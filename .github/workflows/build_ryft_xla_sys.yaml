@@ -20,19 +20,19 @@ jobs:
           - os: linux
             architecture: amd64
             device: cpu
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: cuda-12
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: cuda-13
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: rocm-7
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: macos
             architecture: arm64
             device: cpu
@@ -40,10 +40,11 @@ jobs:
           - os: windows
             architecture: amd64
             device: cpu
-            runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.8xlarge/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.16xlarge/volume=120g/spot=true/extras=s3-cache
     outputs:
       xla_commit_id: ${{ steps.extract_xla_commit_id.outputs.xla_commit_id }}
     steps:
+      - uses: runs-on/action@v2
       - name: Check Out Repository
         uses: actions/checkout@v4
         with:
@@ -79,10 +80,10 @@ jobs:
       - name: Install CUDA 13
         if: ${{ matrix.config.device == 'cuda-13' }}
         run: |
-          wget "https://developer.download.nvidia.com/compute/cuda/repos/$DIST_SLUG/x86_64/cuda-keyring_1.1-1_all.deb"
+          wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
-          sudo apt install -y --no-install-recommends cuda-13-0 cuda-toolkit-13-0
+          sudo apt install -y --no-install-recommends cuda-13-0 cuda-toolkit-13-0 cuda-nvcc-13-0 cuda-nvrtc-dev-13-0
       - name: Install Python
         uses: actions/setup-python@v5
         if: ${{ matrix.config.os == 'windows' }}
@@ -102,22 +103,22 @@ jobs:
           XLA_COMMIT_ID=$(grep 'XLA_COMMIT = "' ryft/crates/ryft-xla-sys/WORKSPACE | sed 's/.*XLA_COMMIT = "\([^"]*\)".*/\1/')
           echo "Extracted XLA Commit ID: $XLA_COMMIT_ID"
           echo "xla_commit_id=$XLA_COMMIT_ID" >> "$GITHUB_OUTPUT"
-      - name: Build `ryft-xla-sys` Static Library
+      - name: Build `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
-        id: build_ryft_xla_sys_static_library
+        id: build_ryft_xla_sys_library
         shell: bash
         run: |
-          OUTPUT=ryft-xla-sys-static-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-          bazel build --config=${{ matrix.config.os }} //:ryft-xla-sys-static-archive
-          cp bazel-bin/ryft-xla-sys-static-archive.tar.gz $OUTPUT
+          OUTPUT=ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+          bazel build --config=${{ matrix.config.os }} //:ryft-xla-sys-archive
+          cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
-      - name: Upload `ryft-xla-sys` Static Library
+      - name: Upload `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.build_ryft_xla_sys_static_library.outputs.library }}
-          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_static_library.outputs.library }}
+          name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
+          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
       - name: Build PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
@@ -138,11 +139,6 @@ jobs:
           cwd: ./ryft/crates/ryft-xla-sys/
           files: ${{ steps.build_pjrt_plugin.outputs.library }}
           outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-      - name: Upload `ryft-xla-sys` Dynamic Library
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.build_ryft_xla_sys_dynamic_library.outputs.library }}
-          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_dynamic_library.outputs.library }}
       - name: Upload PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         uses: actions/upload-artifact@v4
