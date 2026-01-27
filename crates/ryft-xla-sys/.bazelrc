@@ -87,7 +87,7 @@ build:windows --features=-symbol_check
 
 # CUDA Configuration
 build:cuda --@xla//xla/stream_executor/cuda:enable_libnvjitlink_support=True
-build:cuda --@xla//xla/stream_executor/cuda:enable_libnvptxcompiler_support=True
+# build:cuda --@xla//xla/stream_executor/cuda:enable_libnvptxcompiler_support=True
 build:cuda --repo_env TF_NEED_CUDA=1
 build:cuda --repo_env TF_NCCL_USE_STUB=1
 build:cuda --action_env=TF_NVCC_CLANG="1"

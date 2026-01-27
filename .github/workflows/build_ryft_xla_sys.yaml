@@ -25,10 +25,10 @@ jobs:
             architecture: amd64
             device: cuda-12
             runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
-          # - os: linux
-          #   architecture: amd64
-          #   device: cuda-13
-          #   runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
+          - os: linux
+            architecture: amd64
+            device: cuda-13
+            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
           - os: linux
             architecture: amd64
             device: rocm-7
