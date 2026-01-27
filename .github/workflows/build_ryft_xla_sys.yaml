@@ -138,11 +138,6 @@ jobs:
           cwd: ./ryft/crates/ryft-xla-sys/
           files: ${{ steps.build_pjrt_plugin.outputs.library }}
           outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-      - name: Upload `ryft-xla-sys` Dynamic Library
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.build_ryft_xla_sys_dynamic_library.outputs.library }}
-          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_dynamic_library.outputs.library }}
       - name: Upload PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         uses: actions/upload-artifact@v4
