@@ -20,19 +20,19 @@ jobs:
           - os: linux
             architecture: amd64
             device: cpu
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: cuda-12
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: cuda-13
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: linux
             architecture: amd64
             device: rocm-7
-            runner: runs-on=${{ github.run_id }}/runner=32cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
           - os: macos
             architecture: arm64
             device: cpu
@@ -40,10 +40,11 @@ jobs:
           - os: windows
             architecture: amd64
             device: cpu
-            runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.8xlarge/volume=120g/spot=false
+            runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.16xlarge/volume=120g/spot=true/extras=s3-cache
     outputs:
       xla_commit_id: ${{ steps.extract_xla_commit_id.outputs.xla_commit_id }}
     steps:
+      - uses: runs-on/action@v2
       - name: Check Out Repository
         uses: actions/checkout@v4
         with:
