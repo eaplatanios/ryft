@@ -1,0 +1,31 @@
+--- a/third_party/gpus/cuda/hermetic/BUILD.tpl
++++ b/third_party/gpus/cuda/hermetic/BUILD.tpl
+@@ -303,10 +303,9 @@ selects.config_setting_group(
+     ],
+ )
+ 
+-cc_library(
+-    # This is not yet fully supported, but we need the rule
+-    # to make bazel query happy.
++alias(
+     name = "nvptxcompiler",
++    actual = "@cuda_nvcc//:nvptxcompiler",
+ )
+ 
+ alias(
+--- a/third_party/gpus/cuda/hermetic/cuda_nvcc.BUILD.tpl
++++ b/third_party/gpus/cuda/hermetic/cuda_nvcc.BUILD.tpl
+@@ -66,6 +66,13 @@ filegroup(
+     visibility = ["//visibility:public"],
+ )
+ 
++cc_import(
++   name = "nvptxcompiler",
++    hdrs = ["include/nvPTXCompiler.h"],
++    static_library = "lib/libnvptxcompiler_static.a",
++    visibility = ["@local_config_cuda//cuda:__pkg__"],
++)
++
+ filegroup(
+     name = "link_stub",
+     srcs = [

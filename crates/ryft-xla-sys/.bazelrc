@@ -1,0 +1,133 @@
+# Shared Configuration
+common --noenable_bzlmod
+common --announce_rc
+common --experimental_repo_remote_exec
+common --experimental_cc_static_library
+common --show_timestamps
+common --color=yes
+common --verbose_failures=true
+
+build -c opt
+build --spawn_strategy=local
+build --repo_env USE_HERMETIC_CC_TOOLCHAIN=1
+build --repo_env=HERMETIC_PYTHON_VERSION=3.11
+build --output_filter=DONT_MATCH_ANYTHING
+build --legacy_external_runfiles=false
+build --define=tsl_link_protobuf=true
+build --define=grpc_no_ares=true
+build --copt=-DGRPC_BAZEL_BUILD
+build --host_copt=-DGRPC_BAZEL_BUILD
+build --action_env=GRPC_BAZEL_RUNTIME=1
+build --build_tag_filters -no_oss
+
+build:posix --copt=-Wno-sign-compare
+build:posix --cxxopt=-std=c++17
+build:posix --host_cxxopt=-std=c++17
+build:posix --copt -Wno-error=unused-command-line-argument
+build:posix --copt=-Wno-gnu-offsetof-extensions
+build:posix --copt=-Qunused-arguments
+build:posix --copt=-Werror=mismatched-tags
+build:posix --copt=-Wno-error=c23-extensions
+
+# Linux Configuration
+build:linux --config=posix
+build:linux --incompatible_enable_cc_toolchain_resolution
+build:linux --repo_env BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+build:linux --copt=-mavx
+build:linux --host_copt=-mavx
+build:linux --copt=-Wno-unknown-warning-option
+build:linux --copt=-Wno-stringop-truncation
+build:linux --copt=-Wno-array-parameter
+build:linux --copt=-Wno-deprecated-register
+build:linux --copt=-Wno-register
+build:linux --define=tensorflow_mkldnn_contraction_kernel=1
+
+# MacOS Configuration
+build:macos --config=posix
+build:macos --apple_platform_type=macos
+# build:macos --macos_sdk_version=15.5
+# build:macos --xcode_version=16.4
+build:macos --apple_crosstool_top=@local_config_apple_cc//:toolchain
+build:macos --crosstool_top=@local_config_apple_cc//:toolchain
+build:macos --host_crosstool_top=@local_config_apple_cc//:toolchain
+build:macos --linkopt=-Wl,-undefined,dynamic_lookup
+build:macos --host_linkopt=-Wl,-undefined,dynamic_lookup
+build:macos --define=no_nccl_support=true
+
+# Windows Configuration
+build:windows --compiler=clang-cl
+build:windows --extra_toolchains=@local_config_cc//:cc-toolchain-x64_windows-clang-cl
+build:windows --extra_execution_platforms=//:x64_windows-clang-cl
+build:windows --local_resources=memory=128000
+# build:windows --action_env CLANG_COMPILER_PATH=C:\\Program\ Files\\LLVM\\bin\\clang.exe
+# build:windows --repo_env CC=C:\\Program\ Files\\LLVM\\bin\\clang.exe
+# build:windows --repo_env BAZEL_COMPILER=C:\\Program\ Files\\LLVM\\bin\\clang.exe
+# build:windows --repo_env BAZEL_VC=C:\\Program\ Files\ (x86)\\Microsoft\ Visual\ Studio\\2019\\BuildTools\\VC
+build:windows --features=compiler_param_file
+build:windows --features=archive_param_file
+build:windows --incompatible_strict_action_env=true
+build:windows --copt=/arch:AVX
+build:windows --copt=/D_USE_MATH_DEFINES
+build:windows --host_copt=/D_USE_MATH_DEFINES
+build:windows --copt=-DWIN32_LEAN_AND_MEAN
+build:windows --host_copt=-DWIN32_LEAN_AND_MEAN
+build:windows --copt=-DNOGDI
+build:windows --host_copt=-DNOGDI
+build:windows --copt=/Zc:preprocessor
+build:windows --cxxopt=/std:c++17
+build:windows --host_cxxopt=/std:c++17
+build:windows --linkopt=/DEBUG
+build:windows --host_linkopt=/DEBUG
+build:windows --linkopt=/OPT:REF
+build:windows --host_linkopt=/OPT:REF
+build:windows --linkopt=/OPT:ICF
+build:windows --host_linkopt=/OPT:ICF
+build:windows --host_linkopt=/FORCE:MULTIPLE --linkopt=/FORCE:MULTIPLE
+build:windows --features=-symbol_check
+
+# CUDA Configuration
+build:cuda --@xla//xla/stream_executor/cuda:enable_libnvjitlink_support=True
+build:cuda --@xla//xla/stream_executor/cuda:enable_libnvptxcompiler_support=True
+build:cuda --repo_env TF_NEED_CUDA=1
+build:cuda --repo_env TF_NCCL_USE_STUB=1
+build:cuda --action_env=TF_NVCC_CLANG="1"
+build:cuda --@rules_ml_toolchain//common:enable_cuda
+build:cuda --@local_config_cuda//:cuda_compiler=nvcc
+build:cuda --@local_config_cuda//cuda:include_cuda_libs=true
+build:cuda --crosstool_top=@local_config_cuda//crosstool:toolchain
+build:cuda-12 --config=cuda
+build:cuda-12 --repo_env=HERMETIC_CUDA_VERSION="12.9.1"
+build:cuda-12 --repo_env=HERMETIC_CUDNN_VERSION="9.8.0"
+build:cuda-12 --repo_env=HERMETIC_NVSHMEM_VERSION="3.2.5"
+build:cuda-12 --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_50,sm_60,sm_70,sm_80,sm_90,sm_100,compute_120"
+build:cuda-13 --config=cuda
+build:cuda-13 --repo_env=HERMETIC_CUDA_VERSION="13.0.0"
+build:cuda-13 --repo_env=HERMETIC_CUDNN_VERSION="9.12.0"
+build:cuda-13 --repo_env=HERMETIC_NVSHMEM_VERSION="3.3.20"
+build:cuda-13 --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_75,sm_80,sm_90,sm_100,compute_120"
+
+# ROCm Configuration
+build:rocm --noincompatible_enable_cc_toolchain_resolution
+build:rocm --repo_env BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
+build:rocm --@rules_ml_toolchain//common:enable_hermetic_cc=False
+build:rocm --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
+build:rocm --dynamic_mode=off
+build:rocm --repo_env="OS=ubuntu_22.04"
+build:rocm --action_env TF_ROCM_AMDGPU_TARGETS="gfx900,gfx906,gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1200,gfx1201"
+build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain
+# build:rocm --define=using_rocm=true
+build:rocm --define=using_rocm_hipcc=true
+build:rocm --define=tensorflow_mkldnn_contraction_kernel=0
+# build:rocm --define=xnn_enable_avxvnniint8=false
+# build:rocm --define=xnn_enable_avx512fp16=false
+build:rocm --repo_env=TF_NEED_ROCM=1
+build:rocm --action_env=CLANG_COMPILER_PATH="/usr/lib/llvm-18/bin/clang"
+build:rocm --action_env=TF_ROCM_CLANG="1"
+# build:rocm --action_env=TF_HIPCC_CLANG="1"
+build:rocm --copt=-Wno-gnu-offsetof-extensions
+build:rocm --copt=-Qunused-arguments
+build:rocm --linkopt="-fuse-ld=lld"
+build:rocm --host_linkopt="-fuse-ld=lld"
+build:rocm --@local_config_rocm//rocm:rocm_path_type=hermetic
+build:rocm-7 --config=rocm
+build:rocm-7 --repo_env=ROCM_DISTRO_VERSION="rocm_7.10.0_gfx90X"

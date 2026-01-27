@@ -1,0 +1,254 @@
+load("@buildifier_prebuilt//:rules.bzl", "buildifier")
+load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@xla//xla/tsl:tsl.bzl", "tsl_copts")
+load("//bazel:archive.bzl", "build_archive", "extract_headers")
+
+# ----------------------------------------------------
+# Bazel
+# ----------------------------------------------------
+
+buildifier(
+    name = "bzl-format-check",
+    exclude_patterns = [
+        "**/src/**",
+        "**/bazel-*/**",
+    ],
+    lint_mode = "warn",
+    mode = "diff",
+)
+
+buildifier(
+    name = "bzl-format-fix",
+    exclude_patterns = [
+        "**/src/**",
+        "**/bazel-*/**",
+    ],
+    lint_mode = "fix",
+    mode = "fix",
+)
+
+platform(
+    name = "x64_windows-clang-cl",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+        "@bazel_tools//tools/cpp:clang-cl",
+    ],
+)
+
+# ----------------------------------------------------
+# XLA
+# ----------------------------------------------------
+
+XLA_DEPENDENCIES = [
+    "@com_google_absl//absl/status",
+    "@com_google_absl//absl/status:statusor",
+    # "@jax//jaxlib/mosaic/gpu:mlir_capi",
+    "@llvm-project//llvm:Support",
+    "@llvm-project//mlir:CAPIAMDGPU",
+    "@llvm-project//mlir:CAPIArith",
+    "@llvm-project//mlir:CAPIAsync",
+    "@llvm-project//mlir:CAPICF",
+    "@llvm-project//mlir:CAPIConversion",
+    "@llvm-project//mlir:CAPIDebug",
+    "@llvm-project//mlir:CAPIEmitC",
+    "@llvm-project//mlir:CAPIExecutionEngine",
+    "@llvm-project//mlir:CAPIGPU",
+    "@llvm-project//mlir:CAPIIndex",
+    "@llvm-project//mlir:CAPIInterfaces",
+    "@llvm-project//mlir:CAPIIR",
+    "@llvm-project//mlir:CAPILinalg",
+    "@llvm-project//mlir:CAPILLVM",
+    "@llvm-project//mlir:CAPIMath",
+    "@llvm-project//mlir:CAPIMemRef",
+    "@llvm-project//mlir:CAPIMLProgram",
+    "@llvm-project//mlir:CAPINVGPU",
+    "@llvm-project//mlir:CAPINVVM",
+    "@llvm-project//mlir:CAPIPDL",
+    "@llvm-project//mlir:CAPIRegisterEverything",
+    "@llvm-project//mlir:CAPIROCDL",
+    "@llvm-project//mlir:CAPISCF",
+    "@llvm-project//mlir:CAPISMT",
+    "@llvm-project//mlir:CAPIShape",
+    "@llvm-project//mlir:CAPISparseTensor",
+    "@llvm-project//mlir:CAPITensor",
+    "@llvm-project//mlir:CAPITarget",
+    "@llvm-project//mlir:CAPITransformDialect",
+    "@llvm-project//mlir:CAPITransformDialectTransforms",
+    "@llvm-project//mlir:CAPITransforms",
+    "@llvm-project//mlir:CAPIQuant",
+    "@llvm-project//mlir:CAPIVector",
+    "@llvm-project//mlir:FuncDialect",
+    "@llvm-project//mlir:IR",
+    "@llvm-project//mlir:Support",
+    "@shardy//shardy/integrations/c:sdy_capi",
+    "@stablehlo//:chlo_capi",
+    "@stablehlo//:stablehlo_capi",
+    "@stablehlo//:stablehlo_dialect_capi",
+    "@stablehlo//:vhlo_capi",
+    "@xla//xla/ffi/api:c_api",
+    "@xla//xla/mlir_hlo:CAPI",
+    "@xla//xla/pjrt/distributed",
+    "@xla//xla/service/spmd/shardy/integrations/c:xla_sdy_capi",
+]
+
+RYFT_PJRT_SYS_DEPENDENCIES = XLA_DEPENDENCIES + select({
+    "@local_config_cuda//:is_cuda_enabled": [
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu",
+        "@xla//xla/service:gpu_plugin",
+        "@xla//xla/stream_executor:cuda_platform",
+    ],
+    "@local_config_rocm//rocm:using_hipcc": [
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu",
+        "@xla//xla/service:gpu_plugin",
+        "@xla//xla/stream_executor:rocm_platform",
+    ],
+    "//conditions:default": [
+        "@xla//xla/pjrt/c:pjrt_c_api_cpu",
+    ],
+})
+
+cc_library(
+    name = "ryft-xla-sys-library",
+    hdrs = [
+        "src/c++/common.h",
+        "src/c++/distributed.h",
+    ],
+    srcs = [
+        "src/c++/distributed.cc",
+    ],
+    copts = tsl_copts(),
+    deps = RYFT_PJRT_SYS_DEPENDENCIES,
+    alwayslink = True,
+)
+
+cc_static_library(
+    name = "ryft-xla-sys-static-library",
+    deps = [":ryft-xla-sys-library"],
+)
+
+extract_headers(
+    name = "ryft-xla-sys-headers",
+    library = ":ryft-xla-sys-library",
+)
+
+filegroup(
+    name = "ryft-xla-sys-windows-interface-library",
+    srcs = [":ryft-xla-sys-library"],
+    output_group = "interface_library",
+)
+
+filegroup(
+    name = "ryft-xla-sys-td-files",
+    srcs = [
+        "@llvm-project//mlir:AffineOpsTdFiles",
+        "@llvm-project//mlir:ArithOpsTdFiles",
+        "@llvm-project//mlir:AsyncOpsTdFiles",
+        "@llvm-project//mlir:BufferizationOpsTdFiles",
+        "@llvm-project//mlir:BufferizationTransformOpsTdFiles",
+        "@llvm-project//mlir:ComplexOpsTdFiles",
+        "@llvm-project//mlir:ControlFlowOpsTdFiles",
+        "@llvm-project//mlir:FuncTransformOpsTdFiles",
+        "@llvm-project//mlir:GPUOpsTdFiles",
+        "@llvm-project//mlir:GPUTransformOpsTdFiles",
+        "@llvm-project//mlir:IndexOpsTdFiles",
+        "@llvm-project//mlir:LLVMOpsTdFiles",
+        "@llvm-project//mlir:LinalgDocTdFiles",
+        "@llvm-project//mlir:LinalgOpsTdFiles",
+        "@llvm-project//mlir:LinalgStructuredOpsTdFiles",
+        "@llvm-project//mlir:LinalgTransformOpsTdFiles",
+        "@llvm-project//mlir:MLProgramOpsTdFiles",
+        "@llvm-project//mlir:MathOpsTdFiles",
+        "@llvm-project//mlir:MemRefOpsTdFiles",
+        "@llvm-project//mlir:MemRefTransformOpsTdFiles",
+        "@llvm-project//mlir:NVGPUOpsTdFiles",
+        "@llvm-project//mlir:NVGPUTransformOpsTdFiles",
+        "@llvm-project//mlir:NVVMOpsTdFiles",
+        "@llvm-project//mlir:OpenAccOpsTdFiles",
+        "@llvm-project//mlir:OpenMPOpsTdFiles",
+        "@llvm-project//mlir:PDLInterpOpsTdFiles",
+        "@llvm-project//mlir:QuantizationOpsTdFiles",
+        "@llvm-project//mlir:ROCDLOpsTdFiles",
+        "@llvm-project//mlir:SCFTransformOpsTdFiles",
+        "@llvm-project//mlir:SPIRVOpsTdFiles",
+        "@llvm-project//mlir:ShapeOpsTdFiles",
+        "@llvm-project//mlir:TensorOpsTdFiles",
+        "@llvm-project//mlir:TensorTransformOpsTdFiles",
+        "@llvm-project//mlir:VCIXTdFiles",
+        "@llvm-project//mlir:VectorOpsTdFiles",
+        "@llvm-project//mlir:VectorTransformOpsTdFiles",
+        "@llvm-project//mlir:XeVMTdFiles",
+        "@shardy//shardy/dialect/sdy/ir:sdy_td_files",
+        "@stablehlo//:chlo_ops_td_files",
+        "@stablehlo//:stablehlo_ops_td_files",
+        "@stablehlo//:vhlo_ops_td_files",
+        "@xla//xla/mlir_hlo:hlo_ops_td_files",
+    ],
+)
+
+proto_library(
+    name = "ryft-xla-sys-protos",
+    deps = [
+        "@xla//xla/pjrt/proto:compile_options_proto",
+        "@xla//xla/pjrt/proto:execute_options_proto",
+        "@xla//xla/pjrt/proto:executable_metadata_proto",
+        "@xla//xla/pjrt/proto:pjrt_device_dimensions_proto",
+        "@xla//xla/pjrt/proto:pjrt_value_type_proto",
+        "@xla//xla/pjrt/proto:pjrt_partial_program_proto",
+        "@xla//xla/pjrt/proto:topology_description_proto",
+    ],
+)
+
+build_archive(
+    name = "ryft-xla-sys-archive",
+    deps = [
+        ":ryft-xla-sys-headers",
+        ":ryft-xla-sys-protos",
+        ":ryft-xla-sys-static-library",
+        ":ryft-xla-sys-td-files",
+        "@llvm-project//mlir:c_headers",
+    ],
+)
+
+cc_binary(
+    name = "pjrt-gpu-plugin",
+    additional_linker_inputs = [
+        ":pjrt_plugin_exported_symbols.txt",
+        ":pjrt_plugin_version_script.lds",
+    ],
+    copts = tsl_copts(),
+    linkopts = select({
+        "@xla//xla/tsl:windows": [
+            "/FORCE:MULTIPLE",
+        ],
+        "@xla//xla/tsl:macos": [
+            "-Wl,-exported_symbols_list,$(location :pjrt_plugin_exported_symbols.txt)",
+            "-Wl,-undefined,error",
+        ],
+        "//conditions:default": [
+            "-Wl,--version-script,$(location :pjrt_plugin_version_script.lds)",
+            "-Wl,--no-undefined",
+        ],
+    }),
+    linkshared = True,
+    target_compatible_with = select({
+        "@local_config_cuda//:is_cuda_enabled": [],
+        "@local_config_rocm//rocm:using_hipcc": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    win_def_file = ":pjrt_plugin.def",
+    deps = [
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu",
+        "@xla//xla/service:gpu_plugin",
+    ] + select({
+        "@local_config_cuda//:is_cuda_enabled": [
+            "@xla//xla/stream_executor:cuda_platform",
+        ],
+        "@local_config_rocm//rocm:using_hipcc": [
+            "@xla//xla/stream_executor:rocm_platform",
+        ],
+        "//conditions:default": [],
+    }),
+)

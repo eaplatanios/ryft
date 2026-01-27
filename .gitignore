@@ -1,0 +1,17 @@
+# MacOS
+.DS_Store
+
+# Rust
+/target
+
+# Bazel
+**/bazel-*
+
+# VS Code
+.history
+
+# RustRover
+.idea
+
+# Python
+.venv

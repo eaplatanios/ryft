@@ -1,0 +1,27 @@
+--- a/third_party/gpus/cuda/hermetic/BUILD.tpl
++++ b/third_party/gpus/cuda/hermetic/BUILD.tpl
+@@ -307,6 +307,7 @@ cc_library(
+     # This is not yet fully supported, but we need the rule
+     # to make bazel query happy.
+     name = "nvptxcompiler",
++    actual = "@cuda_nvcc//:libnvptxcompiler",
+ )
+ 
+ alias(
+ 
+--- a/xla/stream_executor/cuda/BUILD
++++ b/xla/stream_executor/cuda/BUILD
+@@ -124,7 +124,12 @@ cc_library(
+             "@tsl//tsl/platform:errors",
+             "@tsl//tsl/platform:status",
+             "@tsl//tsl/platform:statusor",
+-        ] + tf_additional_cuda_platform_deps(),
++        ] + tf_additional_cuda_platform_deps() + select({
++            ":libnvptxcompiler_support_enabled": [
++                "@local_config_cuda//cuda:nvptxcompiler",
++            ],
++            "//conditions:default": [],
++        }),
+     alwayslink = True,  # Registers itself with the PlatformManager.
+ )
+ 
