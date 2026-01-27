@@ -102,22 +102,22 @@ jobs:
           XLA_COMMIT_ID=$(grep 'XLA_COMMIT = "' ryft/crates/ryft-xla-sys/WORKSPACE | sed 's/.*XLA_COMMIT = "\([^"]*\)".*/\1/')
           echo "Extracted XLA Commit ID: $XLA_COMMIT_ID"
           echo "xla_commit_id=$XLA_COMMIT_ID" >> "$GITHUB_OUTPUT"
-      - name: Build `ryft-xla-sys` Static Library
+      - name: Build `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
-        id: build_ryft_xla_sys_static_library
+        id: build_ryft_xla_sys_library
         shell: bash
         run: |
-          OUTPUT=ryft-xla-sys-static-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-          bazel build --config=${{ matrix.config.os }} //:ryft-xla-sys-static-archive
-          cp bazel-bin/ryft-xla-sys-static-archive.tar.gz $OUTPUT
+          OUTPUT=ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+          bazel build --config=${{ matrix.config.os }} //:ryft-xla-sys-archive
+          cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
           echo "library=$OUTPUT" >> $GITHUB_OUTPUT
-      - name: Upload `ryft-xla-sys` Static Library
+      - name: Upload `ryft-xla-sys` Library
         if: ${{ matrix.config.device == 'cpu' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.build_ryft_xla_sys_static_library.outputs.library }}
-          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_static_library.outputs.library }}
+          name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
+          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
       - name: Build PJRT Plugin
         if: ${{ matrix.config.device != 'cpu' }}
         working-directory: ./ryft/crates/ryft-xla-sys
