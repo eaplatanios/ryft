@@ -79,7 +79,7 @@ jobs:
       - name: Install CUDA 13
         if: ${{ matrix.config.device == 'cuda-13' }}
         run: |
-          wget "https://developer.download.nvidia.com/compute/cuda/repos/$DIST_SLUG/x86_64/cuda-keyring_1.1-1_all.deb"
+          wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
           sudo apt install -y --no-install-recommends cuda-13-0 cuda-toolkit-13-0
