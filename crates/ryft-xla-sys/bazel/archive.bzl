@@ -29,6 +29,7 @@ HEADERS = [
     "mlir/Dialect/SCF/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Shape/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/SparseTensor/Transforms/Passes.capi.h.inc",
+    "mlir/Dialect/SPIRV/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Tensor/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Transform/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Vector/Transforms/Passes.capi.h.inc",
