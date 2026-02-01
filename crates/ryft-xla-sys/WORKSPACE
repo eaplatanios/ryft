@@ -16,6 +16,11 @@ JAX_SHA256 = "4d931e881c22b12246c2aeaf89bca91815cca4030390979504d7b4d7690b632d"
 
 http_archive(
     name = "xla",
+    patch_args = [
+        "-p1",
+        "--ignore-whitespace",
+    ],
+    patches = ["//patches:recv_callback_fix.patch"],
     sha256 = XLA_SHA256,
     strip_prefix = "xla-{commit}".format(commit = XLA_COMMIT),
     urls = [
