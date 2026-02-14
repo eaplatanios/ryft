@@ -31,6 +31,9 @@ static PJRT_PLUGIN_TPU_LIB: &str = "PJRT_PLUGIN_TPU_LIB";
 /// Name of the environment variable that contains the path to a precompiled PJRT Neuron plugin.
 static PJRT_PLUGIN_NEURON_LIB: &str = "PJRT_PLUGIN_NEURON_LIB";
 
+/// Name of the environment variable that contains the path to a precompiled PJRT Metal plugin.
+static PJRT_PLUGIN_METAL_LIB: &str = "PJRT_PLUGIN_METAL_LIB";
+
 /// URL paired with an expected SHA-256 checksum for verifying downloads.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UrlWithChecksum {
@@ -207,6 +210,9 @@ enum Device {
 
     /// AWS Neuron devices (i.e., Inferentia and Trainium).
     Neuron,
+
+    /// Apple Silicon devices using Metal.
+    Metal,
 }
 
 impl Display for Device {
@@ -218,6 +224,7 @@ impl Display for Device {
             Device::Rocm7 => write!(f, "rocm-7"),
             Device::Tpu => write!(f, "tpu"),
             Device::Neuron => write!(f, "neuron"),
+            Device::Metal => write!(f, "metal"),
         }
     }
 }
@@ -283,6 +290,7 @@ impl BuildConfiguration {
             }
             OperatingSystem::MacOS => {
                 println!("cargo::rustc-link-lib=c++");
+                println!("cargo::rustc-link-lib=framework=CoreFoundation");
                 println!("cargo::rustc-link-arg=-g");
                 println!("cargo::rustc-link-search=native={}", library_directory.display());
                 println!("cargo::rustc-link-arg=-Wl,-rpath,{}", library_directory.display());
@@ -315,6 +323,7 @@ impl BuildConfiguration {
             .header(pjrt_include_path.join("pjrt_c_api_phase_compile_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_profiler_extension.h").to_str().unwrap())
             .header(xla_include_path.join("ffi").join("api").join("c_api.h").to_str().unwrap())
+            .header(xla_include_path.join("service").join("custom_call_status.h").to_str().unwrap())
             .header(
                 xla_include_path
                     .join("service")
@@ -390,6 +399,7 @@ impl BuildConfiguration {
             .clang_arg(format!("-I{}", include_path.display()))
             .allowlist_item("GetPjrtApi")
             .allowlist_item("XLA_FFI.*")
+            .allowlist_item("XlaCustomCallStatus.*")
             .allowlist_item("PJRT.*")
             .allowlist_item("Mlir.*")
             .allowlist_item("mlir.*")
@@ -554,6 +564,9 @@ impl BuildConfiguration {
                     let current_file = match self.device {
                         Device::Tpu => extracted_path.join("libtpu").join("libtpu.so"),
                         Device::Neuron => extracted_path.join("libneuronxla").join("libneuronpjrt.so"),
+                        Device::Metal => {
+                            extracted_path.join("jax_plugins").join("metal_plugin").join("pjrt_plugin_metal_14.dylib")
+                        }
                         _ => new_file.clone(),
                     };
                     if fs::exists(&current_file)? {
@@ -575,8 +588,8 @@ impl BuildConfiguration {
 
     /// Returns the path to the requested [`Artifact`] for this [`BuildConfiguration`] set via environment variables,
     /// if present. Specifically, this function looks for environment variables like [`RYFT_XLA_SYS_ARCHIVE`],
-    /// [`PJRT_PLUGIN_CUDA_12_LIB`], [`PJRT_PLUGIN_CUDA_13_LIB`], [`PJRT_PLUGIN_ROCM_7_LIB`],
-    /// [`PJRT_PLUGIN_TPU_LIB`], and [`PJRT_PLUGIN_NEURON_LIB`] and returns the appropriate path, if present.
+    /// [`PJRT_PLUGIN_CUDA_12_LIB`], [`PJRT_PLUGIN_CUDA_13_LIB`], [`PJRT_PLUGIN_ROCM_7_LIB`], [`PJRT_PLUGIN_TPU_LIB`],
+    /// [`PJRT_PLUGIN_NEURON_LIB`], [`PJRT_PLUGIN_METAL_LIB`] and returns the appropriate path, if present.
     fn artifact_path_from_environment(&self, artifact: Artifact) -> Result<PathBuf> {
         let artifact_name = artifact.name();
 
@@ -587,6 +600,7 @@ impl BuildConfiguration {
             (Artifact::PjrtPlugin, Device::Rocm7) => Some(PJRT_PLUGIN_ROCM_7_LIB),
             (Artifact::PjrtPlugin, Device::Tpu) => Some(PJRT_PLUGIN_TPU_LIB),
             (Artifact::PjrtPlugin, Device::Neuron) => Some(PJRT_PLUGIN_NEURON_LIB),
+            (Artifact::PjrtPlugin, Device::Metal) => Some(PJRT_PLUGIN_METAL_LIB),
             _ => None,
         };
 
@@ -678,7 +692,7 @@ impl BuildConfiguration {
             Device::Cuda12 => format!("--config={} --config=cuda-12", self.operating_system),
             Device::Cuda13 => format!("--config={} --config=cuda-13", self.operating_system),
             Device::Rocm7 => format!("--config={} --config=rocm-7", self.operating_system),
-            Device::Tpu | Device::Neuron => {
+            Device::Tpu | Device::Neuron | Device::Metal => {
                 bail!("the PJRT {} plugin is closed source and does not support Bazel compilation", self.device)
             }
         };
@@ -724,7 +738,7 @@ impl BuildConfiguration {
                         self.operating_system.library_prefix(),
                         self.operating_system.dynamic_library_extension(),
                     ),
-                    Device::Tpu | Device::Neuron => {
+                    Device::Tpu | Device::Neuron | Device::Metal => {
                         bail!(
                             "the PJRT {} plugin is closed source and does not support Bazel compilation",
                             self.device,
@@ -749,6 +763,7 @@ impl BuildConfiguration {
             Artifact::PjrtPlugin => match self.device {
                 Device::Tpu => "libtpu-0.0.34-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
                 Device::Neuron => "libneuronxla-2.2.14584.0%2B06ac23d1-py3-none-linux_x86_64.whl".to_string(),
+                Device::Metal => "jax_metal-0.1.1-py3-none-macosx_13_0_arm64.whl".to_string(),
                 _ => format!("pjrt-plugin-{}.tar.gz", self.platform_string()),
             },
         }
@@ -762,6 +777,9 @@ impl BuildConfiguration {
                 "https://files.pythonhosted.org/packages/17/b9/76527052aa583529fe0b816e6bbe9010676a87e8c50da3a9751d5f404c66"
             }
             (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla",
+            (Artifact::PjrtPlugin, Device::Metal) => {
+                "https://files.pythonhosted.org/packages/09/dc/6d8fbfc29d902251cf333414cf7dcfaf4b252a9920c881354584ed36270d"
+            }
             _ => {
                 "https://github.com/eaplatanios/ryft/releases/download/ryft-xla-sys-41a5d385fedd4777e170b607e68295826fc777a8"
             }
@@ -773,28 +791,31 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("77ce4bf2f7df9e958be7bc9258853aa2bd06b868431517e599991562aad6d8d2")
+                Some("e5f73f314cc7e140743eb83c1b58284b7d1add280971c1c83a8acaf66619efd8")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("7ea72b5e415463c1522b4add4885374f45f45e00457fa4ae772ca25b7e42166b")
+                Some("b9801eddbaa07ec33b0539c90fc455d26f5955e54fe48cf3196db196e821a021")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("f288d5b8611578408c91ee86bc2bc6c89b36f7ac877691a2261e003df285c9a4")
+                Some("7175928ee6a83074b589cc7d4f031338e5841612b274ddd4a08d31808317ef9a")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("9afb2b5c8fca15fa9de2a99f40af77902cb5a1cbef692069045c7862531810bf")
+                Some("9a473e48712e89f42084ac22f2602b86b7f78330021a3eb5db845f38aaad6b06")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("fe8aa7dd536a2ec5fd8a095c2194c793bce3c32ff5ae0c93b71d197bff1775f9")
+                Some("0bbf2738f2f83173c963d80929b86ebc1441ca7275227a016d6c28028bd0d292")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("0be846514e8a99655d5001145f754ac31a020179b468b9929620cb0097a5f3a1")
+                Some("16e81e7e01ac0b74d2a7d8169406229ed830d8bfe64df910b1a4d40f6fb9b75b")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Neuron) => {
                 Some("d1e594b27716bc59b937ccd8f40e7f2b74f6c309643e83dcf511b7ea392924f2")
+            }
+            (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Metal) => {
+                Some("f1dbfecb298cdd3ba6da3ad6dc9a2adb63d71741f8b8ece28c296b32d608b6c8")
             }
             _ => None,
         }
@@ -845,5 +866,9 @@ fn main() {
 
     if cfg!(feature = "neuron") {
         build_configuration.configure_pjrt_plugin(Device::Neuron);
+    }
+
+    if cfg!(feature = "metal") {
+        build_configuration.configure_pjrt_plugin(Device::Metal);
     }
 }

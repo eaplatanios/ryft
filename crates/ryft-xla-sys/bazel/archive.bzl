@@ -29,7 +29,6 @@ HEADERS = [
     "mlir/Dialect/SCF/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Shape/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/SparseTensor/Transforms/Passes.capi.h.inc",
-    "mlir/Dialect/SPIRV/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Tensor/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Transform/Transforms/Passes.capi.h.inc",
     "mlir/Dialect/Vector/Transforms/Passes.capi.h.inc",
@@ -108,6 +107,7 @@ HEADERS = [
     "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h",
     "xla/pjrt/c/pjrt_c_api_stream_extension.h",
     "xla/pjrt/c/pjrt_c_api_triton_extension.h",
+    "xla/service/custom_call_status.h",
     "xla/service/spmd/shardy/integrations/c/passes.h",
 ]
 
