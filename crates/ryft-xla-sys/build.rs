@@ -791,22 +791,22 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("e5f73f314cc7e140743eb83c1b58284b7d1add280971c1c83a8acaf66619efd8")
+                Some("fec3b3da15179b9f6fd35a6d49261d9cbb832455e638b77bf0639f38425644d4")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("b9801eddbaa07ec33b0539c90fc455d26f5955e54fe48cf3196db196e821a021")
+                Some("8c5d35146ae914e128c885b8eacfe03168f70818a16b2fec42e08cc111f1588d")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("7175928ee6a83074b589cc7d4f031338e5841612b274ddd4a08d31808317ef9a")
+                Some("24617176efa50503dc8ece50bbd861665c74f9fcd26ee5ddf3ea7e3c2687959b")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("9a473e48712e89f42084ac22f2602b86b7f78330021a3eb5db845f38aaad6b06")
+                Some("6a6150a5bd9dd0820c0cc80293b49dd030cf3debdda0873ba5946632910c58cc")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("0bbf2738f2f83173c963d80929b86ebc1441ca7275227a016d6c28028bd0d292")
+                Some("355dfdde0bebbbeb65e9e1a0453ee54b1f4aa06f9ad7ab1100f0e95c6b76a5ce")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("16e81e7e01ac0b74d2a7d8169406229ed830d8bfe64df910b1a4d40f6fb9b75b")
+                Some("32cbb8ac52917bdbd423243068a7ca64a5566f475d36b9276875c1240e10ad75")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")

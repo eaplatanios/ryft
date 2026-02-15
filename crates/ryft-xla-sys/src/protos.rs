@@ -7,10 +7,11 @@ use prost_types::{Any as ProtoAny, Duration};
 ///
 /// This type corresponds to `PjRtTopologyDescriptionProto` in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "5 to 8")]
 pub struct Topology {
     /// ID that identifies the platform of this topology.
-    #[prost(bytes = "vec", tag = "1")]
-    pub platform_id: Vec<u8>,
+    #[prost(uint64, tag = "1")]
+    pub platform_id: u64,
 
     /// Name that identifies the platform of this topology (e.g., `"cpu"`, `"gpu"`, `"tpu"`, etc.).
     #[prost(string, tag = "2")]
@@ -26,8 +27,63 @@ pub struct Topology {
     pub is_subslice_topology: bool,
 
     /// Platform-specific Protobuf representation of the topology that may contain additional information.
-    #[prost(message, tag = "9")]
+    #[prost(message, optional, tag = "9")]
     pub platform_specific_topology: Option<ProtoAny>,
+}
+
+/// Topology of CPU devices.
+///
+/// This type corresponds to `CpuTopologyProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct CpuTopology {
+    /// CPU devices that belong to this topology.
+    #[prost(message, repeated, tag = "1")]
+    pub cpu_devices: Vec<CpuTopologyDevice>,
+
+    /// Machine-level attributes associated with this topology.
+    #[prost(string, repeated, tag = "4")]
+    pub machine_attributes: Vec<String>,
+}
+
+/// Description of a CPU device in [`CpuTopology`].
+///
+/// This type corresponds to `CpuTopologyProto.CpuDevice` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct CpuTopologyDevice {
+    /// Process index to which this device belongs.
+    #[prost(int32, tag = "2")]
+    pub process_index: i32,
+
+    /// Local hardware identifier of this device within its process.
+    #[prost(int32, tag = "3")]
+    pub local_hardware_id: i32,
+}
+
+/// Topology of GPU devices.
+///
+/// This type corresponds to `GpuTopologyProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "1, 2, 7")]
+pub struct GpuTopology {
+    /// GPU platform version (e.g., `"NVIDIA A100-SXM4-40GB"`).
+    #[prost(string, tag = "3")]
+    pub platform_version: String,
+
+    /// Number of partitions in this topology.
+    #[prost(int32, tag = "4")]
+    pub num_partitions: i32,
+
+    /// Number of hosts per partition.
+    #[prost(int32, tag = "5")]
+    pub num_hosts_per_partition: i32,
+
+    /// Number of devices per host.
+    #[prost(int32, tag = "6")]
+    pub num_devices_per_host: i32,
+
+    /// GPU target configuration.
+    #[prost(message, optional, tag = "8")]
+    pub gpu_target_config: Option<GpuTargetConfiguration>,
 }
 
 /// Represents the type of data that can be stored in PJRT buffers. Specifically, this represents the type
@@ -2850,4 +2906,395 @@ pub struct ExecutableMetadata {
     /// Additional platform-specific metadata associated with the executable.
     #[prost(message, optional, tag = "2")]
     pub platform_specific_metadata: Option<ProtoAny>,
+}
+
+/// Configuration options for a profiling session created through the PJRT profiler extension.
+///
+/// This type corresponds to `ProfileOptions` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/profiler_options.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct ProfileOptions {
+    /// Version number used to determine whether default values should be applied to newly added fields.
+    /// Clients should set this to the latest version they support so that the profiler can correctly interpret
+    /// the remaining fields.
+    #[prost(uint32, tag = "5")]
+    pub version: u32,
+
+    /// Type of device to profile.
+    #[prost(enumeration = "ProfileDeviceType", tag = "6")]
+    pub device_type: i32,
+
+    /// Boolean flag indicating whether to include dataset operations in the trace. Defaults to `false` if not provided.
+    #[prost(bool, tag = "1")]
+    pub include_dataset_operations: bool,
+
+    /// Host (i.e., CPU) tracing level:
+    ///  - **Level `0`:** Disables host traces.
+    ///  - **Level `1`:** Enables tracing of only user instrumented (or default) _TraceMe_.
+    ///    This is the default value, if not provided.
+    ///  - **Level `2`:** Enables tracing of all level 1 _TraceMe(s)_ and instrumented high level program execution
+    ///    details (e.g., expensive XLA operations, etc.).
+    ///  - **Level `3`:** Enables tracing of all level 2 _TraceMe(s)_ and more verbose (i.e., low-level) program
+    ///    execution details (e.g., including cheap XLA operations, etc.).
+    #[prost(uint32, tag = "2")]
+    pub host_tracing_level: u32,
+
+    /// Device (e.g., GPU or TPU) tracing level:
+    ///   - **Level `0`:** Disables device traces.
+    ///   - **Level `1`:** Enables device traces.
+    /// More levels might be defined for specific device types (i.e., backends) for controlling the trace verbosity.
+    #[prost(uint32, tag = "3")]
+    pub device_tracing_level: u32,
+
+    /// Python function call tracing level. Level `0` disables Python tracing, and higher levels increase verbosity.
+    #[prost(uint32, tag = "4")]
+    pub python_tracing_level: u32,
+
+    /// Boolean flag indicating whether to serialize the HLO proto when XLA is used.
+    #[prost(bool, tag = "7")]
+    pub enable_hlo_proto: bool,
+
+    /// Local profiler start timestamp in nanoseconds since the UNIX epoch.
+    #[prost(uint64, tag = "8")]
+    pub start_timestamp_ns: u64,
+
+    /// Profiling duration in milliseconds. A value of `0` (the default) means that profiling will continue until
+    /// explicitly interrupted.
+    #[prost(uint64, tag = "9")]
+    pub duration_ms: u64,
+
+    /// Directory in which to save the profiling data (defaults to not saving the data, if not specified).
+    #[prost(string, tag = "10")]
+    pub repository_path: String,
+
+    /// Trace options that control host-side trace filtering.
+    #[prost(message, optional, tag = "11")]
+    pub trace_options: Option<ProfileTraceOptions>,
+
+    /// Advanced configuration key-value pairs for backend-specific or experimental profiler settings.
+    #[prost(map = "string, message", tag = "12")]
+    pub advanced_configuration: HashMap<String, ProfileAdvancedConfigurationValue>,
+
+    /// Boolean flag indicating whether to raise an error if the profiler fails to start
+    /// (as opposed to silently ignoring the failure).
+    #[prost(bool, tag = "13")]
+    pub raise_error_on_start_failure: bool,
+
+    /// Profiling session identifier. When set, this is used as a subdirectory name under
+    /// [`ProfileOptions::repository_path`] for storing the profiling data.
+    #[prost(string, tag = "14")]
+    pub session_id: String,
+
+    /// Optional hostname override to use for naming the profiling output file in [`ProfileOptions::repository_path`].
+    /// If not specified, the actual hostname will be used.
+    #[prost(string, tag = "15")]
+    pub override_hostname: String,
+}
+
+/// Device type to profile.
+///
+/// This type corresponds to `ProfileOptions.DeviceType` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/profiler_options.proto).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum ProfileDeviceType {
+    /// Unknown or unspecified device type.
+    Unspecified = 0,
+
+    /// Profile CPU operations.
+    Cpu = 1,
+
+    /// Profile CPU and GPU operations.
+    Gpu = 2,
+
+    /// Profile CPU and TPU operations.
+    Tpu = 3,
+
+    /// Profile CPU and pluggable device (i.e., a custom PJRT [`Plugin`](crate::Plugin) backend) operations.
+    PluggableDevice = 4,
+}
+
+/// Trace options that control host-side trace filtering.
+///
+/// This type corresponds to `ProfileOptions.TraceOptions` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/profiler_options.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct ProfileTraceOptions {
+    /// Filter mask for _TraceMe_ events. If this mask is set, a _TraceMe_ event will be recorded if it passes the
+    /// filter. Only the lowest 32 bits of the mask are used. The higher 32 bits are reserved and will be ignored.
+    #[prost(uint64, tag = "1")]
+    pub host_trace_me_filter_mask: u64,
+}
+
+/// Value in a [`ProfileOptions`] advanced configuration map entry.
+///
+/// This type corresponds to `ProfileOptions.AdvancedConfigValue` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/profiler_options.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct ProfileAdvancedConfigurationValue {
+    /// Configuration value.
+    #[prost(oneof = "ProfileAdvancedConfigurationValueKind", tags = "1, 2, 3")]
+    pub value: Option<ProfileAdvancedConfigurationValueKind>,
+}
+
+/// Kind of value stored in a [`ProfileAdvancedConfigurationValue`].
+///
+/// This type corresponds to `ProfileOptions.AdvancedConfigValue.value` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/profiler_options.proto).
+#[derive(Clone, PartialEq, Oneof)]
+pub enum ProfileAdvancedConfigurationValueKind {
+    /// String configuration value.
+    #[prost(string, tag = "1")]
+    StringValue(String),
+
+    /// Boolean configuration value.
+    #[prost(bool, tag = "2")]
+    BoolValue(bool),
+
+    /// 64-bit integer configuration value.
+    #[prost(int64, tag = "3")]
+    Int64Value(i64),
+}
+
+/// Top-level container for the results of one or more profiling sources. An [`XSpace`] holds one or more [`XPlane`]s,
+/// each representing traces from a different profiling source (e.g., a CPU host, a GPU device, or a backend-specific
+/// tracer).
+///
+/// This type corresponds to `XSpace` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct XSpace {
+    /// Parallel [`XPlane`]s from different profiling sources.
+    #[prost(message, repeated, tag = "1")]
+    pub planes: Vec<XPlane>,
+
+    /// Errors that were raised during [`XPlane`] generation.
+    #[prost(string, repeated, tag = "2")]
+    pub errors: Vec<String>,
+
+    /// Warnings that were logged during [`XPlane`] generation.
+    #[prost(string, repeated, tag = "3")]
+    pub warnings: Vec<String>,
+
+    /// Hostnames from which the [`XPlane`]s were generated.
+    #[prost(string, repeated, tag = "4")]
+    pub hostnames: Vec<String>,
+}
+
+/// Container of multiple parallel timelines (i.e., [`XLine`]s), generated by a profiling source, or by post-processing
+/// one or more [`XPlane`]s. A plane represents traces from a specific source (e.g., a CPU host, a GPU device, or a
+/// backend-specific tracer), represented as parallel timelines (i.e., [`XLine`]s), [`XEventMetadata`], and
+/// [`XStatMetadata`] that are shared across all events within the plane.
+///
+/// This type corresponds to `XPlane` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct XPlane {
+    /// Unique identifier for this [`XPlane`] within its parent [`XSpace`].
+    #[prost(int64, tag = "1")]
+    pub id: i64,
+
+    /// Name of this [`XPlane`] (e.g., `"/host:CPU"`, `"/device:GPU:0"`).
+    #[prost(string, tag = "2")]
+    pub name: String,
+
+    /// Parallel timelines that grouped in this [`XPlane`]. Note that [`XLine`]s with the same [`XLine::id`] represent
+    /// the same timeline across different time ranges.
+    #[prost(message, repeated, tag = "3")]
+    pub lines: Vec<XLine>,
+
+    /// [`XEvent`] metadata, keyed by [`XEventMetadata::id`]. This map should be used for [`XEvent`]s that share the
+    /// same ID over the whole [`XPlane`].
+    #[prost(map = "int64, message", tag = "4")]
+    pub event_metadata: HashMap<i64, XEventMetadata>,
+
+    /// [`XStat`] metadata, keyed by [`XStatMetadata::id`]. This map should be used for [`XStat`]s that share the
+    /// same ID over the whole [`XPlane`].
+    #[prost(map = "int64, message", tag = "5")]
+    pub stat_metadata: HashMap<i64, XStatMetadata>,
+
+    /// [`XStat`]s associated with this [`XPlane`] as a whole (e.g., device capabilities or configuration).
+    #[prost(message, repeated, tag = "6")]
+    pub stats: Vec<XStat>,
+}
+
+/// Timeline within an [`XPlane`] that contains a sequence of [`XEvent`]s. Each line represents a logical thread,
+/// stream, or activity timeline. [`XEvent`] on a line should not partially overlap but may be nested (i.e., one event
+/// may be fully contained within another).
+///
+/// This type corresponds to `XLine` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "5, 6, 7, 8")]
+pub struct XLine {
+    /// Identifier for this [`XLine`] within its parent [`XPlane`]. [`XLine`]s with the same ID across different time
+    /// ranges represent the same timeline.
+    #[prost(int64, tag = "1")]
+    pub id: i64,
+
+    /// Display identifier for this [`XLine`]. [`XLine`]s with the same display ID are grouped in the same row in trace
+    /// viewers.
+    #[prost(int64, tag = "10")]
+    pub display_id: i64,
+
+    /// Name of this [`XLine`].
+    #[prost(string, tag = "2")]
+    pub name: String,
+
+    /// Display name of this [`XLine`] that is shown in trace viewers. If not specified, [`XLine::name`] will be used.
+    #[prost(string, tag = "11")]
+    pub display_name: String,
+
+    /// Start time of this [`XLine`] in nanoseconds since the UNIX epoch.
+    #[prost(int64, tag = "3")]
+    pub timestamp_ns: i64,
+
+    /// Profiling duration of this [`XLine`] in picoseconds.
+    #[prost(int64, tag = "9")]
+    pub duration_ps: i64,
+
+    /// [`XEvent`]s on this [`XLine`], ordered by start time. Events should not partially overlap but can be nested.
+    #[prost(message, repeated, tag = "4")]
+    pub events: Vec<XEvent>,
+}
+
+/// Discrete timed operation on an [`XLine`] timeline.
+///
+/// This type corresponds to `XEvent` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct XEvent {
+    /// ID of the [`XEventMetadata`] associated with this [`XEvent`] in the parent [`XPlane`]'s
+    /// [`XPlane::event_metadata`] map.
+    #[prost(int64, tag = "1")]
+    pub metadata_id: i64,
+
+    /// Timing data for this [`XEvent`].
+    #[prost(oneof = "XEventData", tags = "2, 5")]
+    pub data: Option<XEventData>,
+
+    /// Duration of this [`XEvent`] in picoseconds. A value of `0` indicates an instant event.
+    #[prost(int64, tag = "3")]
+    pub duration_ps: i64,
+
+    /// [`XStat`]s associated with this [`XEvent`].
+    #[prost(message, repeated, tag = "4")]
+    pub stats: Vec<XStat>,
+}
+
+/// Timing data for an [`XEvent`].
+///
+/// This type corresponds to `XEvent.data` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Oneof)]
+pub enum XEventData {
+    /// Start time of the event in picoseconds, as an offset from the parent [`XLine`]'s [`XLine::timestamp_ns`].
+    #[prost(int64, tag = "2")]
+    OffsetPs(i64),
+
+    /// Number of occurrences of this event that is used when events are aggregated.
+    #[prost(int64, tag = "5")]
+    OccurrenceCount(i64),
+}
+
+/// Named value associated with an [`XEvent`] or an [`XPlane`] (e.g., a performance counter value, a metric computed
+/// by a formula applied over nested [`XEvent`]s and their [`XStat`]s, etc.).
+///
+/// This type corresponds to `XStat` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct XStat {
+    /// ID of the [`XStatMetadata`] associated with this [`XStat`] in the parent [`XPlane`]'s
+    /// [`XPlane::stat_metadata`] map.
+    #[prost(int64, tag = "1")]
+    pub metadata_id: i64,
+
+    /// Value of this [`XStat`].
+    #[prost(oneof = "XStatValue", tags = "2, 3, 4, 5, 6, 7")]
+    pub value: Option<XStatValue>,
+}
+
+/// Value stored in an [`XStat`].
+///
+/// This type corresponds to `XStat.value` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Oneof)]
+pub enum XStatValue {
+    /// Double-precision floating-point value.
+    #[prost(double, tag = "2")]
+    DoubleValue(f64),
+
+    /// Unsigned 64-bit integer value.
+    #[prost(uint64, tag = "3")]
+    Uint64Value(u64),
+
+    /// Signed 64-bit integer value.
+    #[prost(int64, tag = "4")]
+    Int64Value(i64),
+
+    /// String value.
+    #[prost(string, tag = "5")]
+    StrValue(String),
+
+    /// Raw bytes value.
+    #[prost(bytes, tag = "6")]
+    BytesValue(Vec<u8>),
+
+    /// Reference to an [`XStatMetadata`] entry by ID that can be used to look up the metadata in the
+    /// parent [`XPlane`]'s [`XPlane::stat_metadata`] map. The string value is stored in the referenced
+    /// [`XStatMetadata::name`].
+    #[prost(uint64, tag = "7")]
+    RefValue(u64),
+}
+
+/// Metadata associated with one or more [`XEvent`]s.
+///
+/// This type corresponds to `XEventMetadata` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct XEventMetadata {
+    /// Unique identifier for this [`XEvent`] metadata within the parent [`XPlane`]'s [`XPlane::event_metadata`] map.
+    #[prost(int64, tag = "1")]
+    pub id: i64,
+
+    /// Name of the [`XEvent`].
+    #[prost(string, tag = "2")]
+    pub name: String,
+
+    /// Display name of this [`XEvent`] that is shown in trace viewers. If not specified, [`XEventMetadata::name`]
+    /// will be used.
+    #[prost(string, tag = "4")]
+    pub display_name: String,
+
+    /// Additional metadata in a serialized format (e.g., a nested Protobuf message).
+    #[prost(bytes = "vec", tag = "3")]
+    pub metadata: Vec<u8>,
+
+    /// [`XStat`]s that are constant across all [`XEvent`]s with [`XEvent::metadata_id`] that matches this
+    /// [`XEventMetadata`]'s [`XEventMetadata::id`].
+    #[prost(message, repeated, tag = "5")]
+    pub stats: Vec<XStat>,
+
+    /// IDs of child [`XEventMetadata`] instances in the parent [`XPlane`]'s [`XPlane::event_metadata`] map.
+    #[prost(int64, repeated, tag = "6")]
+    pub child_id: Vec<i64>,
+}
+
+/// Metadata associated with one or more [`XStat`]s.
+///
+/// This type corresponds to `XStatMetadata` in
+/// [TSL](https://github.com/google/tsl/blob/main/tsl/profiler/protobuf/xplane.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct XStatMetadata {
+    /// Unique identifier for this [`XStat`] metadata within the parent [`XPlane`]'s [`XPlane::stat_metadata`] map.
+    #[prost(int64, tag = "1")]
+    pub id: i64,
+
+    /// Name of the [`XStat`] that should ideally be kept short for efficiency reasons as it may appear multiple times.
+    #[prost(string, tag = "2")]
+    pub name: String,
+
+    /// Description of the [`XStat`] that may be long.
+    #[prost(string, tag = "3")]
+    pub description: String,
 }
