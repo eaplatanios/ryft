@@ -9379,7 +9379,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn sdyTensorMappingAttrGet(ctx: MlirContext, nMappings: isize, mappings: *const MlirAttribute)
-        -> MlirAttribute;
+    -> MlirAttribute;
 }
 unsafe extern "C" {
     pub fn sdyTensorMappingAttrGetRank(attr: MlirAttribute) -> isize;
@@ -9535,7 +9535,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Replace dims[offset ... numDims)\n by dims[offset + shift ... shift + numDims)."]
     pub fn mlirAffineExprShiftDims(affineExpr: MlirAffineExpr, numDims: u32, shift: u32, offset: u32)
-        -> MlirAffineExpr;
+    -> MlirAffineExpr;
 }
 unsafe extern "C" {
     #[doc = " Replace symbols[offset ... numSymbols)\n by symbols[offset + shift ... shift + numSymbols)."]
@@ -10349,7 +10349,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn mlirDenseElementsAttrInt8Get(shapedType: MlirType, numElements: isize, elements: *const i8)
-        -> MlirAttribute;
+    -> MlirAttribute;
 }
 unsafe extern "C" {
     pub fn mlirDenseElementsAttrUInt16Get(
@@ -11303,7 +11303,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Returns the strides of the MemRef if the layout map is in strided form.\n Both strides and offset are out params. strides must point to pre-allocated\n memory of length equal to the rank of the memref."]
     pub fn mlirMemRefTypeGetStridesAndOffset(type_: MlirType, strides: *mut i64, offset: *mut i64)
-        -> MlirLogicalResult;
+    -> MlirLogicalResult;
 }
 unsafe extern "C" {
     #[doc = " Returns the memory spcae of the given Unranked MemRef type."]

@@ -65,9 +65,7 @@ impl PJRT_Distributed_Runtime_Service_Shutdown_Args {
 }
 
 unsafe extern "C" {
-    pub fn PJRT_Distributed_Runtime_Service_Shutdown(
-        args: *mut PJRT_Distributed_Runtime_Service_Shutdown_Args,
-    ) -> *mut PJRT_Error;
+    pub fn PJRT_Distributed_Runtime_Service_Shutdown(args: *mut PJRT_Distributed_Runtime_Service_Shutdown_Args);
 }
 
 #[repr(C)]
@@ -82,9 +80,7 @@ impl PJRT_Distributed_Runtime_Service_Destroy_Args {
 }
 
 unsafe extern "C" {
-    pub fn PJRT_Distributed_Runtime_Service_Destroy(
-        args: *mut PJRT_Distributed_Runtime_Service_Destroy_Args,
-    ) -> *mut PJRT_Error;
+    pub fn PJRT_Distributed_Runtime_Service_Destroy(args: *mut PJRT_Distributed_Runtime_Service_Destroy_Args);
 }
 
 // We represent opaque C types as structs with a particular structure that is following the convention
@@ -259,7 +255,5 @@ impl PJRT_Distributed_Runtime_Client_Destroy_Args {
 }
 
 unsafe extern "C" {
-    pub fn PJRT_Distributed_Runtime_Client_Destroy(
-        args: *mut PJRT_Distributed_Runtime_Client_Destroy_Args,
-    ) -> *mut PJRT_Error;
+    pub fn PJRT_Distributed_Runtime_Client_Destroy(args: *mut PJRT_Distributed_Runtime_Client_Destroy_Args);
 }

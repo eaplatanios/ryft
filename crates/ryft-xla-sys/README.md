@@ -35,7 +35,22 @@ potentially different build time and runtime requirements:
   a precompiled plugin from GitHub releases of `ryft`, if one can be found for the target platform and
   `PJRT_PLUGIN_CUDA_12_LIB` is not set. Note that this plugin has various runtime dependencies that are not included
   in the shared library provided by this feature, including but not limited to: `cublas`, `cudart`, `cudnn`, `cufft`,
-  `cupti`, `cusolver`, `cusparse`, `nccl`, `nvjitlink`, `nvptxcompiler`, `nvrtc`, and `nvshmem`.
+  `cupti`, `cusolver`, `cusparse`, `nccl`, `nvjitlink`, `nvptxcompiler`, `nvrtc`, and `nvshmem`. For Ubuntu 24.04 on
+  x86-64, you can install these dependencies using the following commands:
+
+  ```bash
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+  sudo dpkg -i cuda-keyring_1.1-1_all.deb
+  sudo apt update -y
+  sudo apt install cuda-toolkit-12-8 \
+    libcublas-12-8 \
+    cuda-cudart-12-8 \
+    cuda-nvrtc-12-8 \
+    libcufft-12-8 \
+    libnvjitlink-12-8 \
+    libcudnn9-cuda-12 \
+    libcudnn9-dev-cuda-12
+  ```
 
 - **`cuda-13`:** Enables support for loading the PJRT [CUDA 13](https://docs.nvidia.com/cuda/) plugin for leveraging
   CUDA-enabled GPUs by Nvidia. If this feature is enabled, similar to what happens with the static XLA library,
@@ -45,7 +60,22 @@ potentially different build time and runtime requirements:
   a precompiled plugin from GitHub releases of `ryft`, if one can be found for the target platform and
   `PJRT_PLUGIN_CUDA_13_LIB` is not set. Note that this plugin has various runtime dependencies that are not included
   in the shared library provided by this feature, including but not limited to: `cublas`, `cudart`, `cudnn`, `cufft`,
-  `cupti`, `cusolver`, `cusparse`, `nccl`, `nvjitlink`, `nvptxcompiler`, `nvrtc`, and `nvshmem`.
+  `cupti`, `cusolver`, `cusparse`, `nccl`, `nvjitlink`, `nvptxcompiler`, `nvrtc`, and `nvshmem`. For Ubuntu 24.04 on
+  x86-64, you can install these dependencies using the following commands:
+
+  ```bash
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+  sudo dpkg -i cuda-keyring_1.1-1_all.deb
+  sudo apt update -y
+  sudo apt install cuda-toolkit-13-0 \
+    libcublas-13-0 \
+    cuda-cudart-13-0 \
+    cuda-nvrtc-13-0 \
+    libcufft-13-0 \
+    libnvjitlink-13-0 \
+    libcudnn9-cuda-13 \
+    libcudnn9-dev-cuda-13
+  ```
 
 - **`rocm-7`:** Enables support for loading the PJRT [ROCm 7](https://rocm.docs.amd.com/) plugin for leveraging
   ROCm-enabled GPUs by AMD. If this feature is enabled, similar to what happens with the static XLA library,
@@ -53,8 +83,16 @@ potentially different build time and runtime requirements:
   `cargo vendor` since it requires network access) or it can be provided as a precompiled archive using the
   `PJRT_PLUGIN_ROCM_7_LIB` environment variable. Note that, by default this crate will attempt to download
   a precompiled plugin from GitHub releases of `ryft`, if one can be found for the target platform and
-  `PJRT_PLUGIN_ROCM_7_LIB` is not set. Note that this plugin has various ROCm runtime dependencies that are not included
-  in the shared library provided by this feature.
+  `PJRT_PLUGIN_ROCM_7_LIB` is not set. Note that this plugin has various ROCm runtime dependencies that are not
+  included in the shared library provided by this feature. For Ubuntu, you can install these dependencies using
+  the following commands:
+
+  ```bash
+  wget https://repo.radeon.com/amdgpu-install/7.2/ubuntu/noble/amdgpu-install_7.2.70200-1_all.deb
+  sudo apt install ./amdgpu-install_7.2.70200-1_all.deb
+  sudo apt update -y
+  sudo apt install rocm rocm-core rocm-device-libs rocm-hip-sdk rocprofiler-sdk
+  ```
 
 - **`tpu`:** Enables support for loading the PJRT [TPU](https://cloud.google.com/tpu) plugin for leveraging
   TPUs by Google. If this feature is enabled, this crate will attempt to download a precompiled plugin provided
@@ -68,7 +106,27 @@ potentially different build time and runtime requirements:
   download a precompiled plugin provided by Amazon, if one can be found for the target platform and
   `PJRT_PLUGIN_NEURON_LIB` is not set. Similar to the other feature flags, `PJRT_PLUGIN_NEURON_LIB` can be used to
   provide a path to the precompiled plugin to avoid downloading it. Note that, in contrast to some of the other PJRT
-  plugins, the AWS Neuron plugin is closed source and thus cannot be built from source.
+  plugins, the AWS Neuron plugin is closed source and thus cannot be built from source. Also note that this plugin has
+  various AWS Neuron SDK runtime dependencies that are not included in the shared library provided by this feature.
+  For Ubuntu, you can install these dependencies using the following commands:
+
+  ```bash
+  wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | sudo apt-key add -
+  echo "deb [signed-by=/usr/share/keyrings/neuron-keyring.gpg] https://apt.repos.neuron.amazonaws.com noble main" | sudo tee /etc/apt/sources.list.d/neuron.list
+  sudo apt update -y
+  sudo apt install -y \
+    aws-neuronx-dkms \
+    aws-neuronx-collectives \
+    aws-neuronx-runtime-lib \
+    aws-neuronx-tools
+  ```
+
+- **`metal`:** Enables support for loading the PJRT [Metal](https://developer.apple.com/metal/jax/) plugin for
+  leveraging Apple Silicon accelerators. If this feature is enabled, this crate will attempt to download a precompiled
+  plugin provided as part of [JAX Metal](https://pypi.org/project/jax-metal/), if one can be found for the target
+  platform and `PJRT_PLUGIN_METAL_LIB` is not set. Similar to the other feature flags, `PJRT_PLUGIN_METAL_LIB` can be
+  used to provide a path to the precompiled plugin to avoid downloading it. Note that, in contrast to some of the other
+  PJRT plugins, the Metal plugin is closed source and thus cannot be built from source.
 
 Note that, in cases where precompiled binaries are downloaded, the build script of this crate will verify their SHA-256
 checksums and will make sure to cache them for future builds.
@@ -86,6 +144,8 @@ Currently, precompiled binaries are only available for the following target plat
     - Windows `x86_64`
 - **PJRT Plugins for CUDA 12 & 13, ROCm 7, TPUs, and AWS Neuron:**
     - Linux `x86_64`
+- **PJRT Plugin for Metal (JAX Metal):**
+    - MacOS `aarch64`
 
 ## Contributing
 

@@ -1,4 +1,11 @@
-#[cfg(any(feature = "cuda-12", feature = "cuda-13", feature = "rocm-7", feature = "tpu", feature = "neuron"))]
+#[cfg(any(
+    feature = "cuda-12",
+    feature = "cuda-13",
+    feature = "rocm-7",
+    feature = "tpu",
+    feature = "neuron",
+    feature = "metal",
+))]
 use std::path::PathBuf;
 
 #[cfg(feature = "cuda-12")]
@@ -24,6 +31,11 @@ pub fn pjrt_tpu_plugin_path() -> PathBuf {
 #[cfg(feature = "neuron")]
 pub fn pjrt_neuron_plugin_path() -> PathBuf {
     PathBuf::from(env!("RYFT_PJRT_PLUGIN_NEURON"))
+}
+
+#[cfg(feature = "metal")]
+pub fn pjrt_metal_plugin_path() -> PathBuf {
+    PathBuf::from(env!("RYFT_PJRT_PLUGIN_METAL"))
 }
 
 pub mod bindings;

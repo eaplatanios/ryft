@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-use anyhow::{anyhow, bail, Context, Result};
-use flate2::write::GzEncoder;
+use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
-use reqwest::blocking::Client;
+use flate2::write::GzEncoder;
 use reqwest::Url;
+use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 

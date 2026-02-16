@@ -49,6 +49,13 @@ tpu = []
 # plugin is closed source.
 neuron = []
 
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [Metal](https://developer.apple.com/metal/jax/) plugin
+# that enables using Apple Silicon accelerators. Note that this plugin is only supported on macOS and is distributed as
+# part of [JAX Metal](https://pypi.org/project/jax-metal/), so if an appropriate `pjrt-plugin` archive is not found at
+# the location specified by the `PJRT_PLUGIN_METAL_LIB` environment variable, then an attempt will be made to download
+# it. Building it from source is not supported because the Metal plugin is closed source.
+metal = []
+
 # Uses `bindgen` to generate the various C API bindings instead of using the bindings that are already implemented in
 # Rust. This feature is primarily meant to be used during development of `ryft-xla-sys` and specifically to aid with
 # upgrading the XLA dependency. The typical use case involves enabling this to generate bindings that will then be
