@@ -781,7 +781,7 @@ impl BuildConfiguration {
                 "https://files.pythonhosted.org/packages/09/dc/6d8fbfc29d902251cf333414cf7dcfaf4b252a9920c881354584ed36270d"
             }
             _ => {
-                "https://github.com/eaplatanios/ryft/releases/download/ryft-xla-sys-41a5d385fedd4777e170b607e68295826fc777a8"
+                "https://github.com/eaplatanios/ryft/releases/download/ryft-xla-sys-ca1f837fbdb0c936168b37d529da1419a9d64df8"
             }
         }
     }
@@ -791,22 +791,22 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("fec3b3da15179b9f6fd35a6d49261d9cbb832455e638b77bf0639f38425644d4")
+                Some("bdd26a78dac19d4fd94abe6f849731bb49532889309dc8d9338d411846088684")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("8c5d35146ae914e128c885b8eacfe03168f70818a16b2fec42e08cc111f1588d")
+                Some("a46b8bed5ecaa06eb4fe2a0d2d0b65972a8e3fe906f45b7dd599db8bcccbc571")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("24617176efa50503dc8ece50bbd861665c74f9fcd26ee5ddf3ea7e3c2687959b")
+                Some("0fcc8efa48d1f74dc04c7df5a9d0482f8b4034bcefe79031dda91454b4696f3f")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("6a6150a5bd9dd0820c0cc80293b49dd030cf3debdda0873ba5946632910c58cc")
+                Some("0714611bfc326b6147bc8e9d4bcc4e6518506e77685f284146cf36bb496d5ba1")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("355dfdde0bebbbeb65e9e1a0453ee54b1f4aa06f9ad7ab1100f0e95c6b76a5ce")
+                Some("8e026530a91646de9ae08e128090d9687944d8931b5954907f07cd8ef651a06c")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("32cbb8ac52917bdbd423243068a7ca64a5566f475d36b9276875c1240e10ad75")
+                Some("937633921b4ed1d205e9cb847f12b6a5c9202f250579290031c2178bf5ca4905")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")
