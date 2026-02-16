@@ -129,6 +129,8 @@ build:rocm --action_env=TF_ROCM_CLANG="1"
 build:rocm --copt=-Wno-gnu-offsetof-extensions
 build:rocm --copt=-Qunused-arguments
 build:rocm --linkopt="-fuse-ld=lld"
+build:rocm --copt=-mcmodel=large
+build:rocm --linkopt=-Wl,--no-relax
 build:rocm --host_linkopt="-fuse-ld=lld"
 build:rocm --@local_config_rocm//rocm:rocm_path_type=hermetic
 build:rocm-7 --config=rocm
