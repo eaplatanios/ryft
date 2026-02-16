@@ -6,9 +6,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # XLA
 # ----------------------------------------------------
 
-XLA_COMMIT = "41a5d385fedd4777e170b607e68295826fc777a8"
+XLA_COMMIT = "ca1f837fbdb0c936168b37d529da1419a9d64df8"
 
-XLA_SHA256 = "76f96b50b0c692c92b7ed77a3415b4cdea788e0134886ee5d1bae55baa848cbd"
+XLA_SHA256 = "0ae1e21e448d6fb783dae30fab083fc93b8a7b0f7a3f046966782a2bcfb9e288"
 
 JAX_COMMIT = "d40b4c951a9b53207974330c620130f664a0383e"
 
@@ -16,11 +16,6 @@ JAX_SHA256 = "4d931e881c22b12246c2aeaf89bca91815cca4030390979504d7b4d7690b632d"
 
 http_archive(
     name = "xla",
-    patch_args = [
-        "-p1",
-        "--ignore-whitespace",
-    ],
-    patches = ["//patches:recv_callback_fix.patch"],
     sha256 = XLA_SHA256,
     strip_prefix = "xla-{commit}".format(commit = XLA_COMMIT),
     urls = [
