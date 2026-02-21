@@ -1,23 +1,12 @@
 [workspace]
 resolver = "3"
-
-members = [
-    "crates/ryft",
-    "crates/ryft-core",
-    "crates/ryft-macros",
-    "crates/ryft-macros-tests",
-    "crates/ryft-mlir",
-    "crates/ryft-pjrt",
-    "crates/ryft-xla-sys",
-    "crates/experimental",
-    "crates/experimental-bin",
-    # DO NOT UNCOMMENT THIS LINE!!! "crates/xla",
-]
+members = ["crates/*"]
 
 [workspace.package]
 authors = ["Emmanouil Antonios Platanios <e.a.platanios@gmail.com>"]
 edition = "2024"
 repository = "https://github.com/eaplatanios/ryft"
+documentation = "https://docs.rs/ryft"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]

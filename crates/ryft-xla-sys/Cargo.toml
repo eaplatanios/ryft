@@ -3,6 +3,11 @@ name = "ryft-xla-sys"
 version = "0.0.1"
 readme = "README.md"
 description = "Ryft bindings for XLA."
+include = [
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
 
 authors.workspace = true
 edition.workspace = true
