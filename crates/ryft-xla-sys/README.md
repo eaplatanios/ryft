@@ -149,13 +149,27 @@ Currently, precompiled binaries are only available for the following target plat
 
 ## Contributing
 
-When upgrading the XLA commit that this crate depends on, you must always update the following functions in `build.rs`,
-which control how the precompiled binaries are named, where they are downloaded from, and how their integrity is
-verified:
+When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate change and follow this checklist:
 
-- `BuildConfiguration::precompiled_artifact_name`
-- `BuildConfiguration::precompiled_artifact_url_prefix`
-- `BuildConfiguration::precompiled_artifact_checksum`
-
-Furthermore, you can use the `generate-bindings` feature to regenerate the C API bindings from the XLA source code
-using `bindgen` and copy them over to the `src/bindings.rs` file.
+1. Update all references to the old commit in this crate.
+    - Update `XLA_COMMIT` and `XLA_SHA256` in `WORKSPACE`.
+    - Update any `build.rs` references that still point to the old commit.
+    - Update `JAX_COMMIT` and `JAX_SHA256` only when required by the selected OpenXLA commit.
+2. Rebuild and publish precompiled `ryft-xla-sys` artifacts using `.github/workflows/build_ryft_xla_sys.yaml`.
+    - Use the GitHub CLI to trigger and monitor the workflow (it may take a couple of hours).
+    - After the workflow publishes release artifacts for the new `XLA_COMMIT`, update these functions in `build.rs`:
+        - `BuildConfiguration::precompiled_artifact_name`
+        - `BuildConfiguration::precompiled_artifact_url_prefix`
+        - `BuildConfiguration::precompiled_artifact_checksum`
+3. Compare the old and new `xla/pjrt/c/pjrt_c_api.h` headers.
+    - Regenerate bindings with the `generate-bindings` feature and sync `src/bindings.rs`.
+    - Update any affected `ffi` modules in `crates/ryft-pjrt/src`.
+4. Compare all PJRT extension headers referenced by `pjrt_c_api.h` between the old and new commits.
+    - Update `src/bindings.rs` and any affected modules in `crates/ryft-pjrt/src/extensions`.
+    - If a new extension was added upstream, add a new module in `crates/ryft-pjrt/src/extensions` and include
+      corresponding documentation and tests following existing repository conventions.
+5. Compare Protobuf messages referenced by `src/protos.rs` with the corresponding upstream `.proto` files and update
+   any stale message definitions.
+6. Propagate the changes through `crates/ryft-pjrt` and make sure that tests pass.
+7. Check whether the OpenXLA upgrade changed LLVM; if it did, update `crates/ryft-mlir` as needed.
+8. Audit downstream crates in this repository and apply any compatibility fixes required by the new XLA revision.

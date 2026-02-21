@@ -433,6 +433,379 @@ pub struct Layout {
     pub dynamic_shape_metadata_prefix_size_in_bytes: Option<i64>,
 }
 
+/// Type of optimization profile that can be associated with an operation.
+///
+/// This type corresponds to `ProfileType` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum ProfileType {
+    /// Invalid profile type (default).
+    Invalid = 0,
+
+    /// Window-based profile.
+    Window = 1,
+
+    /// Flag-style profile.
+    Flag = 2,
+
+    /// Integer-valued profile.
+    Integer = 3,
+}
+
+/// Source of the optimization profile associated with an operation.
+///
+/// This type corresponds to `ProfileSource` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum ProfileSource {
+    /// Unknown profile source.
+    UnknownSource = 0,
+
+    /// Profile is embedded in the executable.
+    Embedded = 1,
+
+    /// Profile is retrieved remotely.
+    Remote = 2,
+}
+
+/// Compilation event that triggered profile usage.
+///
+/// This type corresponds to `CompilationEvent` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CompilationEvent {
+    /// Unknown compilation event.
+    UnknownEvent = 0,
+
+    /// First compilation of a program.
+    FirstCompilation = 1,
+
+    /// Recompilation of a program.
+    Recompilation = 2,
+}
+
+/// Strategy used to generate an optimization profile.
+///
+/// This type corresponds to `ProfileGenerationStrategy` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum ProfileGenerationStrategy {
+    /// Unknown profile generation strategy.
+    Unknown = 0,
+
+    /// Genetic algorithm profile search.
+    Ga = 1,
+
+    /// FANTA profile search.
+    Fanta = 2,
+
+    /// CFO profile search.
+    Cfo = 3,
+
+    /// Exhaustive profile search.
+    Exhaustive = 4,
+
+    /// Learned cost-model profile search using a Graph Neural Network.
+    LcmGnn = 5,
+
+    /// Learned cost-model profile search using a Mixture-of-Experts model.
+    LcmMoe = 6,
+}
+
+/// Profile details associated with an [`OpMetadata`] instance.
+///
+/// This type corresponds to `OpMetadata.ProfileInfo` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct OpMetadataProfileInfo {
+    /// Types of optimization profiles that apply to the operation.
+    #[prost(enumeration = "ProfileType", repeated, tag = "1")]
+    pub profile_type: Vec<i32>,
+
+    /// Relative speedup of the tuned configuration compared to the default configuration.
+    #[prost(double, tag = "2")]
+    pub relative_speedup: f64,
+
+    /// Source of the profile information.
+    #[prost(enumeration = "ProfileSource", tag = "3")]
+    pub profile_source: i32,
+
+    /// Compilation event that triggered usage of this profile.
+    #[prost(enumeration = "CompilationEvent", tag = "4")]
+    pub compilation_event: i32,
+
+    /// Strategy used to produce this profile.
+    #[prost(enumeration = "ProfileGenerationStrategy", tag = "5")]
+    pub profile_generation_strategy: i32,
+}
+
+/// Symbolization metadata attached to an HLO operation.
+///
+/// This type corresponds to `OpMetadata` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "6, 7, 11, 13, 14")]
+pub struct OpMetadata {
+    /// Framework operation type that generated this XLA operation.
+    #[prost(string, tag = "1")]
+    pub op_type: String,
+
+    /// User-visible operation name.
+    #[prost(string, tag = "2")]
+    pub op_name: String,
+
+    /// Source file associated with this operation.
+    #[prost(string, tag = "3")]
+    pub source_file: String,
+
+    /// Source line number associated with this operation.
+    #[prost(int32, tag = "4")]
+    pub source_line: i32,
+
+    /// Ending source line number associated with this operation.
+    #[prost(int32, tag = "17")]
+    pub source_end_line: i32,
+
+    /// Source column number associated with this operation.
+    #[prost(int32, tag = "18")]
+    pub source_column: i32,
+
+    /// Ending source column number associated with this operation.
+    #[prost(int32, tag = "19")]
+    pub source_end_column: i32,
+
+    /// Deprecated profile type annotations.
+    #[deprecated]
+    #[prost(enumeration = "ProfileType", repeated, tag = "5")]
+    pub profile_type: Vec<i32>,
+
+    /// Size of generated code for this operation (in bytes).
+    #[prost(int64, tag = "8")]
+    pub size_of_generated_code_in_bytes: i64,
+
+    /// Size of the operation working set in fast device memory (in bytes).
+    #[prost(int64, tag = "9")]
+    pub size_of_memory_working_set_in_bytes: i64,
+
+    /// Profile information associated with this operation.
+    #[prost(message, optional, tag = "10")]
+    pub profile_info: Option<OpMetadataProfileInfo>,
+
+    /// Deduplicated operation name used for grouping equivalent operations.
+    #[prost(string, tag = "12")]
+    pub deduplicated_name: String,
+
+    /// 1-based stack frame index associated with this operation.
+    #[prost(int32, tag = "15")]
+    pub stack_frame_id: i32,
+
+    /// Scheduled instruction name for this operation.
+    #[prost(string, tag = "16")]
+    pub scheduling_name: String,
+}
+
+/// Axis in a device [`Mesh`].
+///
+/// This type corresponds to `MeshProto.MeshAxis` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Eq, Hash, Message)]
+pub struct MeshAxis {
+    /// Axis name.
+    #[prost(string, tag = "1")]
+    pub name: String,
+
+    /// Axis size.
+    #[prost(int64, tag = "2")]
+    pub size: i64,
+}
+
+/// Logical mesh used by named shardings.
+///
+/// This type corresponds to `MeshProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct Mesh {
+    /// Mesh axes.
+    #[prost(message, repeated, tag = "1")]
+    pub axes: Vec<MeshAxis>,
+
+    /// Optional explicit device ordering for the mesh.
+    #[prost(int64, repeated, tag = "2")]
+    pub device_ids: Vec<i64>,
+}
+
+/// Sub-axis reference for a split mesh axis.
+///
+/// This type corresponds to `AxisRefProto.SubAxis` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Message)]
+pub struct AxisReferenceSubAxis {
+    /// Product of axis sizes to the left of the sub-axis.
+    #[prost(int64, tag = "1")]
+    pub pre_size: i64,
+
+    /// Size of the referenced sub-axis.
+    #[prost(int64, tag = "2")]
+    pub size: i64,
+}
+
+/// Reference to a full mesh axis or a split sub-axis.
+///
+/// This type corresponds to `AxisRefProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Message)]
+pub struct AxisReference {
+    /// Index into [`Mesh::axes`].
+    #[prost(int64, tag = "1")]
+    pub mesh_axis_index: i64,
+
+    /// Optional split sub-axis descriptor.
+    #[prost(message, optional, tag = "2")]
+    pub sub_axis_info: Option<AxisReferenceSubAxis>,
+}
+
+/// Sharding of a single logical tensor dimension in a [`NamedSharding`].
+///
+/// This type corresponds to `NamedShardingProto.DimensionSharding` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct NamedShardingDimension {
+    /// Ordered mesh axes used to shard this dimension from major to minor.
+    #[prost(message, repeated, tag = "1")]
+    pub axes: Vec<AxisReference>,
+
+    /// If `true`, this dimension is closed and cannot be further sharded.
+    #[prost(bool, tag = "2")]
+    pub is_closed: bool,
+}
+
+/// Named sharding representation bound to a specific [`Mesh`].
+///
+/// This type corresponds to `NamedShardingProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+#[prost(reserved = "1")]
+pub struct NamedSharding {
+    /// Mesh used by this named sharding.
+    #[prost(message, optional, tag = "2")]
+    pub mesh: Option<Mesh>,
+
+    /// Per-dimension sharding assignments.
+    #[prost(message, repeated, tag = "3")]
+    pub dim_shardings: Vec<NamedShardingDimension>,
+
+    /// Explicitly replicated mesh axes.
+    #[prost(message, repeated, tag = "4")]
+    pub replicated_axes: Vec<AxisReference>,
+
+    /// Mesh axes along which values are unreduced.
+    #[prost(message, repeated, tag = "5")]
+    pub unreduced_axes: Vec<AxisReference>,
+
+    /// Metadata that records the origin of this sharding.
+    #[prost(message, repeated, tag = "6")]
+    pub metadata: Vec<OpMetadata>,
+
+    /// Mesh axes that are user-controlled.
+    #[prost(message, repeated, tag = "7")]
+    pub manual_axes: Vec<AxisReference>,
+}
+
+/// Type of an [`OpSharding`].
+///
+/// This type corresponds to `OpSharding.Type` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum OpShardingType {
+    /// Replicated across all devices.
+    Replicated = 0,
+
+    /// Maximal sharding (single device executes the operation).
+    Maximal = 1,
+
+    /// Tuple sharding where only [`OpSharding::tuple_shardings`] is meaningful.
+    Tuple = 2,
+
+    /// Tiled sharding described by tile shape and assignments.
+    Other = 3,
+
+    /// Manually sharded operation.
+    Manual = 4,
+
+    /// Placeholder sharding with lowest precedence.
+    Unknown = 5,
+
+    /// Unreduced sharding where outputs are not all-reduced.
+    Unreduced = 6,
+}
+
+/// Grouping behavior for shard groups.
+///
+/// This type corresponds to `OpSharding.ShardGroupType` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum ShardGroupType {
+    /// Hard restriction where an operation must match another operation's sharding exactly.
+    As = 0,
+
+    /// Soft restriction where an operation prefers matching shardings with the group.
+    Like = 1,
+}
+
+/// Describes how an operation is partitioned across devices.
+///
+/// This type corresponds to `OpSharding` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct OpSharding {
+    /// Kind of sharding represented by this message.
+    #[prost(enumeration = "OpShardingType", tag = "1")]
+    pub r#type: i32,
+
+    /// Shape of each sharded tile.
+    #[prost(message, optional, tag = "2")]
+    pub tile_shape: Option<Shape>,
+
+    /// Shape of the tile-assignment tensor.
+    #[prost(int64, repeated, tag = "3")]
+    pub tile_assignment_dimensions: Vec<i64>,
+
+    /// Flattened list of assigned device IDs.
+    #[prost(int64, repeated, tag = "4")]
+    pub tile_assignment_devices: Vec<i64>,
+
+    /// Flattened tuple element shardings for tuple-shaped values.
+    #[prost(message, repeated, tag = "5")]
+    pub tuple_shardings: Vec<OpSharding>,
+
+    /// If `true`, replicate across the final tile-assignment dimension.
+    #[prost(bool, tag = "6")]
+    pub replicate_on_last_tile_dim: bool,
+
+    /// Metadata that records the origin of this sharding.
+    #[prost(message, repeated, tag = "7")]
+    pub metadata: Vec<OpMetadata>,
+
+    /// Sharding type for each trailing tile-assignment subgroup dimension.
+    #[prost(enumeration = "OpShardingType", repeated, tag = "8")]
+    pub last_tile_dims: Vec<i32>,
+
+    /// Dimensions used to reshape iota-generated device IDs.
+    #[prost(int64, repeated, tag = "9")]
+    pub iota_reshape_dims: Vec<i64>,
+
+    /// Permutation applied after reshaping iota-generated device IDs.
+    #[prost(int32, repeated, tag = "10")]
+    pub iota_transpose_perm: Vec<i32>,
+
+    /// If `true`, this operation participates in a shard group.
+    #[prost(bool, tag = "11")]
+    pub is_shard_group: bool,
+
+    /// Unique identifier for the shard group.
+    #[prost(int64, tag = "12")]
+    pub shard_group_id: i64,
+
+    /// Grouping behavior for shard-group propagation.
+    #[prost(enumeration = "ShardGroupType", tag = "13")]
+    pub shard_group_type: i32,
+
+    /// Optional named sharding representation. When populated, legacy fields are ignored.
+    #[prost(message, optional, tag = "14")]
+    pub named_sharding: Option<NamedSharding>,
+}
+
 /// Contains a list of compilation environments. Currently [`DebugOptions`] contains a collection of flags that are
 /// the union of flags for multiple different compilation environments. Eventually, those flags will be moved to the
 /// specific compilation environments that they apply to.
