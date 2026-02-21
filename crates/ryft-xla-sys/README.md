@@ -161,9 +161,11 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
         - `BuildConfiguration::precompiled_artifact_name`
         - `BuildConfiguration::precompiled_artifact_url_prefix`
         - `BuildConfiguration::precompiled_artifact_checksum`
-3. Compare the old and new `xla/pjrt/c/pjrt_c_api.h` headers.
+3. Compare the old and new `xla/pjrt/c/pjrt_c_api.h` headers:
     - Regenerate bindings with the `generate-bindings` feature and sync `src/bindings.rs`.
     - Update any affected `ffi` modules in `crates/ryft-pjrt/src`.
+    - Optionally, you can use `git diff <old_commit> <new_commit> xla/pjrt/c` in a checkout of the OpenXLA code
+      repository to better understand what changed in the PJRT C API headers.
 4. Compare all PJRT extension headers referenced by `pjrt_c_api.h` between the old and new commits.
     - Update `src/bindings.rs` and any affected modules in `crates/ryft-pjrt/src/extensions`.
     - If a new extension was added upstream, add a new module in `crates/ryft-pjrt/src/extensions` and include
