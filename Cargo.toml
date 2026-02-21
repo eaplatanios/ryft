@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+
+members = [
+    "crates/ryft-xla-sys",
+]
+
+[workspace.package]
+authors = ["Emmanouil Antonios Platanios <e.a.platanios@gmail.com>"]
+edition = "2024"
+repository = "https://github.com/eaplatanios/ryft"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+bindgen = "0.72.1"
+dirs = "6.0.0"
+flate2 = "1.1.8"
+hex = "0.4.3"
+prost = "0.14.3"
+prost-types = "0.14.3"
+reqwest = { version = "0.13.1", features = ["blocking"] }
+sha2 = "0.10.9"
+tar = "0.4.44"
+zip = "7.2.0"

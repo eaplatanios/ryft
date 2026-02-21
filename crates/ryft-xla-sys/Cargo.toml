@@ -1,0 +1,79 @@
+[package]
+name = "ryft-xla-sys"
+version = "0.0.1"
+readme = "README.md"
+description = "Ryft bindings for XLA."
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+links = "ryft-xla-sys"
+
+[features]
+default = []
+
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [CUDA 12](https://docs.nvidia.com/cuda/) plugin that
+# enables using CUDA-supported accelerators. Note that if an appropriate `pjrt-plugin` archive is not found at the
+# location specified by the `PJRT_PLUGIN_CUDA_12_LIB` environment variable, then an attempt will be made to build it
+# from source using Bazel. However, this is not supported when using `cargo vendor` because it requires having access
+# to the internet during the build process.
+cuda-12 = []
+
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [CUDA 13](https://docs.nvidia.com/cuda/) plugin that
+# enables using CUDA-supported accelerators. Note that if an appropriate `pjrt-plugin` archive is not found at the
+# location specified by the `PJRT_PLUGIN_CUDA_13_LIB` environment variable, then an attempt will be made to build it
+# from source using Bazel. However, this is not supported when using `cargo vendor` because it requires having access
+# to the internet during the build process.
+cuda-13 = []
+
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [ROCm 7](https://rocm.docs.amd.com/) plugin that
+# enables using ROCm-supported accelerators. Note that if an appropriate `pjrt-plugin` archive is not found at the
+# location specified by the `PJRT_PLUGIN_ROCM_7_LIB` environment variable, then an attempt will be made to build it
+# from source using Bazel. However, this is not supported when using `cargo vendor` because it requires having access
+# to the internet during the build process.
+rocm-7 = []
+
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [TPU](https://cloud.google.com/tpu) plugin that enables
+# using Google TPUs. Note that this plugin is only supported on Linux and is distributed as a precompiled binary, so if
+# an appropriate `pjrt-plugin` archive is not found at the location specified by the `PJRT_PLUGIN_TPU_LIB` environment
+# variable, then an attempt will be made to download it. Building it from source is not supported because the TPU plugin
+# is closed source.
+tpu = []
+
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt)
+# [AWS Neuron](https://awsdocs-neuron.readthedocs-hosted.com/) plugin that enables using AWS Inferentia & Trainium
+# devices. Note that this plugin is only supported on Linux and is distributed as a precompiled binary, so if an
+# appropriate `pjrt-plugin` archive is not found at the location specified by the `PJRT_PLUGIN_NEURON_LIB` environment
+# variable, then an attempt will be made to download it. Building it from source is not supported because the Neuron
+# plugin is closed source.
+neuron = []
+
+# Includes support for the [PJRT](https://openxla.org/xla/pjrt) [Metal](https://developer.apple.com/metal/jax/) plugin
+# that enables using Apple Silicon accelerators. Note that this plugin is only supported on macOS and is distributed as
+# part of [JAX Metal](https://pypi.org/project/jax-metal/), so if an appropriate `pjrt-plugin` archive is not found at
+# the location specified by the `PJRT_PLUGIN_METAL_LIB` environment variable, then an attempt will be made to download
+# it. Building it from source is not supported because the Metal plugin is closed source.
+metal = []
+
+# Uses `bindgen` to generate the various C API bindings instead of using the bindings that are already implemented in
+# Rust. This feature is primarily meant to be used during development of `ryft-xla-sys` and specifically to aid with
+# upgrading the XLA dependency. The typical use case involves enabling this to generate bindings that will then be
+# copy-pasted in `src/bindings.rs` so that they do not need to be regenerated each time.
+generate-bindings = ["bindgen"]
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+flate2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+tar.workspace = true
+zip.workspace = true
+
+bindgen = { workspace = true, optional = true }
