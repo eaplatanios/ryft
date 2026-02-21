@@ -1,4 +1,4 @@
-# Ryft Bindings for XLA
+# **Ryft XLA-SYS:** Rust Bindings for XLA
 
 This library contains low-level Rust bindings for components of the [XLA compiler](https://openxla.org/xla)
 that are used by the `ryft` framework. Specifically, it contains bindings for:
