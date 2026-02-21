@@ -7,7 +7,14 @@ authors = ["Emmanouil Antonios Platanios <e.a.platanios@gmail.com>"]
 edition = "2024"
 repository = "https://github.com/eaplatanios/ryft"
 documentation = "https://docs.rs/ryft"
+keywords = ["ryft", "tracing", "autodiff", "compiler", "machine-learning"]
+categories = ["compilers", "hardware-support", "mathematics", "science"]
 license = "MIT OR Apache-2.0"
+include = [
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "NOTICE",
+]
 
 [workspace.dependencies]
 anyhow = "1.0.102"

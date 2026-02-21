@@ -3,6 +3,7 @@ name = "ryft-pjrt"
 version = "0.0.1"
 readme = "README.md"
 description = "Ryft bindings for PJRT."
+keywords = ["ryft", "xla", "pjrt", "gpu", "tpu"]
 include = [
     "../../LICENSE-APACHE",
     "../../LICENSE-MIT",
@@ -12,6 +13,7 @@ include = [
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
+categories.workspace = true
 license.workspace = true
 
 [features]

@@ -3,6 +3,7 @@ name = "ryft-xla-sys"
 version = "0.0.1"
 readme = "README.md"
 description = "Ryft bindings for XLA."
+keywords = ["ryft", "xla", "pjrt", "mlir", "gpu"]
 include = [
     "../../LICENSE-APACHE",
     "../../LICENSE-MIT",
@@ -12,6 +13,7 @@ include = [
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
+categories.workspace = true
 license.workspace = true
 
 links = "ryft-xla-sys"
