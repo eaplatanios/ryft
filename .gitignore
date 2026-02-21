@@ -7,10 +7,9 @@
 # Bazel
 **/bazel-*
 
-# VS Code
+# Code Editors
+.zed
 .history
-
-# RustRover
 .idea
 
 # Python

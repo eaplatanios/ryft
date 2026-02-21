@@ -7,6 +7,7 @@ description = "Ryft bindings for XLA."
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 links = "ryft-xla-sys"
 
