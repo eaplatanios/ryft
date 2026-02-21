@@ -1,0 +1,31 @@
+[package]
+name = "ryft-pjrt"
+version = "0.0.1"
+readme = "README.md"
+description = "Ryft bindings for PJRT."
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+cuda-12 = ["ryft-xla-sys/cuda-12"]
+cuda-13 = ["ryft-xla-sys/cuda-13"]
+rocm-7 = ["ryft-xla-sys/rocm-7"]
+tpu = ["ryft-xla-sys/tpu"]
+neuron = ["ryft-xla-sys/neuron"]
+metal = ["ryft-xla-sys/metal"]
+
+[dependencies]
+ryft-xla-sys = { path = "../ryft-xla-sys", default-features = false }
+half.workspace = true
+hex.workspace = true
+libloading.workspace = true
+paste.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+indoc.workspace = true
