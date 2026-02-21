@@ -2505,8 +2505,8 @@ pub struct ExecutableCompilationOptions {
 
     /// If `true`, use the Shardy partitioner instead of the existing `ShardingPropagation` and `SpmdPartitioner`.
     /// Shardy is a new partitioner that aims to replace the existing partitioning infrastructure.
-    #[prost(bool, optional, tag = "19")]
-    pub use_shardy_partitioner: Option<bool>,
+    #[prost(bool, tag = "19")]
+    pub use_shardy_partitioner: bool,
 
     /// Index of the current process in distributed execution. Used for multi-process compilation and execution.
     #[prost(int64, optional, tag = "22")]
