@@ -1262,6 +1262,7 @@ impl Buffer<'_> {
     /// an [`Error`] occurs while preparing the destination host buffer, you must still call the closure with
     /// `Some(error)` (which forwards the error to PJRT) instead of skipping the call. Otherwise, the associated
     /// future/event may never be resolved by PJRT, thus never rendering this [`Buffer`] ready.
+    #[allow(clippy::type_complexity)]
     pub fn copy_raw_to_host_buffer_future<'b, B: AsMut<[u8]>>(
         &self,
         offset: usize,
