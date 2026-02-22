@@ -1,9 +1,14 @@
 /// XLA-specific runtime data structures.
 ///
-/// The [`arrays`] module models JAX/IFRT-style distributed arrays and their sharding metadata for PJRT execution.
+/// The [`sharding`] module defines device mesh and array sharding metadata (mirroring JAX's
+/// sharding model and Shardy MLIR attributes). The [`arrays`] module builds on that to provide
+/// distributed array types backed by local PJRT buffers for execution.
 pub mod arrays;
+pub mod sharding;
 
-pub use arrays::{
-    AddressableShard, Array, ArrayError, ExecuteArguments, Mesh, MeshAxis, MeshDevice, NamedSharding,
-    PartitionDimension, PartitionSpecification, ShardDescriptor, ShardSlice, ShardingError, ShardingLayout,
+pub use arrays::{AddressableShard, Array, ArrayError, ExecuteArguments};
+
+pub use sharding::{
+    AbstractMesh, Mesh, MeshAxis, MeshDevice, NamedSharding, PartitionDimension, PartitionSpec, ShardDescriptor,
+    ShardSlice, ShardingContext, ShardingError, ShardingLayout,
 };
