@@ -961,9 +961,9 @@ impl Debug for Layout {
 ///
 /// # Cross-Host Transfers
 ///
-/// Cross-host transfers are also supported by some [`Plugin`]s for when operating in a distributed environment.
-/// For such transfers you can use [`Client::cross_host_send_buffers`] and [`Client::cross_host_receive_buffers`]
-/// to send and receive [`Buffer`]s to and from other hosts, respectively.
+/// Cross-host transfers are also supported by some [`Plugin`](crate::Plugin)s for when operating
+/// in a distributed environment. For such transfers you can use [`Client::cross_host_send_buffers`] and
+/// [`Client::cross_host_receive_buffers`] to send and receive [`Buffer`]s to and from other hosts, respectively.
 ///
 /// The lifetime parameter `'o` captures the lifetime of the owner of this [`Buffer`] (e.g., a [`Client`]),
 /// ensuring that the owner outlives the buffer.

@@ -7,7 +7,7 @@ use crate::{Api, Client, Device, Error, Plugin, invoke_pjrt_api_error_fn};
 
 /// Represents a notifying event that is returned by PJRT APIs that enqueue asynchronous work, informing callers when
 /// the work is complete and reporting an [`Error`] if something went wrong. Note that [`Event`]s can carry "payload"
-/// values that are returned as outputs when the underlying work completes via [`Event::r#await`] or [`Event::poll`]
+/// values that are returned as outputs when the underlying work completes via [`Event::await`] or [`Event::poll`]
 /// (e.g., such a payload value could be a host buffer that is being asynchronously populated).
 ///
 /// # Relationship to [`Future`]
@@ -25,7 +25,7 @@ pub struct Event<O> {
 
     /// "Payload" that this [`Event`] carries. Specifically, this payload will be [`Some`] throughout the lifetime of
     /// this [`Event`] and will be returned when it completes (i.e., when its underlying computation completes) via
-    /// [`Event::r#await`] or [`Event::poll`].
+    /// [`Event::await`] or [`Event::poll`].
     output: Option<O>,
 }
 
@@ -59,7 +59,7 @@ impl<O> Event<O> {
     }
 
     /// Sets/triggers this [`Event`] to indicate that the work it represents has completed successfully. If an [`Error`]
-    /// is provided, it will be returned when this [`Event`] is polled via [`Event::poll`] or [`Event::r#await`],
+    /// is provided, it will be returned when this [`Event`] is polled via [`Event::poll`] or [`Event::await`],
     /// representing that something went wrong while executing the underlying work. Otherwise, the work will be
     /// considered successful.
     ///
@@ -228,7 +228,7 @@ pub struct EventHandle {
 impl EventHandle {
     /// Sets/triggers the [`Event`] associated with this [`EventHandle`] to indicate that the work it represents has
     /// completed successfully. If an [`Error`] is provided, it will be returned when the associated [`Event`] is polled
-    /// via [`Event::r#await`] or [`Event::poll`], representing that something went wrong while executing the underlying
+    /// via [`Event::await`] or [`Event::poll`], representing that something went wrong while executing the underlying
     /// work. Otherwise, the work will be considered successful.
     ///
     /// # Safety
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(event_error.code(), error.code());
         assert_eq!(event_error.message(), error.message());
 
-        // Test [`Event::r#await`].
+        // Test [`Event::await`].
         let mut has_invoked_callback = false;
         let event = client.event(42i64).unwrap();
         assert!(event.on_ready(|_| has_invoked_callback = true).is_ok());

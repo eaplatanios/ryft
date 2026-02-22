@@ -93,7 +93,7 @@ impl FfiError {
     }
 
     /// Returns the [`XLA_FFI_Error`](ffi::XLA_FFI_Error) that corresponds to this [`FfiError`] and which can
-    /// be returned from an [`XLA_FFI_Handler`](ffi::XLA_FFI_Handler).
+    /// be returned from an [`XLA_FFI_Handler`](crate::extensions::ffi::handlers::ffi::XLA_FFI_Handler).
     pub unsafe fn to_c_api(&self, api: FfiApi) -> *mut ffi::XLA_FFI_Error {
         unsafe {
             let error_create_fn = (*api.to_c_api())

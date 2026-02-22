@@ -1311,6 +1311,7 @@ unsafe extern "C" {
     pub fn mlirContextGetNumLoadedDialects(context: MlirContext) -> isize;
 }
 unsafe extern "C" {
+    #[allow(rustdoc::invalid_html_tags)]
     #[doc = " Gets the dialect instance owned by the given context using the dialect\n namespace to identify it, loads (i.e., constructs the instance of) the\n dialect if necessary. If the dialect is not registered with the context,\n returns null. Use mlirContextLoad<Name>Dialect to load an unregistered\n dialect."]
     pub fn mlirContextGetOrLoadDialect(context: MlirContext, name: MlirStringRef) -> MlirDialect;
 }

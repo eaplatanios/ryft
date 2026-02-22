@@ -12,7 +12,7 @@ use crate::{
     slice_from_c_api, str_from_c_api,
 };
 
-/// Represents a PJRT [`Device`] topology.
+/// Represents a PJRT [`Device`](crate::Device) topology.
 ///
 /// The lifetime parameter `'o` represents the lifetime of the owner of this [`Topology`] (e.g., a [`Client`])
 /// if it is borrowed. If it is not borrowed, then it will be set to `'static`.

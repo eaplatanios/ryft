@@ -4,7 +4,7 @@ use std::fmt::Display;
 pub static VERSION: Version = Version { major: ffi::PJRT_API_MAJOR as usize, minor: ffi::PJRT_API_MINOR as usize };
 
 /// Represents the version of a PJRT API. Specifically, callers can check for forward compatibility of a PJRT plugin
-/// by using [`Api::version`](crate::api::Api::version) to check if the implementation is aware of newer interface
+/// by using [`Plugin::version`](crate::Plugin::version) to check if the implementation is aware of newer interface
 /// additions. Refer to the [official documentation on PJRT API ABI versioning and compatibility](
 /// https://docs.google.com/document/d/1TKB5NyGtdzrpgw5mpyFjVAhJjpSNdF31T6pjPl_UT2o) for more information.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

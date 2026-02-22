@@ -3,10 +3,29 @@ name = "ryft-pjrt"
 version = "0.0.1"
 readme = "README.md"
 description = "Ryft bindings for PJRT."
+keywords = ["ryft", "xla", "pjrt", "gpu", "tpu"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "README.md",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
 
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+    { file = "CHANGELOG.md", search = "Release Date", replace = "{{date}}", min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n", exactly = 1 },
+]
 
 [features]
 default = []
@@ -18,7 +37,7 @@ neuron = ["ryft-xla-sys/neuron"]
 metal = ["ryft-xla-sys/metal"]
 
 [dependencies]
-ryft-xla-sys = { path = "../ryft-xla-sys", default-features = false }
+ryft-xla-sys.workspace = true
 half.workspace = true
 hex.workspace = true
 libloading.workspace = true

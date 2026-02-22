@@ -169,15 +169,14 @@ impl Api {
 /// Profiler that can be used to profile PJRT program execution. A [`Profiler`] captures trace data from PJRT
 /// [`Plugin`]s during program execution. The typical profiling workflow is as follows:
 ///
-///   1. **Create** a [`Profiler`] via [`Client::profiler`] or [`Plugin::profiler`], providing
-///      [`ProfileOptions`](crate::protos::ProfileOptions) to configure the profiling session (e.g., host tracing
-///      level, device tracing level, etc.).
+///   1. **Create** a [`Profiler`] via [`Client::profiler`] or [`Plugin::profiler`], providing [`ProfileOptions`]
+///      to configure the profiling session (e.g., host tracing level, device tracing level, etc.).
 ///   2. **Start** profiling via [`Profiler::start`]. All PJRT operations performed after this call (and before
 ///      calling [`Profiler::stop`]) will be captured by registered host and device tracers.
 ///   3. **Perform** PJRT operations (e.g., compile and execute programs, transfer buffers, etc.).
 ///   4. **Stop** profiling via [`Profiler::stop`].
-///   5. **Collect** the resulting trace data via [`Profiler::results`], which returns an
-///      [`XSpace`](crate::protos::XSpace) Protocol buffer containing the profiling results.
+///   5. **Collect** the resulting trace data via [`Profiler::results`], which returns an [`XSpace`] Protocol buffer
+///      containing the profiling results.
 ///
 /// The collected `XSpace` data can be saved as `.xplane.pb` files for visualization in
 /// [XProf](https://github.com/openxla/xprof) and [TensorBoard](https://www.tensorflow.org/tensorboard),

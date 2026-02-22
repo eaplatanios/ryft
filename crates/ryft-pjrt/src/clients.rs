@@ -15,9 +15,9 @@ static PJRT_CLIENT_LIFECYCLE_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex
 
 /// PJRT [`Client`]s represent a connection to an accelerator platform. They hold the topology of the system,
 /// managing a list of [`Device`]s and their associated [`Memory`]s (a single device may have multiple memory spaces
-/// like _High Bandwidth Memory_ and slower _Capacity Memory_, for example). Furthermore, while [`Buffer`]s are
-/// associated with (and placed on) [`Device`]s, their lifecycle management is orchestrated through [`Client`]s to
-/// ensure thread safety and correct resource allocation.
+/// like _High Bandwidth Memory_ and slower _Capacity Memory_, for example). Furthermore, while
+/// [`Buffer`](crate::Buffer)s are associated with (and placed on) [`Device`]s, their lifecycle management
+/// is orchestrated through [`Client`]s to ensure thread safety and correct resource allocation.
 ///
 /// Note that a client can optionally use a [`KeyValueStore`] to support multi-process and/or multi-host platforms
 /// (and it has a lifetime parameter, `'s`, that corresponds to that [`KeyValueStore`] since it must outlive the
@@ -392,8 +392,8 @@ pub(crate) struct ProcessInformationHandle {
     error_message: std::ffi::CString,
 }
 
-/// Options that can be passed to [`Plugin::client`], and [`Plugin::client_with_key_value_store`]
-/// to configure a [`Client`].
+/// Options that can be passed to [`Plugin::client`](crate::Plugin::client), and
+/// [`Plugin::client_with_key_value_store`](crate::Plugin::client_with_key_value_store) to configure a [`Client`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientOptions {
     /// Options for configuring a CPU [`Client`] backed by [XLA](https://openxla.org/xla).
@@ -403,7 +403,7 @@ pub enum ClientOptions {
     GPU(GpuClientOptions),
 
     /// Options for configuring a [`Client`]. This represents a default and unstructured set of options that can be
-    /// used to support arbitrary PJRT [`Plugin`]s.
+    /// used to support arbitrary PJRT [`Plugin`](crate::Plugin)s.
     Other(HashMap<String, Value>),
 }
 

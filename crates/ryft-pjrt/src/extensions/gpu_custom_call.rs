@@ -83,14 +83,14 @@ impl Client<'_> {
     ///
     /// # Note Regarding [`GpuCustomCallHandler::Typed`]
     ///
-    /// Note that if you are using a [`GpuCustomCallHandler::Typed`] implementation, XLA will invoke
-    /// [`GpuCustomCallTypedHandler::execute`] during handler registration with a special XLA FFI metadata call frame
-    /// in order to extract API version information. This call frame has no input/output buffers but it includes an
-    /// [`XLA_FFI_Metadata_Extension`](xla_ffi::XLA_FFI_Metadata_Extension) in the extension chain. You must extract
-    /// that extension in your handler implementation and set the API version using
-    /// [`XLA_FFI_API_VERSION_MAJOR`](xla_ffi::XLA_FFI_API_VERSION_MAJOR) and
-    /// [`XLA_FFI_API_VERSION_MINOR`](xla_ffi::XLA_FFI_API_VERSION_MINOR), and immediately return a null pointer,
-    /// for this handler to work as expected.
+    /// Note that if you are using a [`GpuCustomCallHandler::Typed`] implementation, XLA will invoke the `execute`
+    /// handler during the registration process with a special XLA FFI metadata call frame in order to extract API
+    /// version information. This call frame has no input/output buffers but it includes an
+    /// [`XLA_FFI_Metadata_Extension`](crate::extensions::ffi::handlers::ffi::XLA_FFI_Metadata_Extension) in the
+    /// extension chain. You must extract that extension in your handler implementation and set the API version using
+    /// [`XLA_FFI_API_VERSION_MAJOR`](crate::extensions::ffi::versions::ffi::XLA_FFI_API_VERSION_MAJOR) and
+    /// [`XLA_FFI_API_VERSION_MINOR`](crate::extensions::ffi::versions::ffi::XLA_FFI_API_VERSION_MINOR), and
+    /// immediately return a null pointer, for this handler to work as expected.
     pub fn register_gpu_custom_call<N: AsRef<str>, H: Into<GpuCustomCallHandler>>(
         &self,
         name: N,
@@ -190,12 +190,12 @@ impl Api {
 /// Handler for a GPU custom call registration.
 #[derive(Copy, Clone)]
 pub enum GpuCustomCallHandler {
-    /// Legacy untyped XLA handler. All arguments to this handler are passed as a flat `*mut *mut c_void` buffer array
-    /// (inputs followed by outputs) plus an opaque byte string representing any backend-specific configuration. This is
-    /// generally dispreferred to the newer [`GpuCustomCallTypedHandler::Typed`] as it provides no compile-time type
+    /// Legacy untyped XLA handler. All arguments to this handler are passed as a flat `*mut *mut c_void` buffer
+    /// array (inputs followed by outputs) plus an opaque byte string representing any backend-specific configuration.
+    /// This is generally dispreferred to the newer [`GpuCustomCallHandler::Typed`] as it provides no compile-time type
     /// safety for argument counts, buffer shapes, element types, or attributes. Furthermore, with the newer
-    /// [`GpuCustomCallTypedHandler::Typed`] handlers you can more easily wrap normal Rust functions to provide
-    /// as GPU custom call handlers.
+    /// [`GpuCustomCallHandler::Typed`] handlers you can more easily wrap normal Rust functions to provide as GPU
+    /// custom call handlers.
     Untyped(GpuCustomCallUntypedHandler),
 
     /// Typed [XLA FFI](https://openxla.org/xla/custom_call#xla-ffi) handler that provides type-safe buffer bindings
@@ -307,7 +307,7 @@ pub struct GpuCustomCallTypedHandler {
 }
 
 impl GpuCustomCallTypedHandler {
-    /// Constructs a new [`GpuCustomCallFfiHandler`].
+    /// Constructs a new [`GpuCustomCallTypedHandler`].
     ///
     /// # Parameters
     ///
@@ -320,10 +320,10 @@ impl GpuCustomCallTypedHandler {
     ///     before each execution of the compiled [`Executable`](crate::Executable). At this stage, handlers may request
     ///     runtime resources (e.g., collective cliques) needed by the upcoming execution. This handler should not
     ///     attempt to dereference input or output buffers because they may be uninitialized at this stage.
-    ///   - `initialize`: Optional [`FfiHandler`] for the _initialization_ stage. When present, this callback is invoked
-    ///     before execution and after all resources requested during [`GpuCustomCallFfiHandler::prepare`] have been
-    ///     acquired. Similar to [`GpuCustomCallFfiHandler::prepare`], this handler should not attempt to dereference
-    ///     input or output buffers because they may be uninitialized at this stage.
+    ///   - `initialize`: Optional [`FfiHandler`] for the _initialization_ stage. When present, this callback is
+    ///     invoked before execution and after all resources requested during `prepare` have been acquired. Similar
+    ///     to `prepare`, this handler should not attempt to dereference input or output buffers because they may be
+    ///     uninitialized at this stage.
     ///   - `execute`: [`FfiHandler`] for the _execution_ stage. This callback is invoked when the GPU custom call runs
     ///     as part of a PJRT program execution. For GPU backends, handlers typically run on the host CPU and enqueue
     ///     device work using the stream that they can obtain from the execution context. Note that this handler may run

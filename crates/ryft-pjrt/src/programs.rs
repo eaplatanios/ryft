@@ -176,7 +176,7 @@ impl Executable {
         })
     }
 
-    /// Returns the [`Memory`] kind of each output of this [`Executable`].
+    /// Returns the [`Memory`](crate::Memory) kind of each output of this [`Executable`].
     pub fn output_memory_kinds(&self) -> Result<Vec<Cow<'_, str>>, Error> {
         use ffi::PJRT_Executable_OutputMemoryKinds_Args;
         invoke_pjrt_api_error_fn!(
@@ -295,7 +295,7 @@ impl Executable {
 
     /// Returns [`ExecutableMemoryStatistics`] for this [`Executable`] that allow callers to estimate memory usage
     /// for when they will run this [`Executable`]. The returned memory statistics may contain usage information for
-    /// multiple [`Memory`]s (e.g., HBM for GPUs or TPUs and host memory for CPUs).
+    /// multiple [`Memory`](crate::Memory)s (e.g., HBM for GPUs or TPUs and host memory for CPUs).
     pub fn memory_statistics(&self) -> Result<ExecutableMemoryStatistics, Error> {
         use ffi::PJRT_Executable_GetCompiledMemoryStats_Args;
         invoke_pjrt_api_error_fn!(
@@ -459,7 +459,7 @@ impl TryFrom<LoadedExecutable<'_>> for Executable {
     }
 }
 
-/// Serialized representation of a [`CompilationOptions`] instance. The result of [`SerializedCompilationOptions::byte`]
+/// Serialized representation of a [`CompilationOptions`] instance. The result of [`SerializedCompilationOptions::data`]
 /// matches the result of [`CompilationOptions::encode_to_vec`] (as a slice).
 pub struct SerializedCompilationOptions {
     /// Handle that represents this [`SerializedCompilationOptions`] in the PJRT C API.
@@ -512,7 +512,7 @@ impl Drop for SerializedCompilationOptions {
     }
 }
 
-/// Statistics about the [`Memory`] consumption of an [`Executable`] (i.e., a compiled [`Program`]).
+/// Statistics about the [`Memory`](crate::Memory) consumption of an [`Executable`] (i.e., a compiled [`Program`]).
 /// The total device memory required to run the [`Executable`] that corresponds to these statistics is:
 ///
 /// ```text
@@ -678,7 +678,7 @@ impl<'c> LoadedExecutable<'c> {
     /// Executes this [`LoadedExecutable`] on its _addressable_ devices (or on a single _addressable_ device if `device`
     /// is provided) using the provided inputs. Note that the execution of PJRT programs is asynchronous and so the
     /// runtime may not have completed execution by the time this function returns. You can use [`Buffer::ready`] on the
-    /// returned [`Buffer`]s of [`Event::r#await`] on the returned [`Event`]s to wait for the execution to complete.
+    /// returned [`Buffer`]s of [`Event::await`] on the returned [`Event`]s to wait for the execution to complete.
     ///
     /// # Parameters
     ///

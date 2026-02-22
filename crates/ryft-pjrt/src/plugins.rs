@@ -7,7 +7,7 @@ use libloading::Library;
 
 use crate::{Api, Client, ClientOptions, Error, KeyValueStore, invoke_pjrt_api_error_fn};
 
-/// Loaded PJRT [`Plugin`] that can be used via its [`Plugin::api`].
+/// Loaded PJRT [`Plugin`].
 #[derive(Clone)]
 pub struct Plugin {
     /// PJRT [`Api`] for this [`Plugin`].
