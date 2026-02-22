@@ -505,6 +505,7 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
 impl<'t> Context<'t> {
     /// Creates a new StableHLO [`DotAlgorithmAttributeRef`] owned by this [`Context`]. Refer to the documentation of
     /// [`DotGeneralOperation`] for information on the arguments of this function.
+    #[allow(clippy::too_many_arguments)]
     pub fn stable_hlo_dot_algorithm<'c, L: FloatType<'c, 't>, R: FloatType<'c, 't>, T: FloatType<'c, 't>>(
         &'c self,
         lhs_precision_type: L,
@@ -564,11 +565,11 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 /// one output/result tensor, `result`, where `result[result_index] = dot_product` and:
 ///
 ///   - `lhs_result_dims = [d for d in axes(lhs) and d not in lhs_batching_dims and d not in lhs_contracting_dims]`,
-///      where `lhs_batching_dims` and `lhs_contracting_dims` are [`DotDimensionsAttributeRef::lhs_batching_dimensions`]
-///      and [`DotDimensionsAttributeRef::lhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
+///     where `lhs_batching_dims` and `lhs_contracting_dims` are [`DotDimensionsAttributeRef::lhs_batching_dimensions`]
+///     and [`DotDimensionsAttributeRef::lhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
 ///   - `rhs_result_dims = [d for d in axes(rhs) and d not in rhs_batching_dims and d not in rhs_contracting_dims]`,
-///      where `rhs_batching_dims` and `rhs_contracting_dims` are [`DotDimensionsAttributeRef::rhs_batching_dimensions`]
-///      and [`DotDimensionsAttributeRef::rhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
+///     where `rhs_batching_dims` and `rhs_contracting_dims` are [`DotDimensionsAttributeRef::rhs_batching_dimensions`]
+///     and [`DotDimensionsAttributeRef::rhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
 ///   - `result_batching_index + result_lhs_index + result_rhs_index = result_index`, where
 ///     `size(result_batching_index) = size(lhs_batching_dims)`, `size(result_lhs_index) = size(lhs_result_dims)`,
 ///     and `size(result_rhs_index) = size(rhs_result_dims)`,
@@ -596,13 +597,16 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 ///     on different accelerator backends. It contains two [`Precision`]s; one that corresponds to the left-hand side
 ///     input and one that corresponds to the right-hand side input. The possible values for each [`Precision`] value
 ///     have the following semantics:
+/// 
 ///       - [`Precision::Default`]: Fastest calculation, but least accurate approximation to the original number.
 ///       - [`Precision::High`]: Slower calculation, but more accurate approximation to the original number.
 ///       - [`Precision::Highest`]: Slowest calculation, but most accurate approximation to the original number.
+/// 
 ///   - [`DotGeneralOperation::algorithm`] defines the main properties of the algorithm used to implement the dot
 ///     operation, which also defines the precision to use. Therefore, if the precision-related fields of the algorithm
 ///     are set, [`DotGeneralOperation::precision`] must not also be set. The fields of a
 ///     [`DotAlgorithmAttributeRef`] have the following semantics:
+/// 
 ///       - [`DotAlgorithmAttributeRef::lhs_precision_type`] and [`DotAlgorithmAttributeRef::rhs_precision_type`] are
 ///         the precision types that the left-hand side input and right-hand side input of the operation are rounded to.
 ///         Precision types are independent of the storage types of the inputs and the output.
@@ -616,7 +620,9 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 ///         these values should be set to `1`.
 ///       - [`DotAlgorithmAttributeRef::allow_imprecise_accumulation`] specifies whether accumulation in lower precision
 ///         is permitted for some of the computation steps (e.g., using `CUBLASLT_MATMUL_DESC_FAST_ACCUM`).
+/// 
 ///     The following are some example supported [`DotAlgorithmAttributeRef`] values rendered with their MLIR rendering:
+/// 
 ///     ```mlir
 ///     // Inputs are casted to `tf32`, and then accumulated in `f32`:
 ///     {lhs_precision_type = tf32,
@@ -648,6 +654,7 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 ///      num_primitive_operations = 1,
 ///      allow_imprecise_accumulation = true}
 ///     ```
+/// 
 ///     It is up to the compiler implementation to decide which combinations are supported. In general, it is not
 ///     guaranteed that each algorithm is supported on each accelerator type by the consumer of StableHLO. If a given
 ///     algorithm is not supported, an error should be raised as opposed to falling back to an alternative.
@@ -874,6 +881,7 @@ mlir_subtype_trait_impls!(
 
 impl<'t> Context<'t> {
     /// Creates a new StableHLO [`ConvolutionDimensionsAttributeRef`] owned by this [`Context`].
+    #[allow(clippy::too_many_arguments)]
     pub fn stable_hlo_convolution_dimensions<'c>(
         &'c self,
         input_batch_dimension: usize,
@@ -1234,6 +1242,7 @@ mlir_op_trait!(Convolution, @local StaticOrDynamicConvolutionOperation);
 /// documentation of [`ConvolutionOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn convolution<
     'lhs,
     'rhs,
@@ -1380,6 +1389,7 @@ mlir_op_trait!(DynamicConvolution, @local StaticOrDynamicConvolutionOperation);
 /// documentation of [`DynamicConvolutionOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn dynamic_convolution<
     'lhs,
     'rhs,

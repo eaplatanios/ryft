@@ -100,6 +100,7 @@ mlir_op_trait!(BatchNormInference, @local BatchNormOperation);
 /// documentation of [`BatchNormInferenceOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn batch_norm_inference<
     'i,
     's,
@@ -368,6 +369,7 @@ mlir_op_trait!(BatchNormGrad, @local BatchNormOperation);
 /// documentation of [`BatchNormGradOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn batch_norm_grad<
     'i,
     's,

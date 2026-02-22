@@ -38,6 +38,11 @@ impl<'c, 't> ArrayAttributeRef<'c, 't> {
     pub fn len(&self) -> usize {
         unsafe { mlirArrayAttrGetNumElements(self.handle).cast_unsigned() }
     }
+                
+    /// Returns `true` if this [`ArrayAttributeRef`] is empty (i.e., it contains `0` element [`Attribute`]s).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Returns the element [`AttributeRef`]s of this [`ArrayAttributeRef`].
     pub fn elements(&self) -> impl Iterator<Item = AttributeRef<'c, 't>> {

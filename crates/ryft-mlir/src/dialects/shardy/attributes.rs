@@ -770,6 +770,7 @@ impl<'t> Context<'t> {
     ///   - `permutation_factors`: Permutation factor indices.
     ///   - `blocked_propagation_factors`: Propagation-blocked factor indices.
     ///   - `is_custom_rule`: Whether the rule is marked custom.
+    #[allow(clippy::too_many_arguments)]
     pub fn shardy_op_sharding_rule<'c>(
         &'c self,
         factor_sizes: &[usize],

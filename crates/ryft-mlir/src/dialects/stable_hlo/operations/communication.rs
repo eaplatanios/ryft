@@ -756,6 +756,7 @@ mlir_op_trait!(AllGather, @local SupportsChannelHandle);
 /// of [`AllGatherOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn all_gather<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
     all_gather_dimension: usize,
@@ -969,6 +970,7 @@ mlir_op_trait!(AllToAll, @local SupportsChannelHandle);
 /// of [`AllToAllOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     inputs: &[V],
     split_dimension: usize,
@@ -1234,6 +1236,7 @@ mlir_op_trait!(ReduceScatter, @local SupportsChannelHandle);
 /// documentation of [`ReduceScatterOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn reduce_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Location<'c, 't>>(
     operand: V,
     dimension: usize,

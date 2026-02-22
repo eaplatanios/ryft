@@ -324,6 +324,7 @@ mlir_subtype_trait_impls!(
 impl<'t> Context<'t> {
     /// Constructs a new [`UniformQuantizedTypeRef`]. Refer to the documentation
     /// of that type for information on the arguments of this function.
+    #[allow(clippy::too_many_arguments)]
     pub fn uniform_quantized_type<'c, StorageType: Type<'c, 't>, ExpressedType: Type<'c, 't>>(
         &'c self,
         flags: u32,
@@ -455,6 +456,7 @@ mlir_subtype_trait_impls!(
 impl<'t> Context<'t> {
     /// Constructs a new [`UniformQuantizedPerAxisTypeRef`]. Refer to the documentation
     /// of that type for information on the arguments of this function.
+    #[allow(clippy::too_many_arguments)]
     pub fn uniform_quantized_per_axis_type<'c, StorageType: Type<'c, 't>, ExpressedType: Type<'c, 't>>(
         &'c self,
         flags: u32,
@@ -588,6 +590,7 @@ mlir_subtype_trait_impls!(
 impl<'t> Context<'t> {
     /// Constructs a new [`UniformQuantizedSubChannelTypeRef`]. Refer to the documentation
     /// of that type for information on the arguments of this function.
+    #[allow(clippy::too_many_arguments)]
     pub fn uniform_quantized_sub_channel_type<
         'c,
         StorageType: Type<'c, 't>,

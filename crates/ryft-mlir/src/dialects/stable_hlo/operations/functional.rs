@@ -333,6 +333,7 @@ mlir_op_trait!(ReduceWindow, @local HasPadding);
 /// documentation of [`ReduceWindowOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn reduce_window<
     'input,
     'initial_value,

@@ -211,6 +211,11 @@ macro_rules! mlir_dense_array_attribute {
                 pub fn len(&self) -> usize {
                     unsafe { ryft_xla_sys::bindings::mlirDenseArrayGetNumElements(self.handle).cast_unsigned() }
                 }
+                
+                /// Returns `true` if this dense array attribute is empty (i.e., it contains `0` values).
+                pub fn is_empty(&self) -> bool {
+                    self.len() == 0
+                }
 
                 /// Returns the values contained in this dense array attribute.
                 pub fn values(&self) -> impl Iterator<Item = $type> {

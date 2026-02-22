@@ -38,6 +38,11 @@ impl<'c, 't> TupleTypeRef<'c, 't> {
     pub fn len(&self) -> usize {
         unsafe { mlirTupleTypeGetNumTypes(self.handle).cast_unsigned() }
     }
+    
+    /// Returns `true` if this [`TupleTypeRef`] is empty (i.e., it contains `0` elements).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Returns all element [`Type`]s of this [`TupleTypeRef`].
     pub fn elements(&self) -> impl Iterator<Item = TypeRef<'c, 't>> {

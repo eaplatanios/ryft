@@ -44,6 +44,11 @@ impl<'c, 't> DictionaryAttributeRef<'c, 't> {
     pub fn len(&self) -> usize {
         unsafe { mlirDictionaryAttrGetNumElements(self.handle).cast_unsigned() }
     }
+    
+    /// Returns `true` if this [`DictionaryAttributeRef`] is empty (i.e., it contains `0` [`NamedAttributeRef`]s).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Returns the [`NamedAttributeRef`]s stored in this [`DictionaryAttributeRef`].
     pub fn elements(&self) -> impl Iterator<Item = NamedAttributeRef<'c, 't>> {

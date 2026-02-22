@@ -272,8 +272,10 @@ pub const BROADCAST_DIMENSIONS_ATTRIBUTE: &str = "broadcast_dimensions";
 ///
 /// The semantics of broadcasting are implemented as `result[result_index] = operand[operand_index]`,
 /// where `operand_index[d]` is computed based on whether the operand's dimension `d` has size 1:
+/// 
 ///   - If `dim(operand, d) = 1`, then `operand_index[d] = 0` (broadcast across this dimension).
 ///   - Otherwise, `operand_index[d] = result_index[broadcast_dimensions[d]]` (direct mapping).
+/// 
 /// This is computed over all values of `d` in `axes(operand)`.
 ///
 /// To better understand the semantics of this operation, let us consider an operand with type `tensor<1x3xi32>`,
@@ -1727,6 +1729,7 @@ mlir_op_trait!(Scatter, ZeroSuccessors);
 /// documentation of [`ScatterOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn scatter<
     'input,
     'indices,
@@ -1853,6 +1856,7 @@ mlir_op_trait!(SelectAndScatter, @local HasPadding);
 /// documentation of [`SelectAndScatterOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn select_and_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     input: V,
     source: V,
