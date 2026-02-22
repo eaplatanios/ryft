@@ -142,7 +142,7 @@ mod tests {
         let location_1 = context.file_location("test1.rs", 10, 5);
         let location_2 = context.file_location("test2.rs", 20, 10);
         let metadata = context.unit_attribute();
-        let location = context.fused_location(&[location_1, location_2], metadata.as_attribute_ref());
+        let location = context.fused_location(&[location_1, location_2], metadata.as_ref());
         test_location_display_and_debug(location, "loc(fused<unit>[\"test1.rs\":10:5, \"test2.rs\":20:10])");
     }
 
@@ -152,7 +152,7 @@ mod tests {
         let location_1 = context.file_location("file1.rs", 10, 5);
         let location_2 = context.file_location("file2.rs", 20, 10);
         let metadata = context.unit_attribute();
-        let location = context.fused_location(&[location_1, location_2], metadata.as_attribute_ref());
+        let location = context.fused_location(&[location_1, location_2], metadata.as_ref());
         test_location_casting(location);
     }
 }

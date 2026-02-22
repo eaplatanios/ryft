@@ -47,7 +47,7 @@ impl<'c, 't> Identifier<'c, 't> {
     }
 
     /// Returns a [`StringRef`] referencing the underlying string.
-    pub fn as_string_ref(&self) -> StringRef<'c> {
+    pub fn as_ref(&self) -> StringRef<'c> {
         self.into()
     }
 
@@ -87,7 +87,7 @@ impl<'c> TryFrom<&Identifier<'c, '_>> for &'c str {
     type Error = std::str::Utf8Error;
 
     fn try_from(value: &Identifier<'c, '_>) -> Result<Self, Self::Error> {
-        value.as_string_ref().try_into()
+        value.as_ref().try_into()
     }
 }
 

@@ -432,10 +432,7 @@ mod tests {
         assert_eq!(r#type.dimension(1), Size::Dynamic);
         assert_eq!(r#type.dimension(2), Size::Dynamic);
         assert_eq!(r#type.dimension(3), Size::Static(2));
-        assert_eq!(
-            r#type.layout(),
-            Some(context.affine_map_attribute(context.identity_affine_map(4)).as_attribute_ref()),
-        );
+        assert_eq!(r#type.layout(), Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),);
         assert_eq!(r#type.strides_and_offset(), Some((vec![], Size::Static(0))));
         assert_eq!(r#type.memory_space(), None);
         assert_eq!(r#type.affine_map(), context.identity_affine_map(4));
@@ -446,10 +443,7 @@ mod tests {
         let r#type = context.contiguous_mem_ref_type(element_type, &shape, None, location).unwrap();
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
-        assert_eq!(
-            r#type.layout(),
-            Some(context.affine_map_attribute(context.identity_affine_map(4)).as_attribute_ref()),
-        );
+        assert_eq!(r#type.layout(), Some(context.affine_map_attribute(context.identity_affine_map(4)).as_ref()),);
         assert_eq!(r#type.affine_map(), context.identity_affine_map(4));
 
         // Invalid element type.

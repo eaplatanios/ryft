@@ -68,7 +68,7 @@ pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display
     }
 
     /// Up-casts this attribute to an instance of [`Attribute`].
-    fn as_attribute_ref(&self) -> AttributeRef<'c, 't> {
+    fn as_ref(&self) -> AttributeRef<'c, 't> {
         unsafe { AttributeRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
     }
 
@@ -243,7 +243,7 @@ pub(crate) mod tests {
         let rendered_attribute = attribute.to_string();
 
         // Test upcasting.
-        let attribute = attribute.as_attribute_ref();
+        let attribute = attribute.as_ref();
         assert!(attribute.is::<A>());
         assert_eq!(attribute.to_string(), rendered_attribute);
 
@@ -258,7 +258,7 @@ pub(crate) mod tests {
         assert_eq!(attribute.cast::<A>(), None);
 
         // Invalid cast from a generic attribute reference.
-        let attribute = attribute.as_attribute_ref();
+        let attribute = attribute.as_ref();
         assert!(!attribute.is::<A>());
         assert_eq!(attribute.cast::<A>(), None);
     }

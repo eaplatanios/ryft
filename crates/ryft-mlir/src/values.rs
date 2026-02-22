@@ -64,7 +64,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
     }
 
     /// Up-casts this [`Value`] to an instance of [`ValueRef`] (i.e., the most generic value reference type).
-    fn as_value_ref(&self) -> ValueRef<'v, 'c, 't> {
+    fn as_ref(&self) -> ValueRef<'v, 'c, 't> {
         self.cast().unwrap()
     }
 
@@ -283,7 +283,7 @@ mlir_subtype_trait_impls!(BlockArgumentRef<'b, 'c, 't> as Value, mlir_type = Val
 
 impl<'o, 'c, 't> From<BlockArgumentRef<'o, 'c, 't>> for ValueRef<'o, 'c, 't> {
     fn from(value: BlockArgumentRef<'o, 'c, 't>) -> Self {
-        value.as_value_ref()
+        value.as_ref()
     }
 }
 
@@ -340,7 +340,7 @@ mlir_subtype_trait_impls!(OperationResultRef<'o, 'c, 't> as Value, mlir_type = V
 
 impl<'o, 'c, 't> From<OperationResultRef<'o, 'c, 't>> for ValueRef<'o, 'c, 't> {
     fn from(value: OperationResultRef<'o, 'c, 't>) -> Self {
-        value.as_value_ref()
+        value.as_ref()
     }
 }
 
@@ -445,7 +445,7 @@ pub struct ValueAndAttributes<'v, 'c, 't, 's> {
 
 impl<'v, 'c, 't, V: Value<'v, 'c, 't>> From<V> for ValueAndAttributes<'v, 'c, 't, '_> {
     fn from(value: V) -> Self {
-        Self { value: value.as_value_ref(), attributes: None }
+        Self { value: value.as_ref(), attributes: None }
     }
 }
 
@@ -485,8 +485,8 @@ mod tests {
 
         // Test equality.
         assert_eq!(result, op.result(0).unwrap());
-        assert_eq!(result.as_value_ref(), op.result(0).unwrap());
-        assert_eq!(result.as_value_ref(), result);
+        assert_eq!(result.as_ref(), op.result(0).unwrap());
+        assert_eq!(result.as_ref(), result);
         assert_ne!(result, block_argument);
         assert_eq!(block_argument, block_argument);
 
@@ -621,8 +621,8 @@ mod tests {
         assert_eq!(value_and_attributes.value.to_string(), "<block argument> of type 'index' at index: 0");
         assert!(value_and_attributes.attributes.is_none());
         let value_and_attributes = ValueAndAttributes {
-            value: block_argument.as_value_ref(),
-            attributes: Some(HashMap::from([("test_attr".into(), context.unit_attribute().as_attribute_ref())])),
+            value: block_argument.as_ref(),
+            attributes: Some(HashMap::from([("test_attr".into(), context.unit_attribute().as_ref())])),
         };
         assert_eq!(value_and_attributes.clone().value.to_string(), "<block argument> of type 'index' at index: 0");
         assert!(value_and_attributes.attributes.is_some());

@@ -83,14 +83,15 @@ fn main() {
 
 ## Roadmap / TODOs
 
-- [ ] Rename `as_type_ref`, `as_affine_expression_ref`, etc., to just `as_ref`, maybe?
-- [ ] Remove uses of `.expect` and `panic!` (and `.unwrap` where it makes sense), and rely on error propagation
-  instead.
-- [ ] `BooleanAttributeRef::is<IntegerAttributeRef>` panics (and the same for a 1-bit integer attribute in reverse).
+- [ ] Add support for `mlirOperationReplaceUsesOfWith` and `mlirBlockArgumentSetLocation`.
 - [ ] Add `Context` constructors like `i32_type`, etc. Maybe also `bool_type` as an alias for `i1_type`?
-- [ ] Clean up the API we have around elements attributes and make it better typed if possible.
-- [ ] Figure out whether we can use mutable references for the context in more places.
-- [ ] Add wrappers for `mlirOperationReplaceUsesOfWith` and `mlirBlockArgumentSetLocation`.
+- [ ] Clean up the API we have around elements attributes and use stronger typing, if possible.
+- [ ] `BooleanAttributeRef::is<IntegerAttributeRef>` panics (and the same for a 1-bit integer attribute in reverse).
+- [ ] Remove uses of `.expect` and `panic!` (and `.unwrap` where it makes sense), and rely on error propagation
+  instead, similar to what we are doing in `ryft_pjrt`. Note that this is quite challenging in this case since MLIR
+  raises a lot of runtime errors and this is meant to be a library providing Rust bindings for MLIR. The original
+  thinking was that libraries building on top of `ryft_mlir` would create safer wrappers with more robust error handling
+  that is also aware of the specifics of any custom MLIR dialects they may be using.
 - Support more MLIR dialects:
     - [/] `affine`
         - [ ] Add support for operations.
@@ -156,16 +157,16 @@ fn main() {
         - [ ] Add support for operations.
     - [ ] `versioned_hlo`
 
-## License
+#### License
 
-Licensed under either of:
+<sup>
+Licensed under either <a href="../../LICENSE-APACHE">Apache License, Version 2.0</a>
+or <a href="../../LICENSE-MIT">MIT license</a> at your option.
+</sup>
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](../../LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](../../LICENSE-MIT) or https://opensource.org/licenses/MIT)
+<br>
 
-at your option.
-
-## Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you,
+<sub>
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate by you,
 as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+</sub>

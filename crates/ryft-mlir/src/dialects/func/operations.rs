@@ -707,8 +707,8 @@ mod tests {
             assert_eq!(map.get(&op), Some(&"op"));
             assert_eq!(map.get(&dummy_op), Some(&"dummy_op"));
             let mut map = HashMap::new();
-            let op_ref = CallOperationRef::from(&op).as_operation_ref();
-            let dummy_op_ref = dummy_op.as_operation_ref();
+            let op_ref = CallOperationRef::from(&op).as_ref();
+            let dummy_op_ref = dummy_op.as_ref();
             map.insert(&op_ref, "op");
             map.insert(&dummy_op_ref, "dummy_op");
             assert_eq!(map.len(), 2);
@@ -719,7 +719,7 @@ mod tests {
             assert!(matches!(op.callee(), Callee::Symbol(_)));
             assert_eq!(op.function().as_str().unwrap(), "identity");
 
-            let op_ref = unsafe { op.as_operation_ref().cast::<CallOperationRef>() }.unwrap();
+            let op_ref = unsafe { op.as_ref().cast::<CallOperationRef>() }.unwrap();
             assert!(matches!(op_ref.callee(), Callee::Symbol(_)));
 
             // Check that the `no_inline` accessor of [`CallOperation`] works as expected.
@@ -778,17 +778,17 @@ mod tests {
                 "identity",
                 CallProperties {
                     arguments: vec![ValueAndAttributes {
-                        value: block.argument(2).unwrap().as_value_ref(),
+                        value: block.argument(2).unwrap().as_ref(),
                         attributes: Some(HashMap::from([(
                             StringRef::from("dummy"),
-                            context.string_attribute("42").as_attribute_ref(),
+                            context.string_attribute("42").as_ref(),
                         )])),
                     }],
                     results: vec![TypeAndAttributes {
-                        r#type: f64_type.as_type_ref(),
+                        r#type: f64_type.as_ref(),
                         attributes: Some(HashMap::from([(
                             StringRef::from("42"),
-                            context.string_attribute("dummy").as_attribute_ref(),
+                            context.string_attribute("dummy").as_ref(),
                         )])),
                     }],
                     ..Default::default()
@@ -948,7 +948,7 @@ mod tests {
 
         // Define a function called `caller` which calls `identity` from within its body.
         module.body().append_operation({
-            let mut block = context.block(&[(f64_type.as_type_ref(), location), (i64_type.as_type_ref(), location)]);
+            let mut block = context.block(&[(f64_type.as_ref(), location), (i64_type.as_ref(), location)]);
             let constant_op = constant("identity", function_type, location);
             assert_eq!(constant_op.function(), StringRef::from("identity"));
             assert_eq!(constant_op.function_type(), function_type);
@@ -959,17 +959,17 @@ mod tests {
                 identity.result(0).unwrap(),
                 CallIndirectProperties {
                     arguments: vec![ValueAndAttributes {
-                        value: block.argument(0).unwrap().as_value_ref(),
+                        value: block.argument(0).unwrap().as_ref(),
                         attributes: Some(HashMap::from([(
                             StringRef::from("dummy"),
-                            context.string_attribute("42").as_attribute_ref(),
+                            context.string_attribute("42").as_ref(),
                         )])),
                     }],
                     results: vec![TypeAndAttributes {
-                        r#type: f64_type.as_type_ref(),
+                        r#type: f64_type.as_ref(),
                         attributes: Some(HashMap::from([(
                             StringRef::from("42"),
-                            context.string_attribute("dummy").as_attribute_ref(),
+                            context.string_attribute("dummy").as_ref(),
                         )])),
                     }],
                     ..Default::default()
@@ -980,7 +980,7 @@ mod tests {
             // Check that the `callee` accessor of [`CallOperation`] works as expected.
             assert!(matches!(op.callee(), Callee::Value(_)));
 
-            let op_ref = unsafe { op.as_operation_ref().cast::<CallIndirectOperationRef>() }.unwrap();
+            let op_ref = unsafe { op.as_ref().cast::<CallIndirectOperationRef>() }.unwrap();
             assert!(matches!(op_ref.callee(), Callee::Value(_)));
 
             // Check that the `function` accessor of [`CallIndirectOperation`] works as expected.
@@ -1150,8 +1150,8 @@ mod tests {
                     no_inline: true,
                     llvm_emit_c_interface: true,
                     other_attributes: HashMap::from([
-                        ("custom.custom_1", context.unit_attribute().as_attribute_ref()),
-                        ("custom.custom_2", context.string_attribute("42").as_attribute_ref()),
+                        ("custom.custom_1", context.unit_attribute().as_ref()),
+                        ("custom.custom_2", context.string_attribute("42").as_ref()),
                     ]),
                 },
                 block.into(),
@@ -1187,26 +1187,26 @@ mod tests {
                     arguments: vec![
                         f64_type.into(),
                         TypeAndAttributes {
-                            r#type: f64_type.as_type_ref(),
+                            r#type: f64_type.as_ref(),
                             attributes: Some(HashMap::from([
-                                ("custom.there".into(), context.unit_attribute().as_attribute_ref()),
-                                ("custom.we".into(), context.string_attribute("are").as_attribute_ref()),
+                                ("custom.there".into(), context.unit_attribute().as_ref()),
+                                ("custom.we".into(), context.string_attribute("are").as_ref()),
                             ])),
                         },
                         f64_type.into(),
                     ],
                     results: vec![TypeAndAttributes {
-                        r#type: f64_type.as_type_ref(),
+                        r#type: f64_type.as_ref(),
                         attributes: Some(HashMap::from([(
                             "custom.yes".into(),
-                            context.boolean_attribute(false).as_attribute_ref(),
+                            context.boolean_attribute(false).as_ref(),
                         )])),
                     }],
                     no_inline: true,
                     llvm_emit_c_interface: true,
                     other_attributes: HashMap::from([
-                        ("custom.custom_1", context.unit_attribute().as_attribute_ref()),
-                        ("custom.custom_2", context.string_attribute("42").as_attribute_ref()),
+                        ("custom.custom_1", context.unit_attribute().as_ref()),
+                        ("custom.custom_2", context.string_attribute("42").as_ref()),
                     ]),
                 },
                 block.into(),
@@ -1260,8 +1260,8 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
-        let i32_type = context.signless_integer_type(32).as_type_ref();
-        let f64_type = context.float64_type().as_type_ref();
+        let i32_type = context.signless_integer_type(32).as_ref();
+        let f64_type = context.float64_type().as_ref();
         module.body().append_operation({
             let mut block = context.block(&[(i32_type, location), (f64_type, location)]);
             block.append_operation(r#return::<ValueRef, _>(&[], location));
@@ -1294,8 +1294,8 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
-        let i32_type = context.signless_integer_type(32).as_type_ref();
-        let f64_type = context.float64_type().as_type_ref();
+        let i32_type = context.signless_integer_type(32).as_ref();
+        let f64_type = context.float64_type().as_ref();
         module.body().append_operation({
             let mut block = context.block(&[(i32_type, location), (f64_type, location)]);
             let return_op = r#return(&[block.argument(0).unwrap(), block.argument(1).unwrap()], location);

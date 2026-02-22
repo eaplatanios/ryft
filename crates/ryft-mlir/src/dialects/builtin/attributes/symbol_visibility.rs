@@ -139,17 +139,17 @@ mod tests {
         // Test parsing public visibility.
         let attribute = context.symbol_visibility_attribute(SymbolVisibility::Public);
         let parsed = context.parse_attribute("\"public\"").unwrap();
-        assert_eq!(parsed, attribute.as_attribute_ref());
+        assert_eq!(parsed, attribute.as_ref());
 
         // Test parsing private visibility.
         let attribute = context.symbol_visibility_attribute(SymbolVisibility::Private);
         let parsed = context.parse_attribute("\"private\"").unwrap();
-        assert_eq!(parsed, attribute.as_attribute_ref());
+        assert_eq!(parsed, attribute.as_ref());
 
         // Test parsing nested visibility.
         let attribute = context.symbol_visibility_attribute(SymbolVisibility::Nested);
         let parsed = context.parse_attribute("\"nested\"").unwrap();
-        assert_eq!(parsed, attribute.as_attribute_ref());
+        assert_eq!(parsed, attribute.as_ref());
     }
 
     #[test]

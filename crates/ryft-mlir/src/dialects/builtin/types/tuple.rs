@@ -108,9 +108,9 @@ mod tests {
         assert_eq!(r#type.len(), 1);
         assert_eq!(r#type.elements().collect::<Vec<_>>(), vec![element]);
 
-        let element_1 = context.signless_integer_type(32).as_type_ref();
-        let element_2 = context.float32_type().as_type_ref();
-        let element_3 = context.index_type().as_type_ref();
+        let element_1 = context.signless_integer_type(32).as_ref();
+        let element_2 = context.float32_type().as_ref();
+        let element_3 = context.index_type().as_ref();
         let r#type = context.tuple_type(&[element_1, element_2, element_3]);
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.len(), 3);
@@ -120,8 +120,8 @@ mod tests {
     #[test]
     fn test_tuple_type_equality() {
         let context = Context::new();
-        let element_1 = context.index_type().as_type_ref();
-        let element_2 = context.float32_type().as_type_ref();
+        let element_1 = context.index_type().as_ref();
+        let element_2 = context.float32_type().as_ref();
 
         // Same types from the same context must be equal because they are "uniqued".
         let type_1 = context.tuple_type(&[element_1, element_2]);
@@ -134,8 +134,8 @@ mod tests {
 
         // Same types from different contexts must not be equal.
         let context = Context::new();
-        let element_1 = context.index_type().as_type_ref();
-        let element_2 = context.float32_type().as_type_ref();
+        let element_1 = context.index_type().as_ref();
+        let element_2 = context.float32_type().as_ref();
         let type_2 = context.tuple_type(&[element_1, element_2]);
         assert_ne!(type_1, type_2);
     }
@@ -150,9 +150,9 @@ mod tests {
         let r#type = context.tuple_type(&[element]);
         test_type_display_and_debug(r#type, "tuple<f32>");
 
-        let element_1 = context.signless_integer_type(32).as_type_ref();
-        let element_2 = context.float32_type().as_type_ref();
-        let element_3 = context.index_type().as_type_ref();
+        let element_1 = context.signless_integer_type(32).as_ref();
+        let element_2 = context.float32_type().as_ref();
+        let element_3 = context.index_type().as_ref();
         let r#type = context.tuple_type(&[element_1, element_2, element_3]);
         test_type_display_and_debug(r#type, "tuple<i32, f32, index>");
     }
@@ -160,9 +160,9 @@ mod tests {
     #[test]
     fn test_tuple_type_parsing() {
         let context = Context::new();
-        let element_1 = context.signless_integer_type(32).as_type_ref();
-        let element_2 = context.float32_type().as_type_ref();
-        let element_3 = context.index_type().as_type_ref();
+        let element_1 = context.signless_integer_type(32).as_ref();
+        let element_2 = context.float32_type().as_ref();
+        let element_3 = context.index_type().as_ref();
         assert_eq!(context.parse_type("tuple<>").unwrap(), context.tuple_type::<TypeRef>(&[]));
         assert_eq!(context.parse_type("tuple<f32>").unwrap(), context.tuple_type(&[element_2]));
         assert_eq!(
@@ -174,8 +174,8 @@ mod tests {
     #[test]
     fn test_tuple_type_casting() {
         let context = Context::new();
-        let element_1 = context.index_type().as_type_ref();
-        let element_2 = context.float32_type().as_type_ref();
+        let element_1 = context.index_type().as_ref();
+        let element_2 = context.float32_type().as_ref();
         let r#type = context.tuple_type(&[element_1, element_2]);
         test_type_casting(r#type);
     }

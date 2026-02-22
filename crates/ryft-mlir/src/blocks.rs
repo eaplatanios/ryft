@@ -52,7 +52,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
     fn context(&self) -> &'c Context<'t>;
 
     /// Returns a reference to this [`Block`].
-    fn as_block_ref(&self) -> BlockRef<'b, 'c, 't> {
+    fn as_ref(&self) -> BlockRef<'b, 'c, 't> {
         unsafe { BlockRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
     }
 
@@ -606,7 +606,7 @@ impl<'r, 'c, 't> Debug for BlockRef<'r, 'c, 't> {
 
 impl<'b, 'c, 't> From<&'b DetachedBlock<'c, 't>> for BlockRef<'b, 'c, 't> {
     fn from(value: &'b DetachedBlock<'c, 't>) -> Self {
-        value.as_block_ref()
+        value.as_ref()
     }
 }
 
@@ -887,7 +887,7 @@ mod tests {
 
         // Try to remove an orphaned operation.
         let op_3 = OperationBuilder::new("foo", location).build().unwrap();
-        let (_, removed_op) = unsafe { block_0.remove_operation(op_3.as_operation_ref()) };
+        let (_, removed_op) = unsafe { block_0.remove_operation(op_3.as_ref()) };
         assert!(removed_op.is_none());
     }
 
@@ -904,7 +904,7 @@ mod tests {
     fn test_block_ref_parent_operation() {
         let context = Context::new();
         let module = context.module(context.unknown_location());
-        assert_eq!(module.body().parent_operation(), Some(module.as_operation().as_operation_ref()));
+        assert_eq!(module.body().parent_operation(), Some(module.as_operation().as_ref()));
     }
 
     #[test]
@@ -937,8 +937,8 @@ mod tests {
         let block = context.block_with_no_arguments();
         assert_eq!(format!("{}", block), "<<UNLINKED BLOCK>>\n");
         assert_eq!(format!("{:?}", block), "Block[<<UNLINKED BLOCK>>\n]");
-        assert_eq!(format!("{}", block.as_block_ref()), "<<UNLINKED BLOCK>>\n");
-        assert_eq!(format!("{:?}", block.as_block_ref()), "BlockRef[<<UNLINKED BLOCK>>\n]");
+        assert_eq!(format!("{}", block.as_ref()), "<<UNLINKED BLOCK>>\n");
+        assert_eq!(format!("{:?}", block.as_ref()), "BlockRef[<<UNLINKED BLOCK>>\n]");
 
         let mut region = context.region();
         let block = region.append_block(context.block_with_no_arguments());

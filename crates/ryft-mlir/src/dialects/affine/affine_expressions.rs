@@ -50,7 +50,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     }
 
     /// Up-casts this affine expression to an instance of [`AffineExpression`].
-    fn as_affine_expression_ref(&self) -> AffineExpressionRef<'c, 't> {
+    fn as_ref(&self) -> AffineExpressionRef<'c, 't> {
         unsafe { AffineExpressionRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
     }
 
@@ -122,7 +122,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// Returns a new [`ModAffineExpressionRef`]that represents the application of the modulus operator
     /// on the provided [`AffineExpression`]s.
     fn r#mod<Rhs: AffineExpression<'c, 't>>(&self, rhs: Rhs) -> ModAffineExpressionRef<'c, 't> {
-        ModAffineExpressionRef::new(self.as_affine_expression_ref(), rhs.as_affine_expression_ref())
+        ModAffineExpressionRef::new(self.as_ref(), rhs.as_ref())
     }
 
     /// Returns a new [`ModAffineExpressionRef`]that represents the application of the modulus operator
@@ -135,14 +135,14 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// on the provided [`AffineExpression`]s. The "floor-division" operator rounds down the result of the division
     /// to the nearest integer.
     fn floor_div<Rhs: AffineExpression<'c, 't>>(&self, rhs: Rhs) -> FloorDivAffineExpressionRef<'c, 't> {
-        FloorDivAffineExpressionRef::new(self.as_affine_expression_ref(), rhs.as_affine_expression_ref())
+        FloorDivAffineExpressionRef::new(self.as_ref(), rhs.as_ref())
     }
 
     /// Returns a new [`CeilDivAffineExpressionRef`] that represents the application of the "ceil-division" operator
     /// on the provided [`AffineExpression`]s. The "ceil-division" operator rounds up the result of the division
     /// to the nearest integer.
     fn ceil_div<Rhs: AffineExpression<'c, 't>>(&self, rhs: Rhs) -> CeilDivAffineExpressionRef<'c, 't> {
-        CeilDivAffineExpressionRef::new(self.as_affine_expression_ref(), rhs.as_affine_expression_ref())
+        CeilDivAffineExpressionRef::new(self.as_ref(), rhs.as_ref())
     }
 
     /// Composes this affine expression with the provided [`AffineMap`], returning the resulting [`AffineExpression`].
@@ -198,7 +198,7 @@ macro_rules! mlir_affine_expression_operator_impls {
             type Output = MulAffineExpressionRef<'c, 't>;
 
             fn mul(self, rhs: A) -> Self::Output {
-                MulAffineExpressionRef::new(self, rhs.as_affine_expression_ref())
+                MulAffineExpressionRef::new(self, rhs.as_ref())
             }
         }
     };
@@ -671,9 +671,9 @@ mod tests {
     #[test]
     fn test_add_affine_expression() {
         let context = Context::new();
-        let dimension_0 = context.dimension_affine_expression(0).as_affine_expression_ref();
-        let dimension_1 = context.dimension_affine_expression(1).as_affine_expression_ref();
-        let constant_0 = context.constant_affine_expression(5).as_affine_expression_ref();
+        let dimension_0 = context.dimension_affine_expression(0).as_ref();
+        let dimension_1 = context.dimension_affine_expression(1).as_ref();
+        let constant_0 = context.constant_affine_expression(5).as_ref();
 
         let add_expression_0 = dimension_0 + dimension_1;
         assert_eq!(&context, add_expression_0.context());
@@ -690,8 +690,8 @@ mod tests {
     #[test]
     fn test_mul_affine_expression() {
         let context = Context::new();
-        let dimension_0 = context.dimension_affine_expression(0).as_affine_expression_ref();
-        let constant_0 = context.constant_affine_expression(3).as_affine_expression_ref();
+        let dimension_0 = context.dimension_affine_expression(0).as_ref();
+        let constant_0 = context.constant_affine_expression(3).as_ref();
 
         let mul_expression = dimension_0 * constant_0;
         assert_eq!(&context, mul_expression.context());
@@ -765,7 +765,7 @@ mod tests {
     fn test_affine_expression_casting() {
         let context = Context::new();
         let dimension_0 = context.dimension_affine_expression(0);
-        let dimension_0_erased = dimension_0.as_affine_expression_ref();
+        let dimension_0_erased = dimension_0.as_ref();
         let dimension_0_erased_casted = dimension_0_erased.cast::<DimensionAffineExpressionRef>().unwrap();
         let constant_1 = context.constant_affine_expression(42);
         let symbol_0 = context.symbol_affine_expression(0);

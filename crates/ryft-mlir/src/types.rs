@@ -45,7 +45,7 @@ pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + De
     }
 
     /// Up-casts this type to an instance of [`Type`].
-    fn as_type_ref(&self) -> TypeRef<'c, 't> {
+    fn as_ref(&self) -> TypeRef<'c, 't> {
         unsafe { TypeRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
     }
 
@@ -120,7 +120,7 @@ pub struct TypeAndAttributes<'c, 't, 's> {
 
 impl<'c, 't, T: Type<'c, 't>> From<T> for TypeAndAttributes<'c, 't, '_> {
     fn from(value: T) -> Self {
-        Self { r#type: value.as_type_ref(), attributes: None }
+        Self { r#type: value.as_ref(), attributes: None }
     }
 }
 
@@ -144,7 +144,7 @@ pub(crate) mod tests {
         let rendered_type = r#type.to_string();
 
         // Test upcasting.
-        let r#type = r#type.as_type_ref();
+        let r#type = r#type.as_ref();
         assert!(r#type.is::<T>());
         assert_eq!(r#type.to_string(), rendered_type);
 
@@ -159,7 +159,7 @@ pub(crate) mod tests {
         assert_eq!(r#type.cast::<T>(), None);
 
         // Invalid cast from a generic type reference.
-        let r#type = r#type.as_type_ref();
+        let r#type = r#type.as_ref();
         assert!(!r#type.is::<T>());
         assert_eq!(r#type.cast::<T>(), None);
     }
@@ -203,24 +203,24 @@ pub(crate) mod tests {
         let index_type_1 = context.index_type();
         let i32_type = context.signed_integer_type(32);
         assert_eq!(index_type_0, index_type_0);
-        assert_eq!(index_type_0, index_type_0.as_type_ref());
-        assert_eq!(index_type_0.as_type_ref(), index_type_0);
-        assert_eq!(index_type_0.as_type_ref(), index_type_0.as_type_ref());
-        assert_eq!(index_type_0, index_type_1.as_type_ref());
+        assert_eq!(index_type_0, index_type_0.as_ref());
+        assert_eq!(index_type_0.as_ref(), index_type_0);
+        assert_eq!(index_type_0.as_ref(), index_type_0.as_ref());
+        assert_eq!(index_type_0, index_type_1.as_ref());
         assert_eq!(index_type_1, index_type_1);
         assert_ne!(index_type_0, i32_type);
         assert_ne!(i32_type, index_type_0);
         assert_ne!(index_type_1, i32_type);
-        assert_eq!(i32_type.as_type_ref(), i32_type);
+        assert_eq!(i32_type.as_ref(), i32_type);
     }
 
     #[test]
     fn test_type_parsing() {
         let context = Context::new();
         context.allow_unregistered_dialects();
-        assert_eq!(context.parse_type("index"), Some(context.index_type().as_type_ref()));
-        assert_eq!(context.parse_type("i32"), Some(context.signless_integer_type(32).as_type_ref()));
-        assert_eq!(context.parse_type("f64"), Some(context.float64_type().as_type_ref()));
+        assert_eq!(context.parse_type("index"), Some(context.index_type().as_ref()));
+        assert_eq!(context.parse_type("i32"), Some(context.signless_integer_type(32).as_ref()));
+        assert_eq!(context.parse_type("f64"), Some(context.float64_type().as_ref()));
         assert!(context.parse_type("tensor<3x4xf32>").is_some());
         assert!(context.parse_type("!llvm.ptr").is_some());
         assert!(context.parse_type("invalid_type_xyz").is_none());
@@ -234,8 +234,8 @@ pub(crate) mod tests {
         assert_eq!(type_and_attributes.r#type.to_string(), "index");
         assert!(type_and_attributes.attributes.is_none());
         let type_and_attributes = TypeAndAttributes {
-            r#type: index_type.as_type_ref(),
-            attributes: Some(HashMap::from([("test_attr".into(), context.unit_attribute().as_attribute_ref())])),
+            r#type: index_type.as_ref(),
+            attributes: Some(HashMap::from([("test_attr".into(), context.unit_attribute().as_ref())])),
         };
         assert_eq!(type_and_attributes.clone().r#type.to_string(), "index");
         assert!(type_and_attributes.attributes.is_some());

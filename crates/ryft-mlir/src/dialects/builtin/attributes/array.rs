@@ -127,9 +127,9 @@ mod tests {
 
         // Test array with mixed attribute types.
         let mixed_elements = vec![
-            context.integer_attribute(int_type, 42).as_attribute_ref(),
-            context.string_attribute("test").as_attribute_ref(),
-            context.boolean_attribute(true).as_attribute_ref(),
+            context.integer_attribute(int_type, 42).as_ref(),
+            context.string_attribute("test").as_ref(),
+            context.boolean_attribute(true).as_ref(),
         ];
         let attribute = context.array_attribute(&mixed_elements);
         assert_eq!(attribute.len(), 3);

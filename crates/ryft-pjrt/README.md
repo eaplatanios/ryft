@@ -137,16 +137,16 @@ fn main() {
         - [x] Host Allocator
         - [ ] Phase Compile
 
-## License
+#### License
 
-Licensed under either of:
+<sup>
+Licensed under either <a href="../../LICENSE-APACHE">Apache License, Version 2.0</a>
+or <a href="../../LICENSE-MIT">MIT license</a> at your option.
+</sup>
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](../../LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](../../LICENSE-MIT) or https://opensource.org/licenses/MIT)
+<br>
 
-at your option.
-
-## Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you,
+<sub>
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate by you,
 as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+</sub>

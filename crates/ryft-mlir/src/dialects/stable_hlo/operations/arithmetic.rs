@@ -893,7 +893,7 @@ mod tests {
             let input = block.argument(0).unwrap();
             let op = is_finite(input, location);
             assert_eq!(op.input(), input);
-            assert_eq!(op.output().r#type(), output_tensor_type.as_type_ref());
+            assert_eq!(op.output().r#type(), output_tensor_type.as_ref());
             assert_eq!(op.operands().count(), 1);
             assert_eq!(op.results().count(), 1);
             let op = block.append_operation(op);

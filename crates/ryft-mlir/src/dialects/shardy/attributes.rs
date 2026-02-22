@@ -1214,7 +1214,7 @@ mod tests {
         let context = Context::new();
         let attribute = context
             .opaque_attribute("sdy", "all_to_all_param", context.none_type())
-            .as_attribute_ref()
+            .as_ref()
             .cast::<AllToAllParamAttributeRef>()
             .unwrap();
         assert_eq!(&context, attribute.context());
@@ -1227,7 +1227,7 @@ mod tests {
         let context = Context::new();
         let attribute = context
             .opaque_attribute("sdy", "all_to_all_param_list", context.none_type())
-            .as_attribute_ref()
+            .as_ref()
             .cast::<AllToAllParamListAttributeRef>()
             .unwrap();
         assert_eq!(&context, attribute.context());
@@ -1251,7 +1251,7 @@ mod tests {
         let context = Context::new();
         let attribute = context
             .opaque_attribute("sdy", "axis_ref_list", context.none_type())
-            .as_attribute_ref()
+            .as_ref()
             .cast::<AxisRefListAttributeRef>()
             .unwrap();
         assert_eq!(&context, attribute.context());
@@ -1285,7 +1285,7 @@ mod tests {
         let context = Context::new();
         let attribute = context
             .opaque_attribute("sdy", "list_of_axis_ref_lists", context.none_type())
-            .as_attribute_ref()
+            .as_ref()
             .cast::<ListOfAxisRefListsAttributeRef>()
             .unwrap();
         assert_eq!(&context, attribute.context());
@@ -1388,7 +1388,7 @@ mod tests {
         let dim_sharding = context.shardy_dimension_sharding(&[axis_ref], true, None);
         let attribute = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[axis_ref], &[]);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.mesh_or_ref(), mesh.as_attribute_ref());
+        assert_eq!(attribute.mesh_or_ref(), mesh.as_ref());
         assert_eq!(attribute.dim_shardings(), vec![dim_sharding]);
         assert_eq!(attribute.replicated_axes(), vec![axis_ref]);
         assert!(attribute.unreduced_axes().is_empty());

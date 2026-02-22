@@ -95,7 +95,7 @@ mod tests {
         let rendered_type = r#type.to_string();
 
         // Test upcasting.
-        let r#type = r#type.as_type_ref();
+        let r#type = r#type.as_ref();
         assert!(r#type.is::<NoneTypeRef>());
         assert_eq!(r#type.to_string(), rendered_type);
 
@@ -110,7 +110,7 @@ mod tests {
         assert_eq!(r#type.cast::<NoneTypeRef>(), None);
 
         // Invalid cast from a generic type reference.
-        let r#type = r#type.as_type_ref();
+        let r#type = r#type.as_ref();
         assert!(!r#type.is::<NoneTypeRef>());
         assert_eq!(r#type.cast::<NoneTypeRef>(), None);
     }

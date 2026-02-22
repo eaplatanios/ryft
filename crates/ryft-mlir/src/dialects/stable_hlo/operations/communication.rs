@@ -1453,8 +1453,7 @@ mod tests {
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         module.body().append_operation({
-            let mut block =
-                context.block(&[(tensor_type.as_type_ref(), location), (token_type.as_type_ref(), location)]);
+            let mut block = context.block(&[(tensor_type.as_ref(), location), (token_type.as_ref(), location)]);
             let op = send(
                 &[block.argument(0).unwrap()],
                 block.argument(1).unwrap(),
@@ -1562,8 +1561,7 @@ mod tests {
         let i64_type = context.signless_integer_type(64);
         let tensor_type = context.tensor_type(i64_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
         module.body().append_operation({
-            let mut block =
-                context.block(&[(tensor_type.as_type_ref(), location), (token_type.as_type_ref(), location)]);
+            let mut block = context.block(&[(tensor_type.as_ref(), location), (token_type.as_ref(), location)]);
             let op = outfeed(&[block.argument(0).unwrap()], block.argument(1).unwrap(), "config", location);
             assert_eq!(op.outfeed_config().as_str().unwrap(), "config");
             let op = block.append_operation(op);

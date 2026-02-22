@@ -2224,8 +2224,8 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location);
-        let i1_type = context.signless_integer_type(1).as_type_ref();
-        let f32_type = context.float32_type().as_type_ref();
+        let i1_type = context.signless_integer_type(1).as_ref();
+        let f32_type = context.float32_type().as_ref();
         module.body().append_operation({
             let mut block = context.block(&[(i1_type, location), (f32_type, location), (f32_type, location)]);
             let predicate = block.argument(0).unwrap();

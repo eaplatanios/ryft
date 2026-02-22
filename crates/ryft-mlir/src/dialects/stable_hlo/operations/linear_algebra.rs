@@ -255,8 +255,8 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
         rhs_precision_type: R,
     ) -> Self {
         Self::Any_F8_Any_F8_F32 {
-            lhs_precision_type: lhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
+            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
+            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
         }
     }
 
@@ -266,8 +266,8 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
         rhs_precision_type: R,
     ) -> Self {
         Self::Any_F8_Any_F8_F32_Fast_Accumulation {
-            lhs_precision_type: lhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
+            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
+            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
         }
     }
 
@@ -278,9 +278,9 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
         accumulation_type: T,
     ) -> Self {
         Self::Any_F8_Any_F8_Any {
-            lhs_precision_type: lhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
-            accumulation_type: accumulation_type.as_type_ref().cast::<FloatTypeRef>().unwrap(),
+            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
+            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
+            accumulation_type: accumulation_type.as_ref().cast::<FloatTypeRef>().unwrap(),
         }
     }
 
@@ -291,9 +291,9 @@ impl<'c, 't> DotAlgorithmPreset<'c, 't> {
         accumulation_type: T,
     ) -> Self {
         Self::Any_F8_Any_F8_Any_Fast_Accumulation {
-            lhs_precision_type: lhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
-            rhs_precision_type: rhs_precision_type.as_type_ref().cast::<Float8TypeRef>().unwrap(),
-            accumulation_type: accumulation_type.as_type_ref().cast::<FloatTypeRef>().unwrap(),
+            lhs_precision_type: lhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
+            rhs_precision_type: rhs_precision_type.as_ref().cast::<Float8TypeRef>().unwrap(),
+            accumulation_type: accumulation_type.as_ref().cast::<FloatTypeRef>().unwrap(),
         }
     }
 
@@ -2025,13 +2025,13 @@ mod tests {
     #[test]
     fn test_dot_algorithm_preset() {
         let context = Context::new();
-        let f8e4m3fn_type = context.float8e4m3fn_type().as_type_ref().cast::<Float8TypeRef>().unwrap();
-        let f8e5m2_type = context.float8e5m2_type().as_type_ref().cast::<Float8TypeRef>().unwrap();
-        let f16_type = context.float16_type().as_type_ref().cast::<FloatTypeRef>().unwrap();
-        let f32_type = context.float32_type().as_type_ref().cast::<FloatTypeRef>().unwrap();
-        let f64_type = context.float64_type().as_type_ref().cast::<FloatTypeRef>().unwrap();
-        let bf16_type = context.bfloat16_type().as_type_ref().cast::<FloatTypeRef>().unwrap();
-        let tf32_type = context.floattf32_type().as_type_ref().cast::<FloatTypeRef>().unwrap();
+        let f8e4m3fn_type = context.float8e4m3fn_type().as_ref().cast::<Float8TypeRef>().unwrap();
+        let f8e5m2_type = context.float8e5m2_type().as_ref().cast::<Float8TypeRef>().unwrap();
+        let f16_type = context.float16_type().as_ref().cast::<FloatTypeRef>().unwrap();
+        let f32_type = context.float32_type().as_ref().cast::<FloatTypeRef>().unwrap();
+        let f64_type = context.float64_type().as_ref().cast::<FloatTypeRef>().unwrap();
+        let bf16_type = context.bfloat16_type().as_ref().cast::<FloatTypeRef>().unwrap();
+        let tf32_type = context.floattf32_type().as_ref().cast::<FloatTypeRef>().unwrap();
 
         assert_eq!(context.stable_hlo_dot_algorithm_from_preset(DotAlgorithmPreset::Default), None);
 

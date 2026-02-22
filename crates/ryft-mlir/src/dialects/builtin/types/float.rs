@@ -354,15 +354,15 @@ mod tests {
     #[test]
     fn test_float8_type() {
         let context = Context::new();
-        let r#type = context.float8e4m3fn_type().as_type_ref().cast::<Float8TypeRef>().unwrap();
+        let r#type = context.float8e4m3fn_type().as_ref().cast::<Float8TypeRef>().unwrap();
         assert_eq!(&context, r#type.context());
         assert_eq!(r#type.bit_width(), 8);
-        assert_eq!(context.float16_type().as_type_ref().cast::<Float8TypeRef>(), None);
+        assert_eq!(context.float16_type().as_ref().cast::<Float8TypeRef>(), None);
     }
 
     #[test]
     fn test_float8_type_casting() {
         let context = Context::new();
-        test_type_casting(context.float8e4m3fn_type().as_type_ref().cast::<Float8TypeRef>().unwrap());
+        test_type_casting(context.float8e4m3fn_type().as_ref().cast::<Float8TypeRef>().unwrap());
     }
 }

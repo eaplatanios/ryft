@@ -44,7 +44,7 @@ pub trait Region<'r, 'c: 'r, 't: 'c> {
     fn context(&self) -> &'c Context<'t>;
 
     /// Returns a reference to this [`Region`].
-    fn as_region_ref(&self) -> RegionRef<'r, 'c, 't> {
+    fn as_ref(&self) -> RegionRef<'r, 'c, 't> {
         unsafe { RegionRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
     }
 
@@ -282,7 +282,7 @@ impl<'o, 'c, 't> Eq for RegionRef<'o, 'c, 't> {}
 
 impl<'r, 'c, 't> From<&'r DetachedRegion<'c, 't>> for RegionRef<'r, 'c, 't> {
     fn from(value: &'r DetachedRegion<'c, 't>) -> Self {
-        value.as_region_ref()
+        value.as_ref()
     }
 }
 
@@ -352,7 +352,7 @@ mod tests {
         region_1.append_block(context.block_with_no_arguments());
         assert_eq!(region_0.blocks().count(), 2);
         assert_eq!(region_1.blocks().count(), 1);
-        region_1.take_body(region_0.as_region_ref());
+        region_1.take_body(region_0.as_ref());
         assert_eq!(region_0.blocks().count(), 0);
         assert_eq!(region_1.blocks().count(), 2);
     }
@@ -363,10 +363,10 @@ mod tests {
         let region_0 = context.region();
         let region_1 = context.region();
         assert_eq!(region_0, region_0);
-        assert_eq!(region_0, region_0.as_region_ref());
-        assert_eq!(region_0.as_region_ref().clone(), region_0.as_region_ref());
+        assert_eq!(region_0, region_0.as_ref());
+        assert_eq!(region_0.as_ref().clone(), region_0.as_ref());
         assert_ne!(region_0, region_1);
-        assert_ne!(region_1.as_region_ref(), region_0);
+        assert_ne!(region_1.as_ref(), region_0);
         assert_eq!(RegionRef::from(&region_1), region_1);
     }
 
@@ -375,7 +375,7 @@ mod tests {
         let context = Context::new();
         let region = context.region();
         assert!(format!("{:?}", region).contains("DetachedRegion"));
-        assert!(format!("{:?}", region.as_region_ref()).contains("RegionRef"));
+        assert!(format!("{:?}", region.as_ref()).contains("RegionRef"));
     }
 
     #[test]

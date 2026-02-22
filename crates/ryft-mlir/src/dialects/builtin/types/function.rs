@@ -127,10 +127,10 @@ mod tests {
     #[test]
     fn test_function_type() {
         let context = Context::new();
-        let input_1 = context.index_type().as_type_ref();
-        let input_2 = context.float32_type().as_type_ref();
-        let output_1 = context.signless_integer_type(64).as_type_ref();
-        let output_2 = context.float32_type().as_type_ref();
+        let input_1 = context.index_type().as_ref();
+        let input_2 = context.float32_type().as_ref();
+        let output_1 = context.signless_integer_type(64).as_ref();
+        let output_2 = context.float32_type().as_ref();
 
         // Multiple inputs and single output.
         let r#type = context.function_type(&[input_1, input_2], &[output_1]);
@@ -190,10 +190,10 @@ mod tests {
     #[test]
     fn test_function_type_display_and_debug() {
         let context = Context::new();
-        let input_1 = context.index_type().as_type_ref();
-        let input_2 = context.float32_type().as_type_ref();
-        let output_1 = context.signless_integer_type(64).as_type_ref();
-        let output_2 = context.signless_integer_type(1).as_type_ref();
+        let input_1 = context.index_type().as_ref();
+        let input_2 = context.float32_type().as_ref();
+        let output_1 = context.signless_integer_type(64).as_ref();
+        let output_2 = context.signless_integer_type(1).as_ref();
         let r#type = context.function_type(&[input_1, input_2], &[output_1, output_2]);
         test_type_display_and_debug(r#type, "(index, f32) -> (i64, i1)");
     }
@@ -201,10 +201,10 @@ mod tests {
     #[test]
     fn test_function_type_parsing() {
         let context = Context::new();
-        let input_1 = context.index_type().as_type_ref();
-        let input_2 = context.float32_type().as_type_ref();
-        let output_1 = context.signless_integer_type(64).as_type_ref();
-        let output_2 = context.signless_integer_type(1).as_type_ref();
+        let input_1 = context.index_type().as_ref();
+        let input_2 = context.float32_type().as_ref();
+        let output_1 = context.signless_integer_type(64).as_ref();
+        let output_2 = context.signless_integer_type(1).as_ref();
         assert_eq!(
             context.parse_type("(index, f32) -> (i64, i1)").unwrap(),
             context.function_type(&[input_1, input_2], &[output_1, output_2])
@@ -214,10 +214,10 @@ mod tests {
     #[test]
     fn test_function_type_casting() {
         let context = Context::new();
-        let input_1 = context.index_type().as_type_ref();
-        let input_2 = context.float32_type().as_type_ref();
-        let output_1 = context.signless_integer_type(64).as_type_ref();
-        let output_2 = context.float32_type().as_type_ref();
+        let input_1 = context.index_type().as_ref();
+        let input_2 = context.float32_type().as_ref();
+        let output_1 = context.signless_integer_type(64).as_ref();
+        let output_2 = context.float32_type().as_ref();
         let r#type = context.function_type(&[input_1, input_2], &[output_1, output_2]);
         test_type_casting(r#type);
     }

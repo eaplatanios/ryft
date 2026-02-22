@@ -1438,7 +1438,7 @@ mod tests {
         module.body().append_operation({
             let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
             let composite_attributes =
-                HashMap::from([(StringRef::from("my_op_attribute"), context.unit_attribute().as_attribute_ref())]);
+                HashMap::from([(StringRef::from("my_op_attribute"), context.unit_attribute().as_ref())]);
             let composite_op = composite(
                 "my_namespace.my_op",
                 Some(1),
@@ -1555,7 +1555,7 @@ mod tests {
                 &block.arguments().collect::<Vec<_>>(),
                 "my_custom_op",
                 true,
-                Some(backend_config.as_attribute_ref()),
+                Some(backend_config.as_ref()),
                 CustomCallApiVersion::StatusReturning,
                 &[context.flat_symbol_ref_attribute("add_0"), context.flat_symbol_ref_attribute("add_1")],
                 Some(CustomCallMemoryLayouts { operands: vec![vec![0, 1], vec![1, 0]], results: vec![vec![1, 0]] }),

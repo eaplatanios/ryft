@@ -812,11 +812,8 @@ mod tests {
                 "all_gather_test",
                 func::FuncAttributes {
                     arguments: vec![TypeAndAttributes {
-                        r#type: tensor_type.as_type_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("sdy.sharding"),
-                            tensor_sharding.as_attribute_ref(),
-                        )])),
+                        r#type: tensor_type.as_ref(),
+                        attributes: Some(HashMap::from([(StringRef::from("sdy.sharding"), tensor_sharding.as_ref())])),
                     }],
                     results: vec![tensor_type.into()],
                     ..Default::default()
@@ -939,11 +936,8 @@ mod tests {
                 "all_slice_test",
                 func::FuncAttributes {
                     arguments: vec![TypeAndAttributes {
-                        r#type: tensor_type.as_type_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("sdy.sharding"),
-                            tensor_sharding.as_attribute_ref(),
-                        )])),
+                        r#type: tensor_type.as_ref(),
+                        attributes: Some(HashMap::from([(StringRef::from("sdy.sharding"), tensor_sharding.as_ref())])),
                     }],
                     results: vec![tensor_type.into()],
                     ..Default::default()
@@ -1015,11 +1009,8 @@ mod tests {
                 "all_to_all_test",
                 func::FuncAttributes {
                     arguments: vec![TypeAndAttributes {
-                        r#type: tensor_type.as_type_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("sdy.sharding"),
-                            input_sharding.as_attribute_ref(),
-                        )])),
+                        r#type: tensor_type.as_ref(),
+                        attributes: Some(HashMap::from([(StringRef::from("sdy.sharding"), input_sharding.as_ref())])),
                     }],
                     results: vec![tensor_type.into()],
                     ..Default::default()
@@ -1065,11 +1056,8 @@ mod tests {
                 "collective_permute_test",
                 func::FuncAttributes {
                     arguments: vec![TypeAndAttributes {
-                        r#type: tensor_type.as_type_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("sdy.sharding"),
-                            tensor_sharding.as_attribute_ref(),
-                        )])),
+                        r#type: tensor_type.as_ref(),
+                        attributes: Some(HashMap::from([(StringRef::from("sdy.sharding"), tensor_sharding.as_ref())])),
                     }],
                     results: vec![tensor_type.into()],
                     ..Default::default()
@@ -1219,11 +1207,8 @@ mod tests {
                 "reduce_scatter_test",
                 func::FuncAttributes {
                     arguments: vec![TypeAndAttributes {
-                        r#type: tensor_type.as_type_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("sdy.sharding"),
-                            tensor_sharding.as_attribute_ref(),
-                        )])),
+                        r#type: tensor_type.as_ref(),
+                        attributes: Some(HashMap::from([(StringRef::from("sdy.sharding"), tensor_sharding.as_ref())])),
                     }],
                     results: vec![tensor_type.into()],
                     ..Default::default()
@@ -1291,11 +1276,8 @@ mod tests {
                 "replicated_to_unreduced_test",
                 func::FuncAttributes {
                     arguments: vec![TypeAndAttributes {
-                        r#type: tensor_type.as_type_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("sdy.sharding"),
-                            input_sharding.as_attribute_ref(),
-                        )])),
+                        r#type: tensor_type.as_ref(),
+                        attributes: Some(HashMap::from([(StringRef::from("sdy.sharding"), input_sharding.as_ref())])),
                     }],
                     results: vec![tensor_type.into()],
                     ..Default::default()
@@ -1416,11 +1398,8 @@ mod tests {
                 "sharded_to_unreduced_test",
                 func::FuncAttributes {
                     arguments: vec![TypeAndAttributes {
-                        r#type: tensor_type.as_type_ref(),
-                        attributes: Some(HashMap::from([(
-                            StringRef::from("sdy.sharding"),
-                            tensor_sharding.as_attribute_ref(),
-                        )])),
+                        r#type: tensor_type.as_ref(),
+                        attributes: Some(HashMap::from([(StringRef::from("sdy.sharding"), tensor_sharding.as_ref())])),
                     }],
                     results: vec![tensor_type.into()],
                     ..Default::default()

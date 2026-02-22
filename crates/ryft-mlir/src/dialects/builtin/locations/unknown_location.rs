@@ -104,7 +104,7 @@ mod tests {
         let rendered_location = location.to_string();
 
         // Test upcasting.
-        let location = location.as_location_ref();
+        let location = location.as_ref();
         assert!(location.is::<UnknownLocationRef>());
         assert_eq!(location.to_string(), rendered_location);
 
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(location.cast::<UnknownLocationRef>(), None);
 
         // Invalid cast from a generic location reference.
-        let location = location.as_location_ref();
+        let location = location.as_ref();
         assert!(!location.is::<UnknownLocationRef>());
         assert_eq!(location.cast::<UnknownLocationRef>(), None);
     }

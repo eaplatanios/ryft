@@ -284,7 +284,7 @@ mod tests {
             let input_value = block.argument(0).unwrap();
             let op = round_with_away_from_zero_tie_break(input_value, location);
             assert_eq!(op.input(), input_value);
-            assert_eq!(op.output().r#type(), tensor_type.as_type_ref());
+            assert_eq!(op.output().r#type(), tensor_type.as_ref());
             assert_eq!(op.operands().count(), 1);
             assert_eq!(op.results().count(), 1);
             let op = block.append_operation(op);
@@ -326,7 +326,7 @@ mod tests {
             let input_value = block.argument(0).unwrap();
             let op = round_with_nearest_even_tie_break(input_value, location);
             assert_eq!(op.input(), input_value);
-            assert_eq!(op.output().r#type(), tensor_type.as_type_ref());
+            assert_eq!(op.output().r#type(), tensor_type.as_ref());
             assert_eq!(op.operands().count(), 1);
             assert_eq!(op.results().count(), 1);
             let op = block.append_operation(op);

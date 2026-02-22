@@ -1103,8 +1103,8 @@ pub fn dynamic_update_slice<
     location: L,
 ) -> DetachedDynamicUpdateSliceOperation<'c, 't> {
     location.context().load_dialect(DialectHandle::stable_hlo());
-    let mut operands = vec![operand.as_value_ref(), update.as_value_ref()];
-    operands.extend(start_indices.iter().map(|v| v.as_value_ref()));
+    let mut operands = vec![operand.as_ref(), update.as_ref()];
+    operands.extend(start_indices.iter().map(|v| v.as_ref()));
     OperationBuilder::new("stablehlo.dynamic_update_slice", location)
         .add_operands(&operands)
         .enable_result_type_inference()

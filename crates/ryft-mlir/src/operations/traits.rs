@@ -364,7 +364,7 @@ pub trait OneResult<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Note that this function is called `output` and not `result` in order to avoid
     /// a name collision with [`Operation::result`].
     fn output(&self) -> ValueRef<'o, 'c, 't> {
-        self.result(0).unwrap().as_value_ref()
+        self.result(0).unwrap().as_ref()
     }
 
     /// Returns the [`Type`] of the single result/output of this [`Operation`].
@@ -576,8 +576,8 @@ mod tests {
     fn test_function() {
         let context = Context::new();
         let location = context.unknown_location();
-        let f32_type = context.float32_type().as_type_ref();
-        let f64_type = context.float64_type().as_type_ref();
+        let f32_type = context.float32_type().as_ref();
+        let f64_type = context.float64_type().as_ref();
         let function = func::func(
             "custom_function",
             func::FuncAttributes {
@@ -585,20 +585,20 @@ mod tests {
                 arguments: vec![
                     f64_type.into(),
                     TypeAndAttributes {
-                        r#type: f64_type.as_type_ref(),
+                        r#type: f64_type.as_ref(),
                         attributes: Some(HashMap::from([
-                            ("custom.4".into(), context.unit_attribute().as_attribute_ref()),
-                            ("custom.2".into(), context.string_attribute("are").as_attribute_ref()),
+                            ("custom.4".into(), context.unit_attribute().as_ref()),
+                            ("custom.2".into(), context.string_attribute("are").as_ref()),
                         ])),
                     },
                     f64_type.into(),
                 ],
                 results: vec![
                     TypeAndAttributes {
-                        r#type: f64_type.as_type_ref(),
+                        r#type: f64_type.as_ref(),
                         attributes: Some(HashMap::from([(
                             "custom.yes".into(),
-                            context.boolean_attribute(false).as_attribute_ref(),
+                            context.boolean_attribute(false).as_ref(),
                         )])),
                     },
                     f32_type.into(),
@@ -606,8 +606,8 @@ mod tests {
                 no_inline: true,
                 llvm_emit_c_interface: true,
                 other_attributes: HashMap::from([
-                    ("custom.custom_1", context.unit_attribute().as_attribute_ref()),
-                    ("custom.custom_2", context.string_attribute("42").as_attribute_ref()),
+                    ("custom.custom_1", context.unit_attribute().as_ref()),
+                    ("custom.custom_2", context.string_attribute("42").as_ref()),
                 ]),
             },
             context.region(),
@@ -634,10 +634,10 @@ mod tests {
             vec![
                 TypeAndAttributes::from(f64_type),
                 TypeAndAttributes {
-                    r#type: f64_type.as_type_ref(),
+                    r#type: f64_type.as_ref(),
                     attributes: Some(HashMap::from([
-                        ("custom.4".into(), context.unit_attribute().as_attribute_ref()),
-                        ("custom.2".into(), context.string_attribute("are").as_attribute_ref()),
+                        ("custom.4".into(), context.unit_attribute().as_ref()),
+                        ("custom.2".into(), context.string_attribute("are").as_ref()),
                     ])),
                 },
                 TypeAndAttributes::from(f64_type),
@@ -647,11 +647,10 @@ mod tests {
             function.function_result_types_and_attributes(),
             vec![
                 TypeAndAttributes {
-                    r#type: f64_type.as_type_ref(),
-                    attributes: Some(HashMap::from([(
-                        "custom.yes".into(),
-                        context.boolean_attribute(false).as_attribute_ref(),
-                    )])),
+                    r#type: f64_type.as_ref(),
+                    attributes: Some(HashMap::from([
+                        ("custom.yes".into(), context.boolean_attribute(false).as_ref(),)
+                    ])),
                 },
                 TypeAndAttributes::from(f32_type),
             ],

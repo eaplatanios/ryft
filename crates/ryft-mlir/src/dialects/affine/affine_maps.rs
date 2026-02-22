@@ -364,8 +364,8 @@ mod tests {
         let dimension_0 = context.dimension_affine_expression(0);
         let dimension_1 = context.dimension_affine_expression(1);
         let constant_0 = context.constant_affine_expression(2);
-        let expression_0 = (dimension_0 + dimension_1).as_affine_expression_ref();
-        let expression_1 = (dimension_0 * constant_0).as_affine_expression_ref();
+        let expression_0 = (dimension_0 + dimension_1).as_ref();
+        let expression_1 = (dimension_0 * constant_0).as_ref();
 
         let map = context.affine_map(0, 0, &[constant_0]);
         assert_eq!(&context, map.context());
@@ -393,8 +393,8 @@ mod tests {
         let context = Context::new();
         let dimension_0 = context.dimension_affine_expression(0);
         let dimension_1 = context.dimension_affine_expression(1);
-        let result_0 = (dimension_0 + dimension_1).as_affine_expression_ref();
-        let result_1 = dimension_0.as_affine_expression_ref();
+        let result_0 = (dimension_0 + dimension_1).as_ref();
+        let result_1 = dimension_0.as_ref();
         let map = context.affine_map(2, 0, &[result_0, result_1]);
         assert_eq!(map.result(0), result_0);
         assert_eq!(map.result(1), result_1);
@@ -505,10 +505,10 @@ mod tests {
     #[test]
     fn test_affine_map_sub_map() {
         let context = Context::new();
-        let dimension_0 = context.dimension_affine_expression(0).as_affine_expression_ref();
-        let dimension_1 = context.dimension_affine_expression(1).as_affine_expression_ref();
-        let constant_0 = context.constant_affine_expression(2).as_affine_expression_ref();
-        let expression = (dimension_0 * constant_0).as_affine_expression_ref();
+        let dimension_0 = context.dimension_affine_expression(0).as_ref();
+        let dimension_1 = context.dimension_affine_expression(1).as_ref();
+        let constant_0 = context.constant_affine_expression(2).as_ref();
+        let expression = (dimension_0 * constant_0).as_ref();
         let map = context.affine_map(2, 0, &[dimension_0, dimension_1, expression]);
         let sub_map = map.sub_map(2, &[0, 2]);
         assert_eq!(sub_map.result_count(), 2);
@@ -569,8 +569,8 @@ mod tests {
         let dimension_0 = context.dimension_affine_expression(0);
         let dimension_1 = context.dimension_affine_expression(1);
         let constant_0 = context.constant_affine_expression(2);
-        let expression_0 = (dimension_0 + dimension_1).as_affine_expression_ref();
-        let expression_1 = (dimension_0 * constant_0).as_affine_expression_ref();
+        let expression_0 = (dimension_0 + dimension_1).as_ref();
+        let expression_1 = (dimension_0 * constant_0).as_ref();
         let map = context.affine_map(2, 1, &[expression_0, expression_1]);
 
         // We are just checking that [`AffineMap::dump`] runs successfully without crashing.
@@ -585,8 +585,8 @@ mod tests {
         let dimension_1 = context.dimension_affine_expression(1);
         let constant_0 = context.constant_affine_expression(2);
         let symbol_0 = context.symbol_affine_expression(0);
-        let expression_0 = (dimension_0 + dimension_1).as_affine_expression_ref();
-        let expression_1 = (dimension_0 * constant_0).as_affine_expression_ref();
+        let expression_0 = (dimension_0 + dimension_1).as_ref();
+        let expression_1 = (dimension_0 * constant_0).as_ref();
         let map_0 = context.affine_map(4, 2, &[expression_0, expression_1]);
         let map_1 = context.affine_map(2, 4, &[symbol_0 * constant_0]);
         let maps = [&map_0, &map_1];

@@ -850,7 +850,7 @@ macro_rules! mlir_binary_op {
                 context.load_dialect($crate::DialectHandle::$dialect());
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
-                    .add_operands(&[lhs.as_value_ref(), rhs.as_value_ref()])
+                    .add_operands(&[lhs.as_ref(), rhs.as_ref()])
                     .enable_result_type_inference()
                     .build()
                     .and_then(|operation| unsafe { $crate::DetachedOp::cast(operation) })

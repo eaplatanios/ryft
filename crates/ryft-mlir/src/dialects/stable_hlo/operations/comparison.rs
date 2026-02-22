@@ -107,7 +107,7 @@ pub trait CompareOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the [`ComparisonDirection`] of this [`CompareOperation`].
     fn comparison_direction(&self) -> ComparisonDirection {
-        self.as_operation_ref()
+        self.as_ref()
             .attribute(COMPARISON_DIRECTION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ComparisonDirectionAttributeRef>())
             .map(|attribute| attribute.value())
@@ -116,7 +116,7 @@ pub trait CompareOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the [`ComparisonType`] of this [`CompareOperation`].
     fn comparison_type(&self) -> ComparisonType {
-        self.as_operation_ref()
+        self.as_ref()
             .attribute(COMPARISON_TYPE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ComparisonTypeAttributeRef>())
             .map(|attribute| attribute.value())

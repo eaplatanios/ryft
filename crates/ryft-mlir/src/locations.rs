@@ -58,7 +58,7 @@ pub trait Location<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display 
     }
 
     /// Up-casts this [`Location`] to an instance of [`LocationRef`].
-    fn as_location_ref(&self) -> LocationRef<'c, 't> {
+    fn as_ref(&self) -> LocationRef<'c, 't> {
         unsafe { LocationRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
     }
 
@@ -119,7 +119,7 @@ pub(crate) mod tests {
         let rendered_location = location.to_string();
 
         // Test upcasting.
-        let location = location.as_location_ref();
+        let location = location.as_ref();
         assert!(location.is::<L>());
         assert_eq!(location.to_string(), rendered_location);
 
@@ -134,7 +134,7 @@ pub(crate) mod tests {
         assert_eq!(location.cast::<L>(), None);
 
         // Invalid cast from a generic location reference.
-        let location = location.as_location_ref();
+        let location = location.as_ref();
         assert!(!location.is::<L>());
         assert_eq!(location.cast::<L>(), None);
     }
@@ -147,8 +147,8 @@ pub(crate) mod tests {
         let location_2 = context.file_location("foo", 1, 1);
         assert_eq!(location_0.context(), &context);
         assert_eq!(location_0, location_1);
-        assert_ne!(location_0.as_location_ref(), location_2.as_location_ref());
-        assert_ne!(location_1.as_location_ref(), location_2);
+        assert_ne!(location_0.as_ref(), location_2.as_ref());
+        assert_ne!(location_1.as_ref(), location_2);
         assert_eq!(format!("{location_0}").as_str(), "loc(unknown)");
         assert_eq!(format!("{location_0:?}").as_str(), "UnknownLocationRef[loc(unknown)]");
         location_0.emit_error("dummy error");

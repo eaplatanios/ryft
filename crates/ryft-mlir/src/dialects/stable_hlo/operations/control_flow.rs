@@ -471,7 +471,7 @@ mod tests {
                 stable_hlo::ComparisonType::Signed,
                 location,
             ));
-            let cond_result = compare_op.result(0).unwrap().as_value_ref();
+            let cond_result = compare_op.result(0).unwrap().as_ref();
             condition_block.append_operation(stable_hlo::r#return(&[cond_result], location));
             condition_region.append_block(condition_block);
 
@@ -482,7 +482,7 @@ mod tests {
                 context.dense_i64_elements_attribute(counter_type, &[1]).unwrap(),
                 location,
             ));
-            let one_value = one_value_op.result(0).unwrap().as_value_ref();
+            let one_value = one_value_op.result(0).unwrap().as_ref();
             let new_i_op =
                 body_block.append_operation(stable_hlo::add(body_block.argument(0).unwrap(), one_value, location));
             let new_i = new_i_op.result(0).unwrap();

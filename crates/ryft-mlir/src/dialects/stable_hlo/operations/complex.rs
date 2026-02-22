@@ -251,7 +251,7 @@ mod tests {
             let input_value = block.argument(0).unwrap();
             let real_op = real(input_value, location);
             assert_eq!(real_op.input(), input_value);
-            assert_eq!(real_op.output().r#type(), output_tensor_type.as_type_ref());
+            assert_eq!(real_op.output().r#type(), output_tensor_type.as_ref());
             assert_eq!(real_op.operands().count(), 1);
             assert_eq!(real_op.results().count(), 1);
             let real_block = block.append_operation(real_op);

@@ -90,7 +90,7 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
         if handle.ptr.is_null() {
             None
         } else {
-            Some(Self { handle: RefCell::new(handle), operation: operation.as_operation_ref() })
+            Some(Self { handle: RefCell::new(handle), operation: operation.as_ref() })
         }
     }
 

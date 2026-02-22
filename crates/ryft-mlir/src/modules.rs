@@ -248,7 +248,7 @@ mod tests {
         context.load_dialect(DialectHandle::func());
         let module = context.module(context.file_location("foo", 42, 42));
         assert_eq!(module.as_operation().body_region().blocks().next(), Some(module.body()));
-        assert_eq!(module.as_operation(), module.as_operation().as_operation_ref());
+        assert_eq!(module.as_operation(), module.as_operation().as_ref());
     }
 
     #[test]

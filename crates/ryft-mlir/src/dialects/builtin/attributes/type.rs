@@ -85,19 +85,19 @@ mod tests {
         let index_type = context.index_type();
         let attribute = context.type_attribute(index_type);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.r#type(), index_type.as_type_ref());
+        assert_eq!(attribute.r#type(), index_type.as_ref());
 
         // Test with integer type.
         let i64_type = context.signless_integer_type(64);
         let attribute = context.type_attribute(i64_type);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.r#type(), i64_type.as_type_ref());
+        assert_eq!(attribute.r#type(), i64_type.as_ref());
 
         // Test with float type.
         let f32_type = context.float32_type();
         let attribute = context.type_attribute(f32_type);
         assert_eq!(&context, attribute.context());
-        assert_eq!(attribute.r#type(), f32_type.as_type_ref());
+        assert_eq!(attribute.r#type(), f32_type.as_ref());
     }
 
     #[test]

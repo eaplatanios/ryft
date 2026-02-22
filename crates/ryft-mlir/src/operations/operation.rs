@@ -70,7 +70,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     fn context(&self) -> &'c Context<'t>;
 
     /// Returns an [`OperationRef`] that references this [`Operation`].
-    fn as_operation_ref(&self) -> OperationRef<'o, 'c, 't> {
+    fn as_ref(&self) -> OperationRef<'o, 'c, 't> {
         unsafe { OperationRef::from_c_api(self.to_c_api(), self.context()).unwrap() }
     }
 
@@ -1213,9 +1213,9 @@ mod tests {
         let mut op = func::func("test_func", func::FuncAttributes::default(), block.into(), location);
         assert!(op.inherent_attribute_count() > 0);
         assert!(op.has_inherent_attribute("sym_name"));
-        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("test_func").as_attribute_ref()));
+        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("test_func").as_ref()));
         op.set_inherent_attribute("sym_name", context.string_attribute("modified"));
-        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("modified").as_attribute_ref()));
+        assert_eq!(op.inherent_attribute("sym_name"), Some(context.string_attribute("modified").as_ref()));
     }
 
     #[test]
@@ -1233,7 +1233,7 @@ mod tests {
         op.set_discardable_attribute("custom", context.string_attribute("value"));
         assert_eq!(op.discardable_attribute_count(), 1);
         assert!(op.has_discardable_attribute("custom"));
-        assert_eq!(op.discardable_attribute("custom"), Some(context.string_attribute("value").as_attribute_ref()));
+        assert_eq!(op.discardable_attribute("custom"), Some(context.string_attribute("value").as_ref()));
         let attributes = op.discardable_attributes().collect::<Vec<_>>();
         assert_eq!(attributes.len(), 1);
         assert_eq!(attributes[0].name(), context.identifier("custom"));
@@ -1277,7 +1277,7 @@ mod tests {
         let context = Context::new();
         context.allow_unregistered_dialects();
         let location = context.unknown_location();
-        let index_type = context.index_type().as_type_ref();
+        let index_type = context.index_type().as_ref();
 
         // Operation with no operands.
         let op = OperationBuilder::new("foo", location).build().unwrap();
@@ -1285,7 +1285,7 @@ mod tests {
 
         // Operation with three operands.
         let block = context.block(&[(index_type, location)]);
-        let argument_0 = block.argument(0).unwrap().as_value_ref();
+        let argument_0 = block.argument(0).unwrap().as_ref();
         let op = OperationBuilder::new("foo", context.unknown_location())
             .add_operand(argument_0)
             .add_operand(argument_0)
@@ -1304,17 +1304,17 @@ mod tests {
         assert_eq!(op.operand_types().collect::<Vec<_>>(), vec![index_type, index_type, index_type]);
 
         // Try replacing an operand of an operation.
-        let i32_type = context.signless_integer_type(32).as_type_ref();
-        let i64_type = context.signless_integer_type(64).as_type_ref();
+        let i32_type = context.signless_integer_type(32).as_ref();
+        let i64_type = context.signless_integer_type(64).as_ref();
         let mut block = context.block(&[(i32_type, location), (i64_type, location)]);
         let mut op = block.append_operation(op);
-        let argument_1 = block.argument(0).unwrap().as_value_ref();
+        let argument_1 = block.argument(0).unwrap().as_ref();
         assert!(unsafe { op.replace_operand(0, argument_1) });
         assert_eq!(op.operand(0).unwrap(), argument_1);
         assert!(unsafe { !op.replace_operand(10, argument_0) });
 
         // Try replacing all operands of an operation.
-        let argument_2 = block.argument(1).unwrap().as_value_ref();
+        let argument_2 = block.argument(1).unwrap().as_ref();
         assert!(unsafe { op.replace_operands(&[argument_1, argument_2, argument_0]) });
         assert_eq!(op.operand(0), Some(argument_1));
         assert_eq!(op.operand(1), Some(argument_2));
@@ -1404,7 +1404,7 @@ mod tests {
         assert!(op.parent_block().is_none());
         let mut block = context.block_with_no_arguments();
         let op = block.append_operation(op);
-        assert_eq!(op.parent_block(), Some(block.as_block_ref()));
+        assert_eq!(op.parent_block(), Some(block.as_ref()));
     }
 
     #[test]
@@ -1687,8 +1687,8 @@ mod tests {
         let location = context.unknown_location();
         let op_0 = OperationBuilder::new("test.op", location).build().unwrap();
         let op_1 = OperationBuilder::new("test.op", location).build().unwrap();
-        let op_0_ref = op_0.as_operation_ref();
-        let op_1_ref = op_1.as_operation_ref();
+        let op_0_ref = op_0.as_ref();
+        let op_1_ref = op_1.as_ref();
         assert_eq!(op_0, op_0_ref);
         assert_ne!(op_0, op_1_ref);
 
@@ -1717,8 +1717,8 @@ mod tests {
         let op = OperationBuilder::new("foo", location).build().unwrap();
         assert_eq!(format!("{}", op), "\"foo\"() : () -> ()\n");
         assert_eq!(format!("{:?}", op), "DetachedOperation[\"foo\"() : () -> ()\n]");
-        assert_eq!(format!("{}", op.as_operation_ref()), "\"foo\"() : () -> ()\n");
-        assert_eq!(format!("{:?}", op.as_operation_ref()), "OperationRef[\"foo\"() : () -> ()\n]");
+        assert_eq!(format!("{}", op.as_ref()), "\"foo\"() : () -> ()\n");
+        assert_eq!(format!("{:?}", op.as_ref()), "OperationRef[\"foo\"() : () -> ()\n]");
     }
 
     #[test]
@@ -1732,7 +1732,7 @@ mod tests {
         let op = unsafe { op.cast::<DetachedOperation>() };
         assert!(op.is_some());
         let op = op.unwrap();
-        let op_ref = unsafe { op.as_operation_ref().cast::<OperationRef>() };
+        let op_ref = unsafe { op.as_ref().cast::<OperationRef>() };
         assert!(op_ref.is_some());
         assert_eq!(op_ref.unwrap().name(), op.name());
     }

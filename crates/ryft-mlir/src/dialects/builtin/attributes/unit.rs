@@ -114,7 +114,7 @@ mod tests {
         let rendered_attribute = attribute.to_string();
 
         // Test upcasting.
-        let attribute = attribute.as_attribute_ref();
+        let attribute = attribute.as_ref();
         assert!(attribute.is::<UnitAttributeRef>());
         assert_eq!(attribute.to_string(), rendered_attribute);
 
@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(attribute.cast::<UnitAttributeRef>(), None);
 
         // Invalid cast from a generic attribute reference.
-        let attribute = attribute.as_attribute_ref();
+        let attribute = attribute.as_ref();
         assert!(!attribute.is::<UnitAttributeRef>());
         assert_eq!(attribute.cast::<UnitAttributeRef>(), None);
     }

@@ -190,8 +190,8 @@ mod tests {
             let arg_1 = block.argument(1).unwrap();
             let inner_tuple_op = tuple(&[arg_1], location);
             let inner_tuple_block = block.append_operation(inner_tuple_op);
-            let inner_tuple_value = inner_tuple_block.result(0).unwrap().as_value_ref();
-            let outer_tuple_op = tuple(&[arg_0.as_value_ref(), inner_tuple_value], location);
+            let inner_tuple_value = inner_tuple_block.result(0).unwrap().as_ref();
+            let outer_tuple_op = tuple(&[arg_0.as_ref(), inner_tuple_value], location);
             let outer_tuple_block = block.append_operation(outer_tuple_op);
             let outer_tuple_result = outer_tuple_block.result(0).unwrap();
             let get_element_op = get_tuple_element(outer_tuple_result, 0, location);

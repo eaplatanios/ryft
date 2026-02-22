@@ -103,7 +103,7 @@ impl<'c, 't, A: Attribute<'c, 't>> From<DictionaryAttributeRef<'c, 't>> for Hash
     fn from(value: DictionaryAttributeRef<'c, 't>) -> Self {
         value
             .elements()
-            .map(|element| (element.name().as_string_ref(), element.attribute().cast().unwrap()))
+            .map(|element| (element.name().as_ref(), element.attribute().cast().unwrap()))
             .collect()
     }
 }

@@ -435,7 +435,7 @@ mod tests {
                 location,
             );
             let multiply_op = computation_block.append_operation(multiply_op);
-            let multiply_result = multiply_op.result(0).unwrap().as_value_ref();
+            let multiply_result = multiply_op.result(0).unwrap().as_ref();
             computation_block.append_operation(stable_hlo::r#return(&[multiply_result], location));
             computation_region.append_block(computation_block);
             let map_op = map(

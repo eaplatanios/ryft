@@ -244,14 +244,8 @@ mod tests {
         let dimension_0 = context.dimension_affine_expression(0);
         let constant_0 = context.constant_affine_expression(5);
         let constant_1 = context.constant_affine_expression(-10);
-        let constraint_0 = IntegerSetConstraint {
-            expression: (dimension_0 + constant_0).as_affine_expression_ref(),
-            is_equality: false,
-        };
-        let constraint_1 = IntegerSetConstraint {
-            expression: (dimension_0 + constant_1).as_affine_expression_ref(),
-            is_equality: false,
-        };
+        let constraint_0 = IntegerSetConstraint { expression: (dimension_0 + constant_0).as_ref(), is_equality: false };
+        let constraint_1 = IntegerSetConstraint { expression: (dimension_0 + constant_1).as_ref(), is_equality: false };
         let set = context.integer_set(1, 0, &[&constraint_0, &constraint_1]);
         assert_eq!(&context, set.context());
         assert_eq!(set.dimension_count(), 1);
@@ -266,10 +260,7 @@ mod tests {
         let context = Context::new();
         let dimension_0 = context.dimension_affine_expression(0);
         let constant_0 = context.constant_affine_expression(-5);
-        let constraint = IntegerSetConstraint {
-            expression: (dimension_0 + constant_0).as_affine_expression_ref(),
-            is_equality: true,
-        };
+        let constraint = IntegerSetConstraint { expression: (dimension_0 + constant_0).as_ref(), is_equality: true };
         let set = context.integer_set(1, 0, &[&constraint]);
         assert_eq!(set.equality_constraint_count(), 1);
         assert_eq!(set.inequality_constraint_count(), 0);
@@ -284,14 +275,8 @@ mod tests {
         let dimension_0 = context.dimension_affine_expression(0);
         let constant_0 = context.constant_affine_expression(-5);
         let constant_1 = context.constant_affine_expression(-10);
-        let constraint_0 = IntegerSetConstraint {
-            expression: (dimension_0 + constant_0).as_affine_expression_ref(),
-            is_equality: true,
-        };
-        let constraint_1 = IntegerSetConstraint {
-            expression: (dimension_0 + constant_1).as_affine_expression_ref(),
-            is_equality: false,
-        };
+        let constraint_0 = IntegerSetConstraint { expression: (dimension_0 + constant_0).as_ref(), is_equality: true };
+        let constraint_1 = IntegerSetConstraint { expression: (dimension_0 + constant_1).as_ref(), is_equality: false };
         let set = context.integer_set(1, 0, &[&constraint_0, &constraint_1]);
         let constraints = set.constraints().collect::<Vec<_>>();
         assert_eq!(constraints.len(), 2);
@@ -315,8 +300,7 @@ mod tests {
         let dim0 = context.dimension_affine_expression(0);
 
         let const_neg5 = context.constant_affine_expression(-5);
-        let constraint_expr =
-            (dim0.as_affine_expression_ref() + const_neg5.as_affine_expression_ref()).as_affine_expression_ref();
+        let constraint_expr = (dim0.as_ref() + const_neg5.as_ref()).as_ref();
         let constraint = IntegerSetConstraint { expression: constraint_expr.cast().unwrap(), is_equality: true };
 
         // Same sets from the same context must be equal (if they're uniqued)
@@ -328,9 +312,7 @@ mod tests {
         let other_context = Context::new();
         let other_dim0 = other_context.dimension_affine_expression(0);
         let other_const_neg5 = other_context.constant_affine_expression(-5);
-        let other_constraint_expr = (other_dim0.as_affine_expression_ref()
-            + other_const_neg5.as_affine_expression_ref())
-        .as_affine_expression_ref();
+        let other_constraint_expr = (other_dim0.as_ref() + other_const_neg5.as_ref()).as_ref();
         let other_constraint =
             IntegerSetConstraint { expression: other_constraint_expr.cast().unwrap(), is_equality: true };
         let set3 = other_context.integer_set(1, 0, &[&other_constraint]);
@@ -347,19 +329,12 @@ mod tests {
         let constant_2 = context.constant_affine_expression(3);
         let symbol_0 = context.symbol_affine_expression(0);
         let constraint = IntegerSetConstraint {
-            expression: ((dimension_0 + dimension_1) + constant_0).as_affine_expression_ref(),
+            expression: ((dimension_0 + dimension_1) + constant_0).as_ref(),
             is_equality: false,
         };
         let set = context.integer_set(2, 0, &[&constraint]);
-        let replaced_set = set.replace(
-            &[
-                (dimension_0 * constant_1).as_affine_expression_ref(),
-                (dimension_1 * constant_2).as_affine_expression_ref(),
-            ],
-            &[symbol_0],
-            2,
-            1,
-        );
+        let replaced_set =
+            set.replace(&[(dimension_0 * constant_1).as_ref(), (dimension_1 * constant_2).as_ref()], &[symbol_0], 2, 1);
         assert_eq!(replaced_set.dimension_count(), 2);
         assert_eq!(replaced_set.symbol_count(), 1);
         assert_eq!(replaced_set.constraint_count(), 1);
@@ -379,14 +354,8 @@ mod tests {
         let dimension_0 = context.dimension_affine_expression(0);
         let constant_0 = context.constant_affine_expression(5);
         let constant_1 = context.constant_affine_expression(-10);
-        let constraint_0 = IntegerSetConstraint {
-            expression: (dimension_0 + constant_0).as_affine_expression_ref(),
-            is_equality: false,
-        };
-        let constraint_1 = IntegerSetConstraint {
-            expression: (dimension_0 + constant_1).as_affine_expression_ref(),
-            is_equality: false,
-        };
+        let constraint_0 = IntegerSetConstraint { expression: (dimension_0 + constant_0).as_ref(), is_equality: false };
+        let constraint_1 = IntegerSetConstraint { expression: (dimension_0 + constant_1).as_ref(), is_equality: false };
         let set = context.integer_set(1, 0, &[&constraint_0, &constraint_1]);
 
         // We are just checking that [`IntegerSet::dump`] runs successfully without crashing.
