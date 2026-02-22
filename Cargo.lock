@@ -364,6 +364,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1600,6 +1606,38 @@ name = "rustversion"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a0d197bd2c9dc6e53b84da9556a69ba4cdfab8619eb41a8bd1cc2027a0f6b1d"
+
+[[package]]
+name = "ryft"
+version = "0.0.1"
+dependencies = [
+ "ryft-core",
+ "ryft-macros",
+ "ryft-mlir",
+ "ryft-pjrt",
+]
+
+[[package]]
+name = "ryft-core"
+version = "0.0.1"
+dependencies = [
+ "dyn-clone",
+ "half",
+ "paste",
+ "ryft-macros",
+ "ryft-mlir",
+ "ryft-pjrt",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ryft-macros"
+version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "ryft-mlir"

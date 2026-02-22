@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ryft",
+    "crates/ryft-core",
+    "crates/ryft-macros",
     "crates/ryft-mlir",
     "crates/ryft-pjrt",
     "crates/ryft-xla-sys",
@@ -21,6 +24,8 @@ include = [
 ]
 
 [workspace.dependencies]
+ryft-core = { path = "crates/ryft-core", version = "0.0.1", default-features = false }
+ryft-macros = { path = "crates/ryft-macros", version = "0.0.1", default-features = false }
 ryft-mlir = { path = "crates/ryft-mlir", version = "0.0.1", default-features = false }
 ryft-pjrt = { path = "crates/ryft-pjrt", version = "0.0.1", default-features = false }
 ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.1", default-features = false }

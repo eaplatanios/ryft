@@ -1,0 +1,46 @@
+[package]
+name = "ryft"
+version = "0.0.1"
+readme = "../../README.md"
+description = "A Framework for Tracing, Automatic Differentiation, and Just-In-Time Compilation"
+keywords = ["ryft", "tracing", "autodiff", "compiler", "machine-learning"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "../../README.md",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[package.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+    { file = "CHANGELOG.md", search = "Release Date", replace = "{{date}}", min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n", exactly = 1 },
+]
+
+[dependencies]
+ryft-core.workspace = true
+ryft-macros.workspace = true
+ryft-mlir = { workspace = true, optional = true }
+ryft-pjrt = { workspace = true, optional = true }
+
+[features]
+default = ["xla"]
+xla = ["ryft-mlir", "ryft-pjrt", "ryft-core/xla"]
+cuda-12 = ["ryft-core/cuda-12"]
+cuda-13 = ["ryft-core/cuda-13"]
+rocm-7 = ["ryft-core/rocm-7"]
+tpu = ["ryft-core/tpu"]
+neuron = ["ryft-core/neuron"]
+metal = ["ryft-core/metal"]

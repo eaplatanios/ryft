@@ -1,0 +1,48 @@
+error: Found more than one generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute.
+ --> tests/parameters/error_structs.rs:4:36
+  |
+4 | struct StructWithMultipleParameters<P: Parameter, V: Parameter> {
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: Identifier '__P' is reserved.
+  --> tests/parameters/error_structs.rs:16:35
+   |
+16 | struct StructWithInvalidTypeParam<__P: Parameter> {
+   |                                   ^^^^^^^^^^^^^^
+
+error: Identifier ''__p' is reserved.
+  --> tests/parameters/error_structs.rs:22:39
+   |
+22 | struct StructWithInvalidLifetimeParam<'__p, P: Parameter> {
+   |                                       ^^^^
+
+error[E0392]: type parameter `P` is never used
+  --> tests/parameters/error_structs.rs:10:38
+   |
+10 | struct StructWithUnusedParameterType<P: Parameter> {
+   |                                      ^ unused type parameter
+   |
+   = help: consider removing `P`, referring to it in a field, or using a marker such as `PhantomData`
+
+error[E0283]: type annotations needed
+  --> tests/parameters/error_structs.rs:10:8
+   |
+10 | struct StructWithUnusedParameterType<P: Parameter> {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot infer type for type parameter `P` declared on the struct `StructWithUnusedParameterType`
+   |
+   = note: cannot satisfy `_: Parameter`
+   = help: the following types implement trait `Parameter`:
+             ArrayType
+             DataType
+             JvpTracer<Value, Tangent>
+             Placeholder
+             Tracer<T, V, O>
+             bool
+             f32
+             f64
+           and $N others
+note: required by a bound in `StructWithUnusedParameterType`
+  --> tests/parameters/error_structs.rs:10:41
+   |
+10 | struct StructWithUnusedParameterType<P: Parameter> {
+   |                                         ^^^^^^^^^ required by this bound in `StructWithUnusedParameterType`

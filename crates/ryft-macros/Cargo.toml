@@ -1,0 +1,37 @@
+[package]
+name = "ryft-macros"
+version = "0.0.1"
+readme = "README.md"
+description = "Ryft procedural macros."
+keywords = ["ryft"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "README.md",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+    { file = "CHANGELOG.md", search = "Release Date", replace = "{{date}}", min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n", exactly = 1 },
+]
+
+[lib]
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+syn.workspace = true
+quote.workspace = true

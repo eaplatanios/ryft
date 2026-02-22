@@ -1,0 +1,63 @@
+error: Found more than one generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute.
+ --> tests/parameters/error_enums.rs:4:32
+  |
+4 | enum EnumWithMultipleParameters<P: Parameter, V: Parameter> {
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: Ryft parameters must be owned. References are not allowed.
+  --> tests/parameters/error_enums.rs:18:51
+   |
+18 |     Variant1 { field0: u32, field1: (u64, (i8, P, &'static P), u64) },
+   |                                                   ^^^^^^^^^^
+
+error[E0425]: cannot find type `P` in this scope
+  --> tests/parameters/error_enums.rs:10:34
+   |
+10 | enum EnumWithUnusedParameterType<P: Parameter> {
+   |                                  ^ not found in this scope
+
+error[E0425]: cannot find type `P` in this scope
+  --> tests/parameters/error_enums.rs:10:34
+   |
+10 | enum EnumWithUnusedParameterType<P: Parameter> {
+   |                                  ^ not found in this scope
+   |
+help: you might be missing a type parameter
+   |
+10 | enum EnumWithUnusedParameterType<P><P: Parameter> {
+   |                                 +++
+
+error[E0392]: type parameter `P` is never used
+  --> tests/parameters/error_enums.rs:10:34
+   |
+10 | enum EnumWithUnusedParameterType<P: Parameter> {
+   |                                  ^ unused type parameter
+   |
+   = help: consider removing `P`, referring to it in a field, or using a marker such as `PhantomData`
+
+error[E0310]: the parameter type `P` may not live long enough
+  --> tests/parameters/error_enums.rs:18:37
+   |
+18 |     Variant1 { field0: u32, field1: (u64, (i8, P, &'static P), u64) },
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                     |
+   |                                     the parameter type `P` must be valid for the static lifetime...
+   |                                     ...so that the reference type `&'static P` does not outlive the data it points at
+   |
+help: consider adding an explicit lifetime bound
+   |
+16 | enum EnumWithVeryNestedParameterReference<P: Parameter + 'static> {
+   |                                                        +++++++++
+
+error[E0282]: type annotations needed
+  --> tests/parameters/error_enums.rs:10:6
+   |
+10 |   enum EnumWithUnusedParameterType<P: Parameter> {
+   |  ______^
+11 | |     Variant0(usize),
+   | |____________^ cannot infer type of the type parameter `P` declared on the enum `EnumWithUnusedParameterType`
+   |
+help: consider specifying the generic argument
+   |
+10 | enum EnumWithUnusedParameterType::<_><P: Parameter> {
+   |                                 +++++
