@@ -139,9 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 > [!NOTE]
-> Note that this is quite low-level and verbose. `ryft::core` will make compiling and executing programs like this a 
-> lot more ergonomic, similar to what JAX accomplishes in Python. Updates on that crate should be coming in the next
-> few weeks or months.
+> This is quite low-level and verbose. `ryft::core` will make compiling and executing programs like this a lot more
+> ergonomic, similar to what JAX accomplishes in Python. Updates on that crate should be coming in the next few weeks
+> or months.
 
 ## Why "Ryft"?
 
@@ -167,5 +167,5 @@ as defined in the Apache-2.0 license, shall be dual licensed as above, without a
 #### Acknowledgements
 
 <sup>
-Thanks to [RunsOn](https://runs-on.com/) for providing our GitHub Actions runners infrastructure.
+Thanks to <a href="https://runs-on.com/">RunsOn</a> for providing our GitHub Actions runners infrastructure.
 </sup>
