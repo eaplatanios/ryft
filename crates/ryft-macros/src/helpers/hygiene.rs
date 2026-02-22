@@ -13,7 +13,7 @@ use quote::quote;
 /// the result is always `()` and thus will be thrown away (except for any functions defined in `impl` blocks, as
 /// discussed earlier).
 ///
-/// # Arguments
+/// # Parameters
 ///
 ///   * `ryft_path` - Optional [`syn::Path`] specifying the path in which the `ryft` library should be imported from.
 ///     This does not generally need to be provided as `ryft` will always be used by default. However, you may want to

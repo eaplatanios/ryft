@@ -71,7 +71,7 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
         // Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure to MLIR
         // internals that we have when working with the MLIR C API.
         BlockArgumentRefIterator {
-            block: &self,
+            block: self,
             current_argument_index: 0,
             argument_count: self.argument_count(),
             _context: self.context().borrow(),
@@ -413,7 +413,7 @@ impl<'b, 'c: 'b, 't: 'c> Block<'b, 'c, 't> for DetachedBlock<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -451,7 +451,7 @@ impl<'c, 't> Display for DetachedBlock<'c, 't> {
 
 impl<'c, 't> Debug for DetachedBlock<'c, 't> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Block[{}]", self.to_string())
+        write!(formatter, "Block[{self}]")
     }
 }
 
@@ -480,7 +480,7 @@ impl<'t> Context<'t> {
                     argument_types.as_ptr() as *const _,
                     argument_locations.as_ptr() as *const _,
                 ),
-                context: &self,
+                context: self,
             }
         }
     }
@@ -562,7 +562,7 @@ impl<'r, 'b: 'r, 'c: 'b, 't: 'c> Block<'b, 'c, 't> for BlockRef<'r, 'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -600,7 +600,7 @@ impl<'r, 'c, 't> Display for BlockRef<'r, 'c, 't> {
 
 impl<'r, 'c, 't> Debug for BlockRef<'r, 'c, 't> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "BlockRef[{}]", self.to_string())
+        write!(formatter, "BlockRef[{self}]")
     }
 }
 

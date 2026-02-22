@@ -137,14 +137,14 @@ impl GenericsHelpers for syn::Generics {
             }
             syn::Type::Infer(_) | syn::Type::Macro(_) | syn::Type::Never(_) => false,
             syn::Type::Paren(type_paren) => self.referenced_by_type(&type_paren.elem),
-            syn::Type::Path(type_path) => self.referenced_by_type_path(&type_path),
+            syn::Type::Path(type_path) => self.referenced_by_type_path(type_path),
             syn::Type::Ptr(type_ptr) => self.referenced_by_type(&type_ptr.elem),
             syn::Type::Reference(type_reference) => self.referenced_by_type(&type_reference.elem),
             syn::Type::Slice(type_slice) => self.referenced_by_type(&type_slice.elem),
             syn::Type::TraitObject(type_trait_object) => {
                 type_trait_object.bounds.iter().any(|bound| self.referenced_by_type_param_bound(bound))
             }
-            syn::Type::Tuple(type_tuple) => type_tuple.elems.iter().any(|elem| self.referenced_by_type(&elem)),
+            syn::Type::Tuple(type_tuple) => type_tuple.elems.iter().any(|elem| self.referenced_by_type(elem)),
             syn::Type::Verbatim(_) => false,
             _ => false,
         }
@@ -372,18 +372,15 @@ impl GenericsHelpers for syn::Generics {
             .cloned()
             .collect::<syn::punctuated::Punctuated<syn::GenericParam, syn::Token![,]>>();
 
-        let where_clause = match &self.where_clause {
-            None => None,
-            Some(where_clause) => Some(syn::WhereClause {
-                where_token: where_clause.where_token.clone(),
-                predicates: where_clause
-                    .predicates
-                    .iter()
-                    .filter(|predicate| !params_to_remove.iter().any(|param| predicate.references_ident(param)))
-                    .cloned()
-                    .collect(),
-            }),
-        };
+        let where_clause = self.where_clause.as_ref().map(|where_clause| syn::WhereClause {
+            where_token: where_clause.where_token,
+            predicates: where_clause
+                .predicates
+                .iter()
+                .filter(|predicate| !params_to_remove.iter().any(|param| predicate.references_ident(param)))
+                .cloned()
+                .collect(),
+        });
 
         syn::Generics { params, where_clause, ..self.clone() }
     }

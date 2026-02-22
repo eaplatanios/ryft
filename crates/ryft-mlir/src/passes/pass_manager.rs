@@ -96,7 +96,7 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
 
     /// Returns a reference to the [`Context`] that is associated with this [`PassManager`].
     pub fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 
     /// Casts this [`PassManager`] to an [`OperationPassManager`].
@@ -195,9 +195,7 @@ impl<'c, 't: 'c> PassManager<'c, 't> {
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow_mut();
         unsafe {
-            let pass_handle = pass.to_c_api();
-            std::mem::forget(pass);
-            mlirPassManagerAddOwnedPass(self.handle, pass_handle);
+            mlirPassManagerAddOwnedPass(self.handle, pass.to_c_api());
         }
     }
 
@@ -230,7 +228,7 @@ impl<'t> Context<'t> {
                     // limited exposure to MLIR internals that we have when working with the MLIR C API.
                     *self.handle.borrow(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -251,7 +249,7 @@ impl<'t> Context<'t> {
                     *self.handle.borrow(),
                     anchor_operation.into().to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -301,7 +299,7 @@ impl<'p, 'c: 'p, 't: 'c> OperationPassManager<'p, 'c, 't> {
 
     /// Returns a reference to the [`Context`] that is associated with this [`OperationPassManager`].
     pub fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 
     /// Nests an [`OperationPassManager`] under this [`OperationPassManager`] and returns it. The nested
@@ -323,9 +321,7 @@ impl<'p, 'c: 'p, 't: 'c> OperationPassManager<'p, 'c, 't> {
         // internals that we have when working with the MLIR C API.
         let _guard = self.context().borrow_mut();
         unsafe {
-            let pass_handle = pass.to_c_api();
-            std::mem::forget(pass);
-            mlirOpPassManagerAddOwnedPass(self.handle, pass_handle);
+            mlirOpPassManagerAddOwnedPass(self.handle, pass.to_c_api());
         }
     }
 
@@ -388,7 +384,7 @@ impl Display for OperationPassManager<'_, '_, '_> {
 
 impl Debug for OperationPassManager<'_, '_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "OperationPassManager[{}]", self.to_string())
+        write!(formatter, "OperationPassManager[{self}]")
     }
 }
 

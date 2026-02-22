@@ -72,7 +72,7 @@ impl<'o, 'c, 't> Diagnostic<'o, 'c, 't> {
 
     /// Returns a reference to the [`Context`] that owns this [`Diagnostic`].
     pub fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 
     /// Returns the [`DiagnosticSeverity`] of this [`Diagnostic`].
@@ -134,7 +134,7 @@ impl<'t> Context<'t> {
     /// Handlers will be automatically dropped when detached from the [`Context`] or when the [`Context`] they are
     /// attached to is dropped.
     ///
-    /// # Arguments
+    /// # Parameters
     ///
     ///   * `handler` - Function that accepts a [`Diagnostic`], which is only guaranteed to be live during the call,
     ///     and returns `true` when it processes the input [`Diagnostic`] completely (meaning that no other handler
@@ -150,8 +150,8 @@ impl<'t> Context<'t> {
         ) -> MlirLogicalResult {
             unsafe {
                 let user_data = user_data as *mut (F, &'c Context<'t>);
-                let (ref mut handler, ref context) = *user_data;
-                LogicalResult::from((*handler)(Diagnostic::from_c_api(diagnostic, *context).unwrap())).to_c_api()
+                let (ref mut handler, context) = *user_data;
+                LogicalResult::from((*handler)(Diagnostic::from_c_api(diagnostic, context).unwrap())).to_c_api()
             }
         }
 

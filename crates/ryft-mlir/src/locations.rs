@@ -47,7 +47,7 @@ pub trait Location<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display 
 
     /// Returns `true` if this [`Location`] is an instance of `L`.
     fn is<L: Location<'c, 't>>(&self) -> bool {
-        Self::cast::<L>(&self).is_some()
+        Self::cast::<L>(self).is_some()
     }
 
     /// Tries to cast this [`Location`] to an instance of `L` (e.g., an instance of
@@ -92,7 +92,7 @@ impl<'c, 't> Location<'c, 't> for LocationRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 

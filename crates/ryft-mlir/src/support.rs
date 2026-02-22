@@ -65,7 +65,7 @@ impl Display for StringRef<'_> {
 
 impl Debug for StringRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StringRef[{}]", self.to_string())
+        write!(f, "StringRef[{self}]")
     }
 }
 
@@ -133,7 +133,7 @@ impl<'p> From<&'p Path> for StringRef<'p> {
 pub unsafe extern "C" fn write_to_formatter_callback(string_ref: MlirStringRef, data: *mut std::ffi::c_void) {
     unsafe {
         let (formatter, result) = &mut *(data as *mut (&mut std::fmt::Formatter, std::fmt::Result));
-        if let Ok(_) = result {
+        if result.is_ok() {
             *result = StringRef::from_c_api(string_ref)
                 .as_str()
                 .map_err(|_| std::fmt::Error)
@@ -154,7 +154,7 @@ pub unsafe extern "C" fn write_to_formatter_callback(string_ref: MlirStringRef, 
 pub unsafe extern "C" fn write_to_string_callback(string_ref: MlirStringRef, data: *mut std::ffi::c_void) {
     unsafe {
         let (string, result) = &mut *(data as *mut (String, Result<(), std::str::Utf8Error>));
-        if let Ok(_) = result {
+        if result.is_ok() {
             *result = StringRef::from_c_api(string_ref).as_str().map(|result| string.push_str(result));
         }
     }
@@ -236,7 +236,7 @@ impl Display for LogicalResult {
 
 impl Debug for LogicalResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LogicalResult[{}]", self.to_string())
+        write!(f, "LogicalResult[{self}]")
     }
 }
 
@@ -301,6 +301,12 @@ impl ThreadPool {
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         unsafe { mlirLlvmThreadPoolDestroy(self.handle) }
+    }
+}
+
+impl Default for ThreadPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

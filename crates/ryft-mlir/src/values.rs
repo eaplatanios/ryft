@@ -54,7 +54,7 @@ pub trait Value<'v, 'c: 'v, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Dis
 
     /// Returns `true` if this [`Value`] is an instance of `V`.
     fn is<V: Value<'v, 'c, 't>>(&self) -> bool {
-        Self::cast::<V>(&self).is_some()
+        Self::cast::<V>(self).is_some()
     }
 
     /// Tries to cast this [`Value`] to an instance of `V` (e.g., an instance of [`OperationResultRef`]).
@@ -224,7 +224,7 @@ impl<'v, 'o: 'v, 'c, 't> Value<'v, 'c, 't> for ValueRef<'o, 'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -275,7 +275,7 @@ impl<'v, 'b: 'v, 'c, 't> Value<'v, 'c, 't> for BlockArgumentRef<'b, 'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -332,7 +332,7 @@ impl<'o, 'c, 't> Value<'o, 'c, 't> for OperationResultRef<'o, 'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 

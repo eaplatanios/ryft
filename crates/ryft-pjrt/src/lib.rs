@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 

@@ -53,12 +53,12 @@ impl UrlWithChecksum {
         // Check if the file already exists and that the checksum matches.
         if path.exists() {
             println!("cargo::warning=Found cached file at '{}', verifying checksum...", path.display());
-            if self.verify_checksum(&path).is_ok() {
+            if self.verify_checksum(path).is_ok() {
                 println!("cargo::warning=Checksum verification succeeded; skipping download.");
                 return Ok(());
             } else {
                 println!("cargo::warning=Checksum verification failed; re-downloading file...");
-                fs::remove_file(&path)?;
+                fs::remove_file(path)?;
             }
         }
 
@@ -416,7 +416,7 @@ impl BuildConfiguration {
     /// Downloads or builds a PJRT plugin for the provided [`Device`] and sets a build-time environment variable
     /// to the path of the resulting shared library such that it can be loaded by `ryft-pjrt`.
     fn configure_pjrt_plugin(&self, device: Device) {
-        let build_configuration = Self { device, ..self.clone() };
+        let build_configuration = Self { device, ..*self };
         let plugin_directory = build_configuration.artifact_directory(Artifact::PjrtPlugin).unwrap();
         let plugin_path = plugin_directory.join(build_configuration.pjrt_plugin_library_file_name());
         println!(
@@ -605,7 +605,7 @@ impl BuildConfiguration {
         };
 
         if let Some(environment_variable) = environment_variable {
-            let path = env::var(environment_variable).ok().map(|path| PathBuf::from(path));
+            let path = env::var(environment_variable).ok().map(PathBuf::from);
             if let Some(path) = path {
                 println!(
                     "cargo:warning=Using the `{artifact_name}` artifact specified \
@@ -658,7 +658,7 @@ impl BuildConfiguration {
     fn build_artifact(&self, artifact: Artifact) -> Result<PathBuf> {
         println!("cargo::warning=Starting `{}` compilation using Bazel...", artifact.name());
 
-        let current_path = PathBuf::from(env::current_dir().with_context(|| "Failed to get the current directory.")?);
+        let current_path = env::current_dir().with_context(|| "Failed to get the current directory.")?;
         let output_path = PathBuf::from(env::var("OUT_DIR").with_context(|| "`OUT_DIR` not set")?);
 
         // Copy the Bazel workspace files to the output directory.
@@ -679,7 +679,7 @@ impl BuildConfiguration {
             let source_file = current_path.join(&file_name);
             let target_file = output_path.join(&file_name);
             let target_directory = target_file.parent().unwrap();
-            if let Err(error) = fs::create_dir_all(&target_directory) {
+            if let Err(error) = fs::create_dir_all(target_directory) {
                 bail!("failed to create {}; {error}", target_directory.display());
             }
             if let Err(error) = fs::copy(&source_file, &target_file) {

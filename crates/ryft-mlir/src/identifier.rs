@@ -73,7 +73,7 @@ impl Display for Identifier<'_, '_> {
 
 impl Debug for Identifier<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Identifier[\"{}\"]", self.to_string())
+        write!(formatter, "Identifier[{self}]")
     }
 }
 
@@ -126,8 +126,8 @@ mod tests {
         let context = Context::new();
         let foo = context.identifier("foo");
         let bar = context.identifier("bar");
-        assert_eq!(format!("{foo:?}"), "Identifier[\"foo\"]".to_string());
-        assert_eq!(format!("{bar:?}"), "Identifier[\"bar\"]".to_string());
+        assert_eq!(format!("{foo:?}"), "Identifier[foo]".to_string());
+        assert_eq!(format!("{bar:?}"), "Identifier[bar]".to_string());
     }
 
     #[test]

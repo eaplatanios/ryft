@@ -1927,7 +1927,7 @@ impl<'c> DmaMappedBuffer<'c> {
                 memory,
                 specification.layout,
             )
-            .map(|buffer| unsafe { std::mem::transmute(buffer) })
+            .map(|buffer| unsafe { std::mem::transmute::<_, Buffer<'c>>(buffer) })
     }
 
     /// Returns the underlying data as a slice of bytes.

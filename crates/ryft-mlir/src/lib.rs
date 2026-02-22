@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 use std::sync::{Mutex, OnceLock};
 
 use ryft_xla_sys::bindings::mlirRegisterAllPasses;
