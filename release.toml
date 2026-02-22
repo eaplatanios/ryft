@@ -1,3 +1,2 @@
-[release]
 pre-release-commit-message = "[Cargo] Release {{version}}."
 tag-message = "Release {{version}}"
