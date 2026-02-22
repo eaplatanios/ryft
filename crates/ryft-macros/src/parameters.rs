@@ -1200,11 +1200,7 @@ impl CodeGenerator {
         ///     the provided [`Field`]s. Note that the owner may be a tuple, a struct, or the variant of an enum. This
         ///     is used to obtain the [`Parameterized`] structure that corresponds to each [`Field`] in the provided
         ///     list by invoking [`Field::member`] to construct the appropriate accessor.
-        fn generate_body(
-            generator: &CodeGenerator,
-            fields: &[Field],
-            structure: Option<TokenStream>,
-        ) -> TokenStream {
+        fn generate_body(generator: &CodeGenerator, fields: &[Field], structure: Option<TokenStream>) -> TokenStream {
             let ryft = &generator.ryft_crate;
             let param_type = &generator.param_type;
 

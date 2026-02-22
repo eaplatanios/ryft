@@ -3315,7 +3315,7 @@ pub struct ProfileOptions {
     /// Device (e.g., GPU or TPU) tracing level:
     ///   - **Level `0`:** Disables device traces.
     ///   - **Level `1`:** Enables device traces.
-    /// 
+    ///
     /// More levels might be defined for specific device types (i.e., backends) for controlling the trace verbosity.
     #[prost(uint32, tag = "3")]
     pub device_tracing_level: u32,

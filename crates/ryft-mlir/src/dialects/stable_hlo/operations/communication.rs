@@ -264,7 +264,9 @@ pub trait HasChannelHandle<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
             .and_then(|attribute| attribute.channel_id())
-            .unwrap_or_else(|| panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation")
+            })
     }
 
     /// Returns the type of the channel that this [`Operation`] transfers data over.
@@ -272,7 +274,9 @@ pub trait HasChannelHandle<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
             .map(|attribute| attribute.channel_type())
-            .unwrap_or_else(|| panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation")
+            })
     }
 }
 
@@ -333,7 +337,9 @@ pub trait SendRecvOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE}' attribute in StableHLO send/receive operation"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE}' attribute in StableHLO send/receive operation")
+            })
     }
 }
 
@@ -742,7 +748,9 @@ pub trait AllGatherOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_GATHER_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| panic!("invalid '{ALL_GATHER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_gather`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{ALL_GATHER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_gather`")
+            })
     }
 }
 
@@ -940,7 +948,9 @@ pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| panic!("invalid '{ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`")
+            })
     }
 
     /// Returns the number of parts each operand is divided into in this [`AllToAllOperation`].
@@ -948,7 +958,9 @@ pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| panic!("invalid '{ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`")
+            })
     }
 
     /// Returns the dimension along which scattered parts are concatenated in this [`AllToAllOperation`].
@@ -956,7 +968,9 @@ pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| panic!("invalid '{ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`")
+            })
     }
 }
 
@@ -1212,7 +1226,9 @@ pub trait ReduceScatterOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(REDUCE_SCATTER_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .unwrap_or_else(|| panic!("invalid '{REDUCE_SCATTER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::reduce_scatter`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{REDUCE_SCATTER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::reduce_scatter`")
+            })
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the reduction computation

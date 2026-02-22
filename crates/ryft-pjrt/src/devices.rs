@@ -542,7 +542,9 @@ impl DeviceAssignment {
             });
         }
         for replica_id in 0..self.replica_count {
-            for (computation_id, computation_devices) in computation_devices.iter_mut().enumerate().take(self.computation_count) {
+            for (computation_id, computation_devices) in
+                computation_devices.iter_mut().enumerate().take(self.computation_count)
+            {
                 computation_devices
                     .replica_device_ids
                     .push(self.assignment[replica_id * self.computation_count + computation_id] as i64);

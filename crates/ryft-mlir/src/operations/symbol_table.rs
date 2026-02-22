@@ -160,8 +160,7 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
 }
 
 /// Represents the types of visibility that an MLIR symbol may have.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SymbolVisibility {
     /// Represents symbols that are public and may be referenced anywhere internal or external to the visible
     /// references in the IR.
@@ -178,7 +177,6 @@ pub enum SymbolVisibility {
     /// outside of its own [`SymbolTable`], while retaining the ability to observe all of its uses.
     Nested,
 }
-
 
 impl Display for SymbolVisibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

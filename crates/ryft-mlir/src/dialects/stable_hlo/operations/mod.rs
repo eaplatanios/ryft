@@ -96,13 +96,16 @@ mlir_subtype_trait_impls!(
 
 /// Represents the requested accuracy for [`HasAccuracy`]s in StableHLO. Refer to the documentation
 /// of [`AccuracyAttributeRef`] and [`Context::stable_hlo_accuracy`] for more information.
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
-#[derive(Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
 pub enum Accuracy {
     #[default]
     Default,
     Highest,
-    Tolerance { absolute_tolerance: f64, relative_tolerance: f64, units_of_least_precision: usize },
+    Tolerance {
+        absolute_tolerance: f64,
+        relative_tolerance: f64,
+        units_of_least_precision: usize,
+    },
 }
 
 impl<'c, 't> From<AccuracyAttributeRef<'c, 't>> for Accuracy {

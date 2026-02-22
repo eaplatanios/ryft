@@ -47,7 +47,6 @@ pub enum OptimizationLevel {
     O3 = 3,
 }
 
-
 /// Just-In-Time (JIT) compilation-backed [`ExecutionEngine`] for MLIR (or rather LLVM specifically to be precise: more
 /// on this in the example below). This engine takes [`Module`]s and assumes that their IR can be converted to LLVM IR.
 /// For each function in the [`Module`] it creates a wrapper function with the following interface:

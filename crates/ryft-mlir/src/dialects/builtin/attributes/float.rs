@@ -83,11 +83,8 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
-            FloatAttributeRef::from_c_api(
-                mlirFloatAttrDoubleGet(*self.handle.borrow(), r#type.to_c_api(), value),
-                self,
-            )
-            .unwrap()
+            FloatAttributeRef::from_c_api(mlirFloatAttrDoubleGet(*self.handle.borrow(), r#type.to_c_api(), value), self)
+                .unwrap()
         }
     }
 

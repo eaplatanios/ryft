@@ -78,7 +78,9 @@ pub trait ConditionalBranchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
             .attribute(CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
             .map(|attribute| Vec::<i32>::from(attribute)[1])
-            .unwrap_or_else(|| panic!("invalid '{CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::cond_br`"));
+            .unwrap_or_else(|| {
+                panic!("invalid '{CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::cond_br`")
+            });
         self.operands().skip(1).take(true_successor_operand_count as usize).collect::<Vec<_>>()
     }
 
@@ -87,7 +89,9 @@ pub trait ConditionalBranchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
             .attribute(CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
             .map(|attribute| Vec::<i32>::from(attribute)[1])
-            .unwrap_or_else(|| panic!("invalid '{CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::cond_br`"));
+            .unwrap_or_else(|| {
+                panic!("invalid '{CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::cond_br`")
+            });
         self.operands().skip(1 + true_successor_operand_count as usize).collect::<Vec<_>>()
     }
 

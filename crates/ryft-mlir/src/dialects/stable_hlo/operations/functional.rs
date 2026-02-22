@@ -291,7 +291,9 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
             .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .unwrap_or_else(|| panic!("invalid '{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`")
+            })
     }
 
     /// Returns the window strides for this [`ReduceWindowOperation`], if specified.

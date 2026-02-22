@@ -1717,13 +1717,13 @@ impl HostBufferData {
             Box::into_raw(Box::new(HostBufferReference {
                 ptr: buffer_clone_raw,
                 guard: if mutable {
-                    HostBufferReferenceGuard::Mutable(
-                        std::mem::transmute::<RefMut<'_, ()>, RefMut<'_, ()>>((*buffer_clone_raw).borrow_mut()),
-                    )
+                    HostBufferReferenceGuard::Mutable(std::mem::transmute::<RefMut<'_, ()>, RefMut<'_, ()>>(
+                        (*buffer_clone_raw).borrow_mut(),
+                    ))
                 } else {
-                    HostBufferReferenceGuard::Immutable(
-                        std::mem::transmute::<Ref<'_, ()>, Ref<'_, ()>>((*buffer_clone_raw).borrow()),
-                    )
+                    HostBufferReferenceGuard::Immutable(std::mem::transmute::<Ref<'_, ()>, Ref<'_, ()>>(
+                        (*buffer_clone_raw).borrow(),
+                    ))
                 },
             })) as *const std::ffi::c_void
         };
@@ -2048,7 +2048,9 @@ impl<'s> Client<'s> {
         let done_event = unsafe { Event::from_c_api(done_event_handle, self.api(), ()) };
 
         // Register a callback to drop the host buffer data after the copy is completed.
-        if let Ok(done_event) = done_event && let Some(drop_fn) = data.drop_fn {
+        if let Ok(done_event) = done_event
+            && let Some(drop_fn) = data.drop_fn
+        {
             // Register the callback that will be invoked once the host buffer data has been copied.
             done_event.on_ready(|_| {
                 // We ignore the error because there is nothing we can do with it here,

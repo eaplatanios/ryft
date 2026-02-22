@@ -17,9 +17,9 @@ pub trait BatchNormOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(BATCH_NORM_FEATURE_INDEX_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as u32)
-            .unwrap_or_else(|| panic!("invalid '{}' attribute in `stable_hlo::{}`",
-                BATCH_NORM_FEATURE_INDEX_ATTRIBUTE,
-                self.name()))
+            .unwrap_or_else(|| {
+                panic!("invalid '{}' attribute in `stable_hlo::{}`", BATCH_NORM_FEATURE_INDEX_ATTRIBUTE, self.name())
+            })
     }
 
     /// Returns the ε parameter used by this [`BatchNormOperation`] for numerical stability.
@@ -27,7 +27,9 @@ pub trait BatchNormOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(BATCH_NORM_EPSILON_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<FloatAttributeRef>())
             .map(|attribute| attribute.value() as f32)
-            .unwrap_or_else(|| panic!("invalid '{}' attribute in `stable_hlo::{}`", BATCH_NORM_EPSILON_ATTRIBUTE, self.name()))
+            .unwrap_or_else(|| {
+                panic!("invalid '{}' attribute in `stable_hlo::{}`", BATCH_NORM_EPSILON_ATTRIBUTE, self.name())
+            })
     }
 }
 

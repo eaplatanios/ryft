@@ -163,8 +163,7 @@ mlir_subtype_trait_impls!(
 /// and unsupported algorithms should be treated as compilation-time errors rather than as requests that silently fall
 /// back to another algorithm.
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum DotAlgorithmPreset<'c, 't> {
     /// Default (platform-specific) algorithm based on the input/output types. This preset does not prescribe a concrete
     /// input type, output type, or accumulation type.
@@ -597,16 +596,16 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 ///     on different accelerator backends. It contains two [`Precision`]s; one that corresponds to the left-hand side
 ///     input and one that corresponds to the right-hand side input. The possible values for each [`Precision`] value
 ///     have the following semantics:
-/// 
+///
 ///       - [`Precision::Default`]: Fastest calculation, but least accurate approximation to the original number.
 ///       - [`Precision::High`]: Slower calculation, but more accurate approximation to the original number.
 ///       - [`Precision::Highest`]: Slowest calculation, but most accurate approximation to the original number.
-/// 
+///
 ///   - [`DotGeneralOperation::algorithm`] defines the main properties of the algorithm used to implement the dot
 ///     operation, which also defines the precision to use. Therefore, if the precision-related fields of the algorithm
 ///     are set, [`DotGeneralOperation::precision`] must not also be set. The fields of a
 ///     [`DotAlgorithmAttributeRef`] have the following semantics:
-/// 
+///
 ///       - [`DotAlgorithmAttributeRef::lhs_precision_type`] and [`DotAlgorithmAttributeRef::rhs_precision_type`] are
 ///         the precision types that the left-hand side input and right-hand side input of the operation are rounded to.
 ///         Precision types are independent of the storage types of the inputs and the output.
@@ -620,9 +619,9 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 ///         these values should be set to `1`.
 ///       - [`DotAlgorithmAttributeRef::allow_imprecise_accumulation`] specifies whether accumulation in lower precision
 ///         is permitted for some of the computation steps (e.g., using `CUBLASLT_MATMUL_DESC_FAST_ACCUM`).
-/// 
+///
 ///     The following are some example supported [`DotAlgorithmAttributeRef`] values rendered with their MLIR rendering:
-/// 
+///
 ///     ```mlir
 ///     // Inputs are casted to `tf32`, and then accumulated in `f32`:
 ///     {lhs_precision_type = tf32,
@@ -654,7 +653,7 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 ///      num_primitive_operations = 1,
 ///      allow_imprecise_accumulation = true}
 ///     ```
-/// 
+///
 ///     It is up to the compiler implementation to decide which combinations are supported. In general, it is not
 ///     guaranteed that each algorithm is supported on each accelerator type by the consumer of StableHLO. If a given
 ///     algorithm is not supported, an error should be raised as opposed to falling back to an alternative.
@@ -1642,7 +1641,9 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
+            })
     }
 
     /// Returns whether this [`TriangularSolveOperation`] operates on lower or upper triangular matrices.
@@ -1650,7 +1651,9 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_LOWER_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{TRIANGULAR_SOLVE_LOWER_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{TRIANGULAR_SOLVE_LOWER_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
+            })
     }
 
     /// Returns `true` if this [`TriangularSolveOperation`] can assume that the diagonal elements of
@@ -1659,7 +1662,11 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid '{TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`"
+                )
+            })
     }
 
     /// Returns the [`TriangularSolveTransposeType`] for this [`TriangularSolveOperation`].
@@ -1667,7 +1674,9 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<TriangularSolveTransposeTypeAttributeRef>())
             .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
+            })
     }
 }
 

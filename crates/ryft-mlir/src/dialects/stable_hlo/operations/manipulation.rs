@@ -32,7 +32,11 @@ pub trait GetDimensionSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimension(&self) -> usize {
         self.attribute(GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::get_dimension_size`"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid '{GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::get_dimension_size`"
+                )
+            })
             .signless_value() as usize
     }
 }
@@ -97,7 +101,9 @@ pub trait TransposeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRANSPOSE_PERMUTATION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
             .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .unwrap_or_else(|| panic!("invalid '{TRANSPOSE_PERMUTATION_ATTRIBUTE}' attribute in `stable_hlo::transpose`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{TRANSPOSE_PERMUTATION_ATTRIBUTE}' attribute in `stable_hlo::transpose`")
+            })
     }
 }
 
@@ -272,10 +278,10 @@ pub const BROADCAST_DIMENSIONS_ATTRIBUTE: &str = "broadcast_dimensions";
 ///
 /// The semantics of broadcasting are implemented as `result[result_index] = operand[operand_index]`,
 /// where `operand_index[d]` is computed based on whether the operand's dimension `d` has size 1:
-/// 
+///
 ///   - If `dim(operand, d) = 1`, then `operand_index[d] = 0` (broadcast across this dimension).
 ///   - Otherwise, `operand_index[d] = result_index[broadcast_dimensions[d]]` (direct mapping).
-/// 
+///
 /// This is computed over all values of `d` in `axes(operand)`.
 ///
 /// To better understand the semantics of this operation, let us consider an operand with type `tensor<1x3xi32>`,
@@ -311,7 +317,9 @@ pub trait BroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> Vec<usize> {
         self.attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::broadcast`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::broadcast`")
+            })
             .values()
             .map(|value| value as usize)
             .collect()
@@ -411,7 +419,9 @@ pub trait DynamicBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> Vec<usize> {
         self.attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_broadcast`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_broadcast`")
+            })
             .values()
             .map(|value| value as usize)
             .collect()
@@ -786,7 +796,9 @@ pub trait ConcatenateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimension(&self) -> usize {
         self.attribute(CONCATENATE_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{CONCATENATE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::concatenate`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CONCATENATE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::concatenate`")
+            })
             .signless_value() as usize
     }
 }
@@ -980,7 +992,9 @@ pub trait DynamicSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn slice_sizes(&self) -> Vec<usize> {
         self.attribute(DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::dynamic_slice`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::dynamic_slice`")
+            })
             .values()
             .map(|value| value as usize)
             .collect()
@@ -1428,7 +1442,9 @@ pub trait DynamicGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> GatherDimensionsAttributeRef<'c, 't> {
         self.attribute(GATHER_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<GatherDimensionsAttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_gather`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_gather`")
+            })
     }
 
     /// Returns whether the indices are sorted for this [`DynamicGatherOperation`].

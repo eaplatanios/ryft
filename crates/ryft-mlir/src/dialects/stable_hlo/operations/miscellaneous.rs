@@ -526,7 +526,9 @@ pub trait CompositeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn composite_decomposition(&self) -> StringRef<'c> {
         self.attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<FlatSymbolRefAttributeRef>().map(|attribute| attribute.reference()))
-            .unwrap_or_else(|| panic!("invalid '{COMPOSITE_DECOMPOSITION_ATTRIBUTE}' attribute in `stable_hlo::composite`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{COMPOSITE_DECOMPOSITION_ATTRIBUTE}' attribute in `stable_hlo::composite`")
+            })
     }
 }
 
@@ -588,8 +590,7 @@ pub fn composite<
 /// API version used by a [`CustomCallOperation`]. This determines the format in which the custom operation metadata
 /// are specified (i.e., as a [`StringAttributeRef`] or a [`DictionaryAttributeRef`] among other things related to how
 /// it should be invoked.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CustomCallApiVersion {
     Unspecified,
     Original,
@@ -598,7 +599,6 @@ pub enum CustomCallApiVersion {
     #[default]
     TypedFfi,
 }
-
 
 impl<'c, 't> From<IntegerAttributeRef<'c, 't>> for CustomCallApiVersion {
     fn from(value: IntegerAttributeRef<'c, 't>) -> Self {
@@ -827,7 +827,9 @@ pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn custom_call_target_name(&self) -> StringRef<'c> {
         self.attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .unwrap_or_else(|| panic!("invalid '{CUSTOM_CALL_TARGET_NAME_ATTRIBUTE}' attribute in `stable_hlo::custom_call`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_TARGET_NAME_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns `true` if executing this [`CustomCallOperation`] can result in side effects
@@ -835,7 +837,9 @@ pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn custom_call_has_side_effect(&self) -> bool {
         self.attribute(CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>().map(|attribute| attribute.value()))
-            .unwrap_or_else(|| panic!("invalid '{CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE}' attribute in `stable_hlo::custom_call`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns the backend configuration of this [`CustomCallOperation`]. This is either a [`StringAttributeRef`]
@@ -845,14 +849,18 @@ pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn custom_call_backend_config(&self) -> AttributeRef<'c, 't> {
         self.attribute(CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<AttributeRef>())
-            .unwrap_or_else(|| panic!("invalid '{CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::custom_call`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns the [`CustomCallApiVersion`] of this [`CustomCallOperation`].
     fn custom_call_api_version(&self) -> CustomCallApiVersion {
         self.attribute(CUSTOM_CALL_API_VERSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>().map(|attribute| attribute.into()))
-            .unwrap_or_else(|| panic!("invalid '{CUSTOM_CALL_API_VERSION_ATTRIBUTE}' attribute in `stable_hlo::custom_call`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_API_VERSION_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns the names/symbols of functions that are used by this [`CustomCallOperation`].

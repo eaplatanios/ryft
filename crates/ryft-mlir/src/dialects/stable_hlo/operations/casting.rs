@@ -307,7 +307,11 @@ pub trait ReducePrecisionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as u32)
-            .unwrap_or_else(|| panic!("invalid '{REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid '{REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
+                )
+            })
     }
 
     /// Returns the number of mantissa bits in the target precision of this [`ReducePrecisionOperation`].
@@ -315,7 +319,11 @@ pub trait ReducePrecisionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as u32)
-            .unwrap_or_else(|| panic!("invalid '{REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid '{REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
+                )
+            })
     }
 }
 

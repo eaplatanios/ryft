@@ -161,7 +161,9 @@ pub trait RngBitGeneratorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(RNG_ALGORITHM_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<RngAlgorithmAttributeRef<'c, 't>>())
             .map(|attribute| attribute.value())
-            .unwrap_or_else(|| panic!("invalid '{RNG_ALGORITHM_ATTRIBUTE}' attribute in `stable_hlo::rng_bit_generator`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{RNG_ALGORITHM_ATTRIBUTE}' attribute in `stable_hlo::rng_bit_generator`")
+            })
     }
 }
 
