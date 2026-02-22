@@ -9,6 +9,6 @@ pub mod sharding;
 pub use arrays::{AddressableShard, Array, ArrayError, ExecuteArguments};
 
 pub use sharding::{
-    AbstractMesh, Mesh, MeshAxis, MeshDevice, NamedSharding, PartitionDimension, PartitionSpec, ShardDescriptor,
-    ShardSlice, ShardingContext, ShardingError, ShardingLayout,
+    AbstractMesh, AxisType, Mesh, MeshAxis, MeshDevice, NamedSharding, PartitionDimension, PartitionSpec,
+    ShardDescriptor, ShardSlice, ShardingContext, ShardingError, ShardingLayout,
 };

@@ -1,9 +1,6 @@
-//! Device mesh and array sharding metadata for distributed execution.
-//!
-//! This module provides the core data structures for representing how arrays are partitioned
-//! across devices in a multi-device or multi-host environment. The design mirrors
-//! [JAX's sharding model][jax-sharding] and supports conversion to [Shardy][shardy] MLIR dialect
-//! attributes for annotating StableHLO programs.
+//! This module provides the core data structures for representing how arrays are _sharded_ (or _partitioned_) across
+//! devices in a multi-device or multi-host environment. The design mirrors [JAX's sharding model][jax-sharding] and
+//! supports conversion to [Shardy][shardy] MLIR dialect attributes for annotating StableHLO programs.
 //!
 //! [jax-sharding]: https://docs.jax.dev/en/latest/jax.sharding.html
 //! [shardy]: https://openxla.org/shardy/overview
@@ -227,6 +224,10 @@ pub enum ShardingError {
     #[error("partition specification dimension #{dimension} is unconstrained and cannot be used in a sharding layout")]
     UnconstrainedInLayout { dimension: usize },
 
+    /// Error returned when the number of axis types does not match the number of axes.
+    #[error("expected {expected} axis type(s), but got {actual}")]
+    AxisTypeCountMismatch { expected: usize, actual: usize },
+
     /// Error returned when a replicated/unreduced axis in a [`NamedSharding`] does not exist in the mesh.
     #[error("replicated/unreduced axis '{axis_name}' does not exist in the mesh")]
     UnknownExtraAxis { axis_name: String },
@@ -239,6 +240,37 @@ pub enum ShardingError {
     /// Error returned when the same axis appears in both the replicated and unreduced sets.
     #[error("axis '{axis_name}' appears in both replicated and unreduced sets")]
     AxisInBothReplicatedAndUnreduced { axis_name: String },
+}
+
+// ---------------------------------------------------------------------------
+// Axis type
+// ---------------------------------------------------------------------------
+
+/// Per-axis property that controls sharding propagation behavior.
+///
+/// Each axis in a mesh can be tagged with an `AxisType` that tells the compiler (Shardy/GSPMD)
+/// how to treat shardings along that axis during propagation.
+///
+/// # JAX equivalent
+///
+/// Corresponds to [`jax.sharding.AxisType`][jax-axis-type]:
+///
+/// | Variant | Meaning |
+/// |---|---|
+/// | `Auto` | Compiler decides sharding automatically (default) |
+/// | `Explicit` | Sharding is part of the type system, propagated at trace time |
+/// | `Manual` | User manages all device communication (used with `shard_map`) |
+///
+/// [jax-axis-type]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.AxisType
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AxisType {
+    /// Compiler (Shardy/GSPMD) decides sharding automatically.
+    #[default]
+    Auto,
+    /// Sharding is part of the type system, propagated at trace time.
+    Explicit,
+    /// User manages all device communication (used with `shard_map`).
+    Manual,
 }
 
 // ---------------------------------------------------------------------------
@@ -408,14 +440,32 @@ impl MeshDevice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbstractMesh {
     axes: Vec<MeshAxis>,
+    axis_types: Vec<AxisType>,
     axis_index_by_name: HashMap<String, usize>,
 }
 
 impl AbstractMesh {
     /// Creates an abstract mesh from named axes.
     ///
+    /// All axis types default to [`AxisType::Auto`], matching JAX's `Mesh` constructor behavior.
+    ///
     /// Validates that all axis names are non-empty, all sizes are positive, and names are unique.
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
+        let axis_types = vec![AxisType::Auto; axes.len()];
+        Self::build(axes, axis_types)
+    }
+
+    /// Creates an abstract mesh from named axes with explicit per-axis types.
+    ///
+    /// Returns [`ShardingError::AxisTypeCountMismatch`] if `axis_types.len() != axes.len()`.
+    pub fn with_axis_types(axes: Vec<MeshAxis>, axis_types: Vec<AxisType>) -> Result<Self, ShardingError> {
+        if axis_types.len() != axes.len() {
+            return Err(ShardingError::AxisTypeCountMismatch { expected: axes.len(), actual: axis_types.len() });
+        }
+        Self::build(axes, axis_types)
+    }
+
+    fn build(axes: Vec<MeshAxis>, axis_types: Vec<AxisType>) -> Result<Self, ShardingError> {
         let mut axis_index_by_name = HashMap::with_capacity(axes.len());
         for (axis_index, axis) in axes.iter().enumerate() {
             if axis.name.is_empty() {
@@ -428,12 +478,27 @@ impl AbstractMesh {
                 return Err(ShardingError::DuplicateMeshAxisName { axis_name: axis.name.clone() });
             }
         }
-        Ok(Self { axes, axis_index_by_name })
+        Ok(Self { axes, axis_types, axis_index_by_name })
     }
 
     /// Returns the axes of this mesh.
     pub fn axes(&self) -> &[MeshAxis] {
         self.axes.as_slice()
+    }
+
+    /// Returns the per-axis types.
+    pub fn axis_types(&self) -> &[AxisType] {
+        self.axis_types.as_slice()
+    }
+
+    /// Returns axis names as a convenience accessor.
+    pub fn axis_names(&self) -> Vec<&str> {
+        self.axes.iter().map(|a| a.name()).collect()
+    }
+
+    /// Returns axis sizes as a convenience accessor.
+    pub fn axis_sizes(&self) -> Vec<usize> {
+        self.axes.iter().map(|a| a.size()).collect()
     }
 
     /// Returns the total number of devices implied by axis sizes.
@@ -453,6 +518,57 @@ impl AbstractMesh {
     /// Returns the size of `axis_name` in this mesh, if present.
     pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
         self.axis_index(axis_name).map(|axis_index| self.axes[axis_index].size)
+    }
+
+    /// Returns `true` if all axes have type [`AxisType::Auto`].
+    pub fn are_all_axes_auto(&self) -> bool {
+        self.axis_types.iter().all(|t| *t == AxisType::Auto)
+    }
+
+    /// Returns `true` if all axes have type [`AxisType::Explicit`].
+    pub fn are_all_axes_explicit(&self) -> bool {
+        self.axis_types.iter().all(|t| *t == AxisType::Explicit)
+    }
+
+    /// Returns `true` if all axes have type [`AxisType::Manual`].
+    pub fn are_all_axes_manual(&self) -> bool {
+        self.axis_types.iter().all(|t| *t == AxisType::Manual)
+    }
+
+    /// Returns the names of axes with type [`AxisType::Auto`].
+    pub fn auto_axes(&self) -> Vec<&str> {
+        self.axes_with_type(AxisType::Auto)
+    }
+
+    /// Returns the names of axes with type [`AxisType::Explicit`].
+    pub fn explicit_axes(&self) -> Vec<&str> {
+        self.axes_with_type(AxisType::Explicit)
+    }
+
+    /// Returns the names of axes with type [`AxisType::Manual`].
+    pub fn manual_axes(&self) -> Vec<&str> {
+        self.axes_with_type(AxisType::Manual)
+    }
+
+    fn axes_with_type(&self, axis_type: AxisType) -> Vec<&str> {
+        self.axes
+            .iter()
+            .zip(self.axis_types.iter())
+            .filter_map(|(axis, t)| (*t == axis_type).then_some(axis.name()))
+            .collect()
+    }
+
+    /// Returns a new `AbstractMesh` with selected axes' types changed.
+    ///
+    /// Unknown names in `name_to_type` are silently ignored, matching JAX behavior.
+    pub fn with_updated_axis_types(&self, name_to_type: &HashMap<String, AxisType>) -> Self {
+        let axis_types = self
+            .axes
+            .iter()
+            .zip(self.axis_types.iter())
+            .map(|(axis, current_type)| name_to_type.get(axis.name()).copied().unwrap_or(*current_type))
+            .collect();
+        Self { axes: self.axes.clone(), axis_types, axis_index_by_name: self.axis_index_by_name.clone() }
     }
 
     /// Renders this mesh as the right-hand side of a Shardy `sdy.mesh` declaration.
@@ -535,10 +651,21 @@ pub struct Mesh {
 impl Mesh {
     /// Creates a mesh from named axes and row-major devices.
     ///
+    /// All axis types default to [`AxisType::Auto`].
     /// The expected number of `devices` is the product of all `axes` sizes. For an empty axis list, the
     /// expected device count is `1`.
     pub fn new(axes: Vec<MeshAxis>, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
         let abstract_mesh = AbstractMesh::new(axes)?;
+        Self::from_abstract(abstract_mesh, devices)
+    }
+
+    /// Creates a mesh from named axes, explicit per-axis types, and row-major devices.
+    pub fn with_axis_types(
+        axes: Vec<MeshAxis>,
+        axis_types: Vec<AxisType>,
+        devices: Vec<MeshDevice>,
+    ) -> Result<Self, ShardingError> {
+        let abstract_mesh = AbstractMesh::with_axis_types(axes, axis_types)?;
         Self::from_abstract(abstract_mesh, devices)
     }
 
@@ -572,6 +699,21 @@ impl Mesh {
         self.abstract_mesh.axes()
     }
 
+    /// Returns the per-axis types.
+    pub fn axis_types(&self) -> &[AxisType] {
+        self.abstract_mesh.axis_types()
+    }
+
+    /// Returns axis names as a convenience accessor.
+    pub fn axis_names(&self) -> Vec<&str> {
+        self.abstract_mesh.axis_names()
+    }
+
+    /// Returns axis sizes as a convenience accessor.
+    pub fn axis_sizes(&self) -> Vec<usize> {
+        self.abstract_mesh.axis_sizes()
+    }
+
     /// Returns mesh devices in row-major order.
     pub fn devices(&self) -> &[MeshDevice] {
         self.devices.as_slice()
@@ -592,9 +734,62 @@ impl Mesh {
         self.abstract_mesh.axis_size(axis_name)
     }
 
+    /// Returns `true` if all axes have type [`AxisType::Auto`].
+    pub fn are_all_axes_auto(&self) -> bool {
+        self.abstract_mesh.are_all_axes_auto()
+    }
+
+    /// Returns `true` if all axes have type [`AxisType::Explicit`].
+    pub fn are_all_axes_explicit(&self) -> bool {
+        self.abstract_mesh.are_all_axes_explicit()
+    }
+
+    /// Returns `true` if all axes have type [`AxisType::Manual`].
+    pub fn are_all_axes_manual(&self) -> bool {
+        self.abstract_mesh.are_all_axes_manual()
+    }
+
+    /// Returns the names of axes with type [`AxisType::Auto`].
+    pub fn auto_axes(&self) -> Vec<&str> {
+        self.abstract_mesh.auto_axes()
+    }
+
+    /// Returns the names of axes with type [`AxisType::Explicit`].
+    pub fn explicit_axes(&self) -> Vec<&str> {
+        self.abstract_mesh.explicit_axes()
+    }
+
+    /// Returns the names of axes with type [`AxisType::Manual`].
+    pub fn manual_axes(&self) -> Vec<&str> {
+        self.abstract_mesh.manual_axes()
+    }
+
     /// Returns the row-major mesh index of `device_id`, if present.
     pub fn device_index(&self, device_id: DeviceId) -> Option<usize> {
         self.device_index_by_id.get(&device_id).copied()
+    }
+
+    /// Returns just the device IDs.
+    pub fn device_ids(&self) -> Vec<DeviceId> {
+        self.devices.iter().map(|d| d.id()).collect()
+    }
+
+    /// Returns `true` if any two devices belong to different processes.
+    pub fn is_multi_process(&self) -> bool {
+        let mut seen = None;
+        for device in &self.devices {
+            match seen {
+                None => seen = Some(device.process_index()),
+                Some(p) if p != device.process_index() => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Returns devices belonging to the given `process_index`.
+    pub fn local_devices(&self, process_index: usize) -> Vec<&MeshDevice> {
+        self.devices.iter().filter(|d| d.process_index() == process_index).collect()
     }
 
     /// Returns the mesh coordinate of the device at `device_index`, if valid.
@@ -1167,11 +1362,7 @@ impl ShardingLayout {
     ///
     /// Returns [`ShardingError::UnconstrainedInLayout`] if the partition spec contains an
     /// `Unconstrained` dimension.
-    pub fn new(
-        global_shape: Vec<usize>,
-        mesh: Mesh,
-        partition_spec: PartitionSpec,
-    ) -> Result<Self, ShardingError> {
+    pub fn new(global_shape: Vec<usize>, mesh: Mesh, partition_spec: PartitionSpec) -> Result<Self, ShardingError> {
         validate_partition_spec(mesh.abstract_mesh(), &partition_spec)?;
 
         let partition_rank = partition_spec.rank();
@@ -1217,13 +1408,7 @@ impl ShardingLayout {
             }
 
             shard_index_by_device.insert(mesh_device.id(), shard_index);
-            shards.push(ShardDescriptor {
-                shard_index,
-                device: mesh_device,
-                mesh_coordinate,
-                slices,
-                shape,
-            });
+            shards.push(ShardDescriptor { shard_index, device: mesh_device, mesh_coordinate, slices, shape });
         }
 
         Ok(Self { global_shape, mesh, partition_spec, shards, shard_index_by_device })
@@ -1302,7 +1487,10 @@ fn escape_shardy_string(value: &str) -> String {
 }
 
 /// Validates a partition spec against an abstract mesh. Returns the set of axis names used.
-fn validate_partition_spec(mesh: &AbstractMesh, partition_spec: &PartitionSpec) -> Result<HashSet<String>, ShardingError> {
+fn validate_partition_spec(
+    mesh: &AbstractMesh,
+    partition_spec: &PartitionSpec,
+) -> Result<HashSet<String>, ShardingError> {
     let mut used_axes = HashSet::new();
     for (dimension, partition_dimension) in partition_spec.dimensions().iter().enumerate() {
         if let PartitionDimension::Sharded(axis_names) = partition_dimension {
@@ -1509,33 +1697,21 @@ mod tests {
     #[test]
     fn test_partition_spec_shardy_rendering_explicit() {
         let spec = PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
-        assert_eq!(
-            spec.to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding),
-            "[{\"x\"}, {}]"
-        );
+        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding), "[{\"x\"}, {}]");
     }
 
     #[test]
     fn test_partition_spec_shardy_rendering_constraint() {
         let spec = PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
-        assert_eq!(
-            spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint),
-            "[{\"x\"}, {?}]"
-        );
+        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint), "[{\"x\"}, {?}]");
     }
 
     #[test]
     fn test_partition_spec_shardy_rendering_unconstrained() {
         let spec = PartitionSpec::new(vec![PartitionDimension::unconstrained()]);
         // Unconstrained is always open, regardless of context.
-        assert_eq!(
-            spec.to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding),
-            "[{?}]"
-        );
-        assert_eq!(
-            spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint),
-            "[{?}]"
-        );
+        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding), "[{?}]");
+        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint), "[{?}]");
     }
 
     // -----------------------------------------------------------------------
@@ -1581,9 +1757,9 @@ mod tests {
     #[test]
     fn test_named_sharding_replicated_axes() {
         let mesh = test_abstract_mesh_2x2();
-        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
-        let sharding =
-            NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], Vec::new()).unwrap();
+        let partition_spec =
+            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+        let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], Vec::new()).unwrap();
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute("mesh", ShardingContext::ExplicitSharding).unwrap(),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], replicated={\"y\"}>"
@@ -1593,9 +1769,9 @@ mod tests {
     #[test]
     fn test_named_sharding_unreduced_axes() {
         let mesh = test_abstract_mesh_2x2();
-        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
-        let sharding =
-            NamedSharding::with_extra_axes(mesh, partition_spec, Vec::new(), vec!["y".to_string()]).unwrap();
+        let partition_spec =
+            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+        let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, Vec::new(), vec!["y".to_string()]).unwrap();
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute("mesh", ShardingContext::ExplicitSharding).unwrap(),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>"
@@ -1611,13 +1787,8 @@ mod tests {
         ])
         .unwrap();
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
-        let sharding = NamedSharding::with_extra_axes(
-            mesh,
-            partition_spec,
-            vec!["y".to_string()],
-            vec!["z".to_string()],
-        )
-        .unwrap();
+        let sharding =
+            NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], vec!["z".to_string()]).unwrap();
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute("mesh", ShardingContext::ExplicitSharding).unwrap(),
             "#sdy.sharding<@mesh, [{\"x\"}], replicated={\"y\"}, unreduced={\"z\"}>"
@@ -1743,5 +1914,132 @@ mod tests {
 
         assert_eq!(layout.mesh(), &mesh);
         assert_eq!(layout.partition_spec(), &partition_spec);
+    }
+
+    // -----------------------------------------------------------------------
+    // AxisType tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_axis_type_default() {
+        assert_eq!(AxisType::default(), AxisType::Auto);
+    }
+
+    #[test]
+    fn test_abstract_mesh_default_axis_types() {
+        let mesh = test_abstract_mesh_2x2();
+        assert_eq!(mesh.axis_types(), &[AxisType::Auto, AxisType::Auto]);
+    }
+
+    #[test]
+    fn test_abstract_mesh_with_axis_types() {
+        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
+        let types = vec![AxisType::Manual, AxisType::Explicit];
+        let mesh = AbstractMesh::with_axis_types(axes, types).unwrap();
+        assert_eq!(mesh.axis_types(), &[AxisType::Manual, AxisType::Explicit]);
+    }
+
+    #[test]
+    fn test_abstract_mesh_axis_type_count_mismatch() {
+        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
+        let types = vec![AxisType::Auto];
+        assert!(matches!(
+            AbstractMesh::with_axis_types(axes, types),
+            Err(ShardingError::AxisTypeCountMismatch { expected: 2, actual: 1 }),
+        ));
+    }
+
+    #[test]
+    fn test_abstract_mesh_axis_type_queries() {
+        // All auto.
+        let mesh = test_abstract_mesh_2x2();
+        assert!(mesh.are_all_axes_auto());
+        assert!(!mesh.are_all_axes_explicit());
+        assert!(!mesh.are_all_axes_manual());
+        assert_eq!(mesh.auto_axes(), vec!["x", "y"]);
+        assert!(mesh.explicit_axes().is_empty());
+        assert!(mesh.manual_axes().is_empty());
+
+        // Mixed types.
+        let axes = vec![MeshAxis::new("a", 2).unwrap(), MeshAxis::new("b", 2).unwrap(), MeshAxis::new("c", 2).unwrap()];
+        let types = vec![AxisType::Auto, AxisType::Explicit, AxisType::Manual];
+        let mesh = AbstractMesh::with_axis_types(axes, types).unwrap();
+        assert!(!mesh.are_all_axes_auto());
+        assert!(!mesh.are_all_axes_explicit());
+        assert!(!mesh.are_all_axes_manual());
+        assert_eq!(mesh.auto_axes(), vec!["a"]);
+        assert_eq!(mesh.explicit_axes(), vec!["b"]);
+        assert_eq!(mesh.manual_axes(), vec!["c"]);
+    }
+
+    #[test]
+    fn test_abstract_mesh_with_updated_axis_types() {
+        let mesh = test_abstract_mesh_2x2();
+        let updates = HashMap::from([("y".to_string(), AxisType::Manual)]);
+        let updated = mesh.with_updated_axis_types(&updates);
+        assert_eq!(updated.axis_types(), &[AxisType::Auto, AxisType::Manual]);
+
+        // Unknown names are silently ignored.
+        let updates = HashMap::from([("z".to_string(), AxisType::Explicit)]);
+        let updated = mesh.with_updated_axis_types(&updates);
+        assert_eq!(updated.axis_types(), &[AxisType::Auto, AxisType::Auto]);
+    }
+
+    #[test]
+    fn test_abstract_mesh_axis_names_and_sizes() {
+        let mesh = test_abstract_mesh_2x2();
+        assert_eq!(mesh.axis_names(), vec!["x", "y"]);
+        assert_eq!(mesh.axis_sizes(), vec![2, 2]);
+    }
+
+    #[test]
+    fn test_mesh_with_axis_types() {
+        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
+        let types = vec![AxisType::Explicit, AxisType::Manual];
+        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 0), MeshDevice::new(3, 0)];
+        let mesh = Mesh::with_axis_types(axes, types, devices).unwrap();
+        assert_eq!(mesh.axis_types(), &[AxisType::Explicit, AxisType::Manual]);
+    }
+
+    #[test]
+    fn test_mesh_axis_type_delegation() {
+        let mesh = test_mesh_2x2();
+        assert!(mesh.are_all_axes_auto());
+        assert!(!mesh.are_all_axes_explicit());
+        assert!(!mesh.are_all_axes_manual());
+        assert_eq!(mesh.auto_axes(), vec!["x", "y"]);
+        assert!(mesh.explicit_axes().is_empty());
+        assert!(mesh.manual_axes().is_empty());
+        assert_eq!(mesh.axis_names(), vec!["x", "y"]);
+        assert_eq!(mesh.axis_sizes(), vec![2, 2]);
+    }
+
+    #[test]
+    fn test_mesh_is_multi_process() {
+        // Single process.
+        let axes = vec![MeshAxis::new("x", 2).unwrap()];
+        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
+        let mesh = Mesh::new(axes, devices).unwrap();
+        assert!(!mesh.is_multi_process());
+
+        // Multi process.
+        let mesh = test_mesh_2x2(); // devices 0,1 on process 0; devices 2,3 on process 1.
+        assert!(mesh.is_multi_process());
+    }
+
+    #[test]
+    fn test_mesh_local_devices() {
+        let mesh = test_mesh_2x2();
+        let local_0: Vec<DeviceId> = mesh.local_devices(0).iter().map(|d| d.id()).collect();
+        assert_eq!(local_0, vec![0, 1]);
+        let local_1: Vec<DeviceId> = mesh.local_devices(1).iter().map(|d| d.id()).collect();
+        assert_eq!(local_1, vec![2, 3]);
+        assert!(mesh.local_devices(42).is_empty());
+    }
+
+    #[test]
+    fn test_mesh_device_ids() {
+        let mesh = test_mesh_2x2();
+        assert_eq!(mesh.device_ids(), vec![0, 1, 2, 3]);
     }
 }
