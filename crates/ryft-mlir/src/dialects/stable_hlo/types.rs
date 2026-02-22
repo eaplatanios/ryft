@@ -31,7 +31,7 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe { TokenTypeRef::from_c_api(stablehloTokenTypeGet(*self.handle.borrow()), &self).unwrap() }
+        unsafe { TokenTypeRef::from_c_api(stablehloTokenTypeGet(*self.handle.borrow()), self).unwrap() }
     }
 }
 

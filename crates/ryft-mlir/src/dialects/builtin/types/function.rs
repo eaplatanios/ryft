@@ -99,7 +99,7 @@ impl<'t> Context<'t> {
                     outputs.len().cast_signed(),
                     outputs.as_ptr() as *const _,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }

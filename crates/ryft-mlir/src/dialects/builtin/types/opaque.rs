@@ -60,7 +60,7 @@ impl<'t> Context<'t> {
                     StringRef::from(dialect_namespace.as_ref()).to_c_api(),
                     StringRef::from(data.as_ref()).to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }

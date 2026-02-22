@@ -101,7 +101,7 @@ impl<'t> Context<'t> {
                     references.len().cast_signed(),
                     references.as_ptr() as *const _,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -153,7 +153,7 @@ impl<'t> Context<'t> {
         unsafe {
             FlatSymbolRefAttributeRef::from_c_api(
                 mlirFlatSymbolRefAttrGet(*self.handle.borrow(), symbol.into().to_c_api()),
-                &self,
+                self,
             )
             .unwrap()
         }

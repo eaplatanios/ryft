@@ -85,7 +85,7 @@ impl<'t> Context<'t> {
         unsafe {
             FloatAttributeRef::from_c_api(
                 mlirFloatAttrDoubleGet(*self.handle.borrow(), r#type.to_c_api(), value),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -108,7 +108,7 @@ impl<'t> Context<'t> {
         unsafe {
             FloatAttributeRef::from_c_api(
                 mlirFloatAttrDoubleGetChecked(location.to_c_api(), r#type.to_c_api(), value),
-                &self,
+                self,
             )
         }
     }

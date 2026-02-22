@@ -63,7 +63,7 @@ impl<'t> Context<'t> {
         unsafe {
             SymbolVisibilityAttributeRef::from_c_api(
                 mlirStringAttrGet(*self.handle.borrow(), StringRef::from(visibility).to_c_api()),
-                &self,
+                self,
             )
             .unwrap()
         }

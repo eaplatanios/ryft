@@ -55,7 +55,7 @@ pub fn tuple<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 }
 
 /// Name of the [`Attribute`] that is used to store [`GetTupleElementOperation::index`].
-pub const GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE: &'static str = "index";
+pub const GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE: &str = "index";
 
 /// StableHLO [`Operation`] that extracts an element from a tuple based on its index in the tuple. Tuples are a legacy
 /// feature in StableHLO that exists primarily for compatibility with HLO, where they are used to represent variadic
@@ -86,9 +86,7 @@ pub trait GetTupleElementOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!(
-                "invalid '{GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE}' attribute in `stable_hlo::get_tuple_element`",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{GET_TUPLE_ELEMENT_INDEX_ATTRIBUTE}' attribute in `stable_hlo::get_tuple_element`"))
     }
 }
 

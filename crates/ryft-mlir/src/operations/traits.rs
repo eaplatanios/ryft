@@ -42,7 +42,7 @@ pub trait AlwaysSpeculatable<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
 pub trait AutomaticAllocationScope<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {}
 
 /// Name of the [`Attribute`] that is used to store [`Callee`]s in [`Call`]s where it is a [`Callee::Symbol`].
-pub const CALLEE_ATTRIBUTE: &'static str = "callee";
+pub const CALLEE_ATTRIBUTE: &str = "callee";
 
 /// Callee in a [`Call`] [`Operation`].
 pub enum Callee<'o, 'c, 't> {
@@ -90,7 +90,7 @@ pub trait Callable<'o, 'c: 'o, 't: 'c>: HasCallableArgumentAndResultAttributes<'
 pub trait ConstantLike<'o, 'c: 'o, 't: 'c>: OneResult<'o, 'c, 't> + ZeroOperands<'o, 'c, 't> {}
 
 /// Name of the [`Attribute`] that is used to store [`FunctionTypeRef`]s in [`Function`]s.
-pub const FUNCTION_TYPE_ATTRIBUTE: &'static str = "function_type";
+pub const FUNCTION_TYPE_ATTRIBUTE: &str = "function_type";
 
 /// Trait that represents [`Operation`]s that behave like functions. In particular, these operations:
 ///
@@ -162,7 +162,7 @@ pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't
         let argument_attributes = self.callable_argument_attributes();
         argument_types
             .into_iter()
-            .zip(argument_attributes.into_iter())
+            .zip(argument_attributes)
             .map(|(r#type, attributes)| {
                 if attributes.is_empty() {
                     TypeAndAttributes { r#type, attributes: None }
@@ -181,7 +181,7 @@ pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't
         let result_attributes = self.callable_result_attributes();
         result_types
             .into_iter()
-            .zip(result_attributes.into_iter())
+            .zip(result_attributes)
             .map(|(r#type, attributes)| {
                 if attributes.is_empty() {
                     TypeAndAttributes { r#type, attributes: None }
@@ -204,10 +204,10 @@ pub trait Function<'o, 'c: 'o, 't: 'c>: Symbol<'o, 'c, 't> + Callable<'o, 'c, 't
 }
 
 /// Name of the [`Attribute`] that is used to store argument attributes in [`HasCallableArgumentAndResultAttributes`].
-pub const ARGUMENT_ATTRIBUTES_ATTRIBUTE: &'static str = "arg_attrs";
+pub const ARGUMENT_ATTRIBUTES_ATTRIBUTE: &str = "arg_attrs";
 
 /// Name of the [`Attribute`] that is used to store result attributes in [`HasCallableArgumentAndResultAttributes`].
-pub const RESULT_ATTRIBUTES_ATTRIBUTE: &'static str = "res_attrs";
+pub const RESULT_ATTRIBUTES_ATTRIBUTE: &str = "res_attrs";
 
 /// Trait that represents [`Operation`]s that have _callable_ argument and result [`Attribute`]s.
 ///
@@ -404,11 +404,11 @@ pub trait SingleBlock<'o, 'c: 'o, 't: 'c>:
 
 /// Name of the [`Attribute`] that is used to store symbol names that are compatible with
 /// [`SymbolTable`](crate::operations::symbol_table::SymbolTable)s.
-pub const SYMBOL_NAME_ATTRIBUTE: &'static str = "sym_name";
+pub const SYMBOL_NAME_ATTRIBUTE: &str = "sym_name";
 
 /// Name of the [`Attribute`] that is used to store symbol visibilities that are compatible with
 /// [`SymbolTable`](crate::operations::symbol_table::SymbolTable)s.
-pub const SYMBOL_VISIBILITY_ATTRIBUTE: &'static str = "sym_visibility";
+pub const SYMBOL_VISIBILITY_ATTRIBUTE: &str = "sym_visibility";
 
 /// Trait that represents [`Operation`]s that define symbols and which can be referred to from other [`Operation`]s
 /// using those symbols. Refer to the documentation of [`SymbolTable`] for more information on symbols in MLIR.
@@ -527,7 +527,7 @@ pub trait SymbolTable<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         ) {
             unsafe {
                 let data = data as *mut (&mut F, &'c Context<'t>);
-                let (ref mut callback, ref context) = *data;
+                let (ref mut callback, context) = *data;
                 let operation = OperationRef::from_c_api(operation, context).unwrap();
                 (callback)(operation, all_symbol_uses_visible)
             }

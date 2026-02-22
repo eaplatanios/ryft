@@ -144,7 +144,7 @@ impl<'t> Context<'t> {
                     element_type.to_c_api(),
                 )
             };
-            VectorTypeRef::from_c_api(handle, &self)
+            VectorTypeRef::from_c_api(handle, self)
         }
     }
 }

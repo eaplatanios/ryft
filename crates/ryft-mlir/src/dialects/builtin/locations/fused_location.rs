@@ -74,7 +74,7 @@ impl<'t> Context<'t> {
                     locations.as_ptr() as *const _,
                     attribute.to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }

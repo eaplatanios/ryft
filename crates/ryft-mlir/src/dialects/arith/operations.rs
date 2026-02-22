@@ -3,12 +3,12 @@ use crate::{
     Value, ValueRef, mlir_binary_op, mlir_generic_unary_op, mlir_op, mlir_op_trait, mlir_unary_op,
 };
 
-pub const CONSTANT_VALUE_ATTRIBUTE: &'static str = "value";
+pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn value(&self) -> AttributeRef<'c, 't> {
         self.attribute(CONSTANT_VALUE_ATTRIBUTE)
-            .expect(&format!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `arith::constant`"))
+            .unwrap_or_else(|| panic!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `arith::constant`"))
     }
 }
 
@@ -78,7 +78,7 @@ mlir_binary_op!(arith, subf);
 mlir_binary_op!(arith, subi);
 mlir_binary_op!(arith, xori);
 
-pub const CMP_PREDICATE_ATTRIBUTE: &'static str = "predicate";
+pub const CMP_PREDICATE_ATTRIBUTE: &str = "predicate";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(i64)]
@@ -132,7 +132,7 @@ pub trait CmpfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 14 => Some(FloatingPointComparisonPredicate::Unordered),
                 _ => None,
             })
-            .expect(&format!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `arith::cmpf`"))
+            .unwrap_or_else(|| panic!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `arith::cmpf`"))
     }
 }
 
@@ -209,7 +209,7 @@ pub trait CmpiOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 9 => Some(IntegerComparisonPredicate::UnsignedGreaterThanOrEqual),
                 _ => None,
             })
-            .expect(&format!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `arith::cmpi`"))
+            .unwrap_or_else(|| panic!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `arith::cmpi`"))
     }
 }
 

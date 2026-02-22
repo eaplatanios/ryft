@@ -8,13 +8,13 @@ use super::attributes::{
 };
 
 /// Name of the [`Attribute`] that is used to store [`AllGatherOperation::gathering_axes`].
-pub const GATHERING_AXES_ATTRIBUTE: &'static str = "gathering_axes";
+pub const GATHERING_AXES_ATTRIBUTE: &str = "gathering_axes";
 
 /// Name of the [`Attribute`] that is used to store [`AllGatherOperation::out_sharding`],
 /// [`AllReduceOperation::out_sharding`], [`AllSliceOperation::out_sharding`], [`AllToAllOperation::out_sharding`],
 /// [`ReduceScatterOperation::out_sharding`], [`ReplicatedToUnreducedOperation::out_sharding`], and
 /// [`ShardedToUnreducedOperation::out_sharding`].
-pub const OUT_SHARDING_ATTRIBUTE: &'static str = "out_sharding";
+pub const OUT_SHARDING_ATTRIBUTE: &str = "out_sharding";
 
 /// Shardy [`Operation`] that gathers slices of a tensor across axes.
 ///
@@ -76,7 +76,7 @@ pub fn all_gather<
 }
 
 /// Name of the [`Attribute`] that is used to store [`AllReduceOperation::reduction_axes`].
-pub const REDUCTION_AXES_ATTRIBUTE: &'static str = "reduction_axes";
+pub const REDUCTION_AXES_ATTRIBUTE: &str = "reduction_axes";
 
 /// Shardy [`Operation`] that reduces a tensor across axes and keeps the same sharding rank.
 ///
@@ -138,7 +138,7 @@ pub fn all_reduce<
 }
 
 /// Name of the [`Attribute`] that is used to store [`AllSliceOperation::slicing_axes`].
-pub const SLICING_AXES_ATTRIBUTE: &'static str = "slicing_axes";
+pub const SLICING_AXES_ATTRIBUTE: &str = "slicing_axes";
 
 /// Shardy [`Operation`] that slices a tensor along the specified axes.
 ///
@@ -200,7 +200,7 @@ pub fn all_slice<
 }
 
 /// Name of the [`Attribute`] that is used to store [`AllToAllOperation::params`].
-pub const PARAMS_ATTRIBUTE: &'static str = "params";
+pub const PARAMS_ATTRIBUTE: &str = "params";
 
 /// Shardy [`Operation`] that performs a parameterized all-to-all tensor exchange.
 ///
@@ -304,16 +304,16 @@ pub fn collective_permute<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 
 }
 
 /// Name of the [`Attribute`] that is used to store [`ShardingConstraintOperation::sharding`].
-pub const SHARDING_ATTRIBUTE: &'static str = "sharding";
+pub const SHARDING_ATTRIBUTE: &str = "sharding";
 
 /// Name of the [`Attribute`] that is used to store [`ManualComputationOperation::in_shardings`].
-pub const IN_SHARDINGS_ATTRIBUTE: &'static str = "in_shardings";
+pub const IN_SHARDINGS_ATTRIBUTE: &str = "in_shardings";
 
 /// Name of the [`Attribute`] that is used to store [`ManualComputationOperation::out_shardings`].
-pub const OUT_SHARDINGS_ATTRIBUTE: &'static str = "out_shardings";
+pub const OUT_SHARDINGS_ATTRIBUTE: &str = "out_shardings";
 
 /// Name of the [`Attribute`] that is used to store [`ManualComputationOperation::manual_axes`].
-pub const MANUAL_AXES_ATTRIBUTE: &'static str = "manual_axes";
+pub const MANUAL_AXES_ATTRIBUTE: &str = "manual_axes";
 
 /// Shardy region-based [`Operation`] for manual SPMD computation sections.
 ///
@@ -378,10 +378,10 @@ pub fn manual_computation<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 
 }
 
 /// Name of the [`Attribute`] that is used to store [`MeshOperation::symbol_name`].
-pub const SYMBOL_NAME_ATTRIBUTE: &'static str = "sym_name";
+pub const SYMBOL_NAME_ATTRIBUTE: &str = "sym_name";
 
 /// Name of the [`Attribute`] that is used to store [`MeshOperation::mesh`].
-pub const MESH_ATTRIBUTE: &'static str = "mesh";
+pub const MESH_ATTRIBUTE: &str = "mesh";
 
 /// Shardy [`Operation`] that defines a named mesh symbol.
 ///
@@ -429,7 +429,7 @@ pub fn mesh<'c, 't: 'c, L: Location<'c, 't>>(
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReduceScatterOperation::reduce_scatter_axes`].
-pub const REDUCE_SCATTER_AXES_ATTRIBUTE: &'static str = "reduce_scatter_axes";
+pub const REDUCE_SCATTER_AXES_ATTRIBUTE: &str = "reduce_scatter_axes";
 
 /// Shardy [`Operation`] that combines reduce and scatter along specified axes.
 ///
@@ -492,7 +492,7 @@ pub fn reduce_scatter<
 
 /// Name of the [`Attribute`] that is used to store [`ReplicatedToUnreducedOperation::axes`] and
 /// [`ShardedToUnreducedOperation::axes`].
-pub const AXES_ATTRIBUTE: &'static str = "axes";
+pub const AXES_ATTRIBUTE: &str = "axes";
 
 /// Shardy [`Operation`] that moves replicated axes to unreduced axes.
 ///
@@ -680,7 +680,7 @@ pub fn sharding_constraint<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location
 }
 
 /// Name of the [`Attribute`] that is used to store [`ShardingGroupOperation::group_id`].
-pub const GROUP_ID_ATTRIBUTE: &'static str = "group_id";
+pub const GROUP_ID_ATTRIBUTE: &str = "group_id";
 
 /// Shardy [`Operation`] that groups a tensor into a sharding-propagation group.
 ///

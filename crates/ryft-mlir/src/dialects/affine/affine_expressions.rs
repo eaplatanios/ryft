@@ -40,7 +40,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
 
     /// Returns `true` if this type is an instance of `A`.
     fn is<A: AffineExpression<'c, 't>>(&self) -> bool {
-        Self::cast::<A>(&self).is_some()
+        Self::cast::<A>(self).is_some()
     }
 
     /// Tries to cast this type to an instance of `A` (e.g., an instance of [`ConstantAffineExpressionRef`]).
@@ -69,7 +69,7 @@ pub trait AffineExpression<'c, 't: 'c>: Sized + PartialEq + Eq + Display {
     /// Returns `true` if this expression is a semi-affine expression (i.e., not a pure affine expression). Refer to
     /// [`AffineExpression::is_pure_affine`] for information on what constitutes a pure affine expression.
     fn is_semi_affine(&self) -> bool {
-        return !self.is_pure_affine();
+        !self.is_pure_affine()
     }
 
     /// Returns the largest known integral divisor of this affine expression.
@@ -224,7 +224,7 @@ impl<'c, 't> AffineExpression<'c, 't> for AffineExpressionRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -266,7 +266,7 @@ impl<'t> Context<'t> {
         unsafe {
             DimensionAffineExpressionRef::from_c_api(
                 mlirAffineDimExprGet(*self.handle.borrow_mut(), position.cast_signed()),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -307,7 +307,7 @@ impl<'t> Context<'t> {
         unsafe {
             SymbolAffineExpressionRef::from_c_api(
                 mlirAffineSymbolExprGet(*self.handle.borrow_mut(), position.cast_signed()),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -346,7 +346,7 @@ impl<'t> Context<'t> {
     /// Creates a new [`ConstantAffineExpressionRef`] with the specified value.
     pub fn constant_affine_expression<'c>(&'c self, value: i64) -> ConstantAffineExpressionRef<'c, 't> {
         unsafe {
-            ConstantAffineExpressionRef::from_c_api(mlirAffineConstantExprGet(*self.handle.borrow_mut(), value), &self)
+            ConstantAffineExpressionRef::from_c_api(mlirAffineConstantExprGet(*self.handle.borrow_mut(), value), self)
                 .unwrap()
         }
     }
@@ -521,7 +521,7 @@ impl<'c, 't> AffineExpression<'c, 't> for FloorDivAffineExpressionRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 

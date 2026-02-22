@@ -31,7 +31,7 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
 
     /// Returns a reference to the [`Context`] associated with this [`OperationBuilder`].
     pub fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 
     /// Adds the provided [`Attribute`] to the [`Operation`] that is being built under the provided name.

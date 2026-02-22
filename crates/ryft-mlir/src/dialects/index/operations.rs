@@ -3,14 +3,14 @@ use crate::{
     OperationBuilder, Value, ValueRef, mlir_binary_op, mlir_generic_unary_op, mlir_op, mlir_op_trait,
 };
 
-pub const CONSTANT_VALUE_ATTRIBUTE: &'static str = "value";
+pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 
 pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn value(&self) -> usize {
         self.attribute(CONSTANT_VALUE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `index::constant`"))
+            .unwrap_or_else(|| panic!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `index::constant`"))
     }
 }
 
@@ -37,7 +37,7 @@ pub trait BoolConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(CONSTANT_VALUE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `index::bool_constant`"))
+            .unwrap_or_else(|| panic!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `index::bool_constant`"))
     }
 }
 
@@ -100,7 +100,7 @@ pub enum ComparisonPredicate {
     UnsignedGreaterThanOrEqual,
 }
 
-pub const CMP_PREDICATE_ATTRIBUTE: &'static str = "pred";
+pub const CMP_PREDICATE_ATTRIBUTE: &str = "pred";
 
 pub trait CmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
@@ -126,7 +126,7 @@ pub trait CmpOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 "#index<cmp_predicate uge>" => Some(ComparisonPredicate::UnsignedGreaterThanOrEqual),
                 _ => None,
             })
-            .expect(&format!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `index::cmp`"))
+            .unwrap_or_else(|| panic!("invalid '{CMP_PREDICATE_ATTRIBUTE}' attribute in `index::cmp`"))
     }
 }
 

@@ -53,7 +53,7 @@ impl<'t> Context<'t> {
             let child = child.map(|location| location.to_c_api()).unwrap_or(MlirLocation { ptr: std::ptr::null_mut() });
             NamedLocationRef::from_c_api(
                 mlirLocationNameGet(*self.handle.borrow(), StringRef::from(name.as_ref()).to_c_api(), child),
-                &self,
+                self,
             )
             .unwrap()
         }

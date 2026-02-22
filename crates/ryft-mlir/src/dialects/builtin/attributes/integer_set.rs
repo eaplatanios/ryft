@@ -61,7 +61,7 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { IntegerSetAttributeRef::from_c_api(mlirIntegerSetAttrGet(integer_set.to_c_api()), &self).unwrap() }
+        unsafe { IntegerSetAttributeRef::from_c_api(mlirIntegerSetAttrGet(integer_set.to_c_api()), self).unwrap() }
     }
 }
 

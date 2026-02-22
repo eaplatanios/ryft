@@ -53,7 +53,7 @@ impl<'c, 't> AffineMap<'c, 't> {
 
     /// Returns a reference to the [`Context`] that owns this [`AffineMap`].
     pub fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 
     /// Returns the number of dimensions of this [`AffineMap`].
@@ -245,7 +245,7 @@ impl Display for AffineMap<'_, '_> {
 
 impl Debug for AffineMap<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(formatter, "AffineMap[\"{}\"]", self.to_string())
+        write!(formatter, "AffineMap[{self}]")
     }
 }
 
@@ -269,7 +269,7 @@ impl<'t> Context<'t> {
                     affine_expressions.len().cast_signed(),
                     affine_expressions.as_ptr() as *mut _,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -278,7 +278,7 @@ impl<'t> Context<'t> {
     /// Creates an empty [`AffineMap`] (i.e., a zero result affine map with no dimensions or symbols; `() -> ()`)
     /// owned by this [`Context`].
     pub fn empty_affine_map<'c>(&'c self) -> AffineMap<'c, 't> {
-        unsafe { AffineMap::from_c_api(mlirAffineMapEmptyGet(*self.handle.borrow_mut()), &self).unwrap() }
+        unsafe { AffineMap::from_c_api(mlirAffineMapEmptyGet(*self.handle.borrow_mut()), self).unwrap() }
     }
 
     /// Creates a zero result [`AffineMap`] with the provided number of dimensions and symbols (i.e., `(...) -> ()`),
@@ -291,7 +291,7 @@ impl<'t> Context<'t> {
                     dimension_count.cast_signed(),
                     symbol_count.cast_signed(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -299,7 +299,7 @@ impl<'t> Context<'t> {
 
     /// Creates an [`AffineMap`] with a single constant result. The resulting map is owned by this [`Context`].
     pub fn constant_affine_map<'c>(&'c self, value: i64) -> AffineMap<'c, 't> {
-        unsafe { AffineMap::from_c_api(mlirAffineMapConstantGet(*self.handle.borrow_mut(), value), &self).unwrap() }
+        unsafe { AffineMap::from_c_api(mlirAffineMapConstantGet(*self.handle.borrow_mut(), value), self).unwrap() }
     }
 
     /// Creates a multidimensional identity [`AffineMap`] with the specified number of dimensions.
@@ -308,7 +308,7 @@ impl<'t> Context<'t> {
         unsafe {
             AffineMap::from_c_api(
                 mlirAffineMapMultiDimIdentityGet(*self.handle.borrow_mut(), dimension_count.cast_signed()),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -325,7 +325,7 @@ impl<'t> Context<'t> {
                     dimension_count.cast_signed(),
                     result_count.cast_signed(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -343,7 +343,7 @@ impl<'t> Context<'t> {
                     size.cast_signed(),
                     permutation.as_ptr() as *mut _,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -561,7 +561,7 @@ mod tests {
         let dimension_1 = context.dimension_affine_expression(1);
         let map = context.affine_map(2, 0, &[dimension_0 + dimension_1]);
         assert_eq!(format!("{}", map), "(d0, d1) -> (d0 + d1)");
-        assert_eq!(format!("{:?}", map), "AffineMap[\"(d0, d1) -> (d0 + d1)\"]");
+        assert_eq!(format!("{:?}", map), "AffineMap[(d0, d1) -> (d0 + d1)]");
     }
     #[test]
     fn test_affine_map_dump() {

@@ -756,7 +756,7 @@ impl<'t> Context<'t> {
         }
 
         unsafe {
-            let data_size = data.len() * size_of::<D>();
+            let data_size = size_of_val(data);
             let data_alignment = align_of::<D>();
             let data_layout = std::alloc::Layout::from_size_align_unchecked(data_size, data_alignment);
             let data_ptr = std::alloc::alloc(data_layout) as *mut D;
@@ -772,7 +772,7 @@ impl<'t> Context<'t> {
                     Some(deallocate),
                     std::ptr::null_mut(),
                 ),
-                &self,
+                self,
             )
         }
     }
@@ -981,7 +981,7 @@ impl<'t> Context<'t> {
         unsafe {
             SparseElementsAttributeRef::from_c_api(
                 mlirSparseElementsAttribute(shaped_type.to_c_api(), indices.to_c_api(), values.to_c_api()),
-                &self,
+                self,
             )
         }
     }

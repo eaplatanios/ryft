@@ -272,7 +272,7 @@ impl<'t> Context<'t> {
                     layout.unwrap_or_else(|| self.null_attribute()).to_c_api(),
                     memory_space.unwrap_or_else(|| self.null_attribute()).to_c_api(),
                 ),
-                &self,
+                self,
             )
         }
     }
@@ -306,7 +306,7 @@ impl<'t> Context<'t> {
                     dimensions.as_ptr(),
                     memory_space.unwrap_or_else(|| self.null_attribute()).to_c_api(),
                 ),
-                &self,
+                self,
             )
         }
     }
@@ -389,7 +389,7 @@ impl<'t> Context<'t> {
                     element_type.to_c_api(),
                     memory_space.unwrap_or_else(|| self.null_attribute()).to_c_api(),
                 ),
-                &self,
+                self,
             )
         }
     }

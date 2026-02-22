@@ -161,9 +161,11 @@ impl<'o, 'c, 't: 'c> SymbolTable<'o, 'c, 't> {
 
 /// Represents the types of visibility that an MLIR symbol may have.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Default)]
 pub enum SymbolVisibility {
     /// Represents symbols that are public and may be referenced anywhere internal or external to the visible
     /// references in the IR.
+    #[default]
     Public,
 
     /// Represents symbols that are private and may only be referenced by
@@ -177,11 +179,6 @@ pub enum SymbolVisibility {
     Nested,
 }
 
-impl Default for SymbolVisibility {
-    fn default() -> Self {
-        Self::Public
-    }
-}
 
 impl Display for SymbolVisibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,7 +194,7 @@ impl<'s> TryFrom<&'s str> for SymbolVisibility {
     type Error = String;
 
     fn try_from(value: &'s str) -> Result<Self, Self::Error> {
-        match value.as_ref() {
+        match value {
             "public" => Ok(Self::Public),
             "private" => Ok(Self::Private),
             "nested" => Ok(Self::Nested),

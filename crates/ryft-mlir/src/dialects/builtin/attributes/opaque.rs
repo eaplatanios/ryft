@@ -73,7 +73,7 @@ impl<'t> Context<'t> {
                     data.as_ptr() as *const _,
                     r#type.to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }

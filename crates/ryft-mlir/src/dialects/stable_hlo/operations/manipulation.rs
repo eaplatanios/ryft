@@ -9,7 +9,7 @@ use crate::{
 use super::{HasPadding, PADDING_ATTRIBUTE};
 
 /// Name of the [`Attribute`] that is used to store [`GetDimensionSizeOperation::dimension`].
-pub const GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE: &'static str = "dimension";
+pub const GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE: &str = "dimension";
 
 /// StableHLO [`Operation`] that returns the size of dimension [`GetDimensionSizeOperation::dimension`] of its input
 /// tensor as an `i32` scalar [`TensorTypeRef`].
@@ -32,9 +32,7 @@ pub trait GetDimensionSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimension(&self) -> usize {
         self.attribute(GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .expect(&format!(
-                "invalid '{GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::get_dimension_size`",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::get_dimension_size`"))
             .signless_value() as usize
     }
 }
@@ -69,7 +67,7 @@ pub fn get_dimension_size<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
 }
 
 /// Name of the [`Attribute`] that is used to store [`TransposeOperation::permutation`].
-pub const TRANSPOSE_PERMUTATION_ATTRIBUTE: &'static str = "permutation";
+pub const TRANSPOSE_PERMUTATION_ATTRIBUTE: &str = "permutation";
 
 /// StableHLO [`Operation`] that permutes the dimensions of its input tensor according to
 /// [`TransposeOperation::permutation`]. More formally, `result[result_index] = operand[operand_index]` where
@@ -99,7 +97,7 @@ pub trait TransposeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRANSPOSE_PERMUTATION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
             .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .expect(&format!("invalid '{TRANSPOSE_PERMUTATION_ATTRIBUTE}' attribute in `stable_hlo::transpose`"))
+            .unwrap_or_else(|| panic!("invalid '{TRANSPOSE_PERMUTATION_ATTRIBUTE}' attribute in `stable_hlo::transpose`"))
     }
 }
 
@@ -262,7 +260,7 @@ pub fn dynamic_reshape<
 
 /// Name of the [`Attribute`] that is used to store [`BroadcastOperation::dimensions`]
 /// and [`DynamicBroadcastOperation::dimensions`].
-pub const BROADCAST_DIMENSIONS_ATTRIBUTE: &'static str = "broadcast_dimensions";
+pub const BROADCAST_DIMENSIONS_ATTRIBUTE: &str = "broadcast_dimensions";
 
 /// StableHLO [`Operation`] that expands the dimensions and/or rank of an input tensor by duplicating data
 /// in the operand tensor. The operation produces a result tensor with a potentially higher rank and/or larger
@@ -311,7 +309,7 @@ pub trait BroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> Vec<usize> {
         self.attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::broadcast`"))
+            .unwrap_or_else(|| panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::broadcast`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -351,10 +349,10 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: L
 }
 
 /// Name of the [`Attribute`] that is used to store [`DynamicBroadcastOperation::known_expanding_dimensions`].
-pub const DYNAMIC_BROADCAST_KNOWN_EXPANDING_DIMENSIONS_ATTRIBUTE: &'static str = "known_expanding_dimensions";
+pub const DYNAMIC_BROADCAST_KNOWN_EXPANDING_DIMENSIONS_ATTRIBUTE: &str = "known_expanding_dimensions";
 
 /// Name of the [`Attribute`] that is used to store [`DynamicBroadcastOperation::known_non_expanding_dimensions`].
-pub const DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE: &'static str = "known_nonexpanding_dimensions";
+pub const DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE: &str = "known_nonexpanding_dimensions";
 
 /// StableHLO [`Operation`] that expands the dimensions and/or rank of an input tensor by duplicating data
 /// in the operand tensor. Semantically, this operation is equivalent to [`BroadcastOperation`] except for the fact
@@ -411,7 +409,7 @@ pub trait DynamicBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> Vec<usize> {
         self.attribute(BROADCAST_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_broadcast`"))
+            .unwrap_or_else(|| panic!("invalid '{BROADCAST_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_broadcast`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -512,13 +510,13 @@ pub fn dynamic_broadcast<
 }
 
 /// Name of the [`Attribute`] that is used to store [`PadOperation::edge_padding_low`].
-pub const EDGE_PADDING_LOW_ATTRIBUTE: &'static str = "edge_padding_low";
+pub const EDGE_PADDING_LOW_ATTRIBUTE: &str = "edge_padding_low";
 
 /// Name of the [`Attribute`] that is used to store [`PadOperation::edge_padding_high`].
-pub const EDGE_PADDING_HIGH_ATTRIBUTE: &'static str = "edge_padding_high";
+pub const EDGE_PADDING_HIGH_ATTRIBUTE: &str = "edge_padding_high";
 
 /// Name of the [`Attribute`] that is used to store [`PadOperation::interior_padding`].
-pub const INTERIOR_PADDING_ATTRIBUTE: &'static str = "interior_padding";
+pub const INTERIOR_PADDING_ATTRIBUTE: &str = "interior_padding";
 
 /// StableHLO [`Operation`] that expands a tensor by adding padding around and between its elements.
 ///
@@ -577,7 +575,7 @@ pub trait PadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn edge_padding_low(&self) -> Vec<i64> {
         self.attribute(EDGE_PADDING_LOW_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{EDGE_PADDING_LOW_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
+            .unwrap_or_else(|| panic!("invalid '{EDGE_PADDING_LOW_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
             .values()
             .collect()
     }
@@ -586,7 +584,7 @@ pub trait PadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn edge_padding_high(&self) -> Vec<i64> {
         self.attribute(EDGE_PADDING_HIGH_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{EDGE_PADDING_HIGH_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
+            .unwrap_or_else(|| panic!("invalid '{EDGE_PADDING_HIGH_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
             .values()
             .collect()
     }
@@ -595,7 +593,7 @@ pub trait PadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn interior_padding(&self) -> Vec<usize> {
         self.attribute(INTERIOR_PADDING_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{INTERIOR_PADDING_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
+            .unwrap_or_else(|| panic!("invalid '{INTERIOR_PADDING_ATTRIBUTE}' attribute in `stable_hlo::pad`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -752,7 +750,7 @@ pub fn dynamic_pad<
 }
 
 /// Name of the [`Attribute`] that is used to store [`ConcatenateOperation::dimension`].
-pub const CONCATENATE_DIMENSION_ATTRIBUTE: &'static str = "dimension";
+pub const CONCATENATE_DIMENSION_ATTRIBUTE: &str = "dimension";
 
 /// StableHLO [`Operation`] that concatenates multiple input tensors along a specified dimension,
 /// in the same order as provided in the inputs to this operation.
@@ -786,7 +784,7 @@ pub trait ConcatenateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimension(&self) -> usize {
         self.attribute(CONCATENATE_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .expect(&format!("invalid '{CONCATENATE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::concatenate`"))
+            .unwrap_or_else(|| panic!("invalid '{CONCATENATE_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::concatenate`"))
             .signless_value() as usize
     }
 }
@@ -820,13 +818,13 @@ pub fn concatenate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>
 }
 
 /// Name of the [`Attribute`] that is used to store [`SliceOperation::start_indices`].
-pub const SLICE_START_INDICES_ATTRIBUTE: &'static str = "start_indices";
+pub const SLICE_START_INDICES_ATTRIBUTE: &str = "start_indices";
 
 /// Name of the [`Attribute`] that is used to store [`SliceOperation::limit_indices`].
-pub const SLICE_LIMIT_INDICES_ATTRIBUTE: &'static str = "limit_indices";
+pub const SLICE_LIMIT_INDICES_ATTRIBUTE: &str = "limit_indices";
 
 /// Name of the [`Attribute`] that is used to store [`SliceOperation::strides`].
-pub const SLICE_STRIDES_ATTRIBUTE: &'static str = "strides";
+pub const SLICE_STRIDES_ATTRIBUTE: &str = "strides";
 
 /// StableHLO [`Operation`] that extracts a slice from its input/operand tensor using statically-specified
 /// [`SliceOperation::start_indices`], [`SliceOperation::limit_indices`], and [`SliceOperation::strides`].
@@ -856,7 +854,7 @@ pub trait SliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn start_indices(&self) -> Vec<usize> {
         self.attribute(SLICE_START_INDICES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{SLICE_START_INDICES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
+            .unwrap_or_else(|| panic!("invalid '{SLICE_START_INDICES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -866,7 +864,7 @@ pub trait SliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn limit_indices(&self) -> Vec<usize> {
         self.attribute(SLICE_LIMIT_INDICES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{SLICE_LIMIT_INDICES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
+            .unwrap_or_else(|| panic!("invalid '{SLICE_LIMIT_INDICES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -876,7 +874,7 @@ pub trait SliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn strides(&self) -> Vec<usize> {
         self.attribute(SLICE_STRIDES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{SLICE_STRIDES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
+            .unwrap_or_else(|| panic!("invalid '{SLICE_STRIDES_ATTRIBUTE}' attribute in `stable_hlo::slice`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -929,7 +927,7 @@ pub fn slice<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 }
 
 /// Name of the [`Attribute`] that is used to store [`DynamicSliceOperation::slice_sizes`].
-pub const DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE: &'static str = "slice_sizes";
+pub const DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE: &str = "slice_sizes";
 
 /// StableHLO [`Operation`] that extracts a slice from a tensor using dynamically-computed start indices.
 /// [`DynamicSliceOperation::start_indices`] contains the start indices of the slice for each dimension, subject to
@@ -980,9 +978,7 @@ pub trait DynamicSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn slice_sizes(&self) -> Vec<usize> {
         self.attribute(DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!(
-                "invalid '{DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::dynamic_slice`",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::dynamic_slice`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -1204,7 +1200,7 @@ impl<'t> Context<'t> {
                     start_index_map.as_ptr(),
                     index_vector_dimension as i64,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -1212,13 +1208,13 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`GatherOperation::dimensions`].
-pub const GATHER_DIMENSIONS_ATTRIBUTE: &'static str = "dimension_numbers";
+pub const GATHER_DIMENSIONS_ATTRIBUTE: &str = "dimension_numbers";
 
 /// Name of the [`Attribute`] that is used to store [`GatherOperation::slice_sizes`].
-pub const GATHER_SLICE_SIZES_ATTRIBUTE: &'static str = "slice_sizes";
+pub const GATHER_SLICE_SIZES_ATTRIBUTE: &str = "slice_sizes";
 
 /// Name of the [`Attribute`] that is used to store [`GatherOperation::indices_are_sorted`].
-pub const GATHER_INDICES_ARE_SORTED_ATTRIBUTE: &'static str = "indices_are_sorted";
+pub const GATHER_INDICES_ARE_SORTED_ATTRIBUTE: &str = "indices_are_sorted";
 
 /// StableHLO [`Operation`] that gathers slices from [`GatherOperation::input`] at indices specified by
 /// [`GatherOperation::start_indices`]. The exact semantics are more involved and are also controllable by
@@ -1308,14 +1304,14 @@ pub trait GatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> GatherDimensionsAttributeRef<'c, 't> {
         self.attribute(GATHER_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<GatherDimensionsAttributeRef>())
-            .expect(&format!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::gather`"))
+            .unwrap_or_else(|| panic!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::gather`"))
     }
 
     /// Returns the slice sizes for this [`GatherOperation`].
     fn slice_sizes(&self) -> Vec<usize> {
         self.attribute(GATHER_SLICE_SIZES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
-            .expect(&format!("invalid '{GATHER_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::gather`"))
+            .unwrap_or_else(|| panic!("invalid '{GATHER_SLICE_SIZES_ATTRIBUTE}' attribute in `stable_hlo::gather`"))
             .values()
             .map(|value| value as usize)
             .collect()
@@ -1430,7 +1426,7 @@ pub trait DynamicGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> GatherDimensionsAttributeRef<'c, 't> {
         self.attribute(GATHER_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<GatherDimensionsAttributeRef>())
-            .expect(&format!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_gather`"))
+            .unwrap_or_else(|| panic!("invalid '{GATHER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dynamic_gather`"))
     }
 
     /// Returns whether the indices are sorted for this [`DynamicGatherOperation`].
@@ -1582,7 +1578,7 @@ impl<'t> Context<'t> {
                     scattered_dimensions_to_operand_dimensions.as_ptr(),
                     index_vector_dimension as i64,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -1590,13 +1586,13 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`ScatterOperation::dimensions`].
-pub const SCATTER_DIMENSIONS_ATTRIBUTE: &'static str = "scatter_dimension_numbers";
+pub const SCATTER_DIMENSIONS_ATTRIBUTE: &str = "scatter_dimension_numbers";
 
 /// Name of the [`Attribute`] that is used to store [`ScatterOperation::indices_are_sorted`].
-pub const SCATTER_INDICES_ARE_SORTED_ATTRIBUTE: &'static str = "indices_are_sorted";
+pub const SCATTER_INDICES_ARE_SORTED_ATTRIBUTE: &str = "indices_are_sorted";
 
 /// Name of the [`Attribute`] that is used to store [`ScatterOperation::unique_indices`].
-pub const SCATTER_UNIQUE_INDICES_ATTRIBUTE: &'static str = "unique_indices";
+pub const SCATTER_UNIQUE_INDICES_ATTRIBUTE: &str = "unique_indices";
 
 /// StableHLO [`Operation`] that produces result tensors which are equal to its input tensors except that several
 /// slices specified by [`ScatterOperation::scatter_indices`] are updated with [`ScatterOperation::updates`] using
@@ -1695,7 +1691,7 @@ pub trait ScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegio
     fn dimensions(&self) -> ScatterDimensionsAttributeRef<'c, 't> {
         self.attribute(SCATTER_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ScatterDimensionsAttributeRef>())
-            .expect(&format!("invalid '{SCATTER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::scatter`"))
+            .unwrap_or_else(|| panic!("invalid '{SCATTER_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::scatter`"))
     }
 
     /// Returns whether the indices are assumed to be sorted for this [`ScatterOperation`].
@@ -1768,10 +1764,10 @@ pub fn scatter<
 }
 
 /// Name of the [`Attribute`] that is used to store [`SelectAndScatterOperation::window_dimensions`].
-pub const SELECT_AND_SCATTER_WINDOW_DIMENSIONS_ATTRIBUTE: &'static str = "window_dimensions";
+pub const SELECT_AND_SCATTER_WINDOW_DIMENSIONS_ATTRIBUTE: &str = "window_dimensions";
 
 /// Name of the [`Attribute`] that is used to store [`SelectAndScatterOperation::window_strides`].
-pub const SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE: &'static str = "window_strides";
+pub const SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE: &str = "window_strides";
 
 /// StableHLO [`Operation`] that scatters values from [`SelectAndScatterOperation::source`]
 /// using [`SelectAndScatterOperation::scatter`] based on the outcome of

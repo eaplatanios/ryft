@@ -55,7 +55,7 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
-            IntegerTypeRef::from_c_api(mlirIntegerTypeGet(*self.handle.borrow(), bit_width as u32), &self).unwrap()
+            IntegerTypeRef::from_c_api(mlirIntegerTypeGet(*self.handle.borrow(), bit_width as u32), self).unwrap()
         }
     }
 
@@ -67,7 +67,7 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
-            IntegerTypeRef::from_c_api(mlirIntegerTypeSignedGet(*self.handle.borrow(), bit_width as u32), &self)
+            IntegerTypeRef::from_c_api(mlirIntegerTypeSignedGet(*self.handle.borrow(), bit_width as u32), self)
                 .unwrap()
         }
     }
@@ -80,7 +80,7 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
-            IntegerTypeRef::from_c_api(mlirIntegerTypeUnsignedGet(*self.handle.borrow(), bit_width as u32), &self)
+            IntegerTypeRef::from_c_api(mlirIntegerTypeUnsignedGet(*self.handle.borrow(), bit_width as u32), self)
                 .unwrap()
         }
     }

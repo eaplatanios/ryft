@@ -4,10 +4,10 @@ use crate::{
 };
 
 /// Name of the [`Attribute`] that is used to store [`BatchNormOperation::feature_index`].
-pub const BATCH_NORM_FEATURE_INDEX_ATTRIBUTE: &'static str = "feature_index";
+pub const BATCH_NORM_FEATURE_INDEX_ATTRIBUTE: &str = "feature_index";
 
 /// Name of the [`Attribute`] that is used to store [`BatchNormOperation::epsilon`].
-pub const BATCH_NORM_EPSILON_ATTRIBUTE: &'static str = "epsilon";
+pub const BATCH_NORM_EPSILON_ATTRIBUTE: &str = "epsilon";
 
 /// Trait that is shared among all StableHLO [`Operation`]s that are related to
 /// [batch normalization](https://en.wikipedia.org/wiki/Batch_normalization).
@@ -17,11 +17,9 @@ pub trait BatchNormOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(BATCH_NORM_FEATURE_INDEX_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as u32)
-            .expect(&format!(
-                "invalid '{}' attribute in `stable_hlo::{}`",
+            .unwrap_or_else(|| panic!("invalid '{}' attribute in `stable_hlo::{}`",
                 BATCH_NORM_FEATURE_INDEX_ATTRIBUTE,
-                self.name(),
-            ))
+                self.name()))
     }
 
     /// Returns the ε parameter used by this [`BatchNormOperation`] for numerical stability.
@@ -29,7 +27,7 @@ pub trait BatchNormOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(BATCH_NORM_EPSILON_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<FloatAttributeRef>())
             .map(|attribute| attribute.value() as f32)
-            .expect(&format!("invalid '{}' attribute in `stable_hlo::{}`", BATCH_NORM_EPSILON_ATTRIBUTE, self.name()))
+            .unwrap_or_else(|| panic!("invalid '{}' attribute in `stable_hlo::{}`", BATCH_NORM_EPSILON_ATTRIBUTE, self.name()))
     }
 }
 

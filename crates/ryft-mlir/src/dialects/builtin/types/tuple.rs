@@ -69,7 +69,7 @@ impl<'t> Context<'t> {
             let elements = elements.iter().map(|element| element.to_c_api()).collect::<Vec<_>>();
             TupleTypeRef::from_c_api(
                 mlirTupleTypeGet(*self.handle.borrow(), elements.len().cast_signed(), elements.as_ptr() as *const _),
-                &self,
+                self,
             )
             .unwrap()
         }

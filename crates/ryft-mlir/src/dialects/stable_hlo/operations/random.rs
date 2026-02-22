@@ -33,7 +33,7 @@ mlir_enum_attribute!(
 );
 
 /// Name of the [`Attribute`] that is used to store [`RngOperation::rng_distribution`].
-pub const RNG_DISTRIBUTION_ATTRIBUTE: &'static str = "rng_distribution";
+pub const RNG_DISTRIBUTION_ATTRIBUTE: &str = "rng_distribution";
 
 /// StableHLO [`Operation`] that generates random numbers using a specific distribution, populating tensors of
 /// a specific data type and shape. This operation takes three inputs/operands, `a`, `b`, and `shape`. `a` and `b` are
@@ -79,7 +79,7 @@ pub trait RngOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(RNG_DISTRIBUTION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<RngDistributionAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!("invalid '{RNG_DISTRIBUTION_ATTRIBUTE}' attribute in `stable_hlo::rng`"))
+            .unwrap_or_else(|| panic!("invalid '{RNG_DISTRIBUTION_ATTRIBUTE}' attribute in `stable_hlo::rng`"))
     }
 }
 
@@ -128,7 +128,7 @@ pub fn rng<
 }
 
 /// Name of the [`Attribute`] that is used to store [`RngBitGeneratorOperation::rng_algorithm`].
-pub const RNG_ALGORITHM_ATTRIBUTE: &'static str = "rng_algorithm";
+pub const RNG_ALGORITHM_ATTRIBUTE: &str = "rng_algorithm";
 
 /// StableHLO [`Operation`] that generates random bits using the provided initial state (as its only input/operand)
 /// and algorithm specified by [`RngBitGeneratorOperation::rng_algorithm`]. It produces as outputs the updated
@@ -161,7 +161,7 @@ pub trait RngBitGeneratorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(RNG_ALGORITHM_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<RngAlgorithmAttributeRef<'c, 't>>())
             .map(|attribute| attribute.value())
-            .expect(&format!("invalid '{RNG_ALGORITHM_ATTRIBUTE}' attribute in `stable_hlo::rng_bit_generator`"))
+            .unwrap_or_else(|| panic!("invalid '{RNG_ALGORITHM_ATTRIBUTE}' attribute in `stable_hlo::rng_bit_generator`"))
     }
 }
 

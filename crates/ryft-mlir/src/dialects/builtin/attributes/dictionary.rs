@@ -127,7 +127,7 @@ impl<'t> Context<'t> {
                     elements.len().cast_signed(),
                     elements.as_ptr() as *const _,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }

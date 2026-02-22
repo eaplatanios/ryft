@@ -69,7 +69,7 @@ impl<'c, 't> Attribute<'c, 't> for ChannelHandleAttributeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -96,7 +96,7 @@ impl<'t> Context<'t> {
                     channel_id.map(|id| id as i64).unwrap_or(-1),
                     channel_type as i64,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -238,7 +238,7 @@ pub fn after_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 
 /// Name of the [`Attribute`] that is used to store [`HasChannelHandle::channel_id`],
 /// and [`HasChannelHandle::channel_type`].
-pub const COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE: &'static str = "channel_handle";
+pub const COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE: &str = "channel_handle";
 
 /// Trait that represents collective [`Operation`]s that support specifying and operating over specific channels.
 pub trait SupportsChannelHandle<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -264,9 +264,7 @@ pub trait HasChannelHandle<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
             .and_then(|attribute| attribute.channel_id())
-            .expect(&format!(
-                "invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation"))
     }
 
     /// Returns the type of the channel that this [`Operation`] transfers data over.
@@ -274,14 +272,12 @@ pub trait HasChannelHandle<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ChannelHandleAttributeRef>())
             .map(|attribute| attribute.channel_type())
-            .expect(&format!(
-                "invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE}' attribute in StableHLO collective operation"))
     }
 }
 
 /// Name of the [`Attribute`] that is used to store [`HasSourceTargetPairs::source_target_pairs`].
-pub const COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE: &'static str = "source_target_pairs";
+pub const COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE: &str = "source_target_pairs";
 
 /// Trait that represents collective [`Operation`]s that have a `source_target_pairs` attribute.
 pub trait HasSourceTargetPairs<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -325,7 +321,7 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`SendRecvOperation::is_host_transfer`].
-pub const SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE: &'static str = "is_host_transfer";
+pub const SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE: &str = "is_host_transfer";
 
 /// Trait for functionality that is shared between [`SendOperation`] and [`RecvOperation`].
 pub trait SendRecvOperation<'o, 'c: 'o, 't: 'c>:
@@ -337,9 +333,7 @@ pub trait SendRecvOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!(
-                "invalid '{SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE}' attribute in StableHLO send/receive operation",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE}' attribute in StableHLO send/receive operation"))
     }
 }
 
@@ -493,7 +487,7 @@ pub fn recv<'k, 'c: 'k, 't: 'c, K: Value<'k, 'c, 't>, T: Type<'c, 't>, L: Locati
 }
 
 /// Name of the [`Attribute`] that is used to store [`OutfeedOperation::outfeed_config`].
-pub const OUTFEED_CONFIG_ATTRIBUTE: &'static str = "outfeed_config";
+pub const OUTFEED_CONFIG_ATTRIBUTE: &str = "outfeed_config";
 
 /// StableHLO [`Operation`] that writes data to a feed that is configured by [`OutfeedOperation::outfeed_config`],
 /// where this configuration is implementation-specific. This operation takes as inputs a variable number of tensors
@@ -519,7 +513,7 @@ pub trait OutfeedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn outfeed_config(&self) -> StringRef<'c> {
         self.attribute(OUTFEED_CONFIG_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .expect(&format!("invalid '{OUTFEED_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::outfeed`"))
+            .unwrap_or_else(|| panic!("invalid '{OUTFEED_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::outfeed`"))
     }
 }
 
@@ -559,7 +553,7 @@ pub fn outfeed<
 }
 
 /// Name of the [`Attribute`] that is used to store [`InfeedOperation::infeed_config`].
-pub const INFEED_CONFIG_ATTRIBUTE: &'static str = "infeed_config";
+pub const INFEED_CONFIG_ATTRIBUTE: &str = "infeed_config";
 
 /// StableHLO [`Operation`] that reads data from a feed that is configured by [`InfeedOperation::infeed_config`],
 /// where this configuration is implementation-specific. The operation takes an input
@@ -584,7 +578,7 @@ pub trait InfeedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn infeed_config(&self) -> StringRef<'c> {
         self.attribute(INFEED_CONFIG_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .expect(&format!("invalid '{INFEED_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::infeed`"))
+            .unwrap_or_else(|| panic!("invalid '{INFEED_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::infeed`"))
     }
 }
 
@@ -627,10 +621,10 @@ pub fn infeed<
 }
 
 /// Name of the [`Attribute`] that is used to store [`HasReplicaGroups::replica_groups`].
-pub const COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE: &'static str = "replica_groups";
+pub const COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE: &str = "replica_groups";
 
 /// Name of the [`Attribute`] that is used to store [`HasReplicaGroups::use_global_device_ids`].
-pub const COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE: &'static str = "use_global_device_ids";
+pub const COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE: &str = "use_global_device_ids";
 
 /// Trait that represents collective [`Operation`]s that support specifying and operating over replica groups.
 pub trait HasReplicaGroups<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -709,7 +703,7 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`AllGatherOperation::all_gather_dimension`].
-pub const ALL_GATHER_DIMENSION_ATTRIBUTE: &'static str = "all_gather_dim";
+pub const ALL_GATHER_DIMENSION_ATTRIBUTE: &str = "all_gather_dim";
 
 /// StableHLO [`Operation`] that gathers values from all processes within each process group in the StableHLO process
 /// grid, and concatenates them along the [`AllGatherOperation::all_gather_dimension`] dimension.
@@ -748,7 +742,7 @@ pub trait AllGatherOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_GATHER_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!("invalid '{ALL_GATHER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_gather`"))
+            .unwrap_or_else(|| panic!("invalid '{ALL_GATHER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_gather`"))
     }
 }
 
@@ -892,13 +886,13 @@ pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
 }
 
 /// Name of the [`Attribute`] that is used to store [`AllToAllOperation::split_dimension`].
-pub const ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE: &'static str = "split_dimension";
+pub const ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE: &str = "split_dimension";
 
 /// Name of the [`Attribute`] that is used to store [`AllToAllOperation::split_count`].
-pub const ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE: &'static str = "split_count";
+pub const ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE: &str = "split_count";
 
 /// Name of the [`Attribute`] that is used to store [`AllToAllOperation::concatenation_dimension`].
-pub const ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE: &'static str = "concat_dimension";
+pub const ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE: &str = "concat_dimension";
 
 /// StableHLO [`Operation`] that scatters and gathers data across all processes in a process group. Within each
 /// process group in the StableHLO process grid, this operation splits the values of the input tensors along
@@ -945,7 +939,7 @@ pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!("invalid '{ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
+            .unwrap_or_else(|| panic!("invalid '{ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
     }
 
     /// Returns the number of parts each operand is divided into in this [`AllToAllOperation`].
@@ -953,7 +947,7 @@ pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!("invalid '{ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
+            .unwrap_or_else(|| panic!("invalid '{ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
     }
 
     /// Returns the dimension along which scattered parts are concatenated in this [`AllToAllOperation`].
@@ -961,9 +955,7 @@ pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!(
-                "invalid '{ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::all_to_all`"))
     }
 }
 
@@ -1174,7 +1166,7 @@ pub fn collective_permute<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReduceScatterOperation::dimension`].
-pub const REDUCE_SCATTER_DIMENSION_ATTRIBUTE: &'static str = "scatter_dimension";
+pub const REDUCE_SCATTER_DIMENSION_ATTRIBUTE: &str = "scatter_dimension";
 
 /// StableHLO [`Operation`] that performs a reduction using [`ReduceScatterOperation::computation`] over the values of
 /// the operand tensor, across [`HasReplicaGroups::replica_groups`] in the StableHLO process grid, followed by
@@ -1218,9 +1210,7 @@ pub trait ReduceScatterOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(REDUCE_SCATTER_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!(
-                "invalid '{REDUCE_SCATTER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::reduce_scatter`"
-            ))
+            .unwrap_or_else(|| panic!("invalid '{REDUCE_SCATTER_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::reduce_scatter`"))
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the reduction computation

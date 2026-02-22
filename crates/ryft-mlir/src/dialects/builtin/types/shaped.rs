@@ -106,7 +106,7 @@ impl<'t> Context<'t> {
                     element_type.to_c_api(),
                     self.null_attribute().to_c_api(),
                 ),
-                &self,
+                self,
             )
         }
     }

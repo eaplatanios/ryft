@@ -125,7 +125,7 @@ impl<'t> Context<'t> {
                     element_type.to_c_api(),
                     encoding.unwrap_or_else(|| self.null_attribute()).to_c_api(),
                 ),
-                &self,
+                self,
             )
         }
     }
@@ -185,7 +185,7 @@ impl<'t> Context<'t> {
         unsafe {
             UnrankedTensorTypeRef::from_c_api(
                 mlirUnrankedTensorTypeGetChecked(location.to_c_api(), element_type.to_c_api()),
-                &self,
+                self,
             )
         }
     }

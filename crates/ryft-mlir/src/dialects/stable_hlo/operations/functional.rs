@@ -10,7 +10,7 @@ use crate::{
 use super::{HasPadding, PADDING_ATTRIBUTE};
 
 /// Name of the [`Attribute`] that is used to store [`MapOperation::dimensions`].
-pub const MAP_DIMENSIONS_ATTRIBUTE: &'static str = "dimensions";
+pub const MAP_DIMENSIONS_ATTRIBUTE: &str = "dimensions";
 
 /// StableHLO [`Operation`] that applies a computation (i.e., a function) elementwise to input tensors "zipped"
 /// together, across specific dimensions, producing a resulting tensor.
@@ -54,7 +54,7 @@ pub trait MapOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'o
                     .cast::<DenseInteger64ArrayAttributeRef>()
                     .map(|attribute| attribute.values().map(|value| value as usize).collect())
             })
-            .expect(&format!("invalid '{MAP_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::map`"))
+            .unwrap_or_else(|| panic!("invalid '{MAP_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::map`"))
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the mapping computation
@@ -104,7 +104,7 @@ pub fn map<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReduceOperation::dimensions`].
-pub const REDUCE_DIMENSIONS_ATTRIBUTE: &'static str = "dimensions";
+pub const REDUCE_DIMENSIONS_ATTRIBUTE: &str = "dimensions";
 
 /// StableHLO [`Operation`] that applies a reduction computation (i.e., function) along the specified
 /// dimensions of its input tensors. The order of reductions is implementation-specific, which means that
@@ -165,7 +165,7 @@ pub trait ReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
                     .cast::<DenseInteger64ArrayAttributeRef>()
                     .map(|attribute| attribute.values().map(|value| value as usize).collect())
             })
-            .expect(&format!("invalid '{REDUCE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce`"))
+            .unwrap_or_else(|| panic!("invalid '{REDUCE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce`"))
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the reduction computation
@@ -219,16 +219,16 @@ pub fn reduce<
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReduceWindowOperation::window_dimensions`].
-pub const REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE: &'static str = "window_dimensions";
+pub const REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE: &str = "window_dimensions";
 
 /// Name of the [`Attribute`] that is used to store [`ReduceWindowOperation::window_strides`].
-pub const REDUCE_WINDOW_STRIDES_ATTRIBUTE: &'static str = "window_strides";
+pub const REDUCE_WINDOW_STRIDES_ATTRIBUTE: &str = "window_strides";
 
 /// Name of the [`Attribute`] that is used to store [`ReduceWindowOperation::base_dilations`].
-pub const REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE: &'static str = "base_dilations";
+pub const REDUCE_WINDOW_BASE_DILATIONS_ATTRIBUTE: &str = "base_dilations";
 
 /// Name of the [`Attribute`] that is used to store [`ReduceWindowOperation::window_dilations`].
-pub const REDUCE_WINDOW_DILATIONS_ATTRIBUTE: &'static str = "window_dilations";
+pub const REDUCE_WINDOW_DILATIONS_ATTRIBUTE: &str = "window_dilations";
 
 /// StableHLO [`Operation`] that applies a reduction computation (i.e., function) to window that slide over its input
 /// tensors, producing output tensors with the same shape. For each window position, the operation applies the reduction
@@ -291,7 +291,7 @@ pub trait ReduceWindowOperation<'o, 'c: 'o, 't: 'c>:
         self.attribute(REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
             .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .expect(&format!("invalid '{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"))
+            .unwrap_or_else(|| panic!("invalid '{REDUCE_WINDOW_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reduce_window`"))
     }
 
     /// Returns the window strides for this [`ReduceWindowOperation`], if specified.

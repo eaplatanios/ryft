@@ -75,7 +75,7 @@ impl<'c, 't> Attribute<'c, 't> for DenseArrayAttributeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 

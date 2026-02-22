@@ -80,7 +80,7 @@ impl<'t> Context<'t> {
                     strides.len().cast_signed(),
                     strides.as_ptr(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
