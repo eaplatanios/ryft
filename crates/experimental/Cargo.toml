@@ -1,0 +1,16 @@
+[package]
+name = "ryft-experimental"
+version = "0.1.0"
+readme = "README.md"
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+ryft = { path = "../ryft", version = "0.0.1" }
+half.workspace = true
+paste.workspace = true
+thiserror.workspace = true
