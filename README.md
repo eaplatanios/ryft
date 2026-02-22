@@ -30,17 +30,21 @@ platform/runtime requirements, and artifact-loading behavior, refer to:
 ## **Example:** Low-Level StableHLO Matrix Multiplication
 
 The following example uses the low-level MLIR and PJRT APIs provided by `ryft::mlir` and `ryft::pjrt` to build a toy
-StableHLO matrix multiplication module programmatically, compile it, and execute it on a GPU (assuming you have enabled
-the `cuda-13` feature). Note that this is quite low-level and verbose. `ryft::core` will make compiling and executing
-programs like this a lot more ergonomic, similar to what JAX accomplishes in Python. Updates on that crate should be
-coming in the next few weeks or months.
+StableHLO matrix multiplication module programmatically, compile it, and execute it on the CPU plugin. Note that this
+is quite low-level and verbose. `ryft::core` will make compiling and executing programs like this a lot more
+ergonomic, similar to what JAX accomplishes in Python. Updates on that crate should be coming in the next few weeks
+or months.
+
+> [!NOTE]
+> If you want to run on CUDA 13 instead, enable `ryft`'s `cuda-13` feature and replace `load_cpu_plugin()`
+> with `load_cuda_13_plugin()` in the example code below.
 
 ```rust
 use ryft::mlir::*;
-use ryft::pjrt::protos::*;
+use ryft::pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft::pjrt::*;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // First, let us construct the StableHLO module that represents this program.
     let context = Context::new();
     let location = context.unknown_location();
@@ -81,8 +85,8 @@ fn main() {
     assert!(module.verify());
     let program = Program::Mlir { bytecode: module.as_operation().bytecode() };
 
-    // Now that we have the StableHLO program, let us use PJRT to compile it and execute it on a GPU.
-    let plugin = load_cuda_13_plugin()?;
+    // Now that we have the StableHLO program, let us use PJRT to compile it and execute it.
+    let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::default())?;
     let executable = client.compile(
         &program,
@@ -105,8 +109,8 @@ fn main() {
     let rhs = [7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0];
     let lhs_bytes = lhs.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
     let rhs_bytes = rhs.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
-    let lhs_buffer = client.buffer(&lhs_bytes, BufferType::F32, &[2, 3], None, device.clone(), None)?;
-    let rhs_buffer = client.buffer(&rhs_bytes, BufferType::F32, &[3, 2], None, device, None)?;
+    let lhs_buffer = client.buffer(lhs_bytes.as_slice(), BufferType::F32, &[2, 3], None, device.clone(), None)?;
+    let rhs_buffer = client.buffer(rhs_bytes.as_slice(), BufferType::F32, &[3, 2], None, device, None)?;
     let inputs = [
         ExecutionInput { buffer: lhs_buffer, donatable: false },
         ExecutionInput { buffer: rhs_buffer, donatable: false },
@@ -114,7 +118,7 @@ fn main() {
     let inputs = vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }];
 
     // The expected output of this matrix multiplication is [[58.0, 64.0], [139.0, 154.0]].
-    let mut outputs = executable.execute(inputs, 0, None, None, None, None).unwrap().remove(0);
+    let mut outputs = executable.execute(inputs, 0, None, None, None, None)?.remove(0);
     outputs.done.r#await()?;
     let output = outputs
         .outputs
@@ -129,6 +133,8 @@ fn main() {
         })
         .collect::<Vec<_>>();
     assert_eq!(output, vec![58.0, 64.0, 139.0, 154.0]);
+
+    Ok(())
 }
 ```
 
