@@ -1,0 +1,47 @@
+[package]
+name = "ryft-core"
+version = "0.0.1"
+readme = "README.md"
+description = "Core abstractions of the Ryft library."
+keywords = ["ryft", "tracing", "autodiff", "compiler", "machine-learning"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "README.md",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+    { file = "CHANGELOG.md", search = "Release Date", replace = "{{date}}", min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n", exactly = 1 },
+]
+
+[dependencies]
+ryft-macros.workspace = true
+ryft-mlir = { workspace = true, optional = true }
+ryft-pjrt = { workspace = true, optional = true }
+dyn-clone.workspace = true
+half.workspace = true
+paste.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["xla"]
+xla = ["ryft-mlir", "ryft-pjrt"]
+cuda-12 = ["ryft-pjrt/cuda-12"]
+cuda-13 = ["ryft-pjrt/cuda-13"]
+rocm-7 = ["ryft-pjrt/rocm-7"]
+tpu = ["ryft-pjrt/tpu"]
+neuron = ["ryft-pjrt/neuron"]
+metal = ["ryft-pjrt/metal"]

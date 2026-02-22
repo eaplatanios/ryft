@@ -8,6 +8,9 @@
 differentiation, and just-in-time compilation for leveraging hardware accelerators to Rust. The top-level `ryft`
 crate is an umbrella crate that re-exports functionality from a few different crates through a single entry point:
 
+- **`ryft-core`:** Intended home for core tracing, automatic differentiation, JIT, and program abstractions. This crate
+  is still in an early stage and should not be dependent upon. It is expected to start shaping up in the coming months.
+- **`ryft-macros`:** Procedural macros used by `ryft` and `ryft-core` (e.g., parameter-related derivation macros).
 - **`ryft-mlir`:** High-level, ownership-aware Rust bindings for MLIR and MLIR dialects used by XLA tooling.
 - **`ryft-pjrt`:** High-level, ownership-aware Rust bindings for PJRT plugins, clients, buffers, and program execution.
 - **`ryft-xla-sys`:** Low-level `-sys` bindings for XLA/MLIR/PJRT APIs, plus native artifact/toolchain wiring.

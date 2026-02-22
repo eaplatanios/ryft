@@ -1,0 +1,16 @@
+[package]
+name = "ryft-macros-tests"
+version = "0.0.1"
+description = "Tests for Ryft macros."
+keywords = ["ryft"]
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+ryft = { path = "../ryft" }
+trybuild.workspace = true

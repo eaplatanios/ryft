@@ -1,0 +1,223 @@
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:28:15
+   |
+28 |     _f4: [(); Self::ASSOC],
+   |               ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:29:15
+   |
+29 |     _f5: [(); Self::assoc()],
+   |               ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:44:77
+   |
+44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
+   |                                                                             ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:44:96
+   |
+44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
+   |                                                                                                ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:63:19
+   |
+63 |         _f4: [(); Self::ASSOC],
+   |                   ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:64:19
+   |
+64 |         _f5: [(); Self::assoc()],
+   |                   ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:66:56
+   |
+66 |     Tuple(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]),
+   |                                                        ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error: generic parameters may not be used in const operations
+  --> tests/parameters/error_self.rs:66:75
+   |
+66 |     Tuple(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]),
+   |                                                                           ^^^^ cannot perform const operation using `P`
+   |
+   = note: type parameters may not be used in const expressions
+
+error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<__P, T>`
+  --> tests/parameters/error_self.rs:10:12
+   |
+ 9 | #[derive(Parameterized)]
+   |          ------------- expected type parameter
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Generics<__P, T>`, found `Generics<P, T>`
+   |
+   = note: expected struct `Generics<__P, T>`
+              found struct `Generics<P, T>`
+   = note: a type parameter was expected, but a different one was found; you might be missing a type parameter or trait bound
+   = note: for more information, visit https://doc.rust-lang.org/book/ch10-02-traits.html#traits-as-parameters
+note: required for `Generics<__P, T>` to implement `Parameterized<__P>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^------------^^
+   |                                            |
+   |                                            unsatisfied trait bound introduced in this `derive` macro
+note: required by a bound in `ryft::Parameterized::To`
+  --> $WORKSPACE/crates/ryft-core/src/parameters.rs
+   |
+   |     type To<T: Parameter>: Parameterized<T, To<P> = Self> + Parameterized<T, To<Placeholder> = Self::To<Placeholder>>;
+   |                                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Parameterized::To`
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:28:15
+   |
+28 |     _f4: [(); Self::ASSOC],
+   |               ^^^^
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:29:15
+   |
+29 |     _f5: [(); Self::assoc()],
+   |               ^^^^
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:44:77
+   |
+44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
+   |                                                                             ^^^^
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:44:96
+   |
+44 | pub struct Tuple<P: Parameter>(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]);
+   |                                                                                                ^^^^
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:63:19
+   |
+63 |         _f4: [(); Self::ASSOC],
+   |                   ^^^^
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:64:19
+   |
+64 |         _f5: [(); Self::assoc()],
+   |                   ^^^^
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:66:56
+   |
+66 |     Tuple(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]),
+   |                                                        ^^^^
+
+error: generic `Self` types are currently not permitted in anonymous constants
+  --> tests/parameters/error_self.rs:66:75
+   |
+66 |     Tuple(Box<Self>, Box<<Self as Trait>::Assoc>, [(); Self::ASSOC], [(); Self::assoc()]),
+   |                                                                           ^^^^
+
+error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<__P, T>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ expected `Generics<__P, T>`, found `Generics<P, T>`
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                     - found type parameter
+   |
+   = note: expected struct `Generics<__P, T>`
+              found struct `Generics<P, T>`
+   = note: a type parameter was expected, but a different one was found; you might be missing a type parameter or trait bound
+   = note: for more information, visit https://doc.rust-lang.org/book/ch10-02-traits.html#traits-as-parameters
+note: required by a bound in `Generics`
+  --> tests/parameters/error_self.rs:10:44
+   |
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                                            ^^^^^^^^^^^^ required by this bound in `Generics`
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ expected `Generics<Placeholder, T>`, found `Generics<P, T>`
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                     - found this type parameter
+   |
+   = note: expected struct `Generics<Placeholder, T>`
+              found struct `Generics<P, T>`
+note: required by a bound in `Generics`
+  --> tests/parameters/error_self.rs:10:44
+   |
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                                            ^^^^^^^^^^^^ required by this bound in `Generics`
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ expected type parameter `P`, found `Placeholder`
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                     - expected this type parameter
+   |
+   = note: expected type parameter `P`
+                      found struct `Placeholder`
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^
+   |          |
+   |          expected `Generics<Placeholder, T>`, found `Generics<P, T>`
+   |          expected `Generics<Placeholder, T>` because of return type
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                     - found this type parameter
+   |
+   = note: expected struct `Generics<Placeholder, T>`
+              found struct `Generics<P, T>`
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0271]: type mismatch resolving `<T as Trait>::Assoc == Generics<Placeholder, T>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^ expected `Generics<Placeholder, T>`, found `Generics<P, T>`
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |                     - found this type parameter
+   |
+   = note: expected struct `Generics<Placeholder, T>`
+              found struct `Generics<P, T>`
+note: required for `Generics<Placeholder, T>` to implement `Parameterized<Placeholder>`
+  --> tests/parameters/error_self.rs:9:10
+   |
+ 9 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^
+10 | pub struct Generics<P: Parameter, T: Trait<Assoc = Self>>
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^------------^^
+   |                                            |
+   |                                            unsatisfied trait bound introduced in this `derive` macro
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)

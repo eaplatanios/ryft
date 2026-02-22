@@ -1,0 +1,127 @@
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+ --> tests/parameters/error_attributes.rs:8:5
+  |
+8 |     #[ryft(crate = "_ryft")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: Duplicate ryft attribute 'crate'
+  --> tests/parameters/error_attributes.rs:14:8
+   |
+14 | #[ryft(crate = "ryft")]
+   |        ^^^^^
+
+error: Invalid '#[ryft(...)]' attribute: 'parameter_type'. These are the attributes that are supported here: [Symbol("crate")].
+  --> tests/parameters/error_attributes.rs:28:24
+   |
+28 | #[ryft(crate = "ryft", parameter_type = "P")]
+   |                        ^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:32:5
+   |
+32 |     #[ryft(crate = "_ryft")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:39:5
+   |
+39 |     #[ryft(crate = "_ryft")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:42:5
+   |
+42 |     #[ryft(crate = "_ryft")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: Invalid '#[ryft(...)]' attribute: 'ryft'. These are the attributes that are supported here: [Symbol("crate")].
+  --> tests/parameters/error_attributes.rs:47:8
+   |
+47 | #[ryft(ryft = "ryft")]
+   |        ^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:49:5
+   |
+49 |     #[ryft(crate = "_ryft")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:52:14
+   |
+52 |     Variant3(#[ryft(crate = "_ryft")] P),
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:52:14
+   |
+52 |     Variant3(#[ryft(crate = "_ryft")] P),
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:53:17
+   |
+53 |     Variant4(P, #[ryft(crate = "_ryft")] (P, usize)),
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:53:17
+   |
+53 |     Variant4(P, #[ryft(crate = "_ryft")] (P, usize)),
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:56:9
+   |
+56 | /         #[ryft(crate = "_ryft")]
+57 | |         y: (P, usize),
+   | |_____________________^
+
+error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+  --> tests/parameters/error_attributes.rs:56:9
+   |
+56 |         #[ryft(crate = "_ryft")]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `_ryft`
+  --> tests/parameters/error_attributes.rs:21:16
+   |
+21 | #[ryft(crate = "_ryft")]
+   |                ^^^^^^^ use of unresolved module or unlinked crate `_ryft`
+   |
+help: there is a crate or module with a similar name
+   |
+21 - #[ryft(crate = "_ryft")]
+21 + #[ryft(crate = ryft)]
+   |
+help: consider importing one of these items
+   |
+ 1 + use std::error::Error;
+   |
+ 1 + use std::fmt::Error;
+   |
+ 1 + use std::io::Error;
+   |
+ 1 + use core::error::Error;
+   |
+   = and 2 other candidates
+
+error[E0223]: ambiguous associated type
+  --> tests/parameters/error_attributes.rs:20:10
+   |
+20 | #[derive(Parameterized)]
+   |          ^^^^^^^^^^^^^
+   |
+   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `_ryft`
+  --> tests/parameters/error_attributes.rs:21:16
+   |
+21 | #[ryft(crate = "_ryft")]
+   |                ^^^^^^^ use of unresolved module or unlinked crate `_ryft`
+   |
+help: there is a crate or module with a similar name
+   |
+21 - #[ryft(crate = "_ryft")]
+21 + #[ryft(crate = ryft)]
+   |
