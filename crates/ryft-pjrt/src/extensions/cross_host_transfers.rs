@@ -33,6 +33,7 @@ impl CrossHostTransfersExtension {
     /// Returns the [`PJRT_CrossHostTransfers_Extension`](ffi::PJRT_CrossHostTransfers_Extension)
     /// that corresponds to this [`CrossHostTransfersExtension`] and which can be passed to
     /// functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_CrossHostTransfers_Extension {
         self.handle
     }
@@ -613,6 +614,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Transfers_PJRT_Client_CrossHostReceiveBuffers_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             client: *mut PJRT_Client,
             num_shapes: usize,
@@ -693,6 +695,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Transfers_PJRT_Client_MakeCrossHostReceiveBuffers_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             client: *mut PJRT_Client,
             num_shapes: usize,

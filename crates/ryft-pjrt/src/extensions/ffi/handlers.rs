@@ -28,6 +28,7 @@ impl FfiApi {
 
     /// Returns the [`XLA_FFI_Api`](ffi::XLA_FFI_Api) that corresponds to this [`FfiApi`] and
     /// which can be passed to functions in the XLA FFI API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::XLA_FFI_Api {
         self.handle
     }
@@ -395,7 +396,7 @@ impl FfiHandlerTraits {
 
     /// Returns the underlying bitwise representation of this [`FfiHandlerTraits`] instance as a `u32` value.
     pub const fn bits(self) -> u32 {
-        self.bits as u32
+        self.bits
     }
 
     /// Returns `true` if and only if all traits that are present in the provided [`FfiHandlerTraits`] instance are also

@@ -724,7 +724,7 @@ impl<'c> LoadedExecutable<'c> {
         let input_is_donatable = inputs
             .first()
             .map(|inputs| inputs.inputs.iter().map(|input| input.donatable).collect::<Vec<bool>>())
-            .unwrap_or(Vec::new());
+            .unwrap_or_default();
         let send_callback_count = inputs.first().map(|inputs| inputs.send_callbacks.len()).unwrap_or(0);
         let receive_callback_count = inputs.first().map(|inputs| inputs.receive_callbacks.len()).unwrap_or(0);
 
@@ -882,12 +882,10 @@ impl<'c> LoadedExecutable<'c> {
             if !send_callbacks.is_empty() || !receive_callbacks.is_empty() {
                 // Move the owned callback allocations into the event completion handler so that they
                 // are released *only after* the runtime signals the device execution is done.
-                if let Err(error) = done_event.on_ready(move |_| {
+                done_event.on_ready(move |_| {
                     drop(send_callbacks);
                     drop(receive_callbacks);
-                }) {
-                    return Err(error);
-                }
+                })?
             }
 
             let mut outputs = Vec::with_capacity(output_count);
@@ -1043,6 +1041,7 @@ impl SendCallback {
     /// that owns the underlying callback state. The returned [`PJRT_SendCallbackInfo::user_arg`] must be freed after
     /// the execution that uses this callback completes. The [`LoadedExecutable::execute`] implementation handles this
     /// by tying cleanup to the execution completion events.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(self) -> ffi::PJRT_SendCallbackInfo {
         extern "C" fn callback(
             chunk: *mut crate::transfers::ffi::PJRT_Chunk,
@@ -1103,6 +1102,7 @@ impl ReceiveCallback {
     /// that owns the underlying callback state. The returned [`PJRT_RecvCallbackInfo::user_arg`] must be freed after
     /// the execution that uses this callback completes. The [`LoadedExecutable::execute`] implementation handles this
     /// by tying cleanup to the execution completion events.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(self) -> ffi::PJRT_RecvCallbackInfo {
         extern "C" fn callback(
             stream: *mut crate::transfers::ffi::PJRT_CopyToDeviceStream,
@@ -2162,6 +2162,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_ExecuteOptions {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             send_callbacks: *mut *mut PJRT_SendCallbackInfo,
             recv_callbacks: *mut *mut PJRT_RecvCallbackInfo,
@@ -2210,6 +2211,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_LoadedExecutable_Execute_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             executable: *mut PJRT_LoadedExecutable,
             options: *mut PJRT_ExecuteOptions,

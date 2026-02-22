@@ -50,6 +50,7 @@ impl FfiExtension {
 
     /// Returns the [`PJRT_FFI_Extension`] that corresponds to this [`FfiExtension`] and which can be passed
     /// to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const PJRT_FFI_Extension {
         self.handle
     }
@@ -242,7 +243,7 @@ impl ExecutionContext {
     }
 }
 
-#[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
+#[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals, clippy::module_inception)]
 pub mod ffi {
     use crate::errors::ffi::PJRT_Error;
     use crate::ffi::PJRT_Extension_Base;

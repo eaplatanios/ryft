@@ -436,6 +436,7 @@ pub struct CpuClientOptions {
 
 impl CpuClientOptions {
     /// Returns a collection of [`NamedValue`]s that correspond to this [`CpuClientOptions`] instance.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_named_values(&self) -> Vec<NamedValue> {
         let mut values = Vec::new();
         if let Some(device_count) = self.device_count {
@@ -978,6 +979,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Client_Create_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             create_options: *const PJRT_NamedValue,
             num_options: usize,

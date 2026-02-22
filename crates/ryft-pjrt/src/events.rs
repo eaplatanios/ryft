@@ -55,7 +55,7 @@ impl<O> Event<O> {
     /// This function is marked as unsafe because this [`Event`] must remain alive for the lifetime of the returned
     /// [`EventHandle`] (otherwise the latter can become invalid), but there is currently no way to enforce that.
     pub unsafe fn handle(&self) -> EventHandle {
-        EventHandle { handle: unsafe { self.to_c_api() }, api: self.state.api.clone() }
+        EventHandle { handle: unsafe { self.to_c_api() }, api: self.state.api }
     }
 
     /// Sets/triggers this [`Event`] to indicate that the work it represents has completed successfully. If an [`Error`]
@@ -288,7 +288,7 @@ impl Api {
     pub(crate) fn event<O>(&self, output: O) -> Result<Event<O>, Error> {
         use ffi::PJRT_Event_Create_Args;
         invoke_pjrt_api_error_fn!(*self, PJRT_Event_Create, {}, { event })
-            .and_then(|handle| unsafe { Event::from_c_api(handle, self.clone(), output) })
+            .and_then(|handle| unsafe { Event::from_c_api(handle, *self, output) })
     }
 }
 

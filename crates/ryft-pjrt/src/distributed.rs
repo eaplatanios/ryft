@@ -434,7 +434,7 @@ impl Api {
                 let state = unsafe { &*(user_arg as *mut MissedHeartbeatCallbackState) };
                 let mut callback = state.callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let error = unsafe { Error::from_c_api(error as *const crate::errors::ffi::PJRT_Error, state.api) }
-                    .unwrap_or_else(|error| Some(error));
+                    .unwrap_or_else(Some);
                 callback(error);
             }
         }

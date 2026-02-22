@@ -61,6 +61,7 @@ impl Api {
 
     /// Returns the [`PJRT_Api`](ffi::PJRT_Api) that corresponds to this [`Api`] and which can
     /// be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_Api {
         self.handle
     }

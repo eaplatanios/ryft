@@ -294,7 +294,7 @@ impl Eq for Device<'_> {}
 
 impl HasDefaultMemory for Device<'_> {
     fn default_memory(&self) -> Memory<'_> {
-        self.default_memory().expect(format!("default memory not set for device '{self}'").as_str())
+        self.default_memory().unwrap_or_else(|_| panic!("default memory not set for device '{self}'"))
     }
 }
 
@@ -589,7 +589,7 @@ impl SerializedDeviceAssignment {
     /// Returns a pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
     pub fn data(&self) -> &[u8] {
         match self {
-            Self::Rust { data } => &data,
+            Self::Rust { data } => data,
             Self::C { data, data_size, .. } => unsafe { slice_from_c_api(*data as *const u8, *data_size) },
         }
     }

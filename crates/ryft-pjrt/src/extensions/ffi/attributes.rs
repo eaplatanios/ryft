@@ -140,10 +140,8 @@ impl<'o> FfiArray<'o> {
             }
             let data_type = (*handle).data_type;
             Self::element_size_in_bytes(data_type)?;
-            if (*handle).size > 0 && data_type != XLA_FFI_DataType_TOKEN {
-                if (*handle).data.is_null() {
-                    return Err(FfiError::invalid_argument("encountered null XLA FFI attribute values pointer"));
-                }
+            if (*handle).size > 0 && data_type != XLA_FFI_DataType_TOKEN && (*handle).data.is_null() {
+                return Err(FfiError::invalid_argument("encountered null XLA FFI attribute values pointer"));
             }
             Ok(Self { handle, owner: PhantomData })
         }

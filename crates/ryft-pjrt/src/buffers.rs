@@ -186,6 +186,7 @@ impl BufferType {
 
     /// Returns the [`PJRT_Buffer_Type`](ffi::PJRT_Buffer_Type) that corresponds to this [`BufferType`]
     /// and which can be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> ffi::PJRT_Buffer_Type {
         match self {
             Self::Invalid => ffi::PJRT_Buffer_Type_INVALID,
@@ -222,6 +223,7 @@ impl BufferType {
     }
 
     /// Parses a rendered [`BufferType`] (e.g., an XLA primitive type string) into a [`BufferType`].
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str<S: AsRef<str>>(value: S) -> Result<Self, Error> {
         let value = value.as_ref();
         match value.trim().to_ascii_lowercase().as_str() {
@@ -498,7 +500,7 @@ impl TiledLayout {
     pub fn new(minor_to_major: Vec<i64>, tiles: Vec<Tile>) -> Self {
         Self {
             minor_to_major,
-            tile_dimensions: tiles.iter().flat_map(|tile| tile.dimensions.iter().map(|dimension| *dimension)).collect(),
+            tile_dimensions: tiles.iter().flat_map(|tile| tile.dimensions.iter().copied()).collect(),
             tile_dimension_sizes: tiles.iter().map(|tile| tile.dimensions.len()).collect(),
             tile_count: tiles.len(),
         }
@@ -679,6 +681,7 @@ impl Layout {
     }
 
     /// Parses a rendered [`Layout`] (e.g., an XLA layout string) into a [`Layout`].
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str<S: AsRef<str>>(value: S) -> Result<Self, Error> {
         /// Parses and consumes one balanced parenthesized group from `characters`. The provided [`Peekable`] must
         /// be positioned at `'('`. The returned string contains only the inner content, with the outer parentheses
@@ -940,7 +943,7 @@ impl Debug for Layout {
 ///   - **[`Client::uninitialized_buffer`]:** Allocates memory on a [`Memory`] without initializing it.
 ///   - **[`Client::borrowed_on_device_buffer`]:** Borrows data from an on-device buffer.
 ///   - **[`Client::error_buffer`]:** Creates a _poisoned_ [`Buffer`] that signals an error.
-///   _ **[`Client::alias_buffer`], [`Client::fulfill_alias_buffer`], and [`Client::fulfill_alias_buffer_with_error`]:**
+///   - **[`Client::alias_buffer`], [`Client::fulfill_alias_buffer`], and [`Client::fulfill_alias_buffer_with_error`]:**
 ///     Creates an uninitialized [`Buffer`] handle that aliases the result of some computation that has not been
 ///     completed yet (using [`Client::alias_buffer`]), and then _fulfills_ it with some data later on (using
 ///     [`Client::fulfill_alias_buffer`]) or _poisons_ it with an error (using
@@ -1091,7 +1094,7 @@ impl Buffer<'_> {
         unsafe {
             let api_handle = self.api().to_c_api();
             let api_fn_offset = std::mem::offset_of!(crate::ffi::PJRT_Api, PJRT_Buffer_GetMemoryLayout);
-            let api_struct_size = (*api_handle).struct_size as usize;
+            let api_struct_size = (*api_handle).struct_size;
             if api_struct_size <= api_fn_offset {
                 return Err(Error::unimplemented(
                     "`PJRT_Buffer_GetMemoryLayout` is not available in the loaded PJRT plugin".to_string(),
@@ -1512,6 +1515,7 @@ pub struct BufferSpecification<D: AsRef<[u64]>> {
 
 impl BufferSpecification<Vec<u64>> {
     /// Parses a rendered [`BufferSpecification`] (e.g., an XLA shape string) into a [`BufferSpecification`].
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str<S: AsRef<str>>(value: S) -> Result<BufferSpecification<Vec<u64>>, Error> {
         let value = value.as_ref().trim();
         let opening_bracket_index = value.find('[').ok_or_else(|| {
@@ -1712,9 +1716,13 @@ impl HostBufferData {
             Box::into_raw(Box::new(HostBufferReference {
                 ptr: buffer_clone_raw,
                 guard: if mutable {
-                    HostBufferReferenceGuard::Mutable(std::mem::transmute((*buffer_clone_raw).borrow_mut()))
+                    HostBufferReferenceGuard::Mutable(
+                        std::mem::transmute::<RefMut<'_, ()>, RefMut<'_, ()>>((*buffer_clone_raw).borrow_mut()),
+                    )
                 } else {
-                    HostBufferReferenceGuard::Immutable(std::mem::transmute((*buffer_clone_raw).borrow()))
+                    HostBufferReferenceGuard::Immutable(
+                        std::mem::transmute::<Ref<'_, ()>, Ref<'_, ()>>((*buffer_clone_raw).borrow()),
+                    )
                 },
             })) as *const std::ffi::c_void
         };
@@ -1918,7 +1926,7 @@ impl<'c> DmaMappedBuffer<'c> {
         // will be invoked when PJRT fires the "done" event. On failure, it will be invoked when that [`DmaHostBuffer`]
         // itself is dropped. Note that the [`std::mem::transmute`] that follows is safe as we are guaranteed that
         // the client will outlive the buffer due to the `'c` lifetime of [`DmaMappedBuffer`].
-        (&*client)
+        client
             .buffer(
                 DmaHostBuffer { ptr, dma: UnsafeCell::new(Some(dma)) },
                 specification.element_type,
@@ -2039,15 +2047,13 @@ impl<'s> Client<'s> {
         let done_event = unsafe { Event::from_c_api(done_event_handle, self.api(), ()) };
 
         // Register a callback to drop the host buffer data after the copy is completed.
-        if let Ok(done_event) = done_event {
-            if let Some(drop_fn) = data.drop_fn {
-                // Register the callback that will be invoked once the host buffer data has been copied.
-                done_event.on_ready(|_| {
-                    // We ignore the error because there is nothing we can do with it here,
-                    // and if something goes wrong, it should be reflected in [`Buffer::ready`].
-                    drop_fn();
-                })?;
-            }
+        if let Ok(done_event) = done_event && let Some(drop_fn) = data.drop_fn {
+            // Register the callback that will be invoked once the host buffer data has been copied.
+            done_event.on_ready(|_| {
+                // We ignore the error because there is nothing we can do with it here,
+                // and if something goes wrong, it should be reflected in [`Buffer::ready`].
+                drop_fn();
+            })?;
         }
 
         Ok(buffer)
@@ -2346,10 +2352,10 @@ impl<'s> Client<'s> {
     ///
     ///   - `token`: [`AliasBufferFulfillmentToken`] that corresponds to the alias buffer that will be _fulfilled_.
     ///   - `buffer`: [`Buffer`] with which to _fulfill_ the alias buffer. After calling this function, this and the
-    ///      alias buffer that corresponds to the provided `token` will share the same underlying memory (i.e., after
-    ///      calling this function the alias buffer will become effectively a reference to this buffer). That memory
-    ///      will not be freed while either of these two buffers is alive. Note that this buffer must have the same
-    ///      [`BufferSpecification`] as the alias buffer and must reside in the same [`Memory`].
+    ///     alias buffer that corresponds to the provided `token` will share the same underlying memory (i.e., after
+    ///     calling this function the alias buffer will become effectively a reference to this buffer). That memory
+    ///     will not be freed while either of these two buffers is alive. Note that this buffer must have the same
+    ///     [`BufferSpecification`] as the alias buffer and must reside in the same [`Memory`].
     pub fn fulfill_alias_buffer(&'_ self, token: AliasBufferFulfillmentToken, buffer: Buffer<'_>) -> Result<(), Error> {
         use ffi::PJRT_Client_FulfillAliasBuffer_Args;
         invoke_pjrt_api_error_fn!(
@@ -3111,6 +3117,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Client_BufferFromHostBuffer_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             client: *mut PJRT_Client,
             data: *const std::ffi::c_void,
@@ -3209,6 +3216,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Client_CreateViewOfDeviceBuffer_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             client: *mut PJRT_Client,
             device_buffer_ptr: *mut std::ffi::c_void,
@@ -3264,6 +3272,7 @@ pub(crate) mod ffi {
     }
 
     impl PJRT_Client_CreateErrorBuffer_Args {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             client: *mut PJRT_Client,
             error_code: PJRT_Error_Code,
