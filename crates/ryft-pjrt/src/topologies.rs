@@ -323,6 +323,7 @@ impl Drop for SerializedTopology {
 /// Note that this indirection when it comes to Protobuf serialization of [`Topology`]s exists because the PJRT
 /// C API does not expose a Protobuf serialization function and the serialization function it does expose returns
 /// just the platform-specific portion of the overall [`Topology`](crate::protos::Topology) Protobuf message.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum TopologyProto {
     CpuTopology(CpuTopology),
