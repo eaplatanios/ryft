@@ -40,7 +40,6 @@ struct Layer<P: Parameter> {
     weights: Vec<P>,
     bias: P,
     metadata: (usize, usize),
-    marker: PhantomData<P>,
 }
 ```
 

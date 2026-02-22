@@ -16,7 +16,7 @@ The following is an example for how you can create an MLIR context, load the `fu
 parse a StableHLO module, and verify it:
 
 ```rust
-use ryft::mlir::*;
+use ryft_mlir::*;
 
 fn main() {
     let context = Context::new();
@@ -54,7 +54,7 @@ At a high level, a typical workflow for working with `ryft-mlir` looks as follow
 The following is an example showing how to run optimization passes on an MLIR module:
 
 ```rust
-use ryft::mlir::*;
+use ryft_mlir::*;
 
 fn main() {
     let context = Context::new();
