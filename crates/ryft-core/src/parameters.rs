@@ -85,6 +85,38 @@ impl Parameter for Placeholder {}
 //  - Vec<P> is not Parameterized<P>. Vec<T: Parameterized<P>> is Parameterized<P>.
 //  - HashMap<K, P> is not Parameterized<P>. HashMap<K, V: Parameterized<P>> is Parameterized<V>.
 //  - Same goes for arrays and other collection types.
+/// A recursively traversable parameter tree whose leaves are values that implement [`Parameter`].
+///
+/// A [`Parameterized`] value can be split into:
+/// 1. Its shape-only representation via [`param_structure`](Self::param_structure), and
+/// 2. An ordered stream of leaf parameters via [`params`](Self::params), [`params_mut`](Self::params_mut), or
+///    [`into_params`](Self::into_params).
+///
+/// The same value can then be reconstructed using [`from_params`](Self::from_params) or
+/// [`from_params_with_remainder`](Self::from_params_with_remainder).
+///
+/// # Implementations Provided In This Module
+///
+/// - Every `P: Parameter` is a leaf and therefore implements [`Parameterized<P>`].
+/// - [`PhantomData<P>`] implements [`Parameterized<P>`] and contributes zero parameters.
+/// - Tuples whose elements are all [`Parameterized`] are supported for arities 1 through 12.
+/// - Arrays (`[T; N]`) and [`Vec<T>`] are supported when `T: Parameterized<P>`.
+/// - [`std::collections::HashMap`] and [`std::boxed::Box`] are not supported yet.
+///
+/// # Derive Macro
+///
+/// `#[derive(Parameterized)]` can generate implementations for structs and enums:
+/// - Exactly one generic type parameter must be bounded by [`Parameter`].
+/// - That parameter type cannot have additional bounds.
+/// - Nested tuples that mix parameterized and non-parameterized fields are supported within derived containers.
+/// - Mixed tuples are not supported as direct items in generic containers covered by the blanket implementations in
+///   this module (for example, `Vec<(P, usize)>`).
+///
+/// # Ordering Invariant
+///
+/// Implementations must preserve leaf order consistently across traversal and reconstruction. In other words, reading
+/// parameters with [`params`](Self::params) and then rebuilding with [`from_params`](Self::from_params) must produce
+/// the original value.
 pub trait Parameterized<P: Parameter>: Sized {
     // TODO(eaplatanios): We need to prove that `Self::To<P> = Self`.
     // TODO(eaplatanios): What if `P` has additional trait bounds?
@@ -111,17 +143,25 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Returns the number of parameters in this [Parameterized] instance.
     fn param_count(&self) -> usize;
 
+    /// Returns the parameter structure of this value by replacing all leaves with [`Placeholder`]s.
     fn param_structure(&self) -> Self::To<Placeholder>;
 
+    /// Returns an iterator over references to all parameters in this value.
     fn params(&self) -> Self::ParamIterator<'_, P>;
+    /// Returns an iterator over mutable references to all parameters in this value.
     fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P>;
+    /// Consumes this value and returns an iterator over all parameters.
     fn into_params(self) -> Self::ParamIntoIterator<P>;
 
+    /// Reconstructs a value from `structure`, consuming parameters from `params` and leaving any remainder untouched.
     fn from_params_with_remainder<I: Iterator<Item = P>>(
         structure: Self::To<Placeholder>,
         params: &mut I,
     ) -> Result<Self, Error>;
 
+    /// Reconstructs a value from `structure` using all provided parameters.
+    ///
+    /// Returns [`Error::UnusedParams`] if there are leftover parameters.
     fn from_params<I: IntoIterator<Item = P>>(structure: Self::To<Placeholder>, params: I) -> Result<Self, Error> {
         let mut params = params.into_iter();
         let parameterized = Self::from_params_with_remainder(structure, &mut params)?;
@@ -476,3 +516,105 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
 }
 
 // TODO(eaplatanios): Implement this for arrays, HashMap<K, _>, etc.
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Debug;
+    use std::marker::PhantomData;
+
+    use crate::errors::Error;
+
+    use super::{Parameterized, Placeholder};
+
+    fn assert_roundtrip_parameterized<V>(value: V, expected_params: Vec<i32>)
+    where
+        V: Clone + Debug + PartialEq + Parameterized<i32>,
+        V::To<Placeholder>: Clone + Debug + PartialEq,
+    {
+        assert_eq!(value.param_count(), expected_params.len());
+        assert_eq!(value.params().copied().collect::<Vec<_>>(), expected_params);
+        assert_eq!(value.clone().into_params().collect::<Vec<_>>(), expected_params);
+
+        let structure = value.param_structure();
+        assert_eq!(V::from_params(structure.clone(), expected_params.clone()), Ok(value.clone()));
+
+        let mut params_with_remainder = expected_params.iter().copied().chain(std::iter::once(-1));
+        assert_eq!(V::from_params_with_remainder(structure, &mut params_with_remainder), Ok(value));
+        assert_eq!(params_with_remainder.collect::<Vec<_>>(), vec![-1]);
+    }
+
+    fn assert_params_mut_increments<V>(value: V, expected_before: Vec<i32>)
+    where
+        V: Clone + Debug + PartialEq + Parameterized<i32>,
+        V::To<Placeholder>: Clone + Debug + PartialEq,
+    {
+        let mut mutable_value = value;
+        for parameter in mutable_value.params_mut() {
+            *parameter += 1;
+        }
+        let expected_after = expected_before.iter().map(|parameter| parameter + 1).collect::<Vec<_>>();
+        assert_eq!(mutable_value.params().copied().collect::<Vec<_>>(), expected_after);
+    }
+
+    macro_rules! assert_tuple_impl {
+        (($($value:expr),+ $(,)?)) => {{
+            assert_roundtrip_parameterized(($($value,)+), vec![$($value),+]);
+            assert_params_mut_increments(($($value,)+), vec![$($value),+]);
+        }};
+    }
+
+    #[test]
+    fn test_leaf_parameterized_impl() {
+        assert_roundtrip_parameterized(7, vec![7]);
+        assert_params_mut_increments(7, vec![7]);
+    }
+
+    #[test]
+    fn test_phantom_data_parameterized_impl() {
+        assert_roundtrip_parameterized(PhantomData::<i32>, vec![]);
+        assert_params_mut_increments(PhantomData::<i32>, vec![]);
+        assert_eq!(PhantomData::<i32>.param_structure(), PhantomData::<Placeholder>);
+    }
+
+    #[test]
+    fn test_tuple_parameterized_impls_up_to_arity_twelve() {
+        assert_tuple_impl!((0));
+        assert_tuple_impl!((0, 1));
+        assert_tuple_impl!((0, 1, 2));
+        assert_tuple_impl!((0, 1, 2, 3));
+        assert_tuple_impl!((0, 1, 2, 3, 4));
+        assert_tuple_impl!((0, 1, 2, 3, 4, 5));
+        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6));
+        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7));
+        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8));
+        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8, 9));
+        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11));
+    }
+
+    #[test]
+    fn test_array_parameterized_impl() {
+        assert_roundtrip_parameterized([1, 2, 3], vec![1, 2, 3]);
+        assert_params_mut_increments([1, 2, 3], vec![1, 2, 3]);
+        assert_roundtrip_parameterized([(1, 2), (3, 4)], vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_vec_parameterized_impl() {
+        assert_roundtrip_parameterized(vec![1, 2, 3], vec![1, 2, 3]);
+        assert_params_mut_increments(vec![1, 2, 3], vec![1, 2, 3]);
+        assert_roundtrip_parameterized(vec![(1, 2), (3, 4)], vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_from_params_reports_unused_params() {
+        assert_eq!(<i32 as Parameterized<i32>>::from_params(Placeholder, vec![3, 4]), Err(Error::UnusedParams));
+    }
+
+    #[test]
+    fn test_from_params_reports_insufficient_params_for_vec() {
+        let structure = vec![Placeholder, Placeholder, Placeholder];
+        let result = <Vec<i32> as Parameterized<i32>>::from_params(structure, vec![1, 2]);
+        assert_eq!(result, Err(Error::InsufficientParams { expected_count: 3 }));
+    }
+}
