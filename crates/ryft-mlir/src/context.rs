@@ -125,7 +125,7 @@ impl<'t> Context<'t> {
             ContextThreadPool::Owned => {
                 Some(unsafe { ThreadPoolRef::from_c_api(mlirContextGetThreadPool(*self.handle.borrow())) })
             }
-            ContextThreadPool::Borrowed(thread_pool) => Some(thread_pool.clone()),
+            ContextThreadPool::Borrowed(thread_pool) => Some(thread_pool),
         }
     }
 

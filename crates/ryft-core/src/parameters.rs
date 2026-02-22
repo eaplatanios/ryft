@@ -171,7 +171,7 @@ impl<P: Parameter> Parameterized<P> for P {
         _structure: Self::To<Placeholder>,
         params: &mut I,
     ) -> Result<Self, Error> {
-        params.next().ok_or_else(|| Error::InsufficientParams { expected_count: 1 })
+        params.next().ok_or(Error::InsufficientParams { expected_count: 1 })
     }
 }
 
@@ -270,7 +270,7 @@ macro_rules! tuple_parameterized_impl {
                 ) -> Result<Self, Error> {
                     let ($([<$T:lower _field>],)*) = structure;
                     $(let [<$T:lower>] = $T::from_params_with_remainder([<$T:lower _field>], params)?;)*
-                    Ok((($([<$T:lower>],)*)))
+                    Ok(($([<$T:lower>],)*))
                 }
             }
         }
@@ -447,11 +447,11 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
     }
 
     fn params(&self) -> Self::ParamIterator<'_, P> {
-        self.into_iter().flat_map(|value| value.params())
+        self.iter().flat_map(|value| value.params())
     }
 
     fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P> {
-        self.into_iter().flat_map(|value| value.params_mut())
+        self.iter_mut().flat_map(|value| value.params_mut())
     }
 
     fn into_params(self) -> Self::ParamIntoIterator<P> {

@@ -75,7 +75,7 @@ impl<'c, 't> Attribute<'c, 't> for DenseArrayAttributeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -210,6 +210,11 @@ macro_rules! mlir_dense_array_attribute {
                 /// Returns the length of this dense array attribute (i.e., the number of values it contains).
                 pub fn len(&self) -> usize {
                     unsafe { ryft_xla_sys::bindings::mlirDenseArrayGetNumElements(self.handle).cast_unsigned() }
+                }
+
+                /// Returns `true` if this dense array attribute is empty (i.e., it contains `0` values).
+                pub fn is_empty(&self) -> bool {
+                    self.len() == 0
                 }
 
                 /// Returns the values contained in this dense array attribute.

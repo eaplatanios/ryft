@@ -294,7 +294,7 @@ impl Eq for Device<'_> {}
 
 impl HasDefaultMemory for Device<'_> {
     fn default_memory(&self) -> Memory<'_> {
-        self.default_memory().expect(format!("default memory not set for device '{self}'").as_str())
+        self.default_memory().unwrap_or_else(|_| panic!("default memory not set for device '{self}'"))
     }
 }
 
@@ -542,8 +542,10 @@ impl DeviceAssignment {
             });
         }
         for replica_id in 0..self.replica_count {
-            for computation_id in 0..self.computation_count {
-                computation_devices[computation_id]
+            for (computation_id, computation_devices) in
+                computation_devices.iter_mut().enumerate().take(self.computation_count)
+            {
+                computation_devices
                     .replica_device_ids
                     .push(self.assignment[replica_id * self.computation_count + computation_id] as i64);
             }
@@ -589,7 +591,7 @@ impl SerializedDeviceAssignment {
     /// Returns a pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
     pub fn data(&self) -> &[u8] {
         match self {
-            Self::Rust { data } => &data,
+            Self::Rust { data } => data,
             Self::C { data, data_size, .. } => unsafe { slice_from_c_api(*data as *const u8, *data_size) },
         }
     }

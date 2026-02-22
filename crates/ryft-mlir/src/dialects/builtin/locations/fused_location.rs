@@ -8,10 +8,12 @@ use crate::{Attribute, AttributeRef, Context, Location, LocationRef, TypeId, mli
 /// [`FusedLocationRef`] are a special kind of [`Location`] that represents multiple underlying locations merged together.
 /// When MLIR transformations happen (e.g., inlining, fusion, canonicalization, lowering, etc.), a single IR operation
 /// might correspond to multiple different source locations. For example:
+///
 ///  - Inlining a function call: the call site has a location, and the callee body has its own locations.
 ///    The inlined operation corresponds to both.
 ///  - Loop unrolling: one operation in the original IR produces multiple cloned operations, each with both the
 ///    original operation's location and the iteration context.
+///
 /// Rather than losing information, MLIR records both by "fusing" them into a [`FusedLocationRef`]. Refer to the
 /// [MLIR documentation](https://mlir.llvm.org/docs/Dialects/Builtin/#fusedloc) for more information.
 #[derive(Copy, Clone)]
@@ -74,7 +76,7 @@ impl<'t> Context<'t> {
                     locations.as_ptr() as *const _,
                     attribute.to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }

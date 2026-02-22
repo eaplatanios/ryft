@@ -170,7 +170,7 @@ impl<'r, 'c: 'r, 't: 'c> Region<'r, 'c, 't> for DetachedRegion<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -262,7 +262,7 @@ impl<'o, 'r: 'o, 'c: 'r, 't: 'c> Region<'r, 'c, 't> for RegionRef<'o, 'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 

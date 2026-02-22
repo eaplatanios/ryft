@@ -39,6 +39,11 @@ impl<'c, 't> ArrayAttributeRef<'c, 't> {
         unsafe { mlirArrayAttrGetNumElements(self.handle).cast_unsigned() }
     }
 
+    /// Returns `true` if this [`ArrayAttributeRef`] is empty (i.e., it contains `0` element [`Attribute`]s).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns the element [`AttributeRef`]s of this [`ArrayAttributeRef`].
     pub fn elements(&self) -> impl Iterator<Item = AttributeRef<'c, 't>> {
         (0..self.len()).map(|index| self.element(index))
@@ -77,7 +82,7 @@ impl<'t> Context<'t> {
             let elements = elements.iter().map(|element| element.to_c_api()).collect::<Vec<_>>();
             ArrayAttributeRef::from_c_api(
                 mlirArrayAttrGet(*self.handle.borrow(), elements.len().cast_signed(), elements.as_ptr() as *const _),
-                &self,
+                self,
             )
             .unwrap()
         }

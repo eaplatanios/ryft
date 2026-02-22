@@ -42,6 +42,7 @@ impl LayoutsExtension {
 
     /// Returns the [`PJRT_Layouts_Extension`](ffi::PJRT_Layouts_Extension) that corresponds to this
     /// [`LayoutsExtension`] and which can be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_Layouts_Extension {
         self.handle
     }
@@ -279,6 +280,7 @@ pub struct SerializedLayout {
 
 impl SerializedLayout {
     /// Constructs a [`SerializedLayout`] from the provided rendered [`Layout`].
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(rendered_layout: &str) -> Self {
         Self {
             handle: std::ptr::null_mut(),

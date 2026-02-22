@@ -66,6 +66,7 @@ impl<'o, 'c: 'o, 't: 'c> Call<'o, 'c, 't> for CallOperationRef<'o, 'c, 't> {
 /// Structured representation of the operands, results, and [`Attribute`]s that are attached to a [`CallOperation`].
 /// This struct can be used to construct [`CallOperation`]s via [`call`] and provides a [`Default`] implementation
 /// making [`CallOperation`] construction more ergonomic.
+#[derive(Default)]
 pub struct CallProperties<'v, 'c, 't, 's> {
     /// [`Vec`] that contains the [`Value`]s of the [`Call`] arguments along with any [`Attribute`]s they may have.
     pub arguments: Vec<ValueAndAttributes<'v, 'c, 't, 's>>,
@@ -75,12 +76,6 @@ pub struct CallProperties<'v, 'c, 't, 's> {
 
     /// Refer to [`CallOperation::no_inline`] for information on this property.
     pub no_inline: bool,
-}
-
-impl Default for CallProperties<'_, '_, '_, '_> {
-    fn default() -> Self {
-        Self { arguments: Vec::new(), results: Vec::new(), no_inline: false }
-    }
 }
 
 /// Constructs a new detached/owned [`CallOperation`] at the specified [`Location`] for the provided callee and
@@ -178,18 +173,13 @@ impl<'o, 'c: 'o, 't: 'c> Call<'o, 'c, 't> for CallIndirectOperationRef<'o, 'c, '
 /// Structured representation of the operands and results of a [`CallIndirectOperation`]. This struct can be used to
 /// construct [`CallIndirectOperation`]s via [`call_indirect`] and provides a [`Default`] implementation making
 /// [`CallIndirectOperation`] construction more ergonomic.
+#[derive(Default)]
 pub struct CallIndirectProperties<'v, 'c, 't, 's> {
     /// [`Vec`] that contains the [`Value`]s of the [`Call`] arguments along with any [`Attribute`]s they may have.
     pub arguments: Vec<ValueAndAttributes<'v, 'c, 't, 's>>,
 
     /// [`Vec`] that contains the [`Type`]s of the [`Call`] results along with any [`Attribute`]s they may have.
     pub results: Vec<TypeAndAttributes<'c, 't, 's>>,
-}
-
-impl Default for CallIndirectProperties<'_, '_, '_, '_> {
-    fn default() -> Self {
-        Self { arguments: Vec::new(), results: Vec::new() }
-    }
 }
 
 /// Constructs a new detached/owned [`CallIndirectOperation`] at the specified [`Location`] for the provided callee and
@@ -228,7 +218,7 @@ pub fn call_indirect<'f, 'v, 'c: 'f + 'v, 't: 'c, 's, C: Value<'f, 'c, 't>, L: L
 }
 
 /// Name of the [`Attribute`] that is used to store [`ConstantOperation::function`].
-pub const FUNCTION_CONSTANT_VALUE_ATTRIBUTE: &'static str = "value";
+pub const FUNCTION_CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 
 /// [`Operation`] that produces an [SSA](https://en.wikipedia.org/wiki/Static_single-assignment_form) value from a
 /// symbol reference to a [`FuncOperation`].
@@ -301,10 +291,10 @@ pub fn constant<
 }
 
 /// Name of the [`Attribute`] that is used to store [`FuncOperation::no_inline`].
-pub const FUNCTION_NO_INLINE_ATTRIBUTE: &'static str = "no_inline";
+pub const FUNCTION_NO_INLINE_ATTRIBUTE: &str = "no_inline";
 
 /// Name of the [`Attribute`] that is used to store [`FuncOperation::llvm_emit_c_interface`].
-pub const FUNCTION_LLVM_EMIT_C_INTERFACE_ATTRIBUTE: &'static str = "llvm.emit_c_interface";
+pub const FUNCTION_LLVM_EMIT_C_INTERFACE_ATTRIBUTE: &str = "llvm.emit_c_interface";
 
 /// [`Operation`] that contains a single [SSACFG](https://mlir.llvm.org/docs/LangRef/#control-flow-and-ssacfg-regions)
 /// [`Region`](crate::Region), has a name, and that is a [`Function`](crate::Function). [`Operation`]s within the

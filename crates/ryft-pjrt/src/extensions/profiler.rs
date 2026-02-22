@@ -49,6 +49,7 @@ macro_rules! invoke_profiler_api_error_fn {
                         let mut args = ffi::[<$fn _Args>]::new($($input_value),*);
                         let error = api_fn(&mut args as *mut _);
                         match profiler_error_to_error(error, profiler_api, stringify!($fn)) {
+                            #[allow(clippy::double_parens)]
                             Ok(None) => Ok(($(args.$output_name),*)),
                             Ok(Some(error)) => Err(error),
                             Err(error) => Err(error),
@@ -89,6 +90,7 @@ impl ProfilerExtension {
 
     /// Returns the [`PJRT_Profiler_Extension`](ffi::PJRT_Profiler_Extension) that corresponds
     /// to this [`ProfilerExtension`] and which can be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_Profiler_Extension {
         self.handle
     }
@@ -256,7 +258,7 @@ unsafe impl Sync for Profiler {}
 
 impl Drop for Profiler {
     fn drop(&mut self) {
-        invoke_profiler_api_error_fn!(self.extension, PLUGIN_Profiler_Destroy, { profiler = self.to_c_api() },)
+        invoke_profiler_api_error_fn!(self.extension, PLUGIN_Profiler_Destroy, { profiler = self.to_c_api() })
             .expect("failed to destroy PJRT profiler");
     }
 }

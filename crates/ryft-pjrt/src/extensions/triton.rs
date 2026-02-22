@@ -29,6 +29,7 @@ impl TritonExtension {
 
     /// Returns the [`PJRT_Triton_Extension`](ffi::PJRT_Triton_Extension) that corresponds
     /// to this [`TritonExtension`] and which can be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_Triton_Extension {
         self.handle
     }

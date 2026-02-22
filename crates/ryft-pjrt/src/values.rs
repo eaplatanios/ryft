@@ -145,7 +145,7 @@ impl NamedValue {
     /// invalid after this [`NamedValue`] is dropped.
     pub(crate) unsafe fn to_c_api(&self) -> ffi::PJRT_NamedValue {
         let name = self.name.as_ptr() as *const i8;
-        let name_size = self.name.as_bytes().len();
+        let name_size = self.name.len();
         match &self.value {
             Value::Bool(value) => ffi::PJRT_NamedValue {
                 struct_size: size_of::<ffi::PJRT_NamedValue>(),
@@ -190,7 +190,7 @@ impl NamedValue {
                 name_size,
                 value_type: ffi::PJRT_NamedValue_Type_kString,
                 value: ffi::PJRT_Value { string_value: value.as_ptr() as *const i8 },
-                value_size: value.as_bytes().len(),
+                value_size: value.len(),
             },
         }
     }

@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// Name of the [`Attribute`] that is used to store [`ConstantOperation::value`].
-pub const CONSTANT_VALUE_ATTRIBUTE: &'static str = "value";
+pub const CONSTANT_VALUE_ATTRIBUTE: &str = "value";
 
 /// StableHLO [`Operation`] that produces an output tensor from a constant value. That value is represented as an
 /// [`ElementsAttribute`] that is stored in this [`Operation`] and is thus known at compile time. This operation
@@ -33,7 +33,7 @@ pub trait ConstantOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn value(&self) -> ElementsAttributeRef<'c, 't> {
         self.attribute(CONSTANT_VALUE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast())
-            .expect(&format!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `stable_hlo::constant`"))
+            .unwrap_or_else(|| panic!("invalid '{CONSTANT_VALUE_ATTRIBUTE}' attribute in `stable_hlo::constant`"))
     }
 }
 
@@ -62,7 +62,7 @@ pub fn constant<'c, 't, A: ElementsAttribute<'c, 't>, L: Location<'c, 't>>(
 
 /// Name of the [`Attribute`] that is used to store [`DynamicIotaOperation::iota_dimension`]
 /// and [`IotaOperation::iota_dimension`].
-pub const IOTA_DIMENSION_ATTRIBUTE: &'static str = "iota_dimension";
+pub const IOTA_DIMENSION_ATTRIBUTE: &str = "iota_dimension";
 
 /// StableHLO [`Operation`] that fills an output tensor with values in increasing order starting from zero
 /// along the [`IotaOperation::iota_dimension`] dimension.
@@ -95,7 +95,7 @@ pub trait IotaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn iota_dimension(&self) -> usize {
         self.attribute(IOTA_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .expect(&format!("invalid '{IOTA_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::dynamic_iota`"))
+            .unwrap_or_else(|| panic!("invalid '{IOTA_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::dynamic_iota`"))
             .signless_value() as usize
     }
 }
@@ -156,7 +156,7 @@ pub trait DynamicIotaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn iota_dimension(&self) -> usize {
         self.attribute(IOTA_DIMENSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
-            .expect(&format!("invalid '{IOTA_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::dynamic_iota`"))
+            .unwrap_or_else(|| panic!("invalid '{IOTA_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::dynamic_iota`"))
             .signless_value() as usize
     }
 }
@@ -195,10 +195,10 @@ pub fn dynamic_iota<'s, 'c: 's, 't: 'c, S: Value<'s, 'c, 't>, T: Type<'c, 't>, L
 }
 
 /// Name of the [`Attribute`] that is used to store [`SortOperation::dimension`].
-pub const SORT_DIMENSION_ATTRIBUTE: &'static str = "dimension";
+pub const SORT_DIMENSION_ATTRIBUTE: &str = "dimension";
 
 /// Name of the [`Attribute`] that is used to store [`SortOperation::is_stable`].
-pub const SORT_IS_STABLE_ATTRIBUTE: &'static str = "is_stable";
+pub const SORT_IS_STABLE_ATTRIBUTE: &str = "is_stable";
 
 /// StableHLO [`Operation`] that sorts 1-dimensional slices of its inputs/operands along their
 /// [`SortOperation::dimension`] dimension, together, according to its [`SortOperation::comparator`], to produce its
@@ -257,7 +257,7 @@ pub trait SortOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'
             .and_then(|attribute| {
                 attribute.cast::<IntegerAttributeRef<'c, 't>>().map(|attribute| attribute.signless_value() as usize)
             })
-            .expect(&format!("invalid '{SORT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::sort`"))
+            .unwrap_or_else(|| panic!("invalid '{SORT_DIMENSION_ATTRIBUTE}' attribute in `stable_hlo::sort`"))
     }
 
     /// Returns `true` if the sorting performed by this [`SortOperation`] is stable (i.e., the relative order of
@@ -265,7 +265,7 @@ pub trait SortOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion<'
     fn is_stable(&self) -> bool {
         self.attribute(SORT_IS_STABLE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef<'c, 't>>().map(|attribute| attribute.value()))
-            .expect(&format!("invalid '{SORT_IS_STABLE_ATTRIBUTE}' attribute in `stable_hlo::sort`"))
+            .unwrap_or_else(|| panic!("invalid '{SORT_IS_STABLE_ATTRIBUTE}' attribute in `stable_hlo::sort`"))
     }
 
     /// Returns a reference to the [`Region`](crate::Region) that contains the comparator
@@ -307,7 +307,7 @@ pub fn sort<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReverseOperation::reverse_dimensions`].
-pub const REVERSE_DIMENSIONS_ATTRIBUTE: &'static str = "dimensions";
+pub const REVERSE_DIMENSIONS_ATTRIBUTE: &str = "dimensions";
 
 /// StableHLO [`Operation`] that reverses the order of elements in its input tensor along the dimensions specified in
 /// [`ReverseOperation::reverse_dimensions`]. More formally, `output[output_index] = input[input_index]`, where:
@@ -333,7 +333,7 @@ pub trait ReverseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(REVERSE_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
             .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .expect(&format!("invalid '{REVERSE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reverse`"))
+            .unwrap_or_else(|| panic!("invalid '{REVERSE_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::reverse`"))
     }
 }
 
@@ -449,16 +449,16 @@ pub fn optimization_barrier<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
 }
 
 /// Name of the [`Attribute`] that is used to store [`CompositeOperation::composite_name`].
-pub const COMPOSITE_NAME_ATTRIBUTE: &'static str = "name";
+pub const COMPOSITE_NAME_ATTRIBUTE: &str = "name";
 
 /// Name of the [`Attribute`] that is used to store [`CompositeOperation::composite_version`].
-pub const COMPOSITE_VERSION_ATTRIBUTE: &'static str = "version";
+pub const COMPOSITE_VERSION_ATTRIBUTE: &str = "version";
 
 /// Name of the [`Attribute`] that is used to store [`CompositeOperation::composite_attributes`].
-pub const COMPOSITE_ATTRIBUTES_ATTRIBUTE: &'static str = "composite_attributes";
+pub const COMPOSITE_ATTRIBUTES_ATTRIBUTE: &str = "composite_attributes";
 
 /// Name of the [`Attribute`] that is used to store [`CompositeOperation::composite_decomposition`].
-pub const COMPOSITE_DECOMPOSITION_ATTRIBUTE: &'static str = "decomposition";
+pub const COMPOSITE_DECOMPOSITION_ATTRIBUTE: &str = "decomposition";
 
 /// StableHLO [`Operation`] that is composed of other StableHLO operations. You can think of it as a _named_
 /// [`func::call`](crate::dialects::func::call) to [`CompositeOperation::composite_decomposition`] which is a reference
@@ -504,7 +504,7 @@ pub trait CompositeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn composite_name(&self) -> StringRef<'c> {
         self.attribute(COMPOSITE_NAME_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .expect(&format!("invalid '{COMPOSITE_NAME_ATTRIBUTE}' attribute in `stable_hlo::composite`"))
+            .unwrap_or_else(|| panic!("invalid '{COMPOSITE_NAME_ATTRIBUTE}' attribute in `stable_hlo::composite`"))
     }
 
     /// Returns the optional version of this [`CompositeOperation`]. Typically, version 0 means that a composite
@@ -526,7 +526,9 @@ pub trait CompositeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn composite_decomposition(&self) -> StringRef<'c> {
         self.attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<FlatSymbolRefAttributeRef>().map(|attribute| attribute.reference()))
-            .expect(&format!("invalid '{COMPOSITE_DECOMPOSITION_ATTRIBUTE}' attribute in `stable_hlo::composite`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{COMPOSITE_DECOMPOSITION_ATTRIBUTE}' attribute in `stable_hlo::composite`")
+            })
     }
 }
 
@@ -588,19 +590,14 @@ pub fn composite<
 /// API version used by a [`CustomCallOperation`]. This determines the format in which the custom operation metadata
 /// are specified (i.e., as a [`StringAttributeRef`] or a [`DictionaryAttributeRef`] among other things related to how
 /// it should be invoked.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CustomCallApiVersion {
     Unspecified,
     Original,
     StatusReturning,
     StatusReturningUnified,
+    #[default]
     TypedFfi,
-}
-
-impl Default for CustomCallApiVersion {
-    fn default() -> Self {
-        Self::Original
-    }
 }
 
 impl<'c, 't> From<IntegerAttributeRef<'c, 't>> for CustomCallApiVersion {
@@ -735,7 +732,7 @@ impl<'t> Context<'t> {
                     operand_tuple_indices.len().cast_signed(),
                     operand_tuple_indices.as_ptr(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -743,39 +740,39 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_target_name`].
-pub const CUSTOM_CALL_TARGET_NAME_ATTRIBUTE: &'static str = "call_target_name";
+pub const CUSTOM_CALL_TARGET_NAME_ATTRIBUTE: &str = "call_target_name";
 
 /// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_has_side_effect`].
-pub const CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE: &'static str = "has_side_effect";
+pub const CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE: &str = "has_side_effect";
 
 /// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_backend_config`].
-pub const CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE: &'static str = "backend_config";
+pub const CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE: &str = "backend_config";
 
 /// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_api_version`].
-pub const CUSTOM_CALL_API_VERSION_ATTRIBUTE: &'static str = "api_version";
+pub const CUSTOM_CALL_API_VERSION_ATTRIBUTE: &str = "api_version";
 
 /// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_called_computations`].
-pub const CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE: &'static str = "called_computations";
+pub const CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE: &str = "called_computations";
 
 /// Name of the [`Attribute`] that is used to store part of [`CustomCallOperation::custom_call_memory_layouts`].
-pub const CUSTOM_CALL_OPERAND_LAYOUTS_ATTRIBUTE: &'static str = "operand_layouts";
+pub const CUSTOM_CALL_OPERAND_LAYOUTS_ATTRIBUTE: &str = "operand_layouts";
 
 /// Name of the [`Attribute`] that is used to store part of [`CustomCallOperation::custom_call_memory_layouts`].
-pub const CUSTOM_CALL_RESULT_LAYOUTS_ATTRIBUTE: &'static str = "result_layouts";
+pub const CUSTOM_CALL_RESULT_LAYOUTS_ATTRIBUTE: &str = "result_layouts";
 
 /// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_output_operand_aliases`].
-pub const CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE: &'static str = "output_operand_aliases";
+pub const CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE: &str = "output_operand_aliases";
 
 /// [`CustomCallOperation::custom_call_target_name`] for the XLA GPU custom call that creates an uninitialized `memref`.
-pub const XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME: &'static str = "CreateBuffer";
+pub const XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME: &str = "CreateBuffer";
 
 /// [`CustomCallOperation::custom_call_target_name`] for the XLA GPU custom call that creates an initialized `memref`
 /// from a `tensor`.
-pub const XLA_GPU_PIN_CUSTOM_CALL_TARGET_NAME: &'static str = "Pin";
+pub const XLA_GPU_PIN_CUSTOM_CALL_TARGET_NAME: &str = "Pin";
 
 /// [`CustomCallOperation::custom_call_target_name`] for the XLA GPU custom call that deallocates a `memref`
 /// and returns a `tensor`.
-pub const XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME: &'static str = "Unpin";
+pub const XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME: &str = "Unpin";
 
 /// StableHLO [`Operation`] that encapsulates a call to a custom implementation called
 /// [`CustomCallOperation::custom_call_target_name`]. This operation provides a mechanism for invoking operations that
@@ -830,7 +827,9 @@ pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn custom_call_target_name(&self) -> StringRef<'c> {
         self.attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<StringAttributeRef>().map(|attribute| attribute.string()))
-            .expect(&format!("invalid '{CUSTOM_CALL_TARGET_NAME_ATTRIBUTE}' attribute in `stable_hlo::custom_call`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_TARGET_NAME_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns `true` if executing this [`CustomCallOperation`] can result in side effects
@@ -838,9 +837,9 @@ pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn custom_call_has_side_effect(&self) -> bool {
         self.attribute(CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>().map(|attribute| attribute.value()))
-            .expect(&format!(
-                "invalid '{CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE}' attribute in `stable_hlo::custom_call`",
-            ))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns the backend configuration of this [`CustomCallOperation`]. This is either a [`StringAttributeRef`]
@@ -850,14 +849,18 @@ pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn custom_call_backend_config(&self) -> AttributeRef<'c, 't> {
         self.attribute(CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<AttributeRef>())
-            .expect(&format!("invalid '{CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::custom_call`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns the [`CustomCallApiVersion`] of this [`CustomCallOperation`].
     fn custom_call_api_version(&self) -> CustomCallApiVersion {
         self.attribute(CUSTOM_CALL_API_VERSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>().map(|attribute| attribute.into()))
-            .expect(&format!("invalid '{CUSTOM_CALL_API_VERSION_ATTRIBUTE}' attribute in `stable_hlo::custom_call`"))
+            .unwrap_or_else(|| {
+                panic!("invalid '{CUSTOM_CALL_API_VERSION_ATTRIBUTE}' attribute in `stable_hlo::custom_call`")
+            })
     }
 
     /// Returns the names/symbols of functions that are used by this [`CustomCallOperation`].
@@ -935,6 +938,7 @@ mlir_op_trait!(CustomCall, ZeroSuccessors);
 /// for more information on the operation semantics and the arguments of this function.
 ///
 /// Note that if any of the inputs to this function are invalid, the function may panic!
+#[allow(clippy::too_many_arguments)]
 pub fn custom_call<
     'v,
     'c: 'v,

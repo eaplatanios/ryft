@@ -45,6 +45,7 @@ pub struct FfiUserData {
 impl FfiUserData {
     /// Returns the [`PJRT_FFI_UserData`](crate::extensions::ffi::ffi::PJRT_FFI_UserData) that corresponds to this
     /// [`FfiUserData`] and which can be passed to functions in the XLA FFI API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_c_api(self) -> crate::extensions::ffi::ffi::PJRT_FFI_UserData {
         crate::extensions::ffi::ffi::PJRT_FFI_UserData { type_id: self.type_id.into(), data: self.data }
     }

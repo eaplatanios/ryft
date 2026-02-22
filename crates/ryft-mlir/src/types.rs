@@ -35,7 +35,7 @@ pub trait Type<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display + De
 
     /// Returns `true` if this type is an instance of `T`.
     fn is<T: Type<'c, 't>>(&self) -> bool {
-        Self::cast::<T>(&self).is_some()
+        Self::cast::<T>(self).is_some()
     }
 
     /// Tries to cast this type to an instance of `T` (e.g., an instance of [`IntegerTypeRef`](crate::IntegerTypeRef)).
@@ -87,7 +87,7 @@ impl<'c, 't> Type<'c, 't> for TypeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -101,7 +101,7 @@ impl<'t> Context<'t> {
         unsafe {
             TypeRef::from_c_api(
                 mlirTypeParseGet(*self.handle.borrow_mut(), StringRef::from(source.as_ref()).to_c_api()),
-                &self,
+                self,
             )
         }
     }

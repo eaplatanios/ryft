@@ -5,7 +5,7 @@ use proc_macro2::{Group, Span, TokenStream, TokenTree};
 /// locations in the original source code when constructing copies of a specific [`TokenStream`] in different locations,
 /// for example.
 ///
-/// # Arguments
+/// # Parameters
 ///
 ///   * `stream` - [`TokenStream`] to copy.
 ///   * `span` - [`Span`] to use for the new [`TokenStream`].

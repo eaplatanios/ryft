@@ -158,7 +158,7 @@ impl<'c, 't> Type<'c, 't> for Float8TypeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -255,7 +255,7 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { ComplexTypeRef::from_c_api(mlirComplexTypeGet(element_type.to_c_api()), &self).unwrap() }
+        unsafe { ComplexTypeRef::from_c_api(mlirComplexTypeGet(element_type.to_c_api()), self).unwrap() }
     }
 }
 

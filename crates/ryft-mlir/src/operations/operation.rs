@@ -762,7 +762,7 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
         ) -> MlirWalkResult {
             unsafe {
                 let data = data as *mut (&mut F, &'c Context<'t>);
-                let (ref mut callback, ref context) = *data;
+                let (ref mut callback, context) = *data;
                 let operation = OperationRef::from_c_api(operation, context).unwrap();
                 (callback)(operation).to_c_api()
             }
@@ -928,7 +928,7 @@ impl<'o, 'c: 'o, 't: 'c> Operation<'o, 'c, 't> for DetachedOperation<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -984,7 +984,7 @@ impl Display for DetachedOperation<'_, '_> {
 
 impl Debug for DetachedOperation<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "DetachedOperation[{}]", self.to_string())
+        write!(formatter, "DetachedOperation[{self}]")
     }
 }
 
@@ -1016,7 +1016,7 @@ impl<'t> Context<'t> {
                     StringRef::from(source).to_c_api(),
                     StringRef::from(filename).to_c_api(),
                 ),
-                &self,
+                self,
             )
         }
     }
@@ -1049,7 +1049,7 @@ impl<'r, 'o: 'r, 'c: 'o, 't: 'c> Operation<'r, 'c, 't> for OperationRef<'o, 'c, 
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -1095,7 +1095,7 @@ impl Display for OperationRef<'_, '_, '_> {
 
 impl Debug for OperationRef<'_, '_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "OperationRef[{}]", self.to_string())
+        write!(formatter, "OperationRef[{self}]")
     }
 }
 

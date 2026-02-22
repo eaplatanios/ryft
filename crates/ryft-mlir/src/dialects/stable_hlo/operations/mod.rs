@@ -96,17 +96,16 @@ mlir_subtype_trait_impls!(
 
 /// Represents the requested accuracy for [`HasAccuracy`]s in StableHLO. Refer to the documentation
 /// of [`AccuracyAttributeRef`] and [`Context::stable_hlo_accuracy`] for more information.
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
 pub enum Accuracy {
+    #[default]
     Default,
     Highest,
-    Tolerance { absolute_tolerance: f64, relative_tolerance: f64, units_of_least_precision: usize },
-}
-
-impl Default for Accuracy {
-    fn default() -> Self {
-        Self::Default
-    }
+    Tolerance {
+        absolute_tolerance: f64,
+        relative_tolerance: f64,
+        units_of_least_precision: usize,
+    },
 }
 
 impl<'c, 't> From<AccuracyAttributeRef<'c, 't>> for Accuracy {
@@ -159,7 +158,7 @@ impl<'t> Context<'t> {
                     0,
                     StringRef::from("DEFAULT").to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -185,7 +184,7 @@ impl<'t> Context<'t> {
                     0,
                     StringRef::from("HIGHEST").to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -234,7 +233,7 @@ impl<'t> Context<'t> {
                     units_of_least_precision as i64,
                     StringRef::from("TOLERANCE").to_c_api(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -242,7 +241,7 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`HasAccuracy::accuracy`].
-pub const RESULT_ACCURACY_ATTRIBUTE: &'static str = "result_accuracy";
+pub const RESULT_ACCURACY_ATTRIBUTE: &str = "result_accuracy";
 
 /// Trait used to represent StableHLO [`Operation`]s which can have an associated [`Accuracy`] specified as part of
 /// their attributes. This is used by StableHLO transcendental elementwise unary [`Operation`]s.
@@ -258,7 +257,7 @@ pub trait HasAccuracy<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`HasPadding::padding`].
-pub const PADDING_ATTRIBUTE: &'static str = "padding";
+pub const PADDING_ATTRIBUTE: &str = "padding";
 
 pub trait HasPadding<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the padding of this [`Operation`], if specified. The padding consists of a pair of numbers for each

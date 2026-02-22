@@ -44,6 +44,7 @@ impl Memory<'_> {
 
     /// Returns the [`PJRT_Memory`](ffi::PJRT_Memory) that corresponds to this [`Memory`] and which can
     /// be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *mut ffi::PJRT_Memory {
         self.handle
     }

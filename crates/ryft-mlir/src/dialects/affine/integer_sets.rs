@@ -184,7 +184,7 @@ impl Display for IntegerSet<'_, '_> {
 
 impl Debug for IntegerSet<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(formatter, "IntegerSet[\"{}\"]", self.to_string())
+        write!(formatter, "IntegerSet[{self}]")
     }
 }
 
@@ -209,7 +209,7 @@ impl<'t> Context<'t> {
                     constraint_expressions.as_ptr() as *const _,
                     constraint_equalities.as_ptr(),
                 ),
-                &self,
+                self,
             )
         }
     }
@@ -224,7 +224,7 @@ impl<'t> Context<'t> {
                     dimension_count.cast_signed(),
                     symbol_count.cast_signed(),
                 ),
-                &self,
+                self,
             )
         }
     }
@@ -345,7 +345,7 @@ mod tests {
         let context = Context::new();
         let empty_set = context.empty_integer_set(2, 1);
         assert_eq!(format!("{}", empty_set), "(d0, d1)[s0] : (1 == 0)");
-        assert_eq!(format!("{:?}", empty_set), "IntegerSet[\"(d0, d1)[s0] : (1 == 0)\"]");
+        assert_eq!(format!("{:?}", empty_set), "IntegerSet[(d0, d1)[s0] : (1 == 0)]");
     }
 
     #[test]

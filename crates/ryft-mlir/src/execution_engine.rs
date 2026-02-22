@@ -11,6 +11,7 @@ use crate::{LogicalResult, Module, StringRef};
 /// Represents an MLIR compiler optimization level. These levels determine how much effort the compiler puts into
 /// optimizing for runtime code execution speed while trading off compilation time and code size growth for it.
 #[repr(i32)]
+#[derive(Default)]
 pub enum OptimizationLevel {
     /// Results in disabling as many compiler optimizations as possible but not all possible optimizations
     /// (e.g., inlining certain functions may be required for correctness in certain cases).
@@ -33,6 +34,7 @@ pub enum OptimizationLevel {
     /// as well. Also, no matter what, the compilation time needs to not grow superlinearly with the size of input to
     /// MLIR so that users can control the runtime of the optimizer in this mode. This is expected to be a good default
     /// optimization level for the vast majority of users.
+    #[default]
     O2 = 2,
 
     /// Results in optimizations aimed at as fast execution as possible with no constraints. This mode is significantly
@@ -43,12 +45,6 @@ pub enum OptimizationLevel {
     /// time, this mode still tries to avoid superlinear growth in order to make even significantly slower compile times
     /// at least scale reasonably. This does not preclude very substantial constant factor costs though.
     O3 = 3,
-}
-
-impl Default for OptimizationLevel {
-    fn default() -> Self {
-        OptimizationLevel::O2
-    }
 }
 
 /// Just-In-Time (JIT) compilation-backed [`ExecutionEngine`] for MLIR (or rather LLVM specifically to be precise: more
@@ -159,7 +155,7 @@ impl ExecutionEngine {
     /// To use an [`ExecutionEngine`] after constructing it, you must register any necessary function implementations
     /// using [`ExecutionEngine::register_function`] and then call [`ExecutionEngine::initialize`].
     ///
-    /// # Arguments
+    /// # Parameters
     ///
     ///   * `module` - [`Module`] for which to construct an [`ExecutionEngine`]. This module is expected to be
     ///     "translatable" to LLVM IR (i.e., it must only contain operations in dialects that implement
@@ -211,7 +207,7 @@ impl ExecutionEngine {
     /// implementation that has a different signature or calling convention than what is expected, then this function
     /// will result in undefined behavior.
     ///
-    /// # Arguments
+    /// # Parameters
     ///
     ///   * `name` - Name of the function for which to register an implementation.
     ///   * `implementation` - Implementation of the function to use. This must be a pointer to an `extern "C"` function
@@ -265,7 +261,7 @@ impl InitializedExecutionEngine {
     /// example from the documentation string of [`ExecutionEngine`]) and their wrapper function names
     /// (e.g., `"_mlir_example"` for that same example).
     ///
-    /// # Arguments
+    /// # Parameters
     ///
     ///   * `name` - Name of the function to look up.
     pub unsafe fn get_function<'s, S: Into<StringRef<'s>>>(&self, name: S) -> Option<*mut std::ffi::c_void> {
@@ -291,7 +287,7 @@ impl InitializedExecutionEngine {
     /// invalid or misaligned in that they do not match what is specified in the function declaration in the underlying
     /// [`Module`], calling this function will result in undefined behavior.
     ///
-    /// # Arguments
+    /// # Parameters
     ///
     ///   * `name` - Name of the function to invoke.
     ///   * `arguments_and_result` - Pointer that is interpreted as a list of pointers to the actual arguments that will

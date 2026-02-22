@@ -55,7 +55,7 @@ impl<'t> Context<'t> {
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
         unsafe {
-            CallSiteLocationRef::from_c_api(mlirLocationCallSiteGet(callee.to_c_api(), caller.to_c_api()), &self)
+            CallSiteLocationRef::from_c_api(mlirLocationCallSiteGet(callee.to_c_api(), caller.to_c_api()), self)
                 .unwrap()
         }
     }

@@ -39,6 +39,11 @@ impl<'c, 't> TupleTypeRef<'c, 't> {
         unsafe { mlirTupleTypeGetNumTypes(self.handle).cast_unsigned() }
     }
 
+    /// Returns `true` if this [`TupleTypeRef`] is empty (i.e., it contains `0` elements).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns all element [`Type`]s of this [`TupleTypeRef`].
     pub fn elements(&self) -> impl Iterator<Item = TypeRef<'c, 't>> {
         (0..self.len()).map(|index| self.element(index))
@@ -69,7 +74,7 @@ impl<'t> Context<'t> {
             let elements = elements.iter().map(|element| element.to_c_api()).collect::<Vec<_>>();
             TupleTypeRef::from_c_api(
                 mlirTupleTypeGet(*self.handle.borrow(), elements.len().cast_signed(), elements.as_ptr() as *const _),
-                &self,
+                self,
             )
             .unwrap()
         }

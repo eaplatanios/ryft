@@ -257,10 +257,10 @@ pub fn uniform_quantize<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't
 }
 
 /// Name of the [`Attribute`] that is used to store [`ReducePrecisionOperation::exponent_bits`].
-pub const REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE: &'static str = "exponent_bits";
+pub const REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE: &str = "exponent_bits";
 
 /// Name of the [`Attribute`] that is used to store [`ReducePrecisionOperation::mantissa_bits`].
-pub const REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE: &'static str = "mantissa_bits";
+pub const REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE: &str = "mantissa_bits";
 
 /// StableHLO [`Operation`] that performs element-wise reduction of floating-point precision.
 ///
@@ -307,9 +307,11 @@ pub trait ReducePrecisionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as u32)
-            .expect(&format!(
-                "invalid '{REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`",
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid '{REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
+                )
+            })
     }
 
     /// Returns the number of mantissa bits in the target precision of this [`ReducePrecisionOperation`].
@@ -317,9 +319,11 @@ pub trait ReducePrecisionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as u32)
-            .expect(&format!(
-                "invalid '{REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`",
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid '{REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE}' attribute in `stable_hlo::reduce_precision`"
+                )
+            })
     }
 }
 

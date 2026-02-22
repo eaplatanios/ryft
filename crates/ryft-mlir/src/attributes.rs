@@ -57,7 +57,7 @@ pub trait Attribute<'c, 't: 'c>: Sized + Copy + Clone + PartialEq + Eq + Display
 
     /// Returns `true` if this attribute is an instance of `A`.
     fn is<A: Attribute<'c, 't>>(&self) -> bool {
-        Self::cast::<A>(&self).is_some()
+        Self::cast::<A>(self).is_some()
     }
 
     /// Tries to cast this attribute to an instance of `A` (e.g., an instance of
@@ -116,7 +116,7 @@ impl<'c, 't> Attribute<'c, 't> for AttributeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -125,7 +125,7 @@ mlir_subtype_trait_impls!(AttributeRef<'c, 't> as Attribute, mlir_type = Attribu
 impl<'t> Context<'t> {
     /// Returns a null (i.e., empty) [`Attribute`].
     pub fn null_attribute<'c>(&'c self) -> AttributeRef<'c, 't> {
-        AttributeRef { handle: unsafe { mlirAttributeGetNull() }, context: &self }
+        AttributeRef { handle: unsafe { mlirAttributeGetNull() }, context: self }
     }
 
     /// Parses an [`Attribute`] from the provided string representation. Returns [`None`] if MLIR fails to parse
@@ -133,7 +133,7 @@ impl<'t> Context<'t> {
     pub fn parse_attribute<'c>(&'c self, source: &str) -> Option<AttributeRef<'c, 't>> {
         unsafe {
             let handle = mlirAttributeParseGet(*self.handle.borrow_mut(), StringRef::from(source).to_c_api());
-            if handle.ptr.is_null() { None } else { AttributeRef::from_c_api(handle, &self) }
+            if handle.ptr.is_null() { None } else { AttributeRef::from_c_api(handle, self) }
         }
     }
 }
@@ -197,13 +197,13 @@ impl Eq for NamedAttributeRef<'_, '_> {}
 
 impl Display for NamedAttributeRef<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.name().to_string(), self.attribute().to_string())
+        write!(formatter, "{}: {}", self.name(), self.attribute())
     }
 }
 
 impl Debug for NamedAttributeRef<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "NamedAttributeRef[{}]", self.to_string())
+        write!(formatter, "NamedAttributeRef[{self}]")
     }
 }
 
@@ -214,7 +214,7 @@ impl<'t> Context<'t> {
         name: Identifier<'c, 't>,
         attribute: A,
     ) -> NamedAttributeRef<'c, 't> {
-        unsafe { NamedAttributeRef::from_c_api(mlirNamedAttributeGet(name.to_c_api(), attribute.to_c_api()), &self) }
+        unsafe { NamedAttributeRef::from_c_api(mlirNamedAttributeGet(name.to_c_api(), attribute.to_c_api()), self) }
     }
 }
 

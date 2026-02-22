@@ -230,6 +230,7 @@ impl FfiBufferType {
     }
 
     /// Parses a rendered [`FfiBufferType`] (e.g., an XLA primitive type string) into a [`FfiBufferType`].
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str<S: AsRef<str>>(value: S) -> Result<Self, FfiError> {
         let value = value.as_ref();
         match value.trim().to_ascii_lowercase().as_str() {

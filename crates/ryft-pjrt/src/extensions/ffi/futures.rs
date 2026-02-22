@@ -80,6 +80,7 @@ pub(crate) mod ffi {
     }
 
     impl XLA_FFI_Future_Create_Args {
+        #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), future: std::ptr::null_mut() }
         }

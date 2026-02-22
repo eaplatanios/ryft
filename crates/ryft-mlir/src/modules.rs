@@ -55,7 +55,7 @@ impl<'c, 't> Module<'c, 't> {
 
     /// Returns a reference to the [`Context`] that this [`Module`] is associated with.
     pub fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 
     /// Returns a reference to the [`Block`](crate::Block) that represents the body of this [`Module`]
@@ -152,7 +152,7 @@ impl<'m, 'c, 't> From<&'m Module<'c, 't>> for ModuleOperationRef<'m, 'c, 't> {
 impl<'t> Context<'t> {
     /// Creates a new (empty) [`Module`] at the specified [`Location`].
     pub fn module<'c, L: Location<'c, 't>>(&'c self, location: L) -> Module<'c, 't> {
-        unsafe { Module::from_c_api(mlirModuleCreateEmpty(location.to_c_api()), &self).unwrap() }
+        unsafe { Module::from_c_api(mlirModuleCreateEmpty(location.to_c_api()), self).unwrap() }
     }
 
     /// Parses a [`Module`] from the provided string representation. Returns [`None`] if MLIR fails to parse
@@ -162,7 +162,7 @@ impl<'t> Context<'t> {
             let source = std::ffi::CString::new(source.as_ref()).unwrap();
             Module::from_c_api(
                 mlirModuleCreateParse(*self.handle.borrow_mut(), StringRef::from(source.as_c_str()).to_c_api()),
-                &self,
+                self,
             )
         }
     }
@@ -174,7 +174,7 @@ impl<'t> Context<'t> {
             let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
             Module::from_c_api(
                 mlirModuleCreateParseFromFile(*self.handle.borrow_mut(), StringRef::from(path.as_c_str()).to_c_api()),
-                &self,
+                self,
             )
         }
     }

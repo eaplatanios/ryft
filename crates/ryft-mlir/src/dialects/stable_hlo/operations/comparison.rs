@@ -36,10 +36,10 @@ mlir_enum_attribute!(
 );
 
 /// Name of the [`Attribute`] that is used to store [`CompareOperation::comparison_direction`].
-pub const COMPARISON_DIRECTION_ATTRIBUTE: &'static str = "comparison_direction";
+pub const COMPARISON_DIRECTION_ATTRIBUTE: &str = "comparison_direction";
 
 /// Name of the [`Attribute`] that is used to store [`CompareOperation::comparison_type`].
-pub const COMPARISON_TYPE_ATTRIBUTE: &'static str = "compare_type";
+pub const COMPARISON_TYPE_ATTRIBUTE: &str = "compare_type";
 
 /// StableHLO [`Operation`] that performs element-wise comparison of two tensors. The operation compares
 /// corresponding elements from the two input tensors according to [`CompareOperation::comparison_direction`] and
@@ -111,7 +111,7 @@ pub trait CompareOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             .attribute(COMPARISON_DIRECTION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ComparisonDirectionAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!("`{COMPARISON_DIRECTION_ATTRIBUTE}` attribute not found or had incorrect type"))
+            .unwrap_or_else(|| panic!("`{COMPARISON_DIRECTION_ATTRIBUTE}` attribute not found or had incorrect type"))
     }
 
     /// Returns the [`ComparisonType`] of this [`CompareOperation`].
@@ -120,7 +120,7 @@ pub trait CompareOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             .attribute(COMPARISON_TYPE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ComparisonTypeAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!("`{COMPARISON_TYPE_ATTRIBUTE}` attribute not found or had incorrect type"))
+            .unwrap_or_else(|| panic!("`{COMPARISON_TYPE_ATTRIBUTE}` attribute not found or had incorrect type"))
     }
 }
 

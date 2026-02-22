@@ -11,7 +11,7 @@ use crate::helpers::span::with_span;
 ///   - https://github.com/serde-rs/serde/issues/1506
 ///   - https://github.com/serde-rs/serde/issues/1565
 ///
-/// # Arguments
+/// # Parameters
 ///
 ///   * `input` - [`DeriveInput`] for which to replace instances of the `Self` type. Note that this function
 ///     will mutate this [`DeriveInput`] instance directly. Note also that only structs and enums are supported.
@@ -267,7 +267,7 @@ impl ReplaceSelf<'_> {
 
         path.leading_colon = Some(syn::Token![::](span));
 
-        let segments = std::mem::replace(&mut path.segments, syn::punctuated::Punctuated::new());
+        let segments = std::mem::take(&mut path.segments);
         path.segments = segments.into_pairs().skip(1).collect();
     }
 }

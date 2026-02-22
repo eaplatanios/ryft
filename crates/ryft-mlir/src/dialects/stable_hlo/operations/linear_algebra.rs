@@ -106,7 +106,7 @@ impl<'t> Context<'t> {
                     rhs_contracting_dimensions.len().cast_signed(),
                     rhs_contracting_dimensions.as_ptr(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -163,10 +163,11 @@ mlir_subtype_trait_impls!(
 /// and unsupported algorithms should be treated as compilation-time errors rather than as requests that silently fall
 /// back to another algorithm.
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum DotAlgorithmPreset<'c, 't> {
     /// Default (platform-specific) algorithm based on the input/output types. This preset does not prescribe a concrete
     /// input type, output type, or accumulation type.
+    #[default]
     Default,
 
     /// Accepts any [`Float8Type`] input type and accumulates into [`Float32TypeRef`](crate::Float32TypeRef).
@@ -240,12 +241,6 @@ pub enum DotAlgorithmPreset<'c, 't> {
     /// Uses [`Float64TypeRef`](crate::Float64TypeRef) input precision and [`Float64TypeRef`](crate::Float64TypeRef)
     /// accumulation and output precision.
     F64_F64_F64,
-}
-
-impl Default for DotAlgorithmPreset<'_, '_> {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl<'c, 't> DotAlgorithmPreset<'c, 't> {
@@ -509,6 +504,7 @@ impl<'c, 't> IntoWithContext<'c, 't, Option<DotAlgorithmAttributeRef<'c, 't>>> f
 impl<'t> Context<'t> {
     /// Creates a new StableHLO [`DotAlgorithmAttributeRef`] owned by this [`Context`]. Refer to the documentation of
     /// [`DotGeneralOperation`] for information on the arguments of this function.
+    #[allow(clippy::too_many_arguments)]
     pub fn stable_hlo_dot_algorithm<'c, L: FloatType<'c, 't>, R: FloatType<'c, 't>, T: FloatType<'c, 't>>(
         &'c self,
         lhs_precision_type: L,
@@ -538,7 +534,7 @@ impl<'t> Context<'t> {
                     primitive_operation_count as i64,
                     allow_imprecise_accumulation,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -554,13 +550,13 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`DotGeneralOperation::dimensions`].
-pub const DOT_DIMENSIONS_ATTRIBUTE: &'static str = "dot_dimension_numbers";
+pub const DOT_DIMENSIONS_ATTRIBUTE: &str = "dot_dimension_numbers";
 
 /// Name of the [`Attribute`] that is used to store [`DotGeneralOperation::precision`].
-pub const DOT_PRECISION_ATTRIBUTE: &'static str = "precision_config";
+pub const DOT_PRECISION_ATTRIBUTE: &str = "precision_config";
 
 /// Name of the [`Attribute`] that is used to store [`DotGeneralOperation::algorithm`].
-pub const DOT_ALGORITHM_ATTRIBUTE: &'static str = "algorithm";
+pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 
 /// StableHLO [`Operation`] that computes the dot product between slices of two tensors and has configurable
 /// contracting and batch dimensions. It generalizes matrix multiplication to support batching as well as an arbitrary
@@ -568,11 +564,11 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &'static str = "algorithm";
 /// one output/result tensor, `result`, where `result[result_index] = dot_product` and:
 ///
 ///   - `lhs_result_dims = [d for d in axes(lhs) and d not in lhs_batching_dims and d not in lhs_contracting_dims]`,
-///      where `lhs_batching_dims` and `lhs_contracting_dims` are [`DotDimensionsAttributeRef::lhs_batching_dimensions`]
-///      and [`DotDimensionsAttributeRef::lhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
+///     where `lhs_batching_dims` and `lhs_contracting_dims` are [`DotDimensionsAttributeRef::lhs_batching_dimensions`]
+///     and [`DotDimensionsAttributeRef::lhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
 ///   - `rhs_result_dims = [d for d in axes(rhs) and d not in rhs_batching_dims and d not in rhs_contracting_dims]`,
-///      where `rhs_batching_dims` and `rhs_contracting_dims` are [`DotDimensionsAttributeRef::rhs_batching_dimensions`]
-///      and [`DotDimensionsAttributeRef::rhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
+///     where `rhs_batching_dims` and `rhs_contracting_dims` are [`DotDimensionsAttributeRef::rhs_batching_dimensions`]
+///     and [`DotDimensionsAttributeRef::rhs_contracting_dimensions`] in [`DotGeneralOperation::dimensions`].
 ///   - `result_batching_index + result_lhs_index + result_rhs_index = result_index`, where
 ///     `size(result_batching_index) = size(lhs_batching_dims)`, `size(result_lhs_index) = size(lhs_result_dims)`,
 ///     and `size(result_rhs_index) = size(rhs_result_dims)`,
@@ -600,13 +596,16 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &'static str = "algorithm";
 ///     on different accelerator backends. It contains two [`Precision`]s; one that corresponds to the left-hand side
 ///     input and one that corresponds to the right-hand side input. The possible values for each [`Precision`] value
 ///     have the following semantics:
+///
 ///       - [`Precision::Default`]: Fastest calculation, but least accurate approximation to the original number.
 ///       - [`Precision::High`]: Slower calculation, but more accurate approximation to the original number.
 ///       - [`Precision::Highest`]: Slowest calculation, but most accurate approximation to the original number.
+///
 ///   - [`DotGeneralOperation::algorithm`] defines the main properties of the algorithm used to implement the dot
 ///     operation, which also defines the precision to use. Therefore, if the precision-related fields of the algorithm
 ///     are set, [`DotGeneralOperation::precision`] must not also be set. The fields of a
 ///     [`DotAlgorithmAttributeRef`] have the following semantics:
+///
 ///       - [`DotAlgorithmAttributeRef::lhs_precision_type`] and [`DotAlgorithmAttributeRef::rhs_precision_type`] are
 ///         the precision types that the left-hand side input and right-hand side input of the operation are rounded to.
 ///         Precision types are independent of the storage types of the inputs and the output.
@@ -620,7 +619,9 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &'static str = "algorithm";
 ///         these values should be set to `1`.
 ///       - [`DotAlgorithmAttributeRef::allow_imprecise_accumulation`] specifies whether accumulation in lower precision
 ///         is permitted for some of the computation steps (e.g., using `CUBLASLT_MATMUL_DESC_FAST_ACCUM`).
+///
 ///     The following are some example supported [`DotAlgorithmAttributeRef`] values rendered with their MLIR rendering:
+///
 ///     ```mlir
 ///     // Inputs are casted to `tf32`, and then accumulated in `f32`:
 ///     {lhs_precision_type = tf32,
@@ -652,6 +653,7 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &'static str = "algorithm";
 ///      num_primitive_operations = 1,
 ///      allow_imprecise_accumulation = true}
 ///     ```
+///
 ///     It is up to the compiler implementation to decide which combinations are supported. In general, it is not
 ///     guaranteed that each algorithm is supported on each accelerator type by the consumer of StableHLO. If a given
 ///     algorithm is not supported, an error should be raised as opposed to falling back to an alternative.
@@ -717,7 +719,7 @@ pub trait DotGeneralOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn dimensions(&self) -> DotDimensionsAttributeRef<'c, 't> {
         self.attribute(DOT_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DotDimensionsAttributeRef>())
-            .expect(&format!("invalid '{DOT_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dot_general`"))
+            .unwrap_or_else(|| panic!("invalid '{DOT_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::dot_general`"))
     }
 
     /// Returns the [`Precision`] configuration of this [`DotGeneralOperation`], if specified. This configuration
@@ -878,6 +880,7 @@ mlir_subtype_trait_impls!(
 
 impl<'t> Context<'t> {
     /// Creates a new StableHLO [`ConvolutionDimensionsAttributeRef`] owned by this [`Context`].
+    #[allow(clippy::too_many_arguments)]
     pub fn stable_hlo_convolution_dimensions<'c>(
         &'c self,
         input_batch_dimension: usize,
@@ -917,7 +920,7 @@ impl<'t> Context<'t> {
                     output_spatial_dimensions.len().cast_signed(),
                     output_spatial_dimensions.as_ptr(),
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -925,28 +928,28 @@ impl<'t> Context<'t> {
 }
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::dimensions`].
-pub const CONVOLUTION_DIMENSIONS_ATTRIBUTE: &'static str = "dimension_numbers";
+pub const CONVOLUTION_DIMENSIONS_ATTRIBUTE: &str = "dimension_numbers";
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::batch_group_count`].
-pub const CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE: &'static str = "batch_group_count";
+pub const CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE: &str = "batch_group_count";
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::feature_group_count`].
-pub const CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE: &'static str = "feature_group_count";
+pub const CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE: &str = "feature_group_count";
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::window_strides`].
-pub const CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE: &'static str = "window_strides";
+pub const CONVOLUTION_WINDOW_STRIDES_ATTRIBUTE: &str = "window_strides";
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::lhs_dilation`].
-pub const CONVOLUTION_LHS_DILATION_ATTRIBUTE: &'static str = "lhs_dilation";
+pub const CONVOLUTION_LHS_DILATION_ATTRIBUTE: &str = "lhs_dilation";
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::rhs_dilation`].
-pub const CONVOLUTION_RHS_DILATION_ATTRIBUTE: &'static str = "rhs_dilation";
+pub const CONVOLUTION_RHS_DILATION_ATTRIBUTE: &str = "rhs_dilation";
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::window_reversal`].
-pub const CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE: &'static str = "window_reversal";
+pub const CONVOLUTION_WINDOW_REVERSAL_ATTRIBUTE: &str = "window_reversal";
 
 /// Name of the [`Attribute`] that is used to store [`StaticOrDynamicConvolutionOperation::precision`].
-pub const CONVOLUTION_PRECISION_ATTRIBUTE: &'static str = "precision_config";
+pub const CONVOLUTION_PRECISION_ATTRIBUTE: &str = "precision_config";
 
 /// Trait that is shared by [`ConvolutionOperation`] and [`DynamicConvolutionOperation`].
 pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
@@ -964,7 +967,7 @@ pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o,
     fn dimensions(&self) -> ConvolutionDimensionsAttributeRef<'c, 't> {
         self.attribute(CONVOLUTION_DIMENSIONS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<ConvolutionDimensionsAttributeRef>())
-            .expect(&format!("invalid '{CONVOLUTION_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`"))
+            .unwrap_or_else(|| panic!("invalid '{CONVOLUTION_DIMENSIONS_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`"))
     }
 
     /// Returns the batch group count of this [`Operation`].
@@ -972,9 +975,7 @@ pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o,
         self.attribute(CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!(
-                "invalid '{CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{CONVOLUTION_BATCH_GROUP_COUNT_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`"))
     }
 
     /// Returns the feature group count of this [`Operation`].
@@ -982,9 +983,7 @@ pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o,
         self.attribute(CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>())
             .map(|attribute| attribute.signless_value() as usize)
-            .expect(&format!(
-                "invalid '{CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`",
-            ))
+            .unwrap_or_else(|| panic!("invalid '{CONVOLUTION_FEATURE_GROUP_COUNT_ATTRIBUTE}' attribute in `stable_hlo::convolution` or `stable_hlo::dynamic_conv`"))
     }
 
     /// Returns the window strides of this [`Operation`], if specified. The window strides specify how large
@@ -1242,6 +1241,7 @@ mlir_op_trait!(Convolution, @local StaticOrDynamicConvolutionOperation);
 /// documentation of [`ConvolutionOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn convolution<
     'lhs,
     'rhs,
@@ -1388,6 +1388,7 @@ mlir_op_trait!(DynamicConvolution, @local StaticOrDynamicConvolutionOperation);
 /// documentation of [`DynamicConvolutionOperation`] for more information on the operation semantics.
 ///
 /// Note that if any of the inputs to this function are invalid, it will panic!
+#[allow(clippy::too_many_arguments)]
 pub fn dynamic_convolution<
     'lhs,
     'rhs,
@@ -1474,7 +1475,7 @@ pub fn dynamic_convolution<
 }
 
 /// Name of the [`Attribute`] that is used to store [`CholeskyOperation::lower`].
-pub const CHOLESKY_LOWER_ATTRIBUTE: &'static str = "lower";
+pub const CHOLESKY_LOWER_ATTRIBUTE: &str = "lower";
 
 /// StableHLO [`Operation`] that computes the [Cholesky](https://en.wikipedia.org/wiki/Cholesky_decomposition)
 /// decomposition of one or more square symmetric [positive-definite](https://en.wikipedia.org/wiki/Definite_matrix)
@@ -1514,7 +1515,7 @@ pub trait CholeskyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(CHOLESKY_LOWER_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!("invalid '{CHOLESKY_LOWER_ATTRIBUTE}' attribute in `stable_hlo::cholesky`"))
+            .unwrap_or_else(|| panic!("invalid '{CHOLESKY_LOWER_ATTRIBUTE}' attribute in `stable_hlo::cholesky`"))
     }
 }
 
@@ -1557,16 +1558,16 @@ mlir_enum_attribute!(
 );
 
 /// Name of the [`Attribute`] that is used to store [`TriangularSolveOperation::left_side`].
-pub const TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE: &'static str = "left_side";
+pub const TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE: &str = "left_side";
 
 /// Name of the [`Attribute`] that is used to store [`TriangularSolveOperation::lower`].
-pub const TRIANGULAR_SOLVE_LOWER_ATTRIBUTE: &'static str = "lower";
+pub const TRIANGULAR_SOLVE_LOWER_ATTRIBUTE: &str = "lower";
 
 /// Name of the [`Attribute`] that is used to store [`TriangularSolveOperation::unit_diagonal`].
-pub const TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE: &'static str = "unit_diagonal";
+pub const TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE: &str = "unit_diagonal";
 
 /// Name of the [`Attribute`] that is used to store [`TriangularSolveOperation::transpose_a`].
-pub const TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE: &'static str = "transpose_a";
+pub const TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE: &str = "transpose_a";
 
 /// StableHLO [`Operation`] that solves triangular systems of linear equations with lower or upper triangular
 /// coefficient matrices. More formally, given [`TriangularSolveOperation::a`] and [`TriangularSolveOperation::b`],
@@ -1640,9 +1641,9 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!(
-                "invalid '{TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`",
-            ))
+            .unwrap_or_else(|| {
+                panic!("invalid '{TRIANGULAR_SOLVE_LEFT_SIDE_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
+            })
     }
 
     /// Returns whether this [`TriangularSolveOperation`] operates on lower or upper triangular matrices.
@@ -1650,9 +1651,9 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_LOWER_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!(
-                "invalid '{TRIANGULAR_SOLVE_LOWER_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`",
-            ))
+            .unwrap_or_else(|| {
+                panic!("invalid '{TRIANGULAR_SOLVE_LOWER_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
+            })
     }
 
     /// Returns `true` if this [`TriangularSolveOperation`] can assume that the diagonal elements of
@@ -1661,9 +1662,11 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<BooleanAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!(
-                "invalid '{TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`",
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid '{TRIANGULAR_SOLVE_UNIT_DIAGONAL_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`"
+                )
+            })
     }
 
     /// Returns the [`TriangularSolveTransposeType`] for this [`TriangularSolveOperation`].
@@ -1671,9 +1674,9 @@ pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<TriangularSolveTransposeTypeAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!(
-                "invalid '{TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`",
-            ))
+            .unwrap_or_else(|| {
+                panic!("invalid '{TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE}' attribute in `stable_hlo::triangular_solve`")
+            })
     }
 }
 
@@ -1737,10 +1740,10 @@ mlir_enum_attribute!(
 );
 
 /// Name of the [`Attribute`] that is used to store [`FftOperation::fft_type`].
-pub const FFT_TYPE_ATTRIBUTE: &'static str = "fft_type";
+pub const FFT_TYPE_ATTRIBUTE: &str = "fft_type";
 
 /// Name of the [`Attribute`] that is used to store [`FftOperation::fft_length`].
-pub const FFT_LENGTH_ATTRIBUTE: &'static str = "fft_length";
+pub const FFT_LENGTH_ATTRIBUTE: &str = "fft_length";
 
 /// StableHLO [`Operation`] that performs the forward and inverse Fast Fourier Transforms (FFTs) for real and complex
 /// input and output tensors. The type of Fourier transform it performs is controlled by [`FftOperation::fft_type`]:
@@ -1805,7 +1808,7 @@ pub trait FftOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(FFT_TYPE_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<FftTypeAttributeRef>())
             .map(|attribute| attribute.value())
-            .expect(&format!("invalid '{FFT_TYPE_ATTRIBUTE}' attribute in `stable_hlo::fft`"))
+            .unwrap_or_else(|| panic!("invalid '{FFT_TYPE_ATTRIBUTE}' attribute in `stable_hlo::fft`"))
     }
 
     /// Returns the length (i.e., number of step-wise FFT transformations) of this [`FftOperation`].
@@ -1813,7 +1816,7 @@ pub trait FftOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.attribute(FFT_LENGTH_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger64ArrayAttributeRef>())
             .map(|attribute| attribute.values().map(|value| value as usize).collect())
-            .expect(&format!("invalid '{FFT_LENGTH_ATTRIBUTE}' attribute in `stable_hlo::fft`"))
+            .unwrap_or_else(|| panic!("invalid '{FFT_LENGTH_ATTRIBUTE}' attribute in `stable_hlo::fft`"))
     }
 }
 

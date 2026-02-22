@@ -77,7 +77,7 @@ impl<'t> Context<'t> {
                     line as u32,
                     column as u32,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }
@@ -108,7 +108,7 @@ impl<'t> Context<'t> {
                     end_line as u32,
                     end_column as u32,
                 ),
-                &self,
+                self,
             )
             .unwrap()
         }

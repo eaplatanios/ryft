@@ -52,7 +52,7 @@ impl<'c, 't> Attribute<'c, 't> for TensorTypeExtensionsAttributeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -84,7 +84,7 @@ impl<'t> Context<'t> {
                 .collect::<Vec<_>>();
             TensorTypeExtensionsAttributeRef::from_c_api(
                 stablehloTypeExtensionsGet(*self.handle.borrow(), bounds.len().cast_signed(), bounds.as_ptr()),
-                &self,
+                self,
             )
             .unwrap()
         }

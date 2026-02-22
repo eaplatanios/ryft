@@ -38,6 +38,7 @@ impl MemoryDescriptionsExtension {
     /// Returns the [`PJRT_MemoryDescriptions_Extension`](ffi::PJRT_MemoryDescriptions_Extension)
     /// that corresponds to this [`MemoryDescriptionsExtension`] and which can be passed to
     /// functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_MemoryDescriptions_Extension {
         self.handle
     }
@@ -114,6 +115,7 @@ impl MemoryDescription<'_> {
 
     /// Returns the [`PJRT_MemoryDescription`](ffi::PJRT_MemoryDescription) that corresponds to
     /// this [`MemoryDescription`] and which can be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_MemoryDescription {
         self.handle
     }

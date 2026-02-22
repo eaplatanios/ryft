@@ -31,6 +31,7 @@ impl StreamExtension {
 
     /// Returns the [`PJRT_Stream_Extension`](ffi::PJRT_Stream_Extension) that corresponds to this [`StreamExtension`]
     /// and which can be passed to functions in the PJRT C API.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_Stream_Extension {
         self.handle
     }

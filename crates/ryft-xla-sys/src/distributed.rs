@@ -111,6 +111,7 @@ pub struct PJRT_Distributed_Runtime_Client_New_Args {
 }
 
 impl PJRT_Distributed_Runtime_Client_New_Args {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         address: *const std::ffi::c_char,
         node_id: u32,

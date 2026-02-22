@@ -12,11 +12,11 @@
 /// # Parameters
 ///
 ///   - `$api`: API instance that provides access to PJRT C API function pointers. The type that this expression
-///      evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
-///      either an [`Api`](crate::Api) instance itself or a PJRT extension instance. Note that you can also optionally
-///      use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
-///      API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
-///      PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
+///     evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
+///     either an [`Api`](crate::Api) instance itself or a PJRT extension instance. Note that you can also optionally
+///     use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
+///     API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
+///     PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
 ///   - `$fn`: Name of the PJRT C API function to invoke (e.g., `PJRT_Client_Create`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond
 ///     to fields in the corresponding `<$fn>_Args` struct in the PJRT C API.
@@ -88,11 +88,11 @@ macro_rules! invoke_pjrt_api_fn_helper {
 /// # Parameters
 ///
 ///   - `$api`: API instance that provides access to PJRT C API function pointers. The type that this expression
-///      evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
-///      either an [`Api`](crate::Api) instance itself or a PJRT extension instance.Note that you can also optionally
-///      use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
-///      API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
-///      PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
+///     evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
+///     either an [`Api`](crate::Api) instance itself or a PJRT extension instance.Note that you can also optionally
+///     use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
+///     API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
+///     PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
 ///   - `$fn`: Name of the PJRT C API function to invoke (e.g., `PJRT_Client_Create`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond
 ///     to fields in the corresponding `<$fn>_Args` struct in the PJRT C API.
@@ -146,11 +146,11 @@ macro_rules! invoke_pjrt_api_void_fn {
 /// # Parameters
 ///
 ///   - `$api`: API instance that provides access to PJRT C API function pointers. The type that this expression
-///      evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
-///      either an [`Api`](crate::Api) instance itself or a PJRT extension instance. Note that you can also optionally
-///      use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
-///      API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
-///      PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
+///     evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
+///     either an [`Api`](crate::Api) instance itself or a PJRT extension instance. Note that you can also optionally
+///     use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
+///     API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
+///     PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
 ///   - `$fn`: Name of the PJRT C API function to invoke (e.g., `PJRT_Client_Create`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond
 ///     to fields in the corresponding `<$fn>_Args` struct in the PJRT C API.
@@ -215,7 +215,7 @@ macro_rules! invoke_pjrt_api_error_fn {
 /// # Parameters
 ///
 ///   - `$fn`: Name of the XLA distributed runtime C API function to invoke
-///      (e.g., `PJRT_Distributed_Runtime_Client_Connect`).
+///     (e.g., `PJRT_Distributed_Runtime_Client_Connect`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond to fields in the
 ///     corresponding `<$fn>_Args` struct in the XLA distributed runtime C API.
 ///   - `$output_name`: Zero or more output field names to extract from the `<$fn>_Args` struct after the XLA
@@ -245,9 +245,9 @@ macro_rules! invoke_distributed_api_fn_helper {
 /// # Parameters
 ///
 ///   - `$api`: API instance associated with the distributed runtime object being used. This parameter exists for API
-///      symmetry with [`invoke_distributed_api_error_fn!`].
+///     symmetry with [`invoke_distributed_api_error_fn!`].
 ///   - `$fn`: Name of the XLA distributed runtime C API function to invoke
-///      (e.g., `PJRT_Distributed_Runtime_Service_Shutdown`).
+///     (e.g., `PJRT_Distributed_Runtime_Service_Shutdown`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond to fields in the
 ///     corresponding `<$fn>_Args` struct in the XLA distributed runtime C API.
 ///   - `$output_name`: Zero or more output field names to extract from the `<$fn>_Args` struct after the XLA
@@ -300,10 +300,10 @@ macro_rules! invoke_distributed_api_void_fn {
 /// # Parameters
 ///
 ///   - `$api`: API instance that provides access to PJRT C API function pointers. The type that this expression
-///      evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
-///      either an [`Api`](crate::Api) instance itself or a PJRT extension instance.
+///     evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
+///     either an [`Api`](crate::Api) instance itself or a PJRT extension instance.
 ///   - `$fn`: Name of the XLA distributed runtime C API function to invoke
-///      (e.g., `PJRT_Distributed_Runtime_Client_Connect`).
+///     (e.g., `PJRT_Distributed_Runtime_Client_Connect`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond to fields in the
 ///     corresponding `<$fn>_Args` struct in the XLA distributed runtime C API.
 ///   - `$output_name`: Zero or more output field names to extract from the `<$fn>_Args` struct after the XLA

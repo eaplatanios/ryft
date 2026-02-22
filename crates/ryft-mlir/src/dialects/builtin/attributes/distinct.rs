@@ -50,7 +50,7 @@ impl<'c, 't> Attribute<'c, 't> for DistinctAttributeRef<'c, 't> {
     }
 
     fn context(&self) -> &'c Context<'t> {
-        &self.context
+        self.context
     }
 }
 
@@ -66,7 +66,7 @@ impl<'t> Context<'t> {
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
         let _guard = self.borrow();
-        unsafe { DistinctAttributeRef { handle: mlirDisctinctAttrCreate(attribute.to_c_api()), context: &self } }
+        unsafe { DistinctAttributeRef { handle: mlirDisctinctAttrCreate(attribute.to_c_api()), context: self } }
     }
 }
 

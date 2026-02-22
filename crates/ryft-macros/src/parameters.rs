@@ -21,7 +21,7 @@ const DEFAULT_MACRO_PARAMETER_LIFETIME: Symbol = Symbol::new("'__p");
 const DEFAULT_MACRO_PARAMETER_TYPE: Symbol = Symbol::new("__P");
 const DEFAULT_PARAMETER_TYPE: Symbol = Symbol::new("Param");
 
-const FIELD_ATTRIBUTE_ERROR: &'static str = "\
+const FIELD_ATTRIBUTE_ERROR: &str = "\
   The '#[ryft(...)]' attribute is only supported at the top level \
   for structs and enums. It is not supported for fields or variants.";
 
@@ -284,7 +284,7 @@ impl CodeGenerator {
         // Check that there is only a single unique type parameter bounded by [`ryft::Parameter`].
         if param_types.len() > 1 {
             self.add_error(
-                &generics,
+                generics,
                 "Found more than one generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' \
                 macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more \
                 than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be \
@@ -317,7 +317,7 @@ impl CodeGenerator {
                     .flat_map(|predicate| match &predicate {
                         syn::WherePredicate::Type(syn::PredicateType { bounded_ty, bounds, .. })
                             if bounded_ty.matches_ident(&self.param_type)
-                                && !check_bounds(&self.ryft_crate, &bounds) =>
+                                && !check_bounds(&self.ryft_crate, bounds) =>
                         {
                             Some(bounds.iter())
                         }
@@ -328,7 +328,7 @@ impl CodeGenerator {
             .collect::<Vec<_>>();
         bad_bounds.iter().for_each(|bound| {
             self.add_error(
-                &bound,
+                bound,
                 "The generic parameter that is bounded by 'Parameter' indicates the parameter type that is used by \
                     '#[derive(Parameterized)]' and cannot have any bounds other than the 'Parameter' bound.",
             );
@@ -342,7 +342,7 @@ impl CodeGenerator {
         /// Helper function that extracts a [Field] from the provided data. This function also checks for any invalid
         /// or unknown `[#ryft(...)]` attributes attached to the corresponding [`syn::Field`].
         ///
-        /// # Arguments
+        /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is called. We need to pass it as an
         ///     additional argument because Rust function do not capture the surrounding generator.
@@ -403,7 +403,7 @@ impl CodeGenerator {
         /// Helper function that extracts a [`Variant`] from the provided [`syn::Variant`]. This function also checks
         /// for any invalid or unknown `[#ryft(...)]` attributes attached to the [`syn::Variant`].
         ///
-        /// # Arguments
+        /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is called. We need to pass it as an
         ///     additional argument because Rust function do not capture the surrounding generator.
@@ -418,7 +418,7 @@ impl CodeGenerator {
             variant
                 .fields
                 .iter()
-                .filter(|f| f.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).next().is_some())
+                .filter(|f| f.attrs.iter().any(|attr| attr.path() == &RYFT_ATTRIBUTE))
                 .for_each(|f| generator.add_error(f, FIELD_ATTRIBUTE_ERROR));
 
             // Construct a [`Variant`] from the provided information.
@@ -452,7 +452,7 @@ impl CodeGenerator {
                 };
             }
             syn::Data::Enum(data) => {
-                let variants = data.variants.iter().map(|variant| extract_variant(self, &variant)).collect();
+                let variants = data.variants.iter().map(|variant| extract_variant(self, variant)).collect();
                 self.data = Data::Enum(EnumData { ident, variants });
             }
             syn::Data::Union(_) => {
@@ -563,7 +563,7 @@ impl CodeGenerator {
         /// Adds any bounds that are necessary for the provided [`Field`] to the provided [`syn::Generics`].
         fn add_field_bounds(generator: &CodeGenerator, generics: &mut syn::Generics, field: &Field) {
             if field.is_param {
-                add_parameterized_bounds(generator, generics, &field);
+                add_parameterized_bounds(generator, generics, field);
             } else {
                 let bound = syn::Path::from(syn::Ident::new("Clone", Span::call_site()));
                 add_trait_bound(generics, field.ty.clone(), bound);
@@ -589,7 +589,7 @@ impl CodeGenerator {
     /// anywhere in the provided [`syn::DeriveInput`] and will report corresponding errors if they do.
     fn check_for_name_conflicts(&mut self, input: &syn::DeriveInput) {
         input.generics.params.iter().for_each(|param| match param {
-            syn::GenericParam::Lifetime(param) if &param.lifetime == &self.macro_param_lifetime => {
+            syn::GenericParam::Lifetime(param) if param.lifetime == self.macro_param_lifetime => {
                 self.add_error(param, format_args!("Identifier '{}' is reserved.", self.macro_param_lifetime.clone()));
             }
             syn::GenericParam::Type(param) if param.matches_ident(&self.macro_param_type) => {
@@ -605,7 +605,7 @@ impl CodeGenerator {
     /// Adds an error to this [`CodeGenerator`] with the specified message spanning the provided tokens. This is only
     /// meant to be used internally by this class as a convenient helper for collecting errors.
     ///
-    /// # Arguments
+    /// # Parameters
     ///
     ///   * `tokens` - Tokens that the error spans.
     ///   * `message` - Message describing the error.
@@ -693,7 +693,7 @@ impl CodeGenerator {
         /// type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
         /// ```
         ///
-        /// # Arguments
+        /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
@@ -709,7 +709,7 @@ impl CodeGenerator {
 
             let body = match &generator.data {
                 Data::Struct(StructData { fields, .. }) => {
-                    generate_assoc_type_for_fields(generator, &fields, iter_type, &macro_param_type)
+                    generate_assoc_type_for_fields(generator, fields, iter_type, macro_param_type)
                 }
                 Data::Enum(EnumData { ident, variants }) => {
                     let iterator_ident = format_ident!("{}{}", &ident, iter_type.params_assoc_type_name());
@@ -718,10 +718,10 @@ impl CodeGenerator {
                     // [`syn::Generics`] here are constructed this way.
                     let parameterized_fields = variants.iter().flat_map(|variant| variant.fields.iter());
                     let generics = generator.generics_for_fields(parameterized_fields);
-                    let generics = generics.with_renamed_param(&generator.param_type, &macro_param_type);
+                    let generics = generics.with_renamed_param(&generator.param_type, macro_param_type);
                     let generics = match &iter_type {
-                        IterType::Iter => generics.with_lifetime(&macro_param_lifetime, &macro_param_type),
-                        IterType::IterMut => generics.with_lifetime(&macro_param_lifetime, &macro_param_type),
+                        IterType::Iter => generics.with_lifetime(macro_param_lifetime, macro_param_type),
+                        IterType::IterMut => generics.with_lifetime(macro_param_lifetime, macro_param_type),
                         IterType::IntoIter => generics.clone(),
                     };
                     let (_, ty_generics, _) = generics.split_for_impl();
@@ -760,7 +760,7 @@ impl CodeGenerator {
         /// of the caller to nest this appropriately within other types, if needed, and to generate the surrounding
         /// code for the appropriate associated type declaration.
         ///
-        /// # Arguments
+        /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
@@ -771,7 +771,7 @@ impl CodeGenerator {
         ///     directly use [`CodeGenerator::param_type`].
         fn generate_assoc_type_for_fields(
             generator: &CodeGenerator,
-            fields: &Vec<Field>,
+            fields: &[Field],
             iter_type: &IterType,
             iter_param_type: &syn::Ident,
         ) -> TokenStream {
@@ -845,8 +845,8 @@ impl CodeGenerator {
                     let parameterized_fields = variants.iter().flat_map(|variant| variant.fields.iter());
                     let generics = generator.generics_for_fields(parameterized_fields);
                     let generics = match &iter_type {
-                        IterType::Iter => generics.with_lifetime(&macro_param_lifetime, &param_type),
-                        IterType::IterMut => generics.with_lifetime(&macro_param_lifetime, &param_type),
+                        IterType::Iter => generics.with_lifetime(macro_param_lifetime, param_type),
+                        IterType::IterMut => generics.with_lifetime(macro_param_lifetime, param_type),
                         IterType::IntoIter => generics.clone(),
                     };
                     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
@@ -911,7 +911,7 @@ impl CodeGenerator {
         // where `__P` is a fresh and unique identifier. This generic parameter replacement is what
         // takes place in the following line (the uniqueness check for the name is performed in
         // [`CodeGenerator::check_for_name_conflicts`]).
-        let to_assoc_ty_generics = &self.generics.with_renamed_param(&param_type, &macro_param_type);
+        let to_assoc_ty_generics = &self.generics.with_renamed_param(param_type, macro_param_type);
         let to_assoc_impl_generics = &to_assoc_ty_generics.without_params(
             to_assoc_ty_generics
                 .params
@@ -960,21 +960,20 @@ impl CodeGenerator {
         /// caller to surround this [`TokenStream`] with braces and/or parenthesis and to generate the rest of the
         /// surrounding code.
         ///
-        /// # Arguments
+        /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
         ///   * `receiver` - Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
         ///     the owner may be a tuple, a struct, or the variant of an enum. This is used to generate expressions that
         ///     access values of the provided [`Field`]s by invoking [`Field::member`].
-        fn generate_body(generator: &CodeGenerator, fields: &Vec<Field>, receiver: Option<TokenStream>) -> TokenStream {
+        fn generate_body(fields: &[Field], receiver: Option<TokenStream>) -> TokenStream {
             fields.iter().fold(quote!(0usize), |token_stream, field| {
                 let receiver = field.member(receiver.as_ref());
                 match &field {
                     Field { is_param: false, .. } => token_stream,
                     Field { fields: None, .. } => quote!(#token_stream + #receiver.param_count()),
                     Field { fields: Some(fields), .. } => {
-                        let fields_expression = generate_body(generator, fields, Some(receiver));
+                        let fields_expression = generate_body(fields, Some(receiver));
                         quote!(#token_stream + #fields_expression)
                     }
                 }
@@ -982,13 +981,13 @@ impl CodeGenerator {
         }
 
         let body = match &self.data {
-            Data::Struct(StructData { fields, .. }) => generate_body(self, &fields, Some(quote!(self))),
+            Data::Struct(StructData { fields, .. }) => generate_body(fields, Some(quote!(self))),
             Data::Enum(EnumData { ident, variants }) => {
                 let variant_counts = variants.iter().map(|variant| {
                     let variant_ident = &variant.ident;
                     let variant_path = quote!(#ident::#variant_ident);
                     let fields = variant.fields.iter().map(|field| field.member(None));
-                    let fields_body = generate_body(self, &variant.fields, None);
+                    let fields_body = generate_body(&variant.fields, None);
                     match &variant.kind {
                         Kind::Unit => quote!(#variant_path => 0usize),
                         Kind::Unnamed => quote!(#variant_path (#(#fields,)*) => #fields_body),
@@ -1018,14 +1017,13 @@ impl CodeGenerator {
         /// caller to surround this [`TokenStream`] with braces and/or parenthesis and to generate the rest of the
         /// surrounding code.
         ///
-        /// # Arguments
+        /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
         ///   * `receiver` - Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
         ///     the owner may be a tuple, a struct, or the variant of an enum. This is used to generate expressions that
         ///     access values of the provided [`Field`]s by invoking [`Field::member`].
-        fn generate_body(generator: &CodeGenerator, fields: &Vec<Field>, receiver: Option<TokenStream>) -> TokenStream {
+        fn generate_body(fields: &[Field], receiver: Option<TokenStream>) -> TokenStream {
             fields
                 .iter()
                 .map(|field| {
@@ -1035,7 +1033,7 @@ impl CodeGenerator {
                         Field { is_param: false, .. } => quote!(#prefix #receiver.clone()),
                         Field { fields: None, .. } => quote!(#prefix #receiver.param_structure()),
                         Field { fields: Some(fields), .. } => {
-                            let fields_expression = generate_body(generator, fields, Some(receiver));
+                            let fields_expression = generate_body(fields, Some(receiver));
                             quote!(#prefix (#fields_expression))
                         }
                     }
@@ -1046,7 +1044,7 @@ impl CodeGenerator {
 
         let body = match &self.data {
             Data::Struct(StructData { ident, fields, kind }) => {
-                let fields_body = generate_body(self, &fields, Some(quote!(self)));
+                let fields_body = generate_body(fields, Some(quote!(self)));
                 match &kind {
                     Kind::Unit => quote!(#ident),
                     Kind::Unnamed => quote!(#ident ( #fields_body )),
@@ -1058,7 +1056,7 @@ impl CodeGenerator {
                     let variant_ident = &variant.ident;
                     let variant_path = quote!(#ident::#variant_ident);
                     let fields = variant.fields.iter().map(|field| field.member(None));
-                    let fields_body = generate_body(self, &variant.fields, None);
+                    let fields_body = generate_body(&variant.fields, None);
                     match &variant.kind {
                         Kind::Unit => quote!(#variant_path => #variant_path),
                         Kind::Unnamed => quote!(#variant_path (#(#fields,)*) => #variant_path ( #fields_body )),
@@ -1091,7 +1089,7 @@ impl CodeGenerator {
         /// of the caller to surround this [`TokenStream`] with braces and to generate the function
         /// signature/declaration.
         ///
-        /// # Arguments
+        /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::params`],
@@ -1099,7 +1097,7 @@ impl CodeGenerator {
         fn generate_body(generator: &CodeGenerator, iter_type: &IterType) -> TokenStream {
             match &generator.data {
                 Data::Struct(StructData { fields, .. }) => {
-                    generate_body_for_fields(generator, &fields, Some(quote!(self)), iter_type)
+                    generate_body_for_fields(fields, Some(quote!(self)), iter_type)
                 }
                 Data::Enum(EnumData { ident, variants }) => {
                     let assoc_ty = iter_type.params_assoc_type_name();
@@ -1108,7 +1106,7 @@ impl CodeGenerator {
                         let variant_path = quote!(#ident::#variant_ident);
                         let iterator_ident = format_ident!("{}{}", &ident, assoc_ty);
                         let fields = variant.fields.iter().map(|field| field.member(None));
-                        let fields_body = generate_body_for_fields(generator, &variant.fields, None, iter_type);
+                        let fields_body = generate_body_for_fields(&variant.fields, None, iter_type);
                         let variant_body = quote!(#iterator_ident::#variant_ident(#fields_body));
                         match &variant.kind {
                             Kind::Unit => quote!(#variant_path => #variant_body),
@@ -1127,9 +1125,8 @@ impl CodeGenerator {
         /// the owning function. It is the responsibility of the caller to surround this [`TokenStream`] with braces
         /// and/or parenthesis and to generate the rest of the surrounding code.
         ///
-        /// # Arguments
+        /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
         ///   * `receiver` - Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
         ///     the owner may be a tuple, a struct, or the variant of an enum. This is used to generate expressions that
@@ -1137,8 +1134,7 @@ impl CodeGenerator {
         ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::params`],
         ///     [`Parameterized::params_mut`], and [`Parameterized::into_params`], to generate code for.
         fn generate_body_for_fields(
-            generator: &CodeGenerator,
-            fields: &Vec<Field>,
+            fields: &[Field],
             receiver: Option<TokenStream>,
             iter_type: &IterType,
         ) -> TokenStream {
@@ -1154,7 +1150,7 @@ impl CodeGenerator {
                             IterType::IntoIter => quote!(#receiver.into_params()),
                         }),
                         Field { fields: Some(fields), .. } => {
-                            Some(generate_body_for_fields(generator, fields, Some(receiver), iter_type))
+                            Some(generate_body_for_fields(fields, Some(receiver), iter_type))
                         }
                     }
                 })
@@ -1196,7 +1192,7 @@ impl CodeGenerator {
         /// It is the responsibility of the caller to surround this [`TokenStream`] with braces and/or parenthesis and
         /// to generate the rest of the surrounding code.
         ///
-        /// # Arguments
+        /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
@@ -1204,11 +1200,7 @@ impl CodeGenerator {
         ///     the provided [`Field`]s. Note that the owner may be a tuple, a struct, or the variant of an enum. This
         ///     is used to obtain the [`Parameterized`] structure that corresponds to each [`Field`] in the provided
         ///     list by invoking [`Field::member`] to construct the appropriate accessor.
-        fn generate_body(
-            generator: &CodeGenerator,
-            fields: &Vec<Field>,
-            structure: Option<TokenStream>,
-        ) -> TokenStream {
+        fn generate_body(generator: &CodeGenerator, fields: &[Field], structure: Option<TokenStream>) -> TokenStream {
             let ryft = &generator.ryft_crate;
             let param_type = &generator.param_type;
 
@@ -1244,7 +1236,7 @@ impl CodeGenerator {
 
         let body = match &self.data {
             Data::Struct(StructData { ident, fields, kind }) => {
-                let fields = generate_body(self, &fields, Some(quote!(structure)));
+                let fields = generate_body(self, fields, Some(quote!(structure)));
                 match &kind {
                     Kind::Unit => quote!(#ident),
                     Kind::Unnamed => quote!(#ident ( #fields )),

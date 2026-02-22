@@ -31,7 +31,7 @@ impl<'t> Context<'t> {
         // function quite inconvenient/annoying in practice. This should have no negative consequences in
         // terms of safety since MLIR contexts are not thread-safe and in a single-threaded context there
         // should be no possibility for this function to cause problems with an immutable borrow.
-        unsafe { IndexTypeRef::from_c_api(mlirIndexTypeGet(*self.handle.borrow()), &self).unwrap() }
+        unsafe { IndexTypeRef::from_c_api(mlirIndexTypeGet(*self.handle.borrow()), self).unwrap() }
     }
 }
 

@@ -269,7 +269,7 @@ impl Visit<'_> for ReferencesIdentVisitor<'_> {
             return;
         }
 
-        if node.get_ident() == Some(&self.ident) {
+        if node.get_ident() == Some(self.ident) {
             self.referenced = true;
         } else if node.segments.first().iter().any(|segment| &segment.ident == self.ident) {
             // If the path starts with the [`syn::Ident`] that we are looking for, then we assume that it references
@@ -309,7 +309,7 @@ impl Visit<'_> for ReferencesIdentVisitor<'_> {
             // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::TypeParamBound::Trait(b) => self.visit_path(&b.path),
             syn::TypeParamBound::Lifetime(b) => self.visit_lifetime(b),
-            syn::TypeParamBound::PreciseCapture(b) => b.params.iter().for_each(|p| self.visit_captured_param(&p)),
+            syn::TypeParamBound::PreciseCapture(b) => b.params.iter().for_each(|p| self.visit_captured_param(p)),
             syn::TypeParamBound::Verbatim(_) => {}
             _ => {}
         }
@@ -339,7 +339,7 @@ impl<'s> ReplaceIdentVisitor<'s> {
 
 impl VisitMut for ReplaceIdentVisitor<'_> {
     fn visit_path_mut(&mut self, node: &mut syn::Path) {
-        if !node.leading_colon.is_some() && node.segments.first().iter().all(|s| &s.ident == self.ident) {
+        if node.leading_colon.is_none() && node.segments.first().iter().all(|s| &s.ident == self.ident) {
             *node = {
                 let leading_colon = self.replacement.leading_colon;
                 let mut segments = syn::punctuated::Punctuated::<syn::PathSegment, syn::Token![::]>::new();
