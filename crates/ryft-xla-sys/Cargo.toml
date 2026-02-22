@@ -5,6 +5,19 @@ readme = "README.md"
 description = "Ryft bindings for XLA."
 keywords = ["ryft", "xla", "pjrt", "mlir", "gpu"]
 include = [
+    "bazel/**/*",
+    "src/**/*",
+    ".bazelrc",
+    ".bazelversion",
+    "build.rs",
+    "BUILD.bazel",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "pjrt_plugin.def",
+    "pjrt_plugin_exported_symbols.txt",
+    "pjrt_plugin_version_script.lds",
+    "README.md",
+    "WORKSPACE",
     "../../LICENSE-APACHE",
     "../../LICENSE-MIT",
     "../../NOTICE",
@@ -17,6 +30,13 @@ categories.workspace = true
 license.workspace = true
 
 links = "ryft-xla-sys"
+
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+    { file = "CHANGELOG.md", search = "Release Date", replace = "{{date}}", min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n", exactly = 1 },
+]
 
 [features]
 default = []
@@ -76,6 +96,7 @@ prost-types.workspace = true
 
 [build-dependencies]
 anyhow.workspace = true
+bindgen = { workspace = true, optional = true }
 dirs.workspace = true
 flate2.workspace = true
 hex.workspace = true
@@ -83,5 +104,3 @@ reqwest.workspace = true
 sha2.workspace = true
 tar.workspace = true
 zip.workspace = true
-
-bindgen = { workspace = true, optional = true }

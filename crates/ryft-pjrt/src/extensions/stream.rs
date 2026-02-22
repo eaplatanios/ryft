@@ -79,8 +79,8 @@ impl Api {
 }
 
 impl Device<'_> {
-    /// Returns a platform-specific [`StreamHandle`] that should be used to track when an externally-managed
-    /// [`Buffer`](crate::Buffer) is ready to use on this [`Device`].
+    /// Returns a platform-specific [`StreamHandle`] that should be used to track when an externally-managed [`Buffer`]
+    /// is ready to use on this [`Device`].
     pub fn stream_for_external_ready_events(&self) -> Result<StreamHandle, Error> {
         use ffi::PJRT_Get_Stream_For_External_Ready_Events_Args;
         let extension = self.api().stream_extension()?;

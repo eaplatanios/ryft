@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = [
+    "crates/ryft-mlir",
+    "crates/ryft-pjrt",
+    "crates/ryft-xla-sys",
+]
 
 [workspace.package]
 authors = ["Emmanouil Antonios Platanios <e.a.platanios@gmail.com>"]
@@ -17,6 +21,9 @@ include = [
 ]
 
 [workspace.dependencies]
+ryft-mlir = { path = "crates/ryft-mlir", version = "0.0.1", default-features = false }
+ryft-pjrt = { path = "crates/ryft-pjrt", version = "0.0.1", default-features = false }
+ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.1", default-features = false }
 anyhow = "1.0.102"
 bindgen = "0.72.1"
 dirs = "6.0.0"

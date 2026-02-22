@@ -13,11 +13,12 @@ pub type MemoryKindId = usize;
 /// Memory space managed by a PJRT [`Plugin`](crate::Plugin). Memory spaces can be used to describe locations of memory.
 /// These can either be _unpinned_ and free to live anywhere but be accessible from a [`Device`], or they can be
 /// _pinned_ and must live on a specific [`Device`]. Memory spaces know their associated buffers of data and the
-/// [`Device`]s (note the plural) that they are associated with, as well as the [`Client`] that they are part of.
+/// [`Device`]s (note the plural) that they are associated with, as well as the [`Client`](crate::Client) that they
+/// are part of.
 ///
 /// Note that the `'o` lifetime parameter captures the fact that [`Memory`]s are always owned by some other object
-/// (e.g., a [`Client`] or a [`Device`]) and makes sure that that other object stays alive for at least as long as
-/// all associated [`Memory`]s are alive.
+/// (e.g., a [`Client`](crate::Client) or a [`Device`]) and makes sure that that other object stays alive for at least
+/// as long as all associated [`Memory`]s are alive.
 #[derive(Copy, Clone)]
 pub struct Memory<'o> {
     /// Handle that represents this [`Memory`] in the PJRT C API.

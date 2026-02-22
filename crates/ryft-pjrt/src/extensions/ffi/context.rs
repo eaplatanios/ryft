@@ -32,7 +32,7 @@ pub type FfiStream = *mut std::ffi::c_void;
 /// XLA [`FfiHandler`](crate::extensions::ffi::FfiHandler).
 pub type FfiExecutionState = *mut std::ffi::c_void;
 
-/// User data that can be attached to an [`ExecutionContext`] and consumed
+/// User data that can be attached to an [`ExecutionContext`](crate::ExecutionContext) and consumed
 /// by [`FfiHandler`](crate::extensions::ffi::FfiHandler)s.
 pub struct FfiUserData {
     /// [`FfiTypeId`] that corresponds to the type of this [`FfiUserData`].

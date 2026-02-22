@@ -361,7 +361,7 @@ pub struct Layout {
     #[prost(int64, repeated, tag = "1")]
     pub minor_to_major: Vec<i64>,
 
-    /// Sparse dimension encoding levels. Refer to the documentation of [`SparseDimensionLevel`] for more information.
+    /// Sparse dimension encoding levels. Refer to the documentation of [`DimensionLevel`] for more information.
     /// This is only relevant for sparse [`Layout`]s.
     #[prost(enumeration = "DimensionLevel", repeated, tag = "9")]
     pub dimension_levels: Vec<i32>,
@@ -3244,11 +3244,11 @@ pub struct ExecutableMemoryStatistics {
     #[prost(int64, tag = "7")]
     pub host_generated_code_size_in_bytes: i64,
 
-    /// Number of bytes used for storing the [`Executable`] input buffers in host memory.
+    /// Number of bytes used for storing the executable input buffers in host memory.
     #[prost(int64, tag = "8")]
     pub host_input_size_in_bytes: i64,
 
-    /// Number of bytes used for storing the [`Executable`] output buffers in host memory.
+    /// Number of bytes used for storing the executable output buffers in host memory.
     #[prost(int64, tag = "9")]
     pub host_output_size_in_bytes: i64,
 
@@ -3383,7 +3383,7 @@ pub enum ProfileDeviceType {
     /// Profile CPU and TPU operations.
     Tpu = 3,
 
-    /// Profile CPU and pluggable device (i.e., a custom PJRT [`Plugin`](crate::Plugin) backend) operations.
+    /// Profile CPU and pluggable device (i.e., a custom PJRT plugin backend) operations.
     PluggableDevice = 4,
 }
 
