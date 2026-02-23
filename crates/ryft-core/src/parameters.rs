@@ -1,24 +1,11 @@
 use std::{fmt::Debug, marker::PhantomData};
-
+use std::fmt::Display;
 use half::{bf16, f16};
 use paste::paste;
 
 use crate::errors::Error;
 
-// TODO(eaplatanios): Add thorough documentation for [Parameterized].
-//  - [Parameter]s are the leafs and all `P: Parameter` are [Parameterized].
-//  - `PhantomData<P: Parameterized>` is [Parameterized].
-//  - `(P: Parameterized)`, `(P: Parameterized, P: Parameterized)`, ..., up to sized 12, are all [Parameterized].
-//  - `[P: Parameterized; N]` is [Parameterized].
-//  - `Vec<P: Parameterized>` is [Parameterized].
-//  - TODO(eaplatanios): [HashMap]s.
-//  - TODO(eaplatanios): [Box]s.
-//  - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
-//    that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
-//    If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
-//  - Only the `: Parameter` bound is supported by the derive macro. No additional bounds are supported for `P`.
-//
-// TODO(eaplatanios): Add tests for each of the [Parameterized] implementations included in this file.
+// TODO(eaplatanios): Should `Parameter`s always have a static `Rank` and a static `DataType`?
 
 // TODO(eaplatanios): Add support for `named_parameters` which pairs each parameter with a path.
 // TODO(eaplatanios): Support something like a `broadcast` operation (e.g., I want to use the same learning rate
@@ -32,11 +19,10 @@ use crate::errors::Error;
 // - unflatten(aux_data, children) -> tree
 
 // TODO(eaplatanios): Document that this this an empty parameter acting as a placeholder for when we want to manipulate
-//  parameter structures without having to worry about specific parameter types.
-// TODO(eaplatanios): Document that this is a marker trait for parameter types (i.e., leaf nodes).
-//  Furthermore, explain why we need this. Provide `Vec<P>` as a motivating example along with an explanation
-//  for why something like specialization would need to be stable for us to support this.
-// TODO(eaplatanios): Should `Parameter`s always have a static `Rank` and a static `DataType`?
+//  parameter structures without having to worry about specific parameter types. Also document that this is a marker
+//  trait for parameter types (i.e., leaf nodes). Furthermore, explain why we need this. Provide `Vec<P>` as a
+//  motivating example along with an explanation for why something like specialization would need to be stable for us to
+//  support that use case without our `Parameter` marker trait.
 pub trait Parameter {}
 
 impl Parameter for bool {}
@@ -56,8 +42,14 @@ impl Parameter for f32 {}
 impl Parameter for f64 {}
 impl Parameter for usize {}
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Placeholder;
+
+impl Display for Placeholder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<Parameter>")
+    }
+}
 
 impl Debug for Placeholder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -69,22 +61,34 @@ impl Parameter for Placeholder {}
 
 // TODO(eaplatanios): `Vec<(P, non-P)>` is not supported.
 // TODO(eaplatanios): Unit structs should be impossible.
-// TODO(eaplatanios): Talk about the derive macro we have for this trait:
-//  - We also provide a `#[derive(Parameter)]` macro for convenience.
-//  - Supports both structs and enums already.
-//  - The parameter type must be a generic type parameter bounded by [Parameter].
-//  - There must be only one such generic type parameter. Not zero and not more than one.
-//  - All fields that reference / depend on the parameter type are considered parameter fields.
-//  - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
-//  - We need a recursive helper in order to properly handle tuple types. Tuples are not [Parameterized]
-//    themselves (that is done in order to avoid issues with blanket implementations since we only instantiate
-//    [Parameterized] implementations using prespecified parameter types), but they are supported when nested
-//    within other types, for which we are deriving [Parameterized] implementations.
-//  - Configurable `macro_param_lifetime` and `macro_param_type`.
-// TODO(eaplatanios): Document the following:
+
+// TODO(eaplatanios): Add thorough documentation for [Parameterized].
+//  - [Parameter]s are the leafs and all `P: Parameter` are [Parameterized].
+//  - `PhantomData<P: Parameterized>` is [Parameterized].
+//  - `(P: Parameterized)`, `(P: Parameterized, P: Parameterized)`, ..., up to sized 12, are all [Parameterized].
+//  - `[P: Parameterized; N]` is [Parameterized].
+//  - `Vec<P: Parameterized>` is [Parameterized].
 //  - Vec<P> is not Parameterized<P>. Vec<T: Parameterized<P>> is Parameterized<P>.
 //  - HashMap<K, P> is not Parameterized<P>. HashMap<K, V: Parameterized<P>> is Parameterized<V>.
 //  - Same goes for arrays and other collection types.
+
+// TODO(eaplatanios): Talk about the derive macro we have for this trait:
+//    - We also provide a `#[derive(Parameter)]` macro for convenience.
+//    - Supports both structs and enums already.
+//    - The parameter type must be a generic type parameter bounded by [Parameter].
+//    - There must be only one such generic type parameter. Not zero and not more than one.
+//    - All fields that reference / depend on the parameter type are considered parameter fields.
+//    - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
+//    - We need a recursive helper in order to properly handle tuple types. Tuples are not [Parameterized]
+//      themselves (that is done in order to avoid issues with blanket implementations since we only instantiate
+//      [Parameterized] implementations using prespecified parameter types), but they are supported when nested
+//      within other types, for which we are deriving [Parameterized] implementations.
+//    - Configurable `macro_param_lifetime` and `macro_param_type`.
+//    - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
+//      that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
+//      If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
+//    - Only the `: Parameter` bound is supported by the derive macro. No additional bounds are supported for `P`.
+
 /// A recursively traversable parameter tree whose leaves are values that implement [`Parameter`].
 ///
 /// A [`Parameterized`] value can be split into:
@@ -123,15 +127,16 @@ pub trait Parameterized<P: Parameter>: Sized {
     type To<T: Parameter>: Parameterized<T, To<P> = Self> + Parameterized<T, To<Placeholder> = Self::To<Placeholder>>;
     // + Parameterized<T, To<JvpTracer<P>> = Self::To<JvpTracer<P>>>;
 
-    // #![feature(associated_type_defaults)]
-    // type ParamStructure = Self::To<ParamPlaceholder>;
+    // TODO(eaplatanios): Since the following feature is not stable, we can add `type ParamStructure` and always derive
+    //  it as `Self::To<ParamPlaceholder>` in our derive macro for `Parameterized`.
+    //  #![feature(associated_type_defaults)]
+    //  type ParamStructure = Self::To<ParamPlaceholder>;
 
     // TODO(eaplatanios): Explain that we use associated types instead of `RPITIT` in order to support
-    //  deriving [Parameterized] for enums without the need to do any boxing. Though, is that really true?
+    //  deriving [`Parameterized`] for enums without the need to do any boxing. Though, is that really true?
     //  I mean the wrapping enum would have to box anyway...hmm...maybe enums should always use `Box<dyn Iterator>`.
     type ParamIterator<'t, T: 't + Parameter>: 't + Iterator<Item = &'t T>
     where
-        // TODO(eaplatanios): Configure rustfmt to put these in the same line when possible.
         Self: 't;
 
     type ParamIteratorMut<'t, T: 't + Parameter>: 't + Iterator<Item = &'t mut T>
@@ -516,6 +521,7 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
 }
 
 // TODO(eaplatanios): Implement this for arrays, HashMap<K, _>, etc.
+// TODO(eaplatanios): Add tests for each of the [Parameterized] implementations included in this file.
 
 #[cfg(test)]
 mod tests {

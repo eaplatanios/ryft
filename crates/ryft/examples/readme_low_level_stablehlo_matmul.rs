@@ -31,10 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result_type,
             location,
         ));
-        block.append_operation(dialects::func::r#return(
-            &[matmul.result(0).expect("missing matmul result")],
-            location,
-        ));
+        block.append_operation(dialects::func::r#return(&[matmul.result(0).expect("missing matmul result")], location));
         dialects::func::func(
             "main",
             dialects::func::FuncAttributes {
@@ -78,17 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let mut outputs = executable
-        .execute(
-            vec![ExecutionDeviceInputs {
-                inputs: &inputs,
-                ..Default::default()
-            }],
-            0,
-            None,
-            None,
-            None,
-            None,
-        )?
+        .execute(vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }], 0, None, None, None, None)?
         .remove(0);
     outputs.done.r#await()?;
     let output = outputs

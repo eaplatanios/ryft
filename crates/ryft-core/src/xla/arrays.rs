@@ -541,14 +541,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lhs_array = Array::from_sharding(
-            vec![8, 4],
-            BufferType::F32,
-            mesh.clone(),
-            lhs_partition_spec.clone(),
-            lhs_buffers,
-        )
-        .unwrap();
+        let lhs_array =
+            Array::from_sharding(vec![8, 4], BufferType::F32, mesh.clone(), lhs_partition_spec.clone(), lhs_buffers)
+                .unwrap();
         let rhs_array =
             Array::from_sharding(vec![4, 2], BufferType::F32, mesh.clone(), rhs_partition_spec, rhs_buffers).unwrap();
 
