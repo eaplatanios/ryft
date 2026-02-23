@@ -1,5 +1,6 @@
-use std::{fmt::Debug, marker::PhantomData};
-use std::fmt::Display;
+use std::fmt::{Display, Debug};
+use std::{marker::PhantomData};
+
 use half::{bf16, f16};
 use paste::paste;
 
@@ -18,11 +19,13 @@ use crate::errors::Error;
 // - flatten(tree) -> (children, aux_data)
 // - unflatten(aux_data, children) -> tree
 
-// TODO(eaplatanios): Document that this this an empty parameter acting as a placeholder for when we want to manipulate
-//  parameter structures without having to worry about specific parameter types. Also document that this is a marker
-//  trait for parameter types (i.e., leaf nodes). Furthermore, explain why we need this. Provide `Vec<P>` as a
-//  motivating example along with an explanation for why something like specialization would need to be stable for us to
-//  support that use case without our `Parameter` marker trait.
+/// Marker trait for leaf parameter values in a [`Parameterized`] tree. This trait is intentionally empty. A type
+/// implementing [`Parameter`] is treated as an _indivisible leaf_ by [`Parameterized`] traversals. The reason we
+/// need this trait in the first place is so that we can distinguish between leaf and container behavior in blanket
+/// implementations. For example, `Vec<V>` implements `Parameterized<P>` when `V: Parameterized<P>`. Therefore,
+/// `Vec<P>` is treated as a collection of leaf parameters because `P: Parameter` implies `P: Parameterized<P>`,
+/// and not as a single leaf. Without this marker, expressing both leaf and container semantics would require
+/// overlapping blanket implementations or a stable specialization feature.
 pub trait Parameter {}
 
 impl Parameter for bool {}
@@ -42,6 +45,10 @@ impl Parameter for f32 {}
 impl Parameter for f64 {}
 impl Parameter for usize {}
 
+/// Placeholder leaf type for [`Parameterized`] trees that is used represent [`Parameterized::param_structure`].
+/// That is, it is used to replace every parameter leaf in a [`Parameterized`] type yielding a _shape-only_
+/// representation that can later be used with [`Parameterized::from_params`] to instantiate a [`Parameterized`]
+/// value with the same shape but different types of leaves/parameters.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Placeholder;
 
@@ -62,13 +69,7 @@ impl Parameter for Placeholder {}
 // TODO(eaplatanios): `Vec<(P, non-P)>` is not supported.
 // TODO(eaplatanios): Unit structs should be impossible.
 
-// TODO(eaplatanios): Add thorough documentation for [Parameterized].
-//  - [Parameter]s are the leafs and all `P: Parameter` are [Parameterized].
-//  - `PhantomData<P: Parameterized>` is [Parameterized].
-//  - `(P: Parameterized)`, `(P: Parameterized, P: Parameterized)`, ..., up to sized 12, are all [Parameterized].
-//  - `[P: Parameterized; N]` is [Parameterized].
-//  - `Vec<P: Parameterized>` is [Parameterized].
-//  - Vec<P> is not Parameterized<P>. Vec<T: Parameterized<P>> is Parameterized<P>.
+// TODO(eaplatanios): Cover the following cases in the `Parameterized` documentation.
 //  - HashMap<K, P> is not Parameterized<P>. HashMap<K, V: Parameterized<P>> is Parameterized<V>.
 //  - Same goes for arrays and other collection types.
 
@@ -89,7 +90,7 @@ impl Parameter for Placeholder {}
 //      If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
 //    - Only the `: Parameter` bound is supported by the derive macro. No additional bounds are supported for `P`.
 
-/// A recursively traversable parameter tree whose leaves are values that implement [`Parameter`].
+/// Recursively traversable parameter tree whose leaves are values that implement the [`Parameter`] marker trait.
 ///
 /// A [`Parameterized`] value can be split into:
 /// 1. Its shape-only representation via [`param_structure`](Self::param_structure), and
@@ -103,15 +104,29 @@ impl Parameter for Placeholder {}
 ///
 /// - Every `P: Parameter` is a leaf and therefore implements [`Parameterized<P>`].
 /// - [`PhantomData<P>`] implements [`Parameterized<P>`] and contributes zero parameters.
-/// - Tuples whose elements are all [`Parameterized`] are supported for arities 1 through 12.
+/// - Tuples whose elements are all themselves [`Parameterized`] are supported for arities of 1 through 12.
 /// - Arrays (`[T; N]`) and [`Vec<T>`] are supported when `T: Parameterized<P>`.
-/// - [`std::collections::HashMap`] and [`std::boxed::Box`] are not supported yet.
+/// - Because containers are parameterized by element type, `Vec<P>` works whenever `P: Parameter` (as `P` itself is a
+///   leaf that implements [`Parameterized<P>`]).
+/// - [`std::collections::HashMap`] and [`Box`] are not supported yet.
 ///
-/// # Derive Macro
+/// # Derive Macros
 ///
-/// `#[derive(Parameterized)]` can generate implementations for structs and enums:
+/// `ryft-macros` provides two derives for working with this trait:
+/// - `#[derive(Parameter)]` is a convenience derive for leaf types and expands to an empty [`Parameter`] `impl`.
+/// - `#[derive(Parameterized)]` can generate implementations for structs and enums (unions are rejected).
+///
+/// `#[derive(Parameterized)]` currently assumes:
 /// - Exactly one generic type parameter must be bounded by [`Parameter`].
-/// - That parameter type cannot have additional bounds.
+/// - The parameter bound must be written as `Parameter` or `ryft::Parameter` (respecting any
+///   `#[ryft(crate = "...")]` override).
+/// - The parameter type cannot have additional bounds.
+/// - All fields that reference the parameter type are treated as parameter fields.
+/// - Parameter fields must be owned (references and pointers to the parameter type are rejected).
+/// - Non-parameter fields must be [`Clone`] because [`param_structure`](Self::param_structure) clones them.
+/// - The only supported macro attribute is container-level `#[ryft(crate = "...")]`; field/variant-level
+///   `#[ryft(...)]` attributes are rejected.
+/// - The names `__P` and `'__p` are reserved for generated code and cannot be used in the container generics.
 /// - Nested tuples that mix parameterized and non-parameterized fields are supported within derived containers.
 /// - Mixed tuples are not supported as direct items in generic containers covered by the blanket implementations in
 ///   this module (for example, `Vec<(P, usize)>`).
