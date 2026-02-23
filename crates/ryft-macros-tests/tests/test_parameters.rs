@@ -1,9 +1,10 @@
-use std::{
-    marker::PhantomData,
-    ops::{Add, Mul},
-};
+use std::marker::PhantomData;
+use std::ops::{Add, Mul};
 
 use ryft::{Parameter, Parameterized, Placeholder};
+
+/// Helper for asserting that a [`Parameterized`] type has a specific [`Parameterized::ParamStructure`] type.
+fn assert_param_structure_type<P: Parameter, T: Parameterized<P, ParamStructure = S>, S>() {}
 
 #[test]
 fn test_simple_struct() {
@@ -21,6 +22,7 @@ fn test_simple_struct() {
     let structure = Struct { p_0: Placeholder, p_1: Placeholder, np_0, np_1 };
     let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 2 });
 
+    assert_param_structure_type::<usize, Struct<usize>, Struct<Placeholder>>();
     assert_eq!(value.param_count(), 2);
     assert_eq!(value.param_structure(), structure);
     assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize]);
@@ -49,6 +51,7 @@ fn test_tuple_struct() {
     let structure = TupleStruct(Placeholder, Placeholder, np_0, np_1);
     let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 2 });
 
+    assert_param_structure_type::<usize, TupleStruct<usize>, TupleStruct<Placeholder>>();
     assert_eq!(value.param_count(), 2);
     assert_eq!(value.param_structure(), structure);
     assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize]);
@@ -271,6 +274,7 @@ fn test_simple_enum() {
     let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 1 });
     let unused_params_error = Err(ryft::Error::UnusedParams);
 
+    assert_param_structure_type::<usize, Enum<usize>, Enum<Placeholder>>();
     assert_eq!(value.param_count(), 1);
     assert_eq!(value.param_structure(), structure);
     assert_eq!(value.params().collect::<Vec<_>>(), vec![&-42i64]);

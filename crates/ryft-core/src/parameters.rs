@@ -1,5 +1,5 @@
-use std::fmt::{Display, Debug};
-use std::{marker::PhantomData};
+use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use half::{bf16, f16};
 use paste::paste;
@@ -142,10 +142,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     type To<T: Parameter>: Parameterized<T, To<P> = Self> + Parameterized<T, To<Placeholder> = Self::To<Placeholder>>;
     // + Parameterized<T, To<JvpTracer<P>> = Self::To<JvpTracer<P>>>;
 
-    // TODO(eaplatanios): Since the following feature is not stable, we can add `type ParamStructure` and always derive
-    //  it as `Self::To<ParamPlaceholder>` in our derive macro for `Parameterized`.
-    //  #![feature(associated_type_defaults)]
-    //  type ParamStructure = Self::To<ParamPlaceholder>;
+    /// Shape-only representation of this [`Parameterized`] type with all parameter leaves replaced by [`Placeholder`].
+    /// This is always set to `Self::To<Placeholder>`. The only reason this is not included here is that defaulted
+    /// associated types are not supported in stable Rust.
+    type ParamStructure: Parameterized<Placeholder, To<P> = Self>;
 
     // TODO(eaplatanios): Explain that we use associated types instead of `RPITIT` in order to support
     //  deriving [`Parameterized`] for enums without the need to do any boxing. Though, is that really true?
@@ -196,6 +196,7 @@ pub trait Parameterized<P: Parameter>: Sized {
 
 impl<P: Parameter> Parameterized<P> for P {
     type To<T: Parameter> = T;
+    type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
         = std::iter::Once<&'t T>
@@ -237,6 +238,7 @@ impl<P: Parameter> Parameterized<P> for P {
 
 impl<P: Parameter> Parameterized<P> for PhantomData<P> {
     type To<T: Parameter> = PhantomData<T>;
+    type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
         = std::iter::Empty<&'t T>
@@ -288,6 +290,7 @@ macro_rules! tuple_parameterized_impl {
         paste! {
             impl<P: Parameter$(, $T: Parameterized<P>)*> Parameterized<P> for ($($T,)*) {
                 type To<T: Parameter> = ($($T::To<T>,)*);
+                type ParamStructure = Self::To<Placeholder>;
 
                 type ParamIterator<'t, T: 't + Parameter> =
                     tuple_param_iterator_ty!('t, T, ($($T,)*))
@@ -412,6 +415,7 @@ tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
 
 impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V; N] {
     type To<T: Parameter> = [V::To<T>; N];
+    type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
         = std::iter::FlatMap<
@@ -473,6 +477,7 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
 
 impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
     type To<T: Parameter> = Vec<V::To<T>>;
+    type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
         = std::iter::FlatMap<

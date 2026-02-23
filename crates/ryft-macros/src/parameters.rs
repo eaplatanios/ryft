@@ -102,6 +102,7 @@ impl CodeGenerator {
     ///     #[automatically_derived]
     ///     impl<P: Parameter> ryft::Parameterized<P> for CustomType<P> {
     ///         type To<__P> = ...;
+    ///         type ParamStructure = Self::To<ryft::Placeholder>;
     ///
     ///         type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
     ///         type ParamIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
@@ -613,9 +614,10 @@ impl CodeGenerator {
         self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
     }
 
-    /// Generates the associated [`Parameterized::To`], [`Parameterized::ParamIterator`],
-    /// [`Parameterized::ParamIteratorMut`], and [`Parameterized::ParamIntoIterator`] type declarations for the [`Data`]
-    /// owned by the provided [`CodeGenerator`]. This function returns two [`TokenStream`]s:
+    /// Generates the associated [`Parameterized::To`], [`Parameterized::ParamStructure`],
+    /// [`Parameterized::ParamIterator`], [`Parameterized::ParamIteratorMut`], and [`Parameterized::ParamIntoIterator`]
+    /// type declarations for the [`Data`] owned by the provided [`CodeGenerator`]. This function returns two
+    /// [`TokenStream`]s:
     ///
     ///   1. The first [`TokenStream`] contains all the associated type declarations without the surrounding `impl`
     ///      block. For example, the generated code may look something like this (with `...` substituted for generated
@@ -623,6 +625,7 @@ impl CodeGenerator {
     ///
     ///      ```ignore
     ///      type To<__P> = ...;
+    ///      type ParamStructure = Self::To<ryft::Placeholder>;
     ///      type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
     ///      type ParamIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
     ///      type ParamIntoIterator<__P: ryft::Parameter> = ...;
@@ -888,6 +891,7 @@ impl CodeGenerator {
             }
         }
 
+        let ryft = &self.ryft_crate;
         let macro_param_type = &self.macro_param_type;
         let param_type = &self.param_type;
         let ident = self.data.ident();
@@ -922,12 +926,14 @@ impl CodeGenerator {
         let (_, to_assoc_ty_generics, _) = to_assoc_ty_generics.split_for_impl();
         let (to_assoc_impl_generics, _, _) = to_assoc_impl_generics.split_for_impl();
         let to_assoc_ty = quote!(type To #to_assoc_impl_generics = #ident #to_assoc_ty_generics;);
+        let param_structure_assoc_ty = quote!(type ParamStructure = Self::To<#ryft::Placeholder>;);
 
         let param_iterator_assoc_ty = generate_assoc_type(self, &IterType::Iter);
         let param_iterator_mut_assoc_ty = generate_assoc_type(self, &IterType::IterMut);
         let param_into_iterator_assoc_ty = generate_assoc_type(self, &IterType::IntoIter);
         let param_iterator_assoc_types = quote! {
             #to_assoc_ty
+            #param_structure_assoc_ty
             #param_iterator_assoc_ty
             #param_iterator_mut_assoc_ty
             #param_into_iterator_assoc_ty
@@ -1261,7 +1267,7 @@ impl CodeGenerator {
 
         let ryft = &self.ryft_crate;
         let param_type = &self.param_type;
-        let self_to_as_parameterized = quote!(<Self::To<#ryft::Placeholder> as Parameterized<#ryft::Placeholder>>);
+        let self_to_as_parameterized = quote!(<Self::ParamStructure as #ryft::Parameterized<#ryft::Placeholder>>);
         quote! {
             fn from_params_with_remainder<I: Iterator<Item = #param_type>>(
                 structure: Self::To<#ryft::Placeholder>,

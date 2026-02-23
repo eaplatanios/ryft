@@ -4,6 +4,7 @@ members = [
     "crates/ryft",
     "crates/ryft-core",
     "crates/ryft-macros",
+    "crates/ryft-macros-tests",
     "crates/ryft-mlir",
     "crates/ryft-pjrt",
     "crates/ryft-xla-sys",
