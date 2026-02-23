@@ -147,17 +147,26 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// associated types are not supported in stable Rust.
     type ParamStructure: Parameterized<Placeholder, To<P> = Self>;
 
-    // TODO(eaplatanios): Explain that we use associated types instead of `RPITIT` in order to support
-    //  deriving [`Parameterized`] for enums without the need to do any boxing. Though, is that really true?
-    //  I mean the wrapping enum would have to box anyway...hmm...maybe enums should always use `Box<dyn Iterator>`.
+    /// Iterator returned by [`params`](Self::params) for a borrow of the underlying [`Parameter`]s with lifetime `'t`.
+    /// This is an associated type instead of an `impl Iterator` in the corresponding function signature, so that
+    /// implementations can expose and reuse a concrete iterator type. In particular, `#[derive(Parameterized)]` for
+    /// enums synthesizes concrete enum iterators here, avoiding an additional heap allocation and dynamic dispatch.
     type ParamIterator<'t, T: 't + Parameter>: 't + Iterator<Item = &'t T>
     where
         Self: 't;
 
+    /// Iterator returned by [`params_mut`](Self::params_mut) for a mutable borrow of the underlying [`Parameter`]s with
+    /// lifetime `'t`. Similar to [`ParamIterator`](Self::ParamIterator), this is an associated type instead of an
+    /// `impl Iterator` in the corresponding function signature, so that implementations can expose and reuse a concrete
+    /// iterator type, potentially avoiding additional heap allocations and dynamic dispatch.
     type ParamIteratorMut<'t, T: 't + Parameter>: 't + Iterator<Item = &'t mut T>
     where
         Self: 't;
 
+    /// Iterator returned by [`into_params`](Self::into_params), consuming `self` and returning the underlying
+    /// [`Parameter`]s. Similar to [`ParamIterator`](Self::ParamIterator), this is an associated type instead of
+    /// an `impl Iterator` in the corresponding function signature, so that implementations can expose and reuse
+    /// a concrete iterator type, potentially avoiding additional heap allocations and dynamic dispatch.
     type ParamIntoIterator<T: Parameter>: Iterator<Item = T>;
 
     /// Returns the number of parameters in this [Parameterized] instance.
