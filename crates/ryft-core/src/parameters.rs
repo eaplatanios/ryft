@@ -137,8 +137,9 @@ impl Parameter for Placeholder {}
 /// parameters with [`params`](Self::params) and then rebuilding with [`from_params`](Self::from_params) must produce
 /// the original value.
 pub trait Parameterized<P: Parameter>: Sized {
-    // TODO(eaplatanios): We need to prove that `Self::To<P> = Self`.
-    // TODO(eaplatanios): What if `P` has additional trait bounds?
+    // TODO(eaplatanios): Can we enforce that `To<T>` is such that `To<T>::To<P> = Self` for any value of `T` and also
+    //  `To<T>::To<R>` is equal to `To<R>` for any value of `R`.
+    // TODO(eaplatanios): What if `P` has additional trait bounds? How can we represent `To` then?
     type To<T: Parameter>: Parameterized<T, To<P> = Self> + Parameterized<T, To<Placeholder> = Self::To<Placeholder>>;
     // + Parameterized<T, To<JvpTracer<P>> = Self::To<JvpTracer<P>>>;
 
@@ -177,8 +178,10 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Returns an iterator over references to all parameters in this value.
     fn params(&self) -> Self::ParamIterator<'_, P>;
+    
     /// Returns an iterator over mutable references to all parameters in this value.
     fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P>;
+    
     /// Consumes this value and returns an iterator over all parameters.
     fn into_params(self) -> Self::ParamIntoIterator<P>;
 
