@@ -61,7 +61,7 @@ pub(crate) struct CodeGenerator {
     /// [`Parameterized`] bounds for all parameter [`Field`] types. Note that for the latter, the actual bounds that
     /// it adds look as follows (abusing notation a bit and representing the field type as `FieldType<P>` where `P`
     /// is the parameter type since at this point we know that these types are generic with respect to `P`):
-    /// `To<ryft::Placeholder> = FieldType<ryft::Placeholder>>`.
+    /// `ParamStructure = FieldType<ryft::Placeholder>`.
     generics: syn::Generics,
 
     /// [`Data`] that is used for the code generation and which is extracted from the provided [`syn::DeriveInput`].
@@ -100,8 +100,14 @@ impl CodeGenerator {
     /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
     /// const _: () = {
     ///     #[automatically_derived]
+    ///     impl<P: Parameter> ryft::ParameterizedFamily for CustomType<ryft::Placeholder> {
+    ///         type To<__P: ryft::Parameter> = CustomType<__P>;
+    ///     }
+    ///
+    ///     #[automatically_derived]
     ///     impl<P: Parameter> ryft::Parameterized<P> for CustomType<P> {
-    ///         type To<__P> = ...;
+    ///         type Family = CustomType<ryft::Placeholder>;
+    ///         type To<__P: ryft::Parameter> = <Self::Family as ryft::ParameterizedFamily>::To<__P>;
     ///         type ParamStructure = Self::To<ryft::Placeholder>;
     ///
     ///         type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
@@ -113,7 +119,7 @@ impl CodeGenerator {
     ///
     ///         fn params(&self) -> Self::ParamIterator<'_, P> { ... }
     ///         fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P> { ... }
-    ///         fn into_params(&mut self) -> Self::ParamIntoIterator<P> { ... }
+    ///         fn into_params(self) -> Self::ParamIntoIterator<P> { ... }
     ///
     ///         fn from_params_with_remainder<I: Iterator<Item = P>>(
     ///             structure: Self::To<ryft::Placeholder>,
@@ -505,7 +511,7 @@ impl CodeGenerator {
                     //
                     //   FieldType<P>: ryft::Parameterized<
                     //     P,
-                    //     To<ryft::Placeholder> = FieldType<ryft::Placeholder>,
+                    //     ParamStructure = FieldType<ryft::Placeholder>,
                     //   >
                     //
                     // Therefore, we need to construct the `FieldType<ryft::Placeholder>` type and that is what
@@ -516,8 +522,8 @@ impl CodeGenerator {
                     let mut ty_using_param_placeholder = field.ty.clone();
                     ty_using_param_placeholder.replace_ident(&generator.param_type, &ryft_placeholder);
 
-                    // We need to construct the full [ryft::Parameterized] bound and to do that, we first construct
-                    // its arguments `<P, To<ryft::Placeholder> = FieldType<ryft::Placeholder>>`.
+                    // We need to construct the full [`ryft::Parameterized`] bound and to do that, we first construct
+                    // its arguments `<P, ParamStructure = FieldType<ryft::Placeholder>>`.
                     let mut args = syn::punctuated::Punctuated::new();
 
                     // Add the `P` generic argument.
@@ -525,22 +531,10 @@ impl CodeGenerator {
                     let param_type = syn::Type::Path(syn::TypePath { qself: None, path: param_type.into() });
                     args.push(syn::GenericArgument::Type(param_type));
 
-                    // Add the `To<ryft::Placeholder> = FieldType<ryft::Placeholder>` generic argument.
+                    // Add the `ParamStructure = FieldType<ryft::Placeholder>` generic argument.
                     args.push(syn::GenericArgument::AssocType(syn::AssocType {
-                        ident: syn::Ident::new("To", Span::call_site()),
-                        generics: Some(syn::AngleBracketedGenericArguments {
-                            colon2_token: None,
-                            lt_token: <syn::Token![<]>::default(),
-                            args: {
-                                let mut generic_args = syn::punctuated::Punctuated::new();
-                                generic_args.push(syn::GenericArgument::Type(syn::Type::Path(syn::TypePath {
-                                    qself: None,
-                                    path: ryft_placeholder.clone(),
-                                })));
-                                generic_args
-                            },
-                            gt_token: <syn::Token![>]>::default(),
-                        }),
+                        ident: syn::Ident::new("ParamStructure", Span::call_site()),
+                        generics: None,
                         eq_token: <syn::Token![=]>::default(),
                         ty: ty_using_param_placeholder.clone(),
                     }));
@@ -614,7 +608,7 @@ impl CodeGenerator {
         self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
     }
 
-    /// Generates the associated [`Parameterized::To`], [`Parameterized::ParamStructure`],
+    /// Generates the associated [`Parameterized::Family`], [`Parameterized::To`], [`Parameterized::ParamStructure`],
     /// [`Parameterized::ParamIterator`], [`Parameterized::ParamIteratorMut`], and [`Parameterized::ParamIntoIterator`]
     /// type declarations for the [`Data`] owned by the provided [`CodeGenerator`]. This function returns two
     /// [`TokenStream`]s:
@@ -624,19 +618,26 @@ impl CodeGenerator {
     ///      code, of course, and the `ryft` crate possibly substituted as well):
     ///
     ///      ```ignore
-    ///      type To<__P> = ...;
+    ///      type Family = ...;
+    ///      type To<__P: ryft::Parameter> = <Self::Family as ryft::ParameterizedFamily>::To<__P>;
     ///      type ParamStructure = Self::To<ryft::Placeholder>;
     ///      type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
     ///      type ParamIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
     ///      type ParamIntoIterator<__P: ryft::Parameter> = ...;
     ///      ```
     ///
-    ///   2. The second [`TokenStream`] contains any additional iterator types and corresponding [`Iterator`] `impl`
-    ///      blocks that may be required (as in, referenced) by the type declarations in the first [`TokenStream`].
-    ///      For example, the generated code may look something like this (with `...` substituted for generated code,
-    ///      of course, and the `ryft` crate possibly substituted as well):
+    ///   2. The second [`TokenStream`] contains any additional new custom types and corresponding `impl` blocks that
+    ///      may be required (as in, referenced) by the type declarations in the first [`TokenStream`]. For example, the
+    ///      generated code may look something like this (with `...` substituted for generated code, of course, and the
+    ///      `ryft` crate possibly substituted as well):
     ///
     ///      ```ignore
+    ///      #[automatically_derived]
+    ///      impl<P: Parameter> ParameterizedFamily for ... {
+    ///          type To<__P> = ...;
+    ///          ...
+    ///      }
+    ///
     ///      #[automatically_derived]
     ///      pub enum CustomParamIterator<'__p, P: '__p + Parameter> where ... {
     ///          ...
@@ -705,14 +706,14 @@ impl CodeGenerator {
         ///   * `iter_param_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
         ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just directly
         ///     use [`CodeGenerator::param_type`].
-        fn generate_assoc_type(generator: &CodeGenerator, iter_type: &IterType) -> TokenStream {
+        fn generate_assoc_iter_type(generator: &CodeGenerator, iter_type: &IterType) -> TokenStream {
             let ryft = &generator.ryft_crate;
             let macro_param_lifetime = &generator.macro_param_lifetime;
             let macro_param_type = &generator.macro_param_type;
 
             let body = match &generator.data {
                 Data::Struct(StructData { fields, .. }) => {
-                    generate_assoc_type_for_fields(generator, fields, iter_type, macro_param_type)
+                    generate_assoc_iter_type_for_fields(generator, fields, iter_type, macro_param_type)
                 }
                 Data::Enum(EnumData { ident, variants }) => {
                     let iterator_ident = format_ident!("{}{}", &ident, iter_type.params_assoc_type_name());
@@ -772,7 +773,7 @@ impl CodeGenerator {
         ///   * `iter_param_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
         ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just
         ///     directly use [`CodeGenerator::param_type`].
-        fn generate_assoc_type_for_fields(
+        fn generate_assoc_iter_type_for_fields(
             generator: &CodeGenerator,
             fields: &[Field],
             iter_type: &IterType,
@@ -799,7 +800,7 @@ impl CodeGenerator {
                         Some(quote!(<#ty as #ryft::Parameterized<#param_ty>>::#assoc_ty))
                     }
                     Field { fields: Some(fields), .. } => {
-                        Some(generate_assoc_type_for_fields(generator, fields, iter_type, iter_param_type))
+                        Some(generate_assoc_iter_type_for_fields(generator, fields, iter_type, iter_param_type))
                     }
                 })
                 .reduce(|chain_ty, ty| quote!(std::iter::Chain<#chain_ty, #ty>))
@@ -829,7 +830,7 @@ impl CodeGenerator {
         ///     }
         /// }
         /// ```
-        fn generate_type_and_impl(generator: &CodeGenerator, iter_type: &IterType) -> Option<TokenStream> {
+        fn generate_iter_type_and_impl(generator: &CodeGenerator, iter_type: &IterType) -> Option<TokenStream> {
             match &generator.data {
                 Data::Struct(_) => None,
                 Data::Enum(EnumData { ident, variants }) => {
@@ -856,7 +857,7 @@ impl CodeGenerator {
 
                     let iterator_variants = variants.iter().map(|variant| {
                         let variant_ident = &variant.ident;
-                        let iterator_type = generate_assoc_type_for_fields(
+                        let iterator_type = generate_assoc_iter_type_for_fields(
                             generator,
                             &variant.fields,
                             iter_type,
@@ -896,10 +897,10 @@ impl CodeGenerator {
         let param_type = &self.param_type;
         let ident = self.data.ident();
 
-        // For the `To` associated type we need to rename the type parameter in our [`syn::Generics`].
+        // For generated `To` associated types we need to rename the type parameter in our [`syn::Generics`].
         // That is because if we do not rename it, we will end up with something like this:
         // ```
-        // impl<P: Parameter> Parameterized<P> for SomeType<P> {
+        // impl<P: Parameter> ParameterizedFamily for SomeType<Placeholder> {
         //     type To<P> = SomeType<P>;
         //     ...
         // }
@@ -907,7 +908,7 @@ impl CodeGenerator {
         // In this case, the name `P` conflicts with the generic parameter of the `impl` block itself.
         // What we really want is something like this instead:
         // ```
-        // impl<P: Parameter> Parameterized<P> for SomeType<P> {
+        // impl<P: Parameter> ParameterizedFamily for SomeType<Placeholder> {
         //     type To<__P> = SomeType<__P>;
         //     ...
         // }
@@ -915,8 +916,8 @@ impl CodeGenerator {
         // where `__P` is a fresh and unique identifier. This generic parameter replacement is what
         // takes place in the following line (the uniqueness check for the name is performed in
         // [`CodeGenerator::check_for_name_conflicts`]).
-        let to_assoc_ty_generics = &self.generics.with_renamed_param(param_type, macro_param_type);
-        let to_assoc_impl_generics = &to_assoc_ty_generics.without_params(
+        let to_assoc_ty_generics = self.generics.with_renamed_param(param_type, macro_param_type);
+        let to_assoc_impl_generics = to_assoc_ty_generics.without_params(
             to_assoc_ty_generics
                 .params
                 .iter()
@@ -925,13 +926,52 @@ impl CodeGenerator {
         );
         let (_, to_assoc_ty_generics, _) = to_assoc_ty_generics.split_for_impl();
         let (to_assoc_impl_generics, _, _) = to_assoc_impl_generics.split_for_impl();
-        let to_assoc_ty = quote!(type To #to_assoc_impl_generics = #ident #to_assoc_ty_generics;);
+
+        // Generate the [`ParameterizedFamily`] implementation block first.
+        let placeholder_path = ryft.with_segment(Symbol::new("Placeholder").into());
+        let family_generics = self.generics.with_concrete_param(param_type, &placeholder_path);
+        let (family_impl_generics, _, family_where_clause) = family_generics.split_for_impl();
+        let family_type = if self.generics.params.is_empty() {
+            quote!(#ident)
+        } else {
+            let family_type_args = self.generics.params.iter().map(|param| match param {
+                syn::GenericParam::Lifetime(lifetime_param) => {
+                    let lifetime = &lifetime_param.lifetime;
+                    quote!(#lifetime)
+                }
+                syn::GenericParam::Type(type_param) if type_param.ident == *param_type => {
+                    quote!(#ryft::Placeholder)
+                }
+                syn::GenericParam::Type(type_param) => {
+                    let ident = &type_param.ident;
+                    quote!(#ident)
+                }
+                syn::GenericParam::Const(const_param) => {
+                    let ident = &const_param.ident;
+                    quote!(#ident)
+                }
+            });
+            quote!(#ident<#(#family_type_args),*>)
+        };
+        let family_impl = quote! {
+            #[automatically_derived]
+            impl #family_impl_generics #ryft::ParameterizedFamily for #family_type #family_where_clause {
+                type To #to_assoc_impl_generics = #ident #to_assoc_ty_generics;
+            }
+        };
+
+        // Generate the [`Parameterized`] associated type declarations.
+        let family_assoc_ty = quote!(type Family = #family_type;);
+        let to_assoc_ty = quote!(
+            type To #to_assoc_impl_generics = <Self::Family as #ryft::ParameterizedFamily>::To<#macro_param_type>;
+        );
         let param_structure_assoc_ty = quote!(type ParamStructure = Self::To<#ryft::Placeholder>;);
 
-        let param_iterator_assoc_ty = generate_assoc_type(self, &IterType::Iter);
-        let param_iterator_mut_assoc_ty = generate_assoc_type(self, &IterType::IterMut);
-        let param_into_iterator_assoc_ty = generate_assoc_type(self, &IterType::IntoIter);
+        let param_iterator_assoc_ty = generate_assoc_iter_type(self, &IterType::Iter);
+        let param_iterator_mut_assoc_ty = generate_assoc_iter_type(self, &IterType::IterMut);
+        let param_into_iterator_assoc_ty = generate_assoc_iter_type(self, &IterType::IntoIter);
         let param_iterator_assoc_types = quote! {
+            #family_assoc_ty
             #to_assoc_ty
             #param_structure_assoc_ty
             #param_iterator_assoc_ty
@@ -939,10 +979,11 @@ impl CodeGenerator {
             #param_into_iterator_assoc_ty
         };
 
-        let param_iterator_type_and_impl = generate_type_and_impl(self, &IterType::Iter);
-        let param_iterator_mut_type_and_impl = generate_type_and_impl(self, &IterType::IterMut);
-        let param_into_iterator_type_and_impl = generate_type_and_impl(self, &IterType::IntoIter);
+        let param_iterator_type_and_impl = generate_iter_type_and_impl(self, &IterType::Iter);
+        let param_iterator_mut_type_and_impl = generate_iter_type_and_impl(self, &IterType::IterMut);
+        let param_into_iterator_type_and_impl = generate_iter_type_and_impl(self, &IterType::IntoIter);
         let param_iterator_types_and_impls = quote! {
+            #family_impl
             #param_iterator_type_and_impl
             #param_iterator_mut_type_and_impl
             #param_into_iterator_type_and_impl
@@ -1086,7 +1127,7 @@ impl CodeGenerator {
     /// ```ignore
     /// fn params(&self) -> Self::ParamIterator<'_, P> { ... }
     /// fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P> { ... }
-    /// fn into_params(&mut self) -> Self::ParamIntoIterator<P> { ... }
+    /// fn into_params(self) -> Self::ParamIntoIterator<P> { ... }
     /// ```
     fn generate_params_functions(&self) -> TokenStream {
         /// Helper that generates the body the [`Parameterized::params`], [`Parameterized::params_mut`], or

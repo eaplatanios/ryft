@@ -6,8 +6,6 @@ use paste::paste;
 
 use crate::errors::Error;
 
-// TODO(eaplatanios): Should `Parameter`s always have a static `Rank` and a static `DataType`?
-
 // TODO(eaplatanios): Add support for `named_parameters` which pairs each parameter with a path.
 // TODO(eaplatanios): Support something like a `broadcast` operation (e.g., I want to use the same learning rate
 //  for every sub-node from a specific point in the data structure). This is along the lines of what are called
@@ -18,6 +16,12 @@ use crate::errors::Error;
 // For reference, in JAX, to register custom types as trees, we only need to implement these two functions:
 // - flatten(tree) -> (children, aux_data)
 // - unflatten(aux_data, children) -> tree
+
+/// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].
+/// A type `X` implements [`SameAs<Y>`] only when `X` and `Y` are the exact same type.
+pub trait SameAs<T> {}
+
+impl<T> SameAs<T> for T {}
 
 /// Marker trait for leaf parameter values in a [`Parameterized`] tree. This trait is intentionally empty. A type
 /// implementing [`Parameter`] is treated as an _indivisible leaf_ by [`Parameterized`] traversals. The reason we
@@ -65,6 +69,14 @@ impl Debug for Placeholder {
 }
 
 impl Parameter for Placeholder {}
+
+/// Type-level family that maps [`Parameter`] types nested in a type while preserving its overall structure.
+/// This is used internally by [`Parameterized`] and is based on the _type family_ approach described in
+/// [this blog post](https://smallcultfollowing.com/babysteps/blog/2016/11/03/associated-type-constructors-part-2-family-traits/).
+pub trait ParameterizedFamily: Sized {
+    /// Type obtained by replacing [`Parameter`] types nested in this type by `T`.
+    type To<T: Parameter>: Parameterized<T, Family = Self>;
+}
 
 // TODO(eaplatanios): `Vec<(P, non-P)>` is not supported.
 // TODO(eaplatanios): Unit structs should be impossible.
@@ -137,23 +149,28 @@ impl Parameter for Placeholder {}
 /// parameters with [`params`](Self::params) and then rebuilding with [`from_params`](Self::from_params) must produce
 /// the original value.
 pub trait Parameterized<P: Parameter>: Sized {
-    // TODO(eaplatanios): Can we enforce that `To<T>` is such that `To<T>::To<P> = Self` for any value of `T` and also
-    //  `To<T>::To<R>` is equal to `To<R>` for any value of `R`.
+    /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
+    type Family: ParameterizedFamily<To<P> = Self, To<Placeholder> = Self::ParamStructure>;
+
     // TODO(eaplatanios): What if `P` has additional trait bounds? How can we represent `To` then?
     //  The problem is that `type To<T: Parameter>` quantifies over all `T: Parameter`, but some parameterized trees
     //  only support a strict subset of parameter types (e.g., `P: Parameter + FloatLike`). In those cases, `To<T>` is
     //  not well-defined for every `T: Parameter`. We can resolve this by introducing a parameter domain marker `D`
-    //  (e.g., `AnyDomain`, `FloatDomain`) and thread it through these APIs as `Parameterized<P, D>`, `ParamFamily<D>`,
-    //  and `To<T: InDomain<D>>`. This makes the quantification explicit ("for all `T` in domain `D`"), preserves
-    //  reparameterization coherence, and lets us support specialized parameter domains without over-constraining
-    //  `Parameter` globally.
-    type To<T: Parameter>: Parameterized<T, To<P> = Self> + Parameterized<T, To<Placeholder> = Self::To<Placeholder>>;
-    // + Parameterized<T, To<JvpTracer<P>> = Self::To<JvpTracer<P>>>;
+    //  (e.g., `AnyDomain`, `FloatDomain`) and thread it through these APIs as `Parameterized<P, D>`,
+    //  `ParameterizedFamily<D>`, and `To<T: InDomain<D>>`. This makes the quantification explicit ("for all `T` in
+    //  domain `D`"), preserves reparameterization coherence, and lets us support specialized parameter domains without
+    //  over-constraining `Parameter` globally.
+
+    /// Reparameterized form of this [`Parameterized`] type with all of its nested `P` types replaced by `T`. This
+    /// preserves the same [`Family`](Self::Family) and [`ParamStructure`](Self::ParamStructure), and is such that
+    /// reparameterizing back to `P` recovers [`Self`].
+    type To<T: Parameter>: Parameterized<T, Family = Self::Family, To<P> = Self, ParamStructure = Self::ParamStructure>
+        + SameAs<<Self::Family as ParameterizedFamily>::To<T>>;
 
     /// Shape-only representation of this [`Parameterized`] type with all parameter leaves replaced by [`Placeholder`].
     /// This is always set to `Self::To<Placeholder>`. The only reason this is not included here is that defaulted
     /// associated types are not supported in stable Rust.
-    type ParamStructure: Parameterized<Placeholder, To<P> = Self>;
+    type ParamStructure: Parameterized<Placeholder, Family = Self::Family, To<P> = Self> + SameAs<Self::To<Placeholder>>;
 
     /// Iterator returned by [`params`](Self::params) for a borrow of the underlying [`Parameter`]s with lifetime `'t`.
     /// This is an associated type instead of an `impl Iterator` in the corresponding function signature, so that
@@ -181,27 +198,27 @@ pub trait Parameterized<P: Parameter>: Sized {
     fn param_count(&self) -> usize;
 
     /// Returns the parameter structure of this value by replacing all leaves with [`Placeholder`]s.
-    fn param_structure(&self) -> Self::To<Placeholder>;
+    fn param_structure(&self) -> Self::ParamStructure;
 
     /// Returns an iterator over references to all parameters in this value.
     fn params(&self) -> Self::ParamIterator<'_, P>;
-    
+
     /// Returns an iterator over mutable references to all parameters in this value.
     fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P>;
-    
+
     /// Consumes this value and returns an iterator over all parameters.
     fn into_params(self) -> Self::ParamIntoIterator<P>;
 
     /// Reconstructs a value from `structure`, consuming parameters from `params` and leaving any remainder untouched.
     fn from_params_with_remainder<I: Iterator<Item = P>>(
-        structure: Self::To<Placeholder>,
+        structure: Self::ParamStructure,
         params: &mut I,
     ) -> Result<Self, Error>;
 
     /// Reconstructs a value from `structure` using all provided parameters.
     ///
     /// Returns [`Error::UnusedParams`] if there are leftover parameters.
-    fn from_params<I: IntoIterator<Item = P>>(structure: Self::To<Placeholder>, params: I) -> Result<Self, Error> {
+    fn from_params<I: IntoIterator<Item = P>>(structure: Self::ParamStructure, params: I) -> Result<Self, Error> {
         let mut params = params.into_iter();
         let parameterized = Self::from_params_with_remainder(structure, &mut params)?;
         params.next().map(|_| Err(Error::UnusedParams)).unwrap_or_else(|| Ok(parameterized))
@@ -213,25 +230,37 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 }
 
-impl<P: Parameter> Parameterized<P> for P {
+/// Parameterization family for leaf parameter types.
+pub struct ParameterParameterizedFamily;
+
+impl ParameterizedFamily for ParameterParameterizedFamily {
     type To<T: Parameter> = T;
+}
+
+impl<P: Parameter> Parameterized<P> for P {
+    type Family = ParameterParameterizedFamily;
+
+    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+
     type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
         = std::iter::Once<&'t T>
     where
         Self: 't;
+
     type ParamIteratorMut<'t, T: 't + Parameter>
         = std::iter::Once<&'t mut T>
     where
         Self: 't;
+
     type ParamIntoIterator<T: Parameter> = std::iter::Once<T>;
 
     fn param_count(&self) -> usize {
         1
     }
 
-    fn param_structure(&self) -> Self::To<Placeholder> {
+    fn param_structure(&self) -> Self::ParamStructure {
         Placeholder
     }
 
@@ -248,32 +277,43 @@ impl<P: Parameter> Parameterized<P> for P {
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
-        _structure: Self::To<Placeholder>,
+        _structure: Self::ParamStructure,
         params: &mut I,
     ) -> Result<Self, Error> {
         params.next().ok_or(Error::InsufficientParams { expected_count: 1 })
     }
 }
 
-impl<P: Parameter> Parameterized<P> for PhantomData<P> {
+pub struct PhantomDataParameterizedFamily;
+
+impl ParameterizedFamily for PhantomDataParameterizedFamily {
     type To<T: Parameter> = PhantomData<T>;
+}
+
+impl<P: Parameter> Parameterized<P> for PhantomData<P> {
+    type Family = PhantomDataParameterizedFamily;
+
+    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+
     type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
         = std::iter::Empty<&'t T>
     where
         Self: 't;
+
     type ParamIteratorMut<'t, T: 't + Parameter>
         = std::iter::Empty<&'t mut T>
     where
         Self: 't;
+
     type ParamIntoIterator<T: Parameter> = std::iter::Empty<T>;
 
     fn param_count(&self) -> usize {
         0
     }
 
-    fn param_structure(&self) -> Self::To<Placeholder> {
+    fn param_structure(&self) -> Self::ParamStructure {
         PhantomData
     }
 
@@ -290,7 +330,7 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
-        _structure: Self::To<Placeholder>,
+        _structure: Self::ParamStructure,
         _params: &mut I,
     ) -> Result<Self, Error> {
         Ok(PhantomData)
@@ -299,16 +339,40 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
 
 // TODO(eaplatanios): Add implementation for [Box].
 
-// Use declarative macros to provide implementations for tuples of [Parameterized] items. Note that if a tuple contains
-// a mix of [Parameterized] and non-[Parameterized] items, then the generated implementations here will not cover it.
-// Instead, such tuples are supported when nested within `struct`s or `enum`s tagged with `#[derive(Parameterized)]`
-// as the `derive` macro for [Parameterized] provides special treatment for them.
+// Use declarative macros to provide implementations for tuples of [`Parameterized`] items. Note that if a tuple
+// contains a mix of [`Parameterized`] and non-[`Parameterized`] items, then the generated implementations here
+// will not cover it. Instead, such tuples are supported when nested within `struct`s or `enum`s by using our
+// `#[derive(Parameterized)]` macro as it provides special treatment for them.
+
+macro_rules! tuple_parameterized_family_impl {
+    ($($F:ident),*) => {
+        impl<$($F: ParameterizedFamily),*> ParameterizedFamily for ($($F,)*) {
+            type To<T: Parameter> = ($($F::To<T>,)*);
+        }
+    };
+}
+
+tuple_parameterized_family_impl!(F0);
+tuple_parameterized_family_impl!(F0, F1);
+tuple_parameterized_family_impl!(F0, F1, F2);
+tuple_parameterized_family_impl!(F0, F1, F2, F3);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7, F8);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10);
+tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11);
 
 macro_rules! tuple_parameterized_impl {
     ($($T:ident),*) => {
         paste! {
             impl<P: Parameter$(, $T: Parameterized<P>)*> Parameterized<P> for ($($T,)*) {
-                type To<T: Parameter> = ($($T::To<T>,)*);
+                type Family = ($($T::Family,)*);
+
+                type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+
                 type ParamStructure = Self::To<Placeholder>;
 
                 type ParamIterator<'t, T: 't + Parameter> =
@@ -326,7 +390,7 @@ macro_rules! tuple_parameterized_impl {
                     $([<$T:lower>].param_count()+)* 0usize
                 }
 
-                fn param_structure(&self) -> Self::To<Placeholder> {
+                fn param_structure(&self) -> Self::ParamStructure {
                     let ($([<$T:lower>],)*) = &self;
                     ($([<$T:lower>].param_structure(),)*)
                 }
@@ -347,7 +411,7 @@ macro_rules! tuple_parameterized_impl {
                 }
 
                 fn from_params_with_remainder<I: Iterator<Item = P>>(
-                    structure: Self::To<Placeholder>,
+                    structure: Self::ParamStructure,
                     params: &mut I,
                 ) -> Result<Self, Error> {
                     let ($([<$T:lower _field>],)*) = structure;
@@ -432,8 +496,17 @@ tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9);
 tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
 tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
 
+pub struct ArrayParameterizedFamily<F: ParameterizedFamily, const N: usize>(PhantomData<F>);
+
+impl<F: ParameterizedFamily, const N: usize> ParameterizedFamily for ArrayParameterizedFamily<F, N> {
+    type To<T: Parameter> = [F::To<T>; N];
+}
+
 impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V; N] {
-    type To<T: Parameter> = [V::To<T>; N];
+    type Family = ArrayParameterizedFamily<V::Family, N>;
+
+    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+
     type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
@@ -464,7 +537,7 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
         self.iter().map(|value| value.param_count()).sum()
     }
 
-    fn param_structure(&self) -> Self::To<Placeholder> {
+    fn param_structure(&self) -> Self::ParamStructure {
         std::array::from_fn(|i| self[i].param_structure())
     }
 
@@ -481,7 +554,7 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
-        structure: Self::To<Placeholder>,
+        structure: Self::ParamStructure,
         params: &mut I,
     ) -> Result<Self, Error> {
         // Make this more efficient by using [std::array::try_from_fn] once it becomes stable.
@@ -494,8 +567,17 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
     }
 }
 
+pub struct VecParameterizedFamily<F: ParameterizedFamily>(PhantomData<F>);
+
+impl<F: ParameterizedFamily> ParameterizedFamily for VecParameterizedFamily<F> {
+    type To<T: Parameter> = Vec<F::To<T>>;
+}
+
 impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
-    type To<T: Parameter> = Vec<V::To<T>>;
+    type Family = VecParameterizedFamily<V::Family>;
+
+    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+
     type ParamStructure = Self::To<Placeholder>;
 
     type ParamIterator<'t, T: 't + Parameter>
@@ -526,7 +608,7 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
         self.iter().map(|value| value.param_count()).sum()
     }
 
-    fn param_structure(&self) -> Self::To<Placeholder> {
+    fn param_structure(&self) -> Self::ParamStructure {
         self.iter().map(|value| value.param_structure()).collect()
     }
 
@@ -543,7 +625,7 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
-        structure: Self::To<Placeholder>,
+        structure: Self::ParamStructure,
         params: &mut I,
     ) -> Result<Self, Error> {
         let expected_count = structure.len();
@@ -574,7 +656,7 @@ mod tests {
     fn assert_roundtrip_parameterized<V>(value: V, expected_params: Vec<i32>)
     where
         V: Clone + Debug + PartialEq + Parameterized<i32>,
-        V::To<Placeholder>: Clone + Debug + PartialEq,
+        V::ParamStructure: Clone + Debug + PartialEq,
     {
         assert_eq!(value.param_count(), expected_params.len());
         assert_eq!(value.params().copied().collect::<Vec<_>>(), expected_params);
@@ -591,7 +673,7 @@ mod tests {
     fn assert_params_mut_increments<V>(value: V, expected_before: Vec<i32>)
     where
         V: Clone + Debug + PartialEq + Parameterized<i32>,
-        V::To<Placeholder>: Clone + Debug + PartialEq,
+        V::ParamStructure: Clone + Debug + PartialEq,
     {
         let mut mutable_value = value;
         for parameter in mutable_value.params_mut() {

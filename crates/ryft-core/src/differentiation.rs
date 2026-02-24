@@ -11,7 +11,7 @@ use ryft_macros::Parameter;
 use crate::{
     errors::Error,
     ops::constants::{One, Zero},
-    parameters::{Parameter, Parameterized, Placeholder},
+    parameters::{Parameter, Parameterized},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing::{Tracer, VariableTracer},
     types::{ArrayType, Type, Typed},
@@ -73,22 +73,18 @@ impl<Value: Differentiable<Tangent> + Typed<Tangent::T>, Tangent: Zero> From<Val
 fn _jvp<
     V: Parameter,
     VT: Parameter,
-    Input: Parameterized<V, To<Placeholder> = InputJvpTracer::To<Placeholder>>,
-    InputTangent: Parameterized<VT>,
-    Output: Parameterized<V, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    OutputTangent: Parameterized<VT, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    InputJvpTracer: Parameterized<JvpTracer<V, VT>>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<V> = Output>,
+    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer>,
+    InputTangent: Parameterized<VT, ParamStructure = Input::ParamStructure>,
+    Output: Parameterized<V, ParamStructure: Clone>,
+    OutputTangent: Parameterized<VT, ParamStructure = Output::ParamStructure>,
+    InputJvpTracer: Parameterized<JvpTracer<V, VT>, ParamStructure = Input::ParamStructure>,
+    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<V> = Output, ParamStructure = Output::ParamStructure>,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
     value: Input,
     tangent: InputTangent,
-) -> Result<(Output, OutputTangent), Error>
-where
-    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<Placeholder>: Clone>,
-{
+) -> Result<(Output, OutputTangent), Error> {
     let structure = value.param_structure();
     let input_values = value.into_params();
     let input_tangents = tangent.into_params();
@@ -106,20 +102,16 @@ where
 #[inline]
 pub fn jvp<
     V: Parameter,
-    Input: Parameterized<V, To<Placeholder> = InputJvpTracer::To<Placeholder>>,
-    Output: Parameterized<V, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    InputJvpTracer: Parameterized<JvpTracer<V, V>>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<V> = Output>,
+    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer>,
+    Output: Parameterized<V, ParamStructure: Clone>,
+    InputJvpTracer: Parameterized<JvpTracer<V, V>, ParamStructure = Input::ParamStructure>,
+    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<V> = Output, ParamStructure = Output::ParamStructure>,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
     value: Input,
     tangent: Input,
-) -> Result<(Output, Output), Error>
-where
-    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<Placeholder>: Clone>,
-{
+) -> Result<(Output, Output), Error> {
     _jvp(function, value, tangent)
 }
 
@@ -127,20 +119,16 @@ where
 pub fn _differential<
     V: Parameter,
     VT: Parameter,
-    Input: Parameterized<V, To<Placeholder> = InputJvpTracer::To<Placeholder>> + Typed<InputTangent::T>,
-    InputTangent: Parameterized<VT> + One,
-    Output: Parameterized<V, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    OutputTangent: Parameterized<VT, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    InputJvpTracer: Parameterized<JvpTracer<V, VT>>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<V> = Output>,
+    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer> + Typed<InputTangent::T>,
+    InputTangent: Parameterized<VT, ParamStructure = Input::ParamStructure> + One,
+    Output: Parameterized<V, ParamStructure: Clone>,
+    OutputTangent: Parameterized<VT, ParamStructure = Output::ParamStructure>,
+    InputJvpTracer: Parameterized<JvpTracer<V, VT>, ParamStructure = Input::ParamStructure>,
+    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<V> = Output, ParamStructure = Output::ParamStructure>,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
-) -> impl FnOnce(Input) -> OutputTangent
-where
-    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<Placeholder>: Clone>,
-{
+) -> impl FnOnce(Input) -> OutputTangent {
     |value| {
         let tpe = value.tpe();
         _jvp(function, value, InputTangent::one(&tpe)).map(|(_, tangent)| tangent).unwrap()
@@ -150,18 +138,14 @@ where
 #[inline]
 pub fn differential<
     V: Parameter,
-    Input: Parameterized<V, To<Placeholder> = InputJvpTracer::To<Placeholder>> + One,
-    Output: Parameterized<V, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    InputJvpTracer: Parameterized<JvpTracer<V, V>>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<V> = Output>,
+    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer> + One,
+    Output: Parameterized<V, ParamStructure: Clone>,
+    InputJvpTracer: Parameterized<JvpTracer<V, V>, ParamStructure = Input::ParamStructure>,
+    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<V> = Output, ParamStructure = Output::ParamStructure>,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
-) -> impl FnOnce(Input) -> Output
-where
-    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<Placeholder>: Clone>,
-{
+) -> impl FnOnce(Input) -> Output {
     _differential::<V, V, Input, Input, Output, Output, _, _, _>(function)
 }
 
@@ -173,23 +157,17 @@ pub fn _linearize<
     O: Clone + LinearOp<T, V> + Debug,
     V: Parameter + Typed<T>,
     VT: Parameter + Clone + Typed<T>,
-    Input: Parameterized<V, To<Placeholder> = InputJvpTracer::To<Placeholder>>,
-    InputTangent: Parameterized<VT, To<Placeholder> = InputJvpTracer::To<Placeholder>>,
-    Output: Parameterized<V, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    OutputTangent: Parameterized<VT, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    InputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, VT, O>>>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, VT, O>>, To<V> = Output>,
+    Input: Parameterized<V, ParamStructure: Clone, To<JvpTracer<V, Tracer<T, VT, O>>> = InputJvpTracer>,
+    InputTangent: Parameterized<VT, ParamStructure = Input::ParamStructure>,
+    Output: Parameterized<V, ParamStructure: Clone>,
+    OutputTangent: Parameterized<VT, ParamStructure = Output::ParamStructure>,
+    InputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, VT, O>>, ParamStructure = Input::ParamStructure>,
+    OutputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, VT, O>>, To<V> = Output, ParamStructure = Output::ParamStructure>,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
     input: Input,
-) -> Result<(Output, ParameterizedProgram<T, VT, O, InputTangent, OutputTangent>), Error>
-where
-    Input: Parameterized<V, To<JvpTracer<V, Tracer<T, VT, O>>> = InputJvpTracer>,
-    Input::To<Placeholder>: Clone,
-    InputTangent::To<Tracer<T, VT, O>>: Parameterized<Tracer<T, VT, O>, To<Placeholder> = Input::To<Placeholder>>,
-    OutputJvpTracer::To<Placeholder>: Clone,
-{
+) -> Result<(Output, ParameterizedProgram<T, VT, O, InputTangent, OutputTangent>), Error> {
     let mut program_builder = ProgramBuilder::<T, VT, O>::new();
     let input_structure = input.param_structure();
     let input_tangent_ids = input.params().map(|v| program_builder.add_variable(v.tpe())).collect::<Vec<_>>();
@@ -229,20 +207,26 @@ where
 pub fn linearize<
     T: Clone + Debug + Type,
     V: Parameter + Clone + Typed<T>,
-    Input: Parameterized<V, To<Placeholder> = InputJvpTracer::To<Placeholder>>,
-    Output: Parameterized<V, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    InputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>, To<V> = Output>,
+    Input: Parameterized<
+            V,
+            ParamStructure: Clone,
+            To<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>> = InputJvpTracer,
+        >,
+    Output: Parameterized<V, ParamStructure: Clone>,
+    InputJvpTracer: Parameterized<
+            JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
+            ParamStructure = Input::ParamStructure,
+        >,
+    OutputJvpTracer: Parameterized<
+            JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
+            To<V> = Output,
+            ParamStructure = Output::ParamStructure,
+        >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
     input: Input,
-) -> Result<(Output, ParameterizedProgram<T, V, Box<dyn LinearInterpretableOp<T, V>>, Input, Output>), Error>
-where
-    Input: Parameterized<V, To<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>> = InputJvpTracer>,
-    Input::To<Placeholder>: Clone,
-    OutputJvpTracer::To<Placeholder>: Clone,
-{
+) -> Result<(Output, ParameterizedProgram<T, V, Box<dyn LinearInterpretableOp<T, V>>, Input, Output>), Error> {
     _linearize(function, input)
 }
 
@@ -250,20 +234,25 @@ where
 pub fn linear<
     T: Clone + Debug + Type,
     V: Parameter + Clone + ToOwned<Owned = V> + Typed<T>,
-    Input: Parameterized<V, To<Placeholder> = InputJvpTracer::To<Placeholder>> + One,
-    Output: Parameterized<V, To<Placeholder> = OutputJvpTracer::To<Placeholder>>,
-    InputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>, To<V> = Output>,
+    Input: Parameterized<
+            V,
+            ParamStructure: Clone,
+            To<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>> = InputJvpTracer,
+        > + One,
+    Output: Parameterized<V, ParamStructure: Clone>,
+    InputJvpTracer: Parameterized<
+            JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
+            ParamStructure = Input::ParamStructure,
+        >,
+    OutputJvpTracer: Parameterized<
+            JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
+            To<V> = Output,
+            ParamStructure = Output::ParamStructure,
+        >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
-) -> impl FnOnce(Input) -> Output
-where
-    Input: Parameterized<V, To<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>> = InputJvpTracer>,
-    Input::To<Placeholder>: Clone,
-    OutputJvpTracer:
-        Parameterized<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>, To<Placeholder>: Clone>,
-{
+) -> impl FnOnce(Input) -> Output {
     |value| {
         let tpe = value.tpe();
         _linearize(function, Input::one(&tpe)).unwrap().1.interpret(value).unwrap()
