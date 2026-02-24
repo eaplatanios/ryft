@@ -140,6 +140,13 @@ pub trait Parameterized<P: Parameter>: Sized {
     // TODO(eaplatanios): Can we enforce that `To<T>` is such that `To<T>::To<P> = Self` for any value of `T` and also
     //  `To<T>::To<R>` is equal to `To<R>` for any value of `R`.
     // TODO(eaplatanios): What if `P` has additional trait bounds? How can we represent `To` then?
+    //  The problem is that `type To<T: Parameter>` quantifies over all `T: Parameter`, but some parameterized trees
+    //  only support a strict subset of parameter types (e.g., `P: Parameter + FloatLike`). In those cases, `To<T>` is
+    //  not well-defined for every `T: Parameter`. We can resolve this by introducing a parameter domain marker `D`
+    //  (e.g., `AnyDomain`, `FloatDomain`) and thread it through these APIs as `Parameterized<P, D>`, `ParamFamily<D>`,
+    //  and `To<T: InDomain<D>>`. This makes the quantification explicit ("for all `T` in domain `D`"), preserves
+    //  reparameterization coherence, and lets us support specialized parameter domains without over-constraining
+    //  `Parameter` globally.
     type To<T: Parameter>: Parameterized<T, To<P> = Self> + Parameterized<T, To<Placeholder> = Self::To<Placeholder>>;
     // + Parameterized<T, To<JvpTracer<P>> = Self::To<JvpTracer<P>>>;
 
