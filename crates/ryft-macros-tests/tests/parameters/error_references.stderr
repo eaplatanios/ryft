@@ -1,9 +1,3 @@
-error: The generic parameter that is bounded by 'Parameter' indicates the parameter type that is used by '#[derive(Parameterized)]' and cannot have any bounds other than the 'Parameter' bound.
- --> tests/parameters/error_references.rs:4:36
-  |
-4 | struct StructWithReferences<'p, P: 'p + Parameter> {
-  |                                    ^^
-
 error: Ryft parameters must be owned. References are not allowed.
  --> tests/parameters/error_references.rs:7:18
   |
@@ -15,12 +9,6 @@ error: Ryft parameters must be owned. References are not allowed.
   |
 8 |     parameter_1: &'p P,
   |                  ^^^^^
-
-error: The generic parameter that is bounded by 'Parameter' indicates the parameter type that is used by '#[derive(Parameterized)]' and cannot have any bounds other than the 'Parameter' bound.
-  --> tests/parameters/error_references.rs:12:42
-   |
-12 | struct StructWithNestedReferences<'p, P: 'p + Parameter> {
-   |                                          ^^
 
 error: Ryft parameters must be owned. References are not allowed.
   --> tests/parameters/error_references.rs:14:34

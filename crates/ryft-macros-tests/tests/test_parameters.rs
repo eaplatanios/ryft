@@ -99,7 +99,7 @@ fn test_struct_with_nested_tuples() {
 #[test]
 fn test_struct_with_nested_struct() {
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
-    struct Struct<P: Parameter> {
+    struct Struct<P: Parameter + Clone> {
         p_0: P,
         p_1: P,
         np_0: (usize, usize),
@@ -107,7 +107,10 @@ fn test_struct_with_nested_struct() {
     }
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
-    struct StructWithNestedStruct<P: Parameter> {
+    struct StructWithNestedStruct<P: Parameter>
+    where
+        P: Clone,
+    {
         p_0: P,
         p_1: (usize, (i32, P, i64, Struct<P>)),
         np_0: (usize, usize),
@@ -732,7 +735,6 @@ fn test_map_params() {
 fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/parameters/error_attributes.rs");
-    test_cases.compile_fail("tests/parameters/error_bounds.rs");
     test_cases.compile_fail("tests/parameters/error_enums.rs");
     test_cases.compile_fail("tests/parameters/error_no_parameters.rs");
     test_cases.compile_fail("tests/parameters/error_references.rs");

@@ -100,14 +100,19 @@ impl CodeGenerator {
     /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
     /// const _: () = {
     ///     #[automatically_derived]
-    ///     impl<P: Parameter> ryft::ParameterizedFamily for CustomType<ryft::Placeholder> {
-    ///         type To<__P: ryft::Parameter> = CustomType<__P>;
+    ///     impl<__P: ryft::Parameter> ryft::ParameterizedFamily<__P> for CustomType<ryft::Placeholder> {
+    ///         type To = CustomType<__P>;
     ///     }
     ///
     ///     #[automatically_derived]
     ///     impl<P: Parameter> ryft::Parameterized<P> for CustomType<P> {
     ///         type Family = CustomType<ryft::Placeholder>;
-    ///         type To<__P: ryft::Parameter> = <Self::Family as ryft::ParameterizedFamily>::To<__P>;
+    ///         
+    ///         type To<__P: ryft::Parameter> =
+    ///             <Self::Family as ryft::ParameterizedFamily<__P>>::To
+    ///         where
+    ///             Self::Family: ryft::ParameterizedFamily<__P>;
+    ///         
     ///         type ParamStructure = Self::To<ryft::Placeholder>;
     ///
     ///         type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
@@ -253,8 +258,7 @@ impl CodeGenerator {
     /// implementation that will be derived. This function also checks if there are more than one generic type
     /// parameters bounded by [`Parameter`] or if there are none, and reports errors as needed. Note that this
     /// function inspects the bounds on the generic type parameters themselves, as well as any corresponding
-    /// where bounds. It also checks if the extracted generic parameter type has any other bounds besides
-    /// [`Parameter`] as that is not allowed/supported by the [`Parameterized`] derivation macro.
+    /// where bounds.
     fn extract_param_type(&mut self, input: &syn::DeriveInput) {
         let generics = &input.generics;
 
@@ -310,36 +314,6 @@ impl CodeGenerator {
                 '#[ryft(crate = ...)]' attribute.",
             );
         }
-
-        // Check that the only bound attached to the parameter type [`GenericParam`] is [`Parameter`].
-        let bad_bounds = generics
-            .type_params()
-            .filter(|param| param.matches_ident(&self.param_type))
-            .flat_map(|param| param.bounds.iter().filter(|bound| !check_bound(&self.ryft_crate, bound)))
-            .chain(
-                generics
-                    .where_clause
-                    .iter()
-                    .flat_map(|clause| clause.predicates.iter())
-                    .flat_map(|predicate| match &predicate {
-                        syn::WherePredicate::Type(syn::PredicateType { bounded_ty, bounds, .. })
-                            if bounded_ty.matches_ident(&self.param_type)
-                                && !check_bounds(&self.ryft_crate, bounds) =>
-                        {
-                            Some(bounds.iter())
-                        }
-                        _ => None,
-                    })
-                    .flatten(),
-            )
-            .collect::<Vec<_>>();
-        bad_bounds.iter().for_each(|bound| {
-            self.add_error(
-                bound,
-                "The generic parameter that is bounded by 'Parameter' indicates the parameter type that is used by \
-                    '#[derive(Parameterized)]' and cannot have any bounds other than the 'Parameter' bound.",
-            );
-        });
     }
 
     /// Extracts the [`Data`] that is contained in the provided [`syn::DeriveInput`]. This function also checks for
@@ -619,8 +593,14 @@ impl CodeGenerator {
     ///
     ///      ```ignore
     ///      type Family = ...;
-    ///      type To<__P: ryft::Parameter> = <Self::Family as ryft::ParameterizedFamily>::To<__P>;
+    /// 
+    ///      type To<__P: ryft::Parameter> =
+    ///          <Self::Family as ryft::ParameterizedFamily<__P>>::To
+    ///      where
+    ///          Self::Family: ryft::ParameterizedFamily<__P>;
+    /// 
     ///      type ParamStructure = Self::To<ryft::Placeholder>;
+    /// 
     ///      type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
     ///      type ParamIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
     ///      type ParamIntoIterator<__P: ryft::Parameter> = ...;
@@ -633,9 +613,8 @@ impl CodeGenerator {
     ///
     ///      ```ignore
     ///      #[automatically_derived]
-    ///      impl<P: Parameter> ParameterizedFamily for ... {
-    ///          type To<__P> = ...;
-    ///          ...
+    ///      impl<P: ryft::Parameter> ParameterizedFamily<P> for ... {
+    ///          type To = ...;
     ///      }
     ///
     ///      #[automatically_derived]
@@ -897,19 +876,19 @@ impl CodeGenerator {
         let param_type = &self.param_type;
         let ident = self.data.ident();
 
-        // For generated `To` associated types we need to rename the type parameter in our [`syn::Generics`].
+        // For generated `To` associated types we need to rename the parameter type in our [`syn::Generics`].
         // That is because if we do not rename it, we will end up with something like this:
         // ```
-        // impl<P: Parameter> ParameterizedFamily for SomeType<Placeholder> {
-        //     type To<P> = SomeType<P>;
+        // impl<P: Parameter> ParameterizedFamily<P> for SomeType<Placeholder> {
+        //     type To = SomeType<P>;
         //     ...
         // }
         // ```
         // In this case, the name `P` conflicts with the generic parameter of the `impl` block itself.
         // What we really want is something like this instead:
         // ```
-        // impl<P: Parameter> ParameterizedFamily for SomeType<Placeholder> {
-        //     type To<__P> = SomeType<__P>;
+        // impl<__P: Parameter> ParameterizedFamily<__P> for SomeType<Placeholder> {
+        //     type To = SomeType<__P>;
         //     ...
         // }
         // ```
@@ -917,19 +896,11 @@ impl CodeGenerator {
         // takes place in the following line (the uniqueness check for the name is performed in
         // [`CodeGenerator::check_for_name_conflicts`]).
         let to_assoc_ty_generics = self.generics.with_renamed_param(param_type, macro_param_type);
-        let to_assoc_impl_generics = to_assoc_ty_generics.without_params(
-            to_assoc_ty_generics
-                .params
-                .iter()
-                .flat_map(|param| param.ident())
-                .filter(|param| param != &macro_param_type),
-        );
         let (_, to_assoc_ty_generics, _) = to_assoc_ty_generics.split_for_impl();
-        let (to_assoc_impl_generics, _, _) = to_assoc_impl_generics.split_for_impl();
+        let to_assoc_param = quote!(#macro_param_type: #ryft::Parameter);
 
         // Generate the [`ParameterizedFamily`] implementation block first.
-        let placeholder_path = ryft.with_segment(Symbol::new("Placeholder").into());
-        let family_generics = self.generics.with_concrete_param(param_type, &placeholder_path);
+        let family_generics = self.generics.with_renamed_param(param_type, macro_param_type);
         let (family_impl_generics, _, family_where_clause) = family_generics.split_for_impl();
         let family_type = if self.generics.params.is_empty() {
             quote!(#ident)
@@ -955,15 +926,19 @@ impl CodeGenerator {
         };
         let family_impl = quote! {
             #[automatically_derived]
-            impl #family_impl_generics #ryft::ParameterizedFamily for #family_type #family_where_clause {
-                type To #to_assoc_impl_generics = #ident #to_assoc_ty_generics;
+            impl #family_impl_generics #ryft::ParameterizedFamily<#macro_param_type>
+                for #family_type #family_where_clause
+            {
+                type To = #ident #to_assoc_ty_generics;
             }
         };
 
         // Generate the [`Parameterized`] associated type declarations.
         let family_assoc_ty = quote!(type Family = #family_type;);
         let to_assoc_ty = quote!(
-            type To #to_assoc_impl_generics = <Self::Family as #ryft::ParameterizedFamily>::To<#macro_param_type>;
+            type To<#to_assoc_param> = <Self::Family as #ryft::ParameterizedFamily<#macro_param_type>>::To
+            where
+                Self::Family: #ryft::ParameterizedFamily<#macro_param_type>;
         );
         let param_structure_assoc_ty = quote!(type ParamStructure = Self::To<#ryft::Placeholder>;);
 

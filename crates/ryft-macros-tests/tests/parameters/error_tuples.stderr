@@ -15,27 +15,36 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
             (T0, T1, T2, T3, T4, T5, T6, T7, T8)
           and $N others
   = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
-note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily`
+note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`
  --> tests/parameters/error_tuples.rs:3:10
   |
 3 | #[derive(Parameterized)]
   |          ^^^^^^^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `usize: Parameterized<__P>` is not satisfied
+error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfied
  --> tests/parameters/error_tuples.rs:4:8
   |
 4 | struct NestedVecOfTuples<P: Parameter> {
-  |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Parameterized<__P>` is not implemented for `usize`
+  |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Parameterized<Placeholder>` is not implemented for `usize`
   |
-  = note: required for `(__P, usize)` to implement `Parameterized<__P>`
-  = note: 1 redundant requirement hidden
-  = note: required for `NestedVecOfTuples<__P>` to implement `Parameterized<__P>`
-note: required by a bound in `ryft::ParameterizedFamily::To`
- --> $WORKSPACE/crates/ryft-core/src/parameters.rs
+  = help: the following other types implement trait `Parameterized<P>`:
+            (T0, T1)
+            (T0, T1, T2)
+            (T0, T1, T2, T3)
+            (T0, T1, T2, T3, T4)
+            (T0, T1, T2, T3, T4, T5)
+            (T0, T1, T2, T3, T4, T5, T6)
+            (T0, T1, T2, T3, T4, T5, T6, T7)
+            (T0, T1, T2, T3, T4, T5, T6, T7, T8)
+          and $N others
+  = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
+note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`
+ --> tests/parameters/error_tuples.rs:3:10
   |
-  |     type To<T: Parameter>: Parameterized<T, Family = Self>;
-  |                                             ^^^^^^^^^^^^^ required by this bound in `ParameterizedFamily::To`
+3 | #[derive(Parameterized)]
+  |          ^^^^^^^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
+  = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfied
  --> tests/parameters/error_tuples.rs:3:10
@@ -54,5 +63,49 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
             (T0, T1, T2, T3, T4, T5, T6, T7, T8)
           and $N others
   = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
-  = help: see issue #48214
+note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`
+ --> tests/parameters/error_tuples.rs:3:10
+  |
+3 | #[derive(Parameterized)]
+  |          ^^^^^^^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
+note: required by a bound in `ryft::ParameterizedFamily::To`
+ --> $WORKSPACE/crates/ryft-core/src/parameters.rs
+  |
+  |     type To: Parameterized<P, Family = Self, ParamStructure = <Self as ParameterizedFamily<Placeholder>>::To>
+  |          -- required by a bound in this associated type
+  |     where
+  |         Self: ParameterizedFamily<Placeholder>;
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `ParameterizedFamily::To`
+  = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfied
+ --> tests/parameters/error_tuples.rs:3:10
+  |
+3 | #[derive(Parameterized)]
+  |          ^^^^^^^^^^^^^ the trait `Parameterized<Placeholder>` is not implemented for `usize`
+  |
+  = help: the following other types implement trait `Parameterized<P>`:
+            (T0, T1)
+            (T0, T1, T2)
+            (T0, T1, T2, T3)
+            (T0, T1, T2, T3, T4)
+            (T0, T1, T2, T3, T4, T5)
+            (T0, T1, T2, T3, T4, T5, T6)
+            (T0, T1, T2, T3, T4, T5, T6, T7)
+            (T0, T1, T2, T3, T4, T5, T6, T7, T8)
+          and $N others
+  = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
+note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`
+ --> tests/parameters/error_tuples.rs:3:10
+  |
+3 | #[derive(Parameterized)]
+  |          ^^^^^^^^^^^^^ unsatisfied trait bound introduced in this `derive` macro
+note: required by a bound in `ryft::Parameterized::To`
+ --> $WORKSPACE/crates/ryft-core/src/parameters.rs
+  |
+  |     type To<T: Parameter>: Parameterized<T, Family = Self::Family, ParamStructure = Self::ParamStructure>
+  |          -- required by a bound in this associated type
+...
+  |         Self::Family: ParameterizedFamily<T>;
+  |                       ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Parameterized::To`
   = note: this error originates in the derive macro `Parameterized` (in Nightly builds, run with -Z macro-backtrace for more info)

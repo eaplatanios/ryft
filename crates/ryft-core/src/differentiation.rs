@@ -11,7 +11,7 @@ use ryft_macros::Parameter;
 use crate::{
     errors::Error,
     ops::constants::{One, Zero},
-    parameters::{Parameter, Parameterized},
+    parameters::{Parameter, Parameterized, ParameterizedFamily},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing::{Tracer, VariableTracer},
     types::{ArrayType, Type, Typed},
@@ -73,12 +73,17 @@ impl<Value: Differentiable<Tangent> + Typed<Tangent::T>, Tangent: Zero> From<Val
 fn _jvp<
     V: Parameter,
     VT: Parameter,
-    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer>,
+    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer, Family: ParameterizedFamily<JvpTracer<V, VT>>>,
     InputTangent: Parameterized<VT, ParamStructure = Input::ParamStructure>,
     Output: Parameterized<V, ParamStructure: Clone>,
     OutputTangent: Parameterized<VT, ParamStructure = Output::ParamStructure>,
     InputJvpTracer: Parameterized<JvpTracer<V, VT>, ParamStructure = Input::ParamStructure>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<V> = Output, ParamStructure = Output::ParamStructure>,
+    OutputJvpTracer: Parameterized<
+            JvpTracer<V, VT>,
+            To<V> = Output,
+            ParamStructure = Output::ParamStructure,
+            Family: ParameterizedFamily<V>,
+        >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
@@ -102,10 +107,15 @@ fn _jvp<
 #[inline]
 pub fn jvp<
     V: Parameter,
-    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer>,
+    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer, Family: ParameterizedFamily<JvpTracer<V, V>>>,
     Output: Parameterized<V, ParamStructure: Clone>,
     InputJvpTracer: Parameterized<JvpTracer<V, V>, ParamStructure = Input::ParamStructure>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<V> = Output, ParamStructure = Output::ParamStructure>,
+    OutputJvpTracer: Parameterized<
+            JvpTracer<V, V>,
+            To<V> = Output,
+            ParamStructure = Output::ParamStructure,
+            Family: ParameterizedFamily<V>,
+        >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
@@ -119,12 +129,18 @@ pub fn jvp<
 pub fn _differential<
     V: Parameter,
     VT: Parameter,
-    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer> + Typed<InputTangent::T>,
+    Input: Parameterized<V, To<JvpTracer<V, VT>> = InputJvpTracer, Family: ParameterizedFamily<JvpTracer<V, VT>>>
+        + Typed<InputTangent::T>,
     InputTangent: Parameterized<VT, ParamStructure = Input::ParamStructure> + One,
     Output: Parameterized<V, ParamStructure: Clone>,
     OutputTangent: Parameterized<VT, ParamStructure = Output::ParamStructure>,
     InputJvpTracer: Parameterized<JvpTracer<V, VT>, ParamStructure = Input::ParamStructure>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, VT>, To<V> = Output, ParamStructure = Output::ParamStructure>,
+    OutputJvpTracer: Parameterized<
+            JvpTracer<V, VT>,
+            To<V> = Output,
+            ParamStructure = Output::ParamStructure,
+            Family: ParameterizedFamily<V>,
+        >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
@@ -138,10 +154,15 @@ pub fn _differential<
 #[inline]
 pub fn differential<
     V: Parameter,
-    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer> + One,
+    Input: Parameterized<V, To<JvpTracer<V, V>> = InputJvpTracer, Family: ParameterizedFamily<JvpTracer<V, V>>> + One,
     Output: Parameterized<V, ParamStructure: Clone>,
     InputJvpTracer: Parameterized<JvpTracer<V, V>, ParamStructure = Input::ParamStructure>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, V>, To<V> = Output, ParamStructure = Output::ParamStructure>,
+    OutputJvpTracer: Parameterized<
+            JvpTracer<V, V>,
+            To<V> = Output,
+            ParamStructure = Output::ParamStructure,
+            Family: ParameterizedFamily<V>,
+        >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
@@ -157,12 +178,22 @@ pub fn _linearize<
     O: Clone + LinearOp<T, V> + Debug,
     V: Parameter + Typed<T>,
     VT: Parameter + Clone + Typed<T>,
-    Input: Parameterized<V, ParamStructure: Clone, To<JvpTracer<V, Tracer<T, VT, O>>> = InputJvpTracer>,
-    InputTangent: Parameterized<VT, ParamStructure = Input::ParamStructure>,
+    Input: Parameterized<
+            V,
+            ParamStructure: Clone,
+            To<JvpTracer<V, Tracer<T, VT, O>>> = InputJvpTracer,
+            Family: ParameterizedFamily<JvpTracer<V, Tracer<T, VT, O>>>,
+        >,
+    InputTangent: Parameterized<VT, ParamStructure = Input::ParamStructure, Family: ParameterizedFamily<Tracer<T, VT, O>>>,
     Output: Parameterized<V, ParamStructure: Clone>,
-    OutputTangent: Parameterized<VT, ParamStructure = Output::ParamStructure>,
+    OutputTangent: Parameterized<VT, ParamStructure = Output::ParamStructure, Family: ParameterizedFamily<Tracer<T, VT, O>>>,
     InputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, VT, O>>, ParamStructure = Input::ParamStructure>,
-    OutputJvpTracer: Parameterized<JvpTracer<V, Tracer<T, VT, O>>, To<V> = Output, ParamStructure = Output::ParamStructure>,
+    OutputJvpTracer: Parameterized<
+            JvpTracer<V, Tracer<T, VT, O>>,
+            To<V> = Output,
+            ParamStructure = Output::ParamStructure,
+            Family: ParameterizedFamily<V>,
+        >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
     function: F,
@@ -211,8 +242,14 @@ pub fn linearize<
             V,
             ParamStructure: Clone,
             To<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>> = InputJvpTracer,
+            Family: ParameterizedFamily<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>>
+                        + ParameterizedFamily<Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
         >,
-    Output: Parameterized<V, ParamStructure: Clone>,
+    Output: Parameterized<
+            V,
+            ParamStructure: Clone,
+            Family: ParameterizedFamily<Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
+        >,
     InputJvpTracer: Parameterized<
             JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
             ParamStructure = Input::ParamStructure,
@@ -221,6 +258,7 @@ pub fn linearize<
             JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
             To<V> = Output,
             ParamStructure = Output::ParamStructure,
+            Family: ParameterizedFamily<V>,
         >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(
@@ -238,8 +276,14 @@ pub fn linear<
             V,
             ParamStructure: Clone,
             To<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>> = InputJvpTracer,
+            Family: ParameterizedFamily<JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>>
+                        + ParameterizedFamily<Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
         > + One,
-    Output: Parameterized<V, ParamStructure: Clone>,
+    Output: Parameterized<
+            V,
+            ParamStructure: Clone,
+            Family: ParameterizedFamily<Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
+        >,
     InputJvpTracer: Parameterized<
             JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
             ParamStructure = Input::ParamStructure,
@@ -248,6 +292,7 @@ pub fn linear<
             JvpTracer<V, Tracer<T, V, Box<dyn LinearInterpretableOp<T, V>>>>,
             To<V> = Output,
             ParamStructure = Output::ParamStructure,
+            Family: ParameterizedFamily<V>,
         >,
     F: FnOnce(InputJvpTracer) -> OutputJvpTracer,
 >(

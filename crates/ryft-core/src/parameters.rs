@@ -70,12 +70,19 @@ impl Debug for Placeholder {
 
 impl Parameter for Placeholder {}
 
-/// Type-level family that maps [`Parameter`] types nested in a type while preserving its overall structure.
-/// This is used internally by [`Parameterized`] and is based on the _type family_ approach described in
+/// Type-level family that maps [`Parameter`] types nested in a type while preserving its overall
+/// structure. This is used internally by [`Parameterized`] and is based on the _type family_ approach described in
 /// [this blog post](https://smallcultfollowing.com/babysteps/blog/2016/11/03/associated-type-constructors-part-2-family-traits/).
-pub trait ParameterizedFamily: Sized {
-    /// Type obtained by replacing [`Parameter`] types nested in this type by `T`.
-    type To<T: Parameter>: Parameterized<T, Family = Self>;
+/// This trait is generic over `P` (instead of using a non-generic family trait with `type To<P: Parameter>`) so
+/// that each family can constrain the parameter domain at the `impl` level. For example, a family can implement
+/// `ParameterizedFamily<P>` only for `P: Parameter + Clone`. With a generic associated type `To<P>` on a non-generic
+/// family trait, the declaration would quantify over all `P: Parameter`, and implementations would not be allowed to
+/// add stricter per-family bounds on `P`.
+pub trait ParameterizedFamily<P: Parameter>: Sized {
+    /// Type obtained by replacing [`Parameter`] types nested in this type with `P`.
+    type To: Parameterized<P, Family = Self, ParamStructure = <Self as ParameterizedFamily<Placeholder>>::To>
+    where
+        Self: ParameterizedFamily<Placeholder>;
 }
 
 // TODO(eaplatanios): `Vec<(P, non-P)>` is not supported.
@@ -100,7 +107,6 @@ pub trait ParameterizedFamily: Sized {
 //    - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
 //      that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
 //      If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
-//    - Only the `: Parameter` bound is supported by the derive macro. No additional bounds are supported for `P`.
 
 /// Recursively traversable parameter tree whose leaves are values that implement the [`Parameter`] marker trait.
 ///
@@ -132,7 +138,7 @@ pub trait ParameterizedFamily: Sized {
 /// - Exactly one generic type parameter must be bounded by [`Parameter`].
 /// - The parameter bound must be written as `Parameter` or `ryft::Parameter` (respecting any
 ///   `#[ryft(crate = "...")]` override).
-/// - The parameter type cannot have additional bounds.
+/// - Additional bounds on the parameter type are supported and preserved across reparameterization.
 /// - All fields that reference the parameter type are treated as parameter fields.
 /// - Parameter fields must be owned (references and pointers to the parameter type are rejected).
 /// - Non-parameter fields must be [`Clone`] because [`param_structure`](Self::param_structure) clones them.
@@ -150,22 +156,15 @@ pub trait ParameterizedFamily: Sized {
 /// the original value.
 pub trait Parameterized<P: Parameter>: Sized {
     /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
-    type Family: ParameterizedFamily<To<P> = Self, To<Placeholder> = Self::ParamStructure>;
-
-    // TODO(eaplatanios): What if `P` has additional trait bounds? How can we represent `To` then?
-    //  The problem is that `type To<T: Parameter>` quantifies over all `T: Parameter`, but some parameterized trees
-    //  only support a strict subset of parameter types (e.g., `P: Parameter + FloatLike`). In those cases, `To<T>` is
-    //  not well-defined for every `T: Parameter`. We can resolve this by introducing a parameter domain marker `D`
-    //  (e.g., `AnyDomain`, `FloatDomain`) and thread it through these APIs as `Parameterized<P, D>`,
-    //  `ParameterizedFamily<D>`, and `To<T: InDomain<D>>`. This makes the quantification explicit ("for all `T` in
-    //  domain `D`"), preserves reparameterization coherence, and lets us support specialized parameter domains without
-    //  over-constraining `Parameter` globally.
+    type Family: ParameterizedFamily<P, To = Self> + ParameterizedFamily<Placeholder, To = Self::ParamStructure>;
 
     /// Reparameterized form of this [`Parameterized`] type with all of its nested `P` types replaced by `T`. This
     /// preserves the same [`Family`](Self::Family) and [`ParamStructure`](Self::ParamStructure), and is such that
     /// reparameterizing back to `P` recovers [`Self`].
-    type To<T: Parameter>: Parameterized<T, Family = Self::Family, To<P> = Self, ParamStructure = Self::ParamStructure>
-        + SameAs<<Self::Family as ParameterizedFamily>::To<T>>;
+    type To<T: Parameter>: Parameterized<T, Family = Self::Family, ParamStructure = Self::ParamStructure>
+        + SameAs<<Self::Family as ParameterizedFamily<T>>::To>
+    where
+        Self::Family: ParameterizedFamily<T>;
 
     /// Shape-only representation of this [`Parameterized`] type with all parameter leaves replaced by [`Placeholder`].
     /// This is always set to `Self::To<Placeholder>`. The only reason this is not included here is that defaulted
@@ -225,7 +224,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 
     // TODO(eaplatanios): Document that this maps the parameters in this type.
-    fn map_params<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, Error> {
+    fn map_params<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, Error>
+    where
+        Self::Family: ParameterizedFamily<T>,
+    {
         Self::To::<T>::from_params(self.param_structure(), self.into_params().map(map_fn))
     }
 }
@@ -233,14 +235,17 @@ pub trait Parameterized<P: Parameter>: Sized {
 /// Parameterization family for leaf parameter types.
 pub struct ParameterParameterizedFamily;
 
-impl ParameterizedFamily for ParameterParameterizedFamily {
-    type To<T: Parameter> = T;
+impl<P: Parameter> ParameterizedFamily<P> for ParameterParameterizedFamily {
+    type To = P;
 }
 
 impl<P: Parameter> Parameterized<P> for P {
     type Family = ParameterParameterizedFamily;
 
-    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+    type To<T: Parameter>
+        = <Self::Family as ParameterizedFamily<T>>::To
+    where
+        Self::Family: ParameterizedFamily<T>;
 
     type ParamStructure = Self::To<Placeholder>;
 
@@ -286,14 +291,17 @@ impl<P: Parameter> Parameterized<P> for P {
 
 pub struct PhantomDataParameterizedFamily;
 
-impl ParameterizedFamily for PhantomDataParameterizedFamily {
-    type To<T: Parameter> = PhantomData<T>;
+impl<P: Parameter> ParameterizedFamily<P> for PhantomDataParameterizedFamily {
+    type To = PhantomData<P>;
 }
 
 impl<P: Parameter> Parameterized<P> for PhantomData<P> {
     type Family = PhantomDataParameterizedFamily;
 
-    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+    type To<T: Parameter>
+        = <Self::Family as ParameterizedFamily<T>>::To
+    where
+        Self::Family: ParameterizedFamily<T>;
 
     type ParamStructure = Self::To<Placeholder>;
 
@@ -346,8 +354,10 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
 
 macro_rules! tuple_parameterized_family_impl {
     ($($F:ident),*) => {
-        impl<$($F: ParameterizedFamily),*> ParameterizedFamily for ($($F,)*) {
-            type To<T: Parameter> = ($($F::To<T>,)*);
+        impl<P: Parameter, $($F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>),*> ParameterizedFamily<P>
+            for ($($F,)*)
+        {
+            type To = ($(<$F as ParameterizedFamily<P>>::To,)*);
         }
     };
 }
@@ -368,10 +378,13 @@ tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F1
 macro_rules! tuple_parameterized_impl {
     ($($T:ident),*) => {
         paste! {
-            impl<P: Parameter$(, $T: Parameterized<P>)*> Parameterized<P> for ($($T,)*) {
+            impl<P: Parameter$(, $T: Parameterized<P>)*> Parameterized<P> for ($($T,)*)
+            {
                 type Family = ($($T::Family,)*);
 
-                type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+                type To<T: Parameter> = <Self::Family as ParameterizedFamily<T>>::To
+                where
+                    Self::Family: ParameterizedFamily<T>;
 
                 type ParamStructure = Self::To<Placeholder>;
 
@@ -496,16 +509,21 @@ tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9);
 tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
 tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
 
-pub struct ArrayParameterizedFamily<F: ParameterizedFamily, const N: usize>(PhantomData<F>);
+pub struct ArrayParameterizedFamily<F, const N: usize>(PhantomData<F>);
 
-impl<F: ParameterizedFamily, const N: usize> ParameterizedFamily for ArrayParameterizedFamily<F, N> {
-    type To<T: Parameter> = [F::To<T>; N];
+impl<P: Parameter, F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>, const N: usize> ParameterizedFamily<P>
+    for ArrayParameterizedFamily<F, N>
+{
+    type To = [<F as ParameterizedFamily<P>>::To; N];
 }
 
 impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V; N] {
     type Family = ArrayParameterizedFamily<V::Family, N>;
 
-    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+    type To<T: Parameter>
+        = <Self::Family as ParameterizedFamily<T>>::To
+    where
+        Self::Family: ParameterizedFamily<T>;
 
     type ParamStructure = Self::To<Placeholder>;
 
@@ -567,16 +585,21 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
     }
 }
 
-pub struct VecParameterizedFamily<F: ParameterizedFamily>(PhantomData<F>);
+pub struct VecParameterizedFamily<F>(PhantomData<F>);
 
-impl<F: ParameterizedFamily> ParameterizedFamily for VecParameterizedFamily<F> {
-    type To<T: Parameter> = Vec<F::To<T>>;
+impl<P: Parameter, F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>> ParameterizedFamily<P>
+    for VecParameterizedFamily<F>
+{
+    type To = Vec<<F as ParameterizedFamily<P>>::To>;
 }
 
 impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
     type Family = VecParameterizedFamily<V::Family>;
 
-    type To<T: Parameter> = <Self::Family as ParameterizedFamily>::To<T>;
+    type To<T: Parameter>
+        = <Self::Family as ParameterizedFamily<T>>::To
+    where
+        Self::Family: ParameterizedFamily<T>;
 
     type ParamStructure = Self::To<Placeholder>;
 
@@ -651,7 +674,7 @@ mod tests {
 
     use crate::errors::Error;
 
-    use super::{Parameterized, Placeholder};
+    use super::{Parameter, Parameterized, Placeholder};
 
     fn assert_roundtrip_parameterized<V>(value: V, expected_params: Vec<i32>)
     where
@@ -681,6 +704,37 @@ mod tests {
         }
         let expected_after = expected_before.iter().map(|parameter| parameter + 1).collect::<Vec<_>>();
         assert_eq!(mutable_value.params().copied().collect::<Vec<_>>(), expected_after);
+    }
+
+    mod derive_support {
+        pub use crate::errors::Error;
+        pub use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Rate32(i32);
+
+    impl Parameter for Rate32 {}
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    struct Rate64(i64);
+
+    impl Parameter for Rate64 {}
+
+    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
+    #[ryft(crate = "crate::parameters::tests::derive_support")]
+    struct DomainRates<P: Parameter + Clone> {
+        first: P,
+        second: P,
+    }
+
+    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
+    #[ryft(crate = "crate::parameters::tests::derive_support")]
+    struct DomainRatesVec<P: Parameter>
+    where
+        P: Clone,
+    {
+        values: Vec<DomainRates<P>>,
     }
 
     macro_rules! assert_tuple_impl {
@@ -731,6 +785,52 @@ mod tests {
         assert_roundtrip_parameterized(vec![1, 2, 3], vec![1, 2, 3]);
         assert_params_mut_increments(vec![1, 2, 3], vec![1, 2, 3]);
         assert_roundtrip_parameterized(vec![(1, 2), (3, 4)], vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_derive_supports_additional_parameter_bounds() {
+        let value = DomainRates { first: Rate32(3), second: Rate32(7) };
+        assert_eq!(value.param_count(), 2);
+        assert_eq!(value.params().copied().collect::<Vec<_>>(), vec![Rate32(3), Rate32(7)]);
+        assert_eq!(value.param_structure(), DomainRates { first: Placeholder, second: Placeholder });
+
+        let mapped: DomainRates<Rate64> = value.map_params(|rate| Rate64(i64::from(rate.0) * 10)).unwrap();
+        assert_eq!(mapped, DomainRates { first: Rate64(30), second: Rate64(70) });
+    }
+
+    #[test]
+    fn test_derive_supports_additional_parameter_bounds_in_where_clause() {
+        let value = DomainRatesVec {
+            values: vec![
+                DomainRates { first: Rate32(1), second: Rate32(2) },
+                DomainRates { first: Rate32(3), second: Rate32(4) },
+            ],
+        };
+        assert_eq!(value.param_count(), 4);
+        assert_eq!(
+            value.param_structure(),
+            DomainRatesVec {
+                values: vec![
+                    DomainRates { first: Placeholder, second: Placeholder },
+                    DomainRates { first: Placeholder, second: Placeholder },
+                ],
+            }
+        );
+        assert_eq!(
+            DomainRatesVec::from_params(value.param_structure(), vec![Rate32(1), Rate32(2), Rate32(3), Rate32(4)],),
+            Ok(value.clone())
+        );
+
+        let mapped: DomainRatesVec<Rate64> = value.map_params(|rate| Rate64(i64::from(rate.0) + 5)).unwrap();
+        assert_eq!(
+            mapped,
+            DomainRatesVec {
+                values: vec![
+                    DomainRates { first: Rate64(6), second: Rate64(7) },
+                    DomainRates { first: Rate64(8), second: Rate64(9) },
+                ],
+            }
+        );
     }
 
     #[test]
