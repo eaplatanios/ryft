@@ -114,45 +114,74 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// `P`, new instances of this type can be constructed using [`Parameterized::from_params_with_remainder`]. Another way
 /// to think of [`Parameterized`] types is as tree-structured containers of [`Parameter`]s.
 ///
+/// This is analogous to a [JAX pytree](https://docs.jax.dev/en/latest/pytrees.html): JAX represents a pytree as
+/// `leaves + treedef`, while this trait represents a value as parameters plus [`Self::ParamStructure`].
+///
+/// # Mapping To JAX Pytrees
+///
+/// - JAX `tree.flatten(x)` corresponds to [`params`](Self::params) (the leaves) plus
+///   [`param_structure`](Self::param_structure) (the tree definition).
+/// - JAX `tree.unflatten(treedef, leaves)` corresponds to [`from_params`](Self::from_params) or
+///   [`from_params_with_remainder`](Self::from_params_with_remainder).
+/// - JAX `tree.map(f, x)` corresponds to [`map_params`](Self::map_params).
+///
+/// # Examples
+///
+/// Flatten into leaves and structure:
+///
+/// ```rust
+/// use ryft_core::parameters::{Parameterized, Placeholder};
+///
+/// let value = vec![(1.0_f32, 2.0_f32), (3.0_f32, 4.0_f32)];
+/// assert_eq!(value.params().copied().collect::<Vec<_>>(), vec![1.0, 2.0, 3.0, 4.0]);
+/// assert_eq!(value.param_structure(), vec![(Placeholder, Placeholder), (Placeholder, Placeholder)]);
+/// ```
+///
+/// Rebuild the same structure with different parameter values:
+///
+/// ```rust
+/// use ryft_core::parameters::{Parameterized, Placeholder};
+///
+/// let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
+/// let rebuilt = <Vec<(f32, f32)> as Parameterized<f32>>::from_params(
+///     structure,
+///     vec![10.0_f32, 20.0_f32, 30.0_f32, 40.0_f32],
+/// )?;
+/// assert_eq!(rebuilt, vec![(10.0, 20.0), (30.0, 40.0)]);
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// Apply the same transformation to every leaf while preserving structure:
+///
+/// ```rust
+/// use ryft_core::parameters::Parameterized;
+///
+/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+/// let shifted: Vec<(i64, i64)> = value.map_params(|v| i64::from(v) + 100)?;
+/// assert_eq!(shifted, vec![(101, 102), (103, 104)]);
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// For additional intuition and patterns, see JAX's docs on
+/// [pytrees](https://docs.jax.dev/en/latest/pytrees.html) and
+/// [custom pytree nodes](https://docs.jax.dev/en/latest/custom_pytrees.html).
+///
 /// # Implementations Provided In This Module
 ///
 /// - Every `P: Parameter` is a leaf and therefore implements [`Parameterized<P>`].
 /// - [`PhantomData<P>`] implements [`Parameterized<P>`] and contributes zero parameters.
 /// - Tuples whose elements are all themselves [`Parameterized`] are supported for arities of 1 through 12.
 /// - Arrays (`[T; N]`) and [`Vec<T>`] are supported when `T: Parameterized<P>`.
-/// - Because containers are parameterized by element type, `Vec<P>` works whenever `P: Parameter` (as `P` itself is a
-///   leaf that implements [`Parameterized<P>`]).
-/// - [`Box<T>`] is currently not supported (see the box coherence note below for details).
-/// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + std::hash::Hash`, `S: std::hash::BuildHasher + Clone`,
-///   and `T: Parameterized<P>`.
+/// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + std::hash::Hash`,
+///   `S: std::hash::BuildHasher + Clone`, and `T: Parameterized<P>`.
+/// - [`Box<T>`] is intentionally not supported (see the coherence note below).
 ///
-/// # Box Coherence Note
+/// # Coherence Note For `Box<T>`
 ///
-/// We currently cannot provide `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>` because it
+/// We cannot currently provide `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>` because it
 /// overlaps with the blanket leaf implementation `impl<P: Parameter> Parameterized<P> for P`. Since `Box` is a
 /// fundamental type, downstream crates may implement [`Parameter`] for `Box<LocalType>`, and the generic `Box` impl
 /// then becomes non-coherent under Rust's orphan/coherence rules.
-///
-/// # Derive Macros
-///
-/// `ryft-macros` provides two derives for working with this trait:
-/// - `#[derive(Parameter)]` is a convenience derive for leaf types and expands to an empty [`Parameter`] `impl`.
-/// - `#[derive(Parameterized)]` can generate implementations for structs and enums (unions are rejected).
-///
-/// `#[derive(Parameterized)]` currently assumes:
-/// - Exactly one generic type parameter must be bounded by [`Parameter`].
-/// - The parameter bound must be written as `Parameter` or `ryft::Parameter` (respecting any
-///   `#[ryft(crate = "...")]` override).
-/// - Additional bounds on the parameter type are supported and preserved across reparameterization.
-/// - All fields that reference the parameter type are treated as parameter fields.
-/// - Parameter fields must be owned (references and pointers to the parameter type are rejected).
-/// - Non-parameter fields must be [`Clone`] because [`param_structure`](Self::param_structure) clones them.
-/// - The only supported macro attribute is container-level `#[ryft(crate = "...")]`; field/variant-level
-///   `#[ryft(...)]` attributes are rejected.
-/// - The names `__P` and `'__p` are reserved for generated code and cannot be used in the container generics.
-/// - Nested tuples that mix parameterized and non-parameterized fields are supported within derived containers.
-/// - Mixed tuples are not supported as direct items in generic containers covered by the blanket implementations in
-///   this module (for example, `Vec<(P, usize)>`).
 ///
 /// # Ordering Invariant
 ///
