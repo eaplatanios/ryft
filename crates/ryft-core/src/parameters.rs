@@ -85,9 +85,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
         Self: ParameterizedFamily<Placeholder>;
 }
 
-// TODO(eaplatanios): `Vec<(P, non-P)>` is not supported.
-// TODO(eaplatanios): Unit structs should be impossible.
-
 // TODO(eaplatanios): Cover the following cases in the `Parameterized` documentation.
 //  - HashMap<K, P> is not Parameterized<P>. HashMap<K, V: Parameterized<P>> is Parameterized<V>.
 //  - Same goes for arrays and other collection types.
@@ -665,6 +662,7 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
 }
 
 // TODO(eaplatanios): Implement this for arrays, HashMap<K, _>, etc.
+//  HashMap<K, P> is not Parameterized<P>. HashMap<K, V: Parameterized<P>> is Parameterized<V>.
 // TODO(eaplatanios): Add tests for each of the [Parameterized] implementations included in this file.
 
 #[cfg(test)]
