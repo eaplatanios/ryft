@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
+use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
 use half::{bf16, f16};
@@ -85,10 +87,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
         Self: ParameterizedFamily<Placeholder>;
 }
 
-// TODO(eaplatanios): Cover the following cases in the `Parameterized` documentation.
-//  - HashMap<K, P> is not Parameterized<P>. HashMap<K, V: Parameterized<P>> is Parameterized<V>.
-//  - Same goes for arrays and other collection types.
-
 // TODO(eaplatanios): Talk about the derive macro we have for this trait:
 //    - We also provide a `#[derive(Parameter)]` macro for convenience.
 //    - Supports both structs and enums already.
@@ -105,15 +103,16 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 //      that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
 //      If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
 
-/// Recursively traversable parameter tree whose leaves are values that implement the [`Parameter`] marker trait.
+/// Recursively traversable data structure that contains nested [`Parameter`]s of type `P`. A [`Parameterized`] value
+/// can be thought of as consisting of two parts:
+/// 
+///  1. Its _structure_ which can be obtained via [`Self::param_structure`].
+///  2. The _parameters_ nested within that structure, which can be obtained via [`Self::params`], [`Self::params_mut`],
+///     and [`Self::into_params`].
 ///
-/// A [`Parameterized`] value can be split into:
-/// 1. Its shape-only representation via [`param_structure`](Self::param_structure), and
-/// 2. An ordered stream of leaf parameters via [`params`](Self::params), [`params_mut`](Self::params_mut), or
-///    [`into_params`](Self::into_params).
-///
-/// The same value can then be reconstructed using [`from_params`](Self::from_params) or
-/// [`from_params_with_remainder`](Self::from_params_with_remainder).
+/// Given a [`Self::ParamStructure`] and an ordered collection of [`Parameter`]s, of potentially a different type than
+/// `P`, new instances of this type can be constructed using [`Parameterized::from_params_with_remainder`]. Another way
+/// to think of [`Parameterized`] types is as tree-structured containers of [`Parameter`]s.
 ///
 /// # Implementations Provided In This Module
 ///
@@ -123,7 +122,16 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// - Arrays (`[T; N]`) and [`Vec<T>`] are supported when `T: Parameterized<P>`.
 /// - Because containers are parameterized by element type, `Vec<P>` works whenever `P: Parameter` (as `P` itself is a
 ///   leaf that implements [`Parameterized<P>`]).
-/// - [`std::collections::HashMap`] and [`Box`] are not supported yet.
+/// - [`Box<T>`] is currently not supported (see the box coherence note below for details).
+/// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + std::hash::Hash`, `S: std::hash::BuildHasher + Clone`,
+///   and `T: Parameterized<P>`.
+///
+/// # Box Coherence Note
+///
+/// We currently cannot provide `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>` because it
+/// overlaps with the blanket leaf implementation `impl<P: Parameter> Parameterized<P> for P`. Since `Box` is a
+/// fundamental type, downstream crates may implement [`Parameter`] for `Box<LocalType>`, and the generic `Box` impl
+/// then becomes non-coherent under Rust's orphan/coherence rules.
 ///
 /// # Derive Macros
 ///
@@ -220,7 +228,9 @@ pub trait Parameterized<P: Parameter>: Sized {
         params.next().map(|_| Err(Error::UnusedParams)).unwrap_or_else(|| Ok(parameterized))
     }
 
-    // TODO(eaplatanios): Document that this maps the parameters in this type.
+    /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
+    /// `T`, while preserving the [`Parameterized`] tree structure of this type. Nested parameters are visited in the
+    /// same order as [`Self::params`], [`Self::params_mut`], and [`Self::into_params`].
     fn map_params<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, Error>
     where
         Self::Family: ParameterizedFamily<T>,
@@ -341,8 +351,6 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
         Ok(PhantomData)
     }
 }
-
-// TODO(eaplatanios): Add implementation for [Box].
 
 // Use declarative macros to provide implementations for tuples of [`Parameterized`] items. Note that if a tuple
 // contains a mix of [`Parameterized`] and non-[`Parameterized`] items, then the generated implementations here
@@ -661,12 +669,98 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
     }
 }
 
-// TODO(eaplatanios): Implement this for arrays, HashMap<K, _>, etc.
-//  HashMap<K, P> is not Parameterized<P>. HashMap<K, V: Parameterized<P>> is Parameterized<V>.
-// TODO(eaplatanios): Add tests for each of the [Parameterized] implementations included in this file.
+pub struct HashMapParameterizedFamily<K, F, S>(PhantomData<(K, F, S)>);
+
+impl<
+    P: Parameter,
+    K: Clone + Eq + Hash,
+    F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>,
+    S: BuildHasher + Clone,
+> ParameterizedFamily<P> for HashMapParameterizedFamily<K, F, S>
+{
+    type To = HashMap<K, <F as ParameterizedFamily<P>>::To, S>;
+}
+
+impl<P: Parameter, K: Clone + Eq + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
+    for HashMap<K, V, S>
+{
+    type Family = HashMapParameterizedFamily<K, V::Family, S>;
+
+    type To<T: Parameter>
+        = <Self::Family as ParameterizedFamily<T>>::To
+    where
+        Self::Family: ParameterizedFamily<T>;
+
+    type ParamStructure = Self::To<Placeholder>;
+
+    type ParamIterator<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::hash_map::Values<'t, K, V>,
+        <V as Parameterized<P>>::ParamIterator<'t, T>,
+        fn(&'t V) -> <V as Parameterized<P>>::ParamIterator<'t, T>,
+    >
+    where
+        Self: 't;
+
+    type ParamIteratorMut<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::hash_map::ValuesMut<'t, K, V>,
+        <V as Parameterized<P>>::ParamIteratorMut<'t, T>,
+        fn(&'t mut V) -> <V as Parameterized<P>>::ParamIteratorMut<'t, T>,
+    >
+    where
+        Self: 't;
+
+    type ParamIntoIterator<T: Parameter> = std::iter::FlatMap<
+        std::collections::hash_map::IntoValues<K, V>,
+        <V as Parameterized<P>>::ParamIntoIterator<T>,
+        fn(V) -> <V as Parameterized<P>>::ParamIntoIterator<T>,
+    >;
+
+    fn param_count(&self) -> usize {
+        self.values().map(|value| value.param_count()).sum()
+    }
+
+    fn param_structure(&self) -> Self::ParamStructure {
+        let mut structure = HashMap::with_capacity_and_hasher(self.len(), self.hasher().clone());
+        structure.extend(self.iter().map(|(key, value)| (key.clone(), value.param_structure())));
+        structure
+    }
+
+    fn params(&self) -> Self::ParamIterator<'_, P> {
+        self.values().flat_map(V::params)
+    }
+
+    fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P> {
+        self.values_mut().flat_map(V::params_mut)
+    }
+
+    fn into_params(self) -> Self::ParamIntoIterator<P> {
+        self.into_values().flat_map(V::into_params)
+    }
+
+    fn from_params_with_remainder<I: Iterator<Item = P>>(
+        structure: Self::ParamStructure,
+        params: &mut I,
+    ) -> Result<Self, Error> {
+        let expected_count = structure.len();
+        let mut values = HashMap::with_capacity_and_hasher(expected_count, structure.hasher().clone());
+        for (key, value_structure) in structure {
+            values.insert(
+                key,
+                V::from_params_with_remainder(value_structure, params).map_err(|error| match error {
+                    Error::InsufficientParams { .. } => Error::InsufficientParams { expected_count },
+                    error => error,
+                })?,
+            );
+        }
+        Ok(values)
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fmt::Debug;
     use std::marker::PhantomData;
 
@@ -786,6 +880,17 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_map_parameterized_impl() {
+        let mut value = HashMap::new();
+        value.insert("left", (1, 2));
+        value.insert("right", (3, 4));
+
+        let expected_params = value.params().copied().collect::<Vec<_>>();
+        assert_roundtrip_parameterized(value.clone(), expected_params.clone());
+        assert_params_mut_increments(value, expected_params);
+    }
+
+    #[test]
     fn test_derive_supports_additional_parameter_bounds() {
         let value = DomainRates { first: Rate32(3), second: Rate32(7) };
         assert_eq!(value.param_count(), 2);
@@ -840,6 +945,16 @@ mod tests {
     fn test_from_params_reports_insufficient_params_for_vec() {
         let structure = vec![Placeholder, Placeholder, Placeholder];
         let result = <Vec<i32> as Parameterized<i32>>::from_params(structure, vec![1, 2]);
+        assert_eq!(result, Err(Error::InsufficientParams { expected_count: 3 }));
+    }
+
+    #[test]
+    fn test_from_params_reports_insufficient_params_for_hash_map() {
+        let mut structure = HashMap::new();
+        structure.insert("left", Placeholder);
+        structure.insert("right", Placeholder);
+        structure.insert("middle", Placeholder);
+        let result = <HashMap<&str, i32> as Parameterized<i32>>::from_params(structure, vec![1, 2]);
         assert_eq!(result, Err(Error::InsufficientParams { expected_count: 3 }));
     }
 }
