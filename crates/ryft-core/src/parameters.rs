@@ -8,7 +8,12 @@ use paste::paste;
 
 use crate::errors::Error;
 
-// TODO(eaplatanios): Add support for `named_parameters` which pairs each parameter with a path.
+// TODO(eaplatanios): Add support for `named_params` which pairs each parameter with a path based on field names, tuple
+//  indices, vec indices, array indices, map keys, enum variants, etc. There should also be a `named_params_mut` and
+//  an `into_named_params` function, similar to the existing parameter iterators. Furthermore, there should be a
+//  `from_named_params` function, analogous to the current `from_params` function. Once that is added, the derive
+//  macro for `Parameterized` should also be updated to support named parameters.
+
 // TODO(eaplatanios): Support something like a `broadcast` operation (e.g., I want to use the same learning rate
 //  for every sub-node from a specific point in the data structure). This is along the lines of what are called
 //  PyTree prefixes in JAX. Related: https://jax.readthedocs.io/en/latest/pytrees.html#applying-optional-parameters-to-pytrees.
