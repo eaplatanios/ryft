@@ -18,4 +18,10 @@ pub enum Error {
 
     #[error("Named parameter path mismatch. Expected '{expected_path}' but got '{actual_path}'.")]
     NamedParamPathMismatch { expected_path: String, actual_path: String },
+
+    #[error("Missing prefix for parameter path '{path}'.")]
+    MissingPrefixForPath { path: String },
+
+    #[error("Unused prefix path '{path}'.")]
+    UnusedPrefixPath { path: String },
 }

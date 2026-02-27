@@ -9,9 +9,6 @@ use paste::paste;
 
 use crate::errors::Error;
 
-// TODO(eaplatanios): Support something like a `broadcast` operation (e.g., I want to use the same learning rate
-//  for every sub-node from a specific point in the data structure). This is along the lines of what are called
-//  PyTree prefixes in JAX. Related: https://jax.readthedocs.io/en/latest/pytrees.html#applying-optional-parameters-to-pytrees.
 // TODO(eaplatanios): Borrow some of Equinox's tree manipulation capabilities.
 //  Reference: https://docs.kidger.site/equinox/api/manipulation.
 
@@ -134,15 +131,68 @@ impl ParameterPath {
         self.segments.is_empty()
     }
 
-    /// Returns an iterator over the [`ParameterPathSegment`]s in this [`ParameterPath`] in root-to-leaf order.
-    pub fn segments(&self) -> impl DoubleEndedIterator<Item = &ParameterPathSegment> + '_ {
-        self.segments.iter().rev()
+    /// Returns a new [`ParameterPath`] with `name` appended as a [`ParameterPathSegment::Field`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::ParameterPath;
+    /// let path = ParameterPath::root()
+    ///     .with_field("weights")
+    ///     .with_index(1)
+    ///     .with_tuple_index(0);
+    /// assert_eq!(path.to_string(), ".weights[1].0");
+    /// ```
+    pub fn with_field(self, name: &'static str) -> Self {
+        self.with_appended_segment(ParameterPathSegment::Field(name))
+    }
+
+    /// Returns a new [`ParameterPath`] with `name` appended as a [`ParameterPathSegment::Variant`].
+    pub fn with_variant(self, name: &'static str) -> Self {
+        self.with_appended_segment(ParameterPathSegment::Variant(name))
+    }
+
+    /// Returns a new [`ParameterPath`] with `index` appended as a [`ParameterPathSegment::TupleIndex`].
+    pub fn with_tuple_index(self, index: usize) -> Self {
+        self.with_appended_segment(ParameterPathSegment::TupleIndex(index))
+    }
+
+    /// Returns a new [`ParameterPath`] with `index` appended as a [`ParameterPathSegment::Index`].
+    pub fn with_index(self, index: usize) -> Self {
+        self.with_appended_segment(ParameterPathSegment::Index(index))
+    }
+
+    /// Returns a new [`ParameterPath`] with `key` appended as a [`ParameterPathSegment::Key`].
+    pub fn with_key<K: Debug>(self, key: K) -> Self {
+        self.with_appended_segment(ParameterPathSegment::Key(format!("{key:?}")))
     }
 
     /// Returns a new [`ParameterPath`] with the provided [`ParameterPathSegment`] appended to it.
     fn with_segment(mut self, segment: ParameterPathSegment) -> Self {
         self.segments.push(segment);
         self
+    }
+
+    fn with_appended_segment(mut self, segment: ParameterPathSegment) -> Self {
+        self.segments.insert(0, segment);
+        self
+    }
+
+    fn depth(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns `true` if this [`ParameterPath`] is a root-prefix of `other`.
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
+        if self.depth() > other.depth() {
+            return false;
+        }
+        self.segments().zip(other.segments()).all(|(left, right)| left == right)
+    }
+
+    /// Returns an iterator over the [`ParameterPathSegment`]s in this [`ParameterPath`] in root-to-leaf order.
+    pub fn segments(&self) -> impl DoubleEndedIterator<Item = &ParameterPathSegment> + '_ {
+        self.segments.iter().rev()
     }
 }
 
@@ -429,6 +479,70 @@ pub trait Parameterized<P: Parameter>: Sized {
             }
         }
         if params.is_empty() { Self::from_params(structure, values) } else { Err(Error::UnusedParams) }
+    }
+
+    /// Reconstructs a value from `structure` using named parameters interpreted as path prefixes.
+    ///
+    /// # Parameters
+    ///
+    ///   - `structure`: Parameter structure to reconstruct.
+    ///   - `params`: Map from path prefixes to parameter values.
+    ///
+    /// Prefixes are matched against leaf paths in `structure`, and each leaf receives the value of the most-specific
+    /// matching prefix (i.e., longest-prefix-wins). Returns [`Error::MissingPrefixForPath`] if any leaf path is not
+    /// covered by a provided prefix, and [`Error::UnusedPrefixPath`] if any provided prefix matches no leaf path.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use std::collections::HashMap;
+    /// # use ryft_core::parameters::{ParameterPath, Parameterized, Placeholder};
+    /// let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
+    /// let rebuilt = <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params_with_broadcasting(
+    ///     structure,
+    ///     HashMap::from([
+    ///         (ParameterPath::root(), 0),
+    ///         (ParameterPath::root().with_index(1).with_tuple_index(0), 7),
+    ///     ]),
+    /// )?;
+    /// assert_eq!(rebuilt, vec![(0, 0), (7, 0)]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
+    fn from_named_params_with_broadcasting(
+        structure: Self::ParamStructure,
+        params: HashMap<ParameterPath, P>,
+    ) -> Result<Self, Error>
+    where
+        P: Clone,
+    {
+        let leaf_paths = structure.named_params().map(|(path, _)| path).collect::<Vec<_>>();
+        let mut prefixes = params.into_iter().map(|(path, value)| (path, value, 0_usize)).collect::<Vec<_>>();
+        let mut expanded_params = HashMap::with_capacity(leaf_paths.len());
+        for leaf_path in leaf_paths {
+            let mut selected_prefix = None;
+            for (index, (prefix_path, _, _)) in prefixes.iter().enumerate() {
+                if prefix_path.is_prefix_of(&leaf_path) {
+                    let prefix_depth = prefix_path.depth();
+                    if selected_prefix.map(|(_, depth)| prefix_depth > depth).unwrap_or(true) {
+                        selected_prefix = Some((index, prefix_depth));
+                    }
+                }
+            }
+            let (selected_prefix_index, _) =
+                selected_prefix.ok_or_else(|| Error::MissingPrefixForPath { path: leaf_path.to_string() })?;
+            let (_, value, matched_count) = &mut prefixes[selected_prefix_index];
+            expanded_params.insert(leaf_path, value.clone());
+            *matched_count += 1;
+        }
+        let mut unused_prefix_paths = prefixes
+            .into_iter()
+            .filter_map(|(path, _, matched_count)| if matched_count == 0 { Some(path.to_string()) } else { None })
+            .collect::<Vec<_>>();
+        if !unused_prefix_paths.is_empty() {
+            unused_prefix_paths.sort_unstable();
+            return Err(Error::UnusedPrefixPath { path: unused_prefix_paths[0].clone() });
+        }
+        Self::from_named_params(structure, expanded_params)
     }
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
@@ -1459,6 +1573,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parameter_path_builder_helpers() {
+        let path = ParameterPath::root().with_variant("Pair").with_field("weights").with_index(1).with_tuple_index(0);
+        assert_eq!(path.to_string(), ".pair.weights[1].0");
+        assert!(ParameterPath::root().with_variant("Pair").is_prefix_of(&path));
+
+        let key_path = ParameterPath::root().with_key("left");
+        assert_eq!(key_path.to_string(), "[\"left\"]");
+    }
+
+    #[test]
     fn test_phantom_data_parameterized_impl() {
         assert_roundtrip_parameterized(PhantomData::<i32>, vec![]);
         assert_params_mut_increments(PhantomData::<i32>, vec![]);
@@ -1813,5 +1937,78 @@ mod tests {
             <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params(value.param_structure(), named_map),
             Ok(value)
         );
+    }
+
+    #[test]
+    fn test_from_named_params_with_broadcasting_root_prefix() {
+        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
+        let rebuilt = <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params_with_broadcasting(
+            structure,
+            HashMap::from([(ParameterPath::root(), 9)]),
+        );
+        assert_eq!(rebuilt, Ok(vec![(9, 9), (9, 9)]));
+    }
+
+    #[test]
+    fn test_from_named_params_with_broadcasting_uses_most_specific_prefix() {
+        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
+        let rebuilt = <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params_with_broadcasting(
+            structure,
+            HashMap::from([
+                (ParameterPath::root(), 1),
+                (ParameterPath::root().with_index(1), 10),
+                (ParameterPath::root().with_index(1).with_tuple_index(0), 99),
+            ]),
+        );
+        assert_eq!(rebuilt, Ok(vec![(1, 1), (99, 10)]));
+    }
+
+    #[test]
+    fn test_from_named_params_with_broadcasting_reports_missing_prefix() {
+        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
+        let result = <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params_with_broadcasting(
+            structure,
+            HashMap::from([(ParameterPath::root().with_index(0), 5)]),
+        );
+        assert_eq!(result, Err(Error::MissingPrefixForPath { path: "[1].0".to_string() }));
+    }
+
+    #[test]
+    fn test_from_named_params_with_broadcasting_reports_unused_prefix() {
+        let structure = vec![(Placeholder, Placeholder)];
+        let result = <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params_with_broadcasting(
+            structure,
+            HashMap::from([(ParameterPath::root(), 5), (ParameterPath::root().with_index(1), 10)]),
+        );
+        assert_eq!(result, Err(Error::UnusedPrefixPath { path: "[1]".to_string() }));
+    }
+
+    #[test]
+    fn test_from_named_params_with_broadcasting_matches_exact_named_behavior() {
+        let value = vec![(1, 2), (3, 4)];
+        let structure = value.param_structure();
+        let named_params = value.into_named_params().collect::<HashMap<_, _>>();
+        assert_eq!(
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params_with_broadcasting(structure, named_params),
+            Ok(vec![(1, 2), (3, 4)]),
+        );
+    }
+
+    #[test]
+    fn test_from_named_params_with_broadcasting_supports_hash_map_key_paths() {
+        let mut structure = HashMap::new();
+        structure.insert("left", (Placeholder, Placeholder));
+        structure.insert("right", (Placeholder, Placeholder));
+        let result = <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_params_with_broadcasting(
+            structure,
+            HashMap::from([
+                (ParameterPath::root().with_key("left"), 10),
+                (ParameterPath::root().with_key("right"), 30),
+                (ParameterPath::root().with_key("right").with_tuple_index(1), 20),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(result.get("left"), Some(&(10, 10)));
+        assert_eq!(result.get("right"), Some(&(30, 20)));
     }
 }
