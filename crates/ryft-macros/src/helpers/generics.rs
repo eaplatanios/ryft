@@ -58,13 +58,21 @@ pub trait GenericsHelpers: private::Sealed {
     /// of this [`syn::Generics`] instance.
     fn referenced_by_captured_param(&self, captured_param: &syn::CapturedParam) -> bool;
 
-    // TODO(eaplatanios): Document this. Mention that it does not check if that lifetime param already exists.
+    /// Returns a copy of this [`syn::Generics`] with `lifetime` added as a bound to the generic parameter named
+    /// `param` and with `lifetime` appended as a new lifetime generic parameter. If `param` identifies a lifetime
+    /// parameter, `lifetime` is appended to that lifetime's bounds. If `param` identifies a type parameter, `lifetime`
+    /// is appended as a [`syn::TypeParamBound::Lifetime`] bound. This function does not check whether a lifetime
+    /// parameter with the same identifier as `lifetime` already exists in this [`syn::Generics`] instance.
     fn with_lifetime(&self, lifetime: &syn::Lifetime, param: &syn::Ident) -> Self;
 
-    // TODO(eaplatanios): Document this. Mention that it does not check if the new param name already exists.
+    /// Returns a copy of this [`syn::Generics`] where all references to `old_name` are renamed to `new_name`. This
+    /// function rewrites identifiers in generic parameter declarations and where predicates, but it does not check
+    /// whether a generic parameter named `new_name` already exists.
     fn with_renamed_param(&self, old_name: &syn::Ident, new_name: &syn::Ident) -> Self;
 
-    // TODO(eaplatanios): Document this.
+    /// Returns a copy of this [`syn::Generics`] where the generic parameter named `param` is removed and all references
+    /// to it are replaced with `replacement`. This is useful when specializing one generic parameter to a concrete path
+    /// while preserving the remaining generic parameter list and where-clause structure.
     fn with_concrete_param(&self, param: &syn::Ident, replacement: &syn::Path) -> Self;
 
     /// Returns a copy of this [`syn::Generics`] instance with the provided [`syn::TypeParamBound`]s added for each

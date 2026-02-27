@@ -9,8 +9,6 @@ use paste::paste;
 
 use crate::errors::Error;
 
-// TODO(eaplatanios): Address all TODOs in the `ryft-macros` crate.
-
 /// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].
 /// A type `X` implements [`SameAs<Y>`] only when `X` and `Y` are the exact same type.
 pub trait SameAs<T> {}
