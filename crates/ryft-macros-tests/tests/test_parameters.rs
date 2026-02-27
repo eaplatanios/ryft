@@ -3,8 +3,8 @@ use std::ops::{Add, Mul};
 
 use ryft::{Parameter, Parameterized, Placeholder};
 
-/// Helper for asserting that a [`Parameterized`] type has a specific [`Parameterized::ParamStructure`] type.
-fn assert_param_structure_type<P: Parameter, T: Parameterized<P, ParamStructure = S>, S>() {}
+/// Helper for asserting that a [`Parameterized`] type has a specific [`Parameterized::ParameterStructure`] type.
+fn assert_parameter_structure_type<P: Parameter, T: Parameterized<P, ParameterStructure = S>, S>() {}
 
 #[test]
 fn test_simple_struct() {
@@ -20,22 +20,22 @@ fn test_simple_struct() {
     let np_1 = 42u64;
     let mut value = Struct { p_0: 4usize, p_1: 2usize, np_0, np_1 };
     let structure = Struct { p_0: Placeholder, p_1: Placeholder, np_0, np_1 };
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 2 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 2 });
 
-    assert_param_structure_type::<usize, Struct<usize>, Struct<Placeholder>>();
-    assert_eq!(value.param_count(), 2);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 2usize]);
-    assert_eq!(Struct::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_parameter_structure_type::<usize, Struct<usize>, Struct<Placeholder>>();
+    assert_eq!(value.parameter_count(), 2);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &2usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize]);
+    assert_eq!(Struct::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
-        Struct::from_params(structure.clone(), vec![4i64, 2i64]),
+        Struct::from_parameters(structure.clone(), vec![4i64, 2i64]),
         Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 })
     );
-    assert_eq!(Struct::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 
-    value.params_mut().for_each(|param| *param *= 2);
+    value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, Struct { p_0: 8usize, p_1: 4usize, np_0, np_1 })
 }
 
@@ -49,17 +49,20 @@ fn test_tuple_struct() {
     let np_1 = 42u64;
     let mut value = TupleStruct(4usize, 2usize, np_0, np_1);
     let structure = TupleStruct(Placeholder, Placeholder, np_0, np_1);
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 2 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 2 });
 
-    assert_param_structure_type::<usize, TupleStruct<usize>, TupleStruct<Placeholder>>();
-    assert_eq!(value.param_count(), 2);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 2usize]);
-    assert_eq!(TupleStruct::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
-    assert_eq!(TupleStruct::from_params(structure.clone(), vec![4i64, 2i64]), Ok(TupleStruct(4i64, 2i64, np_0, np_1)));
-    assert_eq!(TupleStruct::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_parameter_structure_type::<usize, TupleStruct<usize>, TupleStruct<Placeholder>>();
+    assert_eq!(value.parameter_count(), 2);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &2usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize]);
+    assert_eq!(TupleStruct::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
+    assert_eq!(
+        TupleStruct::from_parameters(structure.clone(), vec![4i64, 2i64]),
+        Ok(TupleStruct(4i64, 2i64, np_0, np_1))
+    );
+    assert_eq!(TupleStruct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -81,19 +84,22 @@ fn test_struct_with_nested_tuples() {
         np_0,
         np_1,
     };
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 3 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 3 });
 
-    assert_eq!(value.param_count(), 3);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize, &0usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize, &mut 0usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 2usize, 0usize]);
-    assert_eq!(StructWithNestedTuples::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_eq!(value.parameter_count(), 3);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &2usize, &0usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize, &mut 0usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize, 0usize]);
     assert_eq!(
-        StructWithNestedTuples::from_params(structure.clone(), vec![4i64, 2i64, 0i64]),
+        StructWithNestedTuples::from_parameters(structure.clone(), Vec::<usize>::new()),
+        insufficient_parameters_error
+    );
+    assert_eq!(
+        StructWithNestedTuples::from_parameters(structure.clone(), vec![4i64, 2i64, 0i64]),
         Ok(StructWithNestedTuples { p_0: 4i64, p_1: (0usize, (-1i32, 2i64, -42i64, 0i64)), np_0, np_1 })
     );
-    assert_eq!(StructWithNestedTuples::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(StructWithNestedTuples::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -131,16 +137,19 @@ fn test_struct_with_nested_struct() {
         np_0,
         np_1,
     };
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 4 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 4 });
 
-    assert_eq!(value.param_count(), 4);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize, &4usize, &2usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize, &mut 4usize, &mut 2usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 2usize, 4usize, 2usize]);
-    assert_eq!(StructWithNestedStruct::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_eq!(value.parameter_count(), 4);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &2usize, &4usize, &2usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize, &mut 4usize, &mut 2usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize, 4usize, 2usize]);
     assert_eq!(
-        StructWithNestedStruct::from_params(structure.clone(), vec![-4i64, -2i64, 4i64, 2i64]),
+        StructWithNestedStruct::from_parameters(structure.clone(), Vec::<usize>::new()),
+        insufficient_parameters_error
+    );
+    assert_eq!(
+        StructWithNestedStruct::from_parameters(structure.clone(), vec![-4i64, -2i64, 4i64, 2i64]),
         Ok(StructWithNestedStruct {
             p_0: -4i64,
             p_1: (0usize, (-1i32, -2i64, -42i64, Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 })),
@@ -148,7 +157,7 @@ fn test_struct_with_nested_struct() {
             np_1,
         })
     );
-    assert_eq!(StructWithNestedStruct::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(StructWithNestedStruct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -161,16 +170,16 @@ fn test_empty_struct() {
     let mut value = EmptyStruct { _p: PhantomData::<usize> };
     let structure = EmptyStruct { _p: PhantomData::<Placeholder> };
 
-    assert_eq!(value.param_count(), 0);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), Vec::<&usize>::new());
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(value.parameter_count(), 0);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(
-        EmptyStruct::from_params(structure.clone(), Vec::<i64>::new()),
+        EmptyStruct::from_parameters(structure.clone(), Vec::<i64>::new()),
         Ok(EmptyStruct { _p: PhantomData::<i64> })
     );
-    assert_eq!(EmptyStruct::from_params(structure, vec![4i64, 2i64]), Err(ryft::Error::UnusedParams));
+    assert_eq!(EmptyStruct::from_parameters(structure, vec![4i64, 2i64]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -187,16 +196,16 @@ fn test_non_empty_struct_with_no_parameters() {
     let mut value = NonEmptyStruct { np_0, np_1, _p: PhantomData::<usize> };
     let structure = NonEmptyStruct { np_0, np_1, _p: PhantomData::<Placeholder> };
 
-    assert_eq!(value.param_count(), 0);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), Vec::<&usize>::new());
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(value.parameter_count(), 0);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(
-        NonEmptyStruct::from_params(structure.clone(), Vec::<i64>::new()),
+        NonEmptyStruct::from_parameters(structure.clone(), Vec::<i64>::new()),
         Ok(NonEmptyStruct { np_0, np_1, _p: PhantomData::<i64> })
     );
-    assert_eq!(NonEmptyStruct::from_params(structure, vec![4usize, 2usize]), Err(ryft::Error::UnusedParams));
+    assert_eq!(NonEmptyStruct::from_parameters(structure, vec![4usize, 2usize]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -209,16 +218,19 @@ fn test_struct_with_lifetime() {
 
     let mut value = Struct1 { x: 4usize, y: ("hey there", 42usize) };
     let structure = Struct1 { x: Placeholder, y: ("hey there", 42usize) };
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 1 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 1 });
 
-    assert_eq!(value.param_count(), 1);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize]);
-    assert_eq!(Struct1::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
-    assert_eq!(Struct1::from_params(structure.clone(), vec![4i64]), Ok(Struct1 { x: 4i64, y: ("hey there", 42usize) }));
-    assert_eq!(Struct1::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(value.parameter_count(), 1);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize]);
+    assert_eq!(Struct1::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
+    assert_eq!(
+        Struct1::from_parameters(structure.clone(), vec![4i64]),
+        Ok(Struct1 { x: 4i64, y: ("hey there", 42usize) })
+    );
+    assert_eq!(Struct1::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     struct Struct2<'p, V: Parameter> {
@@ -228,19 +240,19 @@ fn test_struct_with_lifetime() {
 
     let mut value = Struct2 { x: 4usize, y: ("hey there", 42usize) };
     let structure = Struct2 { x: Placeholder, y: ("hey there", Placeholder) };
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 2 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 2 });
 
-    assert_eq!(value.param_count(), 2);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &42usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 42usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 42usize]);
-    assert_eq!(Struct2::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_eq!(value.parameter_count(), 2);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &42usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 42usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 42usize]);
+    assert_eq!(Struct2::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
-        Struct2::from_params(structure.clone(), vec![4i64, 2i64]),
+        Struct2::from_parameters(structure.clone(), vec![4i64, 2i64]),
         Ok(Struct2 { x: 4i64, y: ("hey there", 2i64) })
     );
-    assert_eq!(Struct2::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(Struct2::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -255,46 +267,46 @@ fn test_simple_enum() {
     }
 
     let structure = Enum::<Placeholder>::Unit;
-    assert_eq!(structure.param_count(), 0);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
-    assert_eq!(Enum::from_params(structure.clone(), Vec::new()), Ok(structure));
+    assert_eq!(structure.parameter_count(), 0);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(Enum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 
     let structure = Enum::<Placeholder>::Empty();
-    assert_eq!(structure.param_count(), 0);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
-    assert_eq!(Enum::from_params(structure.clone(), Vec::new()), Ok(structure));
+    assert_eq!(structure.parameter_count(), 0);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(Enum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 
     let structure = Enum::Parameter0(Placeholder);
-    assert_eq!(structure.param_count(), 1);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), vec![&Placeholder]);
-    assert_eq!(Enum::from_params(structure.clone(), vec![42usize]), Ok(Enum::Parameter0(42usize)));
+    assert_eq!(structure.parameter_count(), 1);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder]);
+    assert_eq!(Enum::from_parameters(structure.clone(), vec![42usize]), Ok(Enum::Parameter0(42usize)));
 
     let mut value = Enum::Parameter1 { field_0: (0usize, -42i64, 4usize), field_1: 2usize };
     let structure = Enum::Parameter1 { field_0: (0usize, Placeholder, 4usize), field_1: 2usize };
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 1 });
-    let unused_params_error = Err(ryft::Error::UnusedParams);
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 1 });
+    let unused_parameters_error = Err(ryft::Error::UnusedParameters);
 
-    assert_param_structure_type::<usize, Enum<usize>, Enum<Placeholder>>();
-    assert_eq!(value.param_count(), 1);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&-42i64]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut -42i64]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![-42i64]);
-    assert_eq!(Enum::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_parameter_structure_type::<usize, Enum<usize>, Enum<Placeholder>>();
+    assert_eq!(value.parameter_count(), 1);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&-42i64]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut -42i64]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![-42i64]);
+    assert_eq!(Enum::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
-        Enum::from_params(structure.clone(), vec![42usize]),
+        Enum::from_parameters(structure.clone(), vec![42usize]),
         Ok(Enum::Parameter1 { field_0: (0usize, 42usize, 4usize), field_1: 2usize })
     );
-    assert_eq!(Enum::from_params(structure, [0usize; 10]), unused_params_error);
+    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), unused_parameters_error);
 
     let structure = Enum::<Placeholder>::NonParameter(4usize, 2usize);
-    assert_eq!(structure.param_count(), 0);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
-    assert_eq!(Enum::from_params(structure.clone(), Vec::new()), Ok(structure));
+    assert_eq!(structure.parameter_count(), 0);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(Enum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 }
 
 #[test]
@@ -307,16 +319,16 @@ fn test_empty_enum() {
     let mut value = EmptyEnum::Phantom(PhantomData::<usize>);
     let structure = EmptyEnum::Phantom(PhantomData::<Placeholder>);
 
-    assert_eq!(value.param_count(), 0);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), Vec::<&usize>::new());
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(value.parameter_count(), 0);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(
-        EmptyEnum::from_params(structure.clone(), Vec::<i64>::new()),
+        EmptyEnum::from_parameters(structure.clone(), Vec::<i64>::new()),
         Ok(EmptyEnum::Phantom(PhantomData::<i64>))
     );
-    assert_eq!(EmptyEnum::from_params(structure, vec![0usize, 1usize]), Err(ryft::Error::UnusedParams));
+    assert_eq!(EmptyEnum::from_parameters(structure, vec![0usize, 1usize]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -330,24 +342,24 @@ fn test_enum_with_lifetime() {
     let mut value = Enum::X(42usize);
     let structure = Enum::X(Placeholder);
 
-    assert_eq!(value.param_count(), 1);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&42usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 42usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![42usize]);
-    assert_eq!(Enum::from_params(structure.clone(), vec![42i32]), Ok(Enum::X(42i32)));
-    assert_eq!(Enum::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(value.parameter_count(), 1);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&42usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 42usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![42usize]);
+    assert_eq!(Enum::from_parameters(structure.clone(), vec![42i32]), Ok(Enum::X(42i32)));
+    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 
     let mut value = Enum::Y("hey there", 42usize);
     let structure = Enum::Y("hey there", 42usize);
 
-    assert_eq!(value.param_count(), 0);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), Vec::<&usize>::new());
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), Vec::<usize>::new());
-    assert_eq!(Enum::from_params(structure.clone(), Vec::<usize>::new()), Ok(value));
-    assert_eq!(Enum::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(value.parameter_count(), 0);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(Enum::from_parameters(structure.clone(), Vec::<usize>::new()), Ok(value));
+    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]
@@ -385,32 +397,32 @@ fn test_complex_type() {
     struct StructWithEnum<P: Parameter>(Enum<P>);
 
     let structure = StructWithEnum::<Placeholder>(Enum::Nada);
-    assert_eq!(structure.param_count(), 0);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
-    assert_eq!(StructWithEnum::from_params(structure.clone(), Vec::new()), Ok(structure));
+    assert_eq!(structure.parameter_count(), 0);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(StructWithEnum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 
     let structure = StructWithEnum::<Placeholder>(Enum::NadaUnit());
-    assert_eq!(structure.param_count(), 0);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
-    assert_eq!(StructWithEnum::from_params(structure.clone(), Vec::new()), Ok(structure));
+    assert_eq!(structure.parameter_count(), 0);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(StructWithEnum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 
     let structure = StructWithEnum(Enum::Parameter(Placeholder));
-    assert_eq!(structure.param_count(), 1);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), vec![&Placeholder]);
+    assert_eq!(structure.parameter_count(), 1);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder]);
     assert_eq!(
-        StructWithEnum::from_params(structure.clone(), vec![42usize]),
+        StructWithEnum::from_parameters(structure.clone(), vec![42usize]),
         Ok(StructWithEnum(Enum::Parameter(42usize)))
     );
 
     let structure = StructWithEnum(Enum::ParameterTuple(Placeholder, Placeholder));
-    assert_eq!(structure.param_count(), 2);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), vec![&Placeholder, &Placeholder]);
+    assert_eq!(structure.parameter_count(), 2);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder, &Placeholder]);
     assert_eq!(
-        StructWithEnum::from_params(structure.clone(), vec![4usize, 2usize]),
+        StructWithEnum::from_parameters(structure.clone(), vec![4usize, 2usize]),
         Ok(StructWithEnum(Enum::ParameterTuple(4usize, 2usize)))
     );
 
@@ -434,11 +446,11 @@ fn test_complex_type() {
         more_stuff: (nested_struct_structure.clone(), Placeholder),
     });
 
-    assert_eq!(structure.param_count(), 5);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), vec![&Placeholder; 5]);
+    assert_eq!(structure.parameter_count(), 5);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder; 5]);
     assert_eq!(
-        StructWithEnum::from_params(structure.clone(), vec![0i32, 1i32, -42i32, -2i32, 0i32]),
+        StructWithEnum::from_parameters(structure.clone(), vec![0i32, 1i32, -42i32, -2i32, 0i32]),
         Ok(StructWithEnum(Enum::Stuff {
             stuff: vec![],
             more_stuff: (
@@ -472,11 +484,11 @@ fn test_complex_type() {
         more_stuff: (nested_struct_structure.clone(), Placeholder),
     });
 
-    assert_eq!(structure.param_count(), 8);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), vec![&Placeholder; 8]);
+    assert_eq!(structure.parameter_count(), 8);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder; 8]);
     assert_eq!(
-        StructWithEnum::from_params(structure.clone(), vec![-1i32, -2i32, -3i32, 0i32, 1i32, -42i32, -2i32, 0i32]),
+        StructWithEnum::from_parameters(structure.clone(), vec![-1i32, -2i32, -3i32, 0i32, 1i32, -42i32, -2i32, 0i32]),
         Ok(StructWithEnum(Enum::Stuff {
             stuff: vec![-1i32, -2i32, -3i32],
             more_stuff: (
@@ -506,11 +518,11 @@ fn test_complex_type() {
     );
 
     let structure = StructWithEnum::<Placeholder>(Enum::StructWithNestedStruct(nested_struct_structure, 42usize));
-    assert_eq!(structure.param_count(), 4);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), vec![&Placeholder; 4]);
+    assert_eq!(structure.parameter_count(), 4);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder; 4]);
     assert_eq!(
-        StructWithEnum::from_params(structure.clone(), vec![0i32, 1i32, -42i32, -2i32]),
+        StructWithEnum::from_parameters(structure.clone(), vec![0i32, 1i32, -42i32, -2i32]),
         Ok(StructWithEnum(Enum::StructWithNestedStruct(
             StructWithNestedStruct {
                 p_0: 0i32,
@@ -537,10 +549,10 @@ fn test_complex_type() {
     );
 
     let structure = StructWithEnum::<Placeholder>(Enum::Irrelevant(42i64));
-    assert_eq!(structure.param_count(), 0);
-    assert_eq!(structure.param_structure(), structure);
-    assert_eq!(structure.params().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
-    assert_eq!(StructWithEnum::from_params(structure.clone(), Vec::new()), Ok(structure));
+    assert_eq!(structure.parameter_count(), 0);
+    assert_eq!(structure.parameter_structure(), structure);
+    assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(StructWithEnum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 }
 
 #[test]
@@ -550,37 +562,37 @@ fn test_nested_vec() {
 
     let mut value = VecWrapper(vec![4usize, 2usize]);
     let structure = VecWrapper(vec![Placeholder, Placeholder]);
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 2 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 2 });
 
-    assert_eq!(value.param_count(), 2);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 2usize]);
-    assert_eq!(VecWrapper::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
-    assert_eq!(VecWrapper::from_params(structure.clone(), vec![4i64, 2i64]), Ok(VecWrapper(vec![4i64, 2i64])));
-    assert_eq!(VecWrapper::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(value.parameter_count(), 2);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &2usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize]);
+    assert_eq!(VecWrapper::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
+    assert_eq!(VecWrapper::from_parameters(structure.clone(), vec![4i64, 2i64]), Ok(VecWrapper(vec![4i64, 2i64])));
+    assert_eq!(VecWrapper::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     struct MultiVecWrapper<P: Parameter>(Vec<P>, usize, (Vec<P>, Vec<Vec<P>>));
 
     let mut value = MultiVecWrapper(vec![4usize, 2usize], 0usize, (Vec::new(), vec![vec![42usize]]));
     let structure = MultiVecWrapper(vec![Placeholder, Placeholder], 0usize, (Vec::new(), vec![vec![Placeholder]]));
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 3 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 3 });
 
-    assert_eq!(value.param_count(), 3);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize, &42usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize, &mut 42usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 2usize, 42usize]);
-    assert_eq!(MultiVecWrapper::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_eq!(value.parameter_count(), 3);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &2usize, &42usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize, &mut 42usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize, 42usize]);
+    assert_eq!(MultiVecWrapper::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
-        MultiVecWrapper::from_params(structure.clone(), vec![4i64, 2i64, 42i64]),
+        MultiVecWrapper::from_parameters(structure.clone(), vec![4i64, 2i64, 42i64]),
         Ok(MultiVecWrapper(vec![4i64, 2i64], 0usize, (Vec::new(), vec![vec![42i64]])))
     );
-    assert_eq!(MultiVecWrapper::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(MultiVecWrapper::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 
-    value.params_mut().for_each(|param| *param *= 2);
+    value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, MultiVecWrapper(vec![8usize, 4usize], 0usize, (Vec::new(), vec![vec![84usize]])));
 }
 
@@ -595,24 +607,27 @@ fn test_nested_vec_of_tuples() {
         0usize,
         (Vec::new(), vec![(vec![Placeholder], Placeholder)]),
     );
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 6 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 6 });
 
-    assert_eq!(value.param_count(), 6);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4i8, &2i8, &2i8, &1i8, &42i8, &0i8]);
+    assert_eq!(value.parameter_count(), 6);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4i8, &2i8, &2i8, &1i8, &42i8, &0i8]);
     assert_eq!(
-        value.params_mut().collect::<Vec<_>>(),
+        value.parameters_mut().collect::<Vec<_>>(),
         vec![&mut 4i8, &mut 2i8, &mut 2i8, &mut 1i8, &mut 42i8, &mut 0i8]
     );
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4i8, 2i8, 2i8, 1i8, 42i8, 0i8]);
-    assert_eq!(NestedVecOfTuples::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4i8, 2i8, 2i8, 1i8, 42i8, 0i8]);
     assert_eq!(
-        NestedVecOfTuples::from_params(structure.clone(), vec![4i64, 2i64, 2i64, 1i64, 42i64, 0i64]),
+        NestedVecOfTuples::from_parameters(structure.clone(), Vec::<usize>::new()),
+        insufficient_parameters_error
+    );
+    assert_eq!(
+        NestedVecOfTuples::from_parameters(structure.clone(), vec![4i64, 2i64, 2i64, 1i64, 42i64, 0i64]),
         Ok(NestedVecOfTuples(vec![(4i64, 2i64), (2i64, 1i64)], 0usize, (Vec::new(), vec![(vec![42i64], 0i64)])))
     );
-    assert_eq!(NestedVecOfTuples::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(NestedVecOfTuples::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 
-    value.params_mut().for_each(|param| *param *= 2);
+    value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, NestedVecOfTuples(vec![(8i8, 4i8), (4i8, 2i8)], 0usize, (Vec::new(), vec![(vec![84i8], 0i8)])));
 }
 
@@ -630,27 +645,27 @@ fn test_generics() {
     let np_1 = 42u64;
     let mut value = Struct { p_0: 4usize, p_1: 2usize, np_0, np_1 };
     let structure = Struct { p_0: Placeholder, p_1: Placeholder, np_0, np_1 };
-    let insufficient_params_error = Err(ryft::Error::InsufficientParams { expected_count: 2 });
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 2 });
 
-    assert_eq!(value.param_count(), 2);
-    assert_eq!(value.param_structure(), structure);
-    assert_eq!(value.params().collect::<Vec<_>>(), vec![&4usize, &2usize]);
-    assert_eq!(value.params_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
-    assert_eq!(value.clone().into_params().collect::<Vec<_>>(), vec![4usize, 2usize]);
-    assert_eq!(Struct::from_params(structure.clone(), Vec::<usize>::new()), insufficient_params_error);
+    assert_eq!(value.parameter_count(), 2);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&4usize, &2usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 4usize, &mut 2usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize]);
+    assert_eq!(Struct::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
-        Struct::from_params(structure.clone(), vec![4i64, 2i64]),
+        Struct::from_parameters(structure.clone(), vec![4i64, 2i64]),
         Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 })
     );
-    assert_eq!(Struct::from_params(structure, [0usize; 10]), Err(ryft::Error::UnusedParams));
+    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 
-    value.params_mut().for_each(|param| *param *= 2);
+    value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, Struct { p_0: 8usize, p_1: 4usize, np_0, np_1 })
 }
 
 #[test]
-fn test_map_params() {
-    // This test implements a toy forward-differentiation approach to test [Parameterized::map_params].
+fn test_map_parameters() {
+    // This test implements a toy forward-differentiation approach to test [Parameterized::map_parameters].
 
     #[derive(Parameter, Parameterized, Debug, Clone, PartialEq, Eq)]
     struct ValueWithTangent<P: Parameter> {
@@ -711,8 +726,8 @@ fn test_map_params() {
     let linear1 = Linear { weights: 4f64, bias: 2f64 };
     let linear2 = Linear { weights: -1f64, bias: -2f64 };
     let mlp = MLP { layers: [linear1, linear2] };
-    let mlp = mlp.map_params(|p| ValueWithTangent { primal: p, tangent: 1f64 }).unwrap();
-    let mlp = mlp.map_params(|p| ValueWithTangent { primal: p.clone(), tangent: p }).unwrap();
+    let mlp = mlp.map_parameters(|p| ValueWithTangent { primal: p, tangent: 1f64 }).unwrap();
+    let mlp = mlp.map_parameters(|p| ValueWithTangent { primal: p.clone(), tangent: p }).unwrap();
 
     assert_eq!(
         mlp.call(x.clone()),

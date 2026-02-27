@@ -92,9 +92,9 @@ pub trait GenericsHelpers: private::Sealed {
     ///
     /// Note that this function not only filters [`syn::Generics::params`], but it also filters
     /// [`syn::Generics::where_clause`] as needed. That is because if we remove a generic parameter that appears in the
-    /// where clauses but we do not remove the corresponding clauses, that will result in invalid generated code.
+    /// where clauses, but we do not remove the corresponding clauses, that will result in invalid generated code.
     ///
-    /// This function does not perform any checks on whether the removed parameters appears in any of the bounds of the
+    /// This function does not perform any checks on whether the removed parameters appear in any of the bounds of the
     /// remaining parameters. It is the caller's responsibility to ensure that the removal is correct and safe.
     fn without_params<'p, P: IntoIterator<Item = &'p syn::Ident>>(&self, params_to_remove: P) -> Self;
 }

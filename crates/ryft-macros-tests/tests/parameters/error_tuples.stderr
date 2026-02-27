@@ -71,7 +71,7 @@ note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedF
 note: required by a bound in `ryft::ParameterizedFamily::To`
  --> $WORKSPACE/crates/ryft-core/src/parameters.rs
   |
-  |     type To: Parameterized<P, Family = Self, ParamStructure = <Self as ParameterizedFamily<Placeholder>>::To>
+  |     type To: Parameterized<P, Family = Self, ParameterStructure = <Self as ParameterizedFamily<Placeholder>>::To>
   |          -- required by a bound in this associated type
   |     where
   |         Self: ParameterizedFamily<Placeholder>;
@@ -103,7 +103,7 @@ note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedF
 note: required by a bound in `ryft::Parameterized::To`
  --> $WORKSPACE/crates/ryft-core/src/parameters.rs
   |
-  |     type To<T: Parameter>: Parameterized<T, Family = Self::Family, ParamStructure = Self::ParamStructure>
+  |     type To<T: Parameter>: Parameterized<T, Family = Self::Family, ParameterStructure = Self::ParameterStructure>
   |          -- required by a bound in this associated type
 ...
   |         Self::Family: ParameterizedFamily<T>;

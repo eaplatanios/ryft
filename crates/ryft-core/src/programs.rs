@@ -566,8 +566,8 @@ impl<T> ProgramType<T> {
 //  about the input and output structures?
 pub struct ParameterizedProgram<T, V: Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     pub program: Program<T, V, O>,
-    pub input_structure: Input::ParamStructure,
-    pub output_structure: Output::ParamStructure,
+    pub input_structure: Input::ParameterStructure,
+    pub output_structure: Output::ParameterStructure,
 }
 
 impl<T, V: Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>>
@@ -575,8 +575,8 @@ impl<T, V: Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>>
 {
     pub fn new(
         program: Program<T, V, O>,
-        input_structure: Input::ParamStructure,
-        output_structure: Output::ParamStructure,
+        input_structure: Input::ParameterStructure,
+        output_structure: Output::ParameterStructure,
     ) -> Self {
         Self { program, input_structure, output_structure }
     }
@@ -586,12 +586,12 @@ impl<T, V: Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>>
         T: Clone + Debug + Type,
         V: ToOwned<Owned = V> + Typed<T> + Parameter,
         O: InterpretableOp<T, V> + Debug,
-        Output::ParamStructure: Clone,
+        Output::ParameterStructure: Clone,
     {
-        let input = input.params().collect::<Vec<_>>();
+        let input = input.parameters().collect::<Vec<_>>();
         let output = self.program.interpret(input.as_slice())?;
         // TODO(eaplatanios): Do not force `unwrap` below.
-        Ok(Output::from_params(self.output_structure.clone(), output).unwrap())
+        Ok(Output::from_parameters(self.output_structure.clone(), output).unwrap())
     }
 }
 
