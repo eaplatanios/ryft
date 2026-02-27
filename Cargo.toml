@@ -32,6 +32,7 @@ ryft-pjrt = { path = "crates/ryft-pjrt", version = "0.0.1", default-features = f
 ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.1", default-features = false }
 anyhow = "1.0.102"
 bindgen = "0.72.1"
+convert_case = "0.11.0"
 dirs = "6.0.0"
 dyn-clone = "1.0.20"
 flate2 = "1.1.9"

@@ -3,16 +3,11 @@ use std::fmt::{Debug, Display};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
+use convert_case::{Case, Casing};
 use half::{bf16, f16};
 use paste::paste;
 
 use crate::errors::Error;
-
-// TODO(eaplatanios): Add support for `named_params` which pairs each parameter with a path based on field names, tuple
-//  indices, vec indices, array indices, map keys, enum variants, etc. There should also be a `named_params_mut` and
-//  an `into_named_params` function, similar to the existing parameter iterators. Furthermore, there should be a
-//  `from_named_params` function, analogous to the current `from_params` function. Once that is added, the derive
-//  macro for `Parameterized` should also be updated to support named parameters.
 
 // TODO(eaplatanios): Support something like a `broadcast` operation (e.g., I want to use the same learning rate
 //  for every sub-node from a specific point in the data structure). This is along the lines of what are called
@@ -77,6 +72,95 @@ impl Debug for Placeholder {
 
 impl Parameter for Placeholder {}
 
+/// Segment in a [`ParameterPath`]. [`Parameterized::named_params`], [`Parameterized::named_params_mut`],
+/// and [`Parameterized::into_named_params`] produce paths that are made out of [`ParameterPathSegment`]s.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ParameterPathSegment {
+    /// Field in a struct.
+    Field(&'static str),
+
+    /// Variant of an enum.
+    Variant(&'static str),
+
+    /// Index/position in a tuple.
+    TupleIndex(usize),
+
+    /// Index/position in indexable containers (e.g., arrays and [`Vec`]).
+    Index(usize),
+
+    /// [`Debug`]-formatted key of a [`HashMap`] entry.
+    Key(String),
+}
+
+impl Display for ParameterPathSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParameterPathSegment::Field(name) => write!(f, ".{name}"),
+            ParameterPathSegment::Variant(name) => write!(f, ".{}", name.to_case(Case::Snake)),
+            ParameterPathSegment::TupleIndex(index) => write!(f, ".{index}"),
+            ParameterPathSegment::Index(index) => write!(f, "[{index}]"),
+            ParameterPathSegment::Key(key) => write!(f, "[{key}]"),
+        }
+    }
+}
+
+/// Path to a [`Parameter`] nested inside a [`Parameterized`] type instance, composed of [`ParameterPathSegment`]s.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+///
+/// let value = vec![(1_i32, 2_i32)];
+/// let paths = value.param_paths().map(|path| path.to_string()).collect::<Vec<_>>();
+/// assert_eq!(paths, vec!["[0].0", "[0].1"]);
+/// ```
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ParameterPath {
+    /// [`ParameterPathSegment`]s stored in leaf-to-root (i.e., reverse) order so that parent containers can
+    /// append their [`ParameterPathSegment`] in `O(1)` time in functions like [`Parameterized::named_params`],
+    /// [`Parameterized::named_params_mut`], and [`Parameterized::into_named_params`].
+    segments: Vec<ParameterPathSegment>,
+}
+
+impl ParameterPath {
+    /// Creates a new empty/root [`ParameterPath`].
+    pub fn root() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if this [`ParameterPath`] is the root path (i.e., is empty).
+    pub fn is_root(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Returns an iterator over the [`ParameterPathSegment`]s in this [`ParameterPath`] in root-to-leaf order.
+    pub fn segments(&self) -> impl DoubleEndedIterator<Item = &ParameterPathSegment> + '_ {
+        self.segments.iter().rev()
+    }
+
+    /// Returns a new [`ParameterPath`] with the provided [`ParameterPathSegment`] appended to it.
+    fn with_segment(mut self, segment: ParameterPathSegment) -> Self {
+        self.segments.push(segment);
+        self
+    }
+}
+
+impl Display for ParameterPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for segment in self.segments() {
+            write!(f, "{segment}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Debug for ParameterPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ParameterPath[{self}]")
+    }
+}
+
 /// Type-level family that maps [`Parameter`] types nested in a type while preserving its overall
 /// structure. This is used internally by [`Parameterized`] and is based on the _type family_ approach described in
 /// [this blog post](https://smallcultfollowing.com/babysteps/blog/2016/11/03/associated-type-constructors-part-2-family-traits/).
@@ -110,10 +194,10 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 
 /// Recursively traversable data structure that contains nested [`Parameter`]s of type `P`. A [`Parameterized`] value
 /// can be thought of as consisting of two parts:
-/// 
+///
 ///  1. Its _structure_ which can be obtained via [`Self::param_structure`].
 ///  2. The _parameters_ nested within that structure, which can be obtained via [`Self::params`], [`Self::params_mut`],
-///     and [`Self::into_params`].
+///     [`Self::into_params`], [`Self::named_params`], [`Self::named_params_mut`], and [`Self::into_named_params`].
 ///
 /// Given a [`Self::ParamStructure`] and an ordered collection of [`Parameter`]s, of potentially a different type than
 /// `P`, new instances of this type can be constructed using [`Parameterized::from_params_with_remainder`]. Another way
@@ -135,7 +219,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// Flatten into leaves and structure:
 ///
 /// ```rust
-/// use ryft_core::parameters::{Parameterized, Placeholder};
+/// # use ryft_core::parameters::{Parameterized, Placeholder};
 ///
 /// let value = vec![(1.0_f32, 2.0_f32), (3.0_f32, 4.0_f32)];
 /// assert_eq!(value.params().copied().collect::<Vec<_>>(), vec![1.0, 2.0, 3.0, 4.0]);
@@ -145,7 +229,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// Rebuild the same structure with different parameter values:
 ///
 /// ```rust
-/// use ryft_core::parameters::{Parameterized, Placeholder};
+/// # use ryft_core::parameters::{Parameterized, Placeholder};
 ///
 /// let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
 /// let rebuilt = <Vec<(f32, f32)> as Parameterized<f32>>::from_params(
@@ -159,12 +243,29 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// Apply the same transformation to every leaf while preserving structure:
 ///
 /// ```rust
-/// use ryft_core::parameters::Parameterized;
+/// # use ryft_core::parameters::Parameterized;
 ///
 /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
 /// let shifted: Vec<(i64, i64)> = value.map_params(|v| i64::from(v) + 100)?;
 /// assert_eq!(shifted, vec![(101, 102), (103, 104)]);
 /// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// Inspect leaf values together with deterministic structural paths:
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+///
+/// let value = vec![(1_i32, 2_i32)];
+/// let named = value
+///     .named_params()
+///     .map(|(path, parameter)| (path.to_string(), *parameter))
+///     .collect::<Vec<_>>();
+///
+/// assert_eq!(
+///     named,
+///     vec![("[0].0".to_string(), 1), ("[0].1".to_string(), 2),],
+/// );
 /// ```
 ///
 /// For additional intuition and patterns, see JAX's docs on
@@ -177,8 +278,8 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// - [`PhantomData<P>`] implements [`Parameterized<P>`] and contributes zero parameters.
 /// - Tuples whose elements are all themselves [`Parameterized`] are supported for arities of 1 through 12.
 /// - Arrays (`[T; N]`) and [`Vec<T>`] are supported when `T: Parameterized<P>`.
-/// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + std::hash::Hash`,
-///   `S: std::hash::BuildHasher + Clone`, and `T: Parameterized<P>`.
+/// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + Debug + Hash`, `S: BuildHasher + Clone`,
+///   and `T: Parameterized<P>`.
 /// - [`Box<T>`] is intentionally not supported (see the coherence note below).
 ///
 /// # Coherence Note For `Box<T>`
@@ -232,6 +333,22 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// a concrete iterator type, potentially avoiding additional heap allocations and dynamic dispatch.
     type ParamIntoIterator<T: Parameter>: Iterator<Item = T>;
 
+    /// Iterator returned by [`Self::named_params`], borrowing the underlying [`Parameter`]s and pairing them with their
+    /// corresponding [`ParameterPath`]s.
+    type NamedParamIterator<'t, T: 't + Parameter>: 't + Iterator<Item = (ParameterPath, &'t T)>
+    where
+        Self: 't;
+
+    /// Iterator returned by [`Self::named_params_mut`], mutably borrowing the underlying [`Parameter`]s and pairing
+    /// them with their corresponding [`ParameterPath`]s.
+    type NamedParamIteratorMut<'t, T: 't + Parameter>: 't + Iterator<Item = (ParameterPath, &'t mut T)>
+    where
+        Self: 't;
+
+    /// Iterator returned by [`Self::into_named_params`], consuming `self` and returning the underlying [`Parameter`]s
+    /// together with their corresponding [`ParameterPath`]s.
+    type NamedParamIntoIterator<T: Parameter>: Iterator<Item = (ParameterPath, T)>;
+
     /// Returns the number of parameters in this [Parameterized] instance.
     fn param_count(&self) -> usize;
 
@@ -246,6 +363,26 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Consumes this value and returns an iterator over all parameters.
     fn into_params(self) -> Self::ParamIntoIterator<P>;
+
+    /// Returns an iterator over all parameters in this value paired with their structural paths.
+    fn named_params(&self) -> Self::NamedParamIterator<'_, P>;
+
+    /// Returns an iterator over mutable references to all parameters in this value paired with their structural paths.
+    fn named_params_mut(&mut self) -> Self::NamedParamIteratorMut<'_, P>;
+
+    /// Consumes this value and returns an iterator over all parameters paired with their structural paths.
+    fn into_named_params(self) -> Self::NamedParamIntoIterator<P>;
+
+    /// Returns an iterator over all structural paths to parameters in this value.
+    ///
+    /// Paths are returned in the same traversal order as [`named_params`](Self::named_params),
+    /// [`named_params_mut`](Self::named_params_mut), and [`into_named_params`](Self::into_named_params).
+    fn param_paths<'p>(&'p self) -> impl 'p + Iterator<Item = ParameterPath>
+    where
+        P: 'p,
+    {
+        self.named_params().map(|(path, _)| path)
+    }
 
     /// Reconstructs a value from `structure`, consuming parameters from `params` and leaving any remainder untouched.
     fn from_params_with_remainder<I: Iterator<Item = P>>(
@@ -262,14 +399,85 @@ pub trait Parameterized<P: Parameter>: Sized {
         params.next().map(|_| Err(Error::UnusedParams)).unwrap_or_else(|| Ok(parameterized))
     }
 
+    /// Reconstructs a value from `structure` using all provided named parameters.
+    ///
+    /// # Parameters
+    ///
+    ///   - `structure`: Parameter structure to reconstruct.
+    ///   - `params`: Map from parameter paths to parameter values.
+    ///
+    /// The map is consumed and path order is not considered. Returns [`Error::InsufficientParams`] when fewer than
+    /// `structure.param_count()` expected parameters are provided, [`Error::NamedParamPathMismatch`] if a required
+    /// path is missing while other paths remain, and [`Error::UnusedParams`] if extra paths remain after reconstruction.
+    fn from_named_params(
+        structure: Self::ParamStructure,
+        mut params: HashMap<ParameterPath, P>,
+    ) -> Result<Self, Error> {
+        let expected_count = structure.param_count();
+        let mut values = Vec::with_capacity(expected_count);
+        for (expected_path, _) in structure.named_params() {
+            match params.remove(&expected_path) {
+                Some(parameter) => values.push(parameter),
+                None if params.is_empty() => return Err(Error::InsufficientParams { expected_count }),
+                None => {
+                    let actual_path = params.keys().next().map(ToString::to_string).unwrap_or_default();
+                    return Err(Error::NamedParamPathMismatch {
+                        expected_path: expected_path.to_string(),
+                        actual_path,
+                    });
+                }
+            }
+        }
+        if params.is_empty() { Self::from_params(structure, values) } else { Err(Error::UnusedParams) }
+    }
+
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
     /// `T`, while preserving the [`Parameterized`] tree structure of this type. Nested parameters are visited in the
-    /// same order as [`Self::params`], [`Self::params_mut`], and [`Self::into_params`].
+    /// same order as [`Self::params`], [`Self::params_mut`], [`Self::into_params`], and their named counterparts.
     fn map_params<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, Error>
     where
         Self::Family: ParameterizedFamily<T>,
     {
         Self::To::<T>::from_params(self.param_structure(), self.into_params().map(map_fn))
+    }
+
+    /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn`, which receives the
+    /// [`ParameterPath`] for each [`Parameter`] along with its value, and returns a new [`Parameter`] value of type
+    /// `T`, while preserving the [`Parameterized`] tree structure of this type. Nested parameters are visited in the
+    /// same order as [`Self::params`], [`Self::params_mut`], [`Self::into_params`], and their named counterparts.
+    fn map_named_params<T: Parameter, F: FnMut(&ParameterPath, P) -> T>(self, map_fn: F) -> Result<Self::To<T>, Error>
+    where
+        Self::Family: ParameterizedFamily<T>,
+    {
+        let mut map_fn = map_fn;
+        let structure = self.param_structure();
+        let mut mapped_params = HashMap::with_capacity(structure.param_count());
+        for (path, parameter) in self.into_named_params() {
+            let mapped_parameter = map_fn(&path, parameter);
+            mapped_params.insert(path, mapped_parameter);
+        }
+        Self::To::<T>::from_named_params(structure, mapped_params)
+    }
+}
+
+/// Iterator adapter that prefixes each yielded [`ParameterPath`] with [`Self::segment`]. This exists as a dedicated
+/// type (instead of using only standard [`Iterator`] combinators) because many [`Parameterized`] associated iterator
+/// types must be named concrete types. A closure-based `map(move |...| ...)` adapter would capture the prefix segment
+/// and produce an unnameable closure type, which is not usable directly in those associated type definitions on stable
+/// Rust. [`PathPrefixedParamIterator`] preserves static dispatch and avoids heap allocation and dynamic dispatch.
+pub struct PathPrefixedParamIterator<P, I: Iterator<Item = (ParameterPath, P)>> {
+    /// Underlying [`Iterator`] that yields `(path, value)` pairs before prefixing with [`Self::segment`].
+    pub iterator: I,
+
+    /// [`ParameterPathSegment`] to prepend to each path produced by [`Self::iterator`].
+    pub segment: ParameterPathSegment,
+}
+
+impl<P, I: Iterator<Item = (ParameterPath, P)>> Iterator for PathPrefixedParamIterator<P, I> {
+    type Item = (ParameterPath, P);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iterator.next().map(|(path, parameter)| (path.with_segment(self.segment.clone()), parameter))
     }
 }
 
@@ -302,6 +510,18 @@ impl<P: Parameter> Parameterized<P> for P {
 
     type ParamIntoIterator<T: Parameter> = std::iter::Once<T>;
 
+    type NamedParamIterator<'t, T: 't + Parameter>
+        = std::iter::Once<(ParameterPath, &'t T)>
+    where
+        Self: 't;
+
+    type NamedParamIteratorMut<'t, T: 't + Parameter>
+        = std::iter::Once<(ParameterPath, &'t mut T)>
+    where
+        Self: 't;
+
+    type NamedParamIntoIterator<T: Parameter> = std::iter::Once<(ParameterPath, T)>;
+
     fn param_count(&self) -> usize {
         1
     }
@@ -320,6 +540,18 @@ impl<P: Parameter> Parameterized<P> for P {
 
     fn into_params(self) -> Self::ParamIntoIterator<P> {
         std::iter::once(self)
+    }
+
+    fn named_params(&self) -> Self::NamedParamIterator<'_, P> {
+        std::iter::once((ParameterPath::root(), self))
+    }
+
+    fn named_params_mut(&mut self) -> Self::NamedParamIteratorMut<'_, P> {
+        std::iter::once((ParameterPath::root(), self))
+    }
+
+    fn into_named_params(self) -> Self::NamedParamIntoIterator<P> {
+        std::iter::once((ParameterPath::root(), self))
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
@@ -358,6 +590,18 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
 
     type ParamIntoIterator<T: Parameter> = std::iter::Empty<T>;
 
+    type NamedParamIterator<'t, T: 't + Parameter>
+        = std::iter::Empty<(ParameterPath, &'t T)>
+    where
+        Self: 't;
+
+    type NamedParamIteratorMut<'t, T: 't + Parameter>
+        = std::iter::Empty<(ParameterPath, &'t mut T)>
+    where
+        Self: 't;
+
+    type NamedParamIntoIterator<T: Parameter> = std::iter::Empty<(ParameterPath, T)>;
+
     fn param_count(&self) -> usize {
         0
     }
@@ -375,6 +619,18 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
     }
 
     fn into_params(self) -> Self::ParamIntoIterator<P> {
+        std::iter::empty()
+    }
+
+    fn named_params(&self) -> Self::NamedParamIterator<'_, P> {
+        std::iter::empty()
+    }
+
+    fn named_params_mut(&mut self) -> Self::NamedParamIteratorMut<'_, P> {
+        std::iter::empty()
+    }
+
+    fn into_named_params(self) -> Self::NamedParamIntoIterator<P> {
         std::iter::empty()
     }
 
@@ -415,27 +671,41 @@ tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10);
 tuple_parameterized_family_impl!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11);
 
 macro_rules! tuple_parameterized_impl {
-    ($($T:ident),*) => {
+    ($($T:ident:$index:tt),*) => {
         paste! {
-            impl<P: Parameter$(, $T: Parameterized<P>)*> Parameterized<P> for ($($T,)*)
-            {
+            impl<P: Parameter$(, $T: Parameterized<P>)*> Parameterized<P> for ($($T,)*) {
                 type Family = ($($T::Family,)*);
 
-                type To<T: Parameter> = <Self::Family as ParameterizedFamily<T>>::To
+                type To<T: Parameter>
+                    = <Self::Family as ParameterizedFamily<T>>::To
                 where
                     Self::Family: ParameterizedFamily<T>;
 
                 type ParamStructure = Self::To<Placeholder>;
 
-                type ParamIterator<'t, T: 't + Parameter> =
-                    tuple_param_iterator_ty!('t, T, ($($T,)*))
-                where Self: 't;
+                type ParamIterator<'t, T: 't + Parameter>
+                    = tuple_param_iterator_ty!('t, T, ($($T:$index,)*))
+                where
+                    Self: 't;
 
-                type ParamIteratorMut<'t, T: 't + Parameter> =
-                    tuple_param_iterator_mut_ty!('t, T, ($($T,)*))
-                where Self: 't;
+                type ParamIteratorMut<'t, T: 't + Parameter>
+                    = tuple_param_iterator_mut_ty!('t, T, ($($T:$index,)*))
+                where
+                    Self: 't;
 
-                type ParamIntoIterator<T: Parameter> = tuple_param_into_iterator_ty!(T, ($($T,)*));
+                type ParamIntoIterator<T: Parameter> = tuple_param_into_iterator_ty!(T, ($($T:$index,)*));
+
+                type NamedParamIterator<'t, T: 't + Parameter>
+                    = tuple_named_param_iterator_ty!('t, T, ($($T:$index,)*))
+                where
+                    Self: 't;
+
+                type NamedParamIteratorMut<'t, T: 't + Parameter>
+                    = tuple_named_param_iterator_mut_ty!('t, T, ($($T:$index,)*))
+                where
+                    Self: 't;
+
+                type NamedParamIntoIterator<T: Parameter> = tuple_named_param_into_iterator_ty!(T, ($($T:$index,)*));
 
                 fn param_count(&self) -> usize {
                     let ($([<$T:lower>],)*) = &self;
@@ -449,17 +719,32 @@ macro_rules! tuple_parameterized_impl {
 
                 fn params(&self) -> Self::ParamIterator<'_, P> {
                     let ($([<$T:lower>],)*) = self;
-                    tuple_param_iterator!(P, ($([<$T:lower>],)*))
+                    tuple_param_iterator!(P, ($([<$T:lower>]:$index,)*))
                 }
 
                 fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P> {
                     let ($([<$T:lower>],)*) = self;
-                    tuple_param_iterator_mut!(P, ($([<$T:lower>],)*))
+                    tuple_param_iterator_mut!(P, ($([<$T:lower>]:$index,)*))
                 }
 
                 fn into_params(self) -> Self::ParamIntoIterator<P> {
                     let ($([<$T:lower>],)*) = self;
-                    tuple_param_into_iterator!(P, ($([<$T:lower>],)*))
+                    tuple_param_into_iterator!(P, ($([<$T:lower>]:$index,)*))
+                }
+
+                fn named_params(&self) -> Self::NamedParamIterator<'_, P> {
+                    let ($([<$T:lower>],)*) = self;
+                    tuple_named_param_iterator!(P, ($([<$T:lower>]:$index,)*))
+                }
+
+                fn named_params_mut(&mut self) -> Self::NamedParamIteratorMut<'_, P> {
+                    let ($([<$T:lower>],)*) = self;
+                    tuple_named_param_iterator_mut!(P, ($([<$T:lower>]:$index,)*))
+                }
+
+                fn into_named_params(self) -> Self::NamedParamIntoIterator<P> {
+                    let ($([<$T:lower>],)*) = self;
+                    tuple_named_param_into_iterator!(P, ($([<$T:lower>]:$index,)*))
                 }
 
                 fn from_params_with_remainder<I: Iterator<Item = P>>(
@@ -480,8 +765,11 @@ macro_rules! tuple_param_iterator_ty {
         std::iter::Empty<&$t $T>
     };
 
-    ($t:lifetime, $T:ty, ($head:ident, $($tail:ident,)*)) => {
-        std::iter::Chain<$head::ParamIterator<$t, $T>, tuple_param_iterator_ty!($t, $T, ($($tail,)*))>
+    ($t:lifetime, $T:ty, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        std::iter::Chain<
+            $head::ParamIterator<$t, $T>,
+            tuple_param_iterator_ty!($t, $T, ($($tail:$tail_index,)*)),
+        >
     };
 }
 
@@ -490,8 +778,11 @@ macro_rules! tuple_param_iterator_mut_ty {
         std::iter::Empty<&$t mut $T>
     };
 
-    ($t:lifetime, $T:ty, ($head:ident, $($tail:ident,)*)) => {
-        std::iter::Chain<$head::ParamIteratorMut<$t, $T>, tuple_param_iterator_mut_ty!($t, $T, ($($tail,)*))>
+    ($t:lifetime, $T:ty, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        std::iter::Chain<
+            $head::ParamIteratorMut<$t, $T>,
+            tuple_param_iterator_mut_ty!($t, $T, ($($tail:$tail_index,)*)),
+        >
     };
 }
 
@@ -500,8 +791,50 @@ macro_rules! tuple_param_into_iterator_ty {
         std::iter::Empty<$T>
     };
 
-    ($T:ty, ($head:ident, $($tail:ident,)*)) => {
-        std::iter::Chain<$head::ParamIntoIterator<$T>, tuple_param_into_iterator_ty!($T, ($($tail,)*))>
+    ($T:ty, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        std::iter::Chain<
+            $head::ParamIntoIterator<$T>,
+            tuple_param_into_iterator_ty!($T, ($($tail:$tail_index,)*)),
+        >
+    };
+}
+
+macro_rules! tuple_named_param_iterator_ty {
+    ($t:lifetime, $T:ty, ()) => {
+        std::iter::Empty<(ParameterPath, &$t $T)>
+    };
+
+    ($t:lifetime, $T:ty, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        std::iter::Chain<
+            PathPrefixedParamIterator<&$t $T, $head::NamedParamIterator<$t, $T>>,
+            tuple_named_param_iterator_ty!($t, $T, ($($tail:$tail_index,)*)),
+        >
+    };
+}
+
+macro_rules! tuple_named_param_iterator_mut_ty {
+    ($t:lifetime, $T:ty, ()) => {
+        std::iter::Empty<(ParameterPath, &$t mut $T)>
+    };
+
+    ($t:lifetime, $T:ty, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        std::iter::Chain<
+            PathPrefixedParamIterator<&$t mut $T, $head::NamedParamIteratorMut<$t, $T>>,
+            tuple_named_param_iterator_mut_ty!($t, $T, ($($tail:$tail_index,)*)),
+        >
+    };
+}
+
+macro_rules! tuple_named_param_into_iterator_ty {
+    ($T:ty, ()) => {
+        std::iter::Empty<(ParameterPath, $T)>
+    };
+
+    ($T:ty, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        std::iter::Chain<
+            PathPrefixedParamIterator<$T, $head::NamedParamIntoIterator<$T>>,
+            tuple_named_param_into_iterator_ty!($T, ($($tail:$tail_index,)*)),
+        >
     };
 }
 
@@ -510,8 +843,8 @@ macro_rules! tuple_param_iterator {
         std::iter::empty::<&'_ $T>()
     };
 
-    ($T:tt, ($head:ident, $($tail:ident,)*)) => {
-        $head.params().chain(tuple_param_iterator!($T, ($($tail,)*)))
+    ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        $head.params().chain(tuple_param_iterator!($T, ($($tail:$tail_index,)*)))
     };
 }
 
@@ -520,8 +853,8 @@ macro_rules! tuple_param_iterator_mut {
         std::iter::empty::<&'_ mut $T>()
     };
 
-    ($T:tt, ($head:ident, $($tail:ident,)*)) => {
-        $head.params_mut().chain(tuple_param_iterator_mut!($T, ($($tail,)*)))
+    ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        $head.params_mut().chain(tuple_param_iterator_mut!($T, ($($tail:$tail_index,)*)))
     };
 }
 
@@ -530,23 +863,59 @@ macro_rules! tuple_param_into_iterator {
         std::iter::empty::<$T>()
     };
 
-    ($T:tt, ($head:ident, $($tail:ident,)*)) => {
-        $head.into_params().chain(tuple_param_into_iterator!($T, ($($tail,)*)))
+    ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {
+        $head.into_params().chain(tuple_param_into_iterator!($T, ($($tail:$tail_index,)*)))
     };
 }
 
-tuple_parameterized_impl!(T0);
-tuple_parameterized_impl!(T0, T1);
-tuple_parameterized_impl!(T0, T1, T2);
-tuple_parameterized_impl!(T0, T1, T2, T3);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
-tuple_parameterized_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
+macro_rules! tuple_named_param_iterator {
+    ($T:tt, ()) => {
+        std::iter::empty::<(ParameterPath, &'_ $T)>()
+    };
+
+    ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {{
+        let iterator = $head.named_params();
+        let iterator = PathPrefixedParamIterator { iterator, segment: ParameterPathSegment::TupleIndex($index) };
+        iterator.chain(tuple_named_param_iterator!($T, ($($tail:$tail_index,)*)))
+    }};
+}
+
+macro_rules! tuple_named_param_iterator_mut {
+    ($T:tt, ()) => {
+        std::iter::empty::<(ParameterPath, &'_ mut $T)>()
+    };
+
+    ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {{
+        let iterator = $head.named_params_mut();
+        let iterator = PathPrefixedParamIterator { iterator, segment: ParameterPathSegment::TupleIndex($index) };
+        iterator.chain(tuple_named_param_iterator_mut!($T, ($($tail:$tail_index,)*)))
+    }};
+}
+
+macro_rules! tuple_named_param_into_iterator {
+    ($T:tt, ()) => {
+        std::iter::empty::<(ParameterPath, $T)>()
+    };
+
+    ($T:tt, ($head:ident:$index:tt, $($tail:ident:$tail_index:tt,)*)) => {{
+        let iterator = $head.into_named_params();
+        let iterator = PathPrefixedParamIterator { iterator, segment: ParameterPathSegment::TupleIndex($index) };
+        iterator.chain(tuple_named_param_into_iterator!($T, ($($tail:$tail_index,)*)))
+    }};
+}
+
+tuple_parameterized_impl!(T0:0);
+tuple_parameterized_impl!(T0:0, T1:1);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10);
+tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11);
 
 pub struct ArrayParameterizedFamily<F, const N: usize>(PhantomData<F>);
 
@@ -590,6 +959,32 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
         fn(V) -> <V as Parameterized<P>>::ParamIntoIterator<T>,
     >;
 
+    type NamedParamIterator<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::iter::Enumerate<std::slice::Iter<'t, V>>,
+        PathPrefixedParamIterator<&'t T, <V as Parameterized<P>>::NamedParamIterator<'t, T>>,
+        fn((usize, &'t V)) -> PathPrefixedParamIterator<&'t T, <V as Parameterized<P>>::NamedParamIterator<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParamIteratorMut<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::iter::Enumerate<std::slice::IterMut<'t, V>>,
+        PathPrefixedParamIterator<&'t mut T, <V as Parameterized<P>>::NamedParamIteratorMut<'t, T>>,
+        fn(
+            (usize, &'t mut V),
+        ) -> PathPrefixedParamIterator<&'t mut T, <V as Parameterized<P>>::NamedParamIteratorMut<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParamIntoIterator<T: Parameter> = std::iter::FlatMap<
+        std::iter::Enumerate<std::array::IntoIter<V, N>>,
+        PathPrefixedParamIterator<T, <V as Parameterized<P>>::NamedParamIntoIterator<T>>,
+        fn((usize, V)) -> PathPrefixedParamIterator<T, <V as Parameterized<P>>::NamedParamIntoIterator<T>>,
+    >;
+
     fn param_count(&self) -> usize {
         self.iter().map(|value| value.param_count()).sum()
     }
@@ -608,6 +1003,27 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
 
     fn into_params(self) -> Self::ParamIntoIterator<P> {
         self.into_iter().flat_map(V::into_params)
+    }
+
+    fn named_params(&self) -> Self::NamedParamIterator<'_, P> {
+        self.iter().enumerate().flat_map(|(index, value)| PathPrefixedParamIterator {
+            iterator: value.named_params(),
+            segment: ParameterPathSegment::Index(index),
+        })
+    }
+
+    fn named_params_mut(&mut self) -> Self::NamedParamIteratorMut<'_, P> {
+        self.iter_mut().enumerate().flat_map(|(index, value)| PathPrefixedParamIterator {
+            iterator: value.named_params_mut(),
+            segment: ParameterPathSegment::Index(index),
+        })
+    }
+
+    fn into_named_params(self) -> Self::NamedParamIntoIterator<P> {
+        self.into_iter().enumerate().flat_map(|(index, value)| PathPrefixedParamIterator {
+            iterator: value.into_named_params(),
+            segment: ParameterPathSegment::Index(index),
+        })
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
@@ -666,6 +1082,32 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
         fn(V) -> <V as Parameterized<P>>::ParamIntoIterator<T>,
     >;
 
+    type NamedParamIterator<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::iter::Enumerate<std::slice::Iter<'t, V>>,
+        PathPrefixedParamIterator<&'t T, <V as Parameterized<P>>::NamedParamIterator<'t, T>>,
+        fn((usize, &'t V)) -> PathPrefixedParamIterator<&'t T, <V as Parameterized<P>>::NamedParamIterator<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParamIteratorMut<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::iter::Enumerate<std::slice::IterMut<'t, V>>,
+        PathPrefixedParamIterator<&'t mut T, <V as Parameterized<P>>::NamedParamIteratorMut<'t, T>>,
+        fn(
+            (usize, &'t mut V),
+        ) -> PathPrefixedParamIterator<&'t mut T, <V as Parameterized<P>>::NamedParamIteratorMut<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParamIntoIterator<T: Parameter> = std::iter::FlatMap<
+        std::iter::Enumerate<std::vec::IntoIter<V>>,
+        PathPrefixedParamIterator<T, <V as Parameterized<P>>::NamedParamIntoIterator<T>>,
+        fn((usize, V)) -> PathPrefixedParamIterator<T, <V as Parameterized<P>>::NamedParamIntoIterator<T>>,
+    >;
+
     fn param_count(&self) -> usize {
         self.iter().map(|value| value.param_count()).sum()
     }
@@ -684,6 +1126,27 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
 
     fn into_params(self) -> Self::ParamIntoIterator<P> {
         self.into_iter().flat_map(|value| value.into_params())
+    }
+
+    fn named_params(&self) -> Self::NamedParamIterator<'_, P> {
+        self.iter().enumerate().flat_map(|(index, value)| PathPrefixedParamIterator {
+            iterator: value.named_params(),
+            segment: ParameterPathSegment::Index(index),
+        })
+    }
+
+    fn named_params_mut(&mut self) -> Self::NamedParamIteratorMut<'_, P> {
+        self.iter_mut().enumerate().flat_map(|(index, value)| PathPrefixedParamIterator {
+            iterator: value.named_params_mut(),
+            segment: ParameterPathSegment::Index(index),
+        })
+    }
+
+    fn into_named_params(self) -> Self::NamedParamIntoIterator<P> {
+        self.into_iter().enumerate().flat_map(|(index, value)| PathPrefixedParamIterator {
+            iterator: value.into_named_params(),
+            segment: ParameterPathSegment::Index(index),
+        })
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
@@ -707,7 +1170,7 @@ pub struct HashMapParameterizedFamily<K, F, S>(PhantomData<(K, F, S)>);
 
 impl<
     P: Parameter,
-    K: Clone + Eq + Hash,
+    K: Clone + Debug + Eq + Hash,
     F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>,
     S: BuildHasher + Clone,
 > ParameterizedFamily<P> for HashMapParameterizedFamily<K, F, S>
@@ -715,7 +1178,7 @@ impl<
     type To = HashMap<K, <F as ParameterizedFamily<P>>::To, S>;
 }
 
-impl<P: Parameter, K: Clone + Eq + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
+impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
     for HashMap<K, V, S>
 {
     type Family = HashMapParameterizedFamily<K, V::Family, S>;
@@ -751,6 +1214,32 @@ impl<P: Parameter, K: Clone + Eq + Hash, V: Parameterized<P>, S: BuildHasher + C
         fn(V) -> <V as Parameterized<P>>::ParamIntoIterator<T>,
     >;
 
+    type NamedParamIterator<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::hash_map::Iter<'t, K, V>,
+        PathPrefixedParamIterator<&'t T, <V as Parameterized<P>>::NamedParamIterator<'t, T>>,
+        fn((&'t K, &'t V)) -> PathPrefixedParamIterator<&'t T, <V as Parameterized<P>>::NamedParamIterator<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParamIteratorMut<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::hash_map::IterMut<'t, K, V>,
+        PathPrefixedParamIterator<&'t mut T, <V as Parameterized<P>>::NamedParamIteratorMut<'t, T>>,
+        fn(
+            (&'t K, &'t mut V),
+        ) -> PathPrefixedParamIterator<&'t mut T, <V as Parameterized<P>>::NamedParamIteratorMut<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParamIntoIterator<T: Parameter> = std::iter::FlatMap<
+        std::collections::hash_map::IntoIter<K, V>,
+        PathPrefixedParamIterator<T, <V as Parameterized<P>>::NamedParamIntoIterator<T>>,
+        fn((K, V)) -> PathPrefixedParamIterator<T, <V as Parameterized<P>>::NamedParamIntoIterator<T>>,
+    >;
+
     fn param_count(&self) -> usize {
         self.values().map(|value| value.param_count()).sum()
     }
@@ -771,6 +1260,27 @@ impl<P: Parameter, K: Clone + Eq + Hash, V: Parameterized<P>, S: BuildHasher + C
 
     fn into_params(self) -> Self::ParamIntoIterator<P> {
         self.into_values().flat_map(V::into_params)
+    }
+
+    fn named_params(&self) -> Self::NamedParamIterator<'_, P> {
+        self.iter().flat_map(|(key, value)| PathPrefixedParamIterator {
+            iterator: value.named_params(),
+            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        })
+    }
+
+    fn named_params_mut(&mut self) -> Self::NamedParamIteratorMut<'_, P> {
+        self.iter_mut().flat_map(|(key, value)| PathPrefixedParamIterator {
+            iterator: value.named_params_mut(),
+            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        })
+    }
+
+    fn into_named_params(self) -> Self::NamedParamIntoIterator<P> {
+        self.into_iter().flat_map(|(key, value)| PathPrefixedParamIterator {
+            iterator: value.into_named_params(),
+            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        })
     }
 
     fn from_params_with_remainder<I: Iterator<Item = P>>(
@@ -800,7 +1310,7 @@ mod tests {
 
     use crate::errors::Error;
 
-    use super::{Parameter, Parameterized, Placeholder};
+    use super::{Parameter, ParameterPath, ParameterPathSegment, Parameterized, Placeholder};
 
     fn assert_roundtrip_parameterized<V>(value: V, expected_params: Vec<i32>)
     where
@@ -832,9 +1342,55 @@ mod tests {
         assert_eq!(mutable_value.params().copied().collect::<Vec<_>>(), expected_after);
     }
 
+    fn assert_named_roundtrip_parameterized<V>(value: V, expected_paths: Vec<String>, expected_params: Vec<i32>)
+    where
+        V: Clone + Debug + PartialEq + Parameterized<i32>,
+        V::ParamStructure: Clone + Debug + PartialEq,
+    {
+        let named_refs =
+            value.named_params().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>();
+        assert_eq!(named_refs, expected_paths.iter().cloned().zip(expected_params.iter().copied()).collect::<Vec<_>>(),);
+
+        let named_owned = value.clone().into_named_params().collect::<Vec<_>>();
+        assert_eq!(
+            named_owned.iter().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            expected_paths.iter().cloned().zip(expected_params.iter().copied()).collect::<Vec<_>>(),
+        );
+
+        let structure = value.param_structure();
+        let named_map = named_owned.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(V::from_named_params(structure, named_map), Ok(value));
+    }
+
+    fn assert_named_params_mut_increments<V>(value: V, expected_paths: Vec<String>, expected_before: Vec<i32>)
+    where
+        V: Clone + Debug + PartialEq + Parameterized<i32>,
+        V::ParamStructure: Clone + Debug + PartialEq,
+    {
+        let mut mutable_value = value;
+        let mut seen_paths = Vec::new();
+        for (path, parameter) in mutable_value.named_params_mut() {
+            seen_paths.push(path.to_string());
+            *parameter += 1;
+        }
+        assert_eq!(seen_paths, expected_paths);
+        let expected_after = expected_before.iter().map(|parameter| parameter + 1).collect::<Vec<_>>();
+        assert_eq!(mutable_value.params().copied().collect::<Vec<_>>(), expected_after);
+    }
+
+    fn assert_param_paths<V>(value: &V, expected_paths: Vec<String>)
+    where
+        V: Parameterized<i32>,
+    {
+        assert_eq!(value.param_paths().map(|path| path.to_string()).collect::<Vec<_>>(), expected_paths);
+    }
+
     mod derive_support {
         pub use crate::errors::Error;
-        pub use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
+        pub use crate::parameters::{
+            Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+            PathPrefixedParamIterator, Placeholder,
+        };
     }
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -863,10 +1419,24 @@ mod tests {
         values: Vec<DomainRates<P>>,
     }
 
+    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
+    #[ryft(crate = "crate::parameters::tests::derive_support")]
+    enum DomainRatesEnum<P: Parameter> {
+        Scalar(P),
+        Pair { left: P, right: P },
+        Empty,
+    }
+
     macro_rules! assert_tuple_impl {
         (($($value:expr),+ $(,)?)) => {{
-            assert_roundtrip_parameterized(($($value,)+), vec![$($value),+]);
-            assert_params_mut_increments(($($value,)+), vec![$($value),+]);
+            let expected_params = vec![$($value),+];
+            let expected_paths = (0..expected_params.len())
+                .map(|index| format!(".{index}"))
+                .collect::<Vec<_>>();
+            assert_roundtrip_parameterized(($($value,)+), expected_params.clone());
+            assert_params_mut_increments(($($value,)+), expected_params.clone());
+            assert_named_roundtrip_parameterized(($($value,)+), expected_paths.clone(), expected_params.clone());
+            assert_named_params_mut_increments(($($value,)+), expected_paths, expected_params);
         }};
     }
 
@@ -874,12 +1444,26 @@ mod tests {
     fn test_leaf_parameterized_impl() {
         assert_roundtrip_parameterized(7, vec![7]);
         assert_params_mut_increments(7, vec![7]);
+        assert_named_roundtrip_parameterized(7, vec!["".to_string()], vec![7]);
+        assert_named_params_mut_increments(7, vec!["".to_string()], vec![7]);
+        assert_param_paths(&7, vec!["".to_string()]);
+    }
+
+    #[test]
+    fn test_parameter_path_segment_display() {
+        assert_eq!(ParameterPathSegment::Field("weights").to_string(), ".weights");
+        assert_eq!(ParameterPathSegment::TupleIndex(1).to_string(), ".1");
+        assert_eq!(ParameterPathSegment::Index(3).to_string(), "[3]");
+        assert_eq!(ParameterPathSegment::Key("\"left\"".to_string()).to_string(), "[\"left\"]");
+        assert_eq!(ParameterPathSegment::Variant("PairValue").to_string(), ".pair_value");
     }
 
     #[test]
     fn test_phantom_data_parameterized_impl() {
         assert_roundtrip_parameterized(PhantomData::<i32>, vec![]);
         assert_params_mut_increments(PhantomData::<i32>, vec![]);
+        assert_named_roundtrip_parameterized(PhantomData::<i32>, vec![], vec![]);
+        assert_named_params_mut_increments(PhantomData::<i32>, vec![], vec![]);
         assert_eq!(PhantomData::<i32>.param_structure(), PhantomData::<Placeholder>);
     }
 
@@ -903,14 +1487,63 @@ mod tests {
     fn test_array_parameterized_impl() {
         assert_roundtrip_parameterized([1, 2, 3], vec![1, 2, 3]);
         assert_params_mut_increments([1, 2, 3], vec![1, 2, 3]);
+        assert_named_roundtrip_parameterized(
+            [1, 2, 3],
+            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec![1, 2, 3],
+        );
+        assert_named_params_mut_increments(
+            [1, 2, 3],
+            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec![1, 2, 3],
+        );
         assert_roundtrip_parameterized([(1, 2), (3, 4)], vec![1, 2, 3, 4]);
+        assert_named_roundtrip_parameterized(
+            [(1, 2), (3, 4)],
+            vec!["[0].0".to_string(), "[0].1".to_string(), "[1].0".to_string(), "[1].1".to_string()],
+            vec![1, 2, 3, 4],
+        );
     }
 
     #[test]
     fn test_vec_parameterized_impl() {
         assert_roundtrip_parameterized(vec![1, 2, 3], vec![1, 2, 3]);
         assert_params_mut_increments(vec![1, 2, 3], vec![1, 2, 3]);
+        assert_named_roundtrip_parameterized(
+            vec![1, 2, 3],
+            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec![1, 2, 3],
+        );
+        assert_named_params_mut_increments(
+            vec![1, 2, 3],
+            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec![1, 2, 3],
+        );
         assert_roundtrip_parameterized(vec![(1, 2), (3, 4)], vec![1, 2, 3, 4]);
+        assert_param_paths(
+            &vec![(1, 2), (3, 4)],
+            vec!["[0].0".to_string(), "[0].1".to_string(), "[1].0".to_string(), "[1].1".to_string()],
+        );
+        assert_named_roundtrip_parameterized(
+            vec![(1, 2), (3, 4)],
+            vec!["[0].0".to_string(), "[0].1".to_string(), "[1].0".to_string(), "[1].1".to_string()],
+            vec![1, 2, 3, 4],
+        );
+
+        let mapped: Vec<(i64, i64)> = vec![(1, 2), (3, 4)]
+            .map_named_params(|path, parameter| {
+                let mut offset = 0_i64;
+                for segment in path.segments() {
+                    match segment {
+                        ParameterPathSegment::Index(index) => offset += ((*index as i64) + 1) * 100,
+                        ParameterPathSegment::TupleIndex(index) => offset += (*index as i64) + 1,
+                        _ => {}
+                    }
+                }
+                i64::from(parameter) + offset
+            })
+            .unwrap();
+        assert_eq!(mapped, vec![(102, 104), (204, 206)]);
     }
 
     #[test]
@@ -919,9 +1552,58 @@ mod tests {
         value.insert("left", (1, 2));
         value.insert("right", (3, 4));
 
-        let expected_params = value.params().copied().collect::<Vec<_>>();
-        assert_roundtrip_parameterized(value.clone(), expected_params.clone());
-        assert_params_mut_increments(value, expected_params);
+        assert_eq!(value.param_count(), 4);
+        let params = value.params().copied().collect::<Vec<_>>();
+        assert_eq!(value.clone().into_params().collect::<Vec<_>>(), params);
+        assert_params_mut_increments(value.clone(), params);
+
+        let structure = value.param_structure();
+        let mut params_in_structure_iteration_order = Vec::new();
+        for key in structure.keys() {
+            params_in_structure_iteration_order.extend(value.get(key).copied().unwrap().into_params());
+        }
+        assert_eq!(
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_params(
+                structure.clone(),
+                params_in_structure_iteration_order.clone(),
+            ),
+            Ok(value.clone())
+        );
+
+        let mut params_with_remainder = params_in_structure_iteration_order.iter().copied().chain(std::iter::once(-1));
+        assert_eq!(
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_params_with_remainder(
+                structure,
+                &mut params_with_remainder
+            ),
+            Ok(value)
+        );
+        assert_eq!(params_with_remainder.collect::<Vec<_>>(), vec![-1]);
+    }
+
+    #[test]
+    fn test_hash_map_named_parameterized_impl() {
+        let mut value = HashMap::new();
+        value.insert("left", (1, 2));
+        value.insert("right", (3, 4));
+
+        let named = value.named_params().collect::<Vec<_>>();
+        assert_eq!(named.len(), 4);
+        for (path, parameter) in named {
+            let segments = path.segments().cloned().collect::<Vec<_>>();
+            assert_eq!(segments.len(), 2);
+            assert!(matches!(segments[0], ParameterPathSegment::Key(_)));
+            assert!(matches!(segments[1], ParameterPathSegment::TupleIndex(0) | ParameterPathSegment::TupleIndex(1)));
+            assert!(matches!(*parameter, 1..=4));
+        }
+
+        let expected = value.clone();
+        let structure = value.param_structure();
+        let named_owned = value.into_named_params().collect::<HashMap<_, _>>();
+        assert_eq!(
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_params(structure, named_owned),
+            Ok(expected)
+        );
     }
 
     #[test]
@@ -929,10 +1611,33 @@ mod tests {
         let value = DomainRates { first: Rate32(3), second: Rate32(7) };
         assert_eq!(value.param_count(), 2);
         assert_eq!(value.params().copied().collect::<Vec<_>>(), vec![Rate32(3), Rate32(7)]);
+        assert_eq!(
+            value.named_params().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![(".first".to_string(), Rate32(3)), (".second".to_string(), Rate32(7))],
+        );
         assert_eq!(value.param_structure(), DomainRates { first: Placeholder, second: Placeholder });
+        assert_eq!(
+            DomainRates::from_named_params(
+                value.param_structure(),
+                value.clone().into_named_params().collect::<HashMap<_, _>>(),
+            ),
+            Ok(value.clone())
+        );
 
-        let mapped: DomainRates<Rate64> = value.map_params(|rate| Rate64(i64::from(rate.0) * 10)).unwrap();
+        let mapped: DomainRates<Rate64> = value.clone().map_params(|rate| Rate64(i64::from(rate.0) * 10)).unwrap();
         assert_eq!(mapped, DomainRates { first: Rate64(30), second: Rate64(70) });
+
+        let mapped_named: DomainRates<Rate64> = value
+            .map_named_params(|path, rate| {
+                let multiplier = match path.segments().next() {
+                    Some(ParameterPathSegment::Field("first")) => 10_i64,
+                    Some(ParameterPathSegment::Field("second")) => 100_i64,
+                    _ => 1_i64,
+                };
+                Rate64(i64::from(rate.0) * multiplier)
+            })
+            .unwrap();
+        assert_eq!(mapped_named, DomainRates { first: Rate64(30), second: Rate64(700) });
     }
 
     #[test]
@@ -957,6 +1662,22 @@ mod tests {
             DomainRatesVec::from_params(value.param_structure(), vec![Rate32(1), Rate32(2), Rate32(3), Rate32(4)],),
             Ok(value.clone())
         );
+        assert_eq!(
+            value.named_params().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![
+                (".values[0].first".to_string(), Rate32(1)),
+                (".values[0].second".to_string(), Rate32(2)),
+                (".values[1].first".to_string(), Rate32(3)),
+                (".values[1].second".to_string(), Rate32(4)),
+            ],
+        );
+        assert_eq!(
+            DomainRatesVec::from_named_params(
+                value.param_structure(),
+                value.clone().into_named_params().collect::<HashMap<_, _>>(),
+            ),
+            Ok(value.clone())
+        );
 
         let mapped: DomainRatesVec<Rate64> = value.map_params(|rate| Rate64(i64::from(rate.0) + 5)).unwrap();
         assert_eq!(
@@ -971,14 +1692,88 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_enum_supports_named_parameters() {
+        let scalar = DomainRatesEnum::Scalar(Rate32(9));
+        assert_eq!(
+            scalar.named_params().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![(".scalar.0".to_string(), Rate32(9))],
+        );
+        assert_eq!(
+            DomainRatesEnum::from_named_params(
+                scalar.param_structure(),
+                scalar.clone().into_named_params().collect::<HashMap<_, _>>(),
+            ),
+            Ok(scalar.clone())
+        );
+
+        let pair = DomainRatesEnum::Pair { left: Rate32(1), right: Rate32(2) };
+        assert_eq!(
+            pair.named_params().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![(".pair.left".to_string(), Rate32(1)), (".pair.right".to_string(), Rate32(2)),],
+        );
+        assert_eq!(
+            DomainRatesEnum::from_named_params(
+                pair.param_structure(),
+                pair.clone().into_named_params().collect::<HashMap<_, _>>(),
+            ),
+            Ok(pair.clone())
+        );
+        let pair_mapped: DomainRatesEnum<Rate64> = pair
+            .map_named_params(|path, rate| {
+                let mut bonus = 0_i64;
+                for segment in path.segments() {
+                    match segment {
+                        ParameterPathSegment::Variant("Pair") => bonus += 1_000,
+                        ParameterPathSegment::Field("left") => bonus += 10,
+                        ParameterPathSegment::Field("right") => bonus += 20,
+                        _ => {}
+                    }
+                }
+                Rate64(i64::from(rate.0) + bonus)
+            })
+            .unwrap();
+        assert_eq!(pair_mapped, DomainRatesEnum::Pair { left: Rate64(1011), right: Rate64(1022) });
+
+        let empty = DomainRatesEnum::<Rate32>::Empty;
+        assert!(empty.named_params().next().is_none());
+        assert_eq!(
+            DomainRatesEnum::from_named_params(
+                empty.param_structure(),
+                empty.clone().into_named_params().collect::<HashMap<_, _>>(),
+            ),
+            Ok(empty)
+        );
+    }
+
+    #[test]
     fn test_from_params_reports_unused_params() {
         assert_eq!(<i32 as Parameterized<i32>>::from_params(Placeholder, vec![3, 4]), Err(Error::UnusedParams));
+    }
+
+    #[test]
+    fn test_from_named_params_reports_unused_params() {
+        let extra_path = ParameterPath::root().with_segment(ParameterPathSegment::Field("extra"));
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_named_params(
+                Placeholder,
+                HashMap::from([(ParameterPath::root(), 3), (extra_path, 4)]),
+            ),
+            Err(Error::UnusedParams)
+        );
     }
 
     #[test]
     fn test_from_params_reports_insufficient_params_for_vec() {
         let structure = vec![Placeholder, Placeholder, Placeholder];
         let result = <Vec<i32> as Parameterized<i32>>::from_params(structure, vec![1, 2]);
+        assert_eq!(result, Err(Error::InsufficientParams { expected_count: 3 }));
+    }
+
+    #[test]
+    fn test_from_named_params_reports_insufficient_params_for_vec() {
+        let structure = vec![Placeholder, Placeholder, Placeholder];
+        let params = vec![1, 2].into_named_params().collect::<HashMap<_, _>>();
+        let result = <Vec<i32> as Parameterized<i32>>::from_named_params(structure, params);
         assert_eq!(result, Err(Error::InsufficientParams { expected_count: 3 }));
     }
 
@@ -990,5 +1785,33 @@ mod tests {
         structure.insert("middle", Placeholder);
         let result = <HashMap<&str, i32> as Parameterized<i32>>::from_params(structure, vec![1, 2]);
         assert_eq!(result, Err(Error::InsufficientParams { expected_count: 3 }));
+    }
+
+    #[test]
+    fn test_from_named_params_reports_path_mismatch() {
+        let value = vec![10, 20];
+        let mut named = value.clone().into_named_params().collect::<HashMap<_, _>>();
+        let replaced_value = named
+            .remove(&ParameterPath::root().with_segment(ParameterPathSegment::Index(1)))
+            .expect("Expected to remove path [1] from named parameter map.");
+        named.insert(ParameterPath::root().with_segment(ParameterPathSegment::Index(2)), replaced_value);
+        let result = <Vec<i32> as Parameterized<i32>>::from_named_params(value.param_structure(), named);
+        assert!(matches!(
+            result,
+            Err(Error::NamedParamPathMismatch { expected_path, actual_path })
+                if expected_path == "[1]" && actual_path == "[2]",
+        ));
+    }
+
+    #[test]
+    fn test_from_named_params_is_order_independent() {
+        let value = vec![(1, 2), (3, 4)];
+        let mut named = value.clone().into_named_params().collect::<Vec<_>>();
+        named.reverse();
+        let named_map = named.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_named_params(value.param_structure(), named_map),
+            Ok(value)
+        );
     }
 }

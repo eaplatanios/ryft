@@ -31,6 +31,7 @@ pre-release-replacements = [
 ryft-macros.workspace = true
 ryft-mlir = { workspace = true, optional = true }
 ryft-pjrt = { workspace = true, optional = true }
+convert_case.workspace = true
 dyn-clone.workspace = true
 half.workspace = true
 paste.workspace = true

@@ -94,6 +94,22 @@ help: there is a crate or module with a similar name
 21 - #[ryft(crate = "_ryft")]
 21 + #[ryft(crate = ryft)]
    |
+help: consider importing this enum
+   |
+ 1 + use ryft::ParameterPathSegment;
+   |
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `_ryft`
+  --> tests/parameters/error_attributes.rs:21:16
+   |
+21 | #[ryft(crate = "_ryft")]
+   |                ^^^^^^^ use of unresolved module or unlinked crate `_ryft`
+   |
+help: there is a crate or module with a similar name
+   |
+21 - #[ryft(crate = "_ryft")]
+21 + #[ryft(crate = ryft)]
+   |
 help: consider importing one of these items
    |
  1 + use std::error::Error;
