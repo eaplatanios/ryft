@@ -1,27 +1,35 @@
 use thiserror::Error;
 
-// TODO(eaplatanios): Add a ryft `Result` type.
-// TODO(eaplatanios): Error messages should be concise lowercase sentences without trailing punctuation.
-
 #[derive(Error, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
-    #[error("Runtime error: {message}.\n{backtrace}")]
+    #[error("runtime error: {message}")]
     RuntimeError { message: String, backtrace: String },
 
-    #[error("Got more parameters than expected.")]
+    // TODO(eaplatanios): Can we unify some of the parameter-related errors?
+    
+    #[error("got more parameters than expected")]
     UnusedParams,
 
     // TODO(eaplatanios): `Error::InsufficientParams` should also include a [`ParameterPath`] for the missing parameter.
     //  and the same should be used in `from_params_with_remainder` whenever relevant.
-    #[error("Expected at least {expected_count} parameters but got fewer.")]
+    #[error("expected at least {expected_count} parameters but got fewer")]
     InsufficientParams { expected_count: usize },
 
-    #[error("Named parameter path mismatch. Expected '{expected_path}' but got '{actual_path}'.")]
+    #[error("named parameter path mismatch; expected '{expected_path}' but got '{actual_path}'")]
     NamedParamPathMismatch { expected_path: String, actual_path: String },
 
-    #[error("Missing prefix for parameter path '{path}'.")]
+    #[error("missing prefix for parameter path '{path}'")]
     MissingPrefixForPath { path: String },
 
-    #[error("Unused prefix path '{path}'.")]
+    #[error("unused prefix path '{path}'")]
     UnusedPrefixPath { path: String },
+
+    #[error("missing named parameter path '{path}'")]
+    MissingNamedParamPath { path: String },
+
+    #[error("unknown named parameter path '{path}'")]
+    UnknownNamedParamPath { path: String },
+
+    #[error("expected exactly {expected_count} replacement values but got {actual_count}")]
+    ReplacementCountMismatch { expected_count: usize, actual_count: usize },
 }

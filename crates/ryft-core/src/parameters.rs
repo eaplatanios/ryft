@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
@@ -8,9 +8,6 @@ use half::{bf16, f16};
 use paste::paste;
 
 use crate::errors::Error;
-
-// TODO(eaplatanios): Borrow some of Equinox's tree manipulation capabilities.
-//  Reference: https://docs.kidger.site/equinox/api/manipulation.
 
 // For reference, in JAX, to register custom types as trees, we only need to implement these two functions:
 // - flatten(tree) -> (children, aux_data)
@@ -47,6 +44,8 @@ impl Parameter for f16 {}
 impl Parameter for f32 {}
 impl Parameter for f64 {}
 impl Parameter for usize {}
+
+impl<P: Parameter> Parameter for Option<P> {}
 
 /// Placeholder leaf type for [`Parameterized`] trees that is used represent [`Parameterized::param_structure`].
 /// That is, it is used to replace every parameter leaf in a [`Parameterized`] type yielding a _shape-only_
@@ -263,6 +262,21 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// - JAX `tree.unflatten(treedef, leaves)` corresponds to [`from_params`](Self::from_params) or
 ///   [`from_params_with_remainder`](Self::from_params_with_remainder).
 /// - JAX `tree.map(f, x)` corresponds to [`map_params`](Self::map_params).
+///
+/// # Mapping To Equinox Manipulations
+///
+/// - Equinox `filter` corresponds to [`filter_named_params`](Self::filter_params).
+/// - Equinox `partition` corresponds to [`partition_named_params`](Self::partition_params).
+/// - Equinox `combine` corresponds to [`combine_optional_params`](Self::combine_optional_params).
+/// - Equinox `apply_updates` corresponds to [`apply_param_updates`](Self::apply_param_updates).
+///
+/// Equinox-inspired tree manipulation operations supported in this module:
+/// - filter-like selection through [`Parameterized::filter_named_params`].
+/// - partition-like splitting through [`Parameterized::partition_named_params`].
+/// - combine-like reconstruction through [`Parameterized::combine_optional_params`].
+/// - apply-updates behavior through [`Parameterized::apply_param_updates`].
+/// - tree-at replacement via [`Parameterized::tree_at`] and [`Parameterized::tree_at_paths`].
+/// Reference: https://docs.kidger.site/equinox/api/manipulation.
 ///
 /// # Examples
 ///
@@ -572,6 +586,236 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
         Self::To::<T>::from_named_params(structure, mapped_params)
     }
+
+    /// Partitions this value's named parameters into selected and rejected trees according to `predicate`.
+    ///
+    /// The returned trees preserve the original structure and use `Some(parameter)` for selected leaves and `None`
+    /// for filtered-out leaves.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::Parameterized;
+    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    /// let (selected, rejected) = value.partition_params(|path, _| path.to_string().starts_with("[1]"))?;
+    /// assert_eq!(selected, vec![(None, None), (Some(3), Some(4))]);
+    /// assert_eq!(rejected, vec![(Some(1), Some(2)), (None, None)]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
+    fn partition_params<F: FnMut(&ParameterPath, &P) -> bool>(
+        self,
+        predicate: F,
+    ) -> Result<(Self::To<Option<P>>, Self::To<Option<P>>), Error>
+    where
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        let mut predicate = predicate;
+        let structure = self.param_structure();
+        let mut selected_params = Vec::with_capacity(structure.param_count());
+        let mut rejected_params = Vec::with_capacity(structure.param_count());
+        for (path, parameter) in self.into_named_params() {
+            if predicate(&path, &parameter) {
+                selected_params.push(Some(parameter));
+                rejected_params.push(None);
+            } else {
+                selected_params.push(None);
+                rejected_params.push(Some(parameter));
+            }
+        }
+        let selected = Self::To::<Option<P>>::from_params(structure, selected_params)?;
+        let rejected = Self::To::<Option<P>>::from_params(selected.param_structure(), rejected_params)?;
+        Ok((selected, rejected))
+    }
+
+    /// Returns a structure-preserving optional tree where leaves selected by `predicate` are wrapped in [`Some`],
+    /// and all other leaves are [`None`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::Parameterized;
+    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    /// let filtered = value.filter_params(|path, _| path.to_string().ends_with(".1"))?;
+    /// assert_eq!(filtered, vec![(None, Some(2)), (None, Some(4))]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
+    fn filter_params<F: FnMut(&ParameterPath, &P) -> bool>(self, predicate: F) -> Result<Self::To<Option<P>>, Error>
+    where
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        let mut predicate = predicate;
+        self.map_named_params(|path, parameter| predicate(path, &parameter).then_some(parameter))
+    }
+
+    /// Combines optional trees into one value using left-to-right `Some` precedence per leaf.
+    ///
+    /// If multiple trees provide `Some` for the same leaf, the first tree's value is used.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::{Parameterized, Placeholder};
+    /// let structure = vec![(Placeholder, Placeholder)];
+    /// let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_params(
+    ///     structure,
+    ///     vec![
+    ///         vec![(Some(10), None)],
+    ///         vec![(Some(20), Some(30))],
+    ///     ],
+    /// )?;
+    /// assert_eq!(combined, vec![(10, 30)]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
+    fn combine_optional_params<I>(structure: Self::ParamStructure, optional_trees: I) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = Self::To<Option<P>>>,
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        let expected_paths = structure.named_params().map(|(path, _)| path).collect::<Vec<_>>();
+        let expected_count = expected_paths.len();
+        let mut optional_iterators = optional_trees.into_iter().map(|tree| tree.into_params()).collect::<Vec<_>>();
+        let mut combined_params = Vec::with_capacity(expected_count);
+        for path in expected_paths {
+            let mut selected = None;
+            for iterator in &mut optional_iterators {
+                let candidate = iterator.next().ok_or(Error::InsufficientParams { expected_count })?;
+                if selected.is_none() {
+                    selected = candidate;
+                }
+            }
+            let parameter = selected.ok_or_else(|| Error::MissingNamedParamPath { path: path.to_string() })?;
+            combined_params.push(parameter);
+        }
+        if optional_iterators.iter_mut().any(|iterator| iterator.next().is_some()) {
+            return Err(Error::UnusedParams);
+        }
+        Self::from_params(structure, combined_params)
+    }
+
+    /// Replaces parameters using an optional replacement tree.
+    ///
+    /// Leaves with `Some(value)` in `replacements` replace the corresponding value in `self`.
+    /// Leaves with `None` are kept unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::Parameterized;
+    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    /// let replaced = value.replace_params(vec![(None, None), (Some(99), None)])?;
+    /// assert_eq!(replaced, vec![(1, 2), (99, 4)]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
+    fn replace_params(self, replacements: Self::To<Option<P>>) -> Result<Self, Error>
+    where
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        let structure = self.param_structure();
+        let current = self.map_params(Some)?;
+        Self::combine_optional_params(structure, vec![replacements, current])
+    }
+
+    /// Applies optional updates leaf-wise using `update_fn(base, update)` whenever an update is present.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::Parameterized;
+    /// let value = vec![(2_i32, 3_i32)];
+    /// let updated = value.apply_param_updates_with(
+    ///     vec![(None, Some(10))],
+    ///     |base, scale| base * scale,
+    /// )?;
+    /// assert_eq!(updated, vec![(2, 30)]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
+    fn apply_param_updates_with<U: Parameter, F>(
+        self,
+        updates: Self::To<Option<U>>,
+        update_fn: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(P, U) -> P,
+        Self::Family: ParameterizedFamily<Option<U>>,
+    {
+        let structure = self.param_structure();
+        let expected_count = structure.param_count();
+        let mut params = self.into_params();
+        let mut updates = updates.into_params();
+        let mut update_fn = update_fn;
+        let mut updated_params = Vec::with_capacity(expected_count);
+        for _ in 0..expected_count {
+            let parameter = params.next().ok_or(Error::InsufficientParams { expected_count })?;
+            let update = updates.next().ok_or(Error::InsufficientParams { expected_count })?;
+            let updated = match update {
+                Some(update) => update_fn(parameter, update),
+                None => parameter,
+            };
+            updated_params.push(updated);
+        }
+        if params.next().is_some() || updates.next().is_some() {
+            return Err(Error::UnusedParams);
+        }
+        Self::from_params(structure, updated_params)
+    }
+
+    /// Applies additive updates to parameters where the update tree contains `Some(delta)`.
+    fn apply_param_updates(self, updates: Self::To<Option<P>>) -> Result<Self, Error>
+    where
+        P: std::ops::Add<Output = P>,
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        self.apply_param_updates_with(updates, |base, delta| base + delta)
+    }
+
+    /// Replaces parameters at `paths` with values from `replacements`.
+    ///
+    /// Returns [`Error::ReplacementCountMismatch`] when `paths` and `replacements` have different lengths.
+    fn tree_at_paths<I, R>(self, paths: I, replacements: R) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = ParameterPath>,
+        R: IntoIterator<Item = P>,
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let replacements = replacements.into_iter().collect::<Vec<_>>();
+        if paths.len() != replacements.len() {
+            return Err(Error::ReplacementCountMismatch {
+                expected_count: paths.len(),
+                actual_count: replacements.len(),
+            });
+        }
+        let structure = self.param_structure();
+        let leaf_paths = structure.named_params().map(|(path, _)| path).collect::<HashSet<_>>();
+        if let Some(path) = paths.iter().filter(|path| !leaf_paths.contains(*path)).min() {
+            return Err(Error::UnknownNamedParamPath { path: path.to_string() });
+        }
+        let mut replacement_map = paths
+            .into_iter()
+            .zip(replacements)
+            .map(|(path, replacement)| (path, Some(replacement)))
+            .collect::<HashMap<_, _>>();
+        let replacement_params = structure
+            .named_params()
+            .map(|(path, _)| replacement_map.remove(&path).unwrap_or(None))
+            .collect::<Vec<_>>();
+        let replacement_tree = Self::To::<Option<P>>::from_params(structure, replacement_params)?;
+        self.replace_params(replacement_tree)
+    }
+
+    /// Selects replacement paths from this value's parameter structure and applies `tree_at_paths`.
+    fn tree_at<F: FnOnce(&Self::ParamStructure) -> Vec<ParameterPath>, R: IntoIterator<Item = P>>(
+        self,
+        selector: F,
+        replacements: R,
+    ) -> Result<Self, Error>
+    where
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        let structure = self.param_structure();
+        let paths = selector(&structure);
+        self.tree_at_paths(paths, replacements)
+    }
 }
 
 /// Iterator adapter that prefixes each yielded [`ParameterPath`] with [`Self::segment`]. This exists as a dedicated
@@ -755,6 +999,8 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
         Ok(PhantomData)
     }
 }
+
+// TODO(eaplatanios): Add `Parameterized<P>` implementation for `Option<T>` where `T: Parameterized<P>`.
 
 // Use declarative macros to provide implementations for tuples of [`Parameterized`] items. Note that if a tuple
 // contains a mix of [`Parameterized`] and non-[`Parameterized`] items, then the generated implementations here
@@ -1728,6 +1974,161 @@ mod tests {
             <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_params(structure, named_owned),
             Ok(expected)
         );
+    }
+
+    #[test]
+    fn test_partition_named_params_splits_by_predicate() {
+        let value = vec![(1, 2), (3, 4)];
+        let (selected, rejected) = value.partition_params(|path, _| path.to_string().starts_with("[1]")).unwrap();
+        assert_eq!(selected, vec![(None, None), (Some(3), Some(4))]);
+        assert_eq!(rejected, vec![(Some(1), Some(2)), (None, None)]);
+    }
+
+    #[test]
+    fn test_filter_named_params_returns_selected_only() {
+        let value = vec![(1, 2), (3, 4)];
+        let filtered = value.filter_params(|path, _| path.to_string().ends_with(".1")).unwrap();
+        assert_eq!(filtered, vec![(None, Some(2)), (None, Some(4))]);
+    }
+
+    #[test]
+    fn test_combine_optional_params_roundtrips_partitioned_output() {
+        let value = vec![(1, 2), (3, 4)];
+        let structure = value.param_structure();
+        let (selected, rejected) =
+            value.clone().partition_params(|path, _| path.to_string().starts_with("[0]")).unwrap();
+        let combined =
+            <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_params(structure, vec![selected, rejected]);
+        assert_eq!(combined, Ok(value));
+    }
+
+    #[test]
+    fn test_combine_optional_params_leftmost_precedence() {
+        let structure = vec![(Placeholder, Placeholder)];
+        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_params(
+            structure,
+            vec![vec![(Some(10), None)], vec![(Some(20), Some(30))]],
+        );
+        assert_eq!(combined, Ok(vec![(10, 30)]));
+    }
+
+    #[test]
+    fn test_combine_optional_params_reports_missing_path() {
+        let structure = vec![(Placeholder, Placeholder)];
+        let combined =
+            <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_params(structure, vec![vec![(Some(10), None)]]);
+        assert_eq!(combined, Err(Error::MissingNamedParamPath { path: "[0].1".to_string() }));
+    }
+
+    #[test]
+    fn test_replace_params_replaces_subset() {
+        let value = vec![(1, 2), (3, 4)];
+        let replaced = value.replace_params(vec![(None, None), (Some(99), None)]).unwrap();
+        assert_eq!(replaced, vec![(1, 2), (99, 4)]);
+    }
+
+    #[test]
+    fn test_apply_param_updates_additive_subset() {
+        let value = vec![(1, 2), (3, 4)];
+        let updated = value.apply_param_updates(vec![(None, Some(100)), (Some(10), None)]).unwrap();
+        assert_eq!(updated, vec![(1, 102), (13, 4)]);
+    }
+
+    #[test]
+    fn test_apply_param_updates_with_custom_function() {
+        let value = vec![(2, 3), (4, 5)];
+        let updated = value
+            .apply_param_updates_with(vec![(Some(10), None), (None, Some(-1))], |base, scale| base * scale)
+            .unwrap();
+        assert_eq!(updated, vec![(20, 3), (4, -5)]);
+    }
+
+    #[test]
+    fn test_apply_param_updates_reports_shape_mismatch() {
+        let value = vec![(1, 2), (3, 4)];
+        let updated = value.apply_param_updates(vec![(Some(10), None)]);
+        assert_eq!(updated, Err(Error::InsufficientParams { expected_count: 4 }));
+    }
+
+    #[test]
+    fn test_tree_at_paths_replaces_single_and_multiple_paths() {
+        let value = vec![(1, 2), (3, 4)];
+        let single = value
+            .clone()
+            .tree_at_paths(vec![ParameterPath::root().with_index(0).with_tuple_index(1)], vec![99])
+            .unwrap();
+        assert_eq!(single, vec![(1, 99), (3, 4)]);
+
+        let multiple = value
+            .tree_at_paths(
+                vec![
+                    ParameterPath::root().with_index(0).with_tuple_index(0),
+                    ParameterPath::root().with_index(1).with_tuple_index(1),
+                ],
+                vec![10, 20],
+            )
+            .unwrap();
+        assert_eq!(multiple, vec![(10, 2), (3, 20)]);
+    }
+
+    #[test]
+    fn test_tree_at_selector_selects_from_structure() {
+        let value = vec![(1, 2), (3, 4)];
+        let updated = value
+            .tree_at(
+                |structure| {
+                    structure
+                        .named_params()
+                        .filter_map(|(path, _)| {
+                            let selected =
+                                matches!(path.segments().next_back(), Some(ParameterPathSegment::TupleIndex(1)));
+                            selected.then_some(path)
+                        })
+                        .collect::<Vec<_>>()
+                },
+                vec![20, 40],
+            )
+            .unwrap();
+        assert_eq!(updated, vec![(1, 20), (3, 40)]);
+    }
+
+    #[test]
+    fn test_tree_at_reports_replacement_count_mismatch() {
+        let value = vec![(1, 2), (3, 4)];
+        let updated = value.tree_at_paths(
+            vec![
+                ParameterPath::root().with_index(0).with_tuple_index(0),
+                ParameterPath::root().with_index(1).with_tuple_index(1),
+            ],
+            vec![10],
+        );
+        assert_eq!(updated, Err(Error::ReplacementCountMismatch { expected_count: 2, actual_count: 1 }));
+    }
+
+    #[test]
+    fn test_tree_at_reports_unknown_path() {
+        let value = vec![(1, 2), (3, 4)];
+        let updated = value.tree_at_paths(vec![ParameterPath::root().with_index(2).with_tuple_index(0)], vec![10]);
+        assert_eq!(updated, Err(Error::UnknownNamedParamPath { path: "[2].0".to_string() }));
+    }
+
+    #[test]
+    fn test_tree_at_paths_supports_leaf_parameterized_value() {
+        let value = 7;
+        let updated = value.tree_at_paths(vec![ParameterPath::root()], vec![11]).unwrap();
+        assert_eq!(updated, 11);
+    }
+
+    #[test]
+    fn test_tree_at_paths_supports_hash_map_key_paths() {
+        let mut value = HashMap::new();
+        value.insert("left", (1, 2));
+        value.insert("right", (3, 4));
+        let replaced = value
+            .tree_at_paths(vec![ParameterPath::root().with_key("right").with_tuple_index(1)], vec![99])
+            .unwrap();
+        assert_eq!(replaced.get("left"), Some(&(1, 2)));
+        assert_eq!(replaced.get("right"), Some(&(3, 99)));
     }
 
     #[test]
