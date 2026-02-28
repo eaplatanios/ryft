@@ -104,80 +104,51 @@ pub struct ParameterPath {
 }
 
 impl ParameterPath {
-    /// Creates a new empty/root [`ParameterPath`].
+    /// Creates a new empty (i.e., root) [`ParameterPath`].
     pub fn root() -> Self {
         Self::default()
     }
 
-    /// Returns `true` if this [`ParameterPath`] is the root path (i.e., is empty).
-    pub fn is_root(&self) -> bool {
-        self.segments.is_empty()
-    }
-
-    /// Returns a new [`ParameterPath`] with `name` appended as a [`ParameterPathSegment::Field`].
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::parameters::ParameterPath;
-    /// let path = ParameterPath::root()
-    ///     .with_field("weights")
-    ///     .with_index(1)
-    ///     .with_tuple_index(0);
-    /// assert_eq!(path.to_string(), ".weights[1].0");
-    /// ```
-    pub fn with_field(self, name: &'static str) -> Self {
-        self.with_appended_segment(ParameterPathSegment::Field(name))
-    }
-
-    /// Returns a new [`ParameterPath`] with `name` appended as a [`ParameterPathSegment::Variant`].
-    pub fn with_variant(self, name: &'static str) -> Self {
-        self.with_appended_segment(ParameterPathSegment::Variant(name))
-    }
-
-    /// Returns a new [`ParameterPath`] with `index` appended as a [`ParameterPathSegment::TupleIndex`].
-    pub fn with_tuple_index(self, index: usize) -> Self {
-        self.with_appended_segment(ParameterPathSegment::TupleIndex(index))
-    }
-
-    /// Returns a new [`ParameterPath`] with `index` appended as a [`ParameterPathSegment::Index`].
-    pub fn with_index(self, index: usize) -> Self {
-        self.with_appended_segment(ParameterPathSegment::Index(index))
-    }
-
-    /// Returns a new [`ParameterPath`] with `key` appended as a [`ParameterPathSegment::Key`].
-    pub fn with_key<K: Debug>(self, key: K) -> Self {
-        self.with_appended_segment(ParameterPathSegment::Key(format!("{key:?}")))
-    }
-
-    // TODO(eapaltanios): Rename this to `with_prefix_segment`.
-    /// Returns a new [`ParameterPath`] with the provided [`ParameterPathSegment`] appended to it.
-    fn with_segment(mut self, segment: ParameterPathSegment) -> Self {
-        self.segments.push(segment);
-        self
-    }
-
-    // TODO(eaplatanios): Rename this to `with_segment` and make it public.
-    fn with_appended_segment(mut self, segment: ParameterPathSegment) -> Self {
-        self.segments.insert(0, segment);
-        self
-    }
-
-    fn depth(&self) -> usize {
+    /// Returns the number of [`ParameterPathSegment`]s in this [`ParameterPath`].
+    pub fn len(&self) -> usize {
         self.segments.len()
     }
 
-    /// Returns `true` if this [`ParameterPath`] is a root-prefix of `other`.
+    /// Returns `true` if this [`ParameterPath`] contains no [`ParameterPathSegment`]s (i.e., is the root path).
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Returns `true` if this [`ParameterPath`] is the root path (i.e., is empty).
+    pub fn is_root(&self) -> bool {
+        self.is_empty()
+    }
+
+    /// Returns `true` if this [`ParameterPath`] is a prefix of `other`.
     pub fn is_prefix_of(&self, other: &Self) -> bool {
-        if self.depth() > other.depth() {
-            return false;
-        }
-        self.segments().zip(other.segments()).all(|(left, right)| left == right)
+        self.len() <= other.len() && self.segments().zip(other.segments()).all(|(left, right)| left == right)
     }
 
     /// Returns an iterator over the [`ParameterPathSegment`]s in this [`ParameterPath`] in root-to-leaf order.
     pub fn segments(&self) -> impl DoubleEndedIterator<Item = &ParameterPathSegment> + '_ {
         self.segments.iter().rev()
+    }
+
+    /// Returns a new [`ParameterPath`] with the provided [`ParameterPathSegment`] appended to it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::{ParameterPath, ParameterPathSegment};
+    /// let path = ParameterPath::root()
+    ///     .with_segment(ParameterPathSegment::Field("weights"))
+    ///     .with_segment(ParameterPathSegment::Index(1))
+    ///     .with_segment(ParameterPathSegment::TupleIndex(0));
+    /// assert_eq!(path.to_string(), ".weights[1].0");
+    /// ```
+    pub fn with_segment(mut self, segment: ParameterPathSegment) -> Self {
+        self.segments.insert(0, segment);
+        self
     }
 }
 
@@ -515,13 +486,18 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// ```rust
     /// # use std::collections::HashMap;
-    /// # use ryft_core::parameters::{ParameterPath, Parameterized, Placeholder};
+    /// # use ryft_core::parameters::{ParameterPath, ParameterPathSegment, Parameterized, Placeholder};
     /// let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
     /// let rebuilt = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
     ///     structure,
     ///     HashMap::from([
     ///         (ParameterPath::root(), 0),
-    ///         (ParameterPath::root().with_index(1).with_tuple_index(0), 7),
+    ///         (
+    ///             ParameterPath::root()
+    ///                 .with_segment(ParameterPathSegment::Index(1))
+    ///                 .with_segment(ParameterPathSegment::TupleIndex(0)),
+    ///             7,
+    ///         ),
     ///     ]),
     /// )?;
     /// assert_eq!(rebuilt, vec![(0, 0), (7, 0)]);
@@ -541,7 +517,7 @@ pub trait Parameterized<P: Parameter>: Sized {
             let mut selected_prefix = None;
             for (index, (prefix_path, _, _)) in prefixes.iter().enumerate() {
                 if prefix_path.is_prefix_of(&leaf_path) {
-                    let prefix_depth = prefix_path.depth();
+                    let prefix_depth = prefix_path.len();
                     if selected_prefix.map(|(_, depth)| prefix_depth > depth).unwrap_or(true) {
                         selected_prefix = Some((index, prefix_depth));
                     }
@@ -845,7 +821,10 @@ impl<P, I: Iterator<Item = (ParameterPath, P)>> Iterator for PathPrefixedParamet
     type Item = (ParameterPath, P);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iterator.next().map(|(path, parameter)| (path.with_segment(self.segment.clone()), parameter))
+        self.iterator.next().map(|(mut path, parameter)| {
+            path.segments.push(self.segment.clone());
+            (path, parameter)
+        })
     }
 }
 
@@ -1841,11 +1820,15 @@ mod tests {
 
     #[test]
     fn test_parameter_path_builder_helpers() {
-        let path = ParameterPath::root().with_variant("Pair").with_field("weights").with_index(1).with_tuple_index(0);
+        let path = ParameterPath::root()
+            .with_segment(ParameterPathSegment::Variant("Pair"))
+            .with_segment(ParameterPathSegment::Field("weights"))
+            .with_segment(ParameterPathSegment::Index(1))
+            .with_segment(ParameterPathSegment::TupleIndex(0));
         assert_eq!(path.to_string(), ".pair.weights[1].0");
-        assert!(ParameterPath::root().with_variant("Pair").is_prefix_of(&path));
+        assert!(ParameterPath::root().with_segment(ParameterPathSegment::Variant("Pair")).is_prefix_of(&path));
 
-        let key_path = ParameterPath::root().with_key("left");
+        let key_path = ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "left")));
         assert_eq!(key_path.to_string(), "[\"left\"]");
     }
 
@@ -2079,15 +2062,26 @@ mod tests {
         let value = vec![(1, 2), (3, 4)];
         let single = value
             .clone()
-            .tree_at_paths(vec![ParameterPath::root().with_index(0).with_tuple_index(1)], vec![99])
+            .tree_at_paths(
+                vec![
+                    ParameterPath::root()
+                        .with_segment(ParameterPathSegment::Index(0))
+                        .with_segment(ParameterPathSegment::TupleIndex(1)),
+                ],
+                vec![99],
+            )
             .unwrap();
         assert_eq!(single, vec![(1, 99), (3, 4)]);
 
         let multiple = value
             .tree_at_paths(
                 vec![
-                    ParameterPath::root().with_index(0).with_tuple_index(0),
-                    ParameterPath::root().with_index(1).with_tuple_index(1),
+                    ParameterPath::root()
+                        .with_segment(ParameterPathSegment::Index(0))
+                        .with_segment(ParameterPathSegment::TupleIndex(0)),
+                    ParameterPath::root()
+                        .with_segment(ParameterPathSegment::Index(1))
+                        .with_segment(ParameterPathSegment::TupleIndex(1)),
                 ],
                 vec![10, 20],
             )
@@ -2121,8 +2115,12 @@ mod tests {
         let value = vec![(1, 2), (3, 4)];
         let updated = value.tree_at_paths(
             vec![
-                ParameterPath::root().with_index(0).with_tuple_index(0),
-                ParameterPath::root().with_index(1).with_tuple_index(1),
+                ParameterPath::root()
+                    .with_segment(ParameterPathSegment::Index(0))
+                    .with_segment(ParameterPathSegment::TupleIndex(0)),
+                ParameterPath::root()
+                    .with_segment(ParameterPathSegment::Index(1))
+                    .with_segment(ParameterPathSegment::TupleIndex(1)),
             ],
             vec![10],
         );
@@ -2132,7 +2130,14 @@ mod tests {
     #[test]
     fn test_tree_at_reports_unknown_path() {
         let value = vec![(1, 2), (3, 4)];
-        let updated = value.tree_at_paths(vec![ParameterPath::root().with_index(2).with_tuple_index(0)], vec![10]);
+        let updated = value.tree_at_paths(
+            vec![
+                ParameterPath::root()
+                    .with_segment(ParameterPathSegment::Index(2))
+                    .with_segment(ParameterPathSegment::TupleIndex(0)),
+            ],
+            vec![10],
+        );
         assert_eq!(updated, Err(Error::UnknownNamedParameterPath { path: "[2].0".to_string() }));
     }
 
@@ -2149,7 +2154,14 @@ mod tests {
         value.insert("left", (1, 2));
         value.insert("right", (3, 4));
         let replaced = value
-            .tree_at_paths(vec![ParameterPath::root().with_key("right").with_tuple_index(1)], vec![99])
+            .tree_at_paths(
+                vec![
+                    ParameterPath::root()
+                        .with_segment(ParameterPathSegment::Key(format!("{:?}", "right")))
+                        .with_segment(ParameterPathSegment::TupleIndex(1)),
+                ],
+                vec![99],
+            )
             .unwrap();
         assert_eq!(replaced.get("left"), Some(&(1, 2)));
         assert_eq!(replaced.get("right"), Some(&(3, 99)));
@@ -2422,8 +2434,13 @@ mod tests {
             structure,
             HashMap::from([
                 (ParameterPath::root(), 1),
-                (ParameterPath::root().with_index(1), 10),
-                (ParameterPath::root().with_index(1).with_tuple_index(0), 99),
+                (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
+                (
+                    ParameterPath::root()
+                        .with_segment(ParameterPathSegment::Index(1))
+                        .with_segment(ParameterPathSegment::TupleIndex(0)),
+                    99,
+                ),
             ]),
         );
         assert_eq!(rebuilt, Ok(vec![(1, 1), (99, 10)]));
@@ -2434,7 +2451,7 @@ mod tests {
         let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
         let result = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
             structure,
-            HashMap::from([(ParameterPath::root().with_index(0), 5)]),
+            HashMap::from([(ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 5)]),
         );
         assert_eq!(result, Err(Error::MissingPrefixForPath { path: "[1].0".to_string() }));
     }
@@ -2444,7 +2461,10 @@ mod tests {
         let structure = vec![(Placeholder, Placeholder)];
         let result = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
             structure,
-            HashMap::from([(ParameterPath::root(), 5), (ParameterPath::root().with_index(1), 10)]),
+            HashMap::from([
+                (ParameterPath::root(), 5),
+                (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
+            ]),
         );
         assert_eq!(result, Err(Error::UnusedPrefixPath { path: "[1]".to_string() }));
     }
@@ -2468,9 +2488,14 @@ mod tests {
         let result = <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
             structure,
             HashMap::from([
-                (ParameterPath::root().with_key("left"), 10),
-                (ParameterPath::root().with_key("right"), 30),
-                (ParameterPath::root().with_key("right").with_tuple_index(1), 20),
+                (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "left"))), 10),
+                (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "right"))), 30),
+                (
+                    ParameterPath::root()
+                        .with_segment(ParameterPathSegment::Key(format!("{:?}", "right")))
+                        .with_segment(ParameterPathSegment::TupleIndex(1)),
+                    20,
+                ),
             ]),
         )
         .unwrap();
