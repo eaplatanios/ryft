@@ -22,6 +22,9 @@ impl<T> SameAs<T> for T {}
 /// `Vec<P>` is treated as a collection of leaf parameters because `P: Parameter` implies `P: Parameterized<P>`,
 /// and not as a single leaf. Without this marker, expressing both leaf and container semantics would require
 /// overlapping blanket implementations or a stable specialization feature.
+/// 
+/// Note that `ryft` provides a derive macro for this trait that you can use for custom types which need to
+/// implement [`Parameter`] by tagging them with `#[derive(Parameter)]`.
 pub trait Parameter {}
 
 impl Parameter for bool {}
@@ -190,7 +193,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 }
 
 // TODO(eaplatanios): Talk about the derive macro we have for this trait:
-//    - We also provide a `#[derive(Parameter)]` macro for convenience.
 //    - Supports both structs and enums already.
 //    - The parameter type must be a generic type parameter bounded by [Parameter].
 //    - There must be only one such generic type parameter. Not zero and not more than one.
@@ -205,62 +207,81 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 //      that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
 //      If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
 
-/// Recursively traversable data structure that contains nested [`Parameter`]s of type `P`. A [`Parameterized`] value
-/// can be thought of as consisting of two parts:
+/// Recursively traversable data structure that contains nested [`Parameter`] leaves of type `P`.
 ///
-///  1. Its _structure_ which can be obtained via [`Self::parameter_structure`].
-///  2. The _parameters_ nested within that structure, which can be obtained via [`Self::parameters`],
-///     [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`],
-///     and [`Self::into_named_parameters`].
+/// A [`Parameterized`] value can be viewed as two parts:
 ///
-/// Given a [`Self::ParameterStructure`] and an ordered collection of [`Parameter`]s, of potentially a different type
-/// than `P`, new instances of this type can be constructed using [`Parameterized::from_parameters_with_remainder`].
-/// Another way to think of [`Parameterized`] types is as tree-structured containers of [`Parameter`]s.
+///  1. Its _structure_, obtained via [`Self::parameter_structure`].
+///  2. Its leaf _parameters_, obtained via [`Self::parameters`], [`Self::parameters_mut`],
+///     [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`], and
+///     [`Self::into_named_parameters`].
 ///
-/// This is analogous to a [JAX pytree](https://docs.jax.dev/en/latest/pytrees.html): JAX represents a pytree as
-/// `leaves + treedef`, while this trait represents a value as parameters plus [`Self::ParameterStructure`].
+/// This API is inspired by JAX pytrees and Equinox's PyTree manipulation APIs, adapted to `ryft` terminology and
+/// Rust's type system.
 ///
-/// # Mapping To JAX Pytrees
+/// # What Is A Parameterized Tree?
 ///
-/// - JAX `tree.flatten(x)` corresponds to [`parameters`](Self::parameters) (the leaves) plus
-///   [`parameter_structure`](Self::parameter_structure) (the tree definition).
-/// - JAX `tree.unflatten(treedef, leaves)` corresponds to [`from_parameters`](Self::from_parameters) or
-///   [`from_parameters_with_remainder`](Self::from_parameters_with_remainder).
-/// - JAX `tree.map(f, x)` corresponds to [`map_parameters`](Self::map_parameters).
-///
-/// # Mapping To Equinox Manipulations
-///
-/// - Equinox `filter` corresponds to [`filter_named_parameters`](Self::filter_parameters).
-/// - Equinox `partition` corresponds to [`partition_named_parameters`](Self::partition_parameters).
-/// - Equinox `combine` corresponds to [`combine_optional_parameters`](Self::combine_optional_parameters).
-/// - Equinox `apply_updates` corresponds to [`apply_parameter_updates`](Self::apply_parameter_updates).
-///
-/// Equinox-inspired tree manipulation operations supported in this module:
-/// - filter-like selection through [`Parameterized::filter_named_parameters`].
-/// - partition-like splitting through [`Parameterized::partition_named_parameters`].
-/// - combine-like reconstruction through [`Parameterized::combine_optional_parameters`].
-/// - apply-updates behavior through [`Parameterized::apply_parameter_updates`].
-/// - tree-at replacement via [`Parameterized::tree_at`] and [`Parameterized::tree_at_paths`].
-/// Reference: https://docs.kidger.site/equinox/api/manipulation.
-///
-/// # Examples
-///
-/// Flatten into leaves and structure:
+/// Any nested container whose leaves implement [`Parameter`] can be traversed as a [`Parameterized`] tree.
+/// A single [`Parameter`] leaf is also a valid tree.
 ///
 /// ```rust
-/// # use ryft_core::parameters::{Parameterized, Placeholder};
-///
-/// let value = vec![(1.0_f32, 2.0_f32), (3.0_f32, 4.0_f32)];
-/// assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1.0, 2.0, 3.0, 4.0]);
-/// assert_eq!(value.parameter_structure(), vec![(Placeholder, Placeholder), (Placeholder, Placeholder)]);
+/// # use ryft_core::parameters::Parameterized;
+/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+/// assert_eq!(value.parameter_count(), 4);
+/// assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
 /// ```
 ///
-/// Rebuild the same structure with different parameter values:
+/// # Common Parameterized Functions
+///
+/// The most commonly used operations are flattening, rebuilding, and mapping:
+///
+/// - Flatten leaves: [`parameters`](Self::parameters) together with
+///   [`parameter_structure`](Self::parameter_structure).
+/// - Rebuild from leaves: [`from_parameters`](Self::from_parameters) or
+///   [`from_parameters_with_remainder`](Self::from_parameters_with_remainder).
+/// - Map leaves: [`map_parameters`](Self::map_parameters) or [`map_named_parameters`](Self::map_named_parameters).
+///
+/// In direct JAX terms:
+///
+/// - `jax.tree.flatten(x)` corresponds to [`parameters`](Self::parameters) +
+///   [`parameter_structure`](Self::parameter_structure).
+/// - `jax.tree.unflatten(treedef, leaves)` corresponds to [`from_parameters`](Self::from_parameters).
+/// - `jax.tree.map(f, x)` corresponds to [`map_parameters`](Self::map_parameters).
+///
+/// ## Common function: `map_parameters`
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+/// let list_of_lists = vec![vec![1_i32, 2, 3], vec![1, 2], vec![1, 2, 3, 4]];
+/// let doubled = list_of_lists.map_parameters(|value| value * 2)?;
+/// assert_eq!(doubled, vec![vec![2, 4, 6], vec![2, 4], vec![2, 4, 6, 8]]);
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// ## Common function: `map_named_parameters`
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+/// let scaled = value.map_named_parameters(|path, parameter| {
+///     if path.to_string().ends_with(".1") { parameter * 10 } else { parameter }
+/// })?;
+/// assert_eq!(scaled, vec![(1, 20), (3, 40)]);
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// # Viewing The Parameterized Definition Of A Value
+///
+/// [`parameter_structure`](Self::parameter_structure) returns the same tree shape with all leaves replaced by
+/// [`Placeholder`] values. This is analogous to inspecting a pytree definition (`treedef`) for debugging.
 ///
 /// ```rust
 /// # use ryft_core::parameters::{Parameterized, Placeholder};
+/// let value = vec![(1.0_f32, 2.0_f32), (3.0_f32, 4.0_f32)];
+/// let structure = value.parameter_structure();
+/// assert_eq!(structure, vec![(Placeholder, Placeholder), (Placeholder, Placeholder)]);
+/// assert_eq!(structure.parameter_count(), 4);
 ///
-/// let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
 /// let rebuilt = <Vec<(f32, f32)> as Parameterized<f32>>::from_parameters(
 ///     structure,
 ///     vec![10.0_f32, 20.0_f32, 30.0_f32, 40.0_f32],
@@ -269,37 +290,123 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// # Ok::<(), ryft_core::errors::Error>(())
 /// ```
 ///
-/// Apply the same transformation to every leaf while preserving structure:
+/// # Parameterized Trees In Ryft Workflows
+///
+/// Similar to how JAX transformations and APIs consume pytrees, many `ryft` utilities operate on parameterized trees:
+///
+/// - [`from_named_parameters`](Self::from_named_parameters) rebuilds from path-indexed leaves.
+/// - [`from_broadcasted_named_parameters`](Self::from_broadcasted_named_parameters) applies prefix-based matching
+///   (longest-prefix-wins), analogous to tree-prefix matching patterns in JAX APIs.
+/// - [`filter_parameters`](Self::filter_parameters), [`partition_parameters`](Self::partition_parameters),
+///   [`combine_optional_parameters`](Self::combine_optional_parameters), and
+///   [`apply_parameter_updates`](Self::apply_parameter_updates) mirror the common Equinox manipulation flow.
+///
+/// # Explicit Parameter Paths
+///
+/// Like JAX key paths, each leaf has a deterministic structural path represented by [`ParameterPath`].
 ///
 /// ```rust
 /// # use ryft_core::parameters::Parameterized;
-///
-/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-/// let shifted: Vec<(i64, i64)> = value.map_parameters(|v| i64::from(v) + 100)?;
-/// assert_eq!(shifted, vec![(101, 102), (103, 104)]);
-/// # Ok::<(), ryft_core::errors::Error>(())
+/// let value = vec![(1_i32, 2_i32)];
+/// let paths = value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>();
+/// assert_eq!(paths, vec!["$[0].0".to_string(), "$[0].1".to_string()]);
 /// ```
 ///
-/// Inspect leaf values together with deterministic structural paths:
-///
 /// ```rust
 /// # use ryft_core::parameters::Parameterized;
-///
 /// let value = vec![(1_i32, 2_i32)];
 /// let named = value
 ///     .named_parameters()
 ///     .map(|(path, parameter)| (path.to_string(), *parameter))
 ///     .collect::<Vec<_>>();
-///
-/// assert_eq!(
-///     named,
-///     vec![("$[0].0".to_string(), 1), ("$[0].1".to_string(), 2),],
-/// );
+/// assert_eq!(named, vec![("$[0].0".to_string(), 1), ("$[0].1".to_string(), 2),]);
 /// ```
 ///
-/// For additional intuition and patterns, see JAX's docs on
-/// [pytrees](https://docs.jax.dev/en/latest/pytrees.html) and
-/// [custom pytree nodes](https://docs.jax.dev/en/latest/custom_pytrees.html).
+/// # Common Parameterized Gotchas
+///
+/// ## Mistaking container nodes for leaves
+///
+/// Traversal happens at leaf granularity. Container nodes (e.g., tuples, vectors, maps) are traversed recursively
+/// and are not passed to mapping closures as a whole.
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+/// let value = vec![(2_i32, 3_i32)];
+/// let mapped = value.map_parameters(|leaf| leaf * 10)?;
+/// assert_eq!(mapped, vec![(20, 30)]);
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// ## Handling `Option` and `None`
+///
+/// Unlike JAX's default treatment of `None` (absence of a node), `Option<P>` is a leaf parameter type in `ryft`
+/// whenever `P: Parameter`. This is frequently useful for optional updates/masks.
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+/// let value = vec![Some(1_i32), None, Some(3_i32)];
+/// assert_eq!(value.parameter_count(), 3);
+/// assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![Some(1), None, Some(3)]);
+/// ```
+///
+/// ## Rebuilding from named paths is strict
+///
+/// [`from_named_parameters`](Self::from_named_parameters) requires exact path coverage (no missing or extra paths).
+/// Use [`from_broadcasted_named_parameters`](Self::from_broadcasted_named_parameters) when you want prefix-based
+/// assignment behavior instead.
+///
+/// # Common Parameterized Patterns
+///
+/// ## Partition, modify, and combine
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+/// let structure = value.parameter_structure();
+/// let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("$[0]"))?;
+/// let recombined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_parameters(
+///     structure,
+///     vec![selected, rejected],
+/// )?;
+/// assert_eq!(recombined, vec![(1, 2), (3, 4)]);
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// ## Tree surgery with selectors
+///
+/// ```rust
+/// # use ryft_core::parameters::Parameterized;
+/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+/// let updated = value.tree_at(
+///     |structure| {
+///         structure
+///             .named_parameters()
+///             .map(|(path, _)| path)
+///             .filter(|path| path.to_string().ends_with(".0"))
+///             .collect::<Vec<_>>()
+///     },
+///     vec![10_i32, 30_i32],
+/// )?;
+/// assert_eq!(updated, vec![(10, 2), (30, 4)]);
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
+///
+/// # Relationship To JAX And Equinox
+///
+/// - JAX `flatten` / `unflatten` / `map` correspond to [`parameters`](Self::parameters) +
+///   [`parameter_structure`](Self::parameter_structure), [`from_parameters`](Self::from_parameters), and
+///   [`map_parameters`](Self::map_parameters), respectively.
+/// - Equinox `filter` / `partition` / `combine` / `apply_updates` / `tree_at` correspond to
+///   [`filter_parameters`](Self::filter_parameters), [`partition_parameters`](Self::partition_parameters),
+///   [`combine_optional_parameters`](Self::combine_optional_parameters),
+///   [`apply_parameter_updates`](Self::apply_parameter_updates), and [`tree_at`](Self::tree_at) /
+///   [`tree_at_paths`](Self::tree_at_paths), respectively.
+///
+/// # References
+///
+/// - JAX PyTrees: <https://docs.jax.dev/en/latest/pytrees.html>
+/// - JAX Custom PyTrees: <https://docs.jax.dev/en/latest/custom_pytrees.html>
+/// - Equinox PyTree Manipulation: <https://docs.kidger.site/equinox/api/manipulation/>
 ///
 /// # Implementations Provided In This Module
 ///
@@ -573,10 +680,21 @@ pub trait Parameterized<P: Parameter>: Sized {
         Self::To::<T>::from_named_parameters(structure, mapped_parameters)
     }
 
-    /// Partitions this value's named parameters into selected and rejected trees according to `predicate`.
+    /// Splits this value into selected and rejected optional trees according to `predicate`.
     ///
-    /// The returned trees preserve the original structure and use `Some(parameter)` for selected leaves and `None`
-    /// for filtered-out leaves.
+    /// This is inspired by Equinox
+    /// [`partition`](https://docs.kidger.site/equinox/api/manipulation/#equinoxpartition).
+    /// It is equivalent to filtering with `predicate` and its inverse, but traverses this tree only once.
+    ///
+    /// # Parameters
+    ///
+    ///   - `predicate`: Called on every leaf as `predicate(path, parameter)`. Return `true` to place that leaf in the
+    ///     first output tree; return `false` to place it in the second output tree.
+    ///
+    /// # Returns
+    ///
+    /// A tuple `(selected, rejected)` where both trees preserve the input structure. For each leaf, exactly one side
+    /// contains `Some(value)` and the other side contains `None`.
     ///
     /// # Example
     ///
@@ -613,8 +731,20 @@ pub trait Parameterized<P: Parameter>: Sized {
         Ok((selected, rejected))
     }
 
-    /// Returns a structure-preserving optional tree where leaves selected by `predicate` are wrapped in [`Some`],
-    /// and all other leaves are [`None`].
+    /// Keeps leaves that satisfy `predicate` and replaces all other leaves with `None`.
+    ///
+    /// This is inspired by Equinox
+    /// [`filter`](https://docs.kidger.site/equinox/api/manipulation/#equinoxfilter), using `Option<P>` as the
+    /// replacement mechanism.
+    ///
+    /// # Parameters
+    ///
+    ///   - `predicate`: Called on every leaf as `predicate(path, parameter)`. Return `true` to keep that leaf as
+    ///     `Some(parameter)`; return `false` to replace it with `None`.
+    ///
+    /// # Returns
+    ///
+    /// A structure-preserving optional tree (`Self::To<Option<P>>`).
     ///
     /// # Example
     ///
@@ -635,7 +765,23 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Combines optional trees into one value using left-to-right `Some` precedence per leaf.
     ///
-    /// If multiple trees provide `Some` for the same leaf, the first tree's value is used.
+    /// This is inspired by Equinox
+    /// [`combine`](https://docs.kidger.site/equinox/api/manipulation/#equinoxcombine) and is typically used to undo
+    /// [`Self::filter_parameters`] or [`Self::partition_parameters`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `structure`: Target parameter structure for the reconstructed output.
+    ///   - `optional_trees`: Optional trees with the same structure as `structure`.
+    ///
+    /// # Returns
+    ///
+    /// A reconstructed value where each leaf is the first non-`None` candidate found at that position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InsufficientParameters`] if any optional tree is too short, [`Error::MissingNamedParameterPath`]
+    /// if all candidates are `None` for a leaf, and [`Error::UnusedParameters`] if any optional tree has extra leaves.
     ///
     /// # Example
     ///
@@ -680,8 +826,22 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Replaces parameters using an optional replacement tree.
     ///
-    /// Leaves with `Some(value)` in `replacements` replace the corresponding value in `self`.
-    /// Leaves with `None` are kept unchanged.
+    /// This is a convenience operation built on top of [`Self::combine_optional_parameters`]. Leaves with
+    /// `Some(value)` in `replacements` take precedence over existing leaf values in `self`, while `None` leaves
+    /// preserve the current value.
+    ///
+    /// # Parameters
+    ///
+    ///   - `replacements`: Optional replacement tree aligned with `self`.
+    ///
+    /// # Returns
+    ///
+    /// A value with the same structure as `self`, where each leaf is either replaced or kept.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same structural errors as [`Self::combine_optional_parameters`] when the replacement tree shape
+    /// does not align with `self`.
     ///
     /// # Example
     ///
@@ -702,6 +862,24 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 
     /// Applies optional updates leaf-wise using `update_fn(base, update)` whenever an update is present.
+    ///
+    /// This is the general form of the Equinox-inspired
+    /// [`apply_updates`](https://docs.kidger.site/equinox/api/manipulation/#equinoxapply_updates) pattern.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Optional update tree aligned with `self`.
+    ///   - `update_fn`: Custom update rule used only when a leaf in `updates` is `Some(update)`.
+    ///
+    /// # Returns
+    ///
+    /// A value with the same structure as `self`, where each leaf is either unchanged (`None` update) or updated via
+    /// `update_fn`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InsufficientParameters`] or [`Error::UnusedParameters`] when the flattened lengths of
+    /// `self` and `updates` do not match.
     ///
     /// # Example
     ///
@@ -746,6 +924,27 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 
     /// Applies additive updates to parameters where the update tree contains `Some(delta)`.
+    ///
+    /// This mirrors Equinox's `apply_updates` behavior for additive updates and is equivalent to
+    /// [`Self::apply_parameter_updates_with`] with `|base, delta| base + delta`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `updates`: Optional additive deltas aligned with `self`.
+    ///
+    /// # Returns
+    ///
+    /// A value with updated leaves where updates are present and unchanged leaves where updates are `None`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::Parameterized;
+    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    /// let updated = value.apply_parameter_updates(vec![(Some(10), None), (None, Some(-2))])?;
+    /// assert_eq!(updated, vec![(11, 2), (3, 2)]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
     fn apply_parameter_updates(self, updates: Self::To<Option<P>>) -> Result<Self, Error>
     where
         P: std::ops::Add<Output = P>,
@@ -754,9 +953,20 @@ pub trait Parameterized<P: Parameter>: Sized {
         self.apply_parameter_updates_with(updates, |base, delta| base + delta)
     }
 
-    /// Replaces parameters at `paths` with values from `replacements`.
+    /// Replaces parameters at explicit paths with values from `replacements`.
     ///
-    /// Returns [`Error::ReplacementCountMismatch`] when `paths` and `replacements` have different lengths.
+    /// This is an explicit-path variant of the Equinox-inspired
+    /// [`tree_at`](https://docs.kidger.site/equinox/api/manipulation/#equinoxtree_at) behavior.
+    ///
+    /// # Parameters
+    ///
+    ///   - `paths`: Exact [`ParameterPath`] values identifying the leaves to replace.
+    ///   - `replacements`: Replacement parameter values, in one-to-one correspondence with `paths`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReplacementCountMismatch`] when `paths` and `replacements` have different lengths, and
+    /// [`Error::UnknownNamedParameterPath`] if any requested path is not a valid leaf path.
     fn tree_at_paths<I, R>(self, paths: I, replacements: R) -> Result<Self, Error>
     where
         I: IntoIterator<Item = ParameterPath>,
@@ -789,7 +999,44 @@ pub trait Parameterized<P: Parameter>: Sized {
         self.replace_parameters(replacement_tree)
     }
 
-    /// Selects replacement paths from this value's parameter structure and applies `tree_at_paths`.
+    /// Replaces selected leaves using a selector closure over the parameter structure.
+    ///
+    /// This corresponds to the selector-based style of Equinox
+    /// [`tree_at`](https://docs.kidger.site/equinox/api/manipulation/#equinoxtree_at), with explicit
+    /// [`ParameterPath`] selection.
+    ///
+    /// # Parameters
+    ///
+    ///   - `selector`: Function that receives this value's parameter structure and returns the paths to replace.
+    ///   - `replacements`: Replacement parameter values for the selected paths.
+    ///
+    /// # Returns
+    ///
+    /// A value with selected leaves replaced and all other leaves unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same validation errors as [`Self::tree_at_paths`] (e.g.,
+    /// [`Error::ReplacementCountMismatch`] and [`Error::UnknownNamedParameterPath`]).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::Parameterized;
+    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    /// let updated = value.tree_at(
+    ///     |structure| {
+    ///         structure
+    ///             .named_parameters()
+    ///             .map(|(path, _)| path)
+    ///             .filter(|path| path.to_string() == "$[1].1")
+    ///             .collect::<Vec<_>>()
+    ///     },
+    ///     vec![99_i32],
+    /// )?;
+    /// assert_eq!(updated, vec![(1, 2), (3, 99)]);
+    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// ```
     fn tree_at<F: FnOnce(&Self::ParameterStructure) -> Vec<ParameterPath>, R: IntoIterator<Item = P>>(
         self,
         selector: F,
