@@ -335,6 +335,10 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// - Every `P: Parameter` is a leaf and therefore implements [`Parameterized<P>`].
 /// - [`PhantomData<P>`] implements [`Parameterized<P>`] and contributes zero parameters.
 /// - Tuples whose elements are all themselves [`Parameterized`] are supported for arities of 1 through 12.
+///   Tuples with mixed [`Parameterized`] and non-[`Parameterized`] elements are supposed only when they appear within
+///   types for which we derive [`Parameterized`] implementations using the `#[derive(Parameterized)]` macro.
+/// - Options are supported only when they appear within types for which we derive [`Parameterized`] implementations
+///   using the `#[derive(Parameterized)]` macro.
 /// - Arrays (`[T; N]`) and [`Vec<T>`] are supported when `T: Parameterized<P>`.
 /// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + Debug + Hash`, `S: BuildHasher + Clone`,
 ///   and `T: Parameterized<P>`.
@@ -1005,8 +1009,6 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
         Ok(PhantomData)
     }
 }
-
-// TODO(eaplatanios): Add `Parameterized<P>` implementation for `Option<T>` where `T: Parameterized<P>`.
 
 // Use declarative macros to provide implementations for tuples of [`Parameterized`] items. Note that if a tuple
 // contains a mix of [`Parameterized`] and non-[`Parameterized`] items, then the generated implementations here
@@ -1803,6 +1805,12 @@ mod tests {
 
     #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
     #[ryft(crate = "crate::parameters::tests::derive_support")]
+    struct DomainOptionalTuple<P: Parameter> {
+        maybe_pair: Option<(P, usize)>,
+    }
+
+    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
+    #[ryft(crate = "crate::parameters::tests::derive_support")]
     enum DomainRatesEnum<P: Parameter> {
         Scalar(P),
         Pair { left: P, right: P },
@@ -2182,6 +2190,41 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_supports_nested_option_with_mixed_tuple_fields() {
+        let some = DomainOptionalTuple { maybe_pair: Some((Rate32(9), 42)) };
+        assert_eq!(some.parameter_count(), 1);
+        assert_eq!(some.parameters().copied().collect::<Vec<_>>(), vec![Rate32(9)]);
+        assert_eq!(
+            some.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![(".maybe_pair.0.0".to_string(), Rate32(9))],
+        );
+        assert_eq!(some.parameter_structure(), DomainOptionalTuple { maybe_pair: Some((Placeholder, 42)) });
+        assert_eq!(
+            DomainOptionalTuple::from_named_parameters(
+                some.parameter_structure(),
+                some.clone().into_named_parameters().collect::<HashMap<_, _>>(),
+            ),
+            Ok(some.clone())
+        );
+
+        let mapped: DomainOptionalTuple<Rate64> =
+            some.clone().map_parameters(|rate| Rate64(i64::from(rate.0) + 5)).unwrap();
+        assert_eq!(mapped, DomainOptionalTuple { maybe_pair: Some((Rate64(14), 42)) });
+
+        let none = DomainOptionalTuple::<Rate32> { maybe_pair: None };
+        assert_eq!(none.parameter_count(), 0);
+        assert!(none.named_parameters().next().is_none());
+        assert_eq!(none.parameter_structure(), DomainOptionalTuple { maybe_pair: None::<(Placeholder, usize)> });
+        assert_eq!(
+            DomainOptionalTuple::from_named_parameters(
+                none.parameter_structure(),
+                none.clone().into_named_parameters().collect::<HashMap<_, _>>(),
+            ),
+            Ok(none)
+        );
+    }
+
+    #[test]
     fn test_derive_supports_additional_parameter_bounds_in_where_clause() {
         let value = DomainRatesVec {
             values: vec![
@@ -2412,10 +2455,7 @@ mod tests {
         let structure = value.parameter_structure();
         let named_parameters = value.into_named_parameters().collect::<HashMap<_, _>>();
         assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-                structure,
-                named_parameters
-            ),
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(structure, named_parameters),
             Ok(vec![(1, 2), (3, 4)]),
         );
     }

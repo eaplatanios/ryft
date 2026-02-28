@@ -66,7 +66,7 @@ fn test_tuple_struct() {
 }
 
 #[test]
-fn test_struct_with_nested_tuples() {
+fn test_struct_with_nested_tuples_and_options() {
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     struct StructWithNestedTuples<P: Parameter> {
         p_0: P,
@@ -100,6 +100,48 @@ fn test_struct_with_nested_tuples() {
         Ok(StructWithNestedTuples { p_0: 4i64, p_1: (0usize, (-1i32, 2i64, -42i64, 0i64)), np_0, np_1 })
     );
     assert_eq!(StructWithNestedTuples::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+
+    #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
+    struct StructWithNestedOption<P: Parameter> {
+        p_0: Option<(usize, (i32, P, i64, P))>,
+        np_0: (usize, usize),
+        np_1: u64,
+    }
+
+    let mut value = StructWithNestedOption { p_0: Some((0usize, (-1i32, 2usize, -42i64, 0usize))), np_0, np_1 };
+    let structure = StructWithNestedOption {
+        p_0: Some((0usize, (-1i32, Placeholder, -42i64, Placeholder))),
+        np_0,
+        np_1,
+    };
+    let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 2 });
+
+    assert_eq!(value.parameter_count(), 2);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&2usize, &0usize]);
+    assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 2usize, &mut 0usize]);
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![2usize, 0usize]);
+    assert_eq!(
+        StructWithNestedOption::from_parameters(structure.clone(), Vec::<usize>::new()),
+        insufficient_parameters_error
+    );
+    assert_eq!(
+        StructWithNestedOption::from_parameters(structure.clone(), vec![4i64, 2i64]),
+        Ok(StructWithNestedOption { p_0: Some((0usize, (-1i32, 4i64, -42i64, 2i64))), np_0, np_1 })
+    );
+    assert_eq!(StructWithNestedOption::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+
+    let value = StructWithNestedOption::<usize> { p_0: None, np_0, np_1 };
+    let structure = StructWithNestedOption::<Placeholder> { p_0: None, np_0, np_1 };
+    assert_eq!(value.parameter_count(), 0);
+    assert_eq!(value.parameter_structure(), structure);
+    assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
+    assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(
+        StructWithNestedOption::from_parameters(structure.clone(), Vec::<i64>::new()),
+        Ok(StructWithNestedOption::<i64> { p_0: None, np_0, np_1 })
+    );
+    assert_eq!(StructWithNestedOption::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
 }
 
 #[test]

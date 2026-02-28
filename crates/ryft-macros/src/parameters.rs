@@ -331,6 +331,30 @@ impl CodeGenerator {
     /// invalid or unknown `[#ryft(...)]` attributes in any of the nested [`syn::Field`]s or [`syn::Variant`]s, as well
     /// as for types of data that are not supported by our `#[derive(Parameterized)]` macro.
     fn extract_data(&mut self, input: &syn::DeriveInput) {
+        /// Extracts the inner type from an [`Option`] type expression. This recognizes any type-path whose final path
+        /// segment is [`Option`] with exactly one type argument (e.g., `Option<T>` or `std::option::Option<T>`) and
+        /// returns that type argument. For non-[`Option`] types, malformed generic arguments, or non-type generic
+        /// arguments, this function returns [`None`].
+        fn extract_option_type(ty: &syn::Type) -> Option<syn::Type> {
+            let syn::Type::Path(type_path) = ty else {
+                return None;
+            };
+            let segment = type_path.path.segments.last()?;
+            if segment.ident != "Option" {
+                return None;
+            }
+            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return None;
+            };
+            if arguments.args.len() != 1 {
+                return None;
+            }
+            match arguments.args.first() {
+                Some(syn::GenericArgument::Type(inner_ty)) => Some(inner_ty.clone()),
+                _ => None,
+            }
+        }
+
         /// Helper function that extracts a [Field] from the provided data. This function also checks for any invalid
         /// or unknown `[#ryft(...)]` attributes attached to the corresponding [`syn::Field`].
         ///
@@ -375,20 +399,23 @@ impl CodeGenerator {
                 index: field_index,
                 ident: field_ident,
                 ty: field_ty.clone(),
-                fields: {
-                    if let syn::Type::Tuple(type_tuple) = &field_ty {
-                        Some(
-                            type_tuple
-                                .elems
-                                .iter()
-                                .enumerate()
-                                .map(|(i, e)| extract_field(generator, i, None, e.clone(), None))
-                                .collect(),
-                        )
-                    } else {
-                        None
-                    }
+                fields: if let syn::Type::Tuple(type_tuple) = &field_ty {
+                    Some(NestedFields::Tuple(
+                        type_tuple
+                            .elems
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| extract_field(generator, i, None, e.clone(), None))
+                            .collect(),
+                    ))
+                } else if let Some(inner_ty) = extract_option_type(&field_ty) {
+                    let mut inner_field = extract_field(generator, 0, None, inner_ty, None);
+                    inner_field.use_receiver_directly = true;
+                    Some(NestedFields::Option(Box::new(inner_field)))
+                } else {
+                    None
                 },
+                use_receiver_directly: false,
             }
         }
 
@@ -490,7 +517,12 @@ impl CodeGenerator {
             // [`CodeGenerator::parameter_type`].
             if field.is_parameter {
                 if let Some(fields) = &field.fields {
-                    fields.iter().for_each(|field| add_parameterized_bounds(generator, generics, field));
+                    match fields {
+                        NestedFields::Tuple(fields) => {
+                            fields.iter().for_each(|field| add_parameterized_bounds(generator, generics, field))
+                        }
+                        NestedFields::Option(field) => add_parameterized_bounds(generator, generics, field),
+                    }
                 } else {
                     // We need to construct a bound that looks like this (abusing notation a bit and representing
                     // the field type as a function of the parameter type), where `P` is the parameter type:
@@ -863,8 +895,61 @@ impl CodeGenerator {
                         };
                         Some(quote!(<#ty as #ryft::Parameterized<#parameter_ty>>::#assoc_ty))
                     }
-                    Field { fields: Some(fields), .. } => {
+                    Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                         Some(generate_assoc_iter_type_for_fields(generator, fields, iter_type, iter_parameter_type))
+                    }
+                    Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                        let inner_ty = &inner_field.ty;
+                        let inner_iterator_ty = generate_assoc_iter_type_for_fields(
+                            generator,
+                            std::slice::from_ref(inner_field.as_ref()),
+                            iter_type,
+                            iter_parameter_type,
+                        );
+                        Some(match &iter_type {
+                            IterType::Iter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::Iter<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::IterMut => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IterMut<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::IntoIter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IntoIter<#inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(#inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::NamedIter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::Iter<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::NamedIterMut => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IterMut<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::NamedIntoIter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IntoIter<#inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(#inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                        })
                     }
                 })
                 .map(|iterator_ty| match &iter_type {
@@ -1142,9 +1227,14 @@ impl CodeGenerator {
                 match &field {
                     Field { is_parameter: false, .. } => token_stream,
                     Field { fields: None, .. } => quote!(#token_stream + #receiver.parameter_count()),
-                    Field { fields: Some(fields), .. } => {
+                    Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                         let fields_expression = generate_body(fields, Some(receiver));
                         quote!(#token_stream + #fields_expression)
+                    }
+                    Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                        let fields_expression =
+                            generate_body(std::slice::from_ref(inner_field.as_ref()), Some(quote!(value)));
+                        quote!(#token_stream + #receiver.as_ref().map_or(0usize, |value| #fields_expression))
                     }
                 }
             })
@@ -1202,9 +1292,14 @@ impl CodeGenerator {
                     match &field {
                         Field { is_parameter: false, .. } => quote!(#prefix #receiver.clone()),
                         Field { fields: None, .. } => quote!(#prefix #receiver.parameter_structure()),
-                        Field { fields: Some(fields), .. } => {
+                        Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                             let fields_expression = generate_body(fields, Some(receiver));
                             quote!(#prefix (#fields_expression))
+                        }
+                        Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                            let fields_expression =
+                                generate_body(std::slice::from_ref(inner_field.as_ref()), Some(quote!(value)));
+                            quote!(#prefix #receiver.as_ref().map(|value| #fields_expression))
                         }
                     }
                 })
@@ -1370,8 +1465,32 @@ impl CodeGenerator {
                                 segment: #path_segment,
                             }),
                         }),
-                        Field { fields: Some(fields), .. } => {
+                        Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                             let iterator = generate_body_for_fields(generator, fields, Some(receiver), iter_type);
+                            if iter_type.is_named() {
+                                Some(quote!(#ryft::PathPrefixedParameterIterator {
+                                    iterator: #iterator,
+                                    segment: #path_segment,
+                                }))
+                            } else {
+                                Some(iterator)
+                            }
+                        }
+                        Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                            let iterator = generate_body_for_fields(
+                                generator,
+                                std::slice::from_ref(inner_field.as_ref()),
+                                Some(quote!(value)),
+                                iter_type,
+                            );
+                            let iterator = match &iter_type {
+                                IterType::Iter => quote!(#receiver.iter().flat_map(|value| #iterator)),
+                                IterType::IterMut => quote!(#receiver.iter_mut().flat_map(|value| #iterator)),
+                                IterType::IntoIter => quote!(#receiver.into_iter().flat_map(|value| #iterator)),
+                                IterType::NamedIter => quote!(#receiver.iter().flat_map(|value| #iterator)),
+                                IterType::NamedIterMut => quote!(#receiver.iter_mut().flat_map(|value| #iterator)),
+                                IterType::NamedIntoIter => quote!(#receiver.into_iter().flat_map(|value| #iterator)),
+                            };
                             if iter_type.is_named() {
                                 Some(quote!(#ryft::PathPrefixedParameterIterator {
                                     iterator: #iterator,
@@ -1483,9 +1602,17 @@ impl CodeGenerator {
                                 error => error,
                             })?
                         },
-                        Field { fields: Some(fields), .. } => {
+                        Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                             let fields_expression = generate_body(generator, fields, Some(structure));
                             quote!(#prefix (#fields_expression))
+                        }
+                        Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                            let fields_expression = generate_body(
+                                generator,
+                                std::slice::from_ref(inner_field.as_ref()),
+                                Some(quote!(structure)),
+                            );
+                            quote!(#prefix #structure.map(|structure| Ok(#fields_expression)).transpose()?)
                         }
                     }
                 })
@@ -1594,10 +1721,19 @@ struct Variant {
     kind: Kind,
 }
 
+/// [`Field`]s nested within another [`Field`] for cases where we need to recurse into the nested fields.
+enum NestedFields {
+    /// Tuple [`Field`]s that are nested within a [`Field`] that is a tuple.
+    Tuple(Vec<Field>),
+
+    /// Option [`Field`] that is nested within a [`Field`] that is an [`Option`].
+    Option(Box<Field>),
+}
+
 /// Parsed [`syn::Field`] from a container that was annotated with `#[derive(Parameterized)]`.
 struct Field {
     /// Indicates whether the [`syn::Type`] of this [`Field`] should be bounded by [`Parameterized`].
-    /// This is determined by whether or not this [`Field`]'s type references [`CodeGenerator::parameter_type`].
+    /// This is determined by whether this [`Field`]'s type references [`CodeGenerator::parameter_type`].
     is_parameter: bool,
 
     /// Index of this [`Field`] in the container that it belongs.
@@ -1609,15 +1745,24 @@ struct Field {
     /// [`syn::Type`] of this [`Field`].
     ty: syn::Type,
 
-    /// Nested [`Field`]s of this [`Field`]. This is optional because it is only relevant for tuples. When a
-    /// [`CodeGenerator`] synthesized [`Parameterized`] implementations it needs to recurse into nested tuple types
-    /// as those types are not [`Parameterized`] by default (this is due to the fact that providing [`Parameterized`]
-    /// implementations for all possible tuple types with arbitrary combinations of [`Parameter`] and non-[`Parameter`]
-    /// fields is too expensive; the number of such combinations grows exponentially with the tuple size).
-    ///
-    /// In summary, the way to interpret this field is that if [`Field::ty`] is a [`syn::Type::Tuple`], then this field
-    /// will be populated with the [`Field`]s extracted from that [`syn::Type::Tuple`].
-    fields: Option<Vec<Field>>,
+    /// Nested [`Field`]s of this [`Field`]. This is optional because it is only relevant for tuple and [`Option`]
+    /// wrappers. When a [`CodeGenerator`] synthesizes [`Parameterized`] implementations it needs to recurse into
+    /// nested tuple types (this is due to the fact that providing [`Parameterized`] implementations for all possible
+    /// tuple types with arbitrary combinations of [`Parameter`] and non-[`Parameter`] fields is too expensive; the
+    /// number of such combinations grows exponentially with the tuple size), and into nested [`Option`] payloads to
+    /// support optional mixed fields without requiring a global container-level `impl Parameterized<P> for Option<T>`,
+    /// which is problematic because we also already have `impl<P: Parameter> Parameter for Option<P>`. In summary,
+    /// this field is populated when [`Self::ty`] is either a [`syn::Type::Tuple`] or an [`Option`] type-path, in which
+    /// case it stores the corresponding extracted nested [`Field`] description.
+    fields: Option<NestedFields>,
+
+    /// Boolean flag indicating whether [`Self::member`] should use the provided receiver directly, without appending
+    /// any member accessor (e.g., `.field` or `.0` to it). This is needed for synthetic nodes that do not correspond
+    /// to an actual struct field or tuple member. In particular, for nested [`Option`]s we recurse by pattern matching
+    /// as `Some(value)`. The synthesized inner field then represents that already-bound `value`, meaning that member
+    /// access must evaluate to `value` directly. Without this marker, recursion would incorrectly try to access
+    /// `value.0` before descending into nested tuple fields.
+    use_receiver_directly: bool,
 }
 
 impl Field {
@@ -1634,11 +1779,13 @@ impl Field {
     /// (e.g., `match &self { Enum(field_0) => ... field_0 ...}`).
     fn member(&self, receiver: Option<&TokenStream>) -> TokenStream {
         let index = syn::Member::Unnamed(self.index.into());
-        match (&self.ident, receiver) {
-            (None, None) => format_ident!("field_{}", self.index).into_token_stream(),
-            (Some(ident), None) => quote!(#ident),
-            (Some(ident), Some(receiver)) => quote!(#receiver.#ident),
-            (None, Some(receiver)) => quote!(#receiver.#index),
+        match (self.use_receiver_directly, &self.ident, receiver) {
+            (true, _, None) => format_ident!("field_{}", self.index).into_token_stream(),
+            (true, _, Some(receiver)) => receiver.clone(),
+            (false, None, None) => format_ident!("field_{}", self.index).into_token_stream(),
+            (false, Some(ident), None) => quote!(#ident),
+            (false, Some(ident), Some(receiver)) => quote!(#receiver.#ident),
+            (false, None, Some(receiver)) => quote!(#receiver.#index),
         }
     }
 }
@@ -1857,7 +2004,46 @@ mod tests {
                     .find(|field| field.ident.as_ref().map(|ident| ident == "nested").unwrap_or(false))
                     .expect("expected to find the 'nested' field");
                 assert!(nested_field.is_parameter);
-                let tuple_fields = nested_field.fields.as_ref().expect("expected nested tuple fields");
+                let tuple_fields = match nested_field.fields.as_ref() {
+                    Some(NestedFields::Tuple(fields)) => fields,
+                    _ => panic!("expected nested tuple fields"),
+                };
+                assert_eq!(tuple_fields.len(), 2);
+                assert!(!tuple_fields[0].is_parameter);
+                assert!(tuple_fields[1].is_parameter);
+            }
+            Data::Enum(_) => panic!("expected extracted data to be a struct"),
+        }
+        assert!(generator.errors.is_empty());
+
+        // Test using a struct with nested options containing mixed tuples.
+        let input = syn::parse2(quote! {
+            struct OptionalContainer<P: Parameter> {
+                maybe: Option<(usize, P)>,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        match &generator.data {
+            Data::Struct(struct_data) => {
+                assert!(matches!(struct_data.kind, Kind::Named));
+                assert_eq!(struct_data.fields.len(), 1);
+                let maybe_field = struct_data
+                    .fields
+                    .iter()
+                    .find(|field| field.ident.as_ref().map(|ident| ident == "maybe").unwrap_or(false))
+                    .expect("expected to find the 'maybe' field");
+                assert!(maybe_field.is_parameter);
+                let option_inner = match maybe_field.fields.as_ref() {
+                    Some(NestedFields::Option(field)) => field,
+                    _ => panic!("expected nested option fields"),
+                };
+                assert!(option_inner.use_receiver_directly);
+                let tuple_fields = match option_inner.fields.as_ref() {
+                    Some(NestedFields::Tuple(fields)) => fields,
+                    _ => panic!("expected nested tuple fields inside option"),
+                };
                 assert_eq!(tuple_fields.len(), 2);
                 assert!(!tuple_fields[0].is_parameter);
                 assert!(tuple_fields[1].is_parameter);
@@ -2330,6 +2516,7 @@ mod tests {
             ident: Some(syn::parse_quote!(value)),
             ty: syn::parse_quote!(P),
             fields: None,
+            use_receiver_directly: false,
         }]);
         let rendered_generics = generics.to_token_stream().to_string();
         assert!(rendered_generics.starts_with("< P >"));
@@ -2350,12 +2537,28 @@ mod tests {
             ident: Some(syn::parse_quote!(weight)),
             ty: syn::parse_quote!(usize),
             fields: None,
+            use_receiver_directly: false,
         };
-        let unnamed_field =
-            Field { is_parameter: false, index: 1, ident: None, ty: syn::parse_quote!(usize), fields: None };
+        let unnamed_field = Field {
+            is_parameter: false,
+            index: 1,
+            ident: None,
+            ty: syn::parse_quote!(usize),
+            fields: None,
+            use_receiver_directly: false,
+        };
+        let receiver_field = Field {
+            is_parameter: true,
+            index: 0,
+            ident: None,
+            ty: syn::parse_quote!(usize),
+            fields: None,
+            use_receiver_directly: true,
+        };
         assert_eq!(named_field.member(None).to_string(), "weight");
         assert_eq!(named_field.member(Some(&receiver)).to_string(), "self . weight");
         assert_eq!(unnamed_field.member(None).to_string(), "field_1");
         assert_eq!(unnamed_field.member(Some(&receiver)).to_string(), "self . 1");
+        assert_eq!(receiver_field.member(Some(&receiver)).to_string(), "self");
     }
 }
