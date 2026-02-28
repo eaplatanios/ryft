@@ -1,6 +1,5 @@
 [package]
 name = "ryft-macros-tests"
-version = "0.0.1"
 description = "Tests for Ryft macros."
 keywords = ["ryft"]
 publish = false

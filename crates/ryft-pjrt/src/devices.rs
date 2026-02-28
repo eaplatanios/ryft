@@ -43,6 +43,9 @@ pub struct Device<'o> {
     /// Cached [`Device::description`] of this [`Device`] so that it will only be constructed once.
     description: OnceLock<Result<DeviceDescription<'o>, Error>>,
 
+    /// Cached [`Device::attributes`] of this [`Device`] so that they are only queried once.
+    attributes: OnceLock<Result<HashMap<String, Value>, Error>>,
+
     /// [`PhantomData`] used to track the lifetime of the owner of this [`Device`].
     owner: PhantomData<&'o ()>,
 }
@@ -54,7 +57,7 @@ impl Device<'_> {
         if handle.is_null() {
             Err(Error::invalid_argument("the provided PJRT device handle is a null pointer"))
         } else {
-            Ok(Self { handle, api, description: OnceLock::new(), owner: PhantomData })
+            Ok(Self { handle, api, description: OnceLock::new(), attributes: OnceLock::new(), owner: PhantomData })
         }
     }
 
@@ -99,7 +102,30 @@ impl Device<'_> {
 
     /// Collection of [`Device`]-specific named attributes that are attached to this [`Device`].
     pub fn attributes(&self) -> Result<&HashMap<String, Value>, Error> {
-        self.description()?.attributes()
+        self.attributes
+            .get_or_init(|| {
+                use ffi::PJRT_Device_GetAttributes_Args;
+                let attributes = invoke_pjrt_api_error_fn!(
+                    self.api(),
+                    PJRT_Device_GetAttributes,
+                    { device = self.to_c_api() },
+                    { attributes, num_attributes, device_attributes, attributes_deleter },
+                )
+                .map(|(attributes, attribute_count, device_attributes, attributes_deleter)| {
+                    let attributes = hash_map_from_c_api(attributes, attribute_count);
+                    if let Some(attributes_deleter) = attributes_deleter {
+                        unsafe { attributes_deleter(device_attributes) };
+                    }
+                    attributes
+                });
+                match attributes {
+                    Ok(attributes) => Ok(attributes),
+                    Err(Error::Unimplemented { .. }) => Ok(self.description()?.attributes()?.clone()),
+                    Err(error) => Err(error),
+                }
+            })
+            .as_ref()
+            .map_err(|error| error.clone())
     }
 
     /// [`DeviceDescription`] associated with this [`Device`].
@@ -709,6 +735,42 @@ pub(crate) mod ffi {
         _data: [u8; 0],
         _marker: PhantomData<(*mut u8, PhantomPinned)>,
     }
+
+    // We represent opaque C types as structs with a particular structure that is following the convention
+    // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
+    #[repr(C)]
+    pub struct PJRT_Device_Attributes {
+        _data: [u8; 0],
+        _marker: PhantomData<(*mut u8, PhantomPinned)>,
+    }
+
+    #[repr(C)]
+    pub struct PJRT_Device_GetAttributes_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub device: *mut PJRT_Device,
+        pub attributes: *const PJRT_NamedValue,
+        pub num_attributes: usize,
+        pub device_attributes: *mut PJRT_Device_Attributes,
+        pub attributes_deleter: Option<unsafe extern "C" fn(device_attributes: *mut PJRT_Device_Attributes)>,
+    }
+
+    impl PJRT_Device_GetAttributes_Args {
+        pub fn new(device: *mut PJRT_Device) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                device,
+                attributes: std::ptr::null(),
+                num_attributes: 0,
+                device_attributes: std::ptr::null_mut(),
+                attributes_deleter: None,
+            }
+        }
+    }
+
+    pub type PJRT_Device_GetAttributes =
+        unsafe extern "C" fn(args: *mut PJRT_Device_GetAttributes_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
     pub struct PJRT_Device_GetDescription_Args {

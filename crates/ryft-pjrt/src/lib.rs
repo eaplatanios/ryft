@@ -197,6 +197,7 @@ pub(crate) mod ffi {
     pub const PJRT_Extension_Type_TpuExecutable: PJRT_Extension_Type = 17;
     pub const PJRT_Extension_Type_Megascale: PJRT_Extension_Type = 18;
     pub const PJRT_Extension_Type_Shardings: PJRT_Extension_Type = 19;
+    pub const PJRT_Extension_Type_AbiVersion: PJRT_Extension_Type = 20;
 
     /// PJRT extension base type. The `extension_type` field must be used to identify the type of the extension
     /// and reinterpret its instance accordingly.
@@ -377,6 +378,7 @@ pub(crate) mod ffi {
 
         pub PJRT_Event_Create: Option<PJRT_Event_Create>,
         pub PJRT_Event_Set: Option<PJRT_Event_Set>,
+        pub PJRT_Device_GetAttributes: Option<PJRT_Device_GetAttributes>,
     }
 }
 

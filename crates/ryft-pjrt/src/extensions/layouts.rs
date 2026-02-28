@@ -128,14 +128,14 @@ impl Layout<'_> {
         self.handle
     }
 
-    /// Serializes this [`Layout`] to a Protobuf message.
+    /// Serializes this [`Layout`] into a Protobuf message.
     pub fn proto(&self) -> Result<crate::protos::Layout, Error> {
         // It would be nice to be able to get this directly without having to go through [`Layout::serialize`] first,
         // but unfortunately, the PJRT C API does not provide the necessary hooks for doing that.
         self.serialize()?.proto()
     }
 
-    /// Serializes this [`Layout`] into a string (i.e., byte array).
+    /// Serializes this [`Layout`] into a [`SerializedLayout`].
     pub fn serialize(&self) -> Result<SerializedLayout, Error> {
         use ffi::PJRT_Layouts_MemoryLayout_Serialize_Args;
         invoke_pjrt_api_error_fn!(
@@ -243,6 +243,25 @@ impl<'o> Topology<'o> {
 }
 
 impl Executable {
+    /// Returns the memory [`Layout`]s of the inputs of this [`Executable`].
+    pub fn input_layouts(&'_ self) -> Result<Vec<Layout<'_>>, Error> {
+        use ffi::PJRT_Layouts_PJRT_Executable_GetParameterLayouts_Args;
+        let extension = self.api().layouts_extension()?;
+        invoke_pjrt_api_error_fn!(
+            @unchecked extension,
+            PJRT_Layouts_PJRT_Executable_GetParameterLayouts,
+            { executable = self.to_c_api() },
+            { num_parameters, layouts },
+        )
+        .and_then(|(parameter_count, parameter_layouts)| {
+            unsafe { slice_from_c_api(parameter_layouts, parameter_count) }
+                .iter()
+                .copied()
+                .map(|handle| unsafe { Layout::from_c_api(handle, extension, true) })
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
+
     /// Returns the memory [`Layout`]s of the outputs of this [`Executable`].
     pub fn output_layouts(&'_ self) -> Result<Vec<Layout<'_>>, Error> {
         use ffi::PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args;
@@ -577,7 +596,7 @@ pub(crate) mod ffi {
     use crate::programs::ffi::PJRT_Executable;
     use crate::topologies::ffi::PJRT_TopologyDescription;
 
-    pub const PJRT_API_LAYOUTS_EXTENSION_VERSION: usize = 3;
+    pub const PJRT_API_LAYOUTS_EXTENSION_VERSION: usize = 4;
 
     // We represent opaque C types as structs with a particular structure that is following the convention
     // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
@@ -728,6 +747,30 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_Layouts_PJRT_Executable_GetParameterLayouts_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub executable: *mut PJRT_Executable,
+        pub num_parameters: usize,
+        pub layouts: *mut *mut PJRT_Layouts_MemoryLayout,
+    }
+
+    impl PJRT_Layouts_PJRT_Executable_GetParameterLayouts_Args {
+        pub fn new(executable: *mut PJRT_Executable) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                executable,
+                num_parameters: 0,
+                layouts: std::ptr::null_mut(),
+            }
+        }
+    }
+
+    pub type PJRT_Layouts_PJRT_Executable_GetParameterLayouts =
+        unsafe extern "C" fn(args: *mut PJRT_Layouts_PJRT_Executable_GetParameterLayouts_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -760,6 +803,7 @@ pub(crate) mod ffi {
         pub PJRT_Layouts_PJRT_Buffer_MemoryLayout: Option<PJRT_Layouts_PJRT_Buffer_MemoryLayout>,
         pub PJRT_Layouts_PJRT_Topology_GetDefaultLayout: Option<PJRT_Layouts_PJRT_Topology_GetDefaultLayout>,
         pub PJRT_Layouts_PJRT_Executable_GetOutputLayouts: Option<PJRT_Layouts_PJRT_Executable_GetOutputLayouts>,
+        pub PJRT_Layouts_PJRT_Executable_GetParameterLayouts: Option<PJRT_Layouts_PJRT_Executable_GetParameterLayouts>,
     }
 }
 
@@ -769,10 +813,9 @@ mod tests {
 
     use indoc::indoc;
 
-    use crate::BufferType;
-    use crate::Program;
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{test_cpu_client, test_cpu_plugin};
+    use crate::{BufferType, Program};
 
     use super::SerializedLayout;
 
@@ -931,10 +974,15 @@ mod tests {
         };
         let executable = client.compile(&program, &compilation_options).unwrap();
         let executable = executable.executable().unwrap();
-        let mut output_layouts = executable.output_layouts().unwrap();
+        let input_layouts = executable.input_layouts().unwrap();
+        assert_eq!(input_layouts.len(), 2);
+        for input_layout in input_layouts {
+            assert_eq!(format!("{}", input_layout.serialize().unwrap()), "{1,0}");
+        }
+        let output_layouts = executable.output_layouts().unwrap();
         assert_eq!(output_layouts.len(), executable.output_count().unwrap());
-        let output_layout = output_layouts.remove(0);
-        let output_layout = output_layout.serialize().unwrap();
-        assert_eq!(format!("{output_layout}"), "{1,0}");
+        for output_layout in output_layouts {
+            assert_eq!(format!("{}", output_layout.serialize().unwrap()), "{1,0}");
+        }
     }
 }

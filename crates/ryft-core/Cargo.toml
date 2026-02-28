@@ -1,6 +1,6 @@
 [package]
 name = "ryft-core"
-version = "0.0.1"
+version = "0.0.2"
 readme = "README.md"
 description = "Core abstractions of the Ryft library."
 keywords = ["ryft", "tracing", "autodiff", "compiler", "machine-learning"]
