@@ -317,6 +317,7 @@ impl BuildConfiguration {
         let stablehlo_integrations_include_path = include_path.join("stablehlo").join("integrations");
         bindgen::builder()
             .header(pjrt_include_path.join("pjrt_c_api.h").to_str().unwrap())
+            .header(pjrt_include_path.join("pjrt_c_api_abi_version_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_ffi_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_layouts_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_memory_descriptions_extension.h").to_str().unwrap())
@@ -456,12 +457,23 @@ impl BuildConfiguration {
     /// any existing extracted directory is replaced to keep the contents up to date. For extracted
     /// `ryft-xla-sys` archives, post-processing (e.g., renaming the static library) is applied.
     fn artifact_directory(&self, artifact: Artifact) -> Result<PathBuf> {
-        let archive_name = self.precompiled_artifact_name(artifact);
+        // We include the XLA commit in the extracted archive name to ensure that we do not use stale extracted files.
+        let artifact_name = self.precompiled_artifact_name(artifact);
+        let artifact_name = artifact_name.trim_end_matches(".tar.gz").trim_end_matches(".whl");
+        let archive_name = format!(
+            "{artifact_name}-{}",
+            include_str!("WORKSPACE")
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("XLA_COMMIT = \""))
+                .and_then(|line| line.strip_suffix('"'))
+                .expect("failed to parse `XLA_COMMIT` from `WORKSPACE`"),
+        );
+
         let extracted_path = dirs::cache_dir()
             .map(|cache_dir| cache_dir.join("ryft").join("xla"))
             .unwrap_or(Path::new(&env::var("OUT_DIR").with_context(|| "`OUT_DIR` not set")?).join("cache"))
             .join("extracted")
-            .join(archive_name.trim_end_matches(".tar.gz").trim_end_matches(".whl"));
+            .join(archive_name.as_str());
 
         // Check if the extracted artifact already exists in the cache and return immediately if it does.
         let cached_artifact_found = match artifact {
@@ -512,15 +524,7 @@ impl BuildConfiguration {
             let cache_dir = dirs::cache_dir()
                 .map(|cache_dir| cache_dir.join("ryft").join("xla"))
                 .unwrap_or(Path::new(&env::var("OUT_DIR").with_context(|| "`OUT_DIR` not set")?).join("cache"));
-            let extracted_path = cache_dir.join("extracted").join(
-                artifact_path
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .trim_end_matches(".tar.gz")
-                    .trim_end_matches(".whl"),
-            );
+            let extracted_path = cache_dir.join("extracted").join(archive_name.as_str());
 
             // If the extracted path already exists, delete it and re-extract the archive.
             // This is done to ensure that the extracted files are always up to date.
@@ -781,7 +785,7 @@ impl BuildConfiguration {
                 "https://files.pythonhosted.org/packages/09/dc/6d8fbfc29d902251cf333414cf7dcfaf4b252a9920c881354584ed36270d"
             }
             _ => {
-                "https://github.com/eaplatanios/ryft/releases/download/ryft-xla-sys-107f6bb86ea1072528d5a155f4a72321cac46a64"
+                "https://github.com/eaplatanios/ryft/releases/download/ryft-xla-sys-964a0a45a0c3090cd484a3c51e8f9d05ed10b968"
             }
         }
     }
@@ -791,22 +795,22 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("a7f69b519911d70e60eb8af6a5d04a465a0fa43062ee4935e7abb8bfd04d870a")
+                Some("2e2f08d144323b3ef140f23398583fa58ef526c8e2b21b15f5b83e3ead1f28eb")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("1a83f6c9add2fdd26944e107dcd33a70b87f3c5a6380a8e252f7e20506fda86f")
+                Some("1c648dfbf594821172354b2499bc79cafd28db874c7f019e0564c99b3de01e09")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("27de76f86881c7c22e1f924a32fbf45b6b343a65a4162737bd9547f65ed3a05e")
+                Some("1ce889c93a7a65bbc2b3d34e004e6d20fa7505a1d99a929cbeecb8164c083181")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("5e8a6c04e148dec7640962c869fcbb0998749d411120bc61d09bc9e58f8c1861")
+                Some("12efab62ecfc2a2902035d72096a193f9d1578da5070a5e7a98b8c9930cba813")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("2749eab741f2b9c6cc8b7de52938341ebb35eb63d3055db3f012b4e06f7f8314")
+                Some("f5fe0422ff854a57a0d4d45306725a82c834eae5e84a2b425e20132e9d4141d1")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("f4d2bccc5223b40af985e9f00ce069387b8cbe0e905e60cd254c4aa4d4c0d6b5")
+                Some("3933f3005e0bceef3ce33863a43112905d09b20c6531fe58ceb4ce91eac6344e")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")

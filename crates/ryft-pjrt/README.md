@@ -116,7 +116,7 @@ fn main() {
     - CPU Plugin:
         - [x] FFI
         - [x] Layouts
-        - [x] Memory descriptions
+        - [x] Memory Descriptions
         - [x] Shardings
     - GPU Plugin:
         - [x] Cross-Host Transfers
@@ -130,6 +130,10 @@ fn main() {
         - [x] Stream
         - [x] Triton
     - TPU Plugin:
+        - [x] FFI
+        - [x] Layouts
+        - [x] Memory Descriptions
+        - [x] Shardings
         - [ ] Callbacks
         - [ ] TPU Topology
         - [ ] TPU Executable
@@ -138,6 +142,7 @@ fn main() {
         - [x] Executable Metadata
         - [x] Host Allocator
         - [ ] Phase Compile
+        - [x] ABI Version
 
 #### License
 

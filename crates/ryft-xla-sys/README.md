@@ -156,7 +156,26 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
     - Update any `build.rs` references that still point to the old commit.
     - Update `JAX_COMMIT` and `JAX_SHA256` only when required by the selected OpenXLA commit.
 2. Rebuild and publish precompiled `ryft-xla-sys` artifacts using `.github/workflows/build_ryft_xla_sys.yaml`.
-    - Use the GitHub CLI to trigger and monitor the workflow (it may take a couple of hours).
+    - Make sure your OpenXLA upgrade changes are committed and pushed to a branch before triggering the workflow.
+    - Trigger the GitHub workflow that builds `ryft-xla-sys` on the branch that contains your changes:
+      ```bash
+      gh workflow run build_ryft_xla_sys.yaml --repo eaplatanios/ryft --ref <branch-name>
+      ```
+    - You can use the following command to monitor the run until completion:
+      ```bash
+      gh run watch <run-id> --repo eaplatanios/ryft --exit-status
+      ```
+      This workflow can take a couple of hours because it builds multiple platform-specific artifacts.
+    - If needed, download the produced artifacts locally for checksum verification:
+      ```bash
+      gh run download <run-id> --repo eaplatanios/ryft --dir /tmp/ryft-xla-sys-artifacts
+      ```
+    - Confirm that the release tag follows the expected format (`ryft-xla-sys-<XLA_COMMIT>`), and then compute
+      the updated SHA-256 checksum for each artifact using this command from within the directory containing the
+      downloaded artifacts:
+      ```bash
+      shasum -a 256 '*.tar.gz
+      ```
     - After the workflow publishes release artifacts for the new `XLA_COMMIT`, update these functions in `build.rs`:
         - `BuildConfiguration::precompiled_artifact_name`
         - `BuildConfiguration::precompiled_artifact_url_prefix`
