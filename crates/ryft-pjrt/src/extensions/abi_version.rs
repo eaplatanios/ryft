@@ -2,7 +2,7 @@ use std::hash::{Hash, Hasher};
 
 use prost::Message;
 
-use crate::{invoke_pjrt_api_error_fn, slice_from_c_api, Api, Client, Error, Executable, Plugin};
+use crate::{Api, Client, Error, Executable, Plugin, invoke_pjrt_api_error_fn, slice_from_c_api};
 
 /// The PJRT ABI version extension provides capabilities for querying runtime and executable ABI versions and checking
 /// compatibility between them. The extension is optional for PJRT [`Plugin`]s and _experimental_, meaning that

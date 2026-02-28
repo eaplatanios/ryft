@@ -141,7 +141,7 @@ impl Layout<'_> {
         invoke_pjrt_api_error_fn!(
             @unchecked self.extension,
             PJRT_Layouts_MemoryLayout_Serialize,
-            { topology = self.to_c_api() },
+            { layout = self.to_c_api() },
             { serialized_bytes, serialized_bytes_size, serialized_layout, serialized_layout_deleter },
         )
         .map(|(serialized_bytes, serialized_bytes_size, serialized_layout, serialized_layout_deleter)| {
