@@ -93,7 +93,7 @@ pub enum ParameterPathSegment {
 ///
 /// let value = vec![(4, 2)];
 /// let paths = value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>();
-/// assert_eq!(paths, vec!["[0].0", "[0].1"]);
+/// assert_eq!(paths, vec!["$[0].0", "$[0].1"]);
 /// ```
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParameterPath {
@@ -144,7 +144,7 @@ impl ParameterPath {
     ///     .with_segment(ParameterPathSegment::Field("weights"))
     ///     .with_segment(ParameterPathSegment::Index(1))
     ///     .with_segment(ParameterPathSegment::TupleIndex(0));
-    /// assert_eq!(path.to_string(), ".weights[1].0");
+    /// assert_eq!(path.to_string(), "$.weights[1].0");
     /// ```
     pub fn with_segment(mut self, segment: ParameterPathSegment) -> Self {
         self.segments.insert(0, segment);
@@ -154,7 +154,7 @@ impl ParameterPath {
 
 impl Display for ParameterPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO(eaplatanios): Should there be a root symbol like `$`?
+        write!(f, "$")?;
         for segment in self.segments() {
             match segment {
                 ParameterPathSegment::Field(name) => write!(f, ".{name}")?,
@@ -293,7 +293,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 /// assert_eq!(
 ///     named,
-///     vec![("[0].0".to_string(), 1), ("[0].1".to_string(), 2),],
+///     vec![("$[0].0".to_string(), 1), ("$[0].1".to_string(), 2),],
 /// );
 /// ```
 ///
@@ -583,7 +583,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// ```rust
     /// # use ryft_core::parameters::Parameterized;
     /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-    /// let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("[1]"))?;
+    /// let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("$[1]"))?;
     /// assert_eq!(selected, vec![(None, None), (Some(3), Some(4))]);
     /// assert_eq!(rejected, vec![(Some(1), Some(2)), (None, None)]);
     /// # Ok::<(), ryft_core::errors::Error>(())
@@ -1800,7 +1800,7 @@ mod tests {
         (($($value:expr),+ $(,)?)) => {{
             let expected_parameters = vec![$($value),+];
             let expected_paths = (0..expected_parameters.len())
-                .map(|index| format!(".{index}"))
+                .map(|index| format!("$.{index}"))
                 .collect::<Vec<_>>();
             assert_roundtrip_parameterized(($($value,)+), expected_parameters.clone());
             assert_parameters_mut_increments(($($value,)+), expected_parameters.clone());
@@ -1813,9 +1813,9 @@ mod tests {
     fn test_leaf_parameterized_impl() {
         assert_roundtrip_parameterized(7, vec![7]);
         assert_parameters_mut_increments(7, vec![7]);
-        assert_named_roundtrip_parameterized(7, vec!["".to_string()], vec![7]);
-        assert_named_parameters_mut_increments(7, vec!["".to_string()], vec![7]);
-        assert_parameter_paths(&7, vec!["".to_string()]);
+        assert_named_roundtrip_parameterized(7, vec!["$".to_string()], vec![7]);
+        assert_named_parameters_mut_increments(7, vec!["$".to_string()], vec![7]);
+        assert_parameter_paths(&7, vec!["$".to_string()]);
     }
 
     #[test]
@@ -1825,11 +1825,11 @@ mod tests {
             .with_segment(ParameterPathSegment::Field("weights"))
             .with_segment(ParameterPathSegment::Index(1))
             .with_segment(ParameterPathSegment::TupleIndex(0));
-        assert_eq!(path.to_string(), ".pair.weights[1].0");
+        assert_eq!(path.to_string(), "$.pair.weights[1].0");
         assert!(ParameterPath::root().with_segment(ParameterPathSegment::Variant("Pair")).is_prefix_of(&path));
 
         let key_path = ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "left")));
-        assert_eq!(key_path.to_string(), "[\"left\"]");
+        assert_eq!(key_path.to_string(), "$[\"left\"]");
     }
 
     #[test]
@@ -1863,18 +1863,18 @@ mod tests {
         assert_parameters_mut_increments([1, 2, 3], vec![1, 2, 3]);
         assert_named_roundtrip_parameterized(
             [1, 2, 3],
-            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
             vec![1, 2, 3],
         );
         assert_named_parameters_mut_increments(
             [1, 2, 3],
-            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
             vec![1, 2, 3],
         );
         assert_roundtrip_parameterized([(1, 2), (3, 4)], vec![1, 2, 3, 4]);
         assert_named_roundtrip_parameterized(
             [(1, 2), (3, 4)],
-            vec!["[0].0".to_string(), "[0].1".to_string(), "[1].0".to_string(), "[1].1".to_string()],
+            vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
             vec![1, 2, 3, 4],
         );
     }
@@ -1885,22 +1885,22 @@ mod tests {
         assert_parameters_mut_increments(vec![1, 2, 3], vec![1, 2, 3]);
         assert_named_roundtrip_parameterized(
             vec![1, 2, 3],
-            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
             vec![1, 2, 3],
         );
         assert_named_parameters_mut_increments(
             vec![1, 2, 3],
-            vec!["[0]".to_string(), "[1]".to_string(), "[2]".to_string()],
+            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
             vec![1, 2, 3],
         );
         assert_roundtrip_parameterized(vec![(1, 2), (3, 4)], vec![1, 2, 3, 4]);
         assert_parameter_paths(
             &vec![(1, 2), (3, 4)],
-            vec!["[0].0".to_string(), "[0].1".to_string(), "[1].0".to_string(), "[1].1".to_string()],
+            vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
         );
         assert_named_roundtrip_parameterized(
             vec![(1, 2), (3, 4)],
-            vec!["[0].0".to_string(), "[0].1".to_string(), "[1].0".to_string(), "[1].1".to_string()],
+            vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
             vec![1, 2, 3, 4],
         );
 
@@ -1984,7 +1984,7 @@ mod tests {
     #[test]
     fn test_partition_named_parameters_splits_by_predicate() {
         let value = vec![(1, 2), (3, 4)];
-        let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("[1]")).unwrap();
+        let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("$[1]")).unwrap();
         assert_eq!(selected, vec![(None, None), (Some(3), Some(4))]);
         assert_eq!(rejected, vec![(Some(1), Some(2)), (None, None)]);
     }
@@ -2001,7 +2001,7 @@ mod tests {
         let value = vec![(1, 2), (3, 4)];
         let structure = value.parameter_structure();
         let (selected, rejected) =
-            value.clone().partition_parameters(|path, _| path.to_string().starts_with("[0]")).unwrap();
+            value.clone().partition_parameters(|path, _| path.to_string().starts_with("$[0]")).unwrap();
         let combined =
             <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_parameters(structure, vec![selected, rejected]);
         assert_eq!(combined, Ok(value));
@@ -2024,7 +2024,7 @@ mod tests {
             structure,
             vec![vec![(Some(10), None)]],
         );
-        assert_eq!(combined, Err(Error::MissingNamedParameterPath { path: "[0].1".to_string() }));
+        assert_eq!(combined, Err(Error::MissingNamedParameterPath { path: "$[0].1".to_string() }));
     }
 
     #[test]
@@ -2138,7 +2138,7 @@ mod tests {
             ],
             vec![10],
         );
-        assert_eq!(updated, Err(Error::UnknownNamedParameterPath { path: "[2].0".to_string() }));
+        assert_eq!(updated, Err(Error::UnknownNamedParameterPath { path: "$[2].0".to_string() }));
     }
 
     #[test]
@@ -2174,7 +2174,7 @@ mod tests {
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![Rate32(3), Rate32(7)]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![(".first".to_string(), Rate32(3)), (".second".to_string(), Rate32(7))],
+            vec![("$.first".to_string(), Rate32(3)), ("$.second".to_string(), Rate32(7))],
         );
         assert_eq!(value.parameter_structure(), DomainRates { first: Placeholder, second: Placeholder });
         assert_eq!(
@@ -2208,7 +2208,7 @@ mod tests {
         assert_eq!(some.parameters().copied().collect::<Vec<_>>(), vec![Rate32(9)]);
         assert_eq!(
             some.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![(".maybe_pair.0.0".to_string(), Rate32(9))],
+            vec![("$.maybe_pair.0.0".to_string(), Rate32(9))],
         );
         assert_eq!(some.parameter_structure(), DomainOptionalTuple { maybe_pair: Some((Placeholder, 42)) });
         assert_eq!(
@@ -2264,10 +2264,10 @@ mod tests {
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
             vec![
-                (".values[0].first".to_string(), Rate32(1)),
-                (".values[0].second".to_string(), Rate32(2)),
-                (".values[1].first".to_string(), Rate32(3)),
-                (".values[1].second".to_string(), Rate32(4)),
+                ("$.values[0].first".to_string(), Rate32(1)),
+                ("$.values[0].second".to_string(), Rate32(2)),
+                ("$.values[1].first".to_string(), Rate32(3)),
+                ("$.values[1].second".to_string(), Rate32(4)),
             ],
         );
         assert_eq!(
@@ -2298,7 +2298,7 @@ mod tests {
                 .named_parameters()
                 .map(|(path, parameter)| (path.to_string(), *parameter))
                 .collect::<Vec<_>>(),
-            vec![(".scalar.0".to_string(), Rate32(9))],
+            vec![("$.scalar.0".to_string(), Rate32(9))],
         );
         assert_eq!(
             DomainRatesEnum::from_named_parameters(
@@ -2311,7 +2311,7 @@ mod tests {
         let pair = DomainRatesEnum::Pair { left: Rate32(1), right: Rate32(2) };
         assert_eq!(
             pair.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![(".pair.left".to_string(), Rate32(1)), (".pair.right".to_string(), Rate32(2)),],
+            vec![("$.pair.left".to_string(), Rate32(1)), ("$.pair.right".to_string(), Rate32(2)),],
         );
         assert_eq!(
             DomainRatesEnum::from_named_parameters(
@@ -2395,13 +2395,13 @@ mod tests {
         let mut named = value.clone().into_named_parameters().collect::<HashMap<_, _>>();
         let replaced_value = named
             .remove(&ParameterPath::root().with_segment(ParameterPathSegment::Index(1)))
-            .expect("Expected to remove path [1] from named parameter map.");
+            .expect("Expected to remove path $[1] from named parameter map.");
         named.insert(ParameterPath::root().with_segment(ParameterPathSegment::Index(2)), replaced_value);
         let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(value.parameter_structure(), named);
         assert!(matches!(
             result,
             Err(Error::NamedParameterPathMismatch { expected_path, actual_path })
-                if expected_path == "[1]" && actual_path == "[2]",
+                if expected_path == "$[1]" && actual_path == "$[2]",
         ));
     }
 
@@ -2453,7 +2453,7 @@ mod tests {
             structure,
             HashMap::from([(ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 5)]),
         );
-        assert_eq!(result, Err(Error::MissingPrefixForPath { path: "[1].0".to_string() }));
+        assert_eq!(result, Err(Error::MissingPrefixForPath { path: "$[1].0".to_string() }));
     }
 
     #[test]
@@ -2466,7 +2466,7 @@ mod tests {
                 (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
             ]),
         );
-        assert_eq!(result, Err(Error::UnusedPrefixPath { path: "[1]".to_string() }));
+        assert_eq!(result, Err(Error::UnusedPrefixPath { path: "$[1]".to_string() }));
     }
 
     #[test]
