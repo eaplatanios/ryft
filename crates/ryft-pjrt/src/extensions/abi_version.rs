@@ -771,31 +771,13 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
-
     use crate::tests::{test_cpu_client, test_cpu_plugin};
-    use crate::Error;
-
-    use super::SerializedAbiVersion;
 
     #[test]
-    fn test_abi_version_extension() {
-        let plugin_result = test_cpu_plugin().abi_version_extension();
-        assert!(plugin_result.is_ok() || matches!(plugin_result, Err(Error::Unimplemented { .. })));
-
-        let client_result = test_cpu_client().abi_version_extension();
-        assert!(client_result.is_ok() || matches!(client_result, Err(Error::Unimplemented { .. })));
+    fn test_host_allocator_extension() {
+        assert!(test_cpu_plugin().abi_version_extension().is_err());
+        assert!(test_cpu_client().abi_version_extension().is_err());
     }
 
-    #[test]
-    fn test_serialized_abi_version_protobuf_roundtrip() {
-        let abi_version = crate::protos::RuntimeAbiVersion { platform: 7, version: vec![3, 1, 4, 1, 5, 9] };
-        let encoded = abi_version.encode_to_vec();
-        let serialized_abi_version = SerializedAbiVersion::from_proto(abi_version.clone());
-
-        assert_eq!(serialized_abi_version.data(), encoded.as_slice());
-        assert_eq!(serialized_abi_version.proto::<crate::protos::RuntimeAbiVersion>(), Ok(abi_version.clone()));
-        assert_eq!(serialized_abi_version, SerializedAbiVersion::from_proto(abi_version));
-        assert_eq!(format!("{serialized_abi_version:?}"), format!("SerializedAbiVersion[{serialized_abi_version}]"));
-    }
+    // TODO(eaplatanios): Add more tests once there is a PJRT plugin that provides this extension.
 }
