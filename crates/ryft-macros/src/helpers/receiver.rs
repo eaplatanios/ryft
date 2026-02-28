@@ -58,8 +58,6 @@ impl ReplaceSelf<'_> {
         // Process the where clause, if one exists.
         if let Some(where_clause) = &mut generics.where_clause {
             where_clause.predicates.iter_mut().for_each(|predicate| match predicate {
-                // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-                // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
                 syn::WherePredicate::Lifetime(_) => {}
                 syn::WherePredicate::Type(predicate) => {
                     self.process_type(&mut predicate.bounded_ty);
@@ -88,8 +86,6 @@ impl ReplaceSelf<'_> {
     /// Replaces all instances of `Self` in the provided [`Type`] with [`Self::receiver_type`].
     fn process_type(&self, ty: &mut syn::Type) {
         match ty {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::Type::Array(ty) => {
                 self.process_type(&mut ty.elem);
                 self.process_expression(&mut ty.len);
@@ -128,8 +124,6 @@ impl ReplaceSelf<'_> {
     /// length of arrays (and is only ever called in that context, though it also recurses into such expressions).
     fn process_expression(&self, expr: &mut syn::Expr) {
         match expr {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::Expr::Array(_) | syn::Expr::Assign(_) | syn::Expr::Async(_) | syn::Expr::Await(_) => {}
             syn::Expr::Binary(expr) => {
                 self.process_expression(&mut expr.left);
@@ -193,8 +187,6 @@ impl ReplaceSelf<'_> {
     /// Replaces all instances of `Self` in the provided [`TypeParamBound`] with [`Self::receiver_type`].
     fn process_type_param_bound(&self, bound: &mut syn::TypeParamBound) {
         match bound {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::TypeParamBound::Trait(bound) => self.process_path(&mut bound.path),
             syn::TypeParamBound::Lifetime(_) | syn::TypeParamBound::Verbatim(_) => {}
             syn::TypeParamBound::PreciseCapture(capture) => {
@@ -222,8 +214,6 @@ impl ReplaceSelf<'_> {
             syn::PathArguments::None => {}
             syn::PathArguments::AngleBracketed(arguments) => {
                 arguments.args.iter_mut().for_each(|arg| match arg {
-                    // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-                    // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
                     syn::GenericArgument::Lifetime(_) => {}
                     syn::GenericArgument::Type(arg) => self.process_type(arg),
                     syn::GenericArgument::Const(_) => {}

@@ -132,8 +132,6 @@ impl GenericsHelpers for syn::Generics {
 
     fn referenced_by_type(&self, ty: &syn::Type) -> bool {
         match ty {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::Type::Array(type_array) => self.referenced_by_type(&type_array.elem),
             syn::Type::BareFn(type_bare_fn) => {
                 type_bare_fn.inputs.iter().any(|input| self.referenced_by_type(&input.ty))
@@ -167,8 +165,6 @@ impl GenericsHelpers for syn::Generics {
 
     fn referenced_by_type_param_bound(&self, type_param_bound: &syn::TypeParamBound) -> bool {
         match type_param_bound {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::TypeParamBound::Trait(bound) => self.referenced_by_path(&bound.path),
             syn::TypeParamBound::Lifetime(lifetime) => self.referenced_by_lifetime(lifetime),
             syn::TypeParamBound::PreciseCapture(capture) => {
@@ -190,8 +186,6 @@ impl GenericsHelpers for syn::Generics {
 
     fn referenced_by_captured_param(&self, captured_param: &syn::CapturedParam) -> bool {
         match captured_param {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::CapturedParam::Lifetime(lifetime) => self.referenced_by_lifetime(lifetime),
             syn::CapturedParam::Ident(ident) => self.matches_any_param(ident),
             _ => false,

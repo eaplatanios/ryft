@@ -173,8 +173,6 @@ impl IdentHelpers for syn::ConstParam {
 impl IdentHelpers for syn::Type {
     fn ident(&self) -> Option<&syn::Ident> {
         match self {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::Type::Array(_) | syn::Type::BareFn(_) => None,
             syn::Type::Group(t) => t.elem.ident(),
             syn::Type::ImplTrait(_)
@@ -290,8 +288,6 @@ impl Visit<'_> for ReferencesIdentVisitor<'_> {
         }
 
         match node {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::CapturedParam::Lifetime(lifetime) => self.visit_lifetime(lifetime),
             syn::CapturedParam::Ident(ident) if ident == self.ident => self.referenced = true,
             _ => {}
@@ -304,8 +300,6 @@ impl Visit<'_> for ReferencesIdentVisitor<'_> {
         }
 
         match node {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::TypeParamBound::Trait(b) => self.visit_path(&b.path),
             syn::TypeParamBound::Lifetime(b) => self.visit_lifetime(b),
             syn::TypeParamBound::PreciseCapture(b) => b.params.iter().for_each(|p| self.visit_captured_param(p)),
