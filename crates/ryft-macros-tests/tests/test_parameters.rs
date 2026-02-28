@@ -109,11 +109,8 @@ fn test_struct_with_nested_tuples_and_options() {
     }
 
     let mut value = StructWithNestedOption { p_0: Some((0usize, (-1i32, 2usize, -42i64, 0usize))), np_0, np_1 };
-    let structure = StructWithNestedOption {
-        p_0: Some((0usize, (-1i32, Placeholder, -42i64, Placeholder))),
-        np_0,
-        np_1,
-    };
+    let structure =
+        StructWithNestedOption { p_0: Some((0usize, (-1i32, Placeholder, -42i64, Placeholder))), np_0, np_1 };
     let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 2 });
 
     assert_eq!(value.parameter_count(), 2);

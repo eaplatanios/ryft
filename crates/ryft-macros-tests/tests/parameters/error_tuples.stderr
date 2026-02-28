@@ -5,6 +5,7 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
   |          ^^^^^^^^^^^^^ the trait `Parameterized<Placeholder>` is not implemented for `usize`
   |
   = help: the following other types implement trait `Parameterized<P>`:
+            ()
             (T0, T1)
             (T0, T1, T2)
             (T0, T1, T2, T3)
@@ -12,7 +13,6 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
             (T0, T1, T2, T3, T4, T5)
             (T0, T1, T2, T3, T4, T5, T6)
             (T0, T1, T2, T3, T4, T5, T6, T7)
-            (T0, T1, T2, T3, T4, T5, T6, T7, T8)
           and $N others
   = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
 note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`
@@ -29,6 +29,7 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Parameterized<Placeholder>` is not implemented for `usize`
   |
   = help: the following other types implement trait `Parameterized<P>`:
+            ()
             (T0, T1)
             (T0, T1, T2)
             (T0, T1, T2, T3)
@@ -36,7 +37,6 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
             (T0, T1, T2, T3, T4, T5)
             (T0, T1, T2, T3, T4, T5, T6)
             (T0, T1, T2, T3, T4, T5, T6, T7)
-            (T0, T1, T2, T3, T4, T5, T6, T7, T8)
           and $N others
   = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
 note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`
@@ -53,6 +53,7 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
   |          ^^^^^^^^^^^^^ the trait `Parameterized<Placeholder>` is not implemented for `usize`
   |
   = help: the following other types implement trait `Parameterized<P>`:
+            ()
             (T0, T1)
             (T0, T1, T2)
             (T0, T1, T2, T3)
@@ -60,7 +61,6 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
             (T0, T1, T2, T3, T4, T5)
             (T0, T1, T2, T3, T4, T5, T6)
             (T0, T1, T2, T3, T4, T5, T6, T7)
-            (T0, T1, T2, T3, T4, T5, T6, T7, T8)
           and $N others
   = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
 note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`
@@ -85,6 +85,7 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
   |          ^^^^^^^^^^^^^ the trait `Parameterized<Placeholder>` is not implemented for `usize`
   |
   = help: the following other types implement trait `Parameterized<P>`:
+            ()
             (T0, T1)
             (T0, T1, T2)
             (T0, T1, T2, T3)
@@ -92,7 +93,6 @@ error[E0277]: the trait bound `usize: Parameterized<Placeholder>` is not satisfi
             (T0, T1, T2, T3, T4, T5)
             (T0, T1, T2, T3, T4, T5, T6)
             (T0, T1, T2, T3, T4, T5, T6, T7)
-            (T0, T1, T2, T3, T4, T5, T6, T7, T8)
           and $N others
   = note: required for `(Placeholder, usize)` to implement `Parameterized<Placeholder>`
 note: required for `NestedVecOfTuples<Placeholder>` to implement `ParameterizedFamily<Placeholder>`

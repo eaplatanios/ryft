@@ -210,17 +210,34 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// In the context of machine learning (ML), a [`Parameterized`] can contain model parameters (thus the name), dataset
 /// entries, reinforcement learning agent observations, etc.
 ///
-///
-///
-///
-///
-///
-///
-///
-///
 /// The [`Parameterized`] type and the functionality it provides is inspired by
 /// [JAX PyTrees](https://docs.jax.dev/en/latest/pytrees.html#working-with-pytrees)
 /// and [Equinox's PyTree manipulation APIs](https://docs.kidger.site/equinox/api/manipulation/).
+///
+/// ## Example
+///
+/// ```rust
+/// # use std::collections::HashMap;
+/// # use ryft_core::parameters::Parameterized;
+///
+/// // Simple tuple with 3 [`Parameter`]s.
+/// let value = (1i32, 2i32, 3i32);
+/// let parameters = value.parameters().collect::<Vec<_>>();
+/// assert_eq!(value.parameter_count(), parameters.len());
+/// assert_eq!(parameters, vec![&1i32, &2i32, &3i32]);
+///
+/// // Nested tuple structure with 3 [`Parameter`]s.
+/// let value = (1i32, (2i32, 3i32), ());
+/// let parameters = value.parameters().collect::<Vec<_>>();
+/// assert_eq!(value.parameter_count(), parameters.len());
+/// assert_eq!(parameters, vec![&1i32, &2i32, &3i32]);
+///
+/// // Nested map and tuple structure with 5 [`Parameter`]s.
+/// let value = (1i32, HashMap::from([("a", vec![2i32]), ("b", vec![3i32, 4i32])]), (5i32,));
+/// let parameters = value.parameters().collect::<Vec<_>>();
+/// assert_eq!(value.parameter_count(), parameters.len());
+/// assert_eq!(parameters, vec![&1i32, &2i32, &3i32, &4i32, &5i32]);
+/// ```
 ///
 ///
 ///
@@ -1271,6 +1288,7 @@ macro_rules! tuple_parameterized_family_impl {
     };
 }
 
+tuple_parameterized_family_impl!();
 tuple_parameterized_family_impl!(F0);
 tuple_parameterized_family_impl!(F0, F1);
 tuple_parameterized_family_impl!(F0, F1, F2);
@@ -1363,6 +1381,7 @@ macro_rules! tuple_parameterized_impl {
                     tuple_named_parameter_into_iterator!(P, ($([<$T:lower>]:$index,)*))
                 }
 
+                #[allow(unused_variables)]
                 fn from_parameters_with_remainder<I: Iterator<Item = P>>(
                     structure: Self::ParameterStructure,
                     parameters: &mut I,
@@ -1520,6 +1539,7 @@ macro_rules! tuple_named_parameter_into_iterator {
     }};
 }
 
+tuple_parameterized_impl!();
 tuple_parameterized_impl!(T0:0);
 tuple_parameterized_impl!(T0:0, T1:1);
 tuple_parameterized_impl!(T0:0, T1:1, T2:2);
