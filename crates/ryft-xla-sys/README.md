@@ -172,9 +172,13 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
       corresponding documentation and tests following existing repository conventions.
 5. Compare Protobuf messages referenced by `src/protos.rs` with the corresponding upstream `.proto` files and update
    any stale message definitions.
-6. Propagate the changes through `crates/ryft-pjrt` and make sure that tests pass.
-7. Check whether the OpenXLA upgrade changed LLVM; if it did, update `crates/ryft-mlir` as needed.
-8. Audit downstream crates in this repository and apply any compatibility fixes required by the new XLA revision.
+6. Update `crates/ryft-xla-sys/CHANGELOG.md` as needed.
+7. Propagate the changes through `crates/ryft-pjrt`, make sure that tests pass, and update
+   `crates/ryft-pjrt/CHANGELOG.md` as needed.
+8. Check whether the OpenXLA upgrade changed LLVM; if it did, update `crates/ryft-mlir` as needed, and final update
+   `crates/ryft-mlir/CHANGELOG.md` as needed.
+9. Audit downstream crates in this repository and apply any compatibility fixes required by the new XLA revision,
+   also updating their corresponding `CHANGELOG.md` files as needed.
 
 #### License
 
