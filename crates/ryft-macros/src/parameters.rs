@@ -1406,23 +1406,23 @@ impl CodeGenerator {
             fn parameters(&self) -> Self::ParameterIterator<'_, #item_ty> {
                 #parameters_body
             }
-            
+
             fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, #item_ty> {
                 #parameters_mut_body
             }
-            
+
             fn into_parameters(self) -> Self::ParameterIntoIterator<#item_ty> {
                 #into_parameters_body
             }
-            
+
             fn named_parameters(&self) -> Self::NamedParameterIterator<'_, #item_ty> {
                 #named_parameters_body
             }
-            
+
             fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, #item_ty> {
                 #named_parameters_mut_body
             }
-            
+
             fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<#item_ty> {
                 #into_named_parameters_body
             }
