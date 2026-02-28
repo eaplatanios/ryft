@@ -114,8 +114,9 @@ fn main() {
     - CPU Plugin:
         - [x] FFI
         - [x] Layouts
-        - [x] Memory descriptions
+        - [x] Memory Descriptions
         - [x] Shardings
+        - [x] ABI Version
     - GPU Plugin:
         - [x] Cross-Host Transfers
         - [x] GPU Custom Call
@@ -127,11 +128,17 @@ fn main() {
         - [x] Shardings
         - [x] Stream
         - [x] Triton
+        - [x] ABI Version
     - TPU Plugin:
+        - [x] FFI
+        - [x] Layouts
+        - [x] Memory Descriptions
+        - [x] Shardings
         - [ ] Callbacks
         - [ ] TPU Topology
         - [ ] TPU Executable
         - [ ] Megascale
+        - [x] ABI Version
     - Extensions that do not appear to be implemented for any PJRT plugins provided by Google:
         - [x] Executable Metadata
         - [x] Host Allocator
