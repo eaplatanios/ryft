@@ -1,4 +1,4 @@
-use crate::helpers::ident::IdentHelpers;
+use crate::helpers::idents::IdentHelpers;
 
 /// Helper private module making sure that [`GenericsHelpers`] is a sealed trait. Refer to
 /// [this page](https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/) for more information
@@ -293,5 +293,264 @@ impl GenericsHelpers for syn::Generics {
         });
 
         syn::Generics { params, where_clause, ..self.clone() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::{ToTokens, quote};
+
+    use crate::helpers::idents::IdentHelpers;
+
+    use super::GenericsHelpers;
+
+    #[test]
+    fn test_generics_is_param_bounded() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<'a, T: Clone, U>
+            where
+                U: Default;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.is_param_bounded(&syn::parse_quote!(T)));
+        assert!(generics.is_param_bounded(&syn::parse_quote!(U)));
+        assert!(!generics.is_param_bounded(&syn::parse_quote!(V)));
+    }
+
+    #[test]
+    fn test_generics_matches_any_param() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<'a, T: Clone, U>
+            where
+                U: Default;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.matches_any_param(&syn::parse_quote!(T)));
+        assert!(generics.matches_any_param(&syn::parse_quote!(U)));
+        assert!(!generics.matches_any_param(&syn::parse_quote!(V)));
+    }
+
+    #[test]
+    fn test_generics_referenced_by_lifetime() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<'a, T>;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.referenced_by_lifetime(&syn::parse_quote!('a)));
+        assert!(!generics.referenced_by_lifetime(&syn::parse_quote!('b)));
+    }
+
+    #[test]
+    fn test_generics_referenced_by_type() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.referenced_by_type(&syn::parse_quote!(T)));
+        assert!(!generics.referenced_by_type(&syn::parse_quote!(Result<V, E>)));
+    }
+
+    #[test]
+    fn test_generics_referenced_by_return_type() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.referenced_by_return_type(&syn::parse_quote!(-> U)));
+        assert!(!generics.referenced_by_return_type(&syn::parse_quote!(-> R)));
+    }
+
+    #[test]
+    fn test_generics_referenced_by_type_param_bound() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<'a, T>;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.referenced_by_type_param_bound(&syn::parse_quote!('a)));
+        assert!(generics.referenced_by_type_param_bound(&syn::parse_quote!(T)));
+        assert!(!generics.referenced_by_type_param_bound(&syn::parse_quote!(Clone)));
+    }
+
+    #[test]
+    fn test_generics_referenced_by_type_path() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T>;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.referenced_by_type_path(&syn::parse_quote!(T)));
+        assert!(generics.referenced_by_type_path(&syn::parse_quote!(<T as Trait>::Assoc)));
+        assert!(!generics.referenced_by_type_path(&syn::parse_quote!(crate::T)));
+    }
+
+    #[test]
+    fn test_generics_referenced_by_path() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.referenced_by_path(&syn::parse_quote!(T)));
+        assert!(!generics.referenced_by_path(&syn::parse_quote!(crate::T)));
+    }
+
+    #[test]
+    fn test_generics_referenced_by_captured_param() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<'a, T>;
+        ))
+        .unwrap()
+        .generics;
+        assert!(generics.referenced_by_captured_param(&syn::parse_quote!('a)));
+        assert!(generics.referenced_by_captured_param(&syn::parse_quote!(T)));
+        assert!(!generics.referenced_by_captured_param(&syn::parse_quote!('b)));
+        assert!(!generics.referenced_by_captured_param(&syn::parse_quote!(U)));
+    }
+
+    #[test]
+    fn test_generics_with_lifetime() {
+        let lifetime: syn::Lifetime = syn::parse_quote!('__p);
+        let t: syn::Ident = syn::parse_quote!(T);
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T>;
+        ))
+        .unwrap()
+        .generics
+        .with_lifetime(&lifetime, &t);
+        assert_eq!(generics.params.len(), 2);
+        assert!(matches!(
+            generics.params.iter().next().expect("expected one generic parameter"),
+            syn::GenericParam::Type(type_param) if type_param
+                    .bounds
+                    .iter()
+                    .any(|bound| matches!(
+                        bound,
+                        syn::TypeParamBound::Lifetime(bound_lifetime) if bound_lifetime == &lifetime,
+                    )),
+        ));
+        assert!(matches!(
+            generics.params.iter().last().expect("expected one generic parameter"),
+            syn::GenericParam::Lifetime(lifetime_param) if lifetime_param.lifetime == lifetime,
+        ));
+    }
+
+    #[test]
+    fn test_generics_with_renamed_param() {
+        let t: syn::Ident = syn::parse_quote!(T);
+        let p: syn::Ident = syn::parse_quote!(P);
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>
+            where
+                Vec<T>: Into<U>,
+                U: From<T>;
+        ))
+        .unwrap()
+        .generics
+        .with_renamed_param(&t, &p);
+        assert!(generics.matches_any_param(&p));
+        assert!(!generics.matches_any_param(&t));
+        let where_clause = generics.where_clause.as_ref().expect("expected a where clause");
+        assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&t)));
+        assert!(where_clause.predicates.iter().any(|predicate| predicate.references_ident(&p)));
+    }
+
+    #[test]
+    fn test_generics_with_concrete_param() {
+        let t: syn::Ident = syn::parse_quote!(T);
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>
+            where
+                Vec<T>: Into<U>,
+                U: From<T>;
+        ))
+        .unwrap()
+        .generics
+        .with_concrete_param(&t, &syn::parse_quote!(ryft::Placeholder));
+        assert!(!generics.matches_any_param(&t));
+        let where_clause = generics.where_clause.as_ref().expect("expected a where clause");
+        assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&t)));
+    }
+
+    #[test]
+    fn test_generics_with_bounds() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>;
+        ))
+        .unwrap()
+        .generics
+        .with_bounds(
+            [&syn::parse_quote!(T), &syn::parse_quote!(u32)],
+            vec![syn::parse_quote!(Clone), syn::parse_quote!(Send)],
+        );
+        let where_clause = generics.where_clause.as_ref().expect("expected a where clause");
+        assert_eq!(where_clause.predicates.len(), 1);
+        assert_eq!(
+            where_clause
+                .predicates
+                .iter()
+                .next()
+                .expect("expected one where predicate")
+                .to_token_stream()
+                .to_string(),
+            "T : Clone + Send",
+        );
+    }
+
+    #[test]
+    fn test_generics_with_where_predicates() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>;
+        ))
+        .unwrap()
+        .generics
+        .with_where_predicates(&[syn::parse_quote!(U: Default)]);
+        assert_eq!(generics.where_clause.as_ref().expect("expected a where clause").predicates.len(), 1);
+    }
+
+    #[test]
+    fn test_generics_without_defaults() {
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<'a, T = u32, U, const N: usize = 4>
+            where
+                T: Clone,
+                U: Into<T>,
+                [T; N]: Default;
+        ))
+        .unwrap()
+        .generics
+        .without_defaults();
+        let rendered_generics = generics.to_token_stream().to_string();
+        assert!(!rendered_generics.contains("= u32"));
+        assert!(!rendered_generics.contains("= 4"));
+    }
+
+    #[test]
+    fn test_generics_without_params() {
+        let u: syn::Ident = syn::parse_quote!(U);
+        let n: syn::Ident = syn::parse_quote!(N);
+        let generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<'a, T = u32, U, const N: usize = 4>
+            where
+                T: Clone,
+                U: Into<T>,
+                [T; N]: Default;
+        ))
+        .unwrap()
+        .generics
+        .without_params([&u, &n]);
+        let rendered_generics = generics.to_token_stream().to_string();
+        assert!(rendered_generics.starts_with("< 'a , T = u32 >"));
+        assert!(!rendered_generics.contains("Into"));
+        assert!(!rendered_generics.contains("[T; N] : Default"));
+        if let Some(where_clause) = generics.where_clause.as_ref() {
+            assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&u)));
+            assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&n)));
+        }
     }
 }

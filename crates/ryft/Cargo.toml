@@ -1,6 +1,6 @@
 [package]
 name = "ryft"
-version = "0.0.1"
+version = "0.0.2"
 readme = "../../README.md"
 description = "A Framework for Tracing, Automatic Differentiation, and Just-In-Time Compilation"
 keywords = ["ryft", "tracing", "autodiff", "compiler", "machine-learning"]

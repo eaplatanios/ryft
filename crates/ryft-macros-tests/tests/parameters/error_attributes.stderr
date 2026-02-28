@@ -1,83 +1,83 @@
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
  --> tests/parameters/error_attributes.rs:8:5
   |
 8 |     #[ryft(crate = "_ryft")]
   |     ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: Duplicate ryft attribute 'crate'
+error: duplicate ryft attribute 'crate'
   --> tests/parameters/error_attributes.rs:14:8
    |
 14 | #[ryft(crate = "ryft")]
    |        ^^^^^
 
-error: Invalid '#[ryft(...)]' attribute: 'parameter_type'. These are the attributes that are supported here: [Symbol("crate")].
+error: invalid '#[ryft(...)]' attribute: 'parameter_type'; these are the attributes that are supported here: [Symbol("crate")]
   --> tests/parameters/error_attributes.rs:28:24
    |
 28 | #[ryft(crate = "ryft", parameter_type = "P")]
    |                        ^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:32:5
    |
 32 |     #[ryft(crate = "_ryft")]
    |     ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:39:5
    |
 39 |     #[ryft(crate = "_ryft")]
    |     ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:42:5
    |
 42 |     #[ryft(crate = "_ryft")]
    |     ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: Invalid '#[ryft(...)]' attribute: 'ryft'. These are the attributes that are supported here: [Symbol("crate")].
+error: invalid '#[ryft(...)]' attribute: 'ryft'; these are the attributes that are supported here: [Symbol("crate")]
   --> tests/parameters/error_attributes.rs:47:8
    |
 47 | #[ryft(ryft = "ryft")]
    |        ^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:49:5
    |
 49 |     #[ryft(crate = "_ryft")]
    |     ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:52:14
    |
 52 |     Variant3(#[ryft(crate = "_ryft")] P),
    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:52:14
    |
 52 |     Variant3(#[ryft(crate = "_ryft")] P),
    |              ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:53:17
    |
 53 |     Variant4(P, #[ryft(crate = "_ryft")] (P, usize)),
    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:53:17
    |
 53 |     Variant4(P, #[ryft(crate = "_ryft")] (P, usize)),
    |                 ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:56:9
    |
 56 | /         #[ryft(crate = "_ryft")]
 57 | |         y: (P, usize),
    | |_____________________^
 
-error: The '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants.
+error: the '#[ryft(...)]' attribute is only supported at the top level for structs and enums. It is not supported for fields or variants
   --> tests/parameters/error_attributes.rs:56:9
    |
 56 |         #[ryft(crate = "_ryft")]

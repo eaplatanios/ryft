@@ -1618,7 +1618,7 @@ checksum = "8a0d197bd2c9dc6e53b84da9556a69ba4cdfab8619eb41a8bd1cc2027a0f6b1d"
 
 [[package]]
 name = "ryft"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "ryft-core",
  "ryft-macros",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "convert_case",
  "dyn-clone",
@@ -1642,8 +1642,10 @@ dependencies = [
 
 [[package]]
 name = "ryft-macros"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
+ "indoc",
+ "pretty_assertions",
  "proc-macro2",
  "quote",
  "syn",
@@ -1651,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-macros-tests"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "ryft",
  "trybuild",
@@ -1659,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-mlir"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "half",
  "indoc",
@@ -1672,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-pjrt"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "futures",
  "half",
@@ -1687,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "ryft-xla-sys"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "bindgen",

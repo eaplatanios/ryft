@@ -1,16 +1,16 @@
-error: Ryft parameters must be owned. References are not allowed.
+error: ryft parameters must be owned; references are not allowed
  --> tests/parameters/error_references.rs:7:18
   |
 7 |     parameter_0: &'p P,
   |                  ^^^^^
 
-error: Ryft parameters must be owned. References are not allowed.
+error: ryft parameters must be owned; references are not allowed
  --> tests/parameters/error_references.rs:8:18
   |
 8 |     parameter_1: &'p P,
   |                  ^^^^^
 
-error: Ryft parameters must be owned. References are not allowed.
+error: ryft parameters must be owned; references are not allowed
   --> tests/parameters/error_references.rs:14:34
    |
 14 |     parameter_1: (P, (P, (usize, &'p P))),

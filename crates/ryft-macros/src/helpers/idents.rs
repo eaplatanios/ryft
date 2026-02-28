@@ -275,9 +275,9 @@ impl Visit<'_> for ReferencesIdentVisitor<'_> {
             self.referenced = true;
         } else {
             // Note that the segment [`syn::Ident`]s are not checked. That is because those identifiers would not match
-            // the identifier we are looking for as they appear in the middle of a path and we only care about paths
+            // the identifier we are looking for as they appear in the middle of a path, and we only care about paths
             // fully matching. Note that if we had type information available when our macros get to run, this would
-            // all be much more easier as we could check for specific types directly.
+            // all be much easier as we could check for specific types directly.
             node.segments.iter().for_each(|segment| self.visit_path_arguments(&segment.arguments));
         }
     }
@@ -362,5 +362,89 @@ impl VisitMut for ReplaceIdentVisitor<'_> {
                 node.ident = replacement_ident.clone();
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::{ToTokens, quote};
+    use syn::parse::Parser;
+
+    use super::IdentHelpers;
+    use crate::helpers::generics::GenericsHelpers;
+
+    #[test]
+    fn test_matches_ident() {
+        let ident_t: syn::Ident = syn::parse_quote!(T);
+        let ident_u: syn::Ident = syn::parse_quote!(U);
+
+        let path: syn::Path = syn::parse_quote!(T);
+        assert_eq!(path.ident().map(|ident| ident.to_string()), Some("T".to_string()));
+        assert!(path.matches_ident(&ident_t));
+
+        let ty: syn::Type = syn::parse_quote!(T);
+        assert_eq!(ty.ident().map(|ident| ident.to_string()), Some("T".to_string()));
+        assert!(ty.matches_ident(&ident_t));
+
+        let generic_param: syn::GenericParam = syn::parse_quote!(T: Clone);
+        assert_eq!(generic_param.ident().map(|ident| ident.to_string()), Some("T".to_string()));
+        assert!(!generic_param.matches_ident(&ident_u));
+
+        let where_predicate: syn::WherePredicate = syn::parse_quote!(T: Clone);
+        assert!(!where_predicate.matches_ident(&ident_t));
+    }
+
+    #[test]
+    fn test_references_ident() {
+        let ident_t: syn::Ident = syn::parse_quote!(T);
+        let ident_p: syn::Ident = syn::parse_quote!(P);
+
+        let referencing_type: syn::Type = syn::parse_quote!(fn(T) -> Option<T>);
+        assert!(referencing_type.references_ident(&ident_t));
+
+        let non_referencing_type: syn::Type = syn::parse_quote!(crate::module::T);
+        assert!(!non_referencing_type.references_ident(&ident_t));
+
+        let referencing_path: syn::Path = syn::parse_quote!(T::Assoc);
+        assert!(referencing_path.references_ident(&ident_t));
+
+        let non_referencing_path: syn::Path = syn::parse_quote!(crate::T);
+        assert!(!non_referencing_path.references_ident(&ident_t));
+
+        let field: syn::Field = syn::Field::parse_named.parse2(quote!(value: Option<T>)).unwrap();
+        assert!(field.references_ident(&ident_t));
+
+        let path: syn::Path = syn::parse_quote!(P);
+        let mut generics = syn::parse2::<syn::DeriveInput>(quote!(
+            struct Dummy<T, U>
+            where
+                Vec<T>: Into<U>,
+                U: From<T>;
+        ))
+        .expect("failed to parse derive input")
+        .generics;
+        generics.replace_ident(&ident_t, &path);
+        assert!(generics.matches_any_param(&ident_p));
+        assert!(!generics.matches_any_param(&ident_t));
+        let where_clause = generics.where_clause.as_ref().expect("expected a where clause");
+        assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&ident_t)));
+        assert!(where_clause.predicates.iter().any(|predicate| predicate.references_ident(&ident_p)));
+    }
+
+    #[test]
+    fn test_replace_ident() {
+        let ident: syn::Ident = syn::parse_quote!(T);
+        let path: syn::Path = syn::parse_quote!(ryft::Placeholder);
+
+        let mut ty: syn::Type = syn::parse_quote!(Option<T>);
+        ty.replace_ident(&ident, &path);
+        assert_eq!(ty.to_token_stream().to_string().replace(' ', ""), "Option<ryft::Placeholder>");
+
+        let mut predicate: syn::WherePredicate = syn::parse_quote!(T: Into<Vec<T>>);
+        predicate.replace_ident(&ident, &path);
+        assert_eq!(
+            predicate.to_token_stream().to_string().replace(' ', ""),
+            "ryft::Placeholder:Into<Vec<ryft::Placeholder>>",
+        );
     }
 }
