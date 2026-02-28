@@ -22,7 +22,7 @@ impl<T> SameAs<T> for T {}
 /// `Vec<P>` is treated as a collection of leaf parameters because `P: Parameter` implies `P: Parameterized<P>`,
 /// and not as a single leaf. Without this marker, expressing both leaf and container semantics would require
 /// overlapping blanket implementations or a stable specialization feature.
-/// 
+///
 /// Note that `ryft` provides a derive macro for this trait that you can use for custom types which need to
 /// implement [`Parameter`] by tagging them with `#[derive(Parameter)]`.
 pub trait Parameter {}
@@ -192,34 +192,43 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
         Self: ParameterizedFamily<Placeholder>;
 }
 
-// TODO(eaplatanios): Talk about the derive macro we have for this trait:
-//    - Supports both structs and enums already.
-//    - The parameter type must be a generic type parameter bounded by [Parameter].
-//    - There must be only one such generic type parameter. Not zero and not more than one.
-//    - All fields that reference / depend on the parameter type are considered parameter fields.
-//    - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
-//    - We need a recursive helper in order to properly handle tuple types. Tuples are not [Parameterized]
-//      themselves (that is done in order to avoid issues with blanket implementations since we only instantiate
-//      [Parameterized] implementations using prespecified parameter types), but they are supported when nested
-//      within other types, for which we are deriving [Parameterized] implementations.
-//    - Configurable `macro_parameter_lifetime` and `macro_parameter_type`.
-//    - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
-//      that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
-//      If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
-
-/// Recursively traversable data structure that contains nested [`Parameter`] leaves of type `P`.
+/// Recursively traversable data structure that contains arbitrarily nested [`Parameter`] values of type `P`.
 ///
-/// A [`Parameterized`] value can be viewed as two parts:
+/// # What is a [`Parameterized`] type?
 ///
-///  1. Its _structure_, obtained via [`Self::parameter_structure`].
-///  2. Its leaf _parameters_, obtained via [`Self::parameters`], [`Self::parameters_mut`],
-///     [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`], and
-///     [`Self::into_named_parameters`].
+/// A [`Parameterized`] type is a container-like structure that typically contains other container-like structures
+/// that eventually bottom out to [`Parameter`] values. For example, we may have a `((usize, P), HashMap<String, P>)`
+/// type which contains parameters of type `P` nested inside it. [`Parameterized`] types can be thought of as tree-like
+/// structures that contain [`Parameter`] values at their leaves (of type `P`). Values of such types can be viewed as
+/// having two parts:
 ///
-/// This API is inspired by JAX pytrees and Equinox's PyTree manipulation APIs, adapted to `ryft` terminology and
-/// Rust's type system.
+///  1. Their _structure_, which can be obtained via [`Self::parameter_structure`].
+///  2. Their _parameter_ values, which can be obtained via [`Self::parameters`], [`Self::parameters_mut`],
+///     [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`],
+///     and [`Self::into_named_parameters`].
 ///
-/// # What Is A Parameterized Tree?
+/// In the context of machine learning (ML), a [`Parameterized`] can contain model parameters (thus the name), dataset
+/// entries, reinforcement learning agent observations, etc.
+///
+///
+///
+///
+///
+///
+///
+///
+///
+/// The [`Parameterized`] type and the functionality it provides is inspired by
+/// [JAX PyTrees](https://docs.jax.dev/en/latest/pytrees.html#working-with-pytrees)
+/// and [Equinox's PyTree manipulation APIs](https://docs.kidger.site/equinox/api/manipulation/).
+///
+///
+///
+///
+///
+///
+///
+///
 ///
 /// Any nested container whose leaves implement [`Parameter`] can be traversed as a [`Parameterized`] tree.
 /// A single [`Parameter`] leaf is also a valid tree.
@@ -421,6 +430,17 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + Debug + Hash`, `S: BuildHasher + Clone`,
 ///   and `T: Parameterized<P>`.
 /// - [`Box<T>`] is intentionally not supported (see the coherence note below).
+///
+/// Macro:
+/// - Supports both structs and enums already.
+/// - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
+///   that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
+///   If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
+/// - The parameter type must be a generic type parameter bounded by [Parameter].
+/// - There must be only one such generic type parameter. Not zero and not more than one.
+/// - All fields that reference / depend on the parameter type are considered parameter fields.
+/// - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
+/// - Configurable `macro_parameter_lifetime` and `macro_parameter_type`.
 ///
 /// # Coherence Note For `Box<T>`
 ///
