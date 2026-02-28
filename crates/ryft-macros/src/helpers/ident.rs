@@ -39,7 +39,6 @@ pub trait IdentHelpers: private::Sealed {
         self.ident() == Some(ident)
     }
 
-    // TODO(eaplatanios): Should this be renamed to `references_generic_param` or something like that?
     /// Returns [`true`] if this instance references the provided [`syn::Ident`]. Note that this function specifically
     /// checks for references of the [`syn::Ident`] that are not ambiguous. For example, if a [`syn::PathSegment`] in
     /// the middle of a long [`syn::Path`] matches the provided [`syn::Ident`], then that will not be counted as a

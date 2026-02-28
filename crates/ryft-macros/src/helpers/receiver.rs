@@ -196,9 +196,18 @@ impl ReplaceSelf<'_> {
             // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
             // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::TypeParamBound::Trait(bound) => self.process_path(&mut bound.path),
-            syn::TypeParamBound::Lifetime(_)
-            | syn::TypeParamBound::PreciseCapture(_) // TODO(eaplatanios): Should we raise an error for this one?
-            | syn::TypeParamBound::Verbatim(_) => {}
+            syn::TypeParamBound::Lifetime(_) | syn::TypeParamBound::Verbatim(_) => {}
+            syn::TypeParamBound::PreciseCapture(capture) => {
+                capture.params.iter_mut().for_each(|param| match param {
+                    syn::CapturedParam::Lifetime(_) => {}
+                    syn::CapturedParam::Ident(ident) if ident == "Self" => {
+                        if let Some(receiver_ident) = self.receiver_type(ident.span()).path.segments.first() {
+                            *ident = receiver_ident.ident.clone();
+                        }
+                    }
+                    _ => {}
+                });
+            }
             _ => {}
         }
     }
