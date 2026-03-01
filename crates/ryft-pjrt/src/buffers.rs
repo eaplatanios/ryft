@@ -22,6 +22,11 @@ pub enum BufferType {
     /// Predicate [`BufferType`] that represents the `true` and `false` values.
     Predicate,
 
+    /// [`BufferType`] that represents signed 1-bit integer values. In XLA this corresponds to `S1`/`int1`, with the
+    /// only representable values being `0` and `-1`. Storage for this [`BufferType`] is unpacked and byte-backed
+    /// (one logical element per byte).
+    I1,
+
     /// [`BufferType`] that represents signed 2-bit integer values.
     I2,
 
@@ -39,6 +44,9 @@ pub enum BufferType {
 
     /// [`BufferType`] that represents signed 64-bit integer values.
     I64,
+
+    /// [`BufferType`] that represents unsigned 1-bit integer values.
+    U1,
 
     /// [`BufferType`] that represents unsigned 2-bit integer values.
     U2,
@@ -153,12 +161,14 @@ impl BufferType {
         match r#type {
             ffi::PJRT_Buffer_Type_TOKEN => Self::Token,
             ffi::PJRT_Buffer_Type_PRED => Self::Predicate,
+            ffi::PJRT_Buffer_Type_S1 => Self::I1,
             ffi::PJRT_Buffer_Type_S2 => Self::I2,
             ffi::PJRT_Buffer_Type_S4 => Self::I4,
             ffi::PJRT_Buffer_Type_S8 => Self::I8,
             ffi::PJRT_Buffer_Type_S16 => Self::I16,
             ffi::PJRT_Buffer_Type_S32 => Self::I32,
             ffi::PJRT_Buffer_Type_S64 => Self::I64,
+            ffi::PJRT_Buffer_Type_U1 => Self::U1,
             ffi::PJRT_Buffer_Type_U2 => Self::U2,
             ffi::PJRT_Buffer_Type_U4 => Self::U4,
             ffi::PJRT_Buffer_Type_U8 => Self::U8,
@@ -192,12 +202,14 @@ impl BufferType {
             Self::Invalid => ffi::PJRT_Buffer_Type_INVALID,
             Self::Token => ffi::PJRT_Buffer_Type_TOKEN,
             Self::Predicate => ffi::PJRT_Buffer_Type_PRED,
+            Self::I1 => ffi::PJRT_Buffer_Type_S1,
             Self::I2 => ffi::PJRT_Buffer_Type_S2,
             Self::I4 => ffi::PJRT_Buffer_Type_S4,
             Self::I8 => ffi::PJRT_Buffer_Type_S8,
             Self::I16 => ffi::PJRT_Buffer_Type_S16,
             Self::I32 => ffi::PJRT_Buffer_Type_S32,
             Self::I64 => ffi::PJRT_Buffer_Type_S64,
+            Self::U1 => ffi::PJRT_Buffer_Type_U1,
             Self::U2 => ffi::PJRT_Buffer_Type_U2,
             Self::U4 => ffi::PJRT_Buffer_Type_U4,
             Self::U8 => ffi::PJRT_Buffer_Type_U8,
@@ -230,12 +242,14 @@ impl BufferType {
             "invalid" => Ok(Self::Invalid),
             "pred" => Ok(Self::Predicate),
             "token" => Ok(Self::Token),
+            "s1" | "i1" => Ok(Self::I1),
             "s2" | "i2" => Ok(Self::I2),
             "s4" | "i4" => Ok(Self::I4),
             "s8" | "i8" => Ok(Self::I8),
             "s16" | "i16" => Ok(Self::I16),
             "s32" | "i32" => Ok(Self::I32),
             "s64" | "i64" => Ok(Self::I64),
+            "u1" => Ok(Self::U1),
             "u2" => Ok(Self::U2),
             "u4" => Ok(Self::U4),
             "u8" => Ok(Self::U8),
@@ -267,12 +281,14 @@ impl BufferType {
             crate::protos::BufferType::Invalid => Self::Invalid,
             crate::protos::BufferType::Token => Self::Token,
             crate::protos::BufferType::Predicate => Self::Predicate,
+            crate::protos::BufferType::I1 => Self::I1,
             crate::protos::BufferType::I2 => Self::I2,
             crate::protos::BufferType::I4 => Self::I4,
             crate::protos::BufferType::I8 => Self::I8,
             crate::protos::BufferType::I16 => Self::I16,
             crate::protos::BufferType::I32 => Self::I32,
             crate::protos::BufferType::I64 => Self::I64,
+            crate::protos::BufferType::U1 => Self::U1,
             crate::protos::BufferType::U2 => Self::U2,
             crate::protos::BufferType::U4 => Self::U4,
             crate::protos::BufferType::U8 => Self::U8,
@@ -304,12 +320,14 @@ impl BufferType {
             Self::Invalid => crate::protos::BufferType::Invalid,
             Self::Token => crate::protos::BufferType::Token,
             Self::Predicate => crate::protos::BufferType::Predicate,
+            Self::I1 => crate::protos::BufferType::I1,
             Self::I2 => crate::protos::BufferType::I2,
             Self::I4 => crate::protos::BufferType::I4,
             Self::I8 => crate::protos::BufferType::I8,
             Self::I16 => crate::protos::BufferType::I16,
             Self::I32 => crate::protos::BufferType::I32,
             Self::I64 => crate::protos::BufferType::I64,
+            Self::U1 => crate::protos::BufferType::U1,
             Self::U2 => crate::protos::BufferType::U2,
             Self::U4 => crate::protos::BufferType::U4,
             Self::U8 => crate::protos::BufferType::U8,
@@ -341,12 +359,14 @@ impl Display for BufferType {
             Self::Invalid => "invalid",
             Self::Token => "token",
             Self::Predicate => "pred",
+            Self::I1 => "i1",
             Self::I2 => "i2",
             Self::I4 => "i4",
             Self::I8 => "i8",
             Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::U1 => "u1",
             Self::U2 => "u2",
             Self::U4 => "u4",
             Self::U8 => "u8",
@@ -2480,6 +2500,8 @@ pub(crate) mod ffi {
     pub const PJRT_Buffer_Type_F8E3M4: PJRT_Buffer_Type = 27;
     pub const PJRT_Buffer_Type_F8E8M0FNU: PJRT_Buffer_Type = 28;
     pub const PJRT_Buffer_Type_F4E2M1FN: PJRT_Buffer_Type = 29;
+    pub const PJRT_Buffer_Type_S1: PJRT_Buffer_Type = 30;
+    pub const PJRT_Buffer_Type_U1: PJRT_Buffer_Type = 31;
 
     pub type PJRT_Buffer_MemoryLayout_Type = std::ffi::c_uint;
     pub const PJRT_Buffer_MemoryLayout_Type_Tiled: PJRT_Buffer_MemoryLayout_Type = 0;
@@ -3446,12 +3468,14 @@ mod tests {
             BufferType::Invalid,
             BufferType::Token,
             BufferType::Predicate,
+            BufferType::I1,
             BufferType::I2,
             BufferType::I4,
             BufferType::I8,
             BufferType::I16,
             BufferType::I32,
             BufferType::I64,
+            BufferType::U1,
             BufferType::U2,
             BufferType::U4,
             BufferType::U8,

@@ -1651,6 +1651,11 @@ pub struct DebugOptions {
     #[prost(int32, optional, tag = "327")]
     pub xla_gpu_executable_warn_stuck_timeout_seconds: Option<i32>,
 
+    /// Number of thunks to track for execution progress reporting. A value greater than `0` enables progress
+    /// tracking and logs the last completed and first pending thunks on execution timeout.
+    #[prost(int32, optional, tag = "457")]
+    pub xla_gpu_execution_progress_tracking: Option<i32>,
+
     /// If `true`, an exhaustive tiling search will be performed.
     #[prost(bool, optional, tag = "219")]
     pub xla_gpu_exhaustive_tiling_search: Option<bool>,
@@ -1708,6 +1713,10 @@ pub struct DebugOptions {
     /// If `true`, checksums of selected thunk inputs/outputs will be recorded (experimental feature).
     #[prost(bool, optional, tag = "414")]
     pub xla_gpu_experimental_enable_checksum_tracing_on_thunks: Option<bool>,
+
+    /// If `true`, convolution operations will be experimentally rewritten as GPU fusions.
+    #[prost(bool, optional, tag = "455")]
+    pub xla_gpu_experimental_enable_conv_fusion: Option<bool>,
 
     /// If `true`, auto-tuning between the native and Triton fusion emitters will be enabled.
     #[prost(bool, optional, tag = "409")]
@@ -2270,6 +2279,10 @@ pub struct DebugOptions {
     /// If `true`, the RAFT library will be used for TopK operations on GPU.
     #[prost(bool, optional, tag = "413")]
     pub xla_gpu_experimental_use_raft_select_k: Option<bool>,
+
+    /// If `true`, experimental tiling propagation will be enabled in GPU compiler passes.
+    #[prost(bool, optional, tag = "456")]
+    pub xla_gpu_experimental_enable_tiling_propagation: Option<bool>,
 
     /// Extra backend-specific options as key-value pairs.
     #[prost(map = "string, string", tag = "500")]

@@ -10,11 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Added support for the PJRT ABI version extension, including runtime/executable ABI version wrappers.
+- Added support for `BufferType::S1` and `BufferType::U1`.
+- Added support for the new `PJRT_Device_GetAttributes` C API function.
+- Added support for the new `PJRT_Client_Load` C API function.
+- Added support for the new `PJRT_LoadedExecutable_AddressableDeviceLogicalIds` C API function.
 
 ### Changed
 
-- Updated PJRT API constants and structs for version `0.93`, including adding the new `PJRT_Device_GetAttributes`.
+- Updated our PJRT C API bindings for version `0.97`.
 - Updated the layouts extension bindings to version `4` and added support for executable parameter layout queries.
 - Updated the FFI extension bindings to version `3` and added support for setting and getting the execution context
   for specific execution stages.

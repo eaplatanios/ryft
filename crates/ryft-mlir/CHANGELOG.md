@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+## Changed
+
+- Upgraded the XLA dependency to a newer version.
+
 ## [0.0.1] - 2026-02-22
 
 ### Added

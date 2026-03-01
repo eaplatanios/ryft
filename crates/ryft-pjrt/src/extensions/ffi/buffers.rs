@@ -19,8 +19,8 @@ pub enum FfiBufferType {
     Predicate,
 
     /// [`FfiBufferType`] that represents signed 1-bit integer values. In XLA this corresponds to `S1`/`int1`,
-    /// with representable values `0` and `-1`. [`FfiBuffer`] storage for this [`FfiBufferType`] is unpacked and
-    /// byte-backed (one logical element per byte).
+    /// with the only representable values being `0` and `-1`. [`FfiBuffer`] storage for this [`FfiBufferType`]
+    /// is unpacked and byte-backed (one logical element per byte).
     I1,
 
     /// [`FfiBufferType`] that represents signed 2-bit integer values.
