@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
@@ -2160,6 +2160,8 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
         Ok(values)
     }
 }
+
+// TODO(eaplatanios): Rewrite all the unit tests for this module.
 
 #[cfg(test)]
 mod tests {
