@@ -134,7 +134,7 @@ impl MemoryDescription<'_> {
     fn kind_id_and_kind(&'_ self) -> Result<(MemoryKindId, Cow<'_, str>), Error> {
         use ffi::PJRT_MemoryDescription_Kind_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_MemoryDescriptions_Extension => self.extension,
             PJRT_MemoryDescription_Kind,
             { memory_description = self.to_c_api() },
             { kind, kind_size, kind_id },
@@ -183,7 +183,7 @@ impl DeviceDescription<'_> {
         use ffi::PJRT_DeviceDescription_MemoryDescriptions_Args;
         let extension = self.api().memory_descriptions_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_MemoryDescriptions_Extension => extension,
             PJRT_DeviceDescription_MemoryDescriptions,
             { device_description = self.to_c_api() },
             { memory_descriptions, num_memory_descriptions, default_memory_index },

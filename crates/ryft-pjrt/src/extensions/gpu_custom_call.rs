@@ -10,7 +10,7 @@ use crate::{Api, Client, Error, Plugin, invoke_pjrt_api_error_fn};
 #[derive(Copy, Clone)]
 pub struct GpuCustomCallExtension {
     /// Handle that represents this [`GpuCustomCallExtension`] in the PJRT C API.
-    handle: *const ffi::PJRT_Gpu_Custom_Call,
+    handle: *const ffi::PJRT_Gpu_Custom_Call_Extension,
 
     /// Underlying PJRT [`Api`].
     api: Api,
@@ -30,10 +30,10 @@ impl GpuCustomCallExtension {
         }
     }
 
-    /// Returns the [`PJRT_Gpu_Custom_Call`](ffi::PJRT_Gpu_Custom_Call) that corresponds to this
+    /// Returns the [`PJRT_Gpu_Custom_Call`](ffi::PJRT_Gpu_Custom_Call_Extension) that corresponds to this
     /// [`GpuCustomCallExtension`] and which can be passed to functions in the PJRT C API.
     #[allow(clippy::wrong_self_convention)]
-    pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_Gpu_Custom_Call {
+    pub(crate) unsafe fn to_c_api(&self) -> *const ffi::PJRT_Gpu_Custom_Call_Extension {
         self.handle
     }
 
@@ -150,7 +150,7 @@ impl Api {
         match handler {
             GpuCustomCallHandler::Untyped(handler) => {
                 invoke_pjrt_api_error_fn!(
-                    @unchecked extension,
+                    @extension ffi::PJRT_Gpu_Custom_Call_Extension => extension,
                     PJRT_Gpu_Register_Custom_Call,
                     {
                         function_name = name.as_ptr() as *const _,
@@ -165,7 +165,7 @@ impl Api {
             }
             GpuCustomCallHandler::Typed(handler) => {
                 invoke_pjrt_api_error_fn!(
-                    @unchecked extension,
+                    @extension ffi::PJRT_Gpu_Custom_Call_Extension => extension,
                     PJRT_Gpu_Register_Custom_Call,
                     {
                         function_name = name.as_ptr() as *const _,
@@ -413,7 +413,7 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_Gpu_Register_Custom_Call_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
-    pub struct PJRT_Gpu_Custom_Call {
+    pub struct PJRT_Gpu_Custom_Call_Extension {
         pub base: PJRT_Extension_Base,
         pub PJRT_Gpu_Register_Custom_Call: Option<PJRT_Gpu_Register_Custom_Call>,
     }
