@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
@@ -83,7 +83,7 @@ pub enum ParameterPathSegment {
     /// Index/position in indexable containers (e.g., arrays and [`Vec`]).
     Index(usize),
 
-    /// [`Debug`]-formatted key of a [`HashMap`] entry.
+    /// [`Debug`]-formatted key of a map entry (e.g., [`HashMap`] or [`BTreeMap`]).
     Key(String),
 }
 
@@ -224,7 +224,8 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///    [_Working with Parameterized Values_](#working-with-parameterized-values) section below.
 ///  - **Arrays:** `[V; N]` is `Parameterized<P>` for any `N` when `V: Parameterized<P>`.
 ///  - **Vectors:** `Vec<V>` is `Parameterized<P>` when `V: Parameterized<P>`.
-///  - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug` and `V: Parameterized<P>`.
+///  - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug` and `V: Parameterized<P>`, and
+///    `BTreeMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug` and `V: Parameterized<P>`.
 ///  - **Phantom Data:** `PhantomData<P>` is `Parameterized<P>` for all `P: Parameter`, containing no parameters.
 ///
 /// Note that Ryft does not provide a generic `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>`
@@ -245,7 +246,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// The following are simple examples showing what [`Parameterized`] types are and how they are structured:
 ///
 /// ```rust
-/// # use std::collections::HashMap;
+/// # use std::collections::BTreeMap;
 /// # use ryft_core::parameters::{Parameterized, Placeholder};
 ///
 /// // Simple tuple with 3 [`Parameter`]s.
@@ -263,13 +264,13 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// assert_eq!(value.parameter_structure(), (Placeholder, (Placeholder, Placeholder), ()));
 ///
 /// // Nested map and tuple structure with 5 [`Parameter`]s.
-/// let value = (1, HashMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
+/// let value = (1, BTreeMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
 /// let parameters = value.parameters().collect::<Vec<_>>();
 /// assert_eq!(value.parameter_count(), parameters.len());
 /// assert_eq!(parameters, vec![&1, &2, &3, &4, &5]);
 /// assert_eq!(
 ///     value.parameter_structure(),
-///     (Placeholder, HashMap::from([("a", vec![Placeholder]), ("b", vec![Placeholder, Placeholder])]), (Placeholder,)),
+///     (Placeholder, BTreeMap::from([("a", vec![Placeholder]), ("b", vec![Placeholder, Placeholder])]), (Placeholder,)),
 /// );
 /// ```
 ///
@@ -1950,9 +1951,142 @@ impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHa
     }
 }
 
+pub struct BTreeMapParameterizedFamily<K, F>(PhantomData<(K, F)>);
+
+impl<P: Parameter, K: Clone + Debug + Ord, F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>>
+    ParameterizedFamily<P> for BTreeMapParameterizedFamily<K, F>
+{
+    type To = BTreeMap<K, <F as ParameterizedFamily<P>>::To>;
+}
+
+impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P> for BTreeMap<K, V> {
+    type Family = BTreeMapParameterizedFamily<K, V::Family>;
+
+    type To<T: Parameter>
+        = <Self::Family as ParameterizedFamily<T>>::To
+    where
+        Self::Family: ParameterizedFamily<T>;
+
+    type ParameterStructure = Self::To<Placeholder>;
+
+    type ParameterIterator<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::btree_map::Values<'t, K, V>,
+        <V as Parameterized<P>>::ParameterIterator<'t, T>,
+        fn(&'t V) -> <V as Parameterized<P>>::ParameterIterator<'t, T>,
+    >
+    where
+        Self: 't;
+
+    type ParameterIteratorMut<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::btree_map::ValuesMut<'t, K, V>,
+        <V as Parameterized<P>>::ParameterIteratorMut<'t, T>,
+        fn(&'t mut V) -> <V as Parameterized<P>>::ParameterIteratorMut<'t, T>,
+    >
+    where
+        Self: 't;
+
+    type ParameterIntoIterator<T: Parameter> = std::iter::FlatMap<
+        std::collections::btree_map::IntoValues<K, V>,
+        <V as Parameterized<P>>::ParameterIntoIterator<T>,
+        fn(V) -> <V as Parameterized<P>>::ParameterIntoIterator<T>,
+    >;
+
+    type NamedParameterIterator<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::btree_map::Iter<'t, K, V>,
+        PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
+        fn(
+            (&'t K, &'t V),
+        ) -> PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParameterIteratorMut<'t, T: 't + Parameter>
+        = std::iter::FlatMap<
+        std::collections::btree_map::IterMut<'t, K, V>,
+        PathPrefixedParameterIterator<&'t mut T, <V as Parameterized<P>>::NamedParameterIteratorMut<'t, T>>,
+        fn(
+            (&'t K, &'t mut V),
+        )
+            -> PathPrefixedParameterIterator<&'t mut T, <V as Parameterized<P>>::NamedParameterIteratorMut<'t, T>>,
+    >
+    where
+        Self: 't;
+
+    type NamedParameterIntoIterator<T: Parameter> = std::iter::FlatMap<
+        std::collections::btree_map::IntoIter<K, V>,
+        PathPrefixedParameterIterator<T, <V as Parameterized<P>>::NamedParameterIntoIterator<T>>,
+        fn((K, V)) -> PathPrefixedParameterIterator<T, <V as Parameterized<P>>::NamedParameterIntoIterator<T>>,
+    >;
+
+    fn parameter_count(&self) -> usize {
+        self.values().map(|value| value.parameter_count()).sum()
+    }
+
+    fn parameter_structure(&self) -> Self::ParameterStructure {
+        let mut structure = BTreeMap::new();
+        structure.extend(self.iter().map(|(key, value)| (key.clone(), value.parameter_structure())));
+        structure
+    }
+
+    fn parameters(&self) -> Self::ParameterIterator<'_, P> {
+        self.values().flat_map(V::parameters)
+    }
+
+    fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> {
+        self.values_mut().flat_map(V::parameters_mut)
+    }
+
+    fn into_parameters(self) -> Self::ParameterIntoIterator<P> {
+        self.into_values().flat_map(V::into_parameters)
+    }
+
+    fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
+        self.iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
+            iterator: value.named_parameters(),
+            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        })
+    }
+
+    fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> {
+        self.iter_mut().flat_map(|(key, value)| PathPrefixedParameterIterator {
+            iterator: value.named_parameters_mut(),
+            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        })
+    }
+
+    fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
+        self.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
+            iterator: value.into_named_parameters(),
+            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        })
+    }
+
+    fn from_parameters_with_remainder<I: Iterator<Item = P>>(
+        structure: Self::ParameterStructure,
+        parameters: &mut I,
+    ) -> Result<Self, Error> {
+        let expected_count = structure.len();
+        let mut values = BTreeMap::new();
+        for (key, value_structure) in structure {
+            values.insert(
+                key,
+                V::from_parameters_with_remainder(value_structure, parameters).map_err(|error| match error {
+                    Error::InsufficientParameters { .. } => Error::InsufficientParameters { expected_count },
+                    error => error,
+                })?,
+            );
+        }
+        Ok(values)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fmt::Debug;
     use std::marker::PhantomData;
 
@@ -2267,6 +2401,27 @@ mod tests {
             <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_parameters(structure, named_owned),
             Ok(expected)
         );
+    }
+
+    #[test]
+    fn test_b_tree_map_parameterized_impl() {
+        let value = BTreeMap::from([("left", (1, 2)), ("right", (3, 4))]);
+        assert_roundtrip_parameterized(value.clone(), vec![1, 2, 3, 4]);
+        assert_parameters_mut_increments(value, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_b_tree_map_named_parameterized_impl() {
+        let value = BTreeMap::from([("left", (1, 2)), ("right", (3, 4))]);
+        let expected_paths = vec![
+            "$[\"left\"].0".to_string(),
+            "$[\"left\"].1".to_string(),
+            "$[\"right\"].0".to_string(),
+            "$[\"right\"].1".to_string(),
+        ];
+        assert_parameter_paths(&value, expected_paths.clone());
+        assert_named_roundtrip_parameterized(value.clone(), expected_paths.clone(), vec![1, 2, 3, 4]);
+        assert_named_parameters_mut_increments(value, expected_paths, vec![1, 2, 3, 4]);
     }
 
     #[test]
