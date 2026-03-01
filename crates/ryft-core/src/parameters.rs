@@ -1031,7 +1031,7 @@ pub trait Parameterized<P: Parameter>: Sized {
         let mut missing_paths = Vec::new();
         parameters.reserve_exact(expected_count);
         for path in expected_paths {
-            let mut selected = None;
+            let mut collected_values = Vec::new();
             let mut has_missing_candidates = false;
             for iterator in &mut value_parameters {
                 let Some((_, candidate)) = iterator.next() else {
@@ -1041,25 +1041,18 @@ pub trait Parameterized<P: Parameter>: Sized {
                 let Some(candidate) = candidate else {
                     continue;
                 };
-                if let Some(value) = selected.as_ref() {
-                    if value != &candidate {
-                        // TODO(eaplatanios): It would probably be better to collect the full set of ambiguous values
-                        //  for the current path before returning. This might all look a lot simpler if we just collect
-                        //  those in a `Vec` first and then just raise an error if the `Vec` has length != 1.
-                        return Err(Error::AmbiguousParameterCombination {
-                            values: vec![format!("{value:?}"), format!("{candidate:?}")],
-                        });
-                    }
-                } else {
-                    selected = Some(candidate);
+                if !collected_values.iter().any(|value| value == &candidate) {
+                    collected_values.push(candidate);
                 }
             }
-            if has_missing_candidates {
+            if has_missing_candidates || collected_values.is_empty() {
                 missing_paths.push(path.to_string());
-            } else if let Some(parameter) = selected {
-                parameters.push(parameter);
+            } else if collected_values.len() > 1 {
+                return Err(Error::AmbiguousParameterCombination {
+                    values: collected_values.into_iter().map(|value| format!("{value:?}")).collect(),
+                });
             } else {
-                missing_paths.push(path.to_string());
+                parameters.push(collected_values.pop().unwrap());
             }
         }
 
@@ -2751,6 +2744,25 @@ mod tests {
         assert_eq!(
             combined,
             Err(Error::AmbiguousParameterCombination { values: vec!["10".to_string(), "20".to_string()] }),
+        );
+    }
+
+    #[test]
+    fn test_combine_optional_parameters_reports_full_ambiguous_value_set() {
+        let structure = vec![(Placeholder, Placeholder)];
+        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
+            structure,
+            vec![
+                vec![(Some(10), None)],
+                vec![(Some(20), Some(30))],
+                vec![(Some(30), Some(40))],
+            ],
+        );
+        assert_eq!(
+            combined,
+            Err(Error::AmbiguousParameterCombination {
+                values: vec!["10".to_string(), "20".to_string(), "30".to_string()],
+            }),
         );
     }
 
