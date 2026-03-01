@@ -8,9 +8,9 @@ use prost::Message;
 
 use crate::protos::CompilationOptions;
 use crate::{
-    Api, Buffer, BufferType, Chunk, Client, CopyToDeviceStream, Device, DeviceAssignment, Error, Event, Plugin,
-    SerializedDeviceAssignment, Topology, Value, hash_map_from_c_api, invoke_pjrt_api_error_fn, slice_from_c_api,
-    str_from_c_api,
+    Api, Buffer, BufferType, Chunk, Client, ComputationId, CopyToDeviceStream, Device, DeviceAssignment, Error, Event,
+    Plugin, ReplicaId, SerializedDeviceAssignment, Topology, Value, hash_map_from_c_api, invoke_pjrt_api_error_fn,
+    slice_from_c_api, str_from_c_api,
 };
 
 /// Program that can be compiled using a PJRT [`Client`]. Programs can be provided in multiple formats though not all
@@ -643,6 +643,24 @@ impl<'c> LoadedExecutable<'c> {
         })
     }
 
+    /// Returns the logical `(replica, partition)` IDs for the _addressable_ devices that this [`LoadedExecutable`]
+    /// will execute on.
+    pub fn addressable_device_logical_ids(&self) -> Result<Vec<(ReplicaId, ComputationId)>, Error> {
+        use ffi::PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args;
+        invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_LoadedExecutable_AddressableDeviceLogicalIds,
+            { executable = self.to_c_api() },
+            { addressable_device_logical_ids, num_addressable_device_logical_ids },
+        )
+        .map(|(logical_ids, logical_ids_count)| {
+            unsafe { slice_from_c_api(logical_ids, logical_ids_count) }
+                .iter()
+                .map(|logical_id| (logical_id.replica as ReplicaId, logical_id.partition as ComputationId))
+                .collect::<Vec<_>>()
+        })
+    }
+
     /// Returns the [`DeviceAssignment`] of this [`LoadedExecutable`].
     pub fn device_assignment(&self) -> Result<DeviceAssignment, Error> {
         use ffi::PJRT_LoadedExecutable_GetDeviceAssignment_Args;
@@ -838,6 +856,8 @@ impl<'c> LoadedExecutable<'c> {
             task_ids.len(),
             task_ids.as_mut_ptr(),
             incarnation_ids_list.as_mut_ptr(),
+            // TODO(eaplatanios): Add support for multi-slice configurations along with the relevant PJRT extension.
+            std::ptr::null_mut(),
         );
 
         // We prepare the input buffer handles array. This is an array of [`Buffer`] handle arrays where the outer
@@ -1200,6 +1220,44 @@ impl<'s> Client<'s> {
             { executable },
         )
         .and_then(|handle| unsafe { LoadedExecutable::from_c_api(handle, self.api(), self.to_c_api()) })
+    }
+
+    /// Loads the provided [`Executable`] into this [`Client`], returning a [`LoadedExecutable`] that is ready for
+    /// execution. If any [`CompilationOptions`] are provided, they will override the compilation options that were
+    /// used when creating the provided [`Executable`].
+    ///
+    /// Note that if the provided [`Executable`] is obtained by calling [`LoadedExecutable::executable`], then this
+    /// function will fall back to serializing it and then calling [`Client::deserialize_and_load_executable`] due
+    /// to a PJRT limitation around how [`Client::load_executable`] works.
+    pub fn load_executable(
+        &'_ self,
+        executable: &Executable,
+        options: Option<&CompilationOptions>,
+    ) -> Result<LoadedExecutable<'_>, Error> {
+        use ffi::PJRT_Client_Load_Args;
+        let options_bytes = options.map(|options| options.encode_to_vec());
+        let loaded_executable = invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_Client_Load,
+            {
+                client = self.to_c_api(),
+                executable = executable.to_c_api(),
+                compile_options = options_bytes
+                    .as_ref()
+                    .map(|options| options.as_ptr() as *const _)
+                    .unwrap_or(std::ptr::null()),
+                compile_options_size = options_bytes.map(|options| options.len()).unwrap_or(0),
+            },
+            { loaded_executable },
+        )
+        .and_then(|handle| unsafe { LoadedExecutable::from_c_api(handle, self.api(), self.to_c_api()) });
+        match loaded_executable {
+            Ok(loaded_executable) => Ok(loaded_executable),
+            Err(Error::InvalidArgument { message, .. }) if message.contains("Missing shared_executable") => {
+                self.deserialize_and_load_executable(executable.serialize()?.data(), options)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Deserializes the provided data into a [`LoadedExecutable`]. Note that the provided data must be the result of
@@ -1891,6 +1949,36 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_LoadedExecutable_AddressableDevices_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_LogicalDeviceIds {
+        pub replica: std::ffi::c_int,
+        pub partition: std::ffi::c_int,
+    }
+
+    #[repr(C)]
+    pub struct PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub executable: *mut PJRT_LoadedExecutable,
+        pub addressable_device_logical_ids: *const PJRT_LogicalDeviceIds,
+        pub num_addressable_device_logical_ids: usize,
+    }
+
+    impl PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args {
+        pub fn new(executable: *mut PJRT_LoadedExecutable) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                executable,
+                addressable_device_logical_ids: std::ptr::null(),
+                num_addressable_device_logical_ids: 0,
+            }
+        }
+    }
+
+    pub type PJRT_LoadedExecutable_AddressableDeviceLogicalIds =
+        unsafe extern "C" fn(args: *mut PJRT_LoadedExecutable_AddressableDeviceLogicalIds_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_LoadedExecutable_GetDeviceAssignment_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -2041,6 +2129,38 @@ pub(crate) mod ffi {
     pub type PJRT_Client_Compile = unsafe extern "C" fn(args: *mut PJRT_Client_Compile_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_Client_Load_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub client: *mut PJRT_Client,
+        pub executable: *mut PJRT_Executable,
+        pub compile_options: *const std::ffi::c_char,
+        pub compile_options_size: usize,
+        pub loaded_executable: *mut PJRT_LoadedExecutable,
+    }
+
+    impl PJRT_Client_Load_Args {
+        pub fn new(
+            client: *mut PJRT_Client,
+            executable: *mut PJRT_Executable,
+            compile_options: *const std::ffi::c_char,
+            compile_options_size: usize,
+        ) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                client,
+                executable,
+                compile_options,
+                compile_options_size,
+                loaded_executable: std::ptr::null_mut(),
+            }
+        }
+    }
+
+    pub type PJRT_Client_Load = unsafe extern "C" fn(args: *mut PJRT_Client_Load_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_Executable_DeserializeAndLoad_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -2109,6 +2229,14 @@ pub(crate) mod ffi {
         _marker: PhantomData<(*mut u8, PhantomPinned)>,
     }
 
+    // We represent opaque C types as structs with a particular structure that is following the convention
+    // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
+    #[repr(C)]
+    pub struct PJRT_MultiSlice_Config {
+        _data: [u8; 0],
+        _marker: PhantomData<(*mut u8, PhantomPinned)>,
+    }
+
     #[repr(C)]
     pub struct PJRT_ExecuteContext_Create_Args {
         pub struct_size: usize,
@@ -2161,6 +2289,7 @@ pub(crate) mod ffi {
         pub num_tasks: usize,
         pub task_ids: *mut std::ffi::c_int,
         pub incarnation_ids: *mut i64,
+        pub multi_slice_config: *mut PJRT_MultiSlice_Config,
     }
 
     impl PJRT_ExecuteOptions {
@@ -2178,6 +2307,7 @@ pub(crate) mod ffi {
             num_tasks: usize,
             task_ids: *mut std::ffi::c_int,
             incarnation_ids: *mut i64,
+            multi_slice_config: *mut PJRT_MultiSlice_Config,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -2194,6 +2324,7 @@ pub(crate) mod ffi {
                 num_tasks,
                 task_ids,
                 incarnation_ids,
+                multi_slice_config,
             }
         }
     }
@@ -2375,14 +2506,16 @@ mod tests {
             let client_addressable_devices = client.addressable_devices().unwrap();
             let program = test_program(false, false);
             let options = test_compilation_options();
-            let loaded_executable = client.compile(&program, &options).unwrap();
-            let loaded_executable_addressable_devices = loaded_executable.addressable_devices().unwrap();
-            assert_eq!(loaded_executable_addressable_devices, client_addressable_devices[..1]);
+            let executable = client.compile(&program, &options).unwrap();
+            let executable_addressable_devices = executable.addressable_devices().unwrap();
+            assert_eq!(executable_addressable_devices, client_addressable_devices[..1]);
+            let executable_addressable_device_logical_ids = executable.addressable_device_logical_ids().unwrap();
+            assert_eq!(executable_addressable_device_logical_ids, vec![(0, 0)]);
             assert_eq!(
-                loaded_executable.device_assignment(),
+                executable.device_assignment(),
                 Ok(DeviceAssignment { replica_count: 1, computation_count: 1, assignment: vec![0] }),
             );
-            let executable = loaded_executable.executable().unwrap();
+            let executable = executable.executable().unwrap();
             assert_eq!(executable.name().unwrap(), "main");
             assert_eq!(executable.replica_count(), Ok(1));
             assert_eq!(executable.computation_count(), Ok(1));
@@ -2410,6 +2543,71 @@ mod tests {
             assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
             assert!(executable.memory_statistics().is_ok());
             assert!(executable.serialize().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_client_load() {
+        test_for_each_platform!(|plugin, client, platform| {
+            let topology = client.topology().unwrap();
+            let program = test_program(false, false);
+            let options = test_compilation_options();
+
+            // Test using an Ahead-Of-Time (AOT)-compiled executable which goes through the main code path.
+            // Note that AOT compilation is not supported on the built-in CPU plugin and so this test only runs
+            // on non-CPU platforms.
+            let executable = plugin.compile(&program, &topology, &options);
+            match platform {
+                TestPlatform::Cpu => assert!(executable.is_err()),
+                _ => {
+                    let executable = executable.unwrap();
+                    let loaded_executable = client.load_executable(&executable, Some(&options)).unwrap();
+                    assert_eq!(loaded_executable.addressable_device_logical_ids(), Ok(vec![(0, 0)]),);
+                    assert_eq!(
+                        loaded_executable.device_assignment(),
+                        Ok(DeviceAssignment { replica_count: 1, computation_count: 1, assignment: vec![0] }),
+                    );
+                    let executable_from_loaded_executable = loaded_executable.executable().unwrap();
+                    assert_eq!(executable_from_loaded_executable.name(), executable.name());
+                    assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
+                    assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
+                    assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
+                    assert_eq!(
+                        executable_from_loaded_executable.output_element_types(),
+                        executable.output_element_types(),
+                    );
+                    assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
+                }
+            };
+
+            // Test using a Just-In-Time (JIT)-compiled executable which goes through the fallback code path.
+            let loaded_executable = client.compile(&program, &options).unwrap();
+            let executable = loaded_executable.executable().unwrap();
+            let loaded_executable_from_executable = client.load_executable(&executable, Some(&options)).unwrap();
+            assert_eq!(
+                loaded_executable_from_executable.addressable_devices(),
+                loaded_executable.addressable_devices(),
+            );
+            assert_eq!(
+                loaded_executable_from_executable.addressable_device_logical_ids(),
+                loaded_executable.addressable_device_logical_ids(),
+            );
+            assert_eq!(loaded_executable_from_executable.device_assignment(), loaded_executable.device_assignment(),);
+            let executable_from_loaded_executable = loaded_executable_from_executable.executable().unwrap();
+            assert_eq!(executable_from_loaded_executable.name(), executable.name());
+            assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
+            assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
+            assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
+            assert_eq!(executable_from_loaded_executable.output_element_types(), executable.output_element_types());
+            assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
+            assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
+            assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
+            assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
+            // The loaded executable optimized program and memory statistics
+            // are not guaranteed to match the original.
+            assert!(executable_from_loaded_executable.optimized_program().is_ok());
+            assert!(executable_from_loaded_executable.memory_statistics().is_ok());
+            assert!(executable_from_loaded_executable.cost_analysis().is_err());
         });
     }
 
