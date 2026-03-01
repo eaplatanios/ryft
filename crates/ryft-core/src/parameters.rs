@@ -1128,99 +1128,6 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Applies optional updates leaf-wise using `update_fn(base, update)` whenever an update is present.
-    ///
-    /// This is the general form of the Equinox-inspired
-    /// [`apply_updates`](https://docs.kidger.site/equinox/api/manipulation/#equinoxapply_updates) pattern.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Optional update tree aligned with `self`.
-    ///   - `update_fn`: Custom update rule used only when a leaf in `updates` is `Some(update)`.
-    ///
-    /// # Returns
-    ///
-    /// A value with the same structure as `self`, where each leaf is either unchanged (`None` update) or updated via
-    /// `update_fn`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::MissingParameters`] or [`Error::UnusedParameters`] when the flattened lengths of
-    /// `self` and `updates` do not match.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::parameters::Parameterized;
-    /// let value = vec![(2_i32, 3_i32)];
-    /// let updated = value.apply_parameter_updates_with(
-    ///     vec![(None, Some(10))],
-    ///     |base, scale| base * scale,
-    /// )?;
-    /// assert_eq!(updated, vec![(2, 30)]);
-    /// # Ok::<(), ryft_core::errors::Error>(())
-    /// ```
-    fn apply_parameter_updates_with<U: Parameter, F>(
-        self,
-        updates: Self::To<Option<U>>,
-        update_fn: F,
-    ) -> Result<Self, Error>
-    where
-        F: FnMut(P, U) -> P,
-        Self::Family: ParameterizedFamily<Option<U>>,
-    {
-        let structure = self.parameter_structure();
-        let expected_count = structure.parameter_count();
-        let mut parameters = self.into_parameters();
-        let mut updates = updates.into_parameters();
-        let mut update_fn = update_fn;
-        let mut updated_parameters = Vec::new();
-        updated_parameters.reserve_exact(expected_count);
-        for _ in 0..expected_count {
-            let parameter = parameters.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
-            let update = updates.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
-            let updated = match update {
-                Some(update) => update_fn(parameter, update),
-                None => parameter,
-            };
-            updated_parameters.push(updated);
-        }
-        if parameters.next().is_some() || updates.next().is_some() {
-            return Err(Error::UnusedParameters { paths: None });
-        }
-        Self::from_parameters(structure, updated_parameters)
-    }
-
-    /// Applies additive updates to parameters where the update tree contains `Some(delta)`.
-    ///
-    /// This mirrors Equinox's `apply_updates` behavior for additive updates and is equivalent to
-    /// [`Self::apply_parameter_updates_with`] with `|base, delta| base + delta`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `updates`: Optional additive deltas aligned with `self`.
-    ///
-    /// # Returns
-    ///
-    /// A value with updated leaves where updates are present and unchanged leaves where updates are `None`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::parameters::Parameterized;
-    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-    /// let updated = value.apply_parameter_updates(vec![(Some(10), None), (None, Some(-2))])?;
-    /// assert_eq!(updated, vec![(11, 2), (3, 2)]);
-    /// # Ok::<(), ryft_core::errors::Error>(())
-    /// ```
-    fn apply_parameter_updates(self, updates: Self::To<Option<P>>) -> Result<Self, Error>
-    where
-        P: std::ops::Add<Output = P>,
-        Self::Family: ParameterizedFamily<Option<P>>,
-    {
-        self.apply_parameter_updates_with(updates, |base, delta| base + delta)
-    }
-
     /// Replaces parameters at explicit paths with values from `replacements`.
     ///
     /// This is an explicit-path variant of the Equinox-inspired
@@ -2850,29 +2757,6 @@ mod tests {
             replaced,
             Err(Error::UnusedParameters { paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]) }),
         );
-    }
-
-    #[test]
-    fn test_apply_parameter_updates_additive_subset() {
-        let value = vec![(1, 2), (3, 4)];
-        let updated = value.apply_parameter_updates(vec![(None, Some(100)), (Some(10), None)]).unwrap();
-        assert_eq!(updated, vec![(1, 102), (13, 4)]);
-    }
-
-    #[test]
-    fn test_apply_parameter_updates_with_custom_function() {
-        let value = vec![(2, 3), (4, 5)];
-        let updated = value
-            .apply_parameter_updates_with(vec![(Some(10), None), (None, Some(-1))], |base, scale| base * scale)
-            .unwrap();
-        assert_eq!(updated, vec![(20, 3), (4, -5)]);
-    }
-
-    #[test]
-    fn test_apply_parameter_updates_reports_shape_mismatch() {
-        let value = vec![(1, 2), (3, 4)];
-        let updated = value.apply_parameter_updates(vec![(Some(10), None)]);
-        assert_eq!(updated, Err(Error::MissingParameters { expected_count: 4, paths: None }));
     }
 
     #[test]
