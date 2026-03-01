@@ -137,22 +137,51 @@ impl ParameterPath {
         self.segments.iter().rev()
     }
 
-    // TODO(eaplatanios): Is there an operator or some nice syntactic sugar we can use for this?
     /// Returns a new [`ParameterPath`] with the provided [`ParameterPathSegment`] appended to it.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use ryft_core::parameters::{ParameterPath, ParameterPathSegment};
+    /// # use ryft_core::parameters::ParameterPath;
     /// let path = ParameterPath::root()
-    ///     .with_segment(ParameterPathSegment::Field("weights"))
-    ///     .with_segment(ParameterPathSegment::Index(1))
-    ///     .with_segment(ParameterPathSegment::TupleIndex(0));
+    ///     .field("weights")
+    ///     .index(1)
+    ///     .tuple_index(0);
     /// assert_eq!(path.to_string(), "$.weights[1].0");
     /// ```
     pub fn with_segment(mut self, segment: ParameterPathSegment) -> Self {
         self.segments.insert(0, segment);
         self
+    }
+
+    /// Returns a new [`ParameterPath`] with a [`ParameterPathSegment::Field`] segment appended
+    /// to the end of this [`ParameterPath`].
+    pub fn field(self, name: &'static str) -> Self {
+        self.with_segment(ParameterPathSegment::Field(name))
+    }
+
+    /// Returns a new [`ParameterPath`] with a [`ParameterPathSegment::Variant`] segment appended
+    /// to the end of this [`ParameterPath`].
+    pub fn variant(self, name: &'static str) -> Self {
+        self.with_segment(ParameterPathSegment::Variant(name))
+    }
+
+    /// Returns a new [`ParameterPath`] with a [`ParameterPathSegment::Index`] segment appended
+    /// to the end of this [`ParameterPath`].
+    pub fn index(self, index: usize) -> Self {
+        self.with_segment(ParameterPathSegment::Index(index))
+    }
+
+    /// Returns a new [`ParameterPath`] with a [`ParameterPathSegment::TupleIndex`] segment appended
+    /// to the end of this [`ParameterPath`].
+    pub fn tuple_index(self, index: usize) -> Self {
+        self.with_segment(ParameterPathSegment::TupleIndex(index))
+    }
+
+    /// Returns a new [`ParameterPath`] with a [`ParameterPathSegment::Key`] segment appended
+    /// to the end of this [`ParameterPath`].
+    pub fn key<K: Debug>(self, key: K) -> Self {
+        self.with_segment(ParameterPathSegment::Key(format!("{key:?}")))
     }
 }
 
@@ -2167,14 +2196,8 @@ mod tests {
         assert_eq!(path.len(), 0);
         assert!(path.is_empty());
         assert!(path.is_root());
-        let path_prefix = ParameterPath::root()
-            .with_segment(ParameterPathSegment::Variant("ResidualConnection"))
-            .with_segment(ParameterPathSegment::Field("weights"));
-        let path = path_prefix
-            .clone()
-            .with_segment(ParameterPathSegment::Index(2))
-            .with_segment(ParameterPathSegment::TupleIndex(1))
-            .with_segment(ParameterPathSegment::Key(format!("{:?}", "alpha")));
+        let path_prefix = ParameterPath::root().variant("ResidualConnection").field("weights");
+        let path = path_prefix.clone().index(2).tuple_index(1).key("alpha");
         assert_eq!(path_prefix.len(), 2);
         assert_eq!(path.len(), 5);
         assert!(!path.is_root());
@@ -2194,8 +2217,6 @@ mod tests {
         assert_eq!(format!("{path}"), "$.residual_connection.weights[2].1[\"alpha\"]");
         assert_eq!(format!("{path:?}"), "ParameterPath[$.residual_connection.weights[2].1[\"alpha\"]]");
     }
-    
-    // TODO(eaplatanios): Review from here onwards.
 
     #[test]
     fn test_parameterized() {
@@ -2237,7 +2258,8 @@ mod tests {
             ],
             metadata: (42, "meta"),
         };
-        let expected_paths = vec![
+
+        let expected_parameter_paths = vec![
             "$.stem.weights[0]".to_string(),
             "$.stem.weights[1]".to_string(),
             "$.stem.bias".to_string(),
@@ -2250,7 +2272,10 @@ mod tests {
             "$.heads[1].gain".to_string(),
         ];
 
+        // Test [`Parameterized::parameter_count`].
         assert_eq!(value.parameter_count(), 10);
+
+        // Test [`Parameterized::parameter_structure`].
         let structure = value.parameter_structure();
         assert_eq!(
             structure,
@@ -2267,31 +2292,44 @@ mod tests {
                 metadata: (42, "meta"),
             },
         );
+
+        // Test [`Parameterized::parameters`].
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        let mut value_with_mutated_parameters = value.clone();
-        for parameter in value_with_mutated_parameters.parameters_mut() {
+
+        // Test [`Parameterized::parameters_mut`].
+        let mut value_clone = value.clone();
+        for parameter in value_clone.parameters_mut() {
             *parameter += 100;
         }
         assert_eq!(
-            value_with_mutated_parameters.parameters().copied().collect::<Vec<_>>(),
+            value_clone.parameters().copied().collect::<Vec<_>>(),
             vec![101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
         );
+
+        // Test [`Parameterized::into_parameters`].
         assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+        // Test [`Parameterized::named_parameters`].
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            expected_paths.iter().cloned().zip(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).collect::<Vec<_>>()
+            expected_parameter_paths
+                .iter()
+                .cloned()
+                .zip(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+                .collect::<Vec<_>>()
         );
-        let mut value_with_named_mutations = value.clone();
-        let mut seen_paths = Vec::new();
-        for (path, parameter) in value_with_named_mutations.named_parameters_mut() {
-            seen_paths.push(path.to_string());
+
+        // Test [`Parameterized::named_parameters_mut`].
+        let mut value_clone = value.clone();
+        let mut seen_parameter_paths = Vec::new();
+        for (path, parameter) in value_clone.named_parameters_mut() {
+            seen_parameter_paths.push(path.to_string());
             *parameter += path.len() as i32;
         }
-        assert_eq!(seen_paths, expected_paths);
-        assert_eq!(
-            value_with_named_mutations.parameters().copied().collect::<Vec<_>>(),
-            vec![4, 5, 5, 7, 10, 10, 11, 11, 13, 13]
-        );
+        assert_eq!(seen_parameter_paths, expected_parameter_paths);
+        assert_eq!(value_clone.parameters().copied().collect::<Vec<_>>(), vec![4, 5, 5, 7, 10, 10, 11, 11, 13, 13]);
+
+        // Test [`Parameterized::into_named_parameters`].
         assert_eq!(
             value
                 .clone()
@@ -2311,10 +2349,14 @@ mod tests {
                 ("$.heads[1].gain".to_string(), 10),
             ]
         );
-        assert_eq!(value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(), expected_paths);
-        let mut parameters_with_remainder = vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 500].into_iter();
+
+        // Test [`Parameterized::parameter_paths`].
+        assert_eq!(value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(), expected_parameter_paths);
+
+        // Test [`Parameterized::from_parameters_with_remainder`].
+        let mut parameters = vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 500].into_iter();
         assert_eq!(
-            Network::from_parameters_with_remainder(structure.clone(), &mut parameters_with_remainder),
+            Network::from_parameters_with_remainder(structure.clone(), &mut parameters),
             Ok(Network {
                 stem: Layer { weights: vec![11, 12], bias: 13, tag: "stem" },
                 controller: Controller::Blend { alpha: 14, branch: Block { pair: (15, 10), gain: 16, name: "branch" } },
@@ -2325,7 +2367,9 @@ mod tests {
                 metadata: (42, "meta"),
             })
         );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![500]);
+        assert_eq!(parameters.collect::<Vec<_>>(), vec![500]);
+
+        // Test [`Parameterized::from_parameters`].
         assert_eq!(
             Network::from_parameters(structure.clone(), vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30]),
             Ok(Network {
@@ -2342,36 +2386,22 @@ mod tests {
             Network::from_parameters(structure.clone(), vec![31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 999]),
             Err(Error::UnusedParameters { paths: None })
         );
-        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
-        named_parameters.reverse();
-        assert_eq!(Network::from_named_parameters(structure.clone(), named_parameters), Ok(value.clone()));
+
+        // Test [`Parameterized::from_named_parameters`].
+        let mut parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
+        parameters.reverse();
+        assert_eq!(Network::from_named_parameters(structure.clone(), parameters), Ok(value.clone()));
+
+        // Test [`Parameterized::from_broadcasted_named_parameters`].
         assert_eq!(
             Network::from_broadcasted_named_parameters(
                 structure.clone(),
                 HashMap::from([
                     (ParameterPath::root(), 1),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Field("controller")), 2),
-                    (
-                        ParameterPath::root()
-                            .with_segment(ParameterPathSegment::Field("controller"))
-                            .with_segment(ParameterPathSegment::Variant("Blend"))
-                            .with_segment(ParameterPathSegment::Field("branch")),
-                        10
-                    ),
-                    (
-                        ParameterPath::root()
-                            .with_segment(ParameterPathSegment::Field("controller"))
-                            .with_segment(ParameterPathSegment::Variant("Blend"))
-                            .with_segment(ParameterPathSegment::Field("branch"))
-                            .with_segment(ParameterPathSegment::Field("gain")),
-                        20
-                    ),
-                    (
-                        ParameterPath::root()
-                            .with_segment(ParameterPathSegment::Field("heads"))
-                            .with_segment(ParameterPathSegment::Index(1)),
-                        30
-                    ),
+                    (ParameterPath::root().field("controller"), 2),
+                    (ParameterPath::root().field("controller").variant("Blend").field("branch"), 10),
+                    (ParameterPath::root().field("controller").variant("Blend").field("branch").field("gain"), 20),
+                    (ParameterPath::root().field("heads").index(1), 30),
                 ])
             ),
             Ok(Network {
@@ -2384,55 +2414,84 @@ mod tests {
                 metadata: (42, "meta"),
             })
         );
+
+        // Test [`Parameterized::map_parameters`].
         assert_eq!(
             value.clone().map_parameters(|parameter| i64::from(parameter) * 10),
             Ok(Network {
-                stem: Layer { weights: vec![10_i64, 20], bias: 30, tag: "stem" },
-                controller: Controller::Blend { alpha: 40, branch: Block { pair: (50, 10), gain: 60, name: "branch" } },
+                stem: Layer { weights: vec![10i64, 20i64], bias: 30i64, tag: "stem" },
+                controller: Controller::Blend {
+                    alpha: 40i64,
+                    branch: Block { pair: (50i64, 10), gain: 60i64, name: "branch" },
+                },
                 heads: [
-                    Block { pair: (70, 11), gain: 80, name: "head_0" },
-                    Block { pair: (90, 12), gain: 100, name: "head_1" },
+                    Block { pair: (70i64, 11), gain: 80i64, name: "head_0" },
+                    Block { pair: (90i64, 12), gain: 100i64, name: "head_1" },
                 ],
                 metadata: (42, "meta"),
             })
         );
-        let named_mapped = value
-            .clone()
-            .map_named_parameters(|path, parameter| i64::from(parameter) + (path.len() as i64))
-            .unwrap();
-        assert_eq!(named_mapped.into_parameters().collect::<Vec<_>>(), vec![4_i64, 5, 5, 7, 10, 10, 11, 11, 13, 13]);
-        let filtered = value
-            .clone()
-            .filter_parameters(|path, _| path.to_string().ends_with(".bias") || path.to_string().ends_with(".gain"))
-            .unwrap();
+
+        // Test [`Parameterized::map_named_parameters`].
         assert_eq!(
-            filtered.into_parameters().collect::<Vec<_>>(),
-            vec![None, None, Some(3), None, None, Some(6), None, Some(8), None, Some(10)]
+            value
+                .clone()
+                .map_named_parameters(|path, parameter| i64::from(parameter) + (path.len() as i64))
+                .unwrap()
+                .into_parameters()
+                .collect::<Vec<_>>(),
+            vec![4i64, 5i64, 5i64, 7i64, 10i64, 10i64, 11i64, 11i64, 13i64, 13i64],
         );
+
+        // Test [`Parameterized::filter_parameters`].
+        assert_eq!(
+            value
+                .clone()
+                .filter_parameters(|path, _| path.to_string().ends_with(".bias") || path.to_string().ends_with(".gain"))
+                .unwrap()
+                .into_parameters()
+                .collect::<Vec<_>>(),
+            vec![None, None, Some(3), None, None, Some(6), None, Some(8), None, Some(10)],
+        );
+
+        // Test [`Parameterized::partition_parameters`].
         let (partition_0, partition_1) =
             value.clone().partition_parameters(|path, _| path.to_string().starts_with("$.heads[1]")).unwrap();
         assert_eq!(
             partition_0.clone().into_parameters().collect::<Vec<_>>(),
-            vec![None, None, None, None, None, None, None, None, Some(9), Some(10)]
+            vec![None, None, None, None, None, None, None, None, Some(9), Some(10)],
         );
         assert_eq!(
             partition_1.clone().into_parameters().collect::<Vec<_>>(),
-            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8), None, None]
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8), None, None],
         );
+
+        // Test [`Parameterized::combine_parameters`].
         assert_eq!(Network::combine_parameters(structure.clone(), vec![partition_0, partition_1]), Ok(value.clone()));
-        let replacement = value
-            .clone()
-            .map_parameters(|parameter| match parameter {
-                2 => Some(200),
-                5 => Some(500),
-                7 => Some(700),
-                10 => Some(1000),
-                _ => None,
-            })
-            .unwrap();
-        let replaced = value.replace_parameters(replacement).unwrap();
-        assert_eq!(replaced.into_parameters().collect::<Vec<_>>(), vec![1, 200, 3, 4, 500, 6, 700, 8, 9, 1000]);
+
+        // Test [`Parameterized::replace_parameters`].
+        assert_eq!(
+            value
+                .clone()
+                .replace_parameters(
+                    value
+                        .map_parameters(|parameter| match parameter {
+                            2 => Some(200),
+                            5 => Some(500),
+                            7 => Some(700),
+                            10 => Some(1000),
+                            _ => None,
+                        })
+                        .unwrap()
+                )
+                .unwrap()
+                .into_parameters()
+                .collect::<Vec<_>>(),
+            vec![1, 200, 3, 4, 500, 6, 700, 8, 9, 1000],
+        );
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     #[test]
     fn test_parameterized_parameter() {
@@ -2490,10 +2549,7 @@ mod tests {
         assert_eq!(
             <i32 as Parameterized<i32>>::from_named_parameters(
                 Placeholder,
-                HashMap::from([
-                    (ParameterPath::root(), 50),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Field("extra")), 60),
-                ])
+                HashMap::from([(ParameterPath::root(), 50), (ParameterPath::root().field("extra"), 60),])
             ),
             Err(Error::UnusedParameters { paths: None })
         );
@@ -2637,10 +2693,7 @@ mod tests {
         assert_eq!(
             <Tuple12 as Parameterized<i32>>::from_broadcasted_named_parameters(
                 value.parameter_structure(),
-                HashMap::from([
-                    (ParameterPath::root(), 1),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::TupleIndex(11)), 99),
-                ]),
+                HashMap::from([(ParameterPath::root(), 1), (ParameterPath::root().tuple_index(11), 99),]),
             ),
             Ok((1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 99)),
         );
@@ -2737,13 +2790,8 @@ mod tests {
                 value.parameter_structure(),
                 HashMap::from([
                     (ParameterPath::root(), 1),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(2)), 10),
-                    (
-                        ParameterPath::root()
-                            .with_segment(ParameterPathSegment::Index(2))
-                            .with_segment(ParameterPathSegment::TupleIndex(1)),
-                        20,
-                    ),
+                    (ParameterPath::root().index(2), 10),
+                    (ParameterPath::root().index(2).tuple_index(1), 20),
                 ]),
             ),
             Ok([(1, 1), (1, 1), (10, 20)]),
@@ -2822,13 +2870,8 @@ mod tests {
                 value.parameter_structure(),
                 HashMap::from([
                     (ParameterPath::root(), 1),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
-                    (
-                        ParameterPath::root()
-                            .with_segment(ParameterPathSegment::Index(1))
-                            .with_segment(ParameterPathSegment::TupleIndex(0)),
-                        99,
-                    ),
+                    (ParameterPath::root().index(1), 10),
+                    (ParameterPath::root().index(1).tuple_index(0), 99),
                 ]),
             ),
             Ok(vec![(1, 1), (99, 10)]),
@@ -2841,9 +2884,9 @@ mod tests {
             <Vec<i32> as Parameterized<i32>>::from_named_parameters(
                 vec![Placeholder, Placeholder],
                 vec![
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 1),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 2),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 7),
+                    (ParameterPath::root().index(0), 1),
+                    (ParameterPath::root().index(1), 2),
+                    (ParameterPath::root().index(0), 7),
                 ],
             ),
             Ok(vec![7, 2]),
@@ -2933,13 +2976,8 @@ mod tests {
                 value.parameter_structure(),
                 HashMap::from([
                     (ParameterPath::root(), 1),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "mu"))), 10,),
-                    (
-                        ParameterPath::root()
-                            .with_segment(ParameterPathSegment::Key(format!("{:?}", "zeta")))
-                            .with_segment(ParameterPathSegment::TupleIndex(1)),
-                        99,
-                    ),
+                    (ParameterPath::root().key("mu"), 10,),
+                    (ParameterPath::root().key("zeta").tuple_index(1), 99),
                 ]),
             ),
             Ok(HashMap::from([("alpha", (1, 1)), ("mu", (10, 10)), ("zeta", (1, 99))])),
@@ -3034,13 +3072,8 @@ mod tests {
                 value.parameter_structure(),
                 HashMap::from([
                     (ParameterPath::root(), 1),
-                    (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "right"))), 10,),
-                    (
-                        ParameterPath::root()
-                            .with_segment(ParameterPathSegment::Key(format!("{:?}", "right")))
-                            .with_segment(ParameterPathSegment::TupleIndex(1)),
-                        20,
-                    ),
+                    (ParameterPath::root().key("right"), 10,),
+                    (ParameterPath::root().key("right").tuple_index(1), 20),
                 ]),
             ),
             Ok(BTreeMap::from([("left", (1, 1)), ("right", (10, 20))])),
