@@ -198,6 +198,8 @@ pub(crate) mod ffi {
     pub const PJRT_Extension_Type_Megascale: PJRT_Extension_Type = 18;
     pub const PJRT_Extension_Type_Shardings: PJRT_Extension_Type = 19;
     pub const PJRT_Extension_Type_AbiVersion: PJRT_Extension_Type = 20;
+    pub const PJRT_Extension_Type_Collectives: PJRT_Extension_Type = 21;
+    pub const PJRT_Extension_Type_MultiSlice: PJRT_Extension_Type = 22;
 
     /// PJRT extension base type. The `extension_type` field must be used to identify the type of the extension
     /// and reinterpret its instance accordingly.
@@ -212,23 +214,20 @@ pub(crate) mod ffi {
     pub struct PJRT_Api {
         // For backwards compatibility, callers must use this value to guard accesses to fields
         // that may have been added after the plugin version they are interacting with was released.
+        // The macros in [`crate::macros`] take care of this automatically.
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
         pub pjrt_api_version: PJRT_Api_Version,
-
         pub PJRT_Error_Destroy: Option<PJRT_Error_Destroy>,
         pub PJRT_Error_Message: Option<PJRT_Error_Message>,
         pub PJRT_Error_GetCode: Option<PJRT_Error_GetCode>,
-
         pub PJRT_Plugin_Initialize: Option<PJRT_Plugin_Initialize>,
         pub PJRT_Plugin_Attributes: Option<PJRT_Plugin_Attributes>,
-
         pub PJRT_Event_Destroy: Option<PJRT_Event_Destroy>,
         pub PJRT_Event_IsReady: Option<PJRT_Event_IsReady>,
         pub PJRT_Event_Error: Option<PJRT_Event_Error>,
         pub PJRT_Event_Await: Option<PJRT_Event_Await>,
         pub PJRT_Event_OnReady: Option<PJRT_Event_OnReady>,
-
         pub PJRT_Client_Create: Option<PJRT_Client_Create>,
         pub PJRT_Client_Destroy: Option<PJRT_Client_Destroy>,
         pub PJRT_Client_PlatformName: Option<PJRT_Client_PlatformName>,
@@ -242,27 +241,23 @@ pub(crate) mod ffi {
         pub PJRT_Client_Compile: Option<PJRT_Client_Compile>,
         pub PJRT_Client_DefaultDeviceAssignment: Option<PJRT_Client_DefaultDeviceAssignment>,
         pub PJRT_Client_BufferFromHostBuffer: Option<PJRT_Client_BufferFromHostBuffer>,
-
         pub PJRT_DeviceDescription_Id: Option<PJRT_DeviceDescription_Id>,
         pub PJRT_DeviceDescription_ProcessIndex: Option<PJRT_DeviceDescription_ProcessIndex>,
         pub PJRT_DeviceDescription_Attributes: Option<PJRT_DeviceDescription_Attributes>,
         pub PJRT_DeviceDescription_Kind: Option<PJRT_DeviceDescription_Kind>,
         pub PJRT_DeviceDescription_DebugString: Option<PJRT_DeviceDescription_DebugString>,
         pub PJRT_DeviceDescription_ToString: Option<PJRT_DeviceDescription_ToString>,
-
         pub PJRT_Device_GetDescription: Option<PJRT_Device_GetDescription>,
         pub PJRT_Device_IsAddressable: Option<PJRT_Device_IsAddressable>,
         pub PJRT_Device_LocalHardwareId: Option<PJRT_Device_LocalHardwareId>,
         pub PJRT_Device_AddressableMemories: Option<PJRT_Device_AddressableMemories>,
         pub PJRT_Device_DefaultMemory: Option<PJRT_Device_DefaultMemory>,
         pub PJRT_Device_MemoryStats: Option<PJRT_Device_MemoryStats>,
-
         pub PJRT_Memory_Id: Option<PJRT_Memory_Id>,
         pub PJRT_Memory_Kind: Option<PJRT_Memory_Kind>,
         pub PJRT_Memory_DebugString: Option<PJRT_Memory_DebugString>,
         pub PJRT_Memory_ToString: Option<PJRT_Memory_ToString>,
         pub PJRT_Memory_AddressableByDevices: Option<PJRT_Memory_AddressableByDevices>,
-
         pub PJRT_Executable_Destroy: Option<PJRT_Executable_Destroy>,
         pub PJRT_Executable_Name: Option<PJRT_Executable_Name>,
         pub PJRT_Executable_NumReplicas: Option<PJRT_Executable_NumReplicas>,
@@ -273,7 +268,6 @@ pub(crate) mod ffi {
         pub PJRT_Executable_OutputMemoryKinds: Option<PJRT_Executable_OutputMemoryKinds>,
         pub PJRT_Executable_OptimizedProgram: Option<PJRT_Executable_OptimizedProgram>,
         pub PJRT_Executable_Serialize: Option<PJRT_Executable_Serialize>,
-
         pub PJRT_LoadedExecutable_Destroy: Option<PJRT_LoadedExecutable_Destroy>,
         pub PJRT_LoadedExecutable_GetExecutable: Option<PJRT_LoadedExecutable_GetExecutable>,
         pub PJRT_LoadedExecutable_AddressableDevices: Option<PJRT_LoadedExecutable_AddressableDevices>,
@@ -282,7 +276,6 @@ pub(crate) mod ffi {
         pub PJRT_LoadedExecutable_Execute: Option<PJRT_LoadedExecutable_Execute>,
         pub PJRT_Executable_DeserializeAndLoad: Option<PJRT_Executable_DeserializeAndLoad>,
         pub PJRT_LoadedExecutable_Fingerprint: Option<PJRT_LoadedExecutable_Fingerprint>,
-
         pub PJRT_Buffer_Destroy: Option<PJRT_Buffer_Destroy>,
         pub PJRT_Buffer_ElementType: Option<PJRT_Buffer_ElementType>,
         pub PJRT_Buffer_Dimensions: Option<PJRT_Buffer_Dimensions>,
@@ -302,13 +295,11 @@ pub(crate) mod ffi {
         pub PJRT_Buffer_IncreaseExternalReferenceCount: Option<PJRT_Buffer_IncreaseExternalReferenceCount>,
         pub PJRT_Buffer_DecreaseExternalReferenceCount: Option<PJRT_Buffer_DecreaseExternalReferenceCount>,
         pub PJRT_Buffer_OpaqueDeviceMemoryDataPointer: Option<PJRT_Buffer_OpaqueDeviceMemoryDataPointer>,
-
         pub PJRT_CopyToDeviceStream_Destroy: Option<PJRT_CopyToDeviceStream_Destroy>,
         pub PJRT_CopyToDeviceStream_AddChunk: Option<PJRT_CopyToDeviceStream_AddChunk>,
         pub PJRT_CopyToDeviceStream_TotalBytes: Option<PJRT_CopyToDeviceStream_TotalBytes>,
         pub PJRT_CopyToDeviceStream_GranuleSize: Option<PJRT_CopyToDeviceStream_GranuleSize>,
         pub PJRT_CopyToDeviceStream_CurrentBytes: Option<PJRT_CopyToDeviceStream_CurrentBytes>,
-
         pub PJRT_TopologyDescription_Create: Option<PJRT_TopologyDescription_Create>,
         pub PJRT_TopologyDescription_Destroy: Option<PJRT_TopologyDescription_Destroy>,
         pub PJRT_TopologyDescription_PlatformName: Option<PJRT_TopologyDescription_PlatformName>,
@@ -316,29 +307,18 @@ pub(crate) mod ffi {
         pub PJRT_TopologyDescription_GetDeviceDescriptions: Option<PJRT_TopologyDescription_GetDeviceDescriptions>,
         pub PJRT_TopologyDescription_Serialize: Option<PJRT_TopologyDescription_Serialize>,
         pub PJRT_TopologyDescription_Attributes: Option<PJRT_TopologyDescription_Attributes>,
-
         pub PJRT_Compile: Option<PJRT_Compile>,
-
         pub PJRT_Executable_OutputElementTypes: Option<PJRT_Executable_OutputElementTypes>,
         pub PJRT_Executable_OutputDimensions: Option<PJRT_Executable_OutputDimensions>,
-
         pub PJRT_Buffer_CopyToMemory: Option<PJRT_Buffer_CopyToMemory>,
-
         pub PJRT_Client_CreateViewOfDeviceBuffer: Option<PJRT_Client_CreateViewOfDeviceBuffer>,
-
         pub PJRT_Executable_Fingerprint: Option<PJRT_Executable_Fingerprint>,
-
         pub PJRT_Client_TopologyDescription: Option<PJRT_Client_TopologyDescription>,
-
         pub PJRT_Executable_GetCompiledMemoryStats: Option<PJRT_Executable_GetCompiledMemoryStats>,
-
         pub PJRT_Memory_Kind_Id: Option<PJRT_Memory_Kind_Id>,
-
         pub PJRT_ExecuteContext_Create: Option<PJRT_ExecuteContext_Create>,
         pub PJRT_ExecuteContext_Destroy: Option<PJRT_ExecuteContext_Destroy>,
-
         pub PJRT_Buffer_CopyRawToHost: Option<PJRT_Buffer_CopyRawToHost>,
-
         pub PJRT_AsyncHostToDeviceTransferManager_Destroy: Option<PJRT_AsyncHostToDeviceTransferManager_Destroy>,
         pub PJRT_AsyncHostToDeviceTransferManager_TransferData:
             Option<PJRT_AsyncHostToDeviceTransferManager_TransferData>,
@@ -355,10 +335,8 @@ pub(crate) mod ffi {
             Option<PJRT_AsyncHostToDeviceTransferManager_AddMetadata>,
         pub PJRT_Client_DmaMap: Option<PJRT_Client_DmaMap>,
         pub PJRT_Client_DmaUnmap: Option<PJRT_Client_DmaUnmap>,
-
         pub PJRT_Client_CreateUninitializedBuffer: Option<PJRT_Client_CreateUninitializedBuffer>,
         pub PJRT_Client_UpdateGlobalProcessInfo: Option<PJRT_Client_UpdateGlobalProcessInfo>,
-
         pub PJRT_TopologyDescription_Deserialize: Option<PJRT_TopologyDescription_Deserialize>,
         pub PJRT_Client_CreateAliasBuffer: Option<PJRT_Client_CreateAliasBuffer>,
         pub PJRT_Client_FulfillAliasBuffer: Option<PJRT_Client_FulfillAliasBuffer>,
@@ -367,18 +345,17 @@ pub(crate) mod ffi {
         pub PJRT_AsyncHostToDeviceTransferManager_TransferLiteral:
             Option<PJRT_AsyncHostToDeviceTransferManager_TransferLiteral>,
         pub PJRT_Buffer_CopyRawToHostFuture: Option<PJRT_Buffer_CopyRawToHostFuture>,
-
         pub PJRT_Device_PoisonExecution: Option<PJRT_Device_PoisonExecution>,
         pub PJRT_Device_CreateAsyncTrackingEvent: Option<PJRT_Device_CreateAsyncTrackingEvent>,
         pub PJRT_AsyncTrackingEvent_Destroy: Option<PJRT_AsyncTrackingEvent_Destroy>,
-
         pub PJRT_Executable_GetCompileOptions: Option<PJRT_Executable_GetCompileOptions>,
-
         pub PJRT_Buffer_DonateWithControlDependency: Option<PJRT_Buffer_DonateWithControlDependency>,
-
         pub PJRT_Event_Create: Option<PJRT_Event_Create>,
         pub PJRT_Event_Set: Option<PJRT_Event_Set>,
         pub PJRT_Device_GetAttributes: Option<PJRT_Device_GetAttributes>,
+        pub PJRT_Client_Load: Option<PJRT_Client_Load>,
+        pub PJRT_LoadedExecutable_AddressableDeviceLogicalIds:
+            Option<PJRT_LoadedExecutable_AddressableDeviceLogicalIds>,
     }
 }
 

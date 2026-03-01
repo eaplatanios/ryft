@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `964a0a45a0c3090cd484a3c51e8f9d05ed10b968`.
+- Upgraded the OpenXLA dependency pin to commit `15bc20b490170c25a4f4669d10573c6a601c0077`.
 - Updated bindgen input headers to include `pjrt_c_api_abi_version_extension.h`.
+- Synchronized `DebugOptions` protobuf definitions with upstream `xla.proto` additions at tags `455`, `456`, and `457`.
 
 ## [0.0.1] - 2026-02-22
 

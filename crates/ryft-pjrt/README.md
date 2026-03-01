@@ -136,6 +136,8 @@ fn main() {
         - [ ] TPU Topology
         - [ ] TPU Executable
         - [ ] Megascale
+        - [ ] Collectives
+        - [ ] Multi-Slice
     - Extensions that do not appear to be implemented for any PJRT plugins provided by Google:
         - [x] Executable Metadata
         - [x] Host Allocator
