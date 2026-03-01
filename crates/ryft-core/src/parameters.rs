@@ -137,6 +137,7 @@ impl ParameterPath {
         self.segments.iter().rev()
     }
 
+    // TODO(eaplatanios): Is there an operator or some nice syntactic sugar we can use for this?
     /// Returns a new [`ParameterPath`] with the provided [`ParameterPathSegment`] appended to it.
     ///
     /// # Example
@@ -2147,762 +2148,666 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
     }
 }
 
-// TODO(eaplatanios): Rewrite all the unit tests for this module.
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::fmt::Debug;
-    use std::marker::PhantomData;
 
-    use crate::errors::Error;
+    use ryft::*;
 
-    use super::{Parameter, ParameterPath, ParameterPathSegment, Parameterized, Placeholder};
-
-    // TODO(eaplatanios): `test_placeholder`: display, debug.
-    // TODO(eaplatanios): `test_parameter_path`: all functions, display, debug.
-    // TODO(eaplatanios): `test_parameterized`: all functions with an interesting nested type.
-    // TODO(eaplatanios): `test_parameterized_parameter`.
-    // TODO(eaplatanios): `test_parameterized_tuple`.
-    // TODO(eaplatanios): `test_parameterized_array`.
-    // TODO(eaplatanios): `test_parameterized_vec`.
-    // TODO(eaplatanios): `test_parameterized_hash_map`.
-    // TODO(eaplatanios): `test_parameterized_b_tree_map`.
-
-    fn assert_roundtrip_parameterized<V>(value: V, expected_parameters: Vec<i32>)
-    where
-        V: Clone + Debug + PartialEq + Parameterized<i32>,
-        V::ParameterStructure: Clone + Debug + PartialEq,
-    {
-        assert_eq!(value.parameter_count(), expected_parameters.len());
-        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), expected_parameters);
-        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), expected_parameters);
-
-        let structure = value.parameter_structure();
-        assert_eq!(V::from_parameters(structure.clone(), expected_parameters.clone()), Ok(value.clone()));
-
-        let mut parameters_with_remainder = expected_parameters.iter().copied().chain(std::iter::once(-1));
-        assert_eq!(V::from_parameters_with_remainder(structure, &mut parameters_with_remainder), Ok(value));
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![-1]);
+    #[test]
+    fn test_placeholder() {
+        let placeholder = Placeholder;
+        assert_eq!(format!("{placeholder}"), "<Parameter>");
+        assert_eq!(format!("{placeholder:?}"), "<Parameter>");
     }
 
-    fn assert_parameters_mut_increments<V>(value: V, expected_before: Vec<i32>)
-    where
-        V: Clone + Debug + PartialEq + Parameterized<i32>,
-        V::ParameterStructure: Clone + Debug + PartialEq,
-    {
-        let mut mutable_value = value;
-        for parameter in mutable_value.parameters_mut() {
-            *parameter += 1;
+    #[test]
+    fn test_parameter_path() {
+        let path = ParameterPath::root();
+        assert_eq!(path.len(), 0);
+        assert!(path.is_empty());
+        assert!(path.is_root());
+        let path_prefix = ParameterPath::root()
+            .with_segment(ParameterPathSegment::Variant("ResidualConnection"))
+            .with_segment(ParameterPathSegment::Field("weights"));
+        let path = path_prefix
+            .clone()
+            .with_segment(ParameterPathSegment::Index(2))
+            .with_segment(ParameterPathSegment::TupleIndex(1))
+            .with_segment(ParameterPathSegment::Key(format!("{:?}", "alpha")));
+        assert_eq!(path_prefix.len(), 2);
+        assert_eq!(path.len(), 5);
+        assert!(!path.is_root());
+        assert!(path.is_prefix_of(&path));
+        assert!(path_prefix.is_prefix_of(&path));
+        assert!(!path.is_prefix_of(&path_prefix));
+        assert_eq!(
+            path.segments().cloned().collect::<Vec<_>>(),
+            vec![
+                ParameterPathSegment::Variant("ResidualConnection"),
+                ParameterPathSegment::Field("weights"),
+                ParameterPathSegment::Index(2),
+                ParameterPathSegment::TupleIndex(1),
+                ParameterPathSegment::Key(format!("{:?}", "alpha")),
+            ],
+        );
+        assert_eq!(format!("{path}"), "$.residual_connection.weights[2].1[\"alpha\"]");
+        assert_eq!(format!("{path:?}"), "ParameterPath[$.residual_connection.weights[2].1[\"alpha\"]]");
+    }
+    
+    // TODO(eaplatanios): Review from here onwards.
+
+    #[test]
+    fn test_parameterized() {
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
+        struct Block<P: Parameter> {
+            pair: (P, usize),
+            gain: P,
+            name: &'static str,
         }
-        let expected_after = expected_before.iter().map(|parameter| parameter + 1).collect::<Vec<_>>();
-        assert_eq!(mutable_value.parameters().copied().collect::<Vec<_>>(), expected_after);
-    }
 
-    fn assert_named_roundtrip_parameterized<V>(value: V, expected_paths: Vec<String>, expected_parameters: Vec<i32>)
-    where
-        V: Clone + Debug + PartialEq + Parameterized<i32>,
-        V::ParameterStructure: Clone + Debug + PartialEq,
-    {
-        let named_refs =
-            value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>();
-        assert_eq!(
-            named_refs,
-            expected_paths.iter().cloned().zip(expected_parameters.iter().copied()).collect::<Vec<_>>(),
-        );
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
+        #[allow(dead_code)]
+        enum Controller<P: Parameter> {
+            Identity,
+            Blend { alpha: P, branch: Block<P> },
+        }
 
-        let named_owned = value.clone().into_named_parameters().collect::<Vec<_>>();
-        assert_eq!(
-            named_owned.iter().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            expected_paths.iter().cloned().zip(expected_parameters.iter().copied()).collect::<Vec<_>>(),
-        );
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
+        struct Layer<P: Parameter> {
+            weights: Vec<P>,
+            bias: P,
+            tag: &'static str,
+        }
 
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
+        struct Network<P: Parameter> {
+            stem: Layer<P>,
+            controller: Controller<P>,
+            heads: [Block<P>; 2],
+            metadata: (usize, &'static str),
+        }
+
+        let value = Network {
+            stem: Layer { weights: vec![1, 2], bias: 3, tag: "stem" },
+            controller: Controller::Blend { alpha: 4, branch: Block { pair: (5, 10), gain: 6, name: "branch" } },
+            heads: [
+                Block { pair: (7, 11), gain: 8, name: "head_0" },
+                Block { pair: (9, 12), gain: 10, name: "head_1" },
+            ],
+            metadata: (42, "meta"),
+        };
+        let expected_paths = vec![
+            "$.stem.weights[0]".to_string(),
+            "$.stem.weights[1]".to_string(),
+            "$.stem.bias".to_string(),
+            "$.controller.blend.alpha".to_string(),
+            "$.controller.blend.branch.pair.0".to_string(),
+            "$.controller.blend.branch.gain".to_string(),
+            "$.heads[0].pair.0".to_string(),
+            "$.heads[0].gain".to_string(),
+            "$.heads[1].pair.0".to_string(),
+            "$.heads[1].gain".to_string(),
+        ];
+
+        assert_eq!(value.parameter_count(), 10);
         let structure = value.parameter_structure();
-        let named_map = named_owned.into_iter().collect::<HashMap<_, _>>();
-        assert_eq!(V::from_named_parameters(structure, named_map), Ok(value));
-    }
-
-    fn assert_named_parameters_mut_increments<V>(value: V, expected_paths: Vec<String>, expected_before: Vec<i32>)
-    where
-        V: Clone + Debug + PartialEq + Parameterized<i32>,
-        V::ParameterStructure: Clone + Debug + PartialEq,
-    {
-        let mut mutable_value = value;
+        assert_eq!(
+            structure,
+            Network {
+                stem: Layer { weights: vec![Placeholder, Placeholder], bias: Placeholder, tag: "stem" },
+                controller: Controller::Blend {
+                    alpha: Placeholder,
+                    branch: Block { pair: (Placeholder, 10), gain: Placeholder, name: "branch" },
+                },
+                heads: [
+                    Block { pair: (Placeholder, 11), gain: Placeholder, name: "head_0" },
+                    Block { pair: (Placeholder, 12), gain: Placeholder, name: "head_1" },
+                ],
+                metadata: (42, "meta"),
+            },
+        );
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let mut value_with_mutated_parameters = value.clone();
+        for parameter in value_with_mutated_parameters.parameters_mut() {
+            *parameter += 100;
+        }
+        assert_eq!(
+            value_with_mutated_parameters.parameters().copied().collect::<Vec<_>>(),
+            vec![101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
+        );
+        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(
+            value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            expected_paths.iter().cloned().zip(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).collect::<Vec<_>>()
+        );
+        let mut value_with_named_mutations = value.clone();
         let mut seen_paths = Vec::new();
-        for (path, parameter) in mutable_value.named_parameters_mut() {
+        for (path, parameter) in value_with_named_mutations.named_parameters_mut() {
             seen_paths.push(path.to_string());
-            *parameter += 1;
+            *parameter += path.len() as i32;
         }
         assert_eq!(seen_paths, expected_paths);
-        let expected_after = expected_before.iter().map(|parameter| parameter + 1).collect::<Vec<_>>();
-        assert_eq!(mutable_value.parameters().copied().collect::<Vec<_>>(), expected_after);
-    }
-
-    fn assert_parameter_paths<V>(value: &V, expected_paths: Vec<String>)
-    where
-        V: Parameterized<i32>,
-    {
+        assert_eq!(
+            value_with_named_mutations.parameters().copied().collect::<Vec<_>>(),
+            vec![4, 5, 5, 7, 10, 10, 11, 11, 13, 13]
+        );
+        assert_eq!(
+            value
+                .clone()
+                .into_named_parameters()
+                .map(|(path, parameter)| (path.to_string(), parameter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("$.stem.weights[0]".to_string(), 1),
+                ("$.stem.weights[1]".to_string(), 2),
+                ("$.stem.bias".to_string(), 3),
+                ("$.controller.blend.alpha".to_string(), 4),
+                ("$.controller.blend.branch.pair.0".to_string(), 5),
+                ("$.controller.blend.branch.gain".to_string(), 6),
+                ("$.heads[0].pair.0".to_string(), 7),
+                ("$.heads[0].gain".to_string(), 8),
+                ("$.heads[1].pair.0".to_string(), 9),
+                ("$.heads[1].gain".to_string(), 10),
+            ]
+        );
         assert_eq!(value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(), expected_paths);
-    }
-
-    mod derive_support {
-        pub use crate::errors::Error;
-        pub use crate::parameters::{
-            Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
-            PathPrefixedParameterIterator, Placeholder,
-        };
-    }
-
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    struct Rate32(i32);
-
-    impl Parameter for Rate32 {}
-
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    struct Rate64(i64);
-
-    impl Parameter for Rate64 {}
-
-    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
-    #[ryft(crate = "crate::parameters::tests::derive_support")]
-    struct DomainRates<P: Parameter + Clone> {
-        first: P,
-        second: P,
-    }
-
-    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
-    #[ryft(crate = "crate::parameters::tests::derive_support")]
-    struct DomainRatesVec<P: Parameter>
-    where
-        P: Clone,
-    {
-        values: Vec<DomainRates<P>>,
-    }
-
-    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
-    #[ryft(crate = "crate::parameters::tests::derive_support")]
-    struct DomainOptionalTuple<P: Parameter> {
-        maybe_pair: Option<(P, usize)>,
-    }
-
-    #[derive(ryft_macros::Parameterized, Clone, Debug, PartialEq, Eq)]
-    #[ryft(crate = "crate::parameters::tests::derive_support")]
-    enum DomainRatesEnum<P: Parameter> {
-        Scalar(P),
-        Pair { left: P, right: P },
-        Empty,
-    }
-
-    macro_rules! assert_tuple_impl {
-        (($($value:expr),+ $(,)?)) => {{
-            let expected_parameters = vec![$($value),+];
-            let expected_paths = (0..expected_parameters.len())
-                .map(|index| format!("$.{index}"))
-                .collect::<Vec<_>>();
-            assert_roundtrip_parameterized(($($value,)+), expected_parameters.clone());
-            assert_parameters_mut_increments(($($value,)+), expected_parameters.clone());
-            assert_named_roundtrip_parameterized(($($value,)+), expected_paths.clone(), expected_parameters.clone());
-            assert_named_parameters_mut_increments(($($value,)+), expected_paths, expected_parameters);
-        }};
-    }
-
-    #[test]
-    fn test_leaf_parameterized_impl() {
-        assert_roundtrip_parameterized(7, vec![7]);
-        assert_parameters_mut_increments(7, vec![7]);
-        assert_named_roundtrip_parameterized(7, vec!["$".to_string()], vec![7]);
-        assert_named_parameters_mut_increments(7, vec!["$".to_string()], vec![7]);
-        assert_parameter_paths(&7, vec!["$".to_string()]);
-    }
-
-    #[test]
-    fn test_parameter_path_builder_helpers() {
-        let path = ParameterPath::root()
-            .with_segment(ParameterPathSegment::Variant("Pair"))
-            .with_segment(ParameterPathSegment::Field("weights"))
-            .with_segment(ParameterPathSegment::Index(1))
-            .with_segment(ParameterPathSegment::TupleIndex(0));
-        assert_eq!(path.to_string(), "$.pair.weights[1].0");
-        assert!(ParameterPath::root().with_segment(ParameterPathSegment::Variant("Pair")).is_prefix_of(&path));
-
-        let key_path = ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "left")));
-        assert_eq!(key_path.to_string(), "$[\"left\"]");
-    }
-
-    #[test]
-    fn test_phantom_data_parameterized_impl() {
-        assert_roundtrip_parameterized(PhantomData::<i32>, vec![]);
-        assert_parameters_mut_increments(PhantomData::<i32>, vec![]);
-        assert_named_roundtrip_parameterized(PhantomData::<i32>, vec![], vec![]);
-        assert_named_parameters_mut_increments(PhantomData::<i32>, vec![], vec![]);
-        assert_eq!(PhantomData::<i32>.parameter_structure(), PhantomData::<Placeholder>);
-    }
-
-    #[test]
-    fn test_tuple_parameterized_impls_up_to_arity_twelve() {
-        assert_tuple_impl!((0));
-        assert_tuple_impl!((0, 1));
-        assert_tuple_impl!((0, 1, 2));
-        assert_tuple_impl!((0, 1, 2, 3));
-        assert_tuple_impl!((0, 1, 2, 3, 4));
-        assert_tuple_impl!((0, 1, 2, 3, 4, 5));
-        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6));
-        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7));
-        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8));
-        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8, 9));
-        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
-        assert_tuple_impl!((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11));
-    }
-
-    #[test]
-    fn test_array_parameterized_impl() {
-        assert_roundtrip_parameterized([1, 2, 3], vec![1, 2, 3]);
-        assert_parameters_mut_increments([1, 2, 3], vec![1, 2, 3]);
-        assert_named_roundtrip_parameterized(
-            [1, 2, 3],
-            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
-            vec![1, 2, 3],
+        let mut parameters_with_remainder = vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 500].into_iter();
+        assert_eq!(
+            Network::from_parameters_with_remainder(structure.clone(), &mut parameters_with_remainder),
+            Ok(Network {
+                stem: Layer { weights: vec![11, 12], bias: 13, tag: "stem" },
+                controller: Controller::Blend { alpha: 14, branch: Block { pair: (15, 10), gain: 16, name: "branch" } },
+                heads: [
+                    Block { pair: (17, 11), gain: 18, name: "head_0" },
+                    Block { pair: (19, 12), gain: 20, name: "head_1" },
+                ],
+                metadata: (42, "meta"),
+            })
         );
-        assert_named_parameters_mut_increments(
-            [1, 2, 3],
-            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
-            vec![1, 2, 3],
+        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![500]);
+        assert_eq!(
+            Network::from_parameters(structure.clone(), vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30]),
+            Ok(Network {
+                stem: Layer { weights: vec![21, 22], bias: 23, tag: "stem" },
+                controller: Controller::Blend { alpha: 24, branch: Block { pair: (25, 10), gain: 26, name: "branch" } },
+                heads: [
+                    Block { pair: (27, 11), gain: 28, name: "head_0" },
+                    Block { pair: (29, 12), gain: 30, name: "head_1" },
+                ],
+                metadata: (42, "meta"),
+            })
         );
-        assert_roundtrip_parameterized([(1, 2), (3, 4)], vec![1, 2, 3, 4]);
-        assert_named_roundtrip_parameterized(
-            [(1, 2), (3, 4)],
-            vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
-            vec![1, 2, 3, 4],
+        assert_eq!(
+            Network::from_parameters(structure.clone(), vec![31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 999]),
+            Err(Error::UnusedParameters { paths: None })
         );
-    }
-
-    #[test]
-    fn test_vec_parameterized_impl() {
-        assert_roundtrip_parameterized(vec![1, 2, 3], vec![1, 2, 3]);
-        assert_parameters_mut_increments(vec![1, 2, 3], vec![1, 2, 3]);
-        assert_named_roundtrip_parameterized(
-            vec![1, 2, 3],
-            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
-            vec![1, 2, 3],
+        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
+        named_parameters.reverse();
+        assert_eq!(Network::from_named_parameters(structure.clone(), named_parameters), Ok(value.clone()));
+        assert_eq!(
+            Network::from_broadcasted_named_parameters(
+                structure.clone(),
+                HashMap::from([
+                    (ParameterPath::root(), 1),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Field("controller")), 2),
+                    (
+                        ParameterPath::root()
+                            .with_segment(ParameterPathSegment::Field("controller"))
+                            .with_segment(ParameterPathSegment::Variant("Blend"))
+                            .with_segment(ParameterPathSegment::Field("branch")),
+                        10
+                    ),
+                    (
+                        ParameterPath::root()
+                            .with_segment(ParameterPathSegment::Field("controller"))
+                            .with_segment(ParameterPathSegment::Variant("Blend"))
+                            .with_segment(ParameterPathSegment::Field("branch"))
+                            .with_segment(ParameterPathSegment::Field("gain")),
+                        20
+                    ),
+                    (
+                        ParameterPath::root()
+                            .with_segment(ParameterPathSegment::Field("heads"))
+                            .with_segment(ParameterPathSegment::Index(1)),
+                        30
+                    ),
+                ])
+            ),
+            Ok(Network {
+                stem: Layer { weights: vec![1, 1], bias: 1, tag: "stem" },
+                controller: Controller::Blend { alpha: 2, branch: Block { pair: (10, 10), gain: 20, name: "branch" } },
+                heads: [
+                    Block { pair: (1, 11), gain: 1, name: "head_0" },
+                    Block { pair: (30, 12), gain: 30, name: "head_1" },
+                ],
+                metadata: (42, "meta"),
+            })
         );
-        assert_named_parameters_mut_increments(
-            vec![1, 2, 3],
-            vec!["$[0]".to_string(), "$[1]".to_string(), "$[2]".to_string()],
-            vec![1, 2, 3],
+        assert_eq!(
+            value.clone().map_parameters(|parameter| i64::from(parameter) * 10),
+            Ok(Network {
+                stem: Layer { weights: vec![10_i64, 20], bias: 30, tag: "stem" },
+                controller: Controller::Blend { alpha: 40, branch: Block { pair: (50, 10), gain: 60, name: "branch" } },
+                heads: [
+                    Block { pair: (70, 11), gain: 80, name: "head_0" },
+                    Block { pair: (90, 12), gain: 100, name: "head_1" },
+                ],
+                metadata: (42, "meta"),
+            })
         );
-        assert_roundtrip_parameterized(vec![(1, 2), (3, 4)], vec![1, 2, 3, 4]);
-        assert_parameter_paths(
-            &vec![(1, 2), (3, 4)],
-            vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
+        let named_mapped = value
+            .clone()
+            .map_named_parameters(|path, parameter| i64::from(parameter) + (path.len() as i64))
+            .unwrap();
+        assert_eq!(named_mapped.into_parameters().collect::<Vec<_>>(), vec![4_i64, 5, 5, 7, 10, 10, 11, 11, 13, 13]);
+        let filtered = value
+            .clone()
+            .filter_parameters(|path, _| path.to_string().ends_with(".bias") || path.to_string().ends_with(".gain"))
+            .unwrap();
+        assert_eq!(
+            filtered.into_parameters().collect::<Vec<_>>(),
+            vec![None, None, Some(3), None, None, Some(6), None, Some(8), None, Some(10)]
         );
-        assert_named_roundtrip_parameterized(
-            vec![(1, 2), (3, 4)],
-            vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
-            vec![1, 2, 3, 4],
+        let (partition_0, partition_1) =
+            value.clone().partition_parameters(|path, _| path.to_string().starts_with("$.heads[1]")).unwrap();
+        assert_eq!(
+            partition_0.clone().into_parameters().collect::<Vec<_>>(),
+            vec![None, None, None, None, None, None, None, None, Some(9), Some(10)]
         );
-
-        let mapped: Vec<(i64, i64)> = vec![(1, 2), (3, 4)]
-            .map_named_parameters(|path, parameter| {
-                let mut offset = 0_i64;
-                for segment in path.segments() {
-                    match segment {
-                        ParameterPathSegment::Index(index) => offset += ((*index as i64) + 1) * 100,
-                        ParameterPathSegment::TupleIndex(index) => offset += (*index as i64) + 1,
-                        _ => {}
-                    }
-                }
-                i64::from(parameter) + offset
+        assert_eq!(
+            partition_1.clone().into_parameters().collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8), None, None]
+        );
+        assert_eq!(Network::combine_parameters(structure.clone(), vec![partition_0, partition_1]), Ok(value.clone()));
+        let replacement = value
+            .clone()
+            .map_parameters(|parameter| match parameter {
+                2 => Some(200),
+                5 => Some(500),
+                7 => Some(700),
+                10 => Some(1000),
+                _ => None,
             })
             .unwrap();
-        assert_eq!(mapped, vec![(102, 104), (204, 206)]);
+        let replaced = value.replace_parameters(replacement).unwrap();
+        assert_eq!(replaced.into_parameters().collect::<Vec<_>>(), vec![1, 200, 3, 4, 500, 6, 700, 8, 9, 1000]);
     }
 
     #[test]
-    fn test_hash_map_parameterized_impl() {
-        let mut value = HashMap::new();
-        value.insert("left", (1, 2));
-        value.insert("right", (3, 4));
-
-        assert_eq!(value.parameter_count(), 4);
-        let expected_parameters = vec![1, 2, 3, 4];
-        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), expected_parameters);
-        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), expected_parameters);
-        assert_parameters_mut_increments(value.clone(), expected_parameters.clone());
-
-        let structure = value.parameter_structure();
-        assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(structure.clone(), expected_parameters),
-            Ok(value.clone())
-        );
-
-        let mut parameters_with_remainder = value.clone().into_parameters().chain(std::iter::once(-1));
-        assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
-                structure,
-                &mut parameters_with_remainder
-            ),
-            Ok(value)
-        );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![-1]);
-    }
-
-    #[test]
-    fn test_hash_map_named_parameterized_impl() {
-        let mut value = HashMap::new();
-        value.insert("left", (1, 2));
-        value.insert("right", (3, 4));
-
-        assert_parameter_paths(
-            &value,
-            vec![
-                "$[\"left\"].0".to_string(),
-                "$[\"left\"].1".to_string(),
-                "$[\"right\"].0".to_string(),
-                "$[\"right\"].1".to_string(),
-            ],
-        );
-        assert_named_parameters_mut_increments(
-            value.clone(),
-            vec![
-                "$[\"left\"].0".to_string(),
-                "$[\"left\"].1".to_string(),
-                "$[\"right\"].0".to_string(),
-                "$[\"right\"].1".to_string(),
-            ],
-            vec![1, 2, 3, 4],
-        );
-
-        let expected = value.clone();
-        let structure = value.parameter_structure();
-        let named_owned = value.into_named_parameters().collect::<HashMap<_, _>>();
-        assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_parameters(structure, named_owned),
-            Ok(expected)
-        );
-    }
-
-    #[test]
-    fn test_hash_map_parameterized_impl_uses_sorted_key_order() {
-        let value = HashMap::from([("zeta", (1, 2)), ("alpha", (3, 4)), ("mu", (5, 6))]);
-
-        let parameters = value.clone().into_parameters().collect::<Vec<_>>();
-        assert_eq!(parameters, vec![3, 4, 5, 6, 1, 2]);
-
-        let rebuilt =
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(value.parameter_structure(), parameters);
-        assert_eq!(rebuilt, Ok(value));
-    }
-
-    #[test]
-    fn test_b_tree_map_parameterized_impl() {
-        let value = BTreeMap::from([("left", (1, 2)), ("right", (3, 4))]);
-        assert_roundtrip_parameterized(value.clone(), vec![1, 2, 3, 4]);
-        assert_parameters_mut_increments(value, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_b_tree_map_named_parameterized_impl() {
-        let value = BTreeMap::from([("left", (1, 2)), ("right", (3, 4))]);
-        let expected_paths = vec![
-            "$[\"left\"].0".to_string(),
-            "$[\"left\"].1".to_string(),
-            "$[\"right\"].0".to_string(),
-            "$[\"right\"].1".to_string(),
-        ];
-        assert_parameter_paths(&value, expected_paths.clone());
-        assert_named_roundtrip_parameterized(value.clone(), expected_paths.clone(), vec![1, 2, 3, 4]);
-        assert_named_parameters_mut_increments(value, expected_paths, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_partition_named_parameters_splits_by_predicate() {
-        let value = vec![(1, 2), (3, 4)];
-        let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("$[1]")).unwrap();
-        assert_eq!(selected, vec![(None, None), (Some(3), Some(4))]);
-        assert_eq!(rejected, vec![(Some(1), Some(2)), (None, None)]);
-    }
-
-    #[test]
-    fn test_filter_named_parameters_returns_selected_only() {
-        let value = vec![(1, 2), (3, 4)];
-        let filtered = value.filter_parameters(|path, _| path.to_string().ends_with(".1")).unwrap();
-        assert_eq!(filtered, vec![(None, Some(2)), (None, Some(4))]);
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_roundtrips_partitioned_output() {
-        let value = vec![(1, 2), (3, 4)];
-        let structure = value.parameter_structure();
-        let (selected, rejected) =
-            value.clone().partition_parameters(|path, _| path.to_string().starts_with("$[0]")).unwrap();
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![selected, rejected]);
-        assert_eq!(combined, Ok(value));
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_accepts_equal_non_none_values() {
-        let structure = vec![(Placeholder, Placeholder)];
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
-            structure,
-            vec![vec![(Some(10), None)], vec![(Some(10), Some(30))]],
-        );
-        assert_eq!(combined, Ok(vec![(10, 30)]));
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_reports_ambiguous_values() {
-        let structure = vec![(Placeholder, Placeholder)];
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
-            structure,
-            vec![vec![(Some(10), None)], vec![(Some(20), Some(30))]],
-        );
-        assert_eq!(
-            combined,
-            Err(Error::AmbiguousParameterCombination { values: vec!["10".to_string(), "20".to_string()] }),
-        );
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_reports_full_ambiguous_value_set() {
-        let structure = vec![(Placeholder, Placeholder)];
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
-            structure,
-            vec![vec![(Some(10), None)], vec![(Some(20), Some(30))], vec![(Some(30), Some(40))]],
-        );
-        assert_eq!(
-            combined,
-            Err(Error::AmbiguousParameterCombination {
-                values: vec!["10".to_string(), "20".to_string(), "30".to_string()],
-            }),
-        );
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_reports_missing_path() {
-        let structure = vec![(Placeholder, Placeholder)];
-        let combined =
-            <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![vec![(Some(10), None)]]);
-        assert_eq!(
-            combined,
-            Err(Error::MissingParameters { expected_count: 2, paths: Some(vec!["$[0].1".to_string()]) }),
-        );
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_reports_all_missing_paths() {
-        let structure = vec![(Placeholder, Placeholder)];
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![vec![(None, None)]]);
-        assert_eq!(
-            combined,
-            Err(Error::MissingParameters {
-                expected_count: 2,
-                paths: Some(vec!["$[0].0".to_string(), "$[0].1".to_string()]),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_reports_missing_paths_for_short_tree() {
-        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
-        let combined =
-            <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![vec![(Some(10), Some(20))]]);
-        assert_eq!(
-            combined,
-            Err(Error::MissingParameters {
-                expected_count: 4,
-                paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_combine_optional_parameters_reports_unused_paths() {
-        let structure = vec![(Placeholder, Placeholder)];
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
-            structure,
-            vec![vec![(Some(10), Some(20)), (Some(30), Some(40))]],
-        );
-        assert_eq!(
-            combined,
-            Err(Error::UnusedParameters { paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]) }),
-        );
-    }
-
-    #[test]
-    fn test_replace_parameters_replaces_subset() {
-        let value = vec![(1, 2), (3, 4)];
-        let replaced = value.replace_parameters(vec![(None, None), (Some(99), None)]).unwrap();
-        assert_eq!(replaced, vec![(1, 2), (99, 4)]);
-    }
-
-    #[test]
-    fn test_replace_parameters_reports_missing_paths() {
-        let value = vec![(1, 2), (3, 4)];
-        let replaced = value.replace_parameters(vec![(None, None)]);
-        assert_eq!(
-            replaced,
-            Err(Error::MissingParameters {
-                expected_count: 4,
-                paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_replace_parameters_reports_unused_paths() {
-        let value = vec![(1, 2)];
-        let replaced = value.replace_parameters(vec![(None, None), (Some(99), Some(100))]);
-        assert_eq!(
-            replaced,
-            Err(Error::UnusedParameters { paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]) }),
-        );
-    }
-
-    #[test]
-    fn test_derive_supports_additional_parameter_bounds() {
-        let value = DomainRates { first: Rate32(3), second: Rate32(7) };
-        assert_eq!(value.parameter_count(), 2);
-        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![Rate32(3), Rate32(7)]);
+    fn test_parameterized_parameter() {
+        let value = 7_i32;
+        assert_eq!(value.parameter_count(), 1);
+        assert_eq!(value.parameter_structure(), Placeholder);
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![7]);
+        let mut value_for_mutation = value;
+        for parameter in value_for_mutation.parameters_mut() {
+            *parameter += 1;
+        }
+        assert_eq!(value_for_mutation, 8);
+        assert_eq!(value.into_parameters().collect::<Vec<_>>(), vec![7]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![("$.first".to_string(), Rate32(3)), ("$.second".to_string(), Rate32(7))],
+            vec![("$".to_string(), 7)],
         );
-        assert_eq!(value.parameter_structure(), DomainRates { first: Placeholder, second: Placeholder });
+        let mut value_for_named_mutation = value;
+        for (path, parameter) in value_for_named_mutation.named_parameters_mut() {
+            assert_eq!(path.to_string(), "$");
+            *parameter *= 2;
+        }
+        assert_eq!(value_for_named_mutation, 14);
         assert_eq!(
-            DomainRates::from_named_parameters(
-                value.parameter_structure(),
-                value.clone().into_named_parameters().collect::<HashMap<_, _>>(),
-            ),
-            Ok(value.clone())
+            value
+                .into_named_parameters()
+                .map(|(path, parameter)| (path.to_string(), parameter))
+                .collect::<Vec<_>>(),
+            vec![("$".to_string(), 7)],
         );
+        assert_eq!(value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(), vec!["$".to_string()]);
 
-        let mapped: DomainRates<Rate64> = value.clone().map_parameters(|rate| Rate64(i64::from(rate.0) * 10)).unwrap();
-        assert_eq!(mapped, DomainRates { first: Rate64(30), second: Rate64(70) });
-
-        let mapped_named: DomainRates<Rate64> = value
-            .map_named_parameters(|path, rate| {
-                let multiplier = match path.segments().next() {
-                    Some(ParameterPathSegment::Field("first")) => 10_i64,
-                    Some(ParameterPathSegment::Field("second")) => 100_i64,
-                    _ => 1_i64,
-                };
-                Rate64(i64::from(rate.0) * multiplier)
-            })
-            .unwrap();
-        assert_eq!(mapped_named, DomainRates { first: Rate64(30), second: Rate64(700) });
+        let mut parameters_with_remainder = vec![10, 20].into_iter();
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_parameters_with_remainder(Placeholder, &mut parameters_with_remainder),
+            Ok(10)
+        );
+        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![20]);
+        assert_eq!(<i32 as Parameterized<i32>>::from_parameters(Placeholder, vec![30]), Ok(30));
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_parameters(Placeholder, vec![30, 40]),
+            Err(Error::UnusedParameters { paths: None })
+        );
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_parameters(Placeholder, Vec::<i32>::new()),
+            Err(Error::MissingParameters { expected_count: 1, paths: None })
+        );
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_named_parameters(
+                Placeholder,
+                HashMap::from([(ParameterPath::root(), 50)])
+            ),
+            Ok(50)
+        );
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_named_parameters(
+                Placeholder,
+                HashMap::from([
+                    (ParameterPath::root(), 50),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Field("extra")), 60),
+                ])
+            ),
+            Err(Error::UnusedParameters { paths: None })
+        );
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_broadcasted_named_parameters(
+                Placeholder,
+                HashMap::from([(ParameterPath::root(), 70)])
+            ),
+            Ok(70)
+        );
+        assert_eq!(value.map_parameters(|parameter| i64::from(parameter) * 10), Ok(70_i64));
+        assert_eq!(value.map_named_parameters(|path, parameter| i64::from(parameter) + (path.len() as i64)), Ok(7_i64));
+        assert_eq!(value.filter_parameters(|_, parameter| *parameter == 7), Ok(Some(7)));
+        assert_eq!(value.partition_parameters(|_, parameter| *parameter == 7), Ok((Some(7), None)));
+        assert_eq!(<i32 as Parameterized<i32>>::combine_parameters(Placeholder, vec![Some(9), None]), Ok(9));
+        assert_eq!(
+            <i32 as Parameterized<i32>>::combine_parameters(Placeholder, vec![Some(9), Some(10)]),
+            Err(Error::AmbiguousParameterCombination { values: vec!["9".to_string(), "10".to_string()] })
+        );
+        assert_eq!(value.replace_parameters(Some(11)), Ok(11));
+        assert_eq!(value.replace_parameters(None), Ok(7));
     }
 
     #[test]
-    fn test_derive_supports_nested_option_with_mixed_tuple_fields() {
-        let some = DomainOptionalTuple { maybe_pair: Some((Rate32(9), 42)) };
-        assert_eq!(some.parameter_count(), 1);
-        assert_eq!(some.parameters().copied().collect::<Vec<_>>(), vec![Rate32(9)]);
-        assert_eq!(
-            some.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![("$.maybe_pair.0.0".to_string(), Rate32(9))],
-        );
-        assert_eq!(some.parameter_structure(), DomainOptionalTuple { maybe_pair: Some((Placeholder, 42)) });
-        assert_eq!(
-            DomainOptionalTuple::from_named_parameters(
-                some.parameter_structure(),
-                some.clone().into_named_parameters().collect::<HashMap<_, _>>(),
-            ),
-            Ok(some.clone())
-        );
-
-        let mapped: DomainOptionalTuple<Rate64> =
-            some.clone().map_parameters(|rate| Rate64(i64::from(rate.0) + 5)).unwrap();
-        assert_eq!(mapped, DomainOptionalTuple { maybe_pair: Some((Rate64(14), 42)) });
-
-        let none = DomainOptionalTuple::<Rate32> { maybe_pair: None };
-        assert_eq!(none.parameter_count(), 0);
-        assert!(none.named_parameters().next().is_none());
-        assert_eq!(none.parameter_structure(), DomainOptionalTuple { maybe_pair: None::<(Placeholder, usize)> });
-        assert_eq!(
-            DomainOptionalTuple::from_named_parameters(
-                none.parameter_structure(),
-                none.clone().into_named_parameters().collect::<HashMap<_, _>>(),
-            ),
-            Ok(none)
-        );
-    }
-
-    #[test]
-    fn test_derive_supports_additional_parameter_bounds_in_where_clause() {
-        let value = DomainRatesVec {
-            values: vec![
-                DomainRates { first: Rate32(1), second: Rate32(2) },
-                DomainRates { first: Rate32(3), second: Rate32(4) },
-            ],
-        };
-        assert_eq!(value.parameter_count(), 4);
+    fn test_parameterized_tuple() {
+        type Tuple12 = (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32);
+        let value: Tuple12 = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+        assert_eq!(value.parameter_count(), 12);
         assert_eq!(
             value.parameter_structure(),
-            DomainRatesVec {
-                values: vec![
-                    DomainRates { first: Placeholder, second: Placeholder },
-                    DomainRates { first: Placeholder, second: Placeholder },
-                ],
-            }
+            (
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+                Placeholder,
+            )
         );
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],);
+        let mut value_for_mutation = value;
+        for parameter in value_for_mutation.parameters_mut() {
+            *parameter += 10;
+        }
         assert_eq!(
-            DomainRatesVec::from_parameters(
-                value.parameter_structure(),
-                vec![Rate32(1), Rate32(2), Rate32(3), Rate32(4)],
-            ),
-            Ok(value.clone())
+            value_for_mutation.parameters().copied().collect::<Vec<_>>(),
+            vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
         );
+        assert_eq!(value.into_parameters().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
             vec![
-                ("$.values[0].first".to_string(), Rate32(1)),
-                ("$.values[0].second".to_string(), Rate32(2)),
-                ("$.values[1].first".to_string(), Rate32(3)),
-                ("$.values[1].second".to_string(), Rate32(4)),
+                ("$.0".to_string(), 0),
+                ("$.1".to_string(), 1),
+                ("$.2".to_string(), 2),
+                ("$.3".to_string(), 3),
+                ("$.4".to_string(), 4),
+                ("$.5".to_string(), 5),
+                ("$.6".to_string(), 6),
+                ("$.7".to_string(), 7),
+                ("$.8".to_string(), 8),
+                ("$.9".to_string(), 9),
+                ("$.10".to_string(), 10),
+                ("$.11".to_string(), 11),
+            ],
+        );
+        let mut value_for_named_mutation = value;
+        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
+            *parameter *= 2;
+        }
+        assert_eq!(
+            value_for_named_mutation.parameters().copied().collect::<Vec<_>>(),
+            vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22],
+        );
+        assert_eq!(
+            value
+                .into_named_parameters()
+                .map(|(path, parameter)| (path.to_string(), parameter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("$.0".to_string(), 0),
+                ("$.1".to_string(), 1),
+                ("$.2".to_string(), 2),
+                ("$.3".to_string(), 3),
+                ("$.4".to_string(), 4),
+                ("$.5".to_string(), 5),
+                ("$.6".to_string(), 6),
+                ("$.7".to_string(), 7),
+                ("$.8".to_string(), 8),
+                ("$.9".to_string(), 9),
+                ("$.10".to_string(), 10),
+                ("$.11".to_string(), 11),
             ],
         );
         assert_eq!(
-            DomainRatesVec::from_named_parameters(
+            value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
+            vec![
+                "$.0".to_string(),
+                "$.1".to_string(),
+                "$.2".to_string(),
+                "$.3".to_string(),
+                "$.4".to_string(),
+                "$.5".to_string(),
+                "$.6".to_string(),
+                "$.7".to_string(),
+                "$.8".to_string(),
+                "$.9".to_string(),
+                "$.10".to_string(),
+                "$.11".to_string(),
+            ],
+        );
+        let mut parameters_with_remainder =
+            vec![100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 999].into_iter();
+        assert_eq!(
+            <Tuple12 as Parameterized<i32>>::from_parameters_with_remainder(
                 value.parameter_structure(),
-                value.clone().into_named_parameters().collect::<HashMap<_, _>>(),
+                &mut parameters_with_remainder
             ),
-            Ok(value.clone())
+            Ok((100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111)),
         );
-
-        let mapped: DomainRatesVec<Rate64> = value.map_parameters(|rate| Rate64(i64::from(rate.0) + 5)).unwrap();
+        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
         assert_eq!(
-            mapped,
-            DomainRatesVec {
-                values: vec![
-                    DomainRates { first: Rate64(6), second: Rate64(7) },
-                    DomainRates { first: Rate64(8), second: Rate64(9) },
-                ],
-            }
-        );
-    }
-
-    #[test]
-    fn test_derive_enum_supports_named_parameters() {
-        let scalar = DomainRatesEnum::Scalar(Rate32(9));
-        assert_eq!(
-            scalar
-                .named_parameters()
-                .map(|(path, parameter)| (path.to_string(), *parameter))
-                .collect::<Vec<_>>(),
-            vec![("$.scalar.0".to_string(), Rate32(9))],
-        );
-        assert_eq!(
-            DomainRatesEnum::from_named_parameters(
-                scalar.parameter_structure(),
-                scalar.clone().into_named_parameters().collect::<HashMap<_, _>>(),
+            <Tuple12 as Parameterized<i32>>::from_parameters(
+                value.parameter_structure(),
+                vec![200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211],
             ),
-            Ok(scalar.clone())
+            Ok((200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211)),
         );
-
-        let pair = DomainRatesEnum::Pair { left: Rate32(1), right: Rate32(2) };
+        let mut named_parameters = value.into_named_parameters().collect::<Vec<_>>();
+        named_parameters.reverse();
         assert_eq!(
-            pair.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![("$.pair.left".to_string(), Rate32(1)), ("$.pair.right".to_string(), Rate32(2)),],
+            <Tuple12 as Parameterized<i32>>::from_named_parameters(value.parameter_structure(), named_parameters),
+            Ok(value)
         );
         assert_eq!(
-            DomainRatesEnum::from_named_parameters(
-                pair.parameter_structure(),
-                pair.clone().into_named_parameters().collect::<HashMap<_, _>>(),
+            <Tuple12 as Parameterized<i32>>::from_broadcasted_named_parameters(
+                value.parameter_structure(),
+                HashMap::from([
+                    (ParameterPath::root(), 1),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::TupleIndex(11)), 99),
+                ]),
             ),
-            Ok(pair.clone())
+            Ok((1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 99)),
         );
-        let pair_mapped: DomainRatesEnum<Rate64> = pair
-            .map_named_parameters(|path, rate| {
-                let mut bonus = 0_i64;
-                for segment in path.segments() {
-                    match segment {
-                        ParameterPathSegment::Variant("Pair") => bonus += 1_000,
-                        ParameterPathSegment::Field("left") => bonus += 10,
-                        ParameterPathSegment::Field("right") => bonus += 20,
-                        _ => {}
-                    }
-                }
-                Rate64(i64::from(rate.0) + bonus)
-            })
-            .unwrap();
-        assert_eq!(pair_mapped, DomainRatesEnum::Pair { left: Rate64(1011), right: Rate64(1022) });
-
-        let empty = DomainRatesEnum::<Rate32>::Empty;
-        assert!(empty.named_parameters().next().is_none());
+        assert_eq!(<() as Parameterized<i32>>::from_parameters((), Vec::<i32>::new()), Ok(()));
         assert_eq!(
-            DomainRatesEnum::from_named_parameters(
-                empty.parameter_structure(),
-                empty.clone().into_named_parameters().collect::<HashMap<_, _>>(),
-            ),
-            Ok(empty)
-        );
-    }
-
-    #[test]
-    fn test_from_parameters_reports_unused_parameters() {
-        assert_eq!(
-            <i32 as Parameterized<i32>>::from_parameters(Placeholder, vec![3, 4]),
+            <() as Parameterized<i32>>::from_parameters((), vec![1]),
             Err(Error::UnusedParameters { paths: None }),
         );
     }
 
     #[test]
-    fn test_from_named_parameters_reports_unused_parameters() {
-        let extra_path = ParameterPath::root().with_segment(ParameterPathSegment::Field("extra"));
+    fn test_parameterized_array() {
+        let value = [(1, 2), (3, 4), (5, 6)];
+        assert_eq!(value.parameter_count(), 6);
         assert_eq!(
-            <i32 as Parameterized<i32>>::from_named_parameters(
-                Placeholder,
-                HashMap::from([(ParameterPath::root(), 3), (extra_path, 4)]),
+            value.parameter_structure(),
+            [(Placeholder, Placeholder), (Placeholder, Placeholder), (Placeholder, Placeholder),],
+        );
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
+        let mut value_for_mutation = value;
+        for parameter in value_for_mutation.parameters_mut() {
+            *parameter += 10;
+        }
+        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![11, 12, 13, 14, 15, 16]);
+        assert_eq!(value.into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![
+                ("$[0].0".to_string(), 1),
+                ("$[0].1".to_string(), 2),
+                ("$[1].0".to_string(), 3),
+                ("$[1].1".to_string(), 4),
+                ("$[2].0".to_string(), 5),
+                ("$[2].1".to_string(), 6),
+            ],
+        );
+        let mut value_for_named_mutation = value;
+        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
+            *parameter *= 3;
+        }
+        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![3, 6, 9, 12, 15, 18]);
+        assert_eq!(
+            value
+                .into_named_parameters()
+                .map(|(path, parameter)| (path.to_string(), parameter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("$[0].0".to_string(), 1),
+                ("$[0].1".to_string(), 2),
+                ("$[1].0".to_string(), 3),
+                ("$[1].1".to_string(), 4),
+                ("$[2].0".to_string(), 5),
+                ("$[2].1".to_string(), 6),
+            ],
+        );
+        assert_eq!(
+            value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
+            vec![
+                "$[0].0".to_string(),
+                "$[0].1".to_string(),
+                "$[1].0".to_string(),
+                "$[1].1".to_string(),
+                "$[2].0".to_string(),
+                "$[2].1".to_string(),
+            ],
+        );
+        let mut parameters_with_remainder = vec![10, 20, 30, 40, 50, 60, 999].into_iter();
+        assert_eq!(
+            <[(i32, i32); 3] as Parameterized<i32>>::from_parameters_with_remainder(
+                value.parameter_structure(),
+                &mut parameters_with_remainder
             ),
-            Err(Error::UnusedParameters { paths: None })
+            Ok([(10, 20), (30, 40), (50, 60)]),
         );
-    }
-
-    #[test]
-    fn test_from_parameters_reports_insufficient_parameters_for_vec() {
-        let structure = vec![Placeholder, Placeholder, Placeholder];
-        let result = <Vec<i32> as Parameterized<i32>>::from_parameters(structure, vec![1, 2]);
-        assert_eq!(result, Err(Error::MissingParameters { expected_count: 3, paths: None }));
-    }
-
-    #[test]
-    fn test_from_named_parameters_reports_insufficient_parameters_for_vec() {
-        let structure = vec![Placeholder, Placeholder, Placeholder];
-        let parameters = vec![1, 2].into_named_parameters().collect::<HashMap<_, _>>();
-        let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(structure, parameters);
-        assert_eq!(result, Err(Error::MissingParameters { expected_count: 3, paths: Some(vec!["$[2]".to_string()]) }));
-    }
-
-    #[test]
-    fn test_from_named_parameters_reports_all_missing_paths_for_vec() {
-        let structure = vec![Placeholder, Placeholder, Placeholder];
-        let parameters = HashMap::from([(ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 1)]);
-        let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(structure, parameters);
+        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
         assert_eq!(
-            result,
-            Err(Error::MissingParameters {
-                expected_count: 3,
-                paths: Some(vec!["$[1]".to_string(), "$[2]".to_string()]),
-            }),
+            <[(i32, i32); 3] as Parameterized<i32>>::from_parameters(
+                value.parameter_structure(),
+                vec![10, 20, 30, 40, 50, 60]
+            ),
+            Ok([(10, 20), (30, 40), (50, 60)]),
         );
-    }
-
-    #[test]
-    fn test_from_named_parameters_accepts_ordered_named_iterator_for_vec() {
-        let value = vec![(1, 2), (3, 4)];
-        let named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
+        let mut named_parameters = value.into_named_parameters().collect::<Vec<_>>();
+        named_parameters.reverse();
         assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_named_parameters(
+            <[(i32, i32); 3] as Parameterized<i32>>::from_named_parameters(
                 value.parameter_structure(),
                 named_parameters
             ),
             Ok(value),
         );
+        assert_eq!(
+            <[(i32, i32); 3] as Parameterized<i32>>::from_broadcasted_named_parameters(
+                value.parameter_structure(),
+                HashMap::from([
+                    (ParameterPath::root(), 1),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(2)), 10),
+                    (
+                        ParameterPath::root()
+                            .with_segment(ParameterPathSegment::Index(2))
+                            .with_segment(ParameterPathSegment::TupleIndex(1)),
+                        20,
+                    ),
+                ]),
+            ),
+            Ok([(1, 1), (1, 1), (10, 20)]),
+        );
+        let filtered = value.filter_parameters(|path, _| path.to_string().ends_with(".1")).unwrap();
+        assert_eq!(filtered.into_parameters().collect::<Vec<_>>(), vec![None, Some(2), None, Some(4), None, Some(6)],);
     }
 
     #[test]
-    fn test_from_named_parameters_accepts_out_of_order_named_iterator_for_vec() {
+    fn test_parameterized_vec() {
         let value = vec![(1, 2), (3, 4)];
+        assert_eq!(value.parameter_count(), 4);
+        assert_eq!(value.parameter_structure(), vec![(Placeholder, Placeholder), (Placeholder, Placeholder)]);
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        let mut value_for_mutation = value.clone();
+        for parameter in value_for_mutation.parameters_mut() {
+            *parameter += 1;
+        }
+        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![
+                ("$[0].0".to_string(), 1),
+                ("$[0].1".to_string(), 2),
+                ("$[1].0".to_string(), 3),
+                ("$[1].1".to_string(), 4),
+            ],
+        );
+        let mut value_for_named_mutation = value.clone();
+        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
+            *parameter *= 2;
+        }
+        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![2, 4, 6, 8]);
+        assert_eq!(
+            value
+                .clone()
+                .into_named_parameters()
+                .map(|(path, parameter)| (path.to_string(), parameter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("$[0].0".to_string(), 1),
+                ("$[0].1".to_string(), 2),
+                ("$[1].0".to_string(), 3),
+                ("$[1].1".to_string(), 4),
+            ],
+        );
+        assert_eq!(
+            value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
+            vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
+        );
+        let mut parameters_with_remainder = vec![10, 20, 30, 40, 999].into_iter();
+        assert_eq!(
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
+                value.parameter_structure(),
+                &mut parameters_with_remainder
+            ),
+            Ok(vec![(10, 20), (30, 40)]),
+        );
+        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
+        assert_eq!(
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_parameters(value.parameter_structure(), vec![10, 20, 30, 40]),
+            Ok(vec![(10, 20), (30, 40)]),
+        );
         let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
         named_parameters.reverse();
         assert_eq!(
@@ -2910,157 +2815,250 @@ mod tests {
                 value.parameter_structure(),
                 named_parameters
             ),
-            Ok(value),
-        );
-    }
-
-    #[test]
-    fn test_from_named_parameters_uses_last_value_for_duplicate_paths() {
-        let structure = vec![Placeholder, Placeholder];
-        let path_0 = ParameterPath::root().with_segment(ParameterPathSegment::Index(0));
-        let path_1 = ParameterPath::root().with_segment(ParameterPathSegment::Index(1));
-        let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(
-            structure,
-            vec![(path_0.clone(), 1), (path_1, 2), (path_0, 7)],
-        );
-        assert_eq!(result, Ok(vec![7, 2]));
-    }
-
-    #[test]
-    fn test_from_parameters_reports_insufficient_parameters_for_hash_map() {
-        let mut structure = HashMap::new();
-        structure.insert("left", Placeholder);
-        structure.insert("right", Placeholder);
-        structure.insert("middle", Placeholder);
-        let result = <HashMap<&str, i32> as Parameterized<i32>>::from_parameters(structure, vec![1, 2]);
-        assert_eq!(result, Err(Error::MissingParameters { expected_count: 3, paths: None }));
-    }
-
-    #[test]
-    fn test_from_named_parameters_reports_path_mismatch() {
-        let value = vec![10, 20];
-        let mut named = value.clone().into_named_parameters().collect::<HashMap<_, _>>();
-        let replaced_value = named
-            .remove(&ParameterPath::root().with_segment(ParameterPathSegment::Index(1)))
-            .expect("Expected to remove path $[1] from named parameter map.");
-        named.insert(ParameterPath::root().with_segment(ParameterPathSegment::Index(2)), replaced_value);
-        let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(value.parameter_structure(), named);
-        assert!(matches!(
-            result,
-            Err(Error::MissingParameters { expected_count: 2, paths: Some(paths) }) if paths == vec!["$[1]".to_string()],
-        ));
-    }
-
-    #[test]
-    fn test_from_named_parameters_is_order_independent() {
-        let value = vec![(1, 2), (3, 4)];
-        let mut named = value.clone().into_named_parameters().collect::<Vec<_>>();
-        named.reverse();
-        let named_map = named.into_iter().collect::<HashMap<_, _>>();
-        assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_named_parameters(value.parameter_structure(), named_map),
-            Ok(value)
-        );
-    }
-
-    #[test]
-    fn test_from_named_parameters_with_broadcasting_root_prefix() {
-        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
-        let rebuilt = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-            structure,
-            HashMap::from([(ParameterPath::root(), 9)]),
-        );
-        assert_eq!(rebuilt, Ok(vec![(9, 9), (9, 9)]));
-    }
-
-    #[test]
-    fn test_from_named_parameters_with_broadcasting_uses_most_specific_prefix() {
-        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
-        let rebuilt = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-            structure,
-            HashMap::from([
-                (ParameterPath::root(), 1),
-                (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
-                (
-                    ParameterPath::root()
-                        .with_segment(ParameterPathSegment::Index(1))
-                        .with_segment(ParameterPathSegment::TupleIndex(0)),
-                    99,
-                ),
-            ]),
-        );
-        assert_eq!(rebuilt, Ok(vec![(1, 1), (99, 10)]));
-    }
-
-    #[test]
-    fn test_from_named_parameters_with_broadcasting_reports_missing_prefix() {
-        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
-        let result = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-            structure,
-            HashMap::from([(ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 5)]),
+            Ok(value.clone()),
         );
         assert_eq!(
-            result,
-            Err(Error::MissingParameters {
-                expected_count: 4,
-                paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_from_named_parameters_with_broadcasting_reports_unused_prefix() {
-        let structure = vec![(Placeholder, Placeholder)];
-        let result = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-            structure,
-            HashMap::from([
-                (ParameterPath::root(), 5),
-                (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
-                (
-                    ParameterPath::root()
-                        .with_segment(ParameterPathSegment::Index(2))
-                        .with_segment(ParameterPathSegment::TupleIndex(0)),
-                    15,
-                ),
-            ]),
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
+                value.parameter_structure(),
+                HashMap::from([
+                    (ParameterPath::root(), 1),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
+                    (
+                        ParameterPath::root()
+                            .with_segment(ParameterPathSegment::Index(1))
+                            .with_segment(ParameterPathSegment::TupleIndex(0)),
+                        99,
+                    ),
+                ]),
+            ),
+            Ok(vec![(1, 1), (99, 10)]),
         );
         assert_eq!(
-            result,
-            Err(Error::UnusedParameters { paths: Some(vec!["$[1]".to_string(), "$[2].0".to_string()]) }),
+            <Vec<i32> as Parameterized<i32>>::from_parameters(vec![Placeholder, Placeholder, Placeholder], vec![1, 2]),
+            Err(Error::MissingParameters { expected_count: 3, paths: None }),
         );
-    }
-
-    #[test]
-    fn test_from_named_parameters_with_broadcasting_matches_exact_named_behavior() {
-        let value = vec![(1, 2), (3, 4)];
-        let structure = value.parameter_structure();
-        let named_parameters = value.into_named_parameters().collect::<HashMap<_, _>>();
         assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(structure, named_parameters),
-            Ok(vec![(1, 2), (3, 4)]),
+            <Vec<i32> as Parameterized<i32>>::from_named_parameters(
+                vec![Placeholder, Placeholder],
+                vec![
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 1),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 2),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 7),
+                ],
+            ),
+            Ok(vec![7, 2]),
         );
     }
 
     #[test]
-    fn test_from_named_parameters_with_broadcasting_supports_hash_map_key_paths() {
-        let mut structure = HashMap::new();
-        structure.insert("left", (Placeholder, Placeholder));
-        structure.insert("right", (Placeholder, Placeholder));
-        let result = <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-            structure,
-            HashMap::from([
-                (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "left"))), 10),
-                (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "right"))), 30),
-                (
-                    ParameterPath::root()
-                        .with_segment(ParameterPathSegment::Key(format!("{:?}", "right")))
-                        .with_segment(ParameterPathSegment::TupleIndex(1)),
-                    20,
-                ),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(result.get("left"), Some(&(10, 10)));
-        assert_eq!(result.get("right"), Some(&(30, 20)));
+    fn test_parameterized_hash_map() {
+        let value = HashMap::from([("zeta", (1, 2)), ("alpha", (3, 4)), ("mu", (5, 6))]);
+        assert_eq!(value.parameter_count(), 6);
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![3, 4, 5, 6, 1, 2]);
+        let mut value_for_mutation = value.clone();
+        for parameter in value_for_mutation.parameters_mut() {
+            *parameter += 10;
+        }
+        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![13, 14, 15, 16, 11, 12]);
+        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![3, 4, 5, 6, 1, 2]);
+        assert_eq!(
+            value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![
+                ("$[\"alpha\"].0".to_string(), 3),
+                ("$[\"alpha\"].1".to_string(), 4),
+                ("$[\"mu\"].0".to_string(), 5),
+                ("$[\"mu\"].1".to_string(), 6),
+                ("$[\"zeta\"].0".to_string(), 1),
+                ("$[\"zeta\"].1".to_string(), 2),
+            ],
+        );
+        let mut value_for_named_mutation = value.clone();
+        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
+            *parameter *= 2;
+        }
+        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![6, 8, 10, 12, 2, 4]);
+        assert_eq!(
+            value
+                .clone()
+                .into_named_parameters()
+                .map(|(path, parameter)| (path.to_string(), parameter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("$[\"alpha\"].0".to_string(), 3),
+                ("$[\"alpha\"].1".to_string(), 4),
+                ("$[\"mu\"].0".to_string(), 5),
+                ("$[\"mu\"].1".to_string(), 6),
+                ("$[\"zeta\"].0".to_string(), 1),
+                ("$[\"zeta\"].1".to_string(), 2),
+            ],
+        );
+        assert_eq!(
+            value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
+            vec![
+                "$[\"alpha\"].0".to_string(),
+                "$[\"alpha\"].1".to_string(),
+                "$[\"mu\"].0".to_string(),
+                "$[\"mu\"].1".to_string(),
+                "$[\"zeta\"].0".to_string(),
+                "$[\"zeta\"].1".to_string(),
+            ],
+        );
+        let mut parameters_with_remainder = vec![30, 40, 50, 60, 10, 20, 999].into_iter();
+        assert_eq!(
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
+                value.parameter_structure(),
+                &mut parameters_with_remainder
+            ),
+            Ok(HashMap::from([("alpha", (30, 40)), ("mu", (50, 60)), ("zeta", (10, 20))])),
+        );
+        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
+        assert_eq!(
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(
+                value.parameter_structure(),
+                vec![30, 40, 50, 60, 10, 20],
+            ),
+            Ok(HashMap::from([("alpha", (30, 40)), ("mu", (50, 60)), ("zeta", (10, 20))])),
+        );
+        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
+        named_parameters.reverse();
+        assert_eq!(
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_parameters(
+                value.parameter_structure(),
+                named_parameters
+            ),
+            Ok(value.clone()),
+        );
+        assert_eq!(
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
+                value.parameter_structure(),
+                HashMap::from([
+                    (ParameterPath::root(), 1),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "mu"))), 10,),
+                    (
+                        ParameterPath::root()
+                            .with_segment(ParameterPathSegment::Key(format!("{:?}", "zeta")))
+                            .with_segment(ParameterPathSegment::TupleIndex(1)),
+                        99,
+                    ),
+                ]),
+            ),
+            Ok(HashMap::from([("alpha", (1, 1)), ("mu", (10, 10)), ("zeta", (1, 99))])),
+        );
+        assert_eq!(
+            <HashMap<&str, i32> as Parameterized<i32>>::from_parameters(
+                HashMap::from([("left", Placeholder), ("right", Placeholder), ("middle", Placeholder)]),
+                vec![1, 2],
+            ),
+            Err(Error::MissingParameters { expected_count: 3, paths: None }),
+        );
+    }
+
+    #[test]
+    fn test_parameterized_b_tree_map() {
+        let value = BTreeMap::from([("left", (1, 2)), ("right", (3, 4))]);
+        assert_eq!(value.parameter_count(), 4);
+        assert_eq!(
+            value.parameter_structure(),
+            BTreeMap::from([("left", (Placeholder, Placeholder)), ("right", (Placeholder, Placeholder))]),
+        );
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        let mut value_for_mutation = value.clone();
+        for parameter in value_for_mutation.parameters_mut() {
+            *parameter += 10;
+        }
+        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![11, 12, 13, 14]);
+        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+            vec![
+                ("$[\"left\"].0".to_string(), 1),
+                ("$[\"left\"].1".to_string(), 2),
+                ("$[\"right\"].0".to_string(), 3),
+                ("$[\"right\"].1".to_string(), 4),
+            ],
+        );
+        let mut value_for_named_mutation = value.clone();
+        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
+            *parameter *= 2;
+        }
+        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![2, 4, 6, 8]);
+        assert_eq!(
+            value
+                .clone()
+                .into_named_parameters()
+                .map(|(path, parameter)| (path.to_string(), parameter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("$[\"left\"].0".to_string(), 1),
+                ("$[\"left\"].1".to_string(), 2),
+                ("$[\"right\"].0".to_string(), 3),
+                ("$[\"right\"].1".to_string(), 4),
+            ],
+        );
+        assert_eq!(
+            value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
+            vec![
+                "$[\"left\"].0".to_string(),
+                "$[\"left\"].1".to_string(),
+                "$[\"right\"].0".to_string(),
+                "$[\"right\"].1".to_string(),
+            ],
+        );
+        let mut parameters_with_remainder = vec![10, 20, 30, 40, 999].into_iter();
+        assert_eq!(
+            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
+                value.parameter_structure(),
+                &mut parameters_with_remainder
+            ),
+            Ok(BTreeMap::from([("left", (10, 20)), ("right", (30, 40))])),
+        );
+        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
+        assert_eq!(
+            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(
+                value.parameter_structure(),
+                vec![10, 20, 30, 40],
+            ),
+            Ok(BTreeMap::from([("left", (10, 20)), ("right", (30, 40))])),
+        );
+        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
+        named_parameters.reverse();
+        assert_eq!(
+            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_parameters(
+                value.parameter_structure(),
+                named_parameters
+            ),
+            Ok(value.clone()),
+        );
+        assert_eq!(
+            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
+                value.parameter_structure(),
+                HashMap::from([
+                    (ParameterPath::root(), 1),
+                    (ParameterPath::root().with_segment(ParameterPathSegment::Key(format!("{:?}", "right"))), 10,),
+                    (
+                        ParameterPath::root()
+                            .with_segment(ParameterPathSegment::Key(format!("{:?}", "right")))
+                            .with_segment(ParameterPathSegment::TupleIndex(1)),
+                        20,
+                    ),
+                ]),
+            ),
+            Ok(BTreeMap::from([("left", (1, 1)), ("right", (10, 20))])),
+        );
+        let (partition_0, partition_1) =
+            value.clone().partition_parameters(|path, _| path.to_string().starts_with("$[\"right\"]")).unwrap();
+        assert_eq!(partition_0.clone().into_parameters().collect::<Vec<_>>(), vec![None, None, Some(3), Some(4)],);
+        assert_eq!(partition_1.clone().into_parameters().collect::<Vec<_>>(), vec![Some(1), Some(2), None, None],);
+        assert_eq!(
+            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::combine_parameters(
+                value.parameter_structure(),
+                vec![partition_0, partition_1],
+            ),
+            Ok(value.clone()),
+        );
+        assert_eq!(
+            value.replace_parameters(BTreeMap::from([("left", (Some(99), None)), ("right", (None, Some(88)))])),
+            Ok(BTreeMap::from([("left", (99, 2)), ("right", (3, 88))])),
+        );
     }
 }
