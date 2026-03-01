@@ -1094,22 +1094,36 @@ pub trait Parameterized<P: Parameter>: Sized {
     {
         let structure = self.parameter_structure();
         let expected_count = structure.parameter_count();
-        let mut parameters = self.into_parameters();
-        let mut replacements = replacement.into_parameters();
+        let expected_paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
+        let mut parameters = self.into_named_parameters();
+        let mut replacements = replacement.into_named_parameters();
         let mut replaced_parameters = Vec::new();
         replaced_parameters.reserve_exact(expected_count);
-        for _ in 0..expected_count {
-            // TODO(eaplatanios): Can we collect all missing parameters and include `paths` in the end, same as we are
-            //  doing with a bunch of other functions that are defined earlier in this file?
-            let parameter = parameters.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
-            let replacement = replacements.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
-            replaced_parameters.push(replacement.unwrap_or(parameter));
+        let mut missing_paths = Vec::new();
+        
+        for path in expected_paths {
+            let parameter = parameters.next().map(|(_, parameter)| parameter);
+            let replacement = replacements.next().map(|(_, replacement)| replacement);
+            if let (Some(parameter), Some(replacement)) = (parameter, replacement) {
+                replaced_parameters.push(replacement.unwrap_or(parameter));
+            } else {
+                missing_paths.push(path.to_string());
+            }
         }
-        if parameters.next().is_some() || replacements.next().is_some() {
-            // TODO(eaplatanios): Can we include `paths` here?
-            return Err(Error::UnusedParameters { paths: None });
+
+        let mut unused_paths = parameters
+            .map(|(path, _)| path.to_string())
+            .chain(replacements.map(|(path, _)| path.to_string()))
+            .collect::<Vec<_>>();
+
+        if !missing_paths.is_empty() {
+            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+        } else if !unused_paths.is_empty() {
+            unused_paths.sort_unstable();
+            Err(Error::UnusedParameters { paths: Some(unused_paths) })
+        } else {
+            Self::from_parameters(structure, replaced_parameters)
         }
-        Self::from_parameters(structure, replaced_parameters)
     }
 
     // TODO(eaplatanios): Review from here onwards.
@@ -2747,11 +2761,7 @@ mod tests {
         let structure = vec![(Placeholder, Placeholder)];
         let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
             structure,
-            vec![
-                vec![(Some(10), None)],
-                vec![(Some(20), Some(30))],
-                vec![(Some(30), Some(40))],
-            ],
+            vec![vec![(Some(10), None)], vec![(Some(20), Some(30))], vec![(Some(30), Some(40))]],
         );
         assert_eq!(
             combined,
@@ -2817,6 +2827,29 @@ mod tests {
         let value = vec![(1, 2), (3, 4)];
         let replaced = value.replace_parameters(vec![(None, None), (Some(99), None)]).unwrap();
         assert_eq!(replaced, vec![(1, 2), (99, 4)]);
+    }
+
+    #[test]
+    fn test_replace_parameters_reports_missing_paths() {
+        let value = vec![(1, 2), (3, 4)];
+        let replaced = value.replace_parameters(vec![(None, None)]);
+        assert_eq!(
+            replaced,
+            Err(Error::MissingParameters {
+                expected_count: 4,
+                paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_replace_parameters_reports_unused_paths() {
+        let value = vec![(1, 2)];
+        let replaced = value.replace_parameters(vec![(None, None), (Some(99), Some(100))]);
+        assert_eq!(
+            replaced,
+            Err(Error::UnusedParameters { paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]) }),
+        );
     }
 
     #[test]
