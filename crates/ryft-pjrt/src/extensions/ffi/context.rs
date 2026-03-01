@@ -123,7 +123,7 @@ impl<'o> FfiExecutionContext<'o> {
     ) -> Result<(), FfiError> {
         use ffi::XLA_FFI_State_Set_Args;
         if stage == FfiExecutionStage::Execution {
-            return Err(FfiError::invalid_argument("execution state cannot be set for the execution stage"));
+            return Err(FfiError::invalid_argument("the XLA execution stage does not have a state associated with it"));
         };
         let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
@@ -146,7 +146,7 @@ impl<'o> FfiExecutionContext<'o> {
     pub fn state(&self, stage: FfiExecutionStage, type_id: FfiTypeId) -> Result<FfiExecutionState, FfiError> {
         use ffi::XLA_FFI_State_Get_Args;
         if stage == FfiExecutionStage::Execution {
-            return Err(FfiError::invalid_argument("execution state cannot be obtained for the execution stage"));
+            return Err(FfiError::invalid_argument("the XLA execution stage does not have a state associated with it"));
         };
         let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
@@ -485,12 +485,12 @@ mod tests {
             assert!(matches!(
                 context.set_state(FfiExecutionStage::Execution, FfiTypeId::new(42), std::ptr::null_mut()),
                 Err(FfiError::InvalidArgument { message, .. })
-                  if message.contains("execution stage does not support execution-state get/set operations"),
+                  if message.contains("the XLA execution stage does not have a state associated with it"),
             ));
             assert!(matches!(
                 context.state(FfiExecutionStage::Execution, FfiTypeId::new(42)),
                 Err(FfiError::InvalidArgument { message, .. })
-                  if message.contains("execution stage does not support execution-state get/set operations"),
+                  if message.contains("the XLA execution stage does not have a state associated with it"),
             ));
             assert!(matches!(
                 context.set_state(FfiExecutionStage::Instantiation, FfiTypeId::new(42), std::ptr::null_mut()),
