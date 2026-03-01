@@ -25,6 +25,7 @@ include = [
 ]
 
 [workspace.dependencies]
+ryft = { path = "crates/ryft", version = "0.0.2", default-features = false }
 ryft-core = { path = "crates/ryft-core", version = "0.0.2", default-features = false }
 ryft-macros = { path = "crates/ryft-macros", version = "0.0.2", default-features = false }
 ryft-mlir = { path = "crates/ryft-mlir", version = "0.0.2", default-features = false }

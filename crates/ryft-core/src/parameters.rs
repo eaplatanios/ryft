@@ -202,31 +202,32 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// structures that contain [`Parameter`] values at their leaves (of type `P`). Values of such types can be viewed as
 /// having two parts:
 ///
-///  1. Their _structure_, which can be obtained via [`Self::parameter_structure`].
-///  2. Their _parameter_ values, which can be obtained via [`Self::parameters`], [`Self::parameters_mut`],
-///     [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`],
-///     and [`Self::into_named_parameters`].
+///   1. Their _structure_, which can be obtained via [`Self::parameter_structure`].
+///   2. Their _parameter_ values, which can be obtained via [`Self::parameters`], [`Self::parameters_mut`],
+///      [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`],
+///      and [`Self::into_named_parameters`].
 ///
 /// In the context of machine learning (ML), a [`Parameterized`] can contain model parameters, dataset entries,
 /// reinforcement learning agent observations, etc. Ryft provides built-in [`Parameterized`] implementations for a wide
 /// range of container-like types, including but not limited to:
 ///
-///  - **Parameters:** All `P: Parameter` are `Parameterized<P>`.
-///  - **Tuples:** `()` is `Parameterized<P>` for all `P: Parameter`, `(V0)` is `Parameterized<P>` when
-///    `V0: Parameterized<P>`, `(V0, V1)` is `Parameterized<P>` when `V0: Parameterized<P>` and `V1: Parameterized<P>`,
-///    etc., up to size 12. Note that tuples with mixed [`Parameterized`] and non-[`Parameterized`] elements are
-///    supported only when they appear within types for which we derive [`Parameterized`] implementations using the
-///    `#[derive(Parameterized)]` macro (described in the [_Custom Types_](#custom-types) section below).
-///  - **Options:** `Option<V>` is `Parameterized<P>` when `V: Parameterized<P>`, _only_ when it appears within
-///    a type for which we derive a [`Parameterized`] implementation using the `#[derive(Parameterized)]` macro.
-///    That is because we need `Option<P>` to be a [`Parameter`] when `P: Parameter` in order to support some of
-///    the manipulation functions that are described in the
-///    [_Working with Parameterized Values_](#working-with-parameterized-values) section below.
-///  - **Arrays:** `[V; N]` is `Parameterized<P>` for any `N` when `V: Parameterized<P>`.
-///  - **Vectors:** `Vec<V>` is `Parameterized<P>` when `V: Parameterized<P>`.
-///  - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug + Ord` and `V: Parameterized<P>`,
-///    and `BTreeMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug + Ord` and `V: Parameterized<P>`.
-///  - **Phantom Data:** `PhantomData<P>` is `Parameterized<P>` for all `P: Parameter`, containing no parameters.
+///   - **Parameters:** All `P: Parameter` are `Parameterized<P>`.
+///   - **Tuples:** `()` is `Parameterized<P>` for all `P: Parameter`, `(V0)` is `Parameterized<P>` when
+///     `V0: Parameterized<P>`, `(V0, V1)` is `Parameterized<P>` when `V0: Parameterized<P>` and `V1: Parameterized<P>`,
+///     etc., up to size 12. Note that tuples with mixed [`Parameterized`] and non-[`Parameterized`] elements are
+///     supported only when they appear within types for which we derive [`Parameterized`] implementations using the
+///     `#[derive(Parameterized)]` macro (described in the [_Custom Parameterized Types_](#custom-parameterized-types)
+///     section below).
+///   - **Options:** `Option<V>` is `Parameterized<P>` when `V: Parameterized<P>`, _only_ when it appears within
+///     a type for which we derive a [`Parameterized`] implementation using the `#[derive(Parameterized)]` macro.
+///     That is because we need `Option<P>` to be a [`Parameter`] when `P: Parameter` in order to support some of
+///     the manipulation functions that are described in the
+///     [_Working with Parameterized Values_](#working-with-parameterized-values) section below.
+///   - **Arrays:** `[V; N]` is `Parameterized<P>` for any `N` when `V: Parameterized<P>`.
+///   - **Vectors:** `Vec<V>` is `Parameterized<P>` when `V: Parameterized<P>`.
+///   - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug + Ord` and `V: Parameterized<P>`,
+///     and `BTreeMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug + Ord` and `V: Parameterized<P>`.
+///   - **Phantom Data:** `PhantomData<P>` is `Parameterized<P>` for all `P: Parameter`, containing no parameters.
 ///
 /// Note that Ryft does not provide a generic `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>`
 /// because it overlaps with the blanket leaf implementation `impl<P: Parameter> Parameterized<P> for P`. Since `Box`
@@ -234,8 +235,8 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// the generic `Box` implementation would then become non-coherent under Rust's orphan/coherence rules.
 ///
 /// Ryft also provides a convenient `#[derive(Parameterized)]` macro that can be used to automatically derive
-/// [`Parameterized`] implementations for custom types. Refer to the [_Custom Types_](#custom-types) section below
-/// for more information on that macro.
+/// [`Parameterized`] implementations for custom types. Refer to the
+/// [_Custom Parameterized Types_](#custom-parameterized-types) section below for information on that macro.
 ///
 /// The [`Parameterized`] type and the functionality it provides is inspired by and shares a lot of commonalities with
 /// [JAX PyTrees](https://docs.jax.dev/en/latest/pytrees.html#working-with-pytrees) and
@@ -247,26 +248,26 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 /// ```rust
 /// # use std::collections::BTreeMap;
-/// # use ryft_core::parameters::{Parameterized, Placeholder};
+/// # use ryft::*;
 ///
 /// // Simple tuple with 3 [`Parameter`]s.
 /// let value = (1, 2, 3);
 /// let parameters = value.parameters().collect::<Vec<_>>();
-/// assert_eq!(value.parameter_count(), parameters.len());
+/// assert_eq!(value.parameter_count(), 3);
 /// assert_eq!(parameters, vec![&1, &2, &3]);
 /// assert_eq!(value.parameter_structure(), (Placeholder, Placeholder, Placeholder));
 ///
 /// // Nested tuple structure with 3 [`Parameter`]s.
 /// let value = (1, (2, 3), ());
 /// let parameters = value.parameters().collect::<Vec<_>>();
-/// assert_eq!(value.parameter_count(), parameters.len());
+/// assert_eq!(value.parameter_count(), 3);
 /// assert_eq!(parameters, vec![&1, &2, &3]);
 /// assert_eq!(value.parameter_structure(), (Placeholder, (Placeholder, Placeholder), ()));
 ///
 /// // Nested map and tuple structure with 5 [`Parameter`]s.
 /// let value = (1, BTreeMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
 /// let parameters = value.parameters().collect::<Vec<_>>();
-/// assert_eq!(value.parameter_count(), parameters.len());
+/// assert_eq!(value.parameter_count(), 5);
 /// assert_eq!(parameters, vec![&1, &2, &3, &4, &5]);
 /// assert_eq!(
 ///     value.parameter_structure(),
@@ -279,28 +280,28 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// The more interesting part about [`Parameterized`] types is what they enable us to do. The following operations are
 /// fundamental to [`Parameterized`] types and are almost always involved when working with such types and values:
 ///
-///  - **Flattening:** Given a parameterized value, _flattening_ consists of obtaining a flat iterator over the
-///    parameters that are contained in that value. These parameters may be arbitrarily nested in the value but we
-///    guarantee that they will always be returned in the same order. This is crucial in enabling the next operation,
-///    _unflattening_, which is the inverse of the flattening operation. This operation is exposed via the
-///    [`Self::parameters`], [`Self::parameters_mut`], and [`Self::into_parameters`] functions.
-///  - **Unflattening:** Given a [`Parameterized::ParameterStructure`] and an iterator over parameter values,
-///    _unflattening_ consists of constructing the fully structured [`Parameterized`] value that contains those
-///    parameters. The [`Parameterized::ParameterStructure`] is necessary in enabling this because _flattening_ is a
-///    lossy operation for certain types. For example, consider a tuple with two `Vec<P>` elements. After flattening
-///    we obtain a single iterator over parameters of type `P` without having any way of recovering the number of
-///    parameters that should go in the first vector versus the second. The [`Parameterized::ParameterStructure`] is
-///    used to provide that information and make recovery possible. An even more straightforward example is a value
-///    contains additional non-parameter information (e.g., consider a `(P, usize)` tuple). The unflattening operation
-///    is exposed via the [`Self::from_parameters`] function.
-///  - **Mapping:** Given a `Parameterized<P>` value, _mapping_ consists of using a function to map all the parameters
-///    nested in that value to new parameters of potentially different types yielding a `Parameterized<T>` value with
-///    the same structure. This is effectively a composition of _flattening_, _mapping_ the individual parameters, and
-///    _unflattening_ to obtain the final structured value. This operation is important in enabling things like tracing
-///    of functions that take parameterized data structures as inputs, whereby we can map all the nested parameters to
-///    tracer variables. It can also be used in a similar way to enable automatic differentiation, etc. It is a
-///    fundamental component of how the core features of Ryft are implemented. This operation is exposed via the
-///    [`Self::map_parameters`] function.
+///   - **Flattening:** Given a parameterized value, _flattening_ consists of obtaining a flat iterator over the
+///     parameters that are contained in that value. These parameters may be arbitrarily nested in the value but we
+///     guarantee that they will always be returned in the same order. This is crucial in enabling the next operation,
+///     _unflattening_, which is the inverse of the flattening operation. This operation is exposed via the
+///     [`Self::parameters`], [`Self::parameters_mut`], and [`Self::into_parameters`] functions.
+///   - **Unflattening:** Given a [`Parameterized::ParameterStructure`] and an iterator over parameter values,
+///     _unflattening_ consists of constructing the fully structured [`Parameterized`] value that contains those
+///     parameters. The [`Parameterized::ParameterStructure`] is necessary in enabling this because _flattening_ is a
+///     lossy operation for certain types. For example, consider a tuple with two `Vec<P>` elements. After flattening
+///     we obtain a single iterator over parameters of type `P` without having any way of recovering the number of
+///     parameters that should go in the first vector versus the second. The [`Parameterized::ParameterStructure`] is
+///     used to provide that information and make recovery possible. An even more straightforward example is a value
+///     contains additional non-parameter information (e.g., consider a `(P, usize)` tuple). The unflattening operation
+///     is exposed via the [`Self::from_parameters`] function.
+///   - **Mapping:** Given a `Parameterized<P>` value, _mapping_ consists of using a function to map all the parameters
+///     nested in that value to new parameters of potentially different types yielding a `Parameterized<T>` value with
+///     the same structure. This is effectively a composition of _flattening_, _mapping_ the individual parameters, and
+///     _unflattening_ to obtain the final structured value. This operation is important in enabling things like tracing
+///     of functions that take parameterized data structures as inputs, whereby we can map all the nested parameters to
+///     tracer variables. It can also be used in a similar way to enable automatic differentiation, etc. It is a
+///     fundamental component of how the core features of Ryft are implemented. This operation is exposed via the
+///     [`Self::map_parameters`] function.
 ///
 /// These core operations are also supported with _named_ parameters, where each parameter is paired with a
 /// [`ParameterPath`] specifying where in the nested data structure it belongs. This is useful for things like saving
@@ -319,7 +320,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 /// ```rust
 /// # use std::collections::{BTreeMap, HashMap};
-/// # use ryft_core::parameters::{ParameterPath, ParameterPathSegment, Parameterized};
+/// # use ryft::*;
 /// 
 /// type Value = (i32, BTreeMap<&'static str, Vec<i32>>, (i32,));
 /// let value = (1, BTreeMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
@@ -385,27 +386,144 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![10, 30])]), (0,)),
 /// );
 /// 
-/// # Ok::<(), ryft_core::errors::Error>(())
+/// # Ok::<(), ryft::Error>(())
 /// ```
 ///
-/// # Custom Types
+/// # Custom Parameterized Types
 ///
-/// TODO(eaplatanios): Introduce section about the derive macro and include examples.
-///  - Supports both structs and enums already.
-///  - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
-///    that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
-///    If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
-///  - The parameter type must be a generic type parameter bounded by [Parameter].
-///  - There must be only one such generic type parameter. Not zero and not more than one.
-///  - All fields that reference / depend on the parameter type are considered parameter fields.
-///  - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
-///  - Configurable `macro_parameter_lifetime` and `macro_parameter_type`.
+/// Ryft provides a `#[derive(Parameterized)]` procedural macro (via the `ryft-macros` crate) that can be used to
+/// generate implementations of both [`ParameterizedFamily`] and [`Parameterized`] for custom structs and enums.
+/// Concretely, the derived implementations:
 ///
+///   - Preserve the container shape and non-parameter data.
+///   - Treat every field or nested field that references the parameter type as part of the types parameters.
+///   - Recursively delegate traversal to nested [`Parameterized`] field types.
+///   - Preserve the variant information when traversing and rebuilding enums.
 ///
+/// The macro has the following requirements:
 ///
+///   - The type on which it is used must be a struct or an enum. Unions are not supported.
+///   - There must be exactly one generic type bounded by [`Parameter`].
+///   - The parameter type must be _owned_ in parameter fields (i.e., parameter references or pointers are not allowed).
+///   - Nested tuples that mix parameterized and non-parameterized elements are supported inside derived structs and
+///     enums. However, the same kinds of mixed tuples are not generally supported inside other generic containers
+///     (e.g., `Vec<(P, usize)>`), unless those container element types already satisfy the required [`Parameterized`]
+///     bounds.
+///   - The generated implementation reserves internal identifiers (e.g., `'__p` and `__P`) for macro-internal
+///     lifetime and type parameters. User-defined generics should avoid these names. The safest approach is not use
+///     names that start with `__` but, if you do, be aware of the possibility for name conflicts due to these internal
+///     identifiers.
 ///
+/// Furthermore, it makes the following assumptions:
 ///
+///   - All fields that reference or depend on the parameter type are treated as parameter fields.
+///   - Non-parameter fields are carried through unchanged and may induce additional trait bounds in the generated
+///     implementations (e.g., a [`Clone`] bound is required for implementing [`Self::parameter_structure`]).
+///   - Generic parameters and their attributes are otherwise carried through as they are.
 ///
+/// This macro also supports a container-level derive attribute, `#[ryft(crate = "...")]`, that overrides the path used
+/// reference Ryft types from the generated code. This is primarily meant for deriving implementations inside wrapper
+/// crates that re-export `ryft` under a different path. It should not be needed for the majority of use cases. Note
+/// also that the `#[ryft(...)]` attribute is not supported on individual struct fields or enum variants.
+///
+/// ## Examples
+/// 
+/// The following examples show how to use the `#[derive(Parameterized)]` macro:
+///
+/// ```rust
+/// # use ryft::*;
+///
+/// #[derive(Debug, Clone, PartialEq, Eq, Parameterized)]
+/// struct Layer<P: Parameter> {
+///     weights: Vec<P>,
+///     bias: P,
+///     metadata: (usize, usize),
+/// }
+///
+/// #[derive(Debug, Clone, PartialEq, Eq, Parameterized)]
+/// enum Block<P: Parameter> {
+///     Identity,
+///     Residual {
+///         trunk: Layer<P>,
+///         shortcut: (P, usize),
+///         tag: &'static str,
+///     },
+/// }
+///
+/// let layer = Layer { weights: vec![1, 2, 3], bias: 4, metadata: (3, 1) };
+/// assert_eq!(layer.parameter_count(), 4);
+/// assert_eq!(layer.parameters().collect::<Vec<_>>(), vec![&1, &2, &3, &4]);
+/// assert_eq!(
+///     layer.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+///     vec![
+///         ("$.weights[0]".to_string(), 1),
+///         ("$.weights[1]".to_string(), 2),
+///         ("$.weights[2]".to_string(), 3),
+///         ("$.bias".to_string(), 4),
+///     ],
+/// );
+/// assert_eq!(
+///     layer.parameter_structure(),
+///     Layer {
+///         weights: vec![Placeholder, Placeholder, Placeholder],
+///         bias: Placeholder,
+///         metadata: (3, 1),
+///     },
+/// );
+///
+/// let block = Block::Residual {
+///     trunk: Layer { weights: vec![10_i32, 20, 30], bias: 40, metadata: (2, 3) },
+///     shortcut: (50, 7),
+///     tag: "residual",
+/// };
+/// assert_eq!(block.parameter_count(), 5);
+/// assert_eq!(block.parameters().collect::<Vec<_>>(), vec![&10, &20, &30, &40, &50]);
+/// assert_eq!(
+///     block.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+///     vec![
+///         ("$.residual.trunk.weights[0]".to_string(), 10),
+///         ("$.residual.trunk.weights[1]".to_string(), 20),
+///         ("$.residual.trunk.weights[2]".to_string(), 30),
+///         ("$.residual.trunk.bias".to_string(), 40),
+///         ("$.residual.shortcut.0".to_string(), 50),
+///     ],
+/// );
+/// assert_eq!(
+///     block.parameter_structure(),
+///     Block::Residual {
+///         trunk: Layer {
+///             weights: vec![Placeholder, Placeholder, Placeholder],
+///             bias: Placeholder,
+///             metadata: (2, 3),
+///         },
+///         shortcut: (Placeholder, 7),
+///         tag: "residual",
+///     },
+/// );
+/// assert_eq!(
+///     Block::from_parameters(
+///         block.parameter_structure(),
+///         vec![1i64, 2i64, 3i64, 4i64, 5i64],
+///     )?,
+///     Block::Residual {
+///         trunk: Layer { weights: vec![1i64, 2i64, 3i64], bias: 4i64, metadata: (2, 3) },
+///         shortcut: (5i64, 7),
+///         tag: "residual",
+///     },
+/// );
+/// 
+/// # Ok::<(), ryft::Error>(())
+/// ```
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
 ///
 /// # Viewing The Parameterized Definition Of A Value
 ///
@@ -427,38 +545,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// # Ok::<(), ryft_core::errors::Error>(())
 /// ```
 ///
-/// # Parameterized Trees In Ryft Workflows
-///
-/// Similar to how JAX transformations and APIs consume pytrees, many `ryft` utilities operate on parameterized trees:
-///
-/// - [`from_named_parameters`](Self::from_named_parameters) rebuilds from path-indexed leaves.
-/// - [`from_broadcasted_named_parameters`](Self::from_broadcasted_named_parameters) applies prefix-based matching
-///   (longest-prefix-wins), analogous to tree-prefix matching patterns in JAX APIs.
-/// - [`filter_parameters`](Self::filter_parameters), [`partition_parameters`](Self::partition_parameters),
-///   [`combine_optional_parameters`](Self::combine_optional_parameters), and
-///   [`apply_parameter_updates`](Self::apply_parameter_updates) mirror the common Equinox manipulation flow.
-///
-/// # Explicit Parameter Paths
-///
-/// Like JAX key paths, each leaf has a deterministic structural path represented by [`ParameterPath`].
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![(1_i32, 2_i32)];
-/// let paths = value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>();
-/// assert_eq!(paths, vec!["$[0].0".to_string(), "$[0].1".to_string()]);
-/// ```
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![(1_i32, 2_i32)];
-/// let named = value
-///     .named_parameters()
-///     .map(|(path, parameter)| (path.to_string(), *parameter))
-///     .collect::<Vec<_>>();
-/// assert_eq!(named, vec![("$[0].0".to_string(), 1), ("$[0].1".to_string(), 2),]);
-/// ```
-///
 /// # Common Parameterized Gotchas
 ///
 /// ## Mistaking container nodes for leaves
@@ -473,71 +559,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// assert_eq!(mapped, vec![(20, 30)]);
 /// # Ok::<(), ryft_core::errors::Error>(())
 /// ```
-///
-/// ## Handling `Option` and `None`
-///
-/// Unlike JAX's default treatment of `None` (absence of a node), `Option<P>` is a leaf parameter type in `ryft`
-/// whenever `P: Parameter`. This is frequently useful for optional updates/masks.
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![Some(1_i32), None, Some(3_i32)];
-/// assert_eq!(value.parameter_count(), 3);
-/// assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![Some(1), None, Some(3)]);
-/// ```
-///
-/// ## Rebuilding from named paths is strict
-///
-/// [`from_named_parameters`](Self::from_named_parameters) requires exact path coverage (no missing or extra paths).
-/// Use [`from_broadcasted_named_parameters`](Self::from_broadcasted_named_parameters) when you want prefix-based
-/// assignment behavior instead.
-///
-/// # Common Parameterized Patterns
-///
-/// ## Partition, modify, and combine
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-/// let structure = value.parameter_structure();
-/// let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("$[0]"))?;
-/// let recombined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_parameters(
-///     structure,
-///     vec![selected, rejected],
-/// )?;
-/// assert_eq!(recombined, vec![(1, 2), (3, 4)]);
-/// # Ok::<(), ryft_core::errors::Error>(())
-/// ```
-///
-/// ## Tree surgery with selectors
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-/// let updated = value.tree_at(
-///     |structure| {
-///         structure
-///             .named_parameters()
-///             .map(|(path, _)| path)
-///             .filter(|path| path.to_string().ends_with(".0"))
-///             .collect::<Vec<_>>()
-///     },
-///     vec![10_i32, 30_i32],
-/// )?;
-/// assert_eq!(updated, vec![(10, 2), (30, 4)]);
-/// # Ok::<(), ryft_core::errors::Error>(())
-/// ```
-///
-/// # Relationship To JAX And Equinox
-///
-/// - JAX `flatten` / `unflatten` / `map` correspond to [`parameters`](Self::parameters) +
-///   [`parameter_structure`](Self::parameter_structure), [`from_parameters`](Self::from_parameters), and
-///   [`map_parameters`](Self::map_parameters), respectively.
-/// - Equinox `filter` / `partition` / `combine` / `apply_updates` / `tree_at` correspond to
-///   [`filter_parameters`](Self::filter_parameters), [`partition_parameters`](Self::partition_parameters),
-///   [`combine_optional_parameters`](Self::combine_optional_parameters),
-///   [`apply_parameter_updates`](Self::apply_parameter_updates), and [`tree_at`](Self::tree_at) /
-///   [`tree_at_paths`](Self::tree_at_paths), respectively.
 pub trait Parameterized<P: Parameter>: Sized {
     /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
     type Family: ParameterizedFamily<P, To = Self> + ParameterizedFamily<Placeholder, To = Self::ParameterStructure>;
@@ -650,6 +671,8 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 
     /// Reconstructs a value from `structure` using all provided named parameters.
+    /// 
+    /// TODO(eaplatanios): Mention difference from [`Self::from_broadcasted_named_parameters`].
     ///
     /// # Parameters
     ///
@@ -683,6 +706,8 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 
     /// Reconstructs a value from `structure` using named parameters interpreted as path prefixes.
+    /// 
+    /// TODO(eaplatanios): Mention difference from [`Self::from_named_parameters`].
     ///
     /// # Parameters
     ///
