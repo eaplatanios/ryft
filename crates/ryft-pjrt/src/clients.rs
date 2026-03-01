@@ -1325,14 +1325,14 @@ mod tests {
     fn test_client() {
         let plugin = test_cpu_plugin();
         let client = test_cpu_client();
-        assert_eq!(client.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 13, 7])));
+        assert_eq!(client.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 13, 8])));
         assert_eq!(client.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(client.attribute("xla_version"), Ok(Value::i64(2)));
         assert!(matches!(
             client.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = client.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 13, 7])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 13, 8])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);

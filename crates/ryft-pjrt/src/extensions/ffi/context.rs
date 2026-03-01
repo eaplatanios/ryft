@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use crate::extensions::ffi::FfiExecutionStage;
 use crate::extensions::ffi::errors::FfiError;
 use crate::extensions::ffi::handlers::FfiApi;
 use crate::extensions::ffi::types::FfiTypeId;
@@ -104,31 +105,42 @@ impl<'o> FfiExecutionContext<'o> {
         .map(|data| FfiUserData { type_id, data })
     }
 
-    /// Sets [`FfiExecutionState`] associated with the provided [`FfiTypeId`] for this [`FfiExecutionContext`].
-    /// Note that this function will return an [`FfiError`] if the state for the specified type has already been set.
+    /// Sets [`FfiExecutionState`] for the provided [`FfiExecutionStage`] associated with the provided [`FfiTypeId`],
+    /// for this [`FfiExecutionContext`]. Note that this function will return an [`FfiError`] if the state for the
+    /// specified type has already been set.
     ///
     /// # Safety
     ///
     /// The caller must ensure that `state` remains valid for the full duration for which the XLA runtime might access
     /// it through this execution context.
-    pub unsafe fn set_state(&self, type_id: FfiTypeId, state: FfiExecutionState) -> Result<(), FfiError> {
+    pub unsafe fn set_state(
+        &self,
+        stage: FfiExecutionStage,
+        type_id: FfiTypeId,
+        state: FfiExecutionState,
+    ) -> Result<(), FfiError> {
         use ffi::XLA_FFI_State_Set_Args;
         invoke_xla_ffi_api_error_fn!(
             self.api,
             XLA_FFI_State_Set,
-            { context = self.handle, type_id = &mut type_id.to_c_api() as *mut _, state = state },
+            {
+                context = self.handle,
+                stage = stage.to_c_api(),
+                type_id = &mut type_id.to_c_api() as *mut _,
+                state = state,
+            },
         )
     }
 
-    /// Returns the [`FfiExecutionState`] associated with the provided [`FfiTypeId`] for this [`FfiExecutionContext`].
-    /// Note that this function will return an [`FfiError`] if the state for the specified type has not been set, or
-    /// if it has been set to a value of a different type.
-    pub fn state(&self, type_id: FfiTypeId) -> Result<FfiExecutionState, FfiError> {
+    /// Returns the [`FfiExecutionState`] for the provided [`FfiExecutionStage`] associated with the provided
+    /// [`FfiTypeId`] for this [`FfiExecutionContext`]. Note that this function will return an [`FfiError`] if the state
+    /// for the specified type has not been set, or if it has been set to a value of a different type.
+    pub fn state(&self, stage: FfiExecutionStage, type_id: FfiTypeId) -> Result<FfiExecutionState, FfiError> {
         use ffi::XLA_FFI_State_Get_Args;
         invoke_xla_ffi_api_error_fn!(
             self.api,
             XLA_FFI_State_Get,
-            { context = self.handle, type_id = &mut type_id.to_c_api() as *mut _ },
+            { context = self.handle, stage = stage.to_c_api(), type_id = &mut type_id.to_c_api() as *mut _ },
             { state },
         )
     }
@@ -208,7 +220,7 @@ pub(crate) mod ffi {
     use std::marker::{PhantomData, PhantomPinned};
 
     use crate::extensions::ffi::errors::ffi::XLA_FFI_Error;
-    use crate::extensions::ffi::handlers::ffi::XLA_FFI_Extension_Base;
+    use crate::extensions::ffi::handlers::ffi::{XLA_FFI_ExecutionStage, XLA_FFI_Extension_Base};
     use crate::extensions::ffi::types::ffi::XLA_FFI_TypeId;
 
     // We represent opaque C types as structs with a particular structure that is following the convention
@@ -248,6 +260,7 @@ pub(crate) mod ffi {
         pub struct_size: usize,
         pub extension_start: *mut XLA_FFI_Extension_Base,
         pub context: *mut XLA_FFI_ExecutionContext,
+        pub stage: XLA_FFI_ExecutionStage,
         pub type_id: *mut XLA_FFI_TypeId,
         pub state: *mut std::ffi::c_void,
     }
@@ -255,10 +268,18 @@ pub(crate) mod ffi {
     impl XLA_FFI_State_Set_Args {
         pub fn new(
             context: *mut XLA_FFI_ExecutionContext,
+            stage: XLA_FFI_ExecutionStage,
             type_id: *mut XLA_FFI_TypeId,
             state: *mut std::ffi::c_void,
         ) -> Self {
-            Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), context, type_id, state }
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                context,
+                stage,
+                type_id,
+                state,
+            }
         }
     }
 
@@ -269,16 +290,22 @@ pub(crate) mod ffi {
         pub struct_size: usize,
         pub extension_start: *mut XLA_FFI_Extension_Base,
         pub context: *mut XLA_FFI_ExecutionContext,
+        pub stage: XLA_FFI_ExecutionStage,
         pub type_id: *mut XLA_FFI_TypeId,
         pub state: *mut std::ffi::c_void,
     }
 
     impl XLA_FFI_State_Get_Args {
-        pub fn new(context: *mut XLA_FFI_ExecutionContext, type_id: *mut XLA_FFI_TypeId) -> Self {
+        pub fn new(
+            context: *mut XLA_FFI_ExecutionContext,
+            stage: XLA_FFI_ExecutionStage,
+            type_id: *mut XLA_FFI_TypeId,
+        ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
                 extension_start: std::ptr::null_mut(),
                 context,
+                stage,
                 type_id,
                 state: std::ptr::null_mut(),
             }
@@ -430,6 +457,7 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use crate::extensions::ffi::errors::FfiError;
+    use crate::extensions::ffi::FfiExecutionStage;
     use crate::extensions::ffi::tests::with_test_ffi_call_frame;
     use crate::extensions::ffi::types::FfiTypeId;
 
@@ -443,12 +471,12 @@ mod tests {
                   if message.contains("User data with type id 42 not found in execution context"),
             ));
             assert!(matches!(
-                context.set_state(FfiTypeId::new(42), std::ptr::null_mut()),
+                context.set_state(FfiExecutionStage::Execution, FfiTypeId::new(42), std::ptr::null_mut()),
                 Err(FfiError::Unknown { message, .. })
                   if message.contains("Type id 42 is not registered with a static registry"),
             ));
             assert!(matches!(
-                context.state(FfiTypeId::new(42)),
+                context.state(FfiExecutionStage::Execution, FfiTypeId::new(42)),
                 Err(FfiError::Unknown { message, .. }) if message.contains("State is not set"),
             ));
             assert!(matches!(

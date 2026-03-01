@@ -84,6 +84,17 @@ impl FfiExecutionStage {
             ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_EXECUTE => Self::Execution,
         }
     }
+    
+    /// Returns the [`XLA_FFI_ExecutionStage`](ffi::XLA_FFI_ExecutionStage) that corresponds to this
+    /// [`FfiExecutionStage`] and which can be passed to functions in the XLA FFI API.
+    pub fn to_c_api(&self) -> ffi::XLA_FFI_ExecutionStage {
+        match self {
+            Self::Instantiation => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_INSTANTIATE,
+            Self::Preparation => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_PREPARE,
+            Self::Initialization => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_INITIALIZE,
+            Self::Execution => ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_EXECUTE,
+        }
+    }
 }
 
 /// Input to an [`FfiHandler`] that appears as part of the [`FfiCallFrame`] it is invoked with.
