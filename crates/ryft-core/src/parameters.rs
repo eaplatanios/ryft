@@ -525,87 +525,109 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
     type Family: ParameterizedFamily<P, To = Self> + ParameterizedFamily<Placeholder, To = Self::ParameterStructure>;
 
-    /// Reparameterized form of this [`Parameterized`] type with all of its nested `P` types replaced by `T`. This
-    /// preserves the same [`Family`](Self::Family) and [`ParameterStructure`](Self::ParameterStructure), and is such that
-    /// reparameterizing back to `P` recovers [`Self`].
+    /// Reparameterized form of this [`Parameterized`] type with all of its nested `P` parameter types replaced by `T`.
+    /// This preserves the same [`Family`](Self::Family) and [`ParameterStructure`](Self::ParameterStructure), and is
+    /// such that reparameterizing back to `P` recovers [`Self`].
     type To<T: Parameter>: Parameterized<T, Family = Self::Family, ParameterStructure = Self::ParameterStructure>
         + SameAs<<Self::Family as ParameterizedFamily<T>>::To>
     where
         Self::Family: ParameterizedFamily<T>;
 
-    /// Shape-only representation of this [`Parameterized`] type with all parameter leaves replaced by [`Placeholder`].
-    /// This is always set to `Self::To<Placeholder>`. The only reason this is not included here is that defaulted
-    /// associated types are not supported in stable Rust.
+    /// Type that represents a shape-only representation of this [`Parameterized`] type with all nested `P` parameter
+    /// types replaced by [`Placeholder`]. This must always be set to `Self::To<Placeholder>`. The only reason this is
+    /// not done by default is that defaulted associated types are not supported in stable Rust, and this forces us to
+    /// require that all implementations provide an implementation for this associated type as well.
     type ParameterStructure: Parameterized<Placeholder, Family = Self::Family, To<P> = Self>
         + SameAs<Self::To<Placeholder>>;
 
-    /// Iterator returned by [`parameters`](Self::parameters) for a borrow of the underlying [`Parameter`]s with
-    /// lifetime `'t`. This is an associated type instead of an `impl Iterator` in the corresponding function signature,
-    /// so that implementations can expose and reuse a concrete iterator type. In particular, `#[derive(Parameterized)]`
-    /// for enums synthesizes concrete enum iterators here, avoiding an additional heap allocation and dynamic dispatch.
+    /// Iterator returned by [`Self::parameters`] for a borrow of the underlying [`Parameter`]s with lifetime `'t`.
+    /// This is an associated type instead of an `impl Iterator` in the corresponding function signature, so that
+    /// implementations can expose and reuse a concrete iterator type. In particular, `#[derive(Parameterized)]` for
+    /// enums synthesizes concrete enum iterators here, avoiding an additional heap allocation and dynamic dispatch.
     type ParameterIterator<'t, T: 't + Parameter>: 't + Iterator<Item = &'t T>
     where
         Self: 't;
 
-    /// Iterator returned by [`parameters_mut`](Self::parameters_mut) for a mutable borrow of the underlying
-    /// [`Parameter`]s with lifetime `'t`. Similar to [`ParameterIterator`](Self::ParameterIterator), this is an
-    /// associated type instead of an `impl Iterator` in the corresponding function signature, so that implementations
-    /// can expose and reuse a concrete iterator type, potentially avoiding additional heap allocations and dynamic
-    /// dispatch.
+    /// Iterator returned by [`Self::parameters_mut`] for a mutable borrow of the underlying [`Parameter`]s with
+    /// lifetime `'t`. Similar to [`Self::ParameterIterator`], this is an associated type instead of an `impl Iterator`
+    /// in the corresponding function signature, so that implementations can expose and reuse a concrete iterator type,
+    /// potentially avoiding additional heap allocations and dynamic dispatch.
     type ParameterIteratorMut<'t, T: 't + Parameter>: 't + Iterator<Item = &'t mut T>
     where
         Self: 't;
 
-    /// Iterator returned by [`into_parameters`](Self::into_parameters), consuming `self` and returning the underlying
-    /// [`Parameter`]s. Similar to [`ParameterIterator`](Self::ParameterIterator), this is an associated type instead of
-    /// an `impl Iterator` in the corresponding function signature, so that implementations can expose and reuse
-    /// a concrete iterator type, potentially avoiding additional heap allocations and dynamic dispatch.
+    /// Iterator returned by [`Self::into_parameters`], consuming `self` and returning the underlying [`Parameter`]s.
+    /// Similar to [`Self::ParameterIterator`], this is an associated type instead of an `impl Iterator` in the
+    /// corresponding function signature, so that implementations can expose and reuse a concrete iterator type,
+    /// potentially avoiding additional heap allocations and dynamic dispatch.
     type ParameterIntoIterator<T: Parameter>: Iterator<Item = T>;
 
     /// Iterator returned by [`Self::named_parameters`], borrowing the underlying [`Parameter`]s and pairing them with
-    /// their corresponding [`ParameterPath`]s.
+    /// their corresponding [`ParameterPath`]s. Similar to [`Self::ParameterIterator`], this is an associated type
+    /// instead of an `impl Iterator` in the corresponding function signature, so that implementations can expose and
+    /// reuse a concrete iterator type, potentially avoiding additional heap allocations and dynamic dispatch.
     type NamedParameterIterator<'t, T: 't + Parameter>: 't + Iterator<Item = (ParameterPath, &'t T)>
     where
         Self: 't;
 
     /// Iterator returned by [`Self::named_parameters_mut`], mutably borrowing the underlying [`Parameter`]s and pairing
-    /// them with their corresponding [`ParameterPath`]s.
+    /// them with their corresponding [`ParameterPath`]s. Similar to [`Self::ParameterIterator`], this is an associated
+    /// type instead of an `impl Iterator` in the corresponding function signature, so that implementations can expose
+    /// and reuse a concrete iterator type, potentially avoiding additional heap allocations and dynamic dispatch.
     type NamedParameterIteratorMut<'t, T: 't + Parameter>: 't + Iterator<Item = (ParameterPath, &'t mut T)>
     where
         Self: 't;
 
     /// Iterator returned by [`Self::into_named_parameters`], consuming `self` and returning the underlying
-    /// [`Parameter`]s together with their corresponding [`ParameterPath`]s.
+    /// [`Parameter`]s together with their corresponding [`ParameterPath`]s. Similar to [`Self::ParameterIterator`],
+    /// this is an associated type instead of an `impl Iterator` in the corresponding function signature, so that
+    /// implementations can expose and reuse a concrete iterator type, potentially avoiding additional heap allocations
+    /// and dynamic dispatch.
     type NamedParameterIntoIterator<T: Parameter>: Iterator<Item = (ParameterPath, T)>;
 
-    /// Returns the number of parameters in this [Parameterized] instance.
+    /// Returns the number of parameters in this [`Parameterized`] value.
     fn parameter_count(&self) -> usize;
 
-    /// Returns the parameter structure of this value by replacing all leaves with [`Placeholder`]s.
+    /// Returns the structure of this value by replacing all of its nested parameters with [`Placeholder`]s.
     fn parameter_structure(&self) -> Self::ParameterStructure;
 
-    /// Returns an iterator over references to all parameters in this value.
+    /// Returns an iterator over references to all parameters in this [`Parameterized`] value. The returned
+    /// iterator traverses the parameters in the same order as [`Self::parameters_mut`], [`Self::into_parameters`],
+    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
     fn parameters(&self) -> Self::ParameterIterator<'_, P>;
 
-    /// Returns an iterator over mutable references to all parameters in this value.
+    /// Returns an iterator over mutable references to all parameters in this [`Parameterized`] value. The returned
+    /// iterator traverses the parameters in the same order as [`Self::parameters`], [`Self::into_parameters`],
+    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
     fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P>;
 
-    /// Consumes this value and returns an iterator over all parameters.
+    /// Consumes this [`Parameterized`] value and returns an iterator over all parameters contained in it. The
+    /// returned iterator traverses the parameters in the same order as [`Self::parameters`], [`Self::parameters_mut`],
+    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
     fn into_parameters(self) -> Self::ParameterIntoIterator<P>;
 
-    /// Returns an iterator over all parameters in this value paired with their structural paths.
+    /// Returns an iterator over references to all parameters in this [`Parameterized`] value, paired with their
+    /// corresponding [`ParameterPath`]s. The returned iterator traverses the parameters in the same order as
+    /// [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters_mut`],
+    /// and [`Self::into_named_parameters`].
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P>;
 
-    /// Returns an iterator over mutable references to all parameters in this value paired with their structural paths.
+    /// Returns an iterator over mutable references to all parameters in this [`Parameterized`] value, paired with
+    /// their corresponding [`ParameterPath`]s. The returned iterator traverses the parameters in the same order as
+    /// [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters`], and
+    /// [`Self::into_named_parameters`].
     fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P>;
 
-    /// Consumes this value and returns an iterator over all parameters paired with their structural paths.
+    /// Consumes this [`Parameterized`] value and returns an iterator over all parameters contained in it, paired with
+    /// their corresponding [`ParameterPath`]s. The returned iterator traverses the parameters in the same order as
+    /// [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters`],
+    /// and [`Self::named_parameters_mut`].
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P>;
 
-    /// Returns an iterator over all structural paths to parameters in this value.
-    ///
-    /// Paths are returned in the same traversal order as [`named_parameters`](Self::named_parameters),
-    /// [`named_parameters_mut`](Self::named_parameters_mut), and [`Self::into_named_parameters`].
+    /// Returns an iterator over the [`ParameterPath`]s to all nested parameters in this [`Parameterized`] value.
+    /// The returned iterator traverses the paths in the same order as [`Self::parameters`], [`Self::parameters_mut`],
+    /// [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`], and
+    /// [`Self::into_named_parameters`].
     fn parameter_paths<'p>(&'p self) -> impl 'p + Iterator<Item = ParameterPath>
     where
         P: 'p,
@@ -613,16 +635,20 @@ pub trait Parameterized<P: Parameter>: Sized {
         self.named_parameters().map(|(path, _)| path)
     }
 
-    /// Reconstructs a value from `structure`, consuming parameters from `parameters` and leaving any remainder
-    /// untouched.
+    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming values
+    /// from the provided `parameters` to populate its parameters. This function may not consume all the provided
+    /// parameters, but if there are not enough parameters in the provided iterator, it will return an
+    /// [`Error::InsufficientParameters`].
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
     ) -> Result<Self, Error>;
 
-    /// Reconstructs a value from `structure` using all provided parameters.
-    ///
-    /// Returns [`Error::UnusedParameters`] if there are leftover parameters.
+    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming values
+    /// from the provided `parameters` to populate its parameters. This function expects to fully consume the provided
+    /// iterator. If it does not contain enough values, then it will return an [`Error::InsufficientParameters`], while
+    /// if it contains too many values, it will return an [`Error::UnusedParameters`]. If you do not want to fully
+    /// consume the provided iterator, then you must use [`Self::from_parameters_with_remainder`] instead.
     fn from_parameters<I: IntoIterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: I,
