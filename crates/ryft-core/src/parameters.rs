@@ -328,7 +328,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// ```rust
 /// # use std::collections::{BTreeMap, HashMap};
 /// # use ryft::*;
-/// 
+///
 /// type Value = (i32, BTreeMap<&'static str, Vec<i32>>, (i32,));
 /// let value = (1, BTreeMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
 ///
@@ -392,7 +392,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     )?,
 ///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![10, 30])]), (0,)),
 /// );
-/// 
+///
 /// # Ok::<(), ryft::Error>(())
 /// ```
 ///
@@ -434,7 +434,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// also that the `#[ryft(...)]` attribute is not supported on individual struct fields or enum variants.
 ///
 /// ## Examples
-/// 
+///
 /// The following examples show how to use the `#[derive(Parameterized)]` macro:
 ///
 /// ```rust
@@ -518,7 +518,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///         tag: "residual",
 ///     },
 /// );
-/// 
+///
 /// # Ok::<(), ryft::Error>(())
 /// ```
 pub trait Parameterized<P: Parameter>: Sized {
@@ -658,19 +658,14 @@ pub trait Parameterized<P: Parameter>: Sized {
         parameters.next().map(|_| Err(Error::UnusedParameters)).unwrap_or_else(|| Ok(parameterized))
     }
 
-    /// Reconstructs a value from `structure` using all provided named parameters.
-    /// 
-    /// TODO(eaplatanios): Mention difference from [`Self::from_broadcasted_named_parameters`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `structure`: Parameter structure to reconstruct.
-    ///   - `parameters`: Map from parameter paths to parameter values.
-    ///
-    /// The map is consumed and path order is not considered. Returns [`Error::InsufficientParameters`] when fewer than
-    /// `structure.parameter_count()` expected parameters are provided, [`Error::NamedParameterPathMismatch`] if a
-    /// required path is missing while other paths remain, and [`Error::UnusedParameters`] if extra paths remain after
-    /// reconstruction.
+    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming named values
+    /// from the provided `parameters` to populate its parameters. Unlike [`Self::from_broadcasted_named_parameters`],
+    /// this function is strict in that keys in `parameters` must match exactly leaf [`ParameterPath`]s in `structure`,
+    /// and path prefix matching is not being used. If there are not enough named values to reconstruct all leaves,
+    /// then this function will return an [`Error::InsufficientParameters`]. If an expected path is missing, then it
+    /// will return an [`Error::MissingParameterPath`]. If extra paths remain after reconstruction, then it will return
+    /// an [`Error::UnusedParameters`]. For fully worked examples, refer to the examples provided in the top-level
+    /// documentation of the [`Parameterized`] trait.
     fn from_named_parameters(
         structure: Self::ParameterStructure,
         mut parameters: HashMap<ParameterPath, P>,
@@ -682,51 +677,22 @@ pub trait Parameterized<P: Parameter>: Sized {
                 Some(parameter) => values.push(parameter),
                 None if parameters.is_empty() => return Err(Error::InsufficientParameters { expected_count }),
                 None => {
-                    let actual_path = parameters.keys().next().map(ToString::to_string).unwrap_or_default();
-                    return Err(Error::NamedParameterPathMismatch {
-                        expected_path: expected_path.to_string(),
-                        actual_path,
-                    });
+                    return Err(Error::MissingParameterPath { path: expected_path.to_string() });
                 }
             }
         }
         if parameters.is_empty() { Self::from_parameters(structure, values) } else { Err(Error::UnusedParameters) }
     }
 
-    /// Reconstructs a value from `structure` using named parameters interpreted as path prefixes.
-    /// 
-    /// TODO(eaplatanios): Mention difference from [`Self::from_named_parameters`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `structure`: Parameter structure to reconstruct.
-    ///   - `parameters`: Map from path prefixes to parameter values.
-    ///
-    /// Prefixes are matched against leaf paths in `structure`, and each leaf receives the value of the most-specific
-    /// matching prefix (i.e., longest-prefix-wins). Returns [`Error::MissingPrefixForPath`] if any leaf path is not
-    /// covered by a provided prefix, and [`Error::UnusedPrefixPath`] if any provided prefix matches no leaf path.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use std::collections::HashMap;
-    /// # use ryft_core::parameters::{ParameterPath, ParameterPathSegment, Parameterized, Placeholder};
-    /// let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
-    /// let rebuilt = <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-    ///     structure,
-    ///     HashMap::from([
-    ///         (ParameterPath::root(), 0),
-    ///         (
-    ///             ParameterPath::root()
-    ///                 .with_segment(ParameterPathSegment::Index(1))
-    ///                 .with_segment(ParameterPathSegment::TupleIndex(0)),
-    ///             7,
-    ///         ),
-    ///     ]),
-    /// )?;
-    /// assert_eq!(rebuilt, vec![(0, 0), (7, 0)]);
-    /// # Ok::<(), ryft_core::errors::Error>(())
-    /// ```
+    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming named values
+    /// from the provided `parameters` to populate its parameters, where keys in `parameters` are interpreted as path
+    /// prefixes. Unlike [`Self::from_named_parameters`], this function does not require exact leaf paths, and each
+    /// leaf path in `structure` receives the value from the most specific matching path prefix (i.e., the longest
+    /// shared path prefix). If any leaf path is not covered by a provided prefix, then this function will return
+    /// an [`Error::MissingPrefixForParameterPath`]. If a provided prefix matches no leaf path, then it will return an
+    /// [`Error::UnusedParameter`]. Note that since one prefix value may need to populate multiple leaves,
+    /// this function requires `P: Clone`. For fully worked examples, refer to the examples provided in the top-level
+    /// documentation of the [`Parameterized`] trait.
     fn from_broadcasted_named_parameters(
         structure: Self::ParameterStructure,
         parameters: HashMap<ParameterPath, P>,
@@ -734,35 +700,32 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         P: Clone,
     {
-        let leaf_paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
-        let mut prefixes = parameters.into_iter().map(|(path, value)| (path, value, 0_usize)).collect::<Vec<_>>();
-        let mut expanded_parameters = HashMap::with_capacity(leaf_paths.len());
-        for leaf_path in leaf_paths {
-            let mut selected_prefix = None;
-            for (index, (prefix_path, _, _)) in prefixes.iter().enumerate() {
-                if prefix_path.is_prefix_of(&leaf_path) {
-                    let prefix_depth = prefix_path.len();
-                    if selected_prefix.map(|(_, depth)| prefix_depth > depth).unwrap_or(true) {
-                        selected_prefix = Some((index, prefix_depth));
-                    }
-                }
-            }
-            let (selected_prefix_index, _) =
-                selected_prefix.ok_or_else(|| Error::MissingPrefixForPath { path: leaf_path.to_string() })?;
-            let (_, value, matched_count) = &mut prefixes[selected_prefix_index];
-            expanded_parameters.insert(leaf_path, value.clone());
+        let paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
+        let mut path_prefixes = parameters.into_iter().map(|(path, value)| (path, value, 0usize)).collect::<Vec<_>>();
+        let mut broadcasted_parameters = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let selected_prefix_index = path_prefixes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (p, _, _))| if p.is_prefix_of(&path) { Some((i, p.len())) } else { None })
+                .max_by(|x, y| x.1.cmp(&y.1))
+                .map(|(i, _)| i).ok_or_else(|| Error::MissingPrefixForParameterPath { path: path.to_string() })?;
+            let (_, value, matched_count) = &mut path_prefixes[selected_prefix_index];
+            broadcasted_parameters.insert(path, value.clone());
             *matched_count += 1;
         }
-        let mut unused_prefix_paths = prefixes
+        let mut unused_prefix_paths = path_prefixes
             .into_iter()
             .filter_map(|(path, _, matched_count)| if matched_count == 0 { Some(path.to_string()) } else { None })
             .collect::<Vec<_>>();
         if !unused_prefix_paths.is_empty() {
             unused_prefix_paths.sort_unstable();
-            return Err(Error::UnusedPrefixPath { path: unused_prefix_paths[0].clone() });
+            return Err(Error::UnusedParameter { path: unused_prefix_paths[0].clone() });
         }
-        Self::from_named_parameters(structure, expanded_parameters)
+        Self::from_named_parameters(structure, broadcasted_parameters)
     }
+    
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
     /// `T`, while preserving the [`Parameterized`] tree structure of this type. Nested parameters are visited in the
@@ -897,7 +860,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InsufficientParameters`] if any optional tree is too short, [`Error::MissingNamedParameterPath`]
+    /// Returns [`Error::InsufficientParameters`] if any optional tree is too short, [`Error::MissingParameterPath`]
     /// if all candidates are `None` for a leaf, and [`Error::UnusedParameters`] if any optional tree has extra leaves.
     ///
     /// # Example
@@ -905,7 +868,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// ```rust
     /// # use ryft_core::parameters::{Parameterized, Placeholder};
     /// let structure = vec![(Placeholder, Placeholder)];
-    /// let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_parameters(
+    /// let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
     ///     structure,
     ///     vec![
     ///         vec![(Some(10), None)],
@@ -915,7 +878,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// assert_eq!(combined, vec![(10, 30)]);
     /// # Ok::<(), ryft_core::errors::Error>(())
     /// ```
-    fn combine_optional_parameters<I>(structure: Self::ParameterStructure, optional_trees: I) -> Result<Self, Error>
+    fn combine_parameters<I>(structure: Self::ParameterStructure, optional_trees: I) -> Result<Self, Error>
     where
         I: IntoIterator<Item = Self::To<Option<P>>>,
         Self::Family: ParameterizedFamily<Option<P>>,
@@ -932,7 +895,7 @@ pub trait Parameterized<P: Parameter>: Sized {
                     selected = candidate;
                 }
             }
-            let parameter = selected.ok_or_else(|| Error::MissingNamedParameterPath { path: path.to_string() })?;
+            let parameter = selected.ok_or_else(|| Error::MissingParameterPath { path: path.to_string() })?;
             combined_parameters.push(parameter);
         }
         if optional_iterators.iter_mut().any(|iterator| iterator.next().is_some()) {
@@ -943,7 +906,7 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Replaces parameters using an optional replacement tree.
     ///
-    /// This is a convenience operation built on top of [`Self::combine_optional_parameters`]. Leaves with
+    /// This is a convenience operation built on top of [`Self::combine_parameters`]. Leaves with
     /// `Some(value)` in `replacements` take precedence over existing leaf values in `self`, while `None` leaves
     /// preserve the current value.
     ///
@@ -957,7 +920,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// # Errors
     ///
-    /// Propagates the same structural errors as [`Self::combine_optional_parameters`] when the replacement tree shape
+    /// Propagates the same structural errors as [`Self::combine_parameters`] when the replacement tree shape
     /// does not align with `self`.
     ///
     /// # Example
@@ -975,7 +938,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     {
         let structure = self.parameter_structure();
         let current = self.map_parameters(Some)?;
-        Self::combine_optional_parameters(structure, vec![replacements, current])
+        Self::combine_parameters(structure, vec![replacements, current])
     }
 
     /// Applies optional updates leaf-wise using `update_fn(base, update)` whenever an update is present.
@@ -1082,8 +1045,8 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ReplacementCountMismatch`] when `paths` and `replacements` have different lengths, and
-    /// [`Error::UnknownNamedParameterPath`] if any requested path is not a valid leaf path.
+    /// Returns [`Error::ParameterReplacementCountMismatch`] when `paths` and `replacements` have different lengths, and
+    /// [`Error::UnknownParameterPath`] if any requested path is not a valid leaf path.
     fn tree_at_paths<I, R>(self, paths: I, replacements: R) -> Result<Self, Error>
     where
         I: IntoIterator<Item = ParameterPath>,
@@ -1093,7 +1056,7 @@ pub trait Parameterized<P: Parameter>: Sized {
         let paths = paths.into_iter().collect::<Vec<_>>();
         let replacements = replacements.into_iter().collect::<Vec<_>>();
         if paths.len() != replacements.len() {
-            return Err(Error::ReplacementCountMismatch {
+            return Err(Error::ParameterReplacementCountMismatch {
                 expected_count: paths.len(),
                 actual_count: replacements.len(),
             });
@@ -1101,7 +1064,7 @@ pub trait Parameterized<P: Parameter>: Sized {
         let structure = self.parameter_structure();
         let leaf_paths = structure.named_parameters().map(|(path, _)| path).collect::<HashSet<_>>();
         if let Some(path) = paths.iter().filter(|path| !leaf_paths.contains(*path)).min() {
-            return Err(Error::UnknownNamedParameterPath { path: path.to_string() });
+            return Err(Error::UnknownParameterPath { path: path.to_string() });
         }
         let mut replacement_map = paths
             .into_iter()
@@ -1134,7 +1097,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// # Errors
     ///
     /// Propagates the same validation errors as [`Self::tree_at_paths`] (e.g.,
-    /// [`Error::ReplacementCountMismatch`] and [`Error::UnknownNamedParameterPath`]).
+    /// [`Error::ParameterReplacementCountMismatch`] and [`Error::UnknownParameterPath`]).
     ///
     /// # Example
     ///
@@ -2573,15 +2536,14 @@ mod tests {
         let structure = value.parameter_structure();
         let (selected, rejected) =
             value.clone().partition_parameters(|path, _| path.to_string().starts_with("$[0]")).unwrap();
-        let combined =
-            <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_parameters(structure, vec![selected, rejected]);
+        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![selected, rejected]);
         assert_eq!(combined, Ok(value));
     }
 
     #[test]
     fn test_combine_optional_parameters_leftmost_precedence() {
         let structure = vec![(Placeholder, Placeholder)];
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_parameters(
+        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
             structure,
             vec![vec![(Some(10), None)], vec![(Some(20), Some(30))]],
         );
@@ -2591,11 +2553,9 @@ mod tests {
     #[test]
     fn test_combine_optional_parameters_reports_missing_path() {
         let structure = vec![(Placeholder, Placeholder)];
-        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_optional_parameters(
-            structure,
-            vec![vec![(Some(10), None)]],
-        );
-        assert_eq!(combined, Err(Error::MissingNamedParameterPath { path: "$[0].1".to_string() }));
+        let combined =
+            <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![vec![(Some(10), None)]]);
+        assert_eq!(combined, Err(Error::MissingParameterPath { path: "$[0].1".to_string() }));
     }
 
     #[test]
@@ -2695,7 +2655,7 @@ mod tests {
             ],
             vec![10],
         );
-        assert_eq!(updated, Err(Error::ReplacementCountMismatch { expected_count: 2, actual_count: 1 }));
+        assert_eq!(updated, Err(Error::ParameterReplacementCountMismatch { expected_count: 2, actual_count: 1 }));
     }
 
     #[test]
@@ -2709,7 +2669,7 @@ mod tests {
             ],
             vec![10],
         );
-        assert_eq!(updated, Err(Error::UnknownNamedParameterPath { path: "$[2].0".to_string() }));
+        assert_eq!(updated, Err(Error::UnknownParameterPath { path: "$[2].0".to_string() }));
     }
 
     #[test]
@@ -2971,8 +2931,7 @@ mod tests {
         let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(value.parameter_structure(), named);
         assert!(matches!(
             result,
-            Err(Error::NamedParameterPathMismatch { expected_path, actual_path })
-                if expected_path == "$[1]" && actual_path == "$[2]",
+            Err(Error::MissingParameterPath { path: expected_path }) if expected_path == "$[1]",
         ));
     }
 
@@ -3024,7 +2983,7 @@ mod tests {
             structure,
             HashMap::from([(ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 5)]),
         );
-        assert_eq!(result, Err(Error::MissingPrefixForPath { path: "$[1].0".to_string() }));
+        assert_eq!(result, Err(Error::MissingPrefixForParameterPath { path: "$[1].0".to_string() }));
     }
 
     #[test]
@@ -3037,7 +2996,7 @@ mod tests {
                 (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
             ]),
         );
-        assert_eq!(result, Err(Error::UnusedPrefixPath { path: "$[1]".to_string() }));
+        assert_eq!(result, Err(Error::UnusedParameter { path: "$[1]".to_string() }));
     }
 
     #[test]

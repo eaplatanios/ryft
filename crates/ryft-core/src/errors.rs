@@ -14,21 +14,18 @@ pub enum Error {
     #[error("expected at least {expected_count} parameters but got fewer")]
     InsufficientParameters { expected_count: usize },
 
-    #[error("named parameter path mismatch; expected '{expected_path}' but got '{actual_path}'")]
-    NamedParameterPathMismatch { expected_path: String, actual_path: String },
+    #[error("missing prefix for parameter at '{path}' path")]
+    MissingPrefixForParameterPath { path: String },
 
-    #[error("missing prefix for parameter path '{path}'")]
-    MissingPrefixForPath { path: String },
+    #[error("unused parameter at '{path}' path")]
+    UnusedParameter { path: String },
 
-    #[error("unused prefix path '{path}'")]
-    UnusedPrefixPath { path: String },
+    #[error("missing parameter at '{path}' path")]
+    MissingParameterPath { path: String },
 
-    #[error("missing named parameter path '{path}'")]
-    MissingNamedParameterPath { path: String },
+    #[error("unknown parameter path '{path}'")]
+    UnknownParameterPath { path: String },
 
-    #[error("unknown named parameter path '{path}'")]
-    UnknownNamedParameterPath { path: String },
-
-    #[error("expected exactly {expected_count} replacement values but got {actual_count}")]
-    ReplacementCountMismatch { expected_count: usize, actual_count: usize },
+    #[error("expected exactly {expected_count} replacement parameter values but got {actual_count}")]
+    ParameterReplacementCountMismatch { expected_count: usize, actual_count: usize },
 }
