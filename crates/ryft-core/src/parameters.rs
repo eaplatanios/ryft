@@ -980,8 +980,6 @@ pub trait Parameterized<P: Parameter>: Sized {
         Ok((partition_0, partition_1))
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Combines multiple structure-aligned `Parameterized<Option<P>>` values into a single `Parameterized<P>` value,
     /// using left-to-right precedence at each parameter location. That is, for each leaf [`ParameterPath`] in
     /// `structure`, this function selects the first [`Some`] value from `values` and uses it for the corresponding
@@ -1020,10 +1018,9 @@ pub trait Parameterized<P: Parameter>: Sized {
         values: I,
     ) -> Result<Self, Error>
     where
-        P: PartialEq + Debug,
+        P: Debug + PartialEq,
         Self::Family: ParameterizedFamily<Option<P>>,
     {
-        // TODO(eaplatanios): Is it easy to support broadcasting semantics in this function?
         let expected_paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
         let expected_count = expected_paths.len();
         let mut value_parameters = values.into_iter().map(|value| value.into_named_parameters()).collect::<Vec<_>>();
@@ -1070,6 +1067,8 @@ pub trait Parameterized<P: Parameter>: Sized {
             Self::from_parameters(structure, parameters)
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Replaces parameters using an optional replacement tree.
     ///
