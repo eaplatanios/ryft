@@ -96,10 +96,11 @@ impl<'o> FfiExecutionContext<'o> {
     /// Returns opaque user data from this [`FfiExecutionContext`] for the provided `type_id`.
     pub fn user_data(&self, type_id: FfiTypeId) -> Result<FfiUserData, FfiError> {
         use ffi::XLA_FFI_ExecutionContext_Get_Args;
+        let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
             self.api,
             XLA_FFI_ExecutionContext_Get,
-            { context = self.handle, type_id = &mut type_id.to_c_api() as *mut _ },
+            { context = self.handle, type_id = &mut type_id_handle as *mut _ },
             { data },
         )
         .map(|data| FfiUserData { type_id, data })
@@ -107,7 +108,8 @@ impl<'o> FfiExecutionContext<'o> {
 
     /// Sets [`FfiExecutionState`] for the provided [`FfiExecutionStage`] associated with the provided [`FfiTypeId`],
     /// for this [`FfiExecutionContext`]. Note that this function will return an [`FfiError`] if the state for the
-    /// specified type has already been set.
+    /// specified type has already been set, or if the provided `stage` is the [`FfiExecutionStage::Execution`]
+    /// [stage](https://github.com/openxla/xla/blob/964a0a45a0c3090cd484a3c51e8f9d05ed10b968/xla/ffi/ffi_api.cc#L327).
     ///
     /// # Safety
     ///
@@ -120,27 +122,37 @@ impl<'o> FfiExecutionContext<'o> {
         state: FfiExecutionState,
     ) -> Result<(), FfiError> {
         use ffi::XLA_FFI_State_Set_Args;
+        if stage == FfiExecutionStage::Execution {
+            return Err(FfiError::invalid_argument("execution state cannot be set for the execution stage"));
+        };
+        let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
             self.api,
             XLA_FFI_State_Set,
             {
                 context = self.handle,
                 stage = stage.to_c_api(),
-                type_id = &mut type_id.to_c_api() as *mut _,
+                type_id = &mut type_id_handle as *mut _,
                 state = state,
             },
         )
     }
 
     /// Returns the [`FfiExecutionState`] for the provided [`FfiExecutionStage`] associated with the provided
-    /// [`FfiTypeId`] for this [`FfiExecutionContext`]. Note that this function will return an [`FfiError`] if the state
-    /// for the specified type has not been set, or if it has been set to a value of a different type.
+    /// [`FfiTypeId`] for this [`FfiExecutionContext`]. Note that this function will return an [`FfiError`] if
+    /// the state for the specified type has not been set, if it has been set to a value of a different type,
+    /// or if the provided `stage` is the [`FfiExecutionStage::Execution`]
+    /// [stage](https://github.com/openxla/xla/blob/964a0a45a0c3090cd484a3c51e8f9d05ed10b968/xla/ffi/ffi_api.cc#L327).
     pub fn state(&self, stage: FfiExecutionStage, type_id: FfiTypeId) -> Result<FfiExecutionState, FfiError> {
         use ffi::XLA_FFI_State_Get_Args;
+        if stage == FfiExecutionStage::Execution {
+            return Err(FfiError::invalid_argument("execution state cannot be obtained for the execution stage"));
+        };
+        let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
             self.api,
             XLA_FFI_State_Get,
-            { context = self.handle, stage = stage.to_c_api(), type_id = &mut type_id.to_c_api() as *mut _ },
+            { context = self.handle, stage = stage.to_c_api(), type_id = &mut type_id_handle as *mut _ },
             { state },
         )
     }
@@ -456,8 +468,8 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use crate::extensions::ffi::errors::FfiError;
     use crate::extensions::ffi::FfiExecutionStage;
+    use crate::extensions::ffi::errors::FfiError;
     use crate::extensions::ffi::tests::with_test_ffi_call_frame;
     use crate::extensions::ffi::types::FfiTypeId;
 
@@ -472,11 +484,21 @@ mod tests {
             ));
             assert!(matches!(
                 context.set_state(FfiExecutionStage::Execution, FfiTypeId::new(42), std::ptr::null_mut()),
+                Err(FfiError::InvalidArgument { message, .. })
+                  if message.contains("execution stage does not support execution-state get/set operations"),
+            ));
+            assert!(matches!(
+                context.state(FfiExecutionStage::Execution, FfiTypeId::new(42)),
+                Err(FfiError::InvalidArgument { message, .. })
+                  if message.contains("execution stage does not support execution-state get/set operations"),
+            ));
+            assert!(matches!(
+                context.set_state(FfiExecutionStage::Instantiation, FfiTypeId::new(42), std::ptr::null_mut()),
                 Err(FfiError::Unknown { message, .. })
                   if message.contains("Type id 42 is not registered with a static registry"),
             ));
             assert!(matches!(
-                context.state(FfiExecutionStage::Execution, FfiTypeId::new(42)),
+                context.state(FfiExecutionStage::Instantiation, FfiTypeId::new(42)),
                 Err(FfiError::Unknown { message, .. }) if message.contains("State is not set"),
             ));
             assert!(matches!(

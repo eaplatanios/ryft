@@ -448,7 +448,7 @@ impl SerializedAbiVersion {
         let handle = Box::into_raw(serialized_abi_version) as *mut ffi::PJRT_SerializedProto;
         Self { handle, deleter: Some(delete), data, data_size }
     }
-    
+
     /// Returns a pointer to the underlying bytes of this [`SerializedAbiVersion`].
     pub fn data(&self) -> &[u8] {
         unsafe { slice_from_c_api(self.data as *const _, self.data_size) }
