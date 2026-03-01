@@ -8,9 +8,9 @@ use prost::Message;
 
 use crate::protos::CompilationOptions;
 use crate::{
-    hash_map_from_c_api, invoke_pjrt_api_error_fn, slice_from_c_api, str_from_c_api, Api, Buffer, BufferType, Chunk, Client,
-    ComputationId, CopyToDeviceStream, Device, DeviceAssignment, Error, Event, Plugin, ReplicaId,
-    SerializedDeviceAssignment, Topology, Value,
+    Api, Buffer, BufferType, Chunk, Client, ComputationId, CopyToDeviceStream, Device, DeviceAssignment, Error, Event,
+    Plugin, ReplicaId, SerializedDeviceAssignment, Topology, Value, hash_map_from_c_api, invoke_pjrt_api_error_fn,
+    slice_from_c_api, str_from_c_api,
 };
 
 /// Program that can be compiled using a PJRT [`Client`]. Programs can be provided in multiple formats though not all
@@ -1225,28 +1225,39 @@ impl<'s> Client<'s> {
     /// Loads the provided [`Executable`] into this [`Client`], returning a [`LoadedExecutable`] that is ready for
     /// execution. If any [`CompilationOptions`] are provided, they will override the compilation options that were
     /// used when creating the provided [`Executable`].
+    ///
+    /// Note that if the provided [`Executable`] is obtained by calling [`LoadedExecutable::executable`], then this
+    /// function will fall back to serializing it and then calling [`Client::deserialize_and_load_executable`] due
+    /// to a PJRT limitation around how [`Client::load_executable`] works.
     pub fn load_executable(
         &'_ self,
         executable: &Executable,
         options: Option<&CompilationOptions>,
     ) -> Result<LoadedExecutable<'_>, Error> {
         use ffi::PJRT_Client_Load_Args;
-        let options = options.map(|options| options.encode_to_vec());
-        invoke_pjrt_api_error_fn!(
+        let options_bytes = options.map(|options| options.encode_to_vec());
+        let loaded_executable = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Client_Load,
             {
                 client = self.to_c_api(),
                 executable = executable.to_c_api(),
-                compile_options = options
+                compile_options = options_bytes
                     .as_ref()
                     .map(|options| options.as_ptr() as *const _)
                     .unwrap_or(std::ptr::null()),
-                compile_options_size = options.map(|options| options.len()).unwrap_or(0),
+                compile_options_size = options_bytes.map(|options| options.len()).unwrap_or(0),
             },
             { loaded_executable },
         )
-        .and_then(|handle| unsafe { LoadedExecutable::from_c_api(handle, self.api(), self.to_c_api()) })
+        .and_then(|handle| unsafe { LoadedExecutable::from_c_api(handle, self.api(), self.to_c_api()) });
+        match loaded_executable {
+            Ok(loaded_executable) => Ok(loaded_executable),
+            Err(Error::InvalidArgument { message, .. }) if message.contains("Missing shared_executable") => {
+                self.deserialize_and_load_executable(executable.serialize()?.data(), options)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Deserializes the provided data into a [`LoadedExecutable`]. Note that the provided data must be the result of
@@ -2371,7 +2382,7 @@ mod tests {
     use indoc::indoc;
 
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-    use crate::tests::{test_cpu_plugin, test_for_each_platform, TestPlatform};
+    use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
     use crate::{
         BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, Executable, ExecutionContext,
         ExecutionDeviceInputs, ExecutionInput, LoadedExecutable, Program,
@@ -2534,10 +2545,70 @@ mod tests {
             assert!(executable.serialize().is_ok());
         });
     }
-    
+
     #[test]
     fn test_client_load() {
-        todo!("Implement this in a similar way to `test_client_deserialize_and_load_executable`")
+        test_for_each_platform!(|plugin, client, platform| {
+            let topology = client.topology().unwrap();
+            let program = test_program(false, false);
+            let options = test_compilation_options();
+
+            // Test using an Ahead-Of-Time (AOT)-compiled executable which goes through the main code path.
+            // Note that AOT compilation is not supported on the built-in CPU plugin and so this test only runs
+            // on non-CPU platforms.
+            let executable = plugin.compile(&program, &topology, &options);
+            match platform {
+                TestPlatform::Cpu => assert!(executable.is_err()),
+                _ => {
+                    let executable = executable.unwrap();
+                    let loaded_executable = client.load_executable(&executable, Some(&options)).unwrap();
+                    assert_eq!(loaded_executable.addressable_device_logical_ids(), Ok(vec![(0, 0)]),);
+                    assert_eq!(
+                        loaded_executable.device_assignment(),
+                        Ok(DeviceAssignment { replica_count: 1, computation_count: 1, assignment: vec![0] }),
+                    );
+                    let executable_from_loaded_executable = loaded_executable.executable().unwrap();
+                    assert_eq!(executable_from_loaded_executable.name(), executable.name());
+                    assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
+                    assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
+                    assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
+                    assert_eq!(
+                        executable_from_loaded_executable.output_element_types(),
+                        executable.output_element_types(),
+                    );
+                    assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
+                }
+            };
+
+            // Test using a Just-In-Time (JIT)-compiled executable which goes through the fallback code path.
+            let loaded_executable = client.compile(&program, &options).unwrap();
+            let executable = loaded_executable.executable().unwrap();
+            let loaded_executable_from_executable = client.load_executable(&executable, Some(&options)).unwrap();
+            assert_eq!(
+                loaded_executable_from_executable.addressable_devices(),
+                loaded_executable.addressable_devices(),
+            );
+            assert_eq!(
+                loaded_executable_from_executable.addressable_device_logical_ids(),
+                loaded_executable.addressable_device_logical_ids(),
+            );
+            assert_eq!(loaded_executable_from_executable.device_assignment(), loaded_executable.device_assignment(),);
+            let executable_from_loaded_executable = loaded_executable_from_executable.executable().unwrap();
+            assert_eq!(executable_from_loaded_executable.name(), executable.name());
+            assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
+            assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
+            assert_eq!(executable_from_loaded_executable.output_count(), executable.output_count());
+            assert_eq!(executable_from_loaded_executable.output_element_types(), executable.output_element_types());
+            assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
+            assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
+            assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
+            assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
+            // The loaded executable optimized program and memory statistics
+            // are not guaranteed to match the original.
+            assert!(executable_from_loaded_executable.optimized_program().is_ok());
+            assert!(executable_from_loaded_executable.memory_statistics().is_ok());
+            assert!(executable_from_loaded_executable.cost_analysis().is_err());
+        });
     }
 
     #[test]
