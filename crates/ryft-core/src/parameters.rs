@@ -898,15 +898,45 @@ pub trait Parameterized<P: Parameter>: Sized {
         Self::To::<T>::from_named_parameters(structure, mapped_parameters)
     }
 
-    /// Partitions all nested [`Parameter`]s of type `P` in this value into two structure-preserving [`Parameterized`]
-    /// values, according to `predicate`. Specifically, this value is a `Parameterized<P>` and this function returns a
-    /// pair of `Parameterized<Option<P>>` values. The first one contains [`Some`] for each parameter for which the
-    /// provided `predicate` returns `true`, and [`None`] elsewhere, and the opposite holds for the second returned
-    /// value. This function is equivalent to using [`Self::filter_parameters`] twice on the same value, but it avoids
-    /// traversing the structure twice.
+    /// Filters all nested [`Parameter`]s of type `P` in this value according to the provided `predicate`, producing a
+    /// structure-preserving [`Parameterized`] value with `Option<P>` leaves. Specifically, this value is a
+    /// `Parameterized<P>` and this function returns a `Parameterized<Option<P>>` where each parameter of this value
+    /// for which `predicate` returns `true` is kept as [`Some`], while all other parameters are replaced by [`None`].
     ///
     /// This function is inspired by
-    /// [Equinox's `partition` function](https://docs.kidger.site/equinox/api/manipulation/#equinoxpartition).
+    /// [Equinox's `filter` function](https://docs.kidger.site/equinox/api/manipulation/#equinox.filter).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft::Parameterized;
+    ///
+    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    ///
+    /// // Keep only the second tuple element across all top-level entries.
+    /// let filtered = value.filter_parameters(|path, _| path.to_string().ends_with(".1"))?;
+    ///
+    /// assert_eq!(filtered, vec![(None, Some(2)), (None, Some(4))]);
+    ///
+    /// # Ok::<(), ryft::Error>(())
+    /// ```
+    fn filter_parameters<F: FnMut(&ParameterPath, &P) -> bool>(self, predicate: F) -> Result<Self::To<Option<P>>, Error>
+    where
+        Self::Family: ParameterizedFamily<Option<P>>,
+    {
+        let mut predicate = predicate;
+        self.map_named_parameters(|path, parameter| predicate(path, &parameter).then_some(parameter))
+    }
+
+    /// Partitions all nested [`Parameter`]s of type `P` in this value into two structure-preserving [`Parameterized`]
+    /// values, according to the provided `predicate`. Specifically, this value is a `Parameterized<P>` and this
+    /// function returns a pair of `Parameterized<Option<P>>` values. The first one contains [`Some`] for each parameter
+    /// for which the provided `predicate` returns `true`, and [`None`] elsewhere, and the opposite holds for the second
+    /// returned value. This function is equivalent to using [`Self::filter_parameters`] twice on the same value, but it
+    /// avoids traversing the structure twice.
+    ///
+    /// This function is inspired by
+    /// [Equinox's `partition` function](https://docs.kidger.site/equinox/api/manipulation/#equinox.partition).
     ///
     /// # Example
     ///
@@ -951,38 +981,6 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Keeps leaves that satisfy `predicate` and replaces all other leaves with `None`.
-    ///
-    /// This is inspired by Equinox
-    /// [`filter`](https://docs.kidger.site/equinox/api/manipulation/#equinoxfilter), using `Option<P>` as the
-    /// replacement mechanism.
-    ///
-    /// # Parameters
-    ///
-    ///   - `predicate`: Called on every leaf as `predicate(path, parameter)`. Return `true` to keep that leaf as
-    ///     `Some(parameter)`; return `false` to replace it with `None`.
-    ///
-    /// # Returns
-    ///
-    /// A structure-preserving optional tree (`Self::To<Option<P>>`).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use ryft_core::parameters::Parameterized;
-    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-    /// let filtered = value.filter_parameters(|path, _| path.to_string().ends_with(".1"))?;
-    /// assert_eq!(filtered, vec![(None, Some(2)), (None, Some(4))]);
-    /// # Ok::<(), ryft_core::errors::Error>(())
-    /// ```
-    fn filter_parameters<F: FnMut(&ParameterPath, &P) -> bool>(self, predicate: F) -> Result<Self::To<Option<P>>, Error>
-    where
-        Self::Family: ParameterizedFamily<Option<P>>,
-    {
-        let mut predicate = predicate;
-        self.map_named_parameters(|path, parameter| predicate(path, &parameter).then_some(parameter))
-    }
 
     /// Combines optional trees into one value using left-to-right `Some` precedence per leaf.
     ///
