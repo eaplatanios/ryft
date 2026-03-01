@@ -224,8 +224,8 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///    [_Working with Parameterized Values_](#working-with-parameterized-values) section below.
 ///  - **Arrays:** `[V; N]` is `Parameterized<P>` for any `N` when `V: Parameterized<P>`.
 ///  - **Vectors:** `Vec<V>` is `Parameterized<P>` when `V: Parameterized<P>`.
-///  - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug` and `V: Parameterized<P>`, and
-///    `BTreeMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug` and `V: Parameterized<P>`.
+///  - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug + Ord` and `V: Parameterized<P>`,
+///    and `BTreeMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug + Ord` and `V: Parameterized<P>`.
 ///  - **Phantom Data:** `PhantomData<P>` is `Parameterized<P>` for all `P: Parameter`, containing no parameters.
 ///
 /// Note that Ryft does not provide a generic `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>`
@@ -1816,7 +1816,7 @@ pub struct HashMapParameterizedFamily<K, F, S>(PhantomData<(K, F, S)>);
 
 impl<
     P: Parameter,
-    K: Clone + Debug + Eq + Hash,
+    K: Clone + Debug + Eq + Ord + Hash,
     F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>,
     S: BuildHasher + Clone,
 > ParameterizedFamily<P> for HashMapParameterizedFamily<K, F, S>
@@ -1824,7 +1824,8 @@ impl<
     type To = HashMap<K, <F as ParameterizedFamily<P>>::To, S>;
 }
 
-impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
+// TODO(eaplatanios): Document inefficiency due to sorting somewhere.
+impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
     for HashMap<K, V, S>
 {
     type Family = HashMapParameterizedFamily<K, V::Family, S>;
@@ -1838,7 +1839,7 @@ impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHa
 
     type ParameterIterator<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::collections::hash_map::Values<'t, K, V>,
+        std::vec::IntoIter<&'t V>,
         <V as Parameterized<P>>::ParameterIterator<'t, T>,
         fn(&'t V) -> <V as Parameterized<P>>::ParameterIterator<'t, T>,
     >
@@ -1847,7 +1848,7 @@ impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHa
 
     type ParameterIteratorMut<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::collections::hash_map::ValuesMut<'t, K, V>,
+        std::vec::IntoIter<&'t mut V>,
         <V as Parameterized<P>>::ParameterIteratorMut<'t, T>,
         fn(&'t mut V) -> <V as Parameterized<P>>::ParameterIteratorMut<'t, T>,
     >
@@ -1855,28 +1856,26 @@ impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHa
         Self: 't;
 
     type ParameterIntoIterator<T: Parameter> = std::iter::FlatMap<
-        std::collections::hash_map::IntoValues<K, V>,
+        std::vec::IntoIter<V>,
         <V as Parameterized<P>>::ParameterIntoIterator<T>,
         fn(V) -> <V as Parameterized<P>>::ParameterIntoIterator<T>,
     >;
 
     type NamedParameterIterator<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::collections::hash_map::Iter<'t, K, V>,
+        std::vec::IntoIter<(K, &'t V)>,
         PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
-        fn(
-            (&'t K, &'t V),
-        ) -> PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
+        fn((K, &'t V)) -> PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
     >
     where
         Self: 't;
 
     type NamedParameterIteratorMut<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::collections::hash_map::IterMut<'t, K, V>,
+        std::vec::IntoIter<(K, &'t mut V)>,
         PathPrefixedParameterIterator<&'t mut T, <V as Parameterized<P>>::NamedParameterIteratorMut<'t, T>>,
         fn(
-            (&'t K, &'t mut V),
+            (K, &'t mut V),
         )
             -> PathPrefixedParameterIterator<&'t mut T, <V as Parameterized<P>>::NamedParameterIteratorMut<'t, T>>,
     >
@@ -1884,7 +1883,7 @@ impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHa
         Self: 't;
 
     type NamedParameterIntoIterator<T: Parameter> = std::iter::FlatMap<
-        std::collections::hash_map::IntoIter<K, V>,
+        std::vec::IntoIter<(K, V)>,
         PathPrefixedParameterIterator<T, <V as Parameterized<P>>::NamedParameterIntoIterator<T>>,
         fn((K, V)) -> PathPrefixedParameterIterator<T, <V as Parameterized<P>>::NamedParameterIntoIterator<T>>,
     >;
@@ -1895,38 +1894,73 @@ impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHa
 
     fn parameter_structure(&self) -> Self::ParameterStructure {
         let mut structure = HashMap::with_capacity_and_hasher(self.len(), self.hasher().clone());
-        structure.extend(self.iter().map(|(key, value)| (key.clone(), value.parameter_structure())));
+        let mut sorted_entries =
+            self.iter().map(|(key, value)| (key.clone(), value.parameter_structure())).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        structure.extend(sorted_entries);
         structure
     }
 
     fn parameters(&self) -> Self::ParameterIterator<'_, P> {
-        self.values().flat_map(V::parameters)
+        let mut sorted_entries = self.iter().map(|(key, value)| (key.clone(), value)).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let sorted_values = sorted_entries.into_iter().map(|(_, value)| value).collect::<Vec<_>>();
+        sorted_values.into_iter().flat_map(V::parameters)
     }
 
     fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> {
-        self.values_mut().flat_map(V::parameters_mut)
+        let mut sorted_entries = self.iter_mut().map(|(key, value)| (key.clone(), value as *mut V)).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let sorted_values = sorted_entries
+            .into_iter()
+            .map(|(_, value_ptr)| {
+                // SAFETY: Each pointer originates from a distinct `iter_mut()` item, so pointers are unique and
+                // non-overlapping. We do not structurally modify the map after collecting pointers, so they remain
+                // valid for the duration of this traversal.
+                unsafe { &mut *value_ptr }
+            })
+            .collect::<Vec<_>>();
+        sorted_values.into_iter().flat_map(V::parameters_mut)
     }
 
     fn into_parameters(self) -> Self::ParameterIntoIterator<P> {
-        self.into_values().flat_map(V::into_parameters)
+        let mut sorted_entries = self.into_iter().collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let sorted_values = sorted_entries.into_iter().map(|(_, value)| value).collect::<Vec<_>>();
+        sorted_values.into_iter().flat_map(V::into_parameters)
     }
 
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
-        self.iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
+        let mut sorted_entries = self.iter().map(|(key, value)| (key.clone(), value)).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        sorted_entries.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
             iterator: value.named_parameters(),
             segment: ParameterPathSegment::Key(format!("{key:?}")),
         })
     }
 
     fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> {
-        self.iter_mut().flat_map(|(key, value)| PathPrefixedParameterIterator {
+        let mut sorted_entries = self.iter_mut().map(|(key, value)| (key.clone(), value as *mut V)).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let sorted_entries = sorted_entries
+            .into_iter()
+            .map(|(key, value_ptr)| {
+                // SAFETY: Each pointer originates from a distinct `iter_mut()` item, so pointers are unique and
+                // non-overlapping. We do not structurally modify the map after collecting pointers, so they remain
+                // valid for the duration of this traversal.
+                (key, unsafe { &mut *value_ptr })
+            })
+            .collect::<Vec<_>>();
+        sorted_entries.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
             iterator: value.named_parameters_mut(),
             segment: ParameterPathSegment::Key(format!("{key:?}")),
         })
     }
 
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
-        self.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
+        let mut sorted_entries = self.into_iter().collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        sorted_entries.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
             iterator: value.into_named_parameters(),
             segment: ParameterPathSegment::Key(format!("{key:?}")),
         })
@@ -1938,7 +1972,9 @@ impl<P: Parameter, K: Clone + Debug + Eq + Hash, V: Parameterized<P>, S: BuildHa
     ) -> Result<Self, Error> {
         let expected_count = structure.len();
         let mut values = HashMap::with_capacity_and_hasher(expected_count, structure.hasher().clone());
-        for (key, value_structure) in structure {
+        let mut sorted_entries = structure.into_iter().collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        for (key, value_structure) in sorted_entries {
             values.insert(
                 key,
                 V::from_parameters_with_remainder(value_structure, parameters).map_err(|error| match error {
@@ -2349,25 +2385,18 @@ mod tests {
         value.insert("right", (3, 4));
 
         assert_eq!(value.parameter_count(), 4);
-        let parameters = value.parameters().copied().collect::<Vec<_>>();
-        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), parameters);
-        assert_parameters_mut_increments(value.clone(), parameters);
+        let expected_parameters = vec![1, 2, 3, 4];
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), expected_parameters);
+        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), expected_parameters);
+        assert_parameters_mut_increments(value.clone(), expected_parameters.clone());
 
         let structure = value.parameter_structure();
-        let mut parameters_in_structure_iteration_order = Vec::new();
-        for key in structure.keys() {
-            parameters_in_structure_iteration_order.extend(value.get(key).copied().unwrap().into_parameters());
-        }
         assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(
-                structure.clone(),
-                parameters_in_structure_iteration_order.clone(),
-            ),
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(structure.clone(), expected_parameters),
             Ok(value.clone())
         );
 
-        let mut parameters_with_remainder =
-            parameters_in_structure_iteration_order.iter().copied().chain(std::iter::once(-1));
+        let mut parameters_with_remainder = value.clone().into_parameters().chain(std::iter::once(-1));
         assert_eq!(
             <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
                 structure,
@@ -2384,15 +2413,25 @@ mod tests {
         value.insert("left", (1, 2));
         value.insert("right", (3, 4));
 
-        let named = value.named_parameters().collect::<Vec<_>>();
-        assert_eq!(named.len(), 4);
-        for (path, parameter) in named {
-            let segments = path.segments().cloned().collect::<Vec<_>>();
-            assert_eq!(segments.len(), 2);
-            assert!(matches!(segments[0], ParameterPathSegment::Key(_)));
-            assert!(matches!(segments[1], ParameterPathSegment::TupleIndex(0) | ParameterPathSegment::TupleIndex(1)));
-            assert!(matches!(*parameter, 1..=4));
-        }
+        assert_parameter_paths(
+            &value,
+            vec![
+                "$[\"left\"].0".to_string(),
+                "$[\"left\"].1".to_string(),
+                "$[\"right\"].0".to_string(),
+                "$[\"right\"].1".to_string(),
+            ],
+        );
+        assert_named_parameters_mut_increments(
+            value.clone(),
+            vec![
+                "$[\"left\"].0".to_string(),
+                "$[\"left\"].1".to_string(),
+                "$[\"right\"].0".to_string(),
+                "$[\"right\"].1".to_string(),
+            ],
+            vec![1, 2, 3, 4],
+        );
 
         let expected = value.clone();
         let structure = value.parameter_structure();
@@ -2401,6 +2440,18 @@ mod tests {
             <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_parameters(structure, named_owned),
             Ok(expected)
         );
+    }
+
+    #[test]
+    fn test_hash_map_parameterized_impl_uses_sorted_key_order() {
+        let value = HashMap::from([("zeta", (1, 2)), ("alpha", (3, 4)), ("mu", (5, 6))]);
+
+        let parameters = value.clone().into_parameters().collect::<Vec<_>>();
+        assert_eq!(parameters, vec![3, 4, 5, 6, 1, 2]);
+
+        let rebuilt =
+            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(value.parameter_structure(), parameters);
+        assert_eq!(rebuilt, Ok(value));
     }
 
     #[test]
