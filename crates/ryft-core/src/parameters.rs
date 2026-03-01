@@ -898,33 +898,30 @@ pub trait Parameterized<P: Parameter>: Sized {
         Self::To::<T>::from_named_parameters(structure, mapped_parameters)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Splits this value into selected and rejected optional trees according to `predicate`.
+    /// Partitions all nested [`Parameter`]s of type `P` in this value into two structure-preserving [`Parameterized`]
+    /// values, according to `predicate`. Specifically, this value is a `Parameterized<P>` and this function returns a
+    /// pair of `Parameterized<Option<P>>` values. The first one contains [`Some`] for each parameter for which the
+    /// provided `predicate` returns `true`, and [`None`] elsewhere, and the opposite holds for the second returned
+    /// value. This function is equivalent to using [`Self::filter_parameters`] twice on the same value, but it avoids
+    /// traversing the structure twice.
     ///
-    /// This is inspired by Equinox
-    /// [`partition`](https://docs.kidger.site/equinox/api/manipulation/#equinoxpartition).
-    /// It is equivalent to filtering with `predicate` and its inverse, but traverses this tree only once.
-    ///
-    /// # Parameters
-    ///
-    ///   - `predicate`: Called on every leaf as `predicate(path, parameter)`. Return `true` to place that leaf in the
-    ///     first output tree; return `false` to place it in the second output tree.
-    ///
-    /// # Returns
-    ///
-    /// A tuple `(selected, rejected)` where both trees preserve the input structure. For each leaf, exactly one side
-    /// contains `Some(value)` and the other side contains `None`.
+    /// This function is inspired by
+    /// [Equinox's `partition` function](https://docs.kidger.site/equinox/api/manipulation/#equinoxpartition).
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use ryft_core::parameters::Parameterized;
+    /// # use ryft::Parameterized;
+    ///
     /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-    /// let (selected, rejected) = value.partition_parameters(|path, _| path.to_string().starts_with("$[1]"))?;
-    /// assert_eq!(selected, vec![(None, None), (Some(3), Some(4))]);
-    /// assert_eq!(rejected, vec![(Some(1), Some(2)), (None, None)]);
-    /// # Ok::<(), ryft_core::errors::Error>(())
+    ///
+    /// // Keep only parameters under the second top-level element in `partition_0`.
+    /// let (partition_0, partition_1) = value.partition_parameters(|path, _| path.to_string().starts_with("$[1]"))?;
+    ///
+    /// assert_eq!(partition_0, vec![(None, None), (Some(3), Some(4))]);
+    /// assert_eq!(partition_1, vec![(Some(1), Some(2)), (None, None)]);
+    ///
+    /// # Ok::<(), ryft::Error>(())
     /// ```
     fn partition_parameters<F: FnMut(&ParameterPath, &P) -> bool>(
         self,
@@ -933,25 +930,27 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         Self::Family: ParameterizedFamily<Option<P>>,
     {
-        let mut predicate = predicate;
         let structure = self.parameter_structure();
-        let mut selected_parameters = Vec::new();
-        let mut rejected_parameters = Vec::new();
-        selected_parameters.reserve_exact(structure.parameter_count());
-        rejected_parameters.reserve_exact(structure.parameter_count());
+        let mut predicate = predicate;
+        let mut partition_0_parameters = Vec::new();
+        let mut partition_1_parameters = Vec::new();
+        partition_0_parameters.reserve_exact(structure.parameter_count());
+        partition_1_parameters.reserve_exact(structure.parameter_count());
         for (path, parameter) in self.into_named_parameters() {
             if predicate(&path, &parameter) {
-                selected_parameters.push(Some(parameter));
-                rejected_parameters.push(None);
+                partition_0_parameters.push(Some(parameter));
+                partition_1_parameters.push(None);
             } else {
-                selected_parameters.push(None);
-                rejected_parameters.push(Some(parameter));
+                partition_0_parameters.push(None);
+                partition_1_parameters.push(Some(parameter));
             }
         }
-        let selected = Self::To::<Option<P>>::from_parameters(structure, selected_parameters)?;
-        let rejected = Self::To::<Option<P>>::from_parameters(selected.parameter_structure(), rejected_parameters)?;
-        Ok((selected, rejected))
+        let partition_0 = Self::To::from_parameters(structure, partition_0_parameters)?;
+        let partition_1 = Self::To::from_parameters(partition_0.parameter_structure(), partition_1_parameters)?;
+        Ok((partition_0, partition_1))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Keeps leaves that satisfy `predicate` and replaces all other leaves with `None`.
     ///
