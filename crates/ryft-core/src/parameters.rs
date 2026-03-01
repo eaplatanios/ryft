@@ -677,22 +677,19 @@ pub trait Parameterized<P: Parameter>: Sized {
         let expected_count = structure.parameter_count();
         let mut values = Vec::new();
         values.reserve_exact(expected_count);
-        // TODO(eaplatanios): We must collect all missing paths before returning `Error::MissingParameters`.
+        let mut missing_paths = Vec::new();
         for (expected_path, _) in structure.named_parameters() {
             match parameters.remove(&expected_path) {
                 Some(parameter) => values.push(parameter),
-                None => {
-                    return Err(Error::MissingParameters {
-                        expected_count,
-                        paths: Some(vec![expected_path.to_string()]),
-                    });
-                }
+                None => missing_paths.push(expected_path.to_string()),
             }
         }
-        if parameters.is_empty() {
-            Self::from_parameters(structure, values)
-        } else {
+        if !missing_paths.is_empty() {
+            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+        } else if !parameters.is_empty() {
             Err(Error::UnusedParameters { paths: None })
+        } else {
+            Self::from_parameters(structure, values)
         }
     }
 
@@ -716,29 +713,33 @@ pub trait Parameterized<P: Parameter>: Sized {
         let expected_count = paths.len();
         let mut path_prefixes = parameters.into_iter().map(|(path, value)| (path, value, 0usize)).collect::<Vec<_>>();
         let mut broadcasted_parameters = HashMap::with_capacity(expected_count);
+        let mut missing_paths = Vec::new();
         for path in paths {
             // TODO(eaplatanios): Is performance a concern here with all these loops and searching?
-            // TODO(eaplatanios): We must collect all missing paths before returning `Error::MissingParameters`.
             let selected_prefix_index = path_prefixes
                 .iter()
                 .enumerate()
                 .filter_map(|(i, (p, _, _))| if p.is_prefix_of(&path) { Some((i, p.len())) } else { None })
                 .max_by(|x, y| x.1.cmp(&y.1))
-                .map(|(i, _)| i)
-                .ok_or_else(|| Error::MissingParameters { expected_count, paths: Some(vec![path.to_string()]) })?;
-            let (_, value, matched_count) = &mut path_prefixes[selected_prefix_index];
-            broadcasted_parameters.insert(path, value.clone());
-            *matched_count += 1;
+                .map(|(i, _)| i);
+            if let Some(selected_prefix_index) = selected_prefix_index {
+                let (_, value, matched_count) = &mut path_prefixes[selected_prefix_index];
+                broadcasted_parameters.insert(path, value.clone());
+                *matched_count += 1;
+            } else {
+                missing_paths.push(path.to_string());
+            }
         }
-        let mut unused_prefix_paths = path_prefixes
+        let unused_prefix_paths = path_prefixes
             .into_iter()
             .filter_map(|(path, _, matched_count)| if matched_count == 0 { Some(path.to_string()) } else { None })
             .collect::<Vec<_>>();
-        if unused_prefix_paths.is_empty() {
-            Self::from_named_parameters(structure, broadcasted_parameters)
-        } else {
-            unused_prefix_paths.sort_unstable();
+        if !missing_paths.is_empty() {
+            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+        } else if !unused_prefix_paths.is_empty() {
             Err(Error::UnusedParameters { paths: Some(unused_prefix_paths) })
+        } else {
+            Self::from_named_parameters(structure, broadcasted_parameters)
         }
     }
 
@@ -2939,6 +2940,20 @@ mod tests {
     }
 
     #[test]
+    fn test_from_named_parameters_reports_all_missing_paths_for_vec() {
+        let structure = vec![Placeholder, Placeholder, Placeholder];
+        let parameters = HashMap::from([(ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 1)]);
+        let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(structure, parameters);
+        assert_eq!(
+            result,
+            Err(Error::MissingParameters {
+                expected_count: 3,
+                paths: Some(vec!["$[1]".to_string(), "$[2]".to_string()]),
+            }),
+        );
+    }
+
+    #[test]
     fn test_from_parameters_reports_insufficient_parameters_for_hash_map() {
         let mut structure = HashMap::new();
         structure.insert("left", Placeholder);
@@ -3013,7 +3028,10 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(Error::MissingParameters { expected_count: 4, paths: Some(vec!["$[1].0".to_string()]) }),
+            Err(Error::MissingParameters {
+                expected_count: 4,
+                paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]),
+            }),
         );
     }
 
