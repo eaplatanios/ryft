@@ -177,7 +177,7 @@ impl Api {
         let extension = self.ffi_extension()?;
         let name = name.as_ref();
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension PJRT_FFI_Extension => extension,
             PJRT_FFI_Type_Register,
             {
                 type_name = name.as_ptr() as *const _,
@@ -208,7 +208,7 @@ impl Api {
         let name = name.as_ref();
         let platform = platform.as_ref();
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension PJRT_FFI_Extension => extension,
             PJRT_FFI_Register_Handler,
             {
                 target_name = name.as_ptr() as *const _,
@@ -233,7 +233,7 @@ impl ExecutionContext {
         use ffi::PJRT_FFI_UserData_Add_Args;
         let extension = self.api().ffi_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension PJRT_FFI_Extension => extension,
             PJRT_FFI_UserData_Add,
             {
                 context = self.to_c_api(),

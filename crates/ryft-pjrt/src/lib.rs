@@ -197,6 +197,7 @@ pub(crate) mod ffi {
     pub const PJRT_Extension_Type_TpuExecutable: PJRT_Extension_Type = 17;
     pub const PJRT_Extension_Type_Megascale: PJRT_Extension_Type = 18;
     pub const PJRT_Extension_Type_Shardings: PJRT_Extension_Type = 19;
+    pub const PJRT_Extension_Type_AbiVersion: PJRT_Extension_Type = 20;
 
     /// PJRT extension base type. The `extension_type` field must be used to identify the type of the extension
     /// and reinterpret its instance accordingly.
@@ -377,6 +378,7 @@ pub(crate) mod ffi {
 
         pub PJRT_Event_Create: Option<PJRT_Event_Create>,
         pub PJRT_Event_Set: Option<PJRT_Event_Set>,
+        pub PJRT_Device_GetAttributes: Option<PJRT_Device_GetAttributes>,
     }
 }
 
@@ -598,7 +600,7 @@ mod tests {
 
         let plugin = test_cpu_plugin();
         let api = plugin.api();
-        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 13, 7])));
+        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 13, 8])));
         assert_eq!(plugin.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(plugin.attribute("xla_version"), Ok(Value::i64(2)));
         assert_eq!(plugin.attribute("xla_version"), api.attribute("xla_version"));
@@ -606,7 +608,7 @@ mod tests {
             plugin.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = plugin.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 13, 7])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 13, 8])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);

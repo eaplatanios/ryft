@@ -3672,3 +3672,33 @@ pub struct XStatMetadata {
     #[prost(string, tag = "3")]
     pub description: String,
 }
+
+/// Runtime ABI version descriptor for PJRT.
+///
+/// This type corresponds to `PjRtRuntimeAbiVersionProto` in
+/// [XLA](https://github.com/openxla/xla/blob/main/xla/pjrt/proto/pjrt_abi_version.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct RuntimeAbiVersion {
+    /// Platform identifier associated with this runtime ABI version.
+    #[prost(uint64, tag = "1")]
+    pub platform: u64,
+
+    /// Serialized ABI version payload interpreted by the corresponding platform implementation.
+    #[prost(bytes = "vec", tag = "2")]
+    pub version: Vec<u8>,
+}
+
+/// Executable ABI version descriptor for PJRT.
+///
+/// This type corresponds to `PjRtExecutableAbiVersionProto` in
+/// [XLA](https://github.com/openxla/xla/blob/main/xla/pjrt/proto/pjrt_abi_version.proto).
+#[derive(Clone, PartialEq, Message)]
+pub struct ExecutableAbiVersion {
+    /// Platform identifier associated with this executable ABI version.
+    #[prost(uint64, tag = "1")]
+    pub platform: u64,
+
+    /// Serialized ABI version payload interpreted by the corresponding platform implementation.
+    #[prost(bytes = "vec", tag = "2")]
+    pub version: Vec<u8>,
+}

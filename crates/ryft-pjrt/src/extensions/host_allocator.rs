@@ -55,7 +55,7 @@ impl Client<'_> {
         use ffi::PJRT_HostAllocator_GetPreferredAlignment_Args;
         let extension = self.host_allocator_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_HostAllocator_Extension => extension,
             PJRT_HostAllocator_GetPreferredAlignment,
             { client = self.to_c_api() },
             { preferred_alignment },
@@ -68,7 +68,7 @@ impl Client<'_> {
         use ffi::PJRT_HostAllocator_Allocate_Args;
         let extension = self.host_allocator_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_HostAllocator_Extension => extension,
             PJRT_HostAllocator_Allocate,
             {
                 client = self.to_c_api(),
@@ -84,7 +84,7 @@ impl Client<'_> {
         use ffi::PJRT_HostAllocator_Free_Args;
         let extension = self.host_allocator_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_HostAllocator_Extension => extension,
             PJRT_HostAllocator_Free,
             {
                 client = self.to_c_api(),

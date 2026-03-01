@@ -53,7 +53,7 @@ impl Executable {
         use ffi::PJRT_Shardings_PJRT_Executable_ParameterShardings_Args;
         let extension = self.api().shardings_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Shardings_Extension => extension,
             PJRT_Shardings_PJRT_Executable_ParameterShardings,
             { executable = self.to_c_api() },
             { num_parameters, shardings, sharding_sizes },
@@ -69,7 +69,7 @@ impl Executable {
         use ffi::PJRT_Shardings_PJRT_Executable_OutputShardings_Args;
         let extension = self.api().shardings_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Shardings_Extension => extension,
             PJRT_Shardings_PJRT_Executable_OutputShardings,
             { executable = self.to_c_api() },
             { num_outputs, shardings, sharding_sizes },

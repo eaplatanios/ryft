@@ -43,6 +43,9 @@ pub struct Device<'o> {
     /// Cached [`Device::description`] of this [`Device`] so that it will only be constructed once.
     description: OnceLock<Result<DeviceDescription<'o>, Error>>,
 
+    /// Cached [`Device::attributes`] of this [`Device`] so that they are only queried once.
+    attributes: OnceLock<Result<HashMap<String, Value>, Error>>,
+
     /// [`PhantomData`] used to track the lifetime of the owner of this [`Device`].
     owner: PhantomData<&'o ()>,
 }
@@ -54,7 +57,7 @@ impl Device<'_> {
         if handle.is_null() {
             Err(Error::invalid_argument("the provided PJRT device handle is a null pointer"))
         } else {
-            Ok(Self { handle, api, description: OnceLock::new(), owner: PhantomData })
+            Ok(Self { handle, api, description: OnceLock::new(), attributes: OnceLock::new(), owner: PhantomData })
         }
     }
 
@@ -99,7 +102,30 @@ impl Device<'_> {
 
     /// Collection of [`Device`]-specific named attributes that are attached to this [`Device`].
     pub fn attributes(&self) -> Result<&HashMap<String, Value>, Error> {
-        self.description()?.attributes()
+        self.attributes
+            .get_or_init(|| {
+                use ffi::PJRT_Device_GetAttributes_Args;
+                let attributes = invoke_pjrt_api_error_fn!(
+                    self.api(),
+                    PJRT_Device_GetAttributes,
+                    { device = self.to_c_api() },
+                    { attributes, num_attributes, device_attributes, attributes_deleter },
+                )
+                .map(|(attributes, attribute_count, device_attributes, attributes_deleter)| {
+                    let attributes = hash_map_from_c_api(attributes, attribute_count);
+                    if let Some(attributes_deleter) = attributes_deleter {
+                        unsafe { attributes_deleter(device_attributes) };
+                    }
+                    attributes
+                });
+                match attributes {
+                    Ok(attributes) => Ok(attributes),
+                    Err(Error::Unimplemented { .. }) => Ok(self.description()?.attributes()?.clone()),
+                    Err(error) => Err(error),
+                }
+            })
+            .as_ref()
+            .map_err(|error| error.clone())
     }
 
     /// [`DeviceDescription`] associated with this [`Device`].
@@ -559,41 +585,57 @@ impl DeviceAssignment {
 
     /// Serializes this [`DeviceAssignment`] into a string (i.e., byte array).
     pub fn serialize(&self) -> Result<SerializedDeviceAssignment, Error> {
-        Ok(SerializedDeviceAssignment::Rust { data: self.proto()?.encode_to_vec() })
+        Ok(SerializedDeviceAssignment::from_proto(self.proto()?))
     }
 }
 
 /// Serialized [`DeviceAssignment`].
-pub enum SerializedDeviceAssignment {
-    /// Serialized [`DeviceAssignment`] that was allocated/serialized using [`DeviceAssignment::serialize`].
-    Rust {
-        /// Bytes that correspond to a serialized [`DeviceAssignment`].
-        data: Vec<u8>,
-    },
+pub struct SerializedDeviceAssignment {
+    /// Opaque data handle that represents data associated with this [`SerializedDeviceAssignment`].
+    /// Note that this handle should _never_ be passed to PJRT C API functions. It should only be obtained from such
+    /// functions. That is because it does not have a contract for the underlying memory layout and may also be
+    /// constructed by Rust code (e.g., in [`SerializedDeviceAssignment::from_proto`]).
+    handle: *mut ffi::PJRT_DeviceAssignmentSerialized,
 
-    /// Serialized [`DeviceAssignment`] that was allocated/serialized using the PJRT C API.
-    C {
-        /// Handle that represents this [`SerializedDeviceAssignment`] in the PJRT C API.
-        handle: *mut ffi::PJRT_DeviceAssignmentSerialized,
+    /// Optional function that must be called to free the underlying memory when dropping this instance.
+    deleter: Option<unsafe extern "C" fn(device_assignment: *mut ffi::PJRT_DeviceAssignmentSerialized)>,
 
-        /// Optional function that must be called to free the underlying memory when dropping this instance.
-        deleter: Option<unsafe extern "C" fn(device_assignment: *mut ffi::PJRT_DeviceAssignmentSerialized)>,
+    /// Pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
+    data: *const std::ffi::c_char,
 
-        /// Pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
-        data: *const std::ffi::c_char,
-
-        /// Size (i.e., number of bytes) of this [`SerializedDeviceAssignment`].
-        data_size: usize,
-    },
+    /// Size (i.e., number of bytes) of this [`SerializedDeviceAssignment`].
+    data_size: usize,
 }
 
 impl SerializedDeviceAssignment {
+    /// Constructs a [`SerializedDeviceAssignment`] from the provided C API handle and data.
+    pub(crate) unsafe fn from_c_api(
+        handle: *mut ffi::PJRT_DeviceAssignmentSerialized,
+        deleter: Option<unsafe extern "C" fn(device_assignment: *mut ffi::PJRT_DeviceAssignmentSerialized)>,
+        data: *const std::ffi::c_char,
+        data_size: usize,
+    ) -> Self {
+        Self { handle, deleter, data, data_size }
+    }
+
+    /// Constructs a [`SerializedDeviceAssignment`] from the provided [`DeviceAssignment`] Protobuf message.
+    pub fn from_proto(device_assignment: crate::protos::DeviceAssignment) -> Self {
+        unsafe extern "C" fn delete(handle: *mut ffi::PJRT_DeviceAssignmentSerialized) {
+            if !handle.is_null() {
+                unsafe { drop(Box::from_raw(handle as *mut Vec<u8>)) };
+            }
+        }
+
+        let serialized_device_assignment = Box::new(device_assignment.encode_to_vec());
+        let data = serialized_device_assignment.as_ptr() as *const std::ffi::c_char;
+        let data_size = serialized_device_assignment.len();
+        let handle = Box::into_raw(serialized_device_assignment) as *mut ffi::PJRT_DeviceAssignmentSerialized;
+        Self { handle, deleter: Some(delete), data, data_size }
+    }
+
     /// Returns a pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
     pub fn data(&self) -> &[u8] {
-        match self {
-            Self::Rust { data } => data,
-            Self::C { data, data_size, .. } => unsafe { slice_from_c_api(*data as *const u8, *data_size) },
-        }
+        unsafe { slice_from_c_api(self.data as *const u8, self.data_size) }
     }
 
     /// Returns the Protobuf message that corresponds to this [`SerializedDeviceAssignment`].
@@ -624,8 +666,8 @@ unsafe impl Sync for SerializedDeviceAssignment {}
 
 impl Drop for SerializedDeviceAssignment {
     fn drop(&mut self) {
-        if let Self::C { handle, deleter: Some(deleter), .. } = self {
-            unsafe { deleter(*handle) };
+        if let Some(deleter) = self.deleter {
+            unsafe { deleter(self.handle) };
         }
     }
 }
@@ -709,6 +751,42 @@ pub(crate) mod ffi {
         _data: [u8; 0],
         _marker: PhantomData<(*mut u8, PhantomPinned)>,
     }
+
+    // We represent opaque C types as structs with a particular structure that is following the convention
+    // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
+    #[repr(C)]
+    pub struct PJRT_Device_Attributes {
+        _data: [u8; 0],
+        _marker: PhantomData<(*mut u8, PhantomPinned)>,
+    }
+
+    #[repr(C)]
+    pub struct PJRT_Device_GetAttributes_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub device: *mut PJRT_Device,
+        pub attributes: *const PJRT_NamedValue,
+        pub num_attributes: usize,
+        pub device_attributes: *mut PJRT_Device_Attributes,
+        pub attributes_deleter: Option<unsafe extern "C" fn(device_attributes: *mut PJRT_Device_Attributes)>,
+    }
+
+    impl PJRT_Device_GetAttributes_Args {
+        pub fn new(device: *mut PJRT_Device) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                device,
+                attributes: std::ptr::null(),
+                num_attributes: 0,
+                device_attributes: std::ptr::null_mut(),
+                attributes_deleter: None,
+            }
+        }
+    }
+
+    pub type PJRT_Device_GetAttributes =
+        unsafe extern "C" fn(args: *mut PJRT_Device_GetAttributes_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
     pub struct PJRT_Device_GetDescription_Args {
