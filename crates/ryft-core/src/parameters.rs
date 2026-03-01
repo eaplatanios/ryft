@@ -207,22 +207,30 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     [`Self::into_parameters`], [`Self::named_parameters`], [`Self::named_parameters_mut`],
 ///     and [`Self::into_named_parameters`].
 ///
-/// In the context of machine learning (ML), a [`Parameterized`] can contain model parameters (thus the name), dataset
-/// entries, reinforcement learning agent observations, etc. Ryft provides built-in [`Parameterized`] implementations
-/// for a wide range of container-like types, including but not limited to:
+/// In the context of machine learning (ML), a [`Parameterized`] can contain model parameters, dataset entries,
+/// reinforcement learning agent observations, etc. Ryft provides built-in [`Parameterized`] implementations for a wide
+/// range of container-like types, including but not limited to:
 ///
 ///  - **Parameters:** All `P: Parameter` are `Parameterized<P>`.
 ///  - **Tuples:** `()` is `Parameterized<P>` for all `P: Parameter`, `(V0)` is `Parameterized<P>` when
 ///    `V0: Parameterized<P>`, `(V0, V1)` is `Parameterized<P>` when `V0: Parameterized<P>` and `V1: Parameterized<P>`,
-///    etc., up to size 12.
+///    etc., up to size 12. Note that tuples with mixed [`Parameterized`] and non-[`Parameterized`] elements are
+///    supported only when they appear within types for which we derive [`Parameterized`] implementations using the
+///    `#[derive(Parameterized)]` macro (described in the [_Custom Types_](#custom-types) section below).
+///  - **Options:** `Option<V>` is `Parameterized<P>` when `V: Parameterized<P>`, _only_ when it appears within
+///    a type for which we derive a [`Parameterized`] implementation using the `#[derive(Parameterized)]` macro.
+///    That is because we need `Option<P>` to be a [`Parameter`] when `P: Parameter` in order to support some of
+///    the manipulation functions that are described in the
+///    [_Working with Parameterized Values_](#working-with-parameterized-values) section below.
 ///  - **Arrays:** `[V; N]` is `Parameterized<P>` for any `N` when `V: Parameterized<P>`.
 ///  - **Vectors:** `Vec<V>` is `Parameterized<P>` when `V: Parameterized<P>`.
 ///  - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug` and `V: Parameterized<P>`.
 ///  - **Phantom Data:** `PhantomData<P>` is `Parameterized<P>` for all `P: Parameter`, containing no parameters.
 ///
-/// Note that [`Option<P>`] is not [`Parameterized<P>`] by default. That is because we need `Option<P>` to be a
-/// [`Parameter`] when `P: Parameter` in order to support some of the manipulation functions that are described in the
-/// [_Working with Parameterized Values_](#working-with-parameterized-values) section below.
+/// Note that Ryft does not provide a generic `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>`
+/// because it overlaps with the blanket leaf implementation `impl<P: Parameter> Parameterized<P> for P`. Since `Box`
+/// is a fundamental type, downstream crates may implement [`Parameter`] for `Box<T>` for some local type `T`, and
+/// the generic `Box` implementation would then become non-coherent under Rust's orphan/coherence rules.
 ///
 /// Ryft also provides a convenient `#[derive(Parameterized)]` macro that can be used to automatically derive
 /// [`Parameterized`] implementations for custom types. Refer to the [_Custom Types_](#custom-types) section below
@@ -238,37 +246,55 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 /// ```rust
 /// # use std::collections::HashMap;
-/// # use ryft_core::parameters::Parameterized;
+/// # use ryft_core::parameters::{Parameterized, Placeholder};
 ///
 /// // Simple tuple with 3 [`Parameter`]s.
 /// let value = (1, 2, 3);
 /// let parameters = value.parameters().collect::<Vec<_>>();
 /// assert_eq!(value.parameter_count(), parameters.len());
 /// assert_eq!(parameters, vec![&1, &2, &3]);
-/// // TODO(eaplatanios): Show the parameter structure.
+/// assert_eq!(value.parameter_structure(), (Placeholder, Placeholder, Placeholder));
 ///
 /// // Nested tuple structure with 3 [`Parameter`]s.
 /// let value = (1, (2, 3), ());
 /// let parameters = value.parameters().collect::<Vec<_>>();
 /// assert_eq!(value.parameter_count(), parameters.len());
 /// assert_eq!(parameters, vec![&1, &2, &3]);
-/// // TODO(eaplatanios): Show the parameter structure.
+/// assert_eq!(value.parameter_structure(), (Placeholder, (Placeholder, Placeholder), ()));
 ///
 /// // Nested map and tuple structure with 5 [`Parameter`]s.
 /// let value = (1, HashMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
 /// let parameters = value.parameters().collect::<Vec<_>>();
 /// assert_eq!(value.parameter_count(), parameters.len());
 /// assert_eq!(parameters, vec![&1, &2, &3, &4, &5]);
-/// // TODO(eaplatanios): Show the parameter structure.
+/// assert_eq!(
+///     value.parameter_structure(),
+///     (Placeholder, HashMap::from([("a", vec![Placeholder]), ("b", vec![Placeholder, Placeholder])]), (Placeholder,)),
+/// );
 /// ```
 ///
 /// # Custom Types
 ///
 /// TODO(eaplatanios): Introduce section about the derive macro and include examples.
+///  - Supports both structs and enums already.
+///  - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
+///    that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
+///    If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
+///  - The parameter type must be a generic type parameter bounded by [Parameter].
+///  - There must be only one such generic type parameter. Not zero and not more than one.
+///  - All fields that reference / depend on the parameter type are considered parameter fields.
+///  - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
+///  - Configurable `macro_parameter_lifetime` and `macro_parameter_type`.
 ///
 /// # Working with Parameterized Values
 ///
 /// TODO(eaplatanios): Talk about our manipulation helpers a bit here but point to their docstrings for details.
+///
+/// # Parameter Ordering Invariance
+///
+/// [`Parameterized`] implementations must preserve the parameter order consistently across traversal and
+/// reconstruction. In other words, reading parameters with [`Self::parameters`] and then rebuilding with
+/// [`Self::from_parameters`] must result in the original value.
 ///
 ///
 ///
@@ -447,50 +473,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///   [`combine_optional_parameters`](Self::combine_optional_parameters),
 ///   [`apply_parameter_updates`](Self::apply_parameter_updates), and [`tree_at`](Self::tree_at) /
 ///   [`tree_at_paths`](Self::tree_at_paths), respectively.
-///
-/// # References
-///
-/// - JAX PyTrees: <https://docs.jax.dev/en/latest/pytrees.html>
-/// - JAX Custom PyTrees: <https://docs.jax.dev/en/latest/custom_pytrees.html>
-/// - Equinox PyTree Manipulation: <https://docs.kidger.site/equinox/api/manipulation/>
-///
-/// # Implementations Provided In This Module
-///
-/// - Every `P: Parameter` is a leaf and therefore implements [`Parameterized<P>`].
-/// - [`PhantomData<P>`] implements [`Parameterized<P>`] and contributes zero parameters.
-/// - Tuples whose elements are all themselves [`Parameterized`] are supported for arities of 1 through 12.
-///   Tuples with mixed [`Parameterized`] and non-[`Parameterized`] elements are supposed only when they appear within
-///   types for which we derive [`Parameterized`] implementations using the `#[derive(Parameterized)]` macro.
-/// - Options are supported only when they appear within types for which we derive [`Parameterized`] implementations
-///   using the `#[derive(Parameterized)]` macro.
-/// - Arrays (`[T; N]`) and [`Vec<T>`] are supported when `T: Parameterized<P>`.
-/// - [`HashMap<K, T, S>`] is supported when `K: Clone + Eq + Debug + Hash`, `S: BuildHasher + Clone`,
-///   and `T: Parameterized<P>`.
-/// - [`Box<T>`] is intentionally not supported (see the coherence note below).
-///
-/// Macro:
-/// - Supports both structs and enums already.
-/// - `#[derive(Parameterized)]` provides support for custom structs and enums, which also support nested tuples
-///   that mix [Parameterized] and non-[Parameterized] fields. However, they can only be nested within other tuples.
-///   If, for example, they appear in e.g., `Vec<(P, usize)>`, then those tuples are not supported.
-/// - The parameter type must be a generic type parameter bounded by [Parameter].
-/// - There must be only one such generic type parameter. Not zero and not more than one.
-/// - All fields that reference / depend on the parameter type are considered parameter fields.
-/// - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
-/// - Configurable `macro_parameter_lifetime` and `macro_parameter_type`.
-///
-/// # Coherence Note For `Box<T>`
-///
-/// We cannot currently provide `impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Box<V>` because it
-/// overlaps with the blanket leaf implementation `impl<P: Parameter> Parameterized<P> for P`. Since `Box` is a
-/// fundamental type, downstream crates may implement [`Parameter`] for `Box<LocalType>`, and the generic `Box` impl
-/// then becomes non-coherent under Rust's orphan/coherence rules.
-///
-/// # Ordering Invariant
-///
-/// Implementations must preserve leaf order consistently across traversal and reconstruction. In other words, reading
-/// parameters with [`parameters`](Self::parameters) and then rebuilding with [`from_parameters`](Self::from_parameters)
-/// must produce the original value.
 pub trait Parameterized<P: Parameter>: Sized {
     /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
     type Family: ParameterizedFamily<P, To = Self> + ParameterizedFamily<Placeholder, To = Self::ParameterStructure>;
