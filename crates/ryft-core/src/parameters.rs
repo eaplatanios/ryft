@@ -274,6 +274,53 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// );
 /// ```
 ///
+/// # Working with Parameterized Values
+///
+/// The more interesting part about [`Parameterized`] types is what they enable us to do. The following operations are
+/// fundamental to [`Parameterized`] types and are almost always involved when working with such types and values:
+///
+///  - **Flattening:** Given a parameterized value, _flattening_ consists of obtaining a flat iterator over the
+///    parameters that are contained in that value. These parameters may be arbitrarily nested in the value but we
+///    guarantee that they will always be returned in the same order. This is crucial in enabling the next operation,
+///    _unflattening_, which is the inverse of the flattening operation. This operation is exposed via the
+///    [`Self::parameters`], [`Self::parameters_mut`], and [`Self::into_parameters`] functions.
+///  - **Unflattening:** Given a [`Parameterized::ParameterStructure`] and an iterator over parameter values,
+///    _unflattening_ consists of constructing the fully structured [`Parameterized`] value that contains those
+///    parameters. The [`Parameterized::ParameterStructure`] is necessary in enabling this because _flattening_ is a
+///    lossy operation for certain types. For example, consider a tuple with two `Vec<P>` elements. After flattening
+///    we obtain a single iterator over parameters of type `P` without having any way of recovering the number of
+///    parameters that should go in the first vector versus the second. The [`Parameterized::ParameterStructure`] is
+///    used to provide that information and make recovery possible. An even more straightforward example is a value
+///    contains additional non-parameter information (e.g., consider a `(P, usize)` tuple). The unflattening operation
+///    is exposed via the [`Self::from_parameters`] function.
+///  - **Mapping:** Given a `Parameterized<P>` value, _mapping_ consists of using a function to map all the parameters
+///    nested in that value to new parameters of potentially different types yielding a `Parameterized<T>` value with
+///    the same structure. This is effectively a composition of _flattening_, _mapping_ the individual parameters, and
+///    _unflattening_ to obtain the final structured value. This operation is important in enabling things like tracing
+///    of functions that take parameterized data structures as inputs, whereby we can map all the nested parameters to
+///    tracer variables. It can also be used in a similar way to enable automatic differentiation, etc. It is a
+///    fundamental component of how the core features of Ryft are implemented. This operation is exposed via the
+///    [`Self::map_parameters`] function.
+///
+/// Note that these core operations are also supported with _named_ parameters, where each parameter is paired with a
+/// [`ParameterPath`] specifying where in the nested data structure it belongs. This is useful for things like saving
+/// model checkpoints, etc. These _named_ parameter operation variants are exposed via the [`Self::named_parameters`],
+/// [`Self::named_parameters_mut`], [`Self::into_named_parameters`], [`Self::from_named_parameters`],
+/// [`Self::from_broadcasted_named_parameters`], [`Self::map_named_parameters`], and [`Self::map_named_parameters`]
+/// functions.
+///
+/// TODO(eaplatanios): Talk about our manipulation helpers a bit here but point to their docstrings for details.
+///  - [`Self::partition_parameters`]
+///  - [`Self::filter_parameters`]
+///  - [`Self::combine_optional_parameters`]
+///  - [`Self::replace_parameters`]
+///  - [`Self::apply_parameter_updates_with`]
+///  - [`Self::apply_parameter_updates`]
+///  - [`Self::tree_at_paths`]
+///  - [`Self::tree_at`]
+///
+/// TODO(eaplatanios): Add examples.
+///
 /// # Custom Types
 ///
 /// TODO(eaplatanios): Introduce section about the derive macro and include examples.
@@ -286,16 +333,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///  - All fields that reference / depend on the parameter type are considered parameter fields.
 ///  - Attributes of generic parameters are not visited/transformed and they are always carried around as they are.
 ///  - Configurable `macro_parameter_lifetime` and `macro_parameter_type`.
-///
-/// # Working with Parameterized Values
-///
-/// TODO(eaplatanios): Talk about our manipulation helpers a bit here but point to their docstrings for details.
-///
-/// # Parameter Ordering Invariance
-///
-/// [`Parameterized`] implementations must preserve the parameter order consistently across traversal and
-/// reconstruction. In other words, reading parameters with [`Self::parameters`] and then rebuilding with
-/// [`Self::from_parameters`] must result in the original value.
 ///
 ///
 ///
