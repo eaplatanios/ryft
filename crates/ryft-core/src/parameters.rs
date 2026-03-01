@@ -1023,13 +1023,18 @@ pub trait Parameterized<P: Parameter>: Sized {
         // TODO(eaplatanios): Is it easy to support broadcasting semantics in this function?
         let expected_paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
         let expected_count = expected_paths.len();
-        let mut value_parameters = values.into_iter().map(|value| value.into_parameters()).collect::<Vec<_>>();
+        let mut value_parameters = values.into_iter().map(|value| value.into_named_parameters()).collect::<Vec<_>>();
         let mut parameters = Vec::new();
+        let mut missing_paths = Vec::new();
         parameters.reserve_exact(expected_count);
         for path in expected_paths {
             let mut selected = None;
+            let mut has_missing_candidates = false;
             for iterator in &mut value_parameters {
-                let candidate = iterator.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
+                let Some((_, candidate)) = iterator.next() else {
+                    has_missing_candidates = true;
+                    continue;
+                };
                 // TODO(eaplatanios): Must check for equality when there are more non-None values and
                 //  return an error if ambiguous. The error should be called
                 //  `Error::AmbiguousParameterCombination { values: Vec<...> }`.
@@ -1037,18 +1042,28 @@ pub trait Parameterized<P: Parameter>: Sized {
                     selected = candidate;
                 }
             }
-            // TODO(eaplatanios): We should be collecting all missing paths and returning them after the loop if
-            //  non-empty similar to what we are doing in `Self::from_named_parameters`.
-            let parameter = selected
-                .ok_or_else(|| Error::MissingParameters { expected_count, paths: Some(vec![path.to_string()]) })?;
-            parameters.push(parameter);
+            if has_missing_candidates {
+                missing_paths.push(path.to_string());
+            } else if let Some(parameter) = selected {
+                parameters.push(parameter);
+            } else {
+                missing_paths.push(path.to_string());
+            }
         }
-        // TODO(eaplatanios): We should be collecting paths for unused parameters and including them in the resulting
-        //  `Error::UnusedParameters` error similar to what we are doing in `Self::from_named_parameters`.
-        if value_parameters.iter_mut().any(|iterator| iterator.next().is_some()) {
-            return Err(Error::UnusedParameters { paths: None });
+
+        let mut unused_paths = value_parameters
+            .iter_mut()
+            .flat_map(|iterator| iterator.map(|(path, _)| path.to_string()))
+            .collect::<Vec<_>>();
+
+        if !missing_paths.is_empty() {
+            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+        } else if !unused_paths.is_empty() {
+            unused_paths.sort_unstable();
+            Err(Error::UnusedParameters { paths: Some(unused_paths) })
+        } else {
+            Self::from_parameters(structure, parameters)
         }
-        Self::from_parameters(structure, parameters)
     }
 
     /// Replaces parameters using an optional replacement tree.
@@ -2711,6 +2726,46 @@ mod tests {
         assert_eq!(
             combined,
             Err(Error::MissingParameters { expected_count: 2, paths: Some(vec!["$[0].1".to_string()]) }),
+        );
+    }
+
+    #[test]
+    fn test_combine_optional_parameters_reports_all_missing_paths() {
+        let structure = vec![(Placeholder, Placeholder)];
+        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![vec![(None, None)]]);
+        assert_eq!(
+            combined,
+            Err(Error::MissingParameters {
+                expected_count: 2,
+                paths: Some(vec!["$[0].0".to_string(), "$[0].1".to_string()]),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_combine_optional_parameters_reports_missing_paths_for_short_tree() {
+        let structure = vec![(Placeholder, Placeholder), (Placeholder, Placeholder)];
+        let combined =
+            <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![vec![(Some(10), Some(20))]]);
+        assert_eq!(
+            combined,
+            Err(Error::MissingParameters {
+                expected_count: 4,
+                paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_combine_optional_parameters_reports_unused_paths() {
+        let structure = vec![(Placeholder, Placeholder)];
+        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
+            structure,
+            vec![vec![(Some(10), Some(20)), (Some(30), Some(40))]],
+        );
+        assert_eq!(
+            combined,
+            Err(Error::UnusedParameters { paths: Some(vec!["$[1].0".to_string(), "$[1].1".to_string()]) }),
         );
     }
 
