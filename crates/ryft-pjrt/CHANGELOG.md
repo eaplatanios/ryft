@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Updated PJRT API constants and structs for version `0.93`, including adding the new `PJRT_Device_GetAttributes`.
 - Updated the layouts extension bindings to version `4` and added support for executable parameter layout queries.
+- Updated the FFI extension bindings to version `3` and added support for setting and getting the execution context
+  for specific execution stages.
 
 ## [0.0.1] - 2026-02-22
 

@@ -13,10 +13,12 @@
 ///
 ///   - `$api`: API instance that provides access to PJRT C API function pointers. The type that this expression
 ///     evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
-///     either an [`Api`](crate::Api) instance itself or a PJRT extension instance. Note that you can also optionally
-///     use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
-///     API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
-///     PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
+///     either an [`Api`](crate::Api) instance itself. Note that you can also optionally use the `@extension` keyword
+///     prefix followed by the extension type and `=>` if you want to call a PJRT extension function `$fn`. For example,
+///     `@extension ffi::PJRT_Layouts_Extension => extension` would treat `extension` as a PJRT extension instance with
+///     a `to_c_api()` function that returns a C API extension struct of type `ffi::PJRT_Layouts_Extension`. Note that
+///     there is also a `@unchecked` prefix that is supported, but that is meant to be used internally by this macro
+///     for invoking a C API function without first checking that it exists.
 ///   - `$fn`: Name of the PJRT C API function to invoke (e.g., `PJRT_Client_Create`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond
 ///     to fields in the corresponding `<$fn>_Args` struct in the PJRT C API.
@@ -31,11 +33,37 @@ macro_rules! invoke_pjrt_api_fn_helper {
     ) => {
         paste::paste! {
             {
-                // TODO(eaplatanios): If there are any extensions that support this kind of checking,
-                //  we will need to figure out how to support them here.
                 let api_handle = unsafe { $api.to_c_api() };
                 let api_fn_offset = std::mem::offset_of!(crate::ffi::PJRT_Api, $fn);
                 let api_struct_size = unsafe { (*api_handle).struct_size } as usize;
+                if api_struct_size <= api_fn_offset {
+                    Err(crate::errors::Error::unimplemented(format!(
+                        "`{}` is not available in the loaded PJRT plugin (version {})",
+                        stringify!($fn).to_owned(),
+                        $api.api().version(),
+                    )))
+                } else {
+                    $crate::invoke_pjrt_api_fn_helper!(
+                        @unchecked $api,
+                        $fn,
+                        { $($input_name = $input_value),* },
+                        { $($output_name),* },
+                    )
+                }
+            }
+        }
+    };
+    (
+        @extension $api_ty:ty => $api:expr,
+        $fn:ident,
+        { $($input_name:ident = $input_value:expr),* $(,)? },
+        { $($output_name:ident),* $(,)? } $(,)?
+    ) => {
+        paste::paste! {
+            {
+                let api_handle = unsafe { $api.to_c_api() };
+                let api_fn_offset = std::mem::offset_of!($api_ty, $fn);
+                let api_struct_size = unsafe { (*api_handle).base.struct_size } as usize;
                 if api_struct_size <= api_fn_offset {
                     Err(crate::errors::Error::unimplemented(format!(
                         "`{}` is not available in the loaded PJRT plugin (version {})",
@@ -89,10 +117,10 @@ macro_rules! invoke_pjrt_api_fn_helper {
 ///
 ///   - `$api`: API instance that provides access to PJRT C API function pointers. The type that this expression
 ///     evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
-///     either an [`Api`](crate::Api) instance itself or a PJRT extension instance.Note that you can also optionally
-///     use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
-///     API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
-///     PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
+///     either an [`Api`](crate::Api) instance itself. Note that you can also optionally use the `@extension` keyword
+///     prefix followed by the extension type and `=>` if you want to call a PJRT extension function `$fn`. For example,
+///     `@extension ffi::PJRT_Layouts_Extension => extension` would treat `extension` as a PJRT extension instance with
+///     a `to_c_api()` function that returns a C API extension struct of type `ffi::PJRT_Layouts_Extension`.
 ///   - `$fn`: Name of the PJRT C API function to invoke (e.g., `PJRT_Client_Create`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond
 ///     to fields in the corresponding `<$fn>_Args` struct in the PJRT C API.
@@ -100,36 +128,36 @@ macro_rules! invoke_pjrt_api_fn_helper {
 ///     PJRT C API function invocation.
 macro_rules! invoke_pjrt_api_void_fn {
     (
-        $(@$unchecked:tt)? $api:expr,
+        $(@$extension:tt $api_ty:ty =>)? $api:expr,
         $fn:ident $(,)?
     ) => {
         $crate::invoke_pjrt_api_void_fn!(
-            $(@$unchecked)? $api,
+            $(@$extension $api_ty =>)? $api,
             $fn,
             {},
             {},
         )
     };
     (
-        $(@$unchecked:tt)? $api:expr,
+        $(@$extension:tt $api_ty:ty =>)? $api:expr,
         $fn:ident,
         { $($input_name:ident = $input_value:expr),* $(,)? } $(,)?
     ) => {
         $crate::invoke_pjrt_api_void_fn!(
-            $(@$unchecked)? $api,
+            $(@$extension $api_ty =>)? $api,
             $fn,
             { $($input_name = $input_value),* },
             {},
         )
     };
     (
-        $(@$unchecked:tt)? $api:expr,
+        $(@$extension:tt $api_ty:ty =>)? $api:expr,
         $fn:ident,
         { $($input_name:ident = $input_value:expr),* $(,)? },
         { $($output_name:ident),* $(,)? } $(,)?
     ) => {
         $crate::invoke_pjrt_api_fn_helper!(
-            $(@$unchecked)? $api,
+            $(@$extension $api_ty =>)? $api,
             $fn,
             { $($input_name = $input_value),* },
             { $($output_name),* },
@@ -147,10 +175,10 @@ macro_rules! invoke_pjrt_api_void_fn {
 ///
 ///   - `$api`: API instance that provides access to PJRT C API function pointers. The type that this expression
 ///     evaluates to must provide an `api()` function that returns an [`Api`](crate::Api) instance. This is typically
-///     either an [`Api`](crate::Api) instance itself or a PJRT extension instance. Note that you can also optionally
-///     use the `@unchecked` keyword prefix if you want to skip checking that `$fn` exists based on the underlying PJRT
-///     API struct size. This check is based on how PJRT handles versioning, though it is not currently supported for
-///     PJRT extensions and that is why we support the optional `@unchecked` keyword prefix.
+///     either an [`Api`](crate::Api) instance itself. Note that you can also optionally use the `@extension` keyword
+///     prefix followed by the extension type and `=>` if you want to call a PJRT extension function `$fn`. For example,
+///     `@extension ffi::PJRT_Layouts_Extension => extension` would treat `extension` as a PJRT extension instance with
+///     a `to_c_api()` function that returns a C API extension struct of type `ffi::PJRT_Layouts_Extension`.
 ///   - `$fn`: Name of the PJRT C API function to invoke (e.g., `PJRT_Client_Create`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond
 ///     to fields in the corresponding `<$fn>_Args` struct in the PJRT C API.
@@ -158,36 +186,36 @@ macro_rules! invoke_pjrt_api_void_fn {
 ///     PJRT C API function invocation.
 macro_rules! invoke_pjrt_api_error_fn {
     (
-        $(@$unchecked:tt)? $api:expr,
+        $(@$extension:tt $api_ty:ty =>)? $api:expr,
         $fn:ident $(,)?
     ) => {
         $crate::invoke_pjrt_api_error_fn!(
-            $(@$unchecked)? $api,
+            $(@$extension $api_ty =>)? $api,
             $fn,
             {},
             {},
         )
     };
     (
-        $(@$unchecked:tt)? $api:expr,
+        $(@$extension:tt $api_ty:ty =>)? $api:expr,
         $fn:ident,
         { $($input_name:ident = $input_value:expr),* $(,)? } $(,)?
     ) => {
         $crate::invoke_pjrt_api_error_fn!(
-            $(@$unchecked)? $api,
+            $(@$extension $api_ty =>)? $api,
             $fn,
             { $($input_name = $input_value),* },
             {},
         )
     };
     (
-        $(@$unchecked:tt)? $api:expr,
+        $(@$extension:tt $api_ty:ty =>)? $api:expr,
         $fn:ident,
         { $($input_name:ident = $input_value:expr),* $(,)? },
         { $($output_name:ident),* $(,)? } $(,)?
     ) => {{
         $crate::invoke_pjrt_api_fn_helper!(
-            $(@$unchecked)? $api,
+            $(@$extension $api_ty =>)? $api,
             $fn,
             { $($input_name = $input_value),* },
             { $($output_name),* },
@@ -373,9 +401,7 @@ macro_rules! invoke_distributed_api_error_fn {
 ///
 ///   - `$api`: XLA FFI API instance that provides access to XLA FFI API function pointers.
 ///     The type that this expression evaluates to must provide an `api()` function that returns
-///     an [`FfiApi`](crate::extensions::ffi::FfiApi) instance. Note that you can also optionally use the `@unchecked`
-///     keyword prefix if you want to skip checking that `$fn` exists based on the underlying XLA FFI API struct size.
-///     This check is based on how XLA FFI handles versioning.
+///     an [`FfiApi`](crate::extensions::ffi::FfiApi) instance.
 ///   - `$fn`: Name of the XLA FFI API function to invoke (e.g., `XLA_FFI_Type_Register`).
 ///   - `$input_name = $input_value`: Zero or more input argument assignments that correspond
 ///     to fields in the corresponding `<$fn>_Args` struct in the XLA FFI API.
@@ -400,38 +426,25 @@ macro_rules! invoke_xla_ffi_api_fn_helper {
                         $api.version(),
                     )))
                 } else {
-                    $crate::invoke_xla_ffi_api_fn_helper!(
-                        @unchecked $api,
-                        $fn,
-                        { $($input_name = $input_value),* },
-                        { $($output_name),* },
-                    )
-                }
-            }
-        }
-    };
-    (
-        @unchecked $api:expr,
-        $fn:ident,
-        { $($input_name:ident = $input_value:expr),* $(,)? },
-        { $($output_name:ident),* $(,)? } $(,)?
-    ) => {
-        paste::paste! {
-            unsafe {
-                let api_fn = (*$api.to_c_api()).$fn.ok_or_else(|| crate::extensions::ffi::FfiError::unimplemented(
-                    format!(
-                        "`{}` is not implemented in the loaded XLA FFI API (version {})",
-                        stringify!($fn).to_owned(),
-                        $api.version(),
-                    ),
-                ));
-                match api_fn {
-                    Ok(api_fn) => {
-                        let mut args = [<$fn _Args>]::new($($input_value),*);
-                        let error = api_fn(&mut args as *mut _);
-                        Ok((($(args.$output_name),*), error))
-                    },
-                    Err(error) => Err(error),
+                    unsafe {
+                        let api_fn = (*$api.to_c_api()).$fn.ok_or_else(|| {
+                            crate::extensions::ffi::FfiError::unimplemented(
+                                format!(
+                                    "`{}` is not implemented in the loaded XLA FFI API (version {})",
+                                    stringify!($fn).to_owned(),
+                                    $api.version(),
+                                ),
+                            )
+                        });
+                        match api_fn {
+                            Ok(api_fn) => {
+                                let mut args = [<$fn _Args>]::new($($input_value),*);
+                                let error = api_fn(&mut args as *mut _);
+                                Ok((($(args.$output_name),*), error))
+                            },
+                            Err(error) => Err(error),
+                        }
+                    }
                 }
             }
         }

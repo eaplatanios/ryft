@@ -176,7 +176,7 @@ impl Api {
         let module = module.as_ref();
         let architecture = architecture.as_ref().as_bytes();
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Triton_Extension => extension,
             PJRT_Triton_Compile,
             {
                 module = module.as_ptr() as *const _,

@@ -2,7 +2,7 @@ use std::hash::{Hash, Hasher};
 
 use prost::Message;
 
-use crate::{invoke_pjrt_api_error_fn, slice_from_c_api, Api, Client, Error, Executable, Plugin};
+use crate::{Api, Client, Error, Executable, Plugin, invoke_pjrt_api_error_fn, slice_from_c_api};
 
 /// The PJRT ABI version extension provides capabilities for querying runtime and executable ABI versions and checking
 /// compatibility between them. The extension is optional for PJRT [`Plugin`]s and _experimental_, meaning that
@@ -53,7 +53,7 @@ impl Executable {
         use ffi::PJRT_Executable_GetAbiVersion_Args;
         let extension = self.api().abi_version_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_AbiVersion_Extension => extension,
             PJRT_Executable_GetAbiVersion,
             { executable = self.to_c_api() },
             { abi_version },
@@ -74,7 +74,7 @@ impl Client<'_> {
         use ffi::PJRT_Client_RuntimeAbiVersion_Args;
         let extension = self.abi_version_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_AbiVersion_Extension => extension,
             PJRT_Client_RuntimeAbiVersion,
             { client = self.to_c_api() },
             { abi_version },
@@ -177,8 +177,7 @@ impl Api {
         &self,
         abi_version: crate::protos::RuntimeAbiVersion,
     ) -> Result<RuntimeAbiVersion, Error> {
-        let serialized_abi_version = SerializedAbiVersion::from_proto(abi_version);
-        self.deserialize_runtime_abi_version(&serialized_abi_version)
+        self.deserialize_runtime_abi_version(&SerializedAbiVersion::from_proto(abi_version))
     }
 
     /// Deserializes a [`RuntimeAbiVersion`] from the provided serialized ABI version.
@@ -190,7 +189,7 @@ impl Api {
         let extension = self.abi_version_extension()?;
         let data = serialized_abi_version.data();
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_AbiVersion_Extension => extension,
             PJRT_RuntimeAbiVersion_FromProto,
             {
                 serialized_proto = data.as_ptr() as *const _,
@@ -206,8 +205,7 @@ impl Api {
         &self,
         abi_version: crate::protos::ExecutableAbiVersion,
     ) -> Result<ExecutableAbiVersion, Error> {
-        let serialized_abi_version = SerializedAbiVersion::from_proto(abi_version);
-        self.deserialize_executable_abi_version(&serialized_abi_version)
+        self.deserialize_executable_abi_version(&SerializedAbiVersion::from_proto(abi_version))
     }
 
     /// Deserializes an [`ExecutableAbiVersion`] from the provided serialized ABI version.
@@ -219,7 +217,7 @@ impl Api {
         let extension = self.abi_version_extension()?;
         let data = serialized_abi_version.data();
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_AbiVersion_Extension => extension,
             PJRT_ExecutableAbiVersion_FromProto,
             {
                 serialized_proto = data.as_ptr() as *const _,
@@ -264,7 +262,7 @@ impl RuntimeAbiVersion {
     pub fn platform_id(&self) -> Result<u64, Error> {
         use ffi::PJRT_RuntimeAbiVersion_PlatformId_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_RuntimeAbiVersion_PlatformId,
             { abi_version = self.to_c_api() },
             { platform_id },
@@ -275,7 +273,7 @@ impl RuntimeAbiVersion {
     pub fn is_compatible_with_runtime(&self, abi_version: &RuntimeAbiVersion) -> Result<(), Error> {
         use ffi::PJRT_RuntimeAbiVersion_IsCompatibleWithRuntime_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_RuntimeAbiVersion_IsCompatibleWithRuntime,
             {
                 abi_version = self.to_c_api(),
@@ -288,7 +286,7 @@ impl RuntimeAbiVersion {
     pub fn is_compatible_with_executable(&self, abi_version: &ExecutableAbiVersion) -> Result<(), Error> {
         use ffi::PJRT_RuntimeAbiVersion_IsCompatibleWithExecutable_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_RuntimeAbiVersion_IsCompatibleWithExecutable,
             {
                 abi_version = self.to_c_api(),
@@ -306,7 +304,7 @@ impl RuntimeAbiVersion {
     pub fn serialize(&self) -> Result<SerializedAbiVersion, Error> {
         use ffi::PJRT_RuntimeAbiVersion_ToProto_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_RuntimeAbiVersion_ToProto,
             { abi_version = self.to_c_api() },
             { serialized_proto, serialized_proto_size, serialized_proto_holder, serialized_proto_deleter },
@@ -329,7 +327,7 @@ impl Drop for RuntimeAbiVersion {
     fn drop(&mut self) {
         use ffi::PJRT_RuntimeAbiVersion_Destroy_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_RuntimeAbiVersion_Destroy,
             { abi_version = self.to_c_api() },
         )
@@ -370,7 +368,7 @@ impl ExecutableAbiVersion {
     pub fn platform_id(&self) -> Result<u64, Error> {
         use ffi::PJRT_ExecutableAbiVersion_PlatformId_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_ExecutableAbiVersion_PlatformId,
             { abi_version = self.to_c_api() },
             { platform_id },
@@ -386,7 +384,7 @@ impl ExecutableAbiVersion {
     pub fn serialize(&self) -> Result<SerializedAbiVersion, Error> {
         use ffi::PJRT_ExecutableAbiVersion_ToProto_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_ExecutableAbiVersion_ToProto,
             { abi_version = self.to_c_api() },
             { serialized_proto, serialized_proto_size, serialized_proto_holder, serialized_proto_deleter },
@@ -409,7 +407,7 @@ impl Drop for ExecutableAbiVersion {
     fn drop(&mut self) {
         use ffi::PJRT_ExecutableAbiVersion_Destroy_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_AbiVersion_Extension => self.extension,
             PJRT_ExecutableAbiVersion_Destroy,
             { abi_version = self.to_c_api() },
         )
@@ -419,7 +417,10 @@ impl Drop for ExecutableAbiVersion {
 
 /// Serialized [`RuntimeAbiVersion`] or [`ExecutableAbiVersion`].
 pub struct SerializedAbiVersion {
-    /// Handle that represents this [`SerializedAbiVersion`] in the PJRT C API.
+    /// Opaque data handle that represents data associated with this [`SerializedAbiVersion`].
+    /// Note that this handle should _never_ be passed to PJRT C API functions. It should only be obtained from such
+    /// functions. That is because it does not have a contract for the underlying memory layout and may also be
+    /// constructed by Rust code (e.g., in [`SerializedAbiVersion::from_proto`]).
     handle: *mut ffi::PJRT_SerializedProto,
 
     /// Optional function that must be called to free the underlying memory when dropping this instance.
@@ -433,14 +434,9 @@ pub struct SerializedAbiVersion {
 }
 
 impl SerializedAbiVersion {
-    /// Returns a pointer to the underlying bytes of this [`SerializedAbiVersion`].
-    pub fn data(&self) -> &[u8] {
-        unsafe { slice_from_c_api(self.data as *const _, self.data_size) }
-    }
-
     /// Constructs a [`SerializedAbiVersion`] from the provided ABI version Protobuf message.
     fn from_proto<M: Message>(abi_version: M) -> Self {
-        unsafe extern "C" fn delete_boxed_data(handle: *mut ffi::PJRT_SerializedProto) {
+        unsafe extern "C" fn delete(handle: *mut ffi::PJRT_SerializedProto) {
             if !handle.is_null() {
                 unsafe { drop(Box::from_raw(handle as *mut Vec<u8>)) };
             }
@@ -450,8 +446,12 @@ impl SerializedAbiVersion {
         let data = serialized_abi_version.as_ptr() as *const std::ffi::c_char;
         let data_size = serialized_abi_version.len();
         let handle = Box::into_raw(serialized_abi_version) as *mut ffi::PJRT_SerializedProto;
+        Self { handle, deleter: Some(delete), data, data_size }
+    }
 
-        Self { handle, deleter: Some(delete_boxed_data), data, data_size }
+    /// Returns a pointer to the underlying bytes of this [`SerializedAbiVersion`].
+    pub fn data(&self) -> &[u8] {
+        unsafe { slice_from_c_api(self.data as *const _, self.data_size) }
     }
 
     /// Returns the Protobuf message that corresponds to this [`SerializedAbiVersion`].

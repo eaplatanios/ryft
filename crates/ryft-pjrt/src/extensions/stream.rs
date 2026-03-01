@@ -86,7 +86,7 @@ impl Device<'_> {
         use ffi::PJRT_Get_Stream_For_External_Ready_Events_Args;
         let extension = self.api().stream_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Stream_Extension => extension,
             PJRT_Get_Stream_For_External_Ready_Events,
             { device = self.to_c_api() },
             { stream },
@@ -101,7 +101,7 @@ impl Buffer<'_> {
         use ffi::PJRT_Wait_Until_Buffer_Ready_On_Stream_Args;
         let extension = self.api().stream_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Stream_Extension => extension,
             PJRT_Wait_Until_Buffer_Ready_On_Stream,
             {
                 stream = stream,

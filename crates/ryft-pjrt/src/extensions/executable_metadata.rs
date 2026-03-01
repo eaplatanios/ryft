@@ -88,7 +88,7 @@ impl Executable {
         use ffi::PJRT_ExecutableMetadata_GetExecutableMetadata_Args;
         let extension = self.api().executable_metadata_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_ExecutableMetadata_Extension => extension,
             PJRT_ExecutableMetadata_GetExecutableMetadata,
             { executable = self.to_c_api() },
             { metadata },
@@ -103,7 +103,7 @@ impl Executable {
                     ))
                 });
             let _ = invoke_pjrt_api_void_fn!(
-                @unchecked extension,
+                @extension ffi::PJRT_ExecutableMetadata_Extension => extension,
                 PJRT_ExecutableMetadata_DestroySerializedMetadata,
                 { metadata = metadata },
             );

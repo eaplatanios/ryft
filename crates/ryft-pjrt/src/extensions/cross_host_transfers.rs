@@ -123,7 +123,7 @@ impl Buffer<'_> {
         let callback_state = Box::into_raw(callback_state);
 
         let result = invoke_pjrt_api_void_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_CrossHostTransfers_Extension => extension,
             PJRT_Transfers_PJRT_Buffer_CopyToRemoteDevice,
             {
                 buffer = self.to_c_api(),
@@ -199,7 +199,7 @@ impl Client<'_> {
 
         let extension = self.api().cross_host_transfers_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_CrossHostTransfers_Extension => extension,
             PJRT_Transfers_PJRT_Client_CrossHostSendBuffers,
             {
                 client = self.to_c_api(),
@@ -274,7 +274,7 @@ impl Client<'_> {
 
         let extension = self.api().cross_host_transfers_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_CrossHostTransfers_Extension => extension,
             PJRT_Transfers_PJRT_Client_CrossHostReceiveBuffers,
             {
                 client = self.to_c_api(),
@@ -445,7 +445,7 @@ impl Client<'_> {
 
         let extension = self.api().cross_host_transfers_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_CrossHostTransfers_Extension => extension,
             PJRT_Transfers_PJRT_Client_MakeCrossHostReceiveBuffers,
             {
                 client = self.to_c_api(),

@@ -139,9 +139,9 @@ impl Layout<'_> {
     pub fn serialize(&self) -> Result<SerializedLayout, Error> {
         use ffi::PJRT_Layouts_MemoryLayout_Serialize_Args;
         invoke_pjrt_api_error_fn!(
-            @unchecked self.extension,
+            @extension ffi::PJRT_Layouts_Extension => self.extension,
             PJRT_Layouts_MemoryLayout_Serialize,
-            { topology = self.to_c_api() },
+            { layout = self.to_c_api() },
             { serialized_bytes, serialized_bytes_size, serialized_layout, serialized_layout_deleter },
         )
         .map(|(serialized_bytes, serialized_bytes_size, serialized_layout, serialized_layout_deleter)| {
@@ -183,7 +183,7 @@ impl Drop for Layout<'_> {
         if !self.is_borrowed {
             use ffi::PJRT_Layouts_MemoryLayout_Destroy_Args;
             invoke_pjrt_api_error_fn!(
-                @unchecked self.extension,
+                @extension ffi::PJRT_Layouts_Extension => self.extension,
                 PJRT_Layouts_MemoryLayout_Destroy,
                 { layout = self.to_c_api() },
             )
@@ -203,7 +203,7 @@ impl<'s> Client<'s> {
         use ffi::PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args;
         let extension = self.layouts_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Layouts_Extension => extension,
             PJRT_Layouts_PJRT_Client_GetDefaultLayout,
             {
                 client = self.to_c_api(),
@@ -228,7 +228,7 @@ impl<'o> Topology<'o> {
         use ffi::PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args;
         let extension = self.api().layouts_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Layouts_Extension => extension,
             PJRT_Layouts_PJRT_Topology_GetDefaultLayout,
             {
                 topology_description = self.to_c_api(),
@@ -248,7 +248,7 @@ impl Executable {
         use ffi::PJRT_Layouts_PJRT_Executable_GetParameterLayouts_Args;
         let extension = self.api().layouts_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Layouts_Extension => extension,
             PJRT_Layouts_PJRT_Executable_GetParameterLayouts,
             { executable = self.to_c_api() },
             { num_parameters, layouts },
@@ -267,7 +267,7 @@ impl Executable {
         use ffi::PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args;
         let extension = self.api().layouts_extension()?;
         invoke_pjrt_api_error_fn!(
-            @unchecked extension,
+            @extension ffi::PJRT_Layouts_Extension => extension,
             PJRT_Layouts_PJRT_Executable_GetOutputLayouts,
             { executable = self.to_c_api() },
             { num_outputs, layouts },
@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executable_output_layouts() {
+    fn test_executable_layouts() {
         let client = test_cpu_client();
         let program = Program::Mlir {
             bytecode: indoc! {"
