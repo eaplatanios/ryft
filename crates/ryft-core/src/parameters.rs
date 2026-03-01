@@ -672,21 +672,103 @@ pub trait Parameterized<P: Parameter>: Sized {
         structure: Self::ParameterStructure,
         parameters: I,
     ) -> Result<Self, Error> {
-        // TODO(eaplatanios): Is performance a concern here where we are collecting into a [`HashMap`]?
-        let mut parameters = parameters.into_iter().collect::<HashMap<_, _>>();
+        // We try to consume parameters in lockstep with `structure.named_parameters()` first. If we encounter any
+        // out-of-order parameters, we lazily materialize the remaining entries into a hash map and continue with
+        // keyed lookups.
         let expected_count = structure.parameter_count();
         let mut values = Vec::new();
         values.reserve_exact(expected_count);
+        let mut matching_paths = Vec::new();
+        matching_paths.reserve_exact(expected_count);
         let mut missing_paths = Vec::new();
+        let mut deferred_parameters = None::<HashMap<_, _>>;
+        let mut matching_path_indices = None::<HashMap<ParameterPath, usize>>;
+        let mut parameters = parameters.into_iter();
+        let mut next_parameter = parameters.next();
+
         for (expected_path, _) in structure.named_parameters() {
-            match parameters.remove(&expected_path) {
-                Some(parameter) => values.push(parameter),
+            if let Some(deferred_parameters) = deferred_parameters.as_mut() {
+                // Once we fall back to deferred lookups, reconstruction is direct keyed removal
+                // for the remaining expected paths.
+                match deferred_parameters.remove(&expected_path) {
+                    Some(parameter) => values.push(parameter),
+                    None => missing_paths.push(expected_path.to_string()),
+                }
+                continue;
+            }
+
+            match next_parameter.take() {
+                Some((provided_path, parameter)) if provided_path == expected_path => {
+                    // As long as the provided parameter paths match the structure parameter paths that we are
+                    // iterating over, we just consume the provided parameters without materializing a hash map.
+                    values.push(parameter);
+                    matching_paths.push(expected_path);
+                    next_parameter = parameters.next();
+                }
+                Some((provided_path, parameter)) => {
+                    // Once there is a mismatch, we materialize the hash map and continue via keyed lookup.
+                    let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
+                    let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
+                        matching_paths
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .map(|(index, path)| (path, index))
+                            .collect::<HashMap<_, _>>()
+                    });
+
+                    // For duplicate parameter paths, the last provided value wins. Duplicates targeting
+                    // already matched paths update `values` in place; all others remain deferred.
+                    let parameters = std::iter::once((provided_path, parameter)).chain(parameters.by_ref());
+                    for (provided_path, parameter) in parameters {
+                        if let Some(index) = matching_path_indices.get(&provided_path).copied() {
+                            values[index] = parameter;
+                        } else {
+                            deferred.insert(provided_path, parameter);
+                        }
+                    }
+
+                    match deferred.remove(&expected_path) {
+                        Some(parameter) => values.push(parameter),
+                        None => missing_paths.push(expected_path.to_string()),
+                    }
+
+                    deferred_parameters = Some(deferred);
+                }
                 None => missing_paths.push(expected_path.to_string()),
             }
         }
+
+        if deferred_parameters.is_none() {
+            if let Some((provided_path, parameter)) = next_parameter.take() {
+                // No mismatch occurred during traversal, but additional parameters remain. We need to materialize
+                // the remaining parameters while still applying duplicate overrides for previously matched paths.
+                let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
+                let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
+                    matching_paths
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, path)| (path, index))
+                        .collect::<HashMap<_, _>>()
+                });
+
+                let parameters = std::iter::once((provided_path, parameter)).chain(parameters);
+                for (provided_path, parameter) in parameters {
+                    if let Some(index) = matching_path_indices.get(&provided_path).copied() {
+                        values[index] = parameter;
+                    } else {
+                        deferred.insert(provided_path, parameter);
+                    }
+                }
+
+                deferred_parameters = Some(deferred);
+            }
+        }
+
         if !missing_paths.is_empty() {
             Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
-        } else if !parameters.is_empty() {
+        } else if deferred_parameters.is_some_and(|deferred_parameters| !deferred_parameters.is_empty()) {
             Err(Error::UnusedParameters { paths: None })
         } else {
             Self::from_parameters(structure, values)
@@ -2991,6 +3073,45 @@ mod tests {
                 paths: Some(vec!["$[1]".to_string(), "$[2]".to_string()]),
             }),
         );
+    }
+
+    #[test]
+    fn test_from_named_parameters_accepts_ordered_named_iterator_for_vec() {
+        let value = vec![(1, 2), (3, 4)];
+        let named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
+        assert_eq!(
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_named_parameters(
+                value.parameter_structure(),
+                named_parameters
+            ),
+            Ok(value),
+        );
+    }
+
+    #[test]
+    fn test_from_named_parameters_accepts_out_of_order_named_iterator_for_vec() {
+        let value = vec![(1, 2), (3, 4)];
+        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
+        named_parameters.reverse();
+        assert_eq!(
+            <Vec<(i32, i32)> as Parameterized<i32>>::from_named_parameters(
+                value.parameter_structure(),
+                named_parameters
+            ),
+            Ok(value),
+        );
+    }
+
+    #[test]
+    fn test_from_named_parameters_uses_last_value_for_duplicate_paths() {
+        let structure = vec![Placeholder, Placeholder];
+        let path_0 = ParameterPath::root().with_segment(ParameterPathSegment::Index(0));
+        let path_1 = ParameterPath::root().with_segment(ParameterPathSegment::Index(1));
+        let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(
+            structure,
+            vec![(path_0.clone(), 1), (path_1, 2), (path_0, 7)],
+        );
+        assert_eq!(result, Ok(vec![7, 2]));
     }
 
     #[test]
