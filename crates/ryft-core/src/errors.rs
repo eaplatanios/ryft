@@ -29,6 +29,12 @@ pub enum Error {
     )]
     MissingParameters { expected_count: usize, paths: Option<Vec<String>> },
 
+    #[error(
+        "got ambiguous parameter values while combining parameterized values; conflicting values: {}",
+        values.iter().map(|value| format!("'{value}'")).collect::<Vec<_>>().join(", "),
+    )]
+    AmbiguousParameterCombination { values: Vec<String> },
+
     #[error("unknown parameter path '{path}'")]
     UnknownParameterPath { path: String },
 

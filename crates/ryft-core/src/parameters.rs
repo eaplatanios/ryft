@@ -15,7 +15,7 @@ pub trait SameAs<T> {}
 
 impl<T> SameAs<T> for T {}
 
-/// Marker trait for leaf parameter values in a [`Parameterized`] tree. This trait is intentionally empty. A type
+/// Marker trait for leaf parameter values in a [`Parameterized`] type. This trait is intentionally empty. A type
 /// implementing [`Parameter`] is treated as an _indivisible leaf_ by [`Parameterized`] traversals. The reason we
 /// need this trait in the first place is so that we can distinguish between leaf and container behavior in blanket
 /// implementations. For example, `Vec<V>` implements `Parameterized<P>` when `V: Parameterized<P>`. Therefore,
@@ -46,10 +46,10 @@ impl Parameter for usize {}
 
 impl<P: Parameter> Parameter for Option<P> {}
 
-/// Placeholder leaf type for [`Parameterized`] trees that is used represent [`Parameterized::parameter_structure`].
-/// That is, it is used to replace every nested parameter in a [`Parameterized`] type yielding a _structure-only_
-/// representation that can later be used with [`Parameterized::from_parameters`] to instantiate a [`Parameterized`]
-/// value with the same shape but different types of parameters.
+/// Placeholder [`Parameter`] type for [`Parameterized`] types that is used represent
+/// [`Parameterized::parameter_structure`]. That is, it is used to replace every nested parameter in a [`Parameterized`]
+/// type yielding a _structure-only_ representation that can later be used with [`Parameterized::from_parameters`] to
+/// instantiate a [`Parameterized`] value with the same shape but different types of parameters.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Placeholder;
 
@@ -878,7 +878,7 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn`, which receives the
     /// [`ParameterPath`] for each [`Parameter`] along with its value, and returns a new [`Parameter`] value of type
-    /// `T`, while preserving the [`Parameterized`] tree structure of this type. Nested parameters are visited in the
+    /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the
     /// same order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`],
     /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
     fn map_named_parameters<T: Parameter, F: FnMut(&ParameterPath, P) -> T>(
@@ -985,10 +985,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Combines multiple structure-aligned `Parameterized<Option<P>>` values into a single `Parameterized<P>` value,
     /// using left-to-right precedence at each parameter location. That is, for each leaf [`ParameterPath`] in
     /// `structure`, this function selects the first [`Some`] value from `values` and uses it for the corresponding
-    /// location in the resulting [`Parameterized`] value that the function returns. If no [`Some`] value is found for
-    /// some leaf [`ParameterPath`], then this function will return a [`Error::MissingParameters`] error. Furthermore,
-    /// if any of the provided `values` contains additional [`Parameter`]s, beyond those that correspond to ones in
-    /// `structure`, then this function will return an [`Error::UnusedParameters`] error.
+    /// location in the resulting [`Parameterized`] value that the function returns. If multiple non-`None` values are
+    /// present for the same leaf, then they must all be equal, and otherwise this function returns an
+    /// [`Error::AmbiguousParameterCombination`] error. If no [`Some`] value is found for some leaf
+    /// [`ParameterPath`], then this function will return a [`Error::MissingParameters`] error. Furthermore, if any of
+    /// the provided `values` contains additional [`Parameter`]s, beyond those that correspond to ones in `structure`,
+    /// then this function will return an [`Error::UnusedParameters`] error.
     ///
     /// This function is typically used to reconstruct values from the results of calling [`Self::filter_parameters`]
     /// and [`Self::partition_parameters`]. It is inspired by
@@ -1018,6 +1020,7 @@ pub trait Parameterized<P: Parameter>: Sized {
         values: I,
     ) -> Result<Self, Error>
     where
+        P: PartialEq + Debug,
         Self::Family: ParameterizedFamily<Option<P>>,
     {
         // TODO(eaplatanios): Is it easy to support broadcasting semantics in this function?
@@ -1035,11 +1038,20 @@ pub trait Parameterized<P: Parameter>: Sized {
                     has_missing_candidates = true;
                     continue;
                 };
-                // TODO(eaplatanios): Must check for equality when there are more non-None values and
-                //  return an error if ambiguous. The error should be called
-                //  `Error::AmbiguousParameterCombination { values: Vec<...> }`.
-                if selected.is_none() {
-                    selected = candidate;
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                if let Some(value) = selected.as_ref() {
+                    if value != &candidate {
+                        // TODO(eaplatanios): It would probably be better to collect the full set of ambiguous values
+                        //  for the current path before returning. This might all look a lot simpler if we just collect
+                        //  those in a `Vec` first and then just raise an error if the `Vec` has length != 1.
+                        return Err(Error::AmbiguousParameterCombination {
+                            values: vec![format!("{value:?}"), format!("{candidate:?}")],
+                        });
+                    }
+                } else {
+                    selected = Some(candidate);
                 }
             }
             if has_missing_candidates {
@@ -1068,9 +1080,8 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Replaces parameters using an optional replacement tree.
     ///
-    /// This is a convenience operation built on top of [`Self::combine_parameters`]. Leaves with
-    /// `Some(value)` in `replacements` take precedence over existing leaf values in `self`, while `None` leaves
-    /// preserve the current value.
+    /// This operation merges `replacements` with `self` leaf-wise. Leaves with `Some(value)` in `replacements` take
+    /// precedence over existing leaf values in `self`, while `None` leaves preserve the current value.
     ///
     /// # Parameters
     ///
@@ -1099,8 +1110,20 @@ pub trait Parameterized<P: Parameter>: Sized {
         Self::Family: ParameterizedFamily<Option<P>>,
     {
         let structure = self.parameter_structure();
-        let current = self.map_parameters(Some)?;
-        Self::combine_parameters(structure, vec![replacements, current])
+        let expected_count = structure.parameter_count();
+        let mut parameters = self.into_parameters();
+        let mut replacements = replacements.into_parameters();
+        let mut replaced_parameters = Vec::new();
+        replaced_parameters.reserve_exact(expected_count);
+        for _ in 0..expected_count {
+            let parameter = parameters.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
+            let replacement = replacements.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
+            replaced_parameters.push(replacement.unwrap_or(parameter));
+        }
+        if parameters.next().is_some() || replacements.next().is_some() {
+            return Err(Error::UnusedParameters { paths: None });
+        }
+        Self::from_parameters(structure, replaced_parameters)
     }
 
     /// Applies optional updates leaf-wise using `update_fn(base, update)` whenever an update is present.
@@ -2709,13 +2732,26 @@ mod tests {
     }
 
     #[test]
-    fn test_combine_optional_parameters_leftmost_precedence() {
+    fn test_combine_optional_parameters_accepts_equal_non_none_values() {
+        let structure = vec![(Placeholder, Placeholder)];
+        let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
+            structure,
+            vec![vec![(Some(10), None)], vec![(Some(10), Some(30))]],
+        );
+        assert_eq!(combined, Ok(vec![(10, 30)]));
+    }
+
+    #[test]
+    fn test_combine_optional_parameters_reports_ambiguous_values() {
         let structure = vec![(Placeholder, Placeholder)];
         let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
             structure,
             vec![vec![(Some(10), None)], vec![(Some(20), Some(30))]],
         );
-        assert_eq!(combined, Ok(vec![(10, 30)]));
+        assert_eq!(
+            combined,
+            Err(Error::AmbiguousParameterCombination { values: vec!["10".to_string(), "20".to_string()] }),
+        );
     }
 
     #[test]
