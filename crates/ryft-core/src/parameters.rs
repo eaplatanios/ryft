@@ -2159,6 +2159,16 @@ mod tests {
 
     use super::{Parameter, ParameterPath, ParameterPathSegment, Parameterized, Placeholder};
 
+    // TODO(eaplatanios): `test_placeholder`: display, debug.
+    // TODO(eaplatanios): `test_parameter_path`: all functions, display, debug.
+    // TODO(eaplatanios): `test_parameterized`: all functions with an interesting nested type.
+    // TODO(eaplatanios): `test_parameterized_parameter`.
+    // TODO(eaplatanios): `test_parameterized_tuple`.
+    // TODO(eaplatanios): `test_parameterized_array`.
+    // TODO(eaplatanios): `test_parameterized_vec`.
+    // TODO(eaplatanios): `test_parameterized_hash_map`.
+    // TODO(eaplatanios): `test_parameterized_b_tree_map`.
+
     fn assert_roundtrip_parameterized<V>(value: V, expected_parameters: Vec<i32>)
     where
         V: Clone + Debug + PartialEq + Parameterized<i32>,
