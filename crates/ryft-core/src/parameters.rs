@@ -208,36 +208,53 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     and [`Self::into_named_parameters`].
 ///
 /// In the context of machine learning (ML), a [`Parameterized`] can contain model parameters (thus the name), dataset
-/// entries, reinforcement learning agent observations, etc.
+/// entries, reinforcement learning agent observations, etc. Ryft provides built-in [`Parameterized`] implementations
+/// for a wide range of container-like types, including but not limited to:
+///
+/// TODO(eaplatanios): List of supported types.
+///
+/// Furthermore, Ryft provides a convenient `#[derive(Parameterized)]` macro that can be used to automatically derive
+/// [`Parameterized`] implementations for custom types. Refer to the [`Custom Types`](#custom-types) section below for
+/// more information on that macro.
 ///
 /// The [`Parameterized`] type and the functionality it provides is inspired by
 /// [JAX PyTrees](https://docs.jax.dev/en/latest/pytrees.html#working-with-pytrees)
 /// and [Equinox's PyTree manipulation APIs](https://docs.kidger.site/equinox/api/manipulation/).
 ///
-/// ## Example
+/// ## Examples
+///
+/// The following are simple examples showing what [`Parameterized`] types are and how they are structured:
 ///
 /// ```rust
 /// # use std::collections::HashMap;
 /// # use ryft_core::parameters::Parameterized;
 ///
 /// // Simple tuple with 3 [`Parameter`]s.
-/// let value = (1i32, 2i32, 3i32);
+/// let value = (1, 2, 3);
 /// let parameters = value.parameters().collect::<Vec<_>>();
 /// assert_eq!(value.parameter_count(), parameters.len());
-/// assert_eq!(parameters, vec![&1i32, &2i32, &3i32]);
+/// assert_eq!(parameters, vec![&1, &2, &3]);
+/// // TODO(eaplatanios): Show the parameter structure.
 ///
 /// // Nested tuple structure with 3 [`Parameter`]s.
-/// let value = (1i32, (2i32, 3i32), ());
+/// let value = (1, (2, 3), ());
 /// let parameters = value.parameters().collect::<Vec<_>>();
 /// assert_eq!(value.parameter_count(), parameters.len());
-/// assert_eq!(parameters, vec![&1i32, &2i32, &3i32]);
+/// assert_eq!(parameters, vec![&1, &2, &3]);
+/// // TODO(eaplatanios): Show the parameter structure.
 ///
 /// // Nested map and tuple structure with 5 [`Parameter`]s.
-/// let value = (1i32, HashMap::from([("a", vec![2i32]), ("b", vec![3i32, 4i32])]), (5i32,));
+/// let value = (1, HashMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
 /// let parameters = value.parameters().collect::<Vec<_>>();
 /// assert_eq!(value.parameter_count(), parameters.len());
-/// assert_eq!(parameters, vec![&1i32, &2i32, &3i32, &4i32, &5i32]);
+/// assert_eq!(parameters, vec![&1, &2, &3, &4, &5]);
+/// // TODO(eaplatanios): Show the parameter structure.
 /// ```
+///
+/// # Custom Types
+///
+/// TODO(eaplatanios): Introduce section about the derive macro and include examples.
+///
 ///
 ///
 ///
