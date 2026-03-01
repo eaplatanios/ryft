@@ -2506,58 +2506,47 @@ mod tests {
 
     #[test]
     fn test_parameterized_tuple() {
-        let value = (0i32, 1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32, 9i32, 10i32, 11i32);
-        assert_eq!(value.parameter_count(), 12);
+        let value = (0i32, (1i32, 2i32), (3i32, (4i32, 5i32)), 6i32, ((7i32, 8i32), 9i32));
+        assert_eq!(value.parameter_count(), 10);
         assert_eq!(
             value.parameter_structure(),
             (
                 Placeholder,
+                (Placeholder, Placeholder),
+                (Placeholder, (Placeholder, Placeholder)),
                 Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
-                Placeholder,
+                ((Placeholder, Placeholder), Placeholder),
             ),
         );
-        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
             vec![
                 ("$.0".to_string(), 0),
-                ("$.1".to_string(), 1),
-                ("$.2".to_string(), 2),
-                ("$.3".to_string(), 3),
-                ("$.4".to_string(), 4),
-                ("$.5".to_string(), 5),
-                ("$.6".to_string(), 6),
-                ("$.7".to_string(), 7),
-                ("$.8".to_string(), 8),
-                ("$.9".to_string(), 9),
-                ("$.10".to_string(), 10),
-                ("$.11".to_string(), 11),
+                ("$.1.0".to_string(), 1),
+                ("$.1.1".to_string(), 2),
+                ("$.2.0".to_string(), 3),
+                ("$.2.1.0".to_string(), 4),
+                ("$.2.1.1".to_string(), 5),
+                ("$.3".to_string(), 6),
+                ("$.4.0.0".to_string(), 7),
+                ("$.4.0.1".to_string(), 8),
+                ("$.4.1".to_string(), 9),
             ],
         );
         assert_eq!(
             value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
             vec![
                 "$.0".to_string(),
-                "$.1".to_string(),
-                "$.2".to_string(),
+                "$.1.0".to_string(),
+                "$.1.1".to_string(),
+                "$.2.0".to_string(),
+                "$.2.1.0".to_string(),
+                "$.2.1.1".to_string(),
                 "$.3".to_string(),
-                "$.4".to_string(),
-                "$.5".to_string(),
-                "$.6".to_string(),
-                "$.7".to_string(),
-                "$.8".to_string(),
-                "$.9".to_string(),
-                "$.10".to_string(),
-                "$.11".to_string(),
+                "$.4.0.0".to_string(),
+                "$.4.0.1".to_string(),
+                "$.4.1".to_string(),
             ],
         );
     }
