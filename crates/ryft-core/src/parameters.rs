@@ -669,11 +669,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// will return an [`Error::MissingParameterPath`]. If extra paths remain after reconstruction, then it will return
     /// an [`Error::UnusedParameters`]. For fully worked examples, refer to the examples provided in the top-level
     /// documentation of the [`Parameterized`] trait.
-    fn from_named_parameters(
+    fn from_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
-        parameters: HashMap<ParameterPath, P>,
+        parameters: I,
     ) -> Result<Self, Error> {
-        let mut parameters = parameters;
+        // TODO(eaplatanios): Is performance a concern here where we are collecting into a [`HashMap`]?
+        let mut parameters = parameters.into_iter().collect::<HashMap<_, _>>();
         let expected_count = structure.parameter_count();
         let mut values = Vec::with_capacity(expected_count);
         for (expected_path, _) in structure.named_parameters() {
@@ -701,9 +702,9 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// `structure`, then it will return an [`Error::UnusedParameters`]. Note that since one prefix value may need to
     /// populate multiple leaves, this function requires `P: Clone`. For fully worked examples, refer to the examples
     /// provided in the top-level documentation of the [`Parameterized`] trait.
-    fn from_broadcasted_named_parameters(
+    fn from_broadcasted_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
-        parameters: HashMap<ParameterPath, P>,
+        parameters: I,
     ) -> Result<Self, Error>
     where
         P: Clone,
@@ -712,6 +713,7 @@ pub trait Parameterized<P: Parameter>: Sized {
         let mut path_prefixes = parameters.into_iter().map(|(path, value)| (path, value, 0usize)).collect::<Vec<_>>();
         let mut broadcasted_parameters = HashMap::with_capacity(paths.len());
         for path in paths {
+            // TODO(eaplatanios): Is performance a concern here with all these loops and searching?
             let selected_prefix_index = path_prefixes
                 .iter()
                 .enumerate()
@@ -723,13 +725,14 @@ pub trait Parameterized<P: Parameter>: Sized {
             broadcasted_parameters.insert(path, value.clone());
             *matched_count += 1;
         }
-        let unused_prefix_paths = path_prefixes
+        let mut unused_prefix_paths = path_prefixes
             .into_iter()
             .filter_map(|(path, _, matched_count)| if matched_count == 0 { Some(path.to_string()) } else { None })
             .collect::<Vec<_>>();
         if unused_prefix_paths.is_empty() {
             Self::from_named_parameters(structure, broadcasted_parameters)
         } else {
+            unused_prefix_paths.sort_unstable();
             Err(Error::UnusedParameters { paths: Some(unused_prefix_paths) })
         }
     }
@@ -3016,7 +3019,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(Error::UnusedParameters { paths: Some(vec!["$[2].0".to_string(), "$[1]".to_string()]) }),
+            Err(Error::UnusedParameters { paths: Some(vec!["$[1]".to_string(), "$[2].0".to_string()]) }),
         );
     }
 
