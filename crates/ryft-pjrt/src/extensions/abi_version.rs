@@ -440,7 +440,7 @@ impl SerializedAbiVersion {
 
     /// Constructs a [`SerializedAbiVersion`] from the provided ABI version Protobuf message.
     fn from_proto<M: Message>(abi_version: M) -> Self {
-        unsafe extern "C" fn delete_boxed_data(handle: *mut ffi::PJRT_SerializedProto) {
+        unsafe extern "C" fn delete(handle: *mut ffi::PJRT_SerializedProto) {
             if !handle.is_null() {
                 unsafe { drop(Box::from_raw(handle as *mut Vec<u8>)) };
             }
@@ -450,7 +450,7 @@ impl SerializedAbiVersion {
         let data = serialized_abi_version.as_ptr() as *const std::ffi::c_char;
         let data_size = serialized_abi_version.len();
         let handle = Box::into_raw(serialized_abi_version) as *mut ffi::PJRT_SerializedProto;
-        Self { handle, deleter: Some(delete_boxed_data), data, data_size }
+        Self { handle, deleter: Some(delete), data, data_size }
     }
 
     /// Returns the Protobuf message that corresponds to this [`SerializedAbiVersion`].

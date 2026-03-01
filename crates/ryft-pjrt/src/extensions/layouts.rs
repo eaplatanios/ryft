@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executable_output_layouts() {
+    fn test_executable_layouts() {
         let client = test_cpu_client();
         let program = Program::Mlir {
             bytecode: indoc! {"
