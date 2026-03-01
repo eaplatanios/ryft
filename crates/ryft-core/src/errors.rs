@@ -5,9 +5,17 @@ pub enum Error {
     #[error("runtime error: {message}")]
     RuntimeError { message: String, backtrace: String },
 
-    // TODO(eaplatanios): Can we unify some of the parameter-related errors?
-    #[error("got more parameters than expected")]
-    UnusedParameters,
+    #[error(
+        "{}",
+        match paths.as_deref() {
+            None => "got more parameters than expected".to_string(),
+            Some(paths) => format!(
+                "got more parameters than expected; unused parameter paths: {}",
+                paths.iter().map(|path| format!("'{path}'")).collect::<Vec<_>>().join(", "),
+            ),
+        }
+    )]
+    UnusedParameters { paths: Option<Vec<String>> },
 
     // TODO(eaplatanios): `Error::InsufficientParameters` should also include a [`ParameterPath`] for the missing
     //  parameter and the same should be used in `from_parameters_with_remainder` whenever relevant.
@@ -16,9 +24,6 @@ pub enum Error {
 
     #[error("missing prefix for parameter at '{path}' path")]
     MissingPrefixForParameterPath { path: String },
-
-    #[error("unused parameter at '{path}' path")]
-    UnusedParameter { path: String },
 
     #[error("missing parameter at '{path}' path")]
     MissingParameterPath { path: String },

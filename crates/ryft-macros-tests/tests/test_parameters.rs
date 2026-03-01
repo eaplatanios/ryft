@@ -31,9 +31,9 @@ fn test_simple_struct() {
     assert_eq!(Struct::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
         Struct::from_parameters(structure.clone(), vec![4i64, 2i64]),
-        Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 })
+        Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 }),
     );
-    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, Struct { p_0: 8usize, p_1: 4usize, np_0, np_1 })
@@ -60,9 +60,12 @@ fn test_tuple_struct() {
     assert_eq!(TupleStruct::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
         TupleStruct::from_parameters(structure.clone(), vec![4i64, 2i64]),
-        Ok(TupleStruct(4i64, 2i64, np_0, np_1))
+        Ok(TupleStruct(4i64, 2i64, np_0, np_1)),
     );
-    assert_eq!(TupleStruct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        TupleStruct::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 }
 
 #[test]
@@ -93,13 +96,16 @@ fn test_struct_with_nested_tuples_and_options() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize, 0usize]);
     assert_eq!(
         StructWithNestedTuples::from_parameters(structure.clone(), Vec::<usize>::new()),
-        insufficient_parameters_error
+        insufficient_parameters_error,
     );
     assert_eq!(
         StructWithNestedTuples::from_parameters(structure.clone(), vec![4i64, 2i64, 0i64]),
-        Ok(StructWithNestedTuples { p_0: 4i64, p_1: (0usize, (-1i32, 2i64, -42i64, 0i64)), np_0, np_1 })
+        Ok(StructWithNestedTuples { p_0: 4i64, p_1: (0usize, (-1i32, 2i64, -42i64, 0i64)), np_0, np_1 }),
     );
-    assert_eq!(StructWithNestedTuples::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        StructWithNestedTuples::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     struct StructWithNestedOption<P: Parameter> {
@@ -120,13 +126,16 @@ fn test_struct_with_nested_tuples_and_options() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![2usize, 0usize]);
     assert_eq!(
         StructWithNestedOption::from_parameters(structure.clone(), Vec::<usize>::new()),
-        insufficient_parameters_error
+        insufficient_parameters_error,
     );
     assert_eq!(
         StructWithNestedOption::from_parameters(structure.clone(), vec![4i64, 2i64]),
-        Ok(StructWithNestedOption { p_0: Some((0usize, (-1i32, 4i64, -42i64, 2i64))), np_0, np_1 })
+        Ok(StructWithNestedOption { p_0: Some((0usize, (-1i32, 4i64, -42i64, 2i64))), np_0, np_1 }),
     );
-    assert_eq!(StructWithNestedOption::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        StructWithNestedOption::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 
     let value = StructWithNestedOption::<usize> { p_0: None, np_0, np_1 };
     let structure = StructWithNestedOption::<Placeholder> { p_0: None, np_0, np_1 };
@@ -136,9 +145,12 @@ fn test_struct_with_nested_tuples_and_options() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(
         StructWithNestedOption::from_parameters(structure.clone(), Vec::<i64>::new()),
-        Ok(StructWithNestedOption::<i64> { p_0: None, np_0, np_1 })
+        Ok(StructWithNestedOption::<i64> { p_0: None, np_0, np_1 }),
     );
-    assert_eq!(StructWithNestedOption::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        StructWithNestedOption::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 }
 
 #[test]
@@ -185,7 +197,7 @@ fn test_struct_with_nested_struct() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize, 4usize, 2usize]);
     assert_eq!(
         StructWithNestedStruct::from_parameters(structure.clone(), Vec::<usize>::new()),
-        insufficient_parameters_error
+        insufficient_parameters_error,
     );
     assert_eq!(
         StructWithNestedStruct::from_parameters(structure.clone(), vec![-4i64, -2i64, 4i64, 2i64]),
@@ -196,7 +208,10 @@ fn test_struct_with_nested_struct() {
             np_1,
         })
     );
-    assert_eq!(StructWithNestedStruct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        StructWithNestedStruct::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 }
 
 #[test]
@@ -216,9 +231,12 @@ fn test_empty_struct() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(
         EmptyStruct::from_parameters(structure.clone(), Vec::<i64>::new()),
-        Ok(EmptyStruct { _p: PhantomData::<i64> })
+        Ok(EmptyStruct { _p: PhantomData::<i64> }),
     );
-    assert_eq!(EmptyStruct::from_parameters(structure, vec![4i64, 2i64]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        EmptyStruct::from_parameters(structure, vec![4i64, 2i64]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 }
 
 #[test]
@@ -242,9 +260,12 @@ fn test_non_empty_struct_with_no_parameters() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(
         NonEmptyStruct::from_parameters(structure.clone(), Vec::<i64>::new()),
-        Ok(NonEmptyStruct { np_0, np_1, _p: PhantomData::<i64> })
+        Ok(NonEmptyStruct { np_0, np_1, _p: PhantomData::<i64> }),
     );
-    assert_eq!(NonEmptyStruct::from_parameters(structure, vec![4usize, 2usize]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        NonEmptyStruct::from_parameters(structure, vec![4usize, 2usize]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 }
 
 #[test]
@@ -267,9 +288,9 @@ fn test_struct_with_lifetime() {
     assert_eq!(Struct1::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
         Struct1::from_parameters(structure.clone(), vec![4i64]),
-        Ok(Struct1 { x: 4i64, y: ("hey there", 42usize) })
+        Ok(Struct1 { x: 4i64, y: ("hey there", 42usize) }),
     );
-    assert_eq!(Struct1::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(Struct1::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     struct Struct2<'p, V: Parameter> {
@@ -289,9 +310,9 @@ fn test_struct_with_lifetime() {
     assert_eq!(Struct2::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
         Struct2::from_parameters(structure.clone(), vec![4i64, 2i64]),
-        Ok(Struct2 { x: 4i64, y: ("hey there", 2i64) })
+        Ok(Struct2 { x: 4i64, y: ("hey there", 2i64) }),
     );
-    assert_eq!(Struct2::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(Struct2::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
 }
 
 #[test]
@@ -326,7 +347,7 @@ fn test_simple_enum() {
     let mut value = Enum::Parameter1 { field_0: (0usize, -42i64, 4usize), field_1: 2usize };
     let structure = Enum::Parameter1 { field_0: (0usize, Placeholder, 4usize), field_1: 2usize };
     let insufficient_parameters_error = Err(ryft::Error::InsufficientParameters { expected_count: 1 });
-    let unused_parameters_error = Err(ryft::Error::UnusedParameters);
+    let unused_parameters_error = Err(ryft::Error::UnusedParameters { paths: None });
 
     assert_parameter_structure_type::<usize, Enum<usize>, Enum<Placeholder>>();
     assert_eq!(value.parameter_count(), 1);
@@ -337,7 +358,7 @@ fn test_simple_enum() {
     assert_eq!(Enum::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
         Enum::from_parameters(structure.clone(), vec![42usize]),
-        Ok(Enum::Parameter1 { field_0: (0usize, 42usize, 4usize), field_1: 2usize })
+        Ok(Enum::Parameter1 { field_0: (0usize, 42usize, 4usize), field_1: 2usize }),
     );
     assert_eq!(Enum::from_parameters(structure, [0usize; 10]), unused_parameters_error);
 
@@ -365,9 +386,12 @@ fn test_empty_enum() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(
         EmptyEnum::from_parameters(structure.clone(), Vec::<i64>::new()),
-        Ok(EmptyEnum::Phantom(PhantomData::<i64>))
+        Ok(EmptyEnum::Phantom(PhantomData::<i64>)),
     );
-    assert_eq!(EmptyEnum::from_parameters(structure, vec![0usize, 1usize]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        EmptyEnum::from_parameters(structure, vec![0usize, 1usize]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 }
 
 #[test]
@@ -387,7 +411,7 @@ fn test_enum_with_lifetime() {
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 42usize]);
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![42usize]);
     assert_eq!(Enum::from_parameters(structure.clone(), vec![42i32]), Ok(Enum::X(42i32)));
-    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
 
     let mut value = Enum::Y("hey there", 42usize);
     let structure = Enum::Y("hey there", 42usize);
@@ -398,7 +422,7 @@ fn test_enum_with_lifetime() {
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(Enum::from_parameters(structure.clone(), Vec::<usize>::new()), Ok(value));
-    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
 }
 
 #[test]
@@ -453,7 +477,7 @@ fn test_complex_type() {
     assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder]);
     assert_eq!(
         StructWithEnum::from_parameters(structure.clone(), vec![42usize]),
-        Ok(StructWithEnum(Enum::Parameter(42usize)))
+        Ok(StructWithEnum(Enum::Parameter(42usize))),
     );
 
     let structure = StructWithEnum(Enum::ParameterTuple(Placeholder, Placeholder));
@@ -462,7 +486,7 @@ fn test_complex_type() {
     assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder, &Placeholder]);
     assert_eq!(
         StructWithEnum::from_parameters(structure.clone(), vec![4usize, 2usize]),
-        Ok(StructWithEnum(Enum::ParameterTuple(4usize, 2usize)))
+        Ok(StructWithEnum(Enum::ParameterTuple(4usize, 2usize))),
     );
 
     let simple_struct_structure = Struct {
@@ -515,7 +539,7 @@ fn test_complex_type() {
                 },
                 0i32,
             ),
-        }))
+        })),
     );
 
     let structure = StructWithEnum::<Placeholder>(Enum::Stuff {
@@ -553,7 +577,7 @@ fn test_complex_type() {
                 },
                 0i32,
             ),
-        }))
+        })),
     );
 
     let structure = StructWithEnum::<Placeholder>(Enum::StructWithNestedStruct(nested_struct_structure, 42usize));
@@ -584,7 +608,7 @@ fn test_complex_type() {
                 np_1: 64u64,
             },
             42usize
-        )))
+        ))),
     );
 
     let structure = StructWithEnum::<Placeholder>(Enum::Irrelevant(42i64));
@@ -610,7 +634,10 @@ fn test_nested_vec() {
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![4usize, 2usize]);
     assert_eq!(VecWrapper::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(VecWrapper::from_parameters(structure.clone(), vec![4i64, 2i64]), Ok(VecWrapper(vec![4i64, 2i64])));
-    assert_eq!(VecWrapper::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        VecWrapper::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     struct MultiVecWrapper<P: Parameter>(Vec<P>, usize, (Vec<P>, Vec<Vec<P>>));
@@ -627,9 +654,12 @@ fn test_nested_vec() {
     assert_eq!(MultiVecWrapper::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
         MultiVecWrapper::from_parameters(structure.clone(), vec![4i64, 2i64, 42i64]),
-        Ok(MultiVecWrapper(vec![4i64, 2i64], 0usize, (Vec::new(), vec![vec![42i64]])))
+        Ok(MultiVecWrapper(vec![4i64, 2i64], 0usize, (Vec::new(), vec![vec![42i64]]))),
     );
-    assert_eq!(MultiVecWrapper::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        MultiVecWrapper::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, MultiVecWrapper(vec![8usize, 4usize], 0usize, (Vec::new(), vec![vec![84usize]])));
@@ -662,9 +692,12 @@ fn test_nested_vec_of_tuples() {
     );
     assert_eq!(
         NestedVecOfTuples::from_parameters(structure.clone(), vec![4i64, 2i64, 2i64, 1i64, 42i64, 0i64]),
-        Ok(NestedVecOfTuples(vec![(4i64, 2i64), (2i64, 1i64)], 0usize, (Vec::new(), vec![(vec![42i64], 0i64)])))
+        Ok(NestedVecOfTuples(vec![(4i64, 2i64), (2i64, 1i64)], 0usize, (Vec::new(), vec![(vec![42i64], 0i64)]))),
     );
-    assert_eq!(NestedVecOfTuples::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(
+        NestedVecOfTuples::from_parameters(structure, [0usize; 10]),
+        Err(ryft::Error::UnusedParameters { paths: None }),
+    );
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, NestedVecOfTuples(vec![(8i8, 4i8), (4i8, 2i8)], 0usize, (Vec::new(), vec![(vec![84i8], 0i8)])));
@@ -694,9 +727,9 @@ fn test_generics() {
     assert_eq!(Struct::from_parameters(structure.clone(), Vec::<usize>::new()), insufficient_parameters_error);
     assert_eq!(
         Struct::from_parameters(structure.clone(), vec![4i64, 2i64]),
-        Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 })
+        Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 }),
     );
-    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters));
+    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, Struct { p_0: 8usize, p_1: 4usize, np_0, np_1 })
@@ -772,16 +805,16 @@ fn test_map_parameters() {
         mlp.call(x.clone()),
         ValueWithTangent {
             primal: ValueWithTangent { primal: -8.0, tangent: 1.0 },
-            tangent: ValueWithTangent { primal: -18.0, tangent: 0.0 }
-        }
+            tangent: ValueWithTangent { primal: -18.0, tangent: 0.0 },
+        },
     );
 
     assert_eq!(
         f(x.clone(), x),
         ValueWithTangent {
             primal: ValueWithTangent { primal: 2.0, tangent: 4.0 },
-            tangent: ValueWithTangent { primal: 4.0, tangent: 10.0 }
-        }
+            tangent: ValueWithTangent { primal: 4.0, tangent: 10.0 },
+        },
     );
 }
 

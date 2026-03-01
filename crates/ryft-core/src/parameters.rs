@@ -655,7 +655,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     ) -> Result<Self, Error> {
         let mut parameters = parameters.into_iter();
         let parameterized = Self::from_parameters_with_remainder(structure, &mut parameters)?;
-        parameters.next().map(|_| Err(Error::UnusedParameters)).unwrap_or_else(|| Ok(parameterized))
+        parameters
+            .next()
+            .map(|_| Err(Error::UnusedParameters { paths: None }))
+            .unwrap_or_else(|| Ok(parameterized))
     }
 
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming named values
@@ -681,7 +684,11 @@ pub trait Parameterized<P: Parameter>: Sized {
                 }
             }
         }
-        if parameters.is_empty() { Self::from_parameters(structure, values) } else { Err(Error::UnusedParameters) }
+        if parameters.is_empty() {
+            Self::from_parameters(structure, values)
+        } else {
+            Err(Error::UnusedParameters { paths: None })
+        }
     }
 
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming named values
@@ -689,10 +696,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// prefixes. Unlike [`Self::from_named_parameters`], this function does not require exact leaf paths, and each
     /// leaf path in `structure` receives the value from the most specific matching path prefix (i.e., the longest
     /// shared path prefix). If any leaf path is not covered by a provided prefix, then this function will return
-    /// an [`Error::MissingPrefixForParameterPath`]. If a provided prefix matches no leaf path, then it will return an
-    /// [`Error::UnusedParameter`]. Note that since one prefix value may need to populate multiple leaves,
-    /// this function requires `P: Clone`. For fully worked examples, refer to the examples provided in the top-level
-    /// documentation of the [`Parameterized`] trait.
+    /// an [`Error::MissingPrefixForParameterPath`]. If there are any remaining [`ParameterPath`]s with no match in
+    /// `structure`, then it will return an [`Error::UnusedParameters`]. Note that since one prefix value may need to
+    /// populate multiple leaves, this function requires `P: Clone`. For fully worked examples, refer to the examples
+    /// provided in the top-level documentation of the [`Parameterized`] trait.
     fn from_broadcasted_named_parameters(
         structure: Self::ParameterStructure,
         parameters: HashMap<ParameterPath, P>,
@@ -709,22 +716,23 @@ pub trait Parameterized<P: Parameter>: Sized {
                 .enumerate()
                 .filter_map(|(i, (p, _, _))| if p.is_prefix_of(&path) { Some((i, p.len())) } else { None })
                 .max_by(|x, y| x.1.cmp(&y.1))
-                .map(|(i, _)| i).ok_or_else(|| Error::MissingPrefixForParameterPath { path: path.to_string() })?;
+                .map(|(i, _)| i)
+                .ok_or_else(|| Error::MissingPrefixForParameterPath { path: path.to_string() })?;
             let (_, value, matched_count) = &mut path_prefixes[selected_prefix_index];
             broadcasted_parameters.insert(path, value.clone());
             *matched_count += 1;
         }
-        let mut unused_prefix_paths = path_prefixes
+        let unused_prefix_paths = path_prefixes
             .into_iter()
             .filter_map(|(path, _, matched_count)| if matched_count == 0 { Some(path.to_string()) } else { None })
             .collect::<Vec<_>>();
-        if !unused_prefix_paths.is_empty() {
-            unused_prefix_paths.sort_unstable();
-            return Err(Error::UnusedParameter { path: unused_prefix_paths[0].clone() });
+        if unused_prefix_paths.is_empty() {
+            Self::from_named_parameters(structure, broadcasted_parameters)
+        } else {
+            Err(Error::UnusedParameters { paths: Some(unused_prefix_paths) })
         }
-        Self::from_named_parameters(structure, broadcasted_parameters)
     }
-    
+
     // TODO(eaplatanios): Review from here onwards.
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
@@ -899,7 +907,7 @@ pub trait Parameterized<P: Parameter>: Sized {
             combined_parameters.push(parameter);
         }
         if optional_iterators.iter_mut().any(|iterator| iterator.next().is_some()) {
-            return Err(Error::UnusedParameters);
+            return Err(Error::UnusedParameters { paths: None });
         }
         Self::from_parameters(structure, combined_parameters)
     }
@@ -998,7 +1006,7 @@ pub trait Parameterized<P: Parameter>: Sized {
             updated_parameters.push(updated);
         }
         if parameters.next().is_some() || updates.next().is_some() {
-            return Err(Error::UnusedParameters);
+            return Err(Error::UnusedParameters { paths: None });
         }
         Self::from_parameters(structure, updated_parameters)
     }
@@ -2880,7 +2888,10 @@ mod tests {
 
     #[test]
     fn test_from_parameters_reports_unused_parameters() {
-        assert_eq!(<i32 as Parameterized<i32>>::from_parameters(Placeholder, vec![3, 4]), Err(Error::UnusedParameters));
+        assert_eq!(
+            <i32 as Parameterized<i32>>::from_parameters(Placeholder, vec![3, 4]),
+            Err(Error::UnusedParameters { paths: None }),
+        );
     }
 
     #[test]
@@ -2891,7 +2902,7 @@ mod tests {
                 Placeholder,
                 HashMap::from([(ParameterPath::root(), 3), (extra_path, 4)]),
             ),
-            Err(Error::UnusedParameters)
+            Err(Error::UnusedParameters { paths: None })
         );
     }
 
@@ -2994,9 +3005,18 @@ mod tests {
             HashMap::from([
                 (ParameterPath::root(), 5),
                 (ParameterPath::root().with_segment(ParameterPathSegment::Index(1)), 10),
+                (
+                    ParameterPath::root()
+                        .with_segment(ParameterPathSegment::Index(2))
+                        .with_segment(ParameterPathSegment::TupleIndex(0)),
+                    15,
+                ),
             ]),
         );
-        assert_eq!(result, Err(Error::UnusedParameter { path: "$[1]".to_string() }));
+        assert_eq!(
+            result,
+            Err(Error::UnusedParameters { paths: Some(vec!["$[2].0".to_string(), "$[1]".to_string()]) }),
+        );
     }
 
     #[test]
