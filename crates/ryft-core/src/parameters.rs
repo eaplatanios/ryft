@@ -1856,13 +1856,16 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
         structure: Self::ParameterStructure,
         parameters: &mut I,
     ) -> Result<Self, Error> {
-        // Make this more efficient by using [std::array::try_from_fn] once it becomes stable.
-        // Tracking issue: https://github.com/rust-lang/rust/issues/89379.
-        let values = structure
-            .into_iter()
-            .map(|value_structure| V::from_parameters_with_remainder(value_structure, parameters))
-            .collect::<Result<Vec<V>, _>>()?;
-        Ok(unsafe { values.try_into().unwrap_unchecked() })
+        // TODO(eaplatanios): Make this more efficient by using [`std::array::try_from_fn`] once it becomes stable.
+        //  Tracking issue: https://github.com/rust-lang/rust/issues/89379.
+        Ok(unsafe {
+            structure
+                .into_iter()
+                .map(|value_structure| V::from_parameters_with_remainder(value_structure, parameters))
+                .collect::<Result<Vec<V>, _>>()?
+                .try_into()
+                .unwrap_unchecked()
+        })
     }
 }
 
@@ -2009,6 +2012,7 @@ impl<
     type To = HashMap<K, <F as ParameterizedFamily<P>>::To, S>;
 }
 
+// TODO(eaplatanios): The following `impl` block needs review.
 // TODO(eaplatanios): Document inefficiency due to sorting somewhere.
 impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
     for HashMap<K, V, S>
@@ -2180,6 +2184,7 @@ impl<P: Parameter, K: Clone + Debug + Ord, F: ParameterizedFamily<P> + Parameter
     type To = BTreeMap<K, <F as ParameterizedFamily<P>>::To>;
 }
 
+// TODO(eaplatanios): The following `impl` block needs review.
 impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P> for BTreeMap<K, V> {
     type Family = BTreeMapParameterizedFamily<K, V::Family>;
 
