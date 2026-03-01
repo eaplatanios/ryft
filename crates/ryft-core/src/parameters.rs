@@ -783,12 +783,10 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
-    /// `T`, while preserving the [`Parameterized`] tree structure of this type. Nested parameters are visited in the
-    /// same order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], and their named
-    /// counterparts.
+    /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the same
+    /// order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters`],
+    /// [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
     fn map_parameters<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, Error>
     where
         Self::Family: ParameterizedFamily<T>,
@@ -799,8 +797,8 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn`, which receives the
     /// [`ParameterPath`] for each [`Parameter`] along with its value, and returns a new [`Parameter`] value of type
     /// `T`, while preserving the [`Parameterized`] tree structure of this type. Nested parameters are visited in the
-    /// same order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], and their named
-    /// counterparts.
+    /// same order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`],
+    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
     fn map_named_parameters<T: Parameter, F: FnMut(&ParameterPath, P) -> T>(
         self,
         map_fn: F,
@@ -817,6 +815,8 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
         Self::To::<T>::from_named_parameters(structure, mapped_parameters)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Splits this value into selected and rejected optional trees according to `predicate`.
     ///
