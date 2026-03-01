@@ -275,13 +275,20 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// );
 /// ```
 ///
+/// Note that the value returned by [`Parameterized::parameter_structure`] is effectively a "shape template"
+/// for a [`Parameterized`] value: every parameter in that value is replaced by [`Placeholder`], while values of
+/// non-parameter types are preserved exactly as they are (i.e., they are cloned). This is useful because flattening,
+/// which is described in more detail in the next section, discards structural boundary information, and
+/// [`Parameterized::ParameterStructure`] keeps that information so functions like [`Self::from_parameters`]
+/// can rebuild values that have the same structure as the original value, but different parameters.
+///
 /// # Working with Parameterized Values
 ///
 /// The more interesting part about [`Parameterized`] types is what they enable us to do. The following operations are
 /// fundamental to [`Parameterized`] types and are almost always involved when working with such types and values:
 ///
 ///   - **Flattening:** Given a parameterized value, _flattening_ consists of obtaining a flat iterator over the
-///     parameters that are contained in that value. These parameters may be arbitrarily nested in the value but we
+///     parameters that are contained in that value. These parameters may be arbitrarily nested in the value, but we
 ///     guarantee that they will always be returned in the same order. This is crucial in enabling the next operation,
 ///     _unflattening_, which is the inverse of the flattening operation. This operation is exposed via the
 ///     [`Self::parameters`], [`Self::parameters_mut`], and [`Self::into_parameters`] functions.
@@ -513,51 +520,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// );
 /// 
 /// # Ok::<(), ryft::Error>(())
-/// ```
-/// 
-/// 
-/// 
-/// 
-/// 
-/// 
-/// 
-/// 
-/// 
-/// 
-///
-/// # Viewing The Parameterized Definition Of A Value
-///
-/// [`parameter_structure`](Self::parameter_structure) returns the same tree shape with all leaves replaced by
-/// [`Placeholder`] values. This is analogous to inspecting a pytree definition (`treedef`) for debugging.
-///
-/// ```rust
-/// # use ryft_core::parameters::{Parameterized, Placeholder};
-/// let value = vec![(1.0_f32, 2.0_f32), (3.0_f32, 4.0_f32)];
-/// let structure = value.parameter_structure();
-/// assert_eq!(structure, vec![(Placeholder, Placeholder), (Placeholder, Placeholder)]);
-/// assert_eq!(structure.parameter_count(), 4);
-///
-/// let rebuilt = <Vec<(f32, f32)> as Parameterized<f32>>::from_parameters(
-///     structure,
-///     vec![10.0_f32, 20.0_f32, 30.0_f32, 40.0_f32],
-/// )?;
-/// assert_eq!(rebuilt, vec![(10.0, 20.0), (30.0, 40.0)]);
-/// # Ok::<(), ryft_core::errors::Error>(())
-/// ```
-///
-/// # Common Parameterized Gotchas
-///
-/// ## Mistaking container nodes for leaves
-///
-/// Traversal happens at leaf granularity. Container nodes (e.g., tuples, vectors, maps) are traversed recursively
-/// and are not passed to mapping closures as a whole.
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![(2_i32, 3_i32)];
-/// let mapped = value.map_parameters(|leaf| leaf * 10)?;
-/// assert_eq!(mapped, vec![(20, 30)]);
-/// # Ok::<(), ryft_core::errors::Error>(())
 /// ```
 pub trait Parameterized<P: Parameter>: Sized {
     /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
