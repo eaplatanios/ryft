@@ -30,3 +30,45 @@ pub fn const_block(code: TokenStream) -> TokenStream {
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use proc_macro2::TokenStream;
+    use quote::{ToTokens, quote};
+
+    use super::const_block;
+
+    #[test]
+    fn test_const_block() {
+        // Test with an empty const block.
+        let block = const_block(TokenStream::new());
+        let item_const: syn::ItemConst = syn::parse2(block).expect("failed to parse empty const block");
+        let expr = match &*item_const.expr {
+            syn::Expr::Block(expr) => expr,
+            other => panic!("expected a block expression but found: {other:?}"),
+        };
+        assert!(expr.block.stmts.is_empty());
+
+        // Test with a non-empty const block.
+        let block = const_block(quote! {
+            type Alias = u32;
+            fn helper() -> u32 {
+                7
+            }
+        });
+        let item_const: syn::ItemConst = syn::parse2(block).expect("failed to parse const block");
+        assert_eq!(item_const.ident.to_string(), "_");
+        assert!(
+            item_const
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("doc") && attr.to_token_stream().to_string().contains("hidden"))
+        );
+        assert!(item_const.attrs.iter().any(|attr| attr.path().is_ident("allow")));
+        let expr = match &*item_const.expr {
+            syn::Expr::Block(expr) => expr,
+            other => panic!("expected a block expression but found: {other:?}"),
+        };
+        assert_eq!(expr.block.stmts.len(), 2);
+    }
+}

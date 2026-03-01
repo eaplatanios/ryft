@@ -19,3 +19,24 @@ impl PathHelpers for syn::Path {
         path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use quote::ToTokens;
+
+    use super::PathHelpers;
+
+    #[test]
+    fn test_path_with_segment() {
+        let path: syn::Path = syn::parse_quote!(ryft::core);
+        assert_eq!(path.to_token_stream().to_string().replace(' ', ""), "ryft::core");
+
+        let path = path.with_segment(syn::parse_quote!(Parameter));
+        assert_eq!(path.to_token_stream().to_string().replace(' ', ""), "ryft::core::Parameter");
+
+        let path: syn::Path = syn::parse_quote!(::ryft);
+        let path = path.with_segment(syn::parse_quote!(core));
+        assert_eq!(path.to_token_stream().to_string().replace(' ', ""), "::ryft::core");
+        assert!(path.leading_colon.is_some());
+    }
+}

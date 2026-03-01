@@ -1,4 +1,4 @@
-error: Found no generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute.
+error: found no generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute
  --> tests/parameters/error_no_parameters.rs:4:8
   |
 4 | struct NestedVecOfTuples<P> {

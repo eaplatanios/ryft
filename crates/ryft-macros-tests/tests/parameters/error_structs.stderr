@@ -1,16 +1,16 @@
-error: Found more than one generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute.
+error: found more than one generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute
  --> tests/parameters/error_structs.rs:4:36
   |
 4 | struct StructWithMultipleParameters<P: Parameter, V: Parameter> {
   |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: Identifier '__P' is reserved.
+error: identifier '__P' is reserved
   --> tests/parameters/error_structs.rs:16:35
    |
 16 | struct StructWithInvalidTypeParam<__P: Parameter> {
    |                                   ^^^^^^^^^^^^^^
 
-error: Identifier ''__p' is reserved.
+error: identifier ''__p' is reserved
   --> tests/parameters/error_structs.rs:22:39
    |
 22 | struct StructWithInvalidLifetimeParam<'__p, P: Parameter> {
@@ -32,14 +32,14 @@ error[E0283]: type annotations needed
    |
    = note: cannot satisfy `_: Parameter`
    = help: the following types implement trait `Parameter`:
+             ArrayType
+             DataType
+             JvpTracer<Value, Tangent>
+             Option<P>
              Placeholder
+             Tracer<T, V, O>
              bool
              f32
-             f64
-             half::bfloat::bf16
-             half::binary16::f16
-             i128
-             i16
            and $N others
 note: required by a bound in `StructWithUnusedParameterType`
   --> tests/parameters/error_structs.rs:10:41

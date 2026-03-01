@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 /// Contains helpers for working with [`syn::Attribute`]s.
-pub mod attribute;
+pub mod attributes;
 
 /// Contains helpers for working with [`syn::Generic`]s.
 pub mod generics;
@@ -11,17 +11,17 @@ pub mod generics;
 pub mod hygiene;
 
 /// Contains helpers for working with [`syn::Ident`]s.
-pub mod ident;
+pub mod idents;
 
 /// Contains helpers for working with [`syn::Path`]s.
-pub mod path;
+pub mod paths;
 
 /// Contains helpers for working with receiver values and types (i.e., `self` and `Self`).
-pub mod receiver;
+pub mod receivers;
 
 /// Contains helpers for working with [`proc_macro2::Span`]s.
-pub mod span;
+pub mod spans;
 
 /// Contains a wrapper over `&'static str` that provides convenient [`PartialEq`], [`Display`],
 /// and [`From`] implementations for working with [`syn`] abstract syntax trees.
-pub mod symbol;
+pub mod symbols;

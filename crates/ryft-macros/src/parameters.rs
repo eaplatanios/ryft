@@ -4,13 +4,13 @@ use std::fmt::Display;
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 
-use crate::helpers::attribute::Attribute;
+use crate::helpers::attributes::Attribute;
 use crate::helpers::generics::GenericsHelpers;
 use crate::helpers::hygiene::const_block;
-use crate::helpers::ident::IdentHelpers;
-use crate::helpers::path::PathHelpers;
-use crate::helpers::receiver::replace_self_type;
-use crate::helpers::symbol::Symbol;
+use crate::helpers::idents::IdentHelpers;
+use crate::helpers::paths::PathHelpers;
+use crate::helpers::receivers::replace_self_type;
+use crate::helpers::symbols::Symbol;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
@@ -19,11 +19,11 @@ const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const DEFAULT_MACRO_PARAMETER_LIFETIME: Symbol = Symbol::new("'__p");
 const DEFAULT_MACRO_PARAMETER_TYPE: Symbol = Symbol::new("__P");
-const DEFAULT_PARAMETER_TYPE: Symbol = Symbol::new("Param");
+const DEFAULT_PARAMETER_TYPE: Symbol = Symbol::new("Parameter");
 
 const FIELD_ATTRIBUTE_ERROR: &str = "\
-  The '#[ryft(...)]' attribute is only supported at the top level \
-  for structs and enums. It is not supported for fields or variants.";
+  the '#[ryft(...)]' attribute is only supported at the top level \
+  for structs and enums. It is not supported for fields or variants";
 
 /// [`CodeGenerator`] are used to generate implementations of the [`Parameterized`] trait via the
 /// `#[derive(Parameterized)]` macro. Refer to the documentation of the [`Parameterized`] trait for information on how
@@ -39,29 +39,29 @@ pub(crate) struct CodeGenerator {
     /// [`syn::Lifetime`] that represents the macro-internal lifetime that is used when we need to introduce one.
     /// This should not conflict with any identifiers that already appear in the scope in which the corresponding
     /// code will be generated. It defaults to [`DEFAULT_MACRO_PARAMETER_LIFETIME`].
-    macro_param_lifetime: syn::Lifetime,
+    macro_parameter_lifetime: syn::Lifetime,
 
     /// [`syn::Ident`] that represents the macro-internal type parameter that is used to represent the parameter type
     /// when we need to introduce a new one (e.g., for an associated type that takes a parameter type as one of its
     /// arguments). This should not conflict with any identifiers that already appear in the scope in which the
     /// corresponding code will be generated. It defaults to [`DEFAULT_MACRO_PARAMETER_TYPE`].
-    macro_param_type: syn::Ident,
+    macro_parameter_type: syn::Ident,
 
     /// [`syn::Ident`] that represents the parameter type in the container on which our macros operate. This must match
     /// one of the generic type parameters of that container. This [`syn::Ident`] is always inferred from the
     /// [`syn::Generics`] of the provided [`syn::DeriveInput`]. It is set to the generic type parameter that is bounded
     /// by [`ryft::Parameter`]. There must be exactly one such type parameter and an error will be generated if there
     /// are zero or more than one such generic type parameters.
-    param_type: syn::Ident,
+    parameter_type: syn::Ident,
 
     /// [`syn::Generics`] that are used for code generation. These [`syn::Generics`] are extracted from the provided
     /// [`syn::DeriveInput`] and post-processed, adding the necessary bounds for the [`Parameterized`] implementation.
     /// Specifically, they include [`Clone`] bounds for non-parameter [`Field`] types in the underlying [`Data`]
-    /// (that is because these bounds are required by the [`Parameterized::param_structure`] implementation) and
+    /// (that is because these bounds are required by the [`Parameterized::parameter_structure`] implementation) and
     /// [`Parameterized`] bounds for all parameter [`Field`] types. Note that for the latter, the actual bounds that
     /// it adds look as follows (abusing notation a bit and representing the field type as `FieldType<P>` where `P`
     /// is the parameter type since at this point we know that these types are generic with respect to `P`):
-    /// `To<ryft::Placeholder> = FieldType<ryft::Placeholder>>`.
+    /// `ParameterStructure = FieldType<ryft::Placeholder>`.
     generics: syn::Generics,
 
     /// [`Data`] that is used for the code generation and which is extracted from the provided [`syn::DeriveInput`].
@@ -100,36 +100,48 @@ impl CodeGenerator {
     /// #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
     /// const _: () = {
     ///     #[automatically_derived]
+    ///     impl<__P: ryft::Parameter> ryft::ParameterizedFamily<__P> for CustomType<ryft::Placeholder> {
+    ///         type To = CustomType<__P>;
+    ///     }
+    ///
+    ///     #[automatically_derived]
     ///     impl<P: Parameter> ryft::Parameterized<P> for CustomType<P> {
-    ///         type To<__P> = ...;
+    ///         type Family = CustomType<ryft::Placeholder>;
+    ///         
+    ///         type To<__P: ryft::Parameter> =
+    ///             <Self::Family as ryft::ParameterizedFamily<__P>>::To
+    ///         where
+    ///             Self::Family: ryft::ParameterizedFamily<__P>;
+    ///         
+    ///         type ParameterStructure = Self::To<ryft::Placeholder>;
     ///
-    ///         type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
-    ///         type ParamIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
-    ///         type ParamIntoIterator<__P: ryft::Parameter> = ...;
+    ///         type ParameterIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+    ///         type ParameterIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+    ///         type ParameterIntoIterator<__P: ryft::Parameter> = ...;
     ///
-    ///         fn param_count(&self) -> usize { ... }
-    ///         fn param_structure(&self) -> Self::To<ryft::Placeholder> { ... }
+    ///         fn parameter_count(&self) -> usize { ... }
+    ///         fn parameter_structure(&self) -> Self::To<ryft::Placeholder> { ... }
     ///
-    ///         fn params(&self) -> Self::ParamIterator<'_, P> { ... }
-    ///         fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P> { ... }
-    ///         fn into_params(&mut self) -> Self::ParamIntoIterator<P> { ... }
+    ///         fn parameters(&self) -> Self::ParameterIterator<'_, P> { ... }
+    ///         fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> { ... }
+    ///         fn into_parameters(self) -> Self::ParameterIntoIterator<P> { ... }
     ///
-    ///         fn from_params_with_remainder<I: Iterator<Item = P>>(
+    ///         fn from_parameters_with_remainder<I: Iterator<Item = P>>(
     ///             structure: Self::To<ryft::Placeholder>,
-    ///             params: &mut I,
+    ///             parameters: &mut I,
     ///         ) -> Result<Self, ryft::Error> {
-    ///             let expected_count = structure.param_count();
+    ///             let expected_count = structure.parameter_count();
     ///             Ok(...)
     ///         }
     ///     }
     ///
     ///     #[automatically_derived]
-    ///     pub enum CustomParamIterator<'__p, P: '__p + Parameter> where ... {
+    ///     pub enum CustomParameterIterator<'__p, P: '__p + Parameter> where ... {
     ///         ...
     ///     }
     ///
     ///     #[automatically_derived]
-    ///     impl<'__p, P: '__p + Parameter> Iterator for CustomParamIterator<'__p, P> {
+    ///     impl<'__p, P: '__p + Parameter> Iterator for CustomParameterIterator<'__p, P> {
     ///         type Item = &'__p P;
     ///
     ///         fn next(&mut self) -> Option<Self::Item> {
@@ -157,9 +169,9 @@ impl CodeGenerator {
         // return a compiler error before we get to use them.
         let mut generator = CodeGenerator {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
-            macro_param_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
-            macro_param_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
-            param_type: DEFAULT_PARAMETER_TYPE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
             generics: syn::Generics::default(),
             data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
             errors: Vec::new(),
@@ -167,29 +179,29 @@ impl CodeGenerator {
 
         // Extracts all the necessary information from our [`syn::DeriveInput`].
         generator.extract_attributes(&input);
-        generator.extract_param_type(&input);
+        generator.extract_parameter_type(&input);
         generator.extract_data(&input);
         generator.extract_generics(&input);
         generator.check_for_name_conflicts(&input);
 
         // Perform the actual code generation.
         let ryft = &generator.ryft_crate;
-        let param_type = &generator.param_type;
+        let parameter_type = &generator.parameter_type;
         let ident = generator.data.ident();
         let (impl_generics, ty_generics, where_clause) = generator.generics.split_for_impl();
         let (assoc_types, additional_types_and_impls) = generator.generate_assoc_types();
-        let param_count = generator.generate_param_count_function();
-        let param_structure = generator.generate_param_structure_function();
-        let params_functions = generator.generate_params_functions();
-        let from_params_with_remainder = generator.generate_from_params_with_remainder();
+        let parameter_count = generator.generate_parameter_count_function();
+        let parameter_structure = generator.generate_parameter_structure_function();
+        let parameters_functions = generator.generate_parameters_functions();
+        let from_parameters_with_remainder = generator.generate_from_parameters_with_remainder();
         let code = const_block(quote! {
             #[automatically_derived]
-            impl #impl_generics #ryft::Parameterized<#param_type> for #ident #ty_generics #where_clause {
+            impl #impl_generics #ryft::Parameterized<#parameter_type> for #ident #ty_generics #where_clause {
                 #assoc_types
-                #param_count
-                #param_structure
-                #params_functions
-                #from_params_with_remainder
+                #parameter_count
+                #parameter_structure
+                #parameters_functions
+                #from_parameters_with_remainder
             }
 
             #additional_types_and_impls
@@ -204,6 +216,17 @@ impl CodeGenerator {
         }
 
         code.into()
+    }
+
+    /// Adds an error to this [`CodeGenerator`] with the specified message spanning the provided tokens. This is only
+    /// meant to be used internally by this class as a convenient helper for collecting errors.
+    ///
+    /// # Parameters
+    ///
+    ///   * `tokens` - Tokens that the error spans.
+    ///   * `message` - Message describing the error.
+    fn add_error<T: ToTokens, U: Display>(&mut self, tokens: T, message: U) {
+        self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
     }
 
     /// Returns a [`TokenStream`] that represents a [`compile_error!`] invocation that contain information about
@@ -229,7 +252,7 @@ impl CodeGenerator {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
                 _ => Err(meta.error(format_args!(
-                    "Invalid '#[ryft(...)]' attribute: '{}'. These are the attributes that are supported here: {:?}.",
+                    "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
                     meta.path.to_token_stream().to_string().replace(' ', ""),
                     VALID_CONTAINER_ATTRIBUTES,
                 ))),
@@ -246,9 +269,8 @@ impl CodeGenerator {
     /// implementation that will be derived. This function also checks if there are more than one generic type
     /// parameters bounded by [`Parameter`] or if there are none, and reports errors as needed. Note that this
     /// function inspects the bounds on the generic type parameters themselves, as well as any corresponding
-    /// where bounds. It also checks if the extracted generic parameter type has any other bounds besides
-    /// [`Parameter`] as that is not allowed/supported by the [`Parameterized`] derivation macro.
-    fn extract_param_type(&mut self, input: &syn::DeriveInput) {
+    /// where bounds.
+    fn extract_parameter_type(&mut self, input: &syn::DeriveInput) {
         let generics = &input.generics;
 
         // Helper that checks if the provided [`syn::TypeParamBound`] is a [`ryft::Parameter`] bound. Given that
@@ -271,10 +293,10 @@ impl CodeGenerator {
 
         // Collect all parameters that are bounded by [`ryft::Parameter`].
         let where_predicates = generics.where_clause.iter().flat_map(|clause| clause.predicates.iter());
-        let param_types: HashSet<&syn::Ident> = generics
+        let parameter_types: HashSet<&syn::Ident> = generics
             .type_params()
-            .filter(|param| param.bounds.iter().any(|bound| check_bound(&self.ryft_crate, bound)))
-            .map(|param| &param.ident)
+            .filter(|parameter| parameter.bounds.iter().any(|bound| check_bound(&self.ryft_crate, bound)))
+            .map(|parameter| &parameter.ident)
             .chain(where_predicates.flat_map(|predicate| match &predicate {
                 syn::WherePredicate::Type(p) if check_bounds(&self.ryft_crate, &p.bounds) => p.bounded_ty.ident(),
                 _ => None,
@@ -282,63 +304,57 @@ impl CodeGenerator {
             .collect();
 
         // Check that there is only a single unique type parameter bounded by [`ryft::Parameter`].
-        if param_types.len() > 1 {
+        if parameter_types.len() > 1 {
             self.add_error(
                 generics,
-                "Found more than one generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' \
+                "found more than one generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' \
                 macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more \
-                than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be \
+                than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be \
                 substituted for the custom ryft 'crate' provided, if one was provided using the \
-                '#[ryft(crate = ...)]' attribute.",
+                '#[ryft(crate = ...)]' attribute",
             );
-        } else if let Some(param_type) = param_types.into_iter().next() {
-            self.param_type = param_type.clone();
+        } else if let Some(parameter_type) = parameter_types.into_iter().next() {
+            self.parameter_type = parameter_type.clone();
         } else {
             self.add_error(
                 &input.ident,
-                "Found no generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' \
+                "found no generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' \
                 macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more \
-                than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be \
+                than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be \
                 substituted for the custom ryft 'crate' provided, if one was provided using the \
-                '#[ryft(crate = ...)]' attribute.",
+                '#[ryft(crate = ...)]' attribute",
             );
         }
-
-        // Check that the only bound attached to the parameter type [`GenericParam`] is [`Parameter`].
-        let bad_bounds = generics
-            .type_params()
-            .filter(|param| param.matches_ident(&self.param_type))
-            .flat_map(|param| param.bounds.iter().filter(|bound| !check_bound(&self.ryft_crate, bound)))
-            .chain(
-                generics
-                    .where_clause
-                    .iter()
-                    .flat_map(|clause| clause.predicates.iter())
-                    .flat_map(|predicate| match &predicate {
-                        syn::WherePredicate::Type(syn::PredicateType { bounded_ty, bounds, .. })
-                            if bounded_ty.matches_ident(&self.param_type)
-                                && !check_bounds(&self.ryft_crate, bounds) =>
-                        {
-                            Some(bounds.iter())
-                        }
-                        _ => None,
-                    })
-                    .flatten(),
-            )
-            .collect::<Vec<_>>();
-        bad_bounds.iter().for_each(|bound| {
-            self.add_error(
-                bound,
-                "The generic parameter that is bounded by 'Parameter' indicates the parameter type that is used by \
-                    '#[derive(Parameterized)]' and cannot have any bounds other than the 'Parameter' bound.",
-            );
-        });
     }
 
     /// Extracts the [`Data`] that is contained in the provided [`syn::DeriveInput`]. This function also checks for
     /// invalid or unknown `[#ryft(...)]` attributes in any of the nested [`syn::Field`]s or [`syn::Variant`]s, as well
     /// as for types of data that are not supported by our `#[derive(Parameterized)]` macro.
     fn extract_data(&mut self, input: &syn::DeriveInput) {
+        /// Extracts the inner type from an [`Option`] type expression. This recognizes any type-path whose final path
+        /// segment is [`Option`] with exactly one type argument (e.g., `Option<T>` or `std::option::Option<T>`) and
+        /// returns that type argument. For non-[`Option`] types, malformed generic arguments, or non-type generic
+        /// arguments, this function returns [`None`].
+        fn extract_option_type(ty: &syn::Type) -> Option<syn::Type> {
+            let syn::Type::Path(type_path) = ty else {
+                return None;
+            };
+            let segment = type_path.path.segments.last()?;
+            if segment.ident != "Option" {
+                return None;
+            }
+            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return None;
+            };
+            if arguments.args.len() != 1 {
+                return None;
+            }
+            match arguments.args.first() {
+                Some(syn::GenericArgument::Type(inner_ty)) => Some(inner_ty.clone()),
+                _ => None,
+            }
+        }
+
         /// Helper function that extracts a [Field] from the provided data. This function also checks for any invalid
         /// or unknown `[#ryft(...)]` attributes attached to the corresponding [`syn::Field`].
         ///
@@ -366,37 +382,40 @@ impl CodeGenerator {
                 .for_each(|attr| generator.add_error(attr, FIELD_ATTRIBUTE_ERROR));
 
             // Check if the field is a parameter field and perform validation checks, if necessary.
-            let is_param = field_ty.references_ident(&generator.param_type);
+            let is_parameter = field_ty.references_ident(&generator.parameter_type);
             match &field_ty {
-                syn::Type::Ptr(_) if is_param => {
-                    generator.add_error(&field_ty, "Ryft parameters must be owned. Pointers are not allowed.")
+                syn::Type::Ptr(_) if is_parameter => {
+                    generator.add_error(&field_ty, "ryft parameters must be owned; pointers are not allowed")
                 }
-                syn::Type::Reference(_) if is_param => {
-                    generator.add_error(&field_ty, "Ryft parameters must be owned. References are not allowed.")
+                syn::Type::Reference(_) if is_parameter => {
+                    generator.add_error(&field_ty, "ryft parameters must be owned; references are not allowed")
                 }
                 _ => {}
             }
 
             // Construct a [`Field`] from the provided information.
             Field {
-                is_param,
+                is_parameter,
                 index: field_index,
                 ident: field_ident,
                 ty: field_ty.clone(),
-                fields: {
-                    if let syn::Type::Tuple(type_tuple) = &field_ty {
-                        Some(
-                            type_tuple
-                                .elems
-                                .iter()
-                                .enumerate()
-                                .map(|(i, e)| extract_field(generator, i, None, e.clone(), None))
-                                .collect(),
-                        )
-                    } else {
-                        None
-                    }
+                fields: if let syn::Type::Tuple(type_tuple) = &field_ty {
+                    Some(NestedFields::Tuple(
+                        type_tuple
+                            .elems
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| extract_field(generator, i, None, e.clone(), None))
+                            .collect(),
+                    ))
+                } else if let Some(inner_ty) = extract_option_type(&field_ty) {
+                    let mut inner_field = extract_field(generator, 0, None, inner_ty, None);
+                    inner_field.use_receiver_directly = true;
+                    Some(NestedFields::Option(Box::new(inner_field)))
+                } else {
+                    None
                 },
+                use_receiver_directly: false,
             }
         }
 
@@ -456,7 +475,7 @@ impl CodeGenerator {
                 self.data = Data::Enum(EnumData { ident, variants });
             }
             syn::Data::Union(_) => {
-                self.add_error(&input.ident, "The '#[derive(ryft::Parameterized)]' macro does not support unions.");
+                self.add_error(&input.ident, "the '#[derive(ryft::Parameterized)]' macro does not support unions");
             }
         }
     }
@@ -492,19 +511,25 @@ impl CodeGenerator {
         }
 
         /// Adds [`Parameterized`] bounds for the provided [`Field`]'s [`syn::Type`], if it references the
-        /// [`CodeGenerator::param_type`]. If it does not, then this function will not do anything.
+        /// [`CodeGenerator::parameter_type`]. If it does not, then this function will not do anything.
         fn add_parameterized_bounds(generator: &CodeGenerator, generics: &mut syn::Generics, field: &Field) {
-            // We do not add [`Parameterized`] bounds for types that do not reference the [`CodeGenerator::param_type`].
-            if field.is_param {
+            // We do not add [`Parameterized`] bounds for types that do not reference the
+            // [`CodeGenerator::parameter_type`].
+            if field.is_parameter {
                 if let Some(fields) = &field.fields {
-                    fields.iter().for_each(|field| add_parameterized_bounds(generator, generics, field));
+                    match fields {
+                        NestedFields::Tuple(fields) => {
+                            fields.iter().for_each(|field| add_parameterized_bounds(generator, generics, field))
+                        }
+                        NestedFields::Option(field) => add_parameterized_bounds(generator, generics, field),
+                    }
                 } else {
                     // We need to construct a bound that looks like this (abusing notation a bit and representing
                     // the field type as a function of the parameter type), where `P` is the parameter type:
                     //
                     //   FieldType<P>: ryft::Parameterized<
                     //     P,
-                    //     To<ryft::Placeholder> = FieldType<ryft::Placeholder>,
+                    //     ParameterStructure = FieldType<ryft::Placeholder>,
                     //   >
                     //
                     // Therefore, we need to construct the `FieldType<ryft::Placeholder>` type and that is what
@@ -512,36 +537,24 @@ impl CodeGenerator {
                     // `parse_quote!` but we instead construct it manually in order to avoid the parsing overhead.
                     let ryft_placeholder = generator.ryft_crate.with_segment(Symbol::new("Placeholder").into());
 
-                    let mut ty_using_param_placeholder = field.ty.clone();
-                    ty_using_param_placeholder.replace_ident(&generator.param_type, &ryft_placeholder);
+                    let mut ty_using_parameter_placeholder = field.ty.clone();
+                    ty_using_parameter_placeholder.replace_ident(&generator.parameter_type, &ryft_placeholder);
 
-                    // We need to construct the full [ryft::Parameterized] bound and to do that, we first construct
-                    // its arguments `<P, To<ryft::Placeholder> = FieldType<ryft::Placeholder>>`.
+                    // We need to construct the full [`ryft::Parameterized`] bound and to do that, we first construct
+                    // its arguments `<P, ParameterStructure = FieldType<ryft::Placeholder>>`.
                     let mut args = syn::punctuated::Punctuated::new();
 
                     // Add the `P` generic argument.
-                    let param_type = generator.param_type.clone();
-                    let param_type = syn::Type::Path(syn::TypePath { qself: None, path: param_type.into() });
-                    args.push(syn::GenericArgument::Type(param_type));
+                    let parameter_type = generator.parameter_type.clone();
+                    let parameter_type = syn::Type::Path(syn::TypePath { qself: None, path: parameter_type.into() });
+                    args.push(syn::GenericArgument::Type(parameter_type));
 
-                    // Add the `To<ryft::Placeholder> = FieldType<ryft::Placeholder>` generic argument.
+                    // Add the `ParameterStructure = FieldType<ryft::Placeholder>` generic argument.
                     args.push(syn::GenericArgument::AssocType(syn::AssocType {
-                        ident: syn::Ident::new("To", Span::call_site()),
-                        generics: Some(syn::AngleBracketedGenericArguments {
-                            colon2_token: None,
-                            lt_token: <syn::Token![<]>::default(),
-                            args: {
-                                let mut generic_args = syn::punctuated::Punctuated::new();
-                                generic_args.push(syn::GenericArgument::Type(syn::Type::Path(syn::TypePath {
-                                    qself: None,
-                                    path: ryft_placeholder.clone(),
-                                })));
-                                generic_args
-                            },
-                            gt_token: <syn::Token![>]>::default(),
-                        }),
+                        ident: syn::Ident::new("ParameterStructure", Span::call_site()),
+                        generics: None,
                         eq_token: <syn::Token![=]>::default(),
-                        ty: ty_using_param_placeholder.clone(),
+                        ty: ty_using_parameter_placeholder.clone(),
                     }));
 
                     // Then, we construct the full bound [`syn::Path`].
@@ -562,7 +575,7 @@ impl CodeGenerator {
 
         /// Adds any bounds that are necessary for the provided [`Field`] to the provided [`syn::Generics`].
         fn add_field_bounds(generator: &CodeGenerator, generics: &mut syn::Generics, field: &Field) {
-            if field.is_param {
+            if field.is_parameter {
                 add_parameterized_bounds(generator, generics, field);
             } else {
                 let bound = syn::Path::from(syn::Ident::new("Clone", Span::call_site()));
@@ -588,59 +601,75 @@ impl CodeGenerator {
     /// will check for whether the reserved [`MACRO_PARAMETER_LIFETIME`] and [`MACRO_PARAMETER_TYPE`] identifiers appear
     /// anywhere in the provided [`syn::DeriveInput`] and will report corresponding errors if they do.
     fn check_for_name_conflicts(&mut self, input: &syn::DeriveInput) {
-        input.generics.params.iter().for_each(|param| match param {
-            syn::GenericParam::Lifetime(param) if param.lifetime == self.macro_param_lifetime => {
-                self.add_error(param, format_args!("Identifier '{}' is reserved.", self.macro_param_lifetime.clone()));
+        input.generics.params.iter().for_each(|parameter| match parameter {
+            syn::GenericParam::Lifetime(parameter) if parameter.lifetime == self.macro_parameter_lifetime => {
+                self.add_error(
+                    parameter,
+                    format_args!("identifier '{}' is reserved", self.macro_parameter_lifetime.clone()),
+                );
             }
-            syn::GenericParam::Type(param) if param.matches_ident(&self.macro_param_type) => {
-                self.add_error(param, format_args!("Identifier '{}' is reserved.", self.macro_param_type.clone()));
+            syn::GenericParam::Type(parameter) if parameter.matches_ident(&self.macro_parameter_type) => {
+                self.add_error(
+                    parameter,
+                    format_args!("identifier '{}' is reserved", self.macro_parameter_type.clone()),
+                );
             }
-            syn::GenericParam::Const(param) if param.matches_ident(&self.macro_param_type) => {
-                self.add_error(param, format_args!("Identifier '{}' is reserved.", self.macro_param_type.clone()));
+            syn::GenericParam::Const(parameter) if parameter.matches_ident(&self.macro_parameter_type) => {
+                self.add_error(
+                    parameter,
+                    format_args!("identifier '{}' is reserved", self.macro_parameter_type.clone()),
+                );
             }
             _ => {}
         });
     }
 
-    /// Adds an error to this [`CodeGenerator`] with the specified message spanning the provided tokens. This is only
-    /// meant to be used internally by this class as a convenient helper for collecting errors.
-    ///
-    /// # Parameters
-    ///
-    ///   * `tokens` - Tokens that the error spans.
-    ///   * `message` - Message describing the error.
-    fn add_error<T: ToTokens, U: Display>(&mut self, tokens: T, message: U) {
-        self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
-    }
-
-    /// Generates the associated [`Parameterized::To`], [`Parameterized::ParamIterator`],
-    /// [`Parameterized::ParamIteratorMut`], and [`Parameterized::ParamIntoIterator`] type declarations for the [`Data`]
-    /// owned by the provided [`CodeGenerator`]. This function returns two [`TokenStream`]s:
+    /// Generates the associated [`Parameterized::Family`], [`Parameterized::To`],
+    /// [`Parameterized::ParameterStructure`], [`Parameterized::ParameterIterator`],
+    /// [`Parameterized::ParameterIteratorMut`], and [`Parameterized::ParameterIntoIterator`] type declarations
+    /// for the [`Data`] owned by the provided [`CodeGenerator`]. This function returns two [`TokenStream`]s:
     ///
     ///   1. The first [`TokenStream`] contains all the associated type declarations without the surrounding `impl`
     ///      block. For example, the generated code may look something like this (with `...` substituted for generated
     ///      code, of course, and the `ryft` crate possibly substituted as well):
     ///
     ///      ```ignore
-    ///      type To<__P> = ...;
-    ///      type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
-    ///      type ParamIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
-    ///      type ParamIntoIterator<__P: ryft::Parameter> = ...;
+    ///      type Family = ...;
+    ///
+    ///      type To<__P: ryft::Parameter> =
+    ///          <Self::Family as ryft::ParameterizedFamily<__P>>::To
+    ///      where
+    ///          Self::Family: ryft::ParameterizedFamily<__P>;
+    ///
+    ///      type ParameterStructure = Self::To<ryft::Placeholder>;
+    ///
+    ///      type ParameterIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+    ///      type ParameterIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+    ///      type ParameterIntoIterator<__P: ryft::Parameter> = ...;
+    ///
+    ///      type NamedParameterIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+    ///      type NamedParameterIteratorMut<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+    ///      type NamedParameterIntoIterator<__P: ryft::Parameter> = ...;
     ///      ```
     ///
-    ///   2. The second [`TokenStream`] contains any additional iterator types and corresponding [`Iterator`] `impl`
-    ///      blocks that may be required (as in, referenced) by the type declarations in the first [`TokenStream`].
-    ///      For example, the generated code may look something like this (with `...` substituted for generated code,
-    ///      of course, and the `ryft` crate possibly substituted as well):
+    ///   2. The second [`TokenStream`] contains any additional new custom types and corresponding `impl` blocks that
+    ///      may be required (as in, referenced) by the type declarations in the first [`TokenStream`]. For example, the
+    ///      generated code may look something like this (with `...` substituted for generated code, of course, and the
+    ///      `ryft` crate possibly substituted as well):
     ///
     ///      ```ignore
     ///      #[automatically_derived]
-    ///      pub enum CustomParamIterator<'__p, P: '__p + Parameter> where ... {
+    ///      impl<P: ryft::Parameter> ParameterizedFamily<P> for ... {
+    ///          type To = ...;
+    ///      }
+    ///
+    ///      #[automatically_derived]
+    ///      pub enum CustomParameterIterator<'__p, P: '__p + Parameter> where ... {
     ///          ...
     ///      }
     ///
     ///      #[automatically_derived]
-    ///      impl<'__p, P: '__p + Parameter> Iterator for CustomParamIterator<'__p, P> {
+    ///      impl<'__p, P: '__p + Parameter> Iterator for CustomParameterIterator<'__p, P> {
     ///          type Item = &'__p P;
     ///
     ///          fn next(&mut self) -> Option<Self::Item> {
@@ -649,12 +678,12 @@ impl CodeGenerator {
     ///      }
     ///
     ///      #[automatically_derived]
-    ///      pub enum CustomParamIteratorMut<'__p, P: '__p + Parameter> where ... {
+    ///      pub enum CustomParameterIteratorMut<'__p, P: '__p + Parameter> where ... {
     ///          ...
     ///      }
     ///
     ///      #[automatically_derived]
-    ///      impl<'__p, P: '__p + Parameter> Iterator for CustomParamIteratorMut<'__p, P> {
+    ///      impl<'__p, P: '__p + Parameter> Iterator for CustomParameterIteratorMut<'__p, P> {
     ///          type Item = &'__p mut P;
     ///
     ///          fn next(&mut self) -> Option<Self::Item> {
@@ -663,13 +692,55 @@ impl CodeGenerator {
     ///      }
     ///
     ///      #[automatically_derived]
-    ///      pub enum CustomParamIntoIterator<P: Parameter> where ... {
+    ///      pub enum CustomParameterIntoIterator<P: Parameter> where ... {
     ///          ...
     ///      }
     ///
     ///      #[automatically_derived]
-    ///      impl<P: Parameter> Iterator for CustomParamIntoIterator<P> {
+    ///      impl<P: Parameter> Iterator for CustomParameterIntoIterator<P> {
     ///          type Item = P;
+    ///
+    ///          fn next(&mut self) -> Option<Self::Item> {
+    ///              ...
+    ///          }
+    ///      }
+    ///
+    ///      #[automatically_derived]
+    ///      pub enum CustomNamedParameterIterator<'__p, P: '__p + Parameter> where ... {
+    ///          ...
+    ///      }
+    ///
+    ///      #[automatically_derived]
+    ///      impl<'__p, P: '__p + Parameter> Iterator for CustomNamedParameterIterator<'__p, P> {
+    ///          type Item = (ryft::ParameterPath, &'__p P);
+    ///
+    ///          fn next(&mut self) -> Option<Self::Item> {
+    ///              ...
+    ///          }
+    ///      }
+    ///
+    ///      #[automatically_derived]
+    ///      pub enum CustomNamedParameterIteratorMut<'__p, P: '__p + Parameter> where ... {
+    ///          ...
+    ///      }
+    ///
+    ///      #[automatically_derived]
+    ///      impl<'__p, P: '__p + Parameter> Iterator for CustomNamedParameterIteratorMut<'__p, P> {
+    ///          type Item = (ryft::ParameterPath, &'__p mut P);
+    ///
+    ///          fn next(&mut self) -> Option<Self::Item> {
+    ///              ...
+    ///          }
+    ///      }
+    ///
+    ///      #[automatically_derived]
+    ///      pub enum CustomNamedParameterIntoIterator<P: Parameter> where ... {
+    ///          ...
+    ///      }
+    ///
+    ///      #[automatically_derived]
+    ///      impl<P: Parameter> Iterator for CustomNamedParameterIntoIterator<P> {
+    ///          type Item = (ryft::ParameterPath, P);
     ///
     ///          fn next(&mut self) -> Option<Self::Item> {
     ///              ...
@@ -683,46 +754,52 @@ impl CodeGenerator {
     ///      must not be placed inside the [`Parameterized`] `impl` block that this [`CodeGenerator`] produces. It must
     ///      instead be placed adjacent to it. That is taken care of by [`CodeGenerator::generate_parameterized_impl`].
     fn generate_assoc_types(&self) -> (TokenStream, TokenStream) {
-        /// Helper that generates the associated [`Parameterized::ParamIterator`], [`Parameterized::ParamIteratorMut`],
-        /// or [`Parameterized::ParamIntoIterator`] type declaration for the [`Data`] owned by the provided
-        /// [`CodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete type declaration
-        /// but without the surrounding `impl` block. For example, the generated code may look something like this
-        /// (with `...` substituted for generated code, of course, and the `ryft` crate possibly substituted as well):
+        /// Helper that generates one associated parameter-iterator type declaration for the [`Data`]
+        /// owned by the provided [`CodeGenerator`]. This includes both unnamed iterators (i.e.,
+        /// [`Parameterized::ParameterIterator`], [`Parameterized::ParameterIteratorMut`],
+        /// and [`Parameterized::ParameterIntoIterator`]) and named iterators (i.e.,
+        /// [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
+        /// and [`Parameterized::NamedParameterIntoIterator`]). Note that this function returns a [`TokenStream`] with
+        /// the complete type declaration but without the surrounding `impl` block. For example, the generated code may
+        /// look something like this (with `...` substituted for generated code, of course, and the `ryft` crate
+        /// possibly substituted as well):
         ///
         /// ```ignore
-        /// type ParamIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+        /// type ParameterIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
+        /// type NamedParameterIterator<'__p, __P: '__p + ryft::Parameter> = ... where Self: '__p;
         /// ```
         ///
         /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParamIterator`],
-        ///     [`Parameterized::ParamIteratorMut`], and [`Parameterized::ParamIntoIterator`] to generate code for.
-        ///   * `iter_param_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
+        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
+        ///     [`Parameterized::ParameterIteratorMut`], [`Parameterized::ParameterIntoIterator`],
+        ///     [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
+        ///     and [`Parameterized::NamedParameterIntoIterator`] to generate code for.
+        ///   * `iter_parameter_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
         ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just directly
-        ///     use [`CodeGenerator::param_type`].
-        fn generate_assoc_type(generator: &CodeGenerator, iter_type: &IterType) -> TokenStream {
+        ///     use [`CodeGenerator::parameter_type`].
+        fn generate_assoc_iter_type(generator: &CodeGenerator, iter_type: &IterType) -> TokenStream {
             let ryft = &generator.ryft_crate;
-            let macro_param_lifetime = &generator.macro_param_lifetime;
-            let macro_param_type = &generator.macro_param_type;
+            let macro_parameter_lifetime = &generator.macro_parameter_lifetime;
+            let macro_parameter_type = &generator.macro_parameter_type;
 
             let body = match &generator.data {
                 Data::Struct(StructData { fields, .. }) => {
-                    generate_assoc_type_for_fields(generator, fields, iter_type, macro_param_type)
+                    generate_assoc_iter_type_for_fields(generator, fields, iter_type, macro_parameter_type)
                 }
                 Data::Enum(EnumData { ident, variants }) => {
-                    let iterator_ident = format_ident!("{}{}", &ident, iter_type.params_assoc_type_name());
+                    let iterator_ident = format_ident!("{}{}", &ident, iter_type.parameters_assoc_type_name());
 
                     // Refer to the implementation of [`generate_type_and_impl`] for more information on why the
                     // [`syn::Generics`] here are constructed this way.
                     let parameterized_fields = variants.iter().flat_map(|variant| variant.fields.iter());
                     let generics = generator.generics_for_fields(parameterized_fields);
-                    let generics = generics.with_renamed_param(&generator.param_type, macro_param_type);
+                    let generics = generics.with_renamed_param(&generator.parameter_type, macro_parameter_type);
                     let generics = match &iter_type {
-                        IterType::Iter => generics.with_lifetime(macro_param_lifetime, macro_param_type),
-                        IterType::IterMut => generics.with_lifetime(macro_param_lifetime, macro_param_type),
-                        IterType::IntoIter => generics.clone(),
+                        IterType::IntoIter | IterType::NamedIntoIter => generics.clone(),
+                        _ => generics.with_lifetime(macro_parameter_lifetime, macro_parameter_type),
                     };
                     let (_, ty_generics, _) = generics.split_for_impl();
 
@@ -730,95 +807,196 @@ impl CodeGenerator {
                         IterType::Iter => quote!(#iterator_ident #ty_generics),
                         IterType::IterMut => quote!(#iterator_ident #ty_generics),
                         IterType::IntoIter => quote!(#iterator_ident #ty_generics),
+                        IterType::NamedIter => quote!(#iterator_ident #ty_generics),
+                        IterType::NamedIterMut => quote!(#iterator_ident #ty_generics),
+                        IterType::NamedIntoIter => quote!(#iterator_ident #ty_generics),
                     }
                 }
             };
 
             match &iter_type {
                 IterType::Iter => quote! {
-                    type ParamIterator<
-                        #macro_param_lifetime,
-                        #macro_param_type: #macro_param_lifetime + #ryft::Parameter,
-                    > = #body where Self: #macro_param_lifetime;
+                    type ParameterIterator<
+                        #macro_parameter_lifetime,
+                        #macro_parameter_type: #macro_parameter_lifetime + #ryft::Parameter,
+                    > = #body where Self: #macro_parameter_lifetime;
                 },
                 IterType::IterMut => quote! {
-                    type ParamIteratorMut<
-                        #macro_param_lifetime,
-                        #macro_param_type: #macro_param_lifetime + #ryft::Parameter,
-                    > = #body where Self: #macro_param_lifetime;
+                    type ParameterIteratorMut<
+                        #macro_parameter_lifetime,
+                        #macro_parameter_type: #macro_parameter_lifetime + #ryft::Parameter,
+                    > = #body where Self: #macro_parameter_lifetime;
                 },
                 IterType::IntoIter => quote! {
-                    type ParamIntoIterator<#macro_param_type: #ryft::Parameter> = #body;
+                    type ParameterIntoIterator<#macro_parameter_type: #ryft::Parameter> = #body;
+                },
+                IterType::NamedIter => quote! {
+                    type NamedParameterIterator<
+                        #macro_parameter_lifetime,
+                        #macro_parameter_type: #macro_parameter_lifetime + #ryft::Parameter,
+                    > = #body where Self: #macro_parameter_lifetime;
+                },
+                IterType::NamedIterMut => quote! {
+                    type NamedParameterIteratorMut<
+                        #macro_parameter_lifetime,
+                        #macro_parameter_type: #macro_parameter_lifetime + #ryft::Parameter,
+                    > = #body where Self: #macro_parameter_lifetime;
+                },
+                IterType::NamedIntoIter => quote! {
+                    type NamedParameterIntoIterator<#macro_parameter_type: #ryft::Parameter> = #body;
                 },
             }
         }
 
-        /// Helper that generates the associated [`Parameterized::ParamIterator`], [`Parameterized::ParamIteratorMut`],
-        /// or [`Parameterized::ParamIntoIterator`] type portion for the provided [`Field`]s. The resulting
-        /// [`TokenStream`] contains an expression that evaluates to the appropriate type and that can be nested
-        /// directly within the generic arguments of other types (e.g., for nested tuples). It is the responsibility
-        /// of the caller to nest this appropriately within other types, if needed, and to generate the surrounding
-        /// code for the appropriate associated type declaration.
+        /// Helper that generates the associated iterator type portion for the provided [`Field`]s. This includes both
+        /// unnamed iterators (i.e., [`Parameterized::ParameterIterator`], [`Parameterized::ParameterIteratorMut`],
+        /// and [`Parameterized::ParameterIntoIterator`]) and named iterators (i.e.,
+        /// [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
+        /// and [`Parameterized::NamedParameterIntoIterator`]). The resulting [`TokenStream`] contains an expression
+        /// that evaluates to the appropriate type and that can be nested directly within the generic arguments of other
+        /// types (e.g., for nested tuples). It is the responsibility of the caller to nest this appropriately within
+        /// other types, if needed, and to generate the surrounding code for the appropriate associated type
+        /// declaration.
         ///
         /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParamIterator`],
-        ///     [`Parameterized::ParamIteratorMut`], and [`Parameterized::ParamIntoIterator`] to generate code for.
-        ///   * `iter_param_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
+        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
+        ///     [`Parameterized::ParameterIteratorMut`], [`Parameterized::ParameterIntoIterator`],
+        ///     [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
+        ///     and [`Parameterized::NamedParameterIntoIterator`] to generate code for.
+        ///   * `iter_parameter_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
         ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just
-        ///     directly use [`CodeGenerator::param_type`].
-        fn generate_assoc_type_for_fields(
+        ///     directly use [`CodeGenerator::parameter_type`].
+        fn generate_assoc_iter_type_for_fields(
             generator: &CodeGenerator,
             fields: &[Field],
             iter_type: &IterType,
-            iter_param_type: &syn::Ident,
+            iter_parameter_type: &syn::Ident,
         ) -> TokenStream {
-            let lifetime = &generator.macro_param_lifetime;
-            let item_ty = match &iter_type {
-                IterType::Iter => quote!(&#lifetime #iter_param_type),
-                IterType::IterMut => quote!(&#lifetime mut #iter_param_type),
-                IterType::IntoIter => quote!(#iter_param_type),
-            };
+            let ryft = &generator.ryft_crate;
+            let lifetime = &generator.macro_parameter_lifetime;
             fields
                 .iter()
                 .filter_map(|field| match &field {
-                    Field { is_param: false, .. } => None,
+                    Field { is_parameter: false, .. } => None,
                     Field { ty, fields: None, .. } => {
-                        let ryft = &generator.ryft_crate;
-                        let param_ty = &generator.param_type;
+                        let parameter_ty = &generator.parameter_type;
                         let assoc_ty = match &iter_type {
-                            IterType::Iter => quote!(ParamIterator<#lifetime, #iter_param_type>),
-                            IterType::IterMut => quote!(ParamIteratorMut<#lifetime, #iter_param_type>),
-                            IterType::IntoIter => quote!(ParamIntoIterator<#iter_param_type>),
+                            IterType::Iter => quote!(ParameterIterator<#lifetime, #iter_parameter_type>),
+                            IterType::IterMut => quote!(ParameterIteratorMut<#lifetime, #iter_parameter_type>),
+                            IterType::IntoIter => quote!(ParameterIntoIterator<#iter_parameter_type>),
+                            IterType::NamedIter => quote!(NamedParameterIterator<#lifetime, #iter_parameter_type>),
+                            IterType::NamedIterMut => {
+                                quote!(NamedParameterIteratorMut<#lifetime, #iter_parameter_type>)
+                            }
+                            IterType::NamedIntoIter => quote!(NamedParameterIntoIterator<#iter_parameter_type>),
                         };
-                        Some(quote!(<#ty as #ryft::Parameterized<#param_ty>>::#assoc_ty))
+                        Some(quote!(<#ty as #ryft::Parameterized<#parameter_ty>>::#assoc_ty))
                     }
-                    Field { fields: Some(fields), .. } => {
-                        Some(generate_assoc_type_for_fields(generator, fields, iter_type, iter_param_type))
+                    Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
+                        Some(generate_assoc_iter_type_for_fields(generator, fields, iter_type, iter_parameter_type))
+                    }
+                    Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                        let inner_ty = &inner_field.ty;
+                        let inner_iterator_ty = generate_assoc_iter_type_for_fields(
+                            generator,
+                            std::slice::from_ref(inner_field.as_ref()),
+                            iter_type,
+                            iter_parameter_type,
+                        );
+                        Some(match &iter_type {
+                            IterType::Iter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::Iter<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::IterMut => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IterMut<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::IntoIter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IntoIter<#inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(#inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::NamedIter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::Iter<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::NamedIterMut => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IterMut<#lifetime, #inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                            IterType::NamedIntoIter => quote!(
+                                std::iter::FlatMap<
+                                    std::option::IntoIter<#inner_ty>,
+                                    #inner_iterator_ty,
+                                    fn(#inner_ty) -> #inner_iterator_ty,
+                                >
+                            ),
+                        })
+                    }
+                })
+                .map(|iterator_ty| match &iter_type {
+                    IterType::Iter | IterType::IterMut | IterType::IntoIter => iterator_ty,
+                    IterType::NamedIter => quote!(
+                        #ryft::PathPrefixedParameterIterator<&#lifetime #iter_parameter_type, #iterator_ty>
+                    ),
+                    IterType::NamedIterMut => quote!(
+                        #ryft::PathPrefixedParameterIterator<&#lifetime mut #iter_parameter_type, #iterator_ty>
+                    ),
+                    IterType::NamedIntoIter => {
+                        quote!(#ryft::PathPrefixedParameterIterator<#iter_parameter_type, #iterator_ty>)
                     }
                 })
                 .reduce(|chain_ty, ty| quote!(std::iter::Chain<#chain_ty, #ty>))
-                .unwrap_or_else(|| quote!(std::iter::Empty<#item_ty>))
+                .unwrap_or_else(|| {
+                    let item_ty = match &iter_type {
+                        IterType::Iter => quote!(&#lifetime #iter_parameter_type),
+                        IterType::IterMut => quote!(&#lifetime mut #iter_parameter_type),
+                        IterType::IntoIter => quote!(#iter_parameter_type),
+                        IterType::NamedIter => quote!((#ryft::ParameterPath, &#lifetime #iter_parameter_type)),
+                        IterType::NamedIterMut => quote!((#ryft::ParameterPath, &#lifetime mut #iter_parameter_type)),
+                        IterType::NamedIntoIter => quote!((#ryft::ParameterPath, #iter_parameter_type)),
+                    };
+                    quote!(std::iter::Empty<#item_ty>)
+                })
         }
 
-        /// Helper that generates any custom iterator types and their corresponding [`Iterator`] `impl` blocks that may
-        /// be necessary for the corresponding [`Parameterized::ParamIterator`], [`Parameterized::ParamIteratorMut`], or
-        /// [`Parameterized::ParamIntoIterator`] declarations. Note that this function returns a [`TokenStream`] with
-        /// the complete type declarations and corresponding `impl` blocks that must be placed outside of any other
+        /// Helper that generates any custom iterator types and their corresponding [`Iterator`] `impl` blocks
+        /// that may be necessary for the corresponding unnamed iterator declarations (i.e.,
+        /// [`Parameterized::ParameterIterator`], [`Parameterized::ParameterIteratorMut`],
+        /// and [`Parameterized::ParameterIntoIterator`]) and named iterator declarations (i.e.,
+        /// [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`], and
+        /// [`Parameterized::NamedParameterIntoIterator`]). Note that this function returns a [`TokenStream`]
+        /// with the complete type declarations and corresponding `impl` blocks that must be placed outside of any other
         /// `impl` blocks that this [`CodeGenerator`] may produce. For example, the generated code may look something
         /// like this (with `...` substituted for generated code, of course, and the `ryft` crate possibly substituted
-        /// as well):
+        /// as well) for a specific [`IterType`]:
         ///
         /// ```ignore
         /// #[automatically_derived]
-        /// pub enum CustomParamIterator<'__p, P: '__p + Parameter> where ... {
+        /// pub enum CustomParameterIterator<'__p, P: '__p + Parameter> where ... {
         ///     ...
         /// }
         ///
         /// #[automatically_derived]
-        /// impl<'__p, P: '__p + Parameter> Iterator for CustomParamIterator<'__p, P> {
+        /// impl<'__p, P: '__p + Parameter> Iterator for CustomParameterIterator<'__p, P> {
         ///     type Item = &'__p P;
         ///
         ///     fn next(&mut self) -> Option<Self::Item> {
@@ -826,17 +1004,25 @@ impl CodeGenerator {
         ///     }
         /// }
         /// ```
-        fn generate_type_and_impl(generator: &CodeGenerator, iter_type: &IterType) -> Option<TokenStream> {
+        fn generate_iter_type_and_impl(generator: &CodeGenerator, iter_type: &IterType) -> Option<TokenStream> {
             match &generator.data {
                 Data::Struct(_) => None,
                 Data::Enum(EnumData { ident, variants }) => {
-                    let macro_param_lifetime = &generator.macro_param_lifetime;
-                    let param_type = &generator.param_type;
-                    let iterator_ident = format_ident!("{}{}", &ident, iter_type.params_assoc_type_name());
+                    let ryft = &generator.ryft_crate;
+                    let macro_parameter_lifetime = &generator.macro_parameter_lifetime;
+                    let parameter_type = &generator.parameter_type;
+                    let iterator_ident = format_ident!("{}{}", &ident, iter_type.parameters_assoc_type_name());
                     let item_ty = match &iter_type {
-                        IterType::Iter => quote!(&#macro_param_lifetime #param_type),
-                        IterType::IterMut => quote!(&#macro_param_lifetime mut #param_type),
-                        IterType::IntoIter => quote!(#param_type),
+                        IterType::Iter => quote!(&#macro_parameter_lifetime #parameter_type),
+                        IterType::IterMut => quote!(&#macro_parameter_lifetime mut #parameter_type),
+                        IterType::IntoIter => quote!(#parameter_type),
+                        IterType::NamedIter => {
+                            quote!((#ryft::ParameterPath, &#macro_parameter_lifetime #parameter_type))
+                        }
+                        IterType::NamedIterMut => {
+                            quote!((#ryft::ParameterPath, &#macro_parameter_lifetime mut #parameter_type))
+                        }
+                        IterType::NamedIntoIter => quote!((#ryft::ParameterPath, #parameter_type)),
                     };
 
                     // When generating types that hold references (e.g., iterators over parameter references),
@@ -845,20 +1031,37 @@ impl CodeGenerator {
                     let parameterized_fields = variants.iter().flat_map(|variant| variant.fields.iter());
                     let generics = generator.generics_for_fields(parameterized_fields);
                     let generics = match &iter_type {
-                        IterType::Iter => generics.with_lifetime(macro_param_lifetime, param_type),
-                        IterType::IterMut => generics.with_lifetime(macro_param_lifetime, param_type),
-                        IterType::IntoIter => generics.clone(),
+                        IterType::IntoIter | IterType::NamedIntoIter => generics.clone(),
+                        _ => generics.with_lifetime(macro_parameter_lifetime, parameter_type),
                     };
                     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
                     let iterator_variants = variants.iter().map(|variant| {
                         let variant_ident = &variant.ident;
-                        let iterator_type = generate_assoc_type_for_fields(
+                        let iterator_type = generate_assoc_iter_type_for_fields(
                             generator,
                             &variant.fields,
                             iter_type,
-                            &generator.param_type,
+                            &generator.parameter_type,
                         );
+                        let iterator_type = match &iter_type {
+                            IterType::Iter | IterType::IterMut | IterType::IntoIter => iterator_type,
+                            IterType::NamedIter => {
+                                quote!(#ryft::PathPrefixedParameterIterator<
+                                    &#macro_parameter_lifetime #parameter_type,
+                                    #iterator_type,
+                                >)
+                            }
+                            IterType::NamedIterMut => {
+                                quote!(#ryft::PathPrefixedParameterIterator<
+                                    &#macro_parameter_lifetime mut #parameter_type,
+                                    #iterator_type,
+                                >)
+                            }
+                            IterType::NamedIntoIter => {
+                                quote!(#ryft::PathPrefixedParameterIterator<#parameter_type, #iterator_type>)
+                            }
+                        };
                         quote!(#variant_ident(#iterator_type))
                     });
 
@@ -888,73 +1091,125 @@ impl CodeGenerator {
             }
         }
 
-        let macro_param_type = &self.macro_param_type;
-        let param_type = &self.param_type;
+        let ryft = &self.ryft_crate;
+        let macro_parameter_type = &self.macro_parameter_type;
+        let parameter_type = &self.parameter_type;
         let ident = self.data.ident();
 
-        // For the `To` associated type we need to rename the type parameter in our [`syn::Generics`].
+        // For generated `To` associated types we need to rename the parameter type in our [`syn::Generics`].
         // That is because if we do not rename it, we will end up with something like this:
         // ```
-        // impl<P: Parameter> Parameterized<P> for SomeType<P> {
-        //     type To<P> = SomeType<P>;
+        // impl<P: Parameter> ParameterizedFamily<P> for SomeType<Placeholder> {
+        //     type To = SomeType<P>;
         //     ...
         // }
         // ```
         // In this case, the name `P` conflicts with the generic parameter of the `impl` block itself.
         // What we really want is something like this instead:
         // ```
-        // impl<P: Parameter> Parameterized<P> for SomeType<P> {
-        //     type To<__P> = SomeType<__P>;
+        // impl<__P: Parameter> ParameterizedFamily<__P> for SomeType<Placeholder> {
+        //     type To = SomeType<__P>;
         //     ...
         // }
         // ```
         // where `__P` is a fresh and unique identifier. This generic parameter replacement is what
         // takes place in the following line (the uniqueness check for the name is performed in
         // [`CodeGenerator::check_for_name_conflicts`]).
-        let to_assoc_ty_generics = &self.generics.with_renamed_param(param_type, macro_param_type);
-        let to_assoc_impl_generics = &to_assoc_ty_generics.without_params(
-            to_assoc_ty_generics
-                .params
-                .iter()
-                .flat_map(|param| param.ident())
-                .filter(|param| param != &macro_param_type),
-        );
+        let to_assoc_ty_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
         let (_, to_assoc_ty_generics, _) = to_assoc_ty_generics.split_for_impl();
-        let (to_assoc_impl_generics, _, _) = to_assoc_impl_generics.split_for_impl();
-        let to_assoc_ty = quote!(type To #to_assoc_impl_generics = #ident #to_assoc_ty_generics;);
+        let to_assoc_parameter = quote!(#macro_parameter_type: #ryft::Parameter);
 
-        let param_iterator_assoc_ty = generate_assoc_type(self, &IterType::Iter);
-        let param_iterator_mut_assoc_ty = generate_assoc_type(self, &IterType::IterMut);
-        let param_into_iterator_assoc_ty = generate_assoc_type(self, &IterType::IntoIter);
-        let param_iterator_assoc_types = quote! {
+        // Generate the [`ParameterizedFamily`] implementation block first.
+        let family_generics = self.generics.with_renamed_param(parameter_type, macro_parameter_type);
+        let (family_impl_generics, _, family_where_clause) = family_generics.split_for_impl();
+        let family_type = if self.generics.params.is_empty() {
+            quote!(#ident)
+        } else {
+            let family_type_args = self.generics.params.iter().map(|parameter| match parameter {
+                syn::GenericParam::Lifetime(lifetime_param) => {
+                    let lifetime = &lifetime_param.lifetime;
+                    quote!(#lifetime)
+                }
+                syn::GenericParam::Type(type_param) if type_param.ident == *parameter_type => {
+                    quote!(#ryft::Placeholder)
+                }
+                syn::GenericParam::Type(type_param) => {
+                    let ident = &type_param.ident;
+                    quote!(#ident)
+                }
+                syn::GenericParam::Const(const_param) => {
+                    let ident = &const_param.ident;
+                    quote!(#ident)
+                }
+            });
+            quote!(#ident<#(#family_type_args),*>)
+        };
+        let family_impl = quote! {
+            #[automatically_derived]
+            impl #family_impl_generics #ryft::ParameterizedFamily<#macro_parameter_type>
+                for #family_type #family_where_clause
+            {
+                type To = #ident #to_assoc_ty_generics;
+            }
+        };
+
+        // Generate the [`Parameterized`] associated type declarations.
+        let family_assoc_ty = quote!(type Family = #family_type;);
+        let to_assoc_ty = quote!(
+            type To<#to_assoc_parameter>
+                = <Self::Family as #ryft::ParameterizedFamily<#macro_parameter_type>>::To
+            where
+                Self::Family: #ryft::ParameterizedFamily<#macro_parameter_type>;
+        );
+        let parameter_structure_assoc_type = quote!(type ParameterStructure = Self::To<#ryft::Placeholder>;);
+
+        let parameter_iterator_assoc_type = generate_assoc_iter_type(self, &IterType::Iter);
+        let parameter_iterator_mut_assoc_type = generate_assoc_iter_type(self, &IterType::IterMut);
+        let parameter_into_iterator_assoc_type = generate_assoc_iter_type(self, &IterType::IntoIter);
+        let named_parameter_iterator_assoc_type = generate_assoc_iter_type(self, &IterType::NamedIter);
+        let named_parameter_iterator_mut_assoc_type = generate_assoc_iter_type(self, &IterType::NamedIterMut);
+        let named_parameter_into_iterator_assoc_type = generate_assoc_iter_type(self, &IterType::NamedIntoIter);
+        let parameter_iterator_assoc_types = quote! {
+            #family_assoc_ty
             #to_assoc_ty
-            #param_iterator_assoc_ty
-            #param_iterator_mut_assoc_ty
-            #param_into_iterator_assoc_ty
+            #parameter_structure_assoc_type
+            #parameter_iterator_assoc_type
+            #parameter_iterator_mut_assoc_type
+            #parameter_into_iterator_assoc_type
+            #named_parameter_iterator_assoc_type
+            #named_parameter_iterator_mut_assoc_type
+            #named_parameter_into_iterator_assoc_type
         };
 
-        let param_iterator_type_and_impl = generate_type_and_impl(self, &IterType::Iter);
-        let param_iterator_mut_type_and_impl = generate_type_and_impl(self, &IterType::IterMut);
-        let param_into_iterator_type_and_impl = generate_type_and_impl(self, &IterType::IntoIter);
-        let param_iterator_types_and_impls = quote! {
-            #param_iterator_type_and_impl
-            #param_iterator_mut_type_and_impl
-            #param_into_iterator_type_and_impl
+        let parameter_iterator_type_and_impl = generate_iter_type_and_impl(self, &IterType::Iter);
+        let parameter_iterator_mut_type_and_impl = generate_iter_type_and_impl(self, &IterType::IterMut);
+        let parameter_into_iterator_type_and_impl = generate_iter_type_and_impl(self, &IterType::IntoIter);
+        let named_parameter_iterator_type_and_impl = generate_iter_type_and_impl(self, &IterType::NamedIter);
+        let named_parameter_iterator_mut_type_and_impl = generate_iter_type_and_impl(self, &IterType::NamedIterMut);
+        let named_parameter_into_iterator_type_and_impl = generate_iter_type_and_impl(self, &IterType::NamedIntoIter);
+        let parameter_iterator_types_and_impls = quote! {
+            #family_impl
+            #parameter_iterator_type_and_impl
+            #parameter_iterator_mut_type_and_impl
+            #parameter_into_iterator_type_and_impl
+            #named_parameter_iterator_type_and_impl
+            #named_parameter_iterator_mut_type_and_impl
+            #named_parameter_into_iterator_type_and_impl
         };
 
-        (param_iterator_assoc_types, param_iterator_types_and_impls)
+        (parameter_iterator_assoc_types, parameter_iterator_types_and_impls)
     }
 
-    /// Generates an implementation for the [`Parameterized::param_count`] for the [`Data`] owned by this
+    /// Generates an implementation for the [`Parameterized::parameter_count`] for the [`Data`] owned by this
     /// [`CodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete function declaration and
     /// implementation but without the surrounding `impl` block. For example, the generated code may look something like
     /// this (with `...` substituted for generated code, of course, and the `ryft` crate possibly substituted as well):
     ///
     /// ```ignore
-    /// fn param_count(&self) -> usize { ... }
+    /// fn parameter_count(&self) -> usize { ... }
     /// ```
-    fn generate_param_count_function(&self) -> TokenStream {
-        /// Helper that generates the body portion of the [`Parameterized::param_count`] function for the provided
+    fn generate_parameter_count_function(&self) -> TokenStream {
+        /// Helper that generates the body portion of the [`Parameterized::parameter_count`] function for the provided
         /// [`Field`]s. The resulting [`TokenStream`] contains an expression that evaluates to the appropriate [`usize`]
         /// and that can be nested directly within the body of the owning function. It is the responsibility of the
         /// caller to surround this [`TokenStream`] with braces and/or parenthesis and to generate the rest of the
@@ -970,11 +1225,16 @@ impl CodeGenerator {
             fields.iter().fold(quote!(0usize), |token_stream, field| {
                 let receiver = field.member(receiver.as_ref());
                 match &field {
-                    Field { is_param: false, .. } => token_stream,
-                    Field { fields: None, .. } => quote!(#token_stream + #receiver.param_count()),
-                    Field { fields: Some(fields), .. } => {
+                    Field { is_parameter: false, .. } => token_stream,
+                    Field { fields: None, .. } => quote!(#token_stream + #receiver.parameter_count()),
+                    Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                         let fields_expression = generate_body(fields, Some(receiver));
                         quote!(#token_stream + #fields_expression)
+                    }
+                    Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                        let fields_expression =
+                            generate_body(std::slice::from_ref(inner_field.as_ref()), Some(quote!(value)));
+                        quote!(#token_stream + #receiver.as_ref().map_or(0usize, |value| #fields_expression))
                     }
                 }
             })
@@ -998,24 +1258,24 @@ impl CodeGenerator {
             }
         };
 
-        quote!(fn param_count(&self) -> usize { #body })
+        quote!(fn parameter_count(&self) -> usize { #body })
     }
 
-    /// Generates an implementation for the [`Parameterized::param_structure`] for the [`Data`] owned by this
-    /// [`CodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete function declaration and
-    /// implementation but without the surrounding `impl` block. For example, the generated code may look something
+    /// Generates an implementation for the [`Parameterized::parameter_structure`] for the [`Data`] owned by this
+    /// [`CodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete function declaration
+    /// and implementation but without the surrounding `impl` block. For example, the generated code may look something
     /// like this (with `...` substituted for generated code, of course, and the `ryft` crate possible substituted
     /// as well):
     ///
     /// ```ignore
-    /// fn param_structure(&self) -> Self::To<ryft::Placeholder> { ... }
+    /// fn parameter_structure(&self) -> Self::To<ryft::Placeholder> { ... }
     /// ```
-    fn generate_param_structure_function(&self) -> TokenStream {
-        /// Helper that generates the body portion of the [`Parameterized::param_structure`] function for the provided
-        /// [`Field`]s. The resulting [`TokenStream`] contains an expression that evaluates to the appropriate structure
-        /// and that can be nested directly within the body of the owning function. It is the responsibility of the
-        /// caller to surround this [`TokenStream`] with braces and/or parenthesis and to generate the rest of the
-        /// surrounding code.
+    fn generate_parameter_structure_function(&self) -> TokenStream {
+        /// Helper that generates the body portion of the [`Parameterized::parameter_structure`] function for the
+        /// provided [`Field`]s. The resulting [`TokenStream`] contains an expression that evaluates to the appropriate
+        /// structure and that can be nested directly within the body of the owning function. It is the responsibility
+        /// of the caller to surround this [`TokenStream`] with braces and/or parenthesis and to generate the rest of
+        /// the surrounding code.
         ///
         /// # Parameters
         ///
@@ -1030,11 +1290,16 @@ impl CodeGenerator {
                     let prefix = field.ident.as_ref().map(|ident| quote!(#ident:)).unwrap_or(TokenStream::new());
                     let receiver = field.member(receiver.as_ref());
                     match &field {
-                        Field { is_param: false, .. } => quote!(#prefix #receiver.clone()),
-                        Field { fields: None, .. } => quote!(#prefix #receiver.param_structure()),
-                        Field { fields: Some(fields), .. } => {
+                        Field { is_parameter: false, .. } => quote!(#prefix #receiver.clone()),
+                        Field { fields: None, .. } => quote!(#prefix #receiver.parameter_structure()),
+                        Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                             let fields_expression = generate_body(fields, Some(receiver));
                             quote!(#prefix (#fields_expression))
+                        }
+                        Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                            let fields_expression =
+                                generate_body(std::slice::from_ref(inner_field.as_ref()), Some(quote!(value)));
+                            quote!(#prefix #receiver.as_ref().map(|value| #fields_expression))
                         }
                     }
                 })
@@ -1068,127 +1333,240 @@ impl CodeGenerator {
         };
 
         let ryft = &self.ryft_crate;
-        quote!(fn param_structure(&self) -> Self::To<#ryft::Placeholder> { #body })
+        quote!(fn parameter_structure(&self) -> Self::To<#ryft::Placeholder> { #body })
     }
 
-    /// Generates implementations for the [`Parameterized::params`], [`Parameterized::params_mut`], and
-    /// [`Parameterized::into_params`] functions for the [`Data`] owned by this [`CodeGenerator`]. Note that this
-    /// function returns a [`TokenStream`] with the complete function declarations and implementations but without
-    /// the surrounding `impl` block. For example, the generated code may look something like this (with `...`
-    /// substituted for generated code, of course, and the `ryft` crate possibly substituted as well):
+    /// Generates implementations for the [`Parameterized::parameters`], [`Parameterized::parameters_mut`],
+    /// [`Parameterized::into_parameters`], [`Parameterized::named_parameters`],
+    /// [`Parameterized::named_parameters_mut`], and [`Parameterized::into_named_parameters`] functions for the [`Data`]
+    /// owned by this [`CodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete function
+    /// declarations and implementations but without the surrounding `impl` block. For example, the generated code may
+    /// look something like this (with `...` substituted for generated code, of course, and the `ryft` crate possibly
+    /// substituted as well):
     ///
     /// ```ignore
-    /// fn params(&self) -> Self::ParamIterator<'_, P> { ... }
-    /// fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, P> { ... }
-    /// fn into_params(&mut self) -> Self::ParamIntoIterator<P> { ... }
+    /// fn parameters(&self) -> Self::ParameterIterator<'_, P> { ... }
+    /// fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> { ... }
+    /// fn into_parameters(self) -> Self::ParameterIntoIterator<P> { ... }
+    /// fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> { ... }
+    /// fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> { ... }
+    /// fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> { ... }
     /// ```
-    fn generate_params_functions(&self) -> TokenStream {
-        /// Helper that generates the body the [`Parameterized::params`], [`Parameterized::params_mut`], or
-        /// [`Parameterized::into_params`] function. The resulting [`TokenStream`] contains an expression that evaluates
-        /// to the appropriate iterator and should be used as the body of the owning function. It is the responsibility
-        /// of the caller to surround this [`TokenStream`] with braces and to generate the function
-        /// signature/declaration.
+    fn generate_parameters_functions(&self) -> TokenStream {
+        /// Helper that generates the body of one iterator-returning traversal function. This includes
+        /// both unnamed traversals (i.e., [`Parameterized::parameters`], [`Parameterized::parameters_mut`], and
+        /// [`Parameterized::into_parameters`]) and named traversals (i.e., [`Parameterized::named_parameters`],
+        /// [`Parameterized::named_parameters_mut`], and [`Parameterized::into_named_parameters`]). The resulting
+        /// [`TokenStream`] contains an expression that evaluates to the appropriate iterator and should be used as
+        /// the body of the owning function. It is the responsibility of the caller to surround this [`TokenStream`]
+        /// with braces and to generate the function signature/declaration.
         ///
         /// # Parameters
         ///
         ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::params`],
-        ///     [`Parameterized::params_mut`], and [`Parameterized::into_params`], to generate code for.
+        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::parameters`],
+        ///     [`Parameterized::parameters_mut`], [`Parameterized::into_parameters`],
+        ///     [`Parameterized::named_parameters`], [`Parameterized::named_parameters_mut`],
+        ///     and [`Parameterized::into_named_parameters`], to generate code for.
         fn generate_body(generator: &CodeGenerator, iter_type: &IterType) -> TokenStream {
             match &generator.data {
                 Data::Struct(StructData { fields, .. }) => {
-                    generate_body_for_fields(fields, Some(quote!(self)), iter_type)
+                    generate_body_for_fields(generator, fields, Some(quote!(self)), iter_type)
                 }
                 Data::Enum(EnumData { ident, variants }) => {
-                    let assoc_ty = iter_type.params_assoc_type_name();
-                    let variant_params = variants.iter().map(|variant| {
+                    let ryft = &generator.ryft_crate;
+                    let assoc_ty = iter_type.parameters_assoc_type_name();
+                    let variant_parameters = variants.iter().map(|variant| {
                         let variant_ident = &variant.ident;
                         let variant_path = quote!(#ident::#variant_ident);
                         let iterator_ident = format_ident!("{}{}", &ident, assoc_ty);
                         let fields = variant.fields.iter().map(|field| field.member(None));
-                        let fields_body = generate_body_for_fields(&variant.fields, None, iter_type);
-                        let variant_body = quote!(#iterator_ident::#variant_ident(#fields_body));
+                        let fields_body = generate_body_for_fields(generator, &variant.fields, None, iter_type);
+                        let variant_body = if iter_type.is_named() {
+                            let variant_name = variant.ident.to_string();
+                            quote! {
+                                #iterator_ident::#variant_ident(#ryft::PathPrefixedParameterIterator {
+                                    iterator: #fields_body,
+                                    segment: #ryft::ParameterPathSegment::Variant(#variant_name),
+                                })
+                            }
+                        } else {
+                            quote!(#iterator_ident::#variant_ident(#fields_body))
+                        };
                         match &variant.kind {
                             Kind::Unit => quote!(#variant_path => #variant_body),
                             Kind::Unnamed => quote!(#variant_path (#(#fields,)*) => #variant_body),
                             Kind::Named => quote!(#variant_path { #(#fields,)* } => #variant_body),
                         }
                     });
-                    quote!(match self { #(#variant_params,)* })
+                    quote!(match self { #(#variant_parameters,)* })
                 }
             }
         }
 
-        /// Helper that generates the body portion of the [`Parameterized::params`], [`Parameterized::params_mut`], or
-        /// [`Parameterized::into_params`] function for the provided [`Field`]s. The resulting [`TokenStream`] contains
-        /// an expression that evaluates to the appropriate iterator and that can be nested directly within the body of
-        /// the owning function. It is the responsibility of the caller to surround this [`TokenStream`] with braces
-        /// and/or parenthesis and to generate the rest of the surrounding code.
+        /// Helper that generates the field-level body portion of one iterator-returning traversal function
+        /// for the provided [`Field`]s. This includes both unnamed traversals (i.e., [`Parameterized::parameters`],
+        /// [`Parameterized::parameters_mut`], and [`Parameterized::into_parameters`]) and named traversals
+        /// (i.e., [`Parameterized::named_parameters`], [`Parameterized::named_parameters_mut`], and
+        /// [`Parameterized::into_named_parameters`]). The resulting [`TokenStream`] contains an expression that
+        /// evaluates to the appropriate iterator and that can be nested directly within the body of the owning
+        /// function. It is the responsibility of the caller to surround this [`TokenStream`] with braces and/or
+        /// parentheses and to generate the rest of the surrounding code.
         ///
         /// # Parameters
         ///
+        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
         ///   * `fields` - List of [`Field`]s for which to generate code.
         ///   * `receiver` - Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
         ///     the owner may be a tuple, a struct, or the variant of an enum. This is used to generate expressions that
         ///     access values of the provided [`Field`]s by invoking [`Field::member`].
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::params`],
-        ///     [`Parameterized::params_mut`], and [`Parameterized::into_params`], to generate code for.
+        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::parameters`],
+        ///     [`Parameterized::parameters_mut`], [`Parameterized::into_parameters`],
+        ///     [`Parameterized::named_parameters`], [`Parameterized::named_parameters_mut`],
+        ///     and [`Parameterized::into_named_parameters`], to generate code for.
         fn generate_body_for_fields(
+            generator: &CodeGenerator,
             fields: &[Field],
             receiver: Option<TokenStream>,
             iter_type: &IterType,
         ) -> TokenStream {
+            let ryft = &generator.ryft_crate;
+            let parameter_type = &generator.parameter_type;
             fields
                 .iter()
                 .filter_map(|field| {
                     let receiver = field.member(receiver.as_ref());
+                    let path_segment = match &field.ident {
+                        Some(ident) => {
+                            let name = ident.to_string();
+                            quote!(#ryft::ParameterPathSegment::Field(#name))
+                        }
+                        None => {
+                            let index = field.index;
+                            quote!(#ryft::ParameterPathSegment::TupleIndex(#index))
+                        }
+                    };
                     match &field {
-                        Field { is_param: false, .. } => None,
+                        Field { is_parameter: false, .. } => None,
                         Field { fields: None, .. } => Some(match &iter_type {
-                            IterType::Iter => quote!(#receiver.params()),
-                            IterType::IterMut => quote!(#receiver.params_mut()),
-                            IterType::IntoIter => quote!(#receiver.into_params()),
+                            IterType::Iter => quote!(#receiver.parameters()),
+                            IterType::IterMut => quote!(#receiver.parameters_mut()),
+                            IterType::IntoIter => quote!(#receiver.into_parameters()),
+                            IterType::NamedIter => quote!(#ryft::PathPrefixedParameterIterator {
+                                iterator: #receiver.named_parameters(),
+                                segment: #path_segment,
+                            }),
+                            IterType::NamedIterMut => quote!(#ryft::PathPrefixedParameterIterator {
+                                iterator: #receiver.named_parameters_mut(),
+                                segment: #path_segment,
+                            }),
+                            IterType::NamedIntoIter => quote!(#ryft::PathPrefixedParameterIterator {
+                                iterator: #receiver.into_named_parameters(),
+                                segment: #path_segment,
+                            }),
                         }),
-                        Field { fields: Some(fields), .. } => {
-                            Some(generate_body_for_fields(fields, Some(receiver), iter_type))
+                        Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
+                            let iterator = generate_body_for_fields(generator, fields, Some(receiver), iter_type);
+                            if iter_type.is_named() {
+                                Some(quote!(#ryft::PathPrefixedParameterIterator {
+                                    iterator: #iterator,
+                                    segment: #path_segment,
+                                }))
+                            } else {
+                                Some(iterator)
+                            }
+                        }
+                        Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                            let iterator = generate_body_for_fields(
+                                generator,
+                                std::slice::from_ref(inner_field.as_ref()),
+                                Some(quote!(value)),
+                                iter_type,
+                            );
+                            let iterator = match &iter_type {
+                                IterType::Iter => quote!(#receiver.iter().flat_map(|value| #iterator)),
+                                IterType::IterMut => quote!(#receiver.iter_mut().flat_map(|value| #iterator)),
+                                IterType::IntoIter => quote!(#receiver.into_iter().flat_map(|value| #iterator)),
+                                IterType::NamedIter => quote!(#receiver.iter().flat_map(|value| #iterator)),
+                                IterType::NamedIterMut => quote!(#receiver.iter_mut().flat_map(|value| #iterator)),
+                                IterType::NamedIntoIter => quote!(#receiver.into_iter().flat_map(|value| #iterator)),
+                            };
+                            if iter_type.is_named() {
+                                Some(quote!(#ryft::PathPrefixedParameterIterator {
+                                    iterator: #iterator,
+                                    segment: #path_segment,
+                                }))
+                            } else {
+                                Some(iterator)
+                            }
                         }
                     }
                 })
                 .reduce(|chain_ty, ty| quote!(#chain_ty.chain(#ty)))
-                .unwrap_or_else(|| quote!(std::iter::empty()))
+                .unwrap_or_else(|| match iter_type {
+                    IterType::Iter | IterType::IterMut | IterType::IntoIter => quote!(std::iter::empty()),
+                    IterType::NamedIter => quote!(std::iter::empty::<(#ryft::ParameterPath, &'_ #parameter_type)>()),
+                    IterType::NamedIterMut => {
+                        quote!(std::iter::empty::<(#ryft::ParameterPath, &'_ mut #parameter_type)>())
+                    }
+                    IterType::NamedIntoIter => quote!(std::iter::empty::<(#ryft::ParameterPath, #parameter_type)>()),
+                })
         }
 
-        let params_body = generate_body(self, &IterType::Iter);
-        let params_mut_body = generate_body(self, &IterType::IterMut);
-        let into_params_body = generate_body(self, &IterType::IntoIter);
+        let parameters_body = generate_body(self, &IterType::Iter);
+        let parameters_mut_body = generate_body(self, &IterType::IterMut);
+        let into_parameters_body = generate_body(self, &IterType::IntoIter);
+        let named_parameters_body = generate_body(self, &IterType::NamedIter);
+        let named_parameters_mut_body = generate_body(self, &IterType::NamedIterMut);
+        let into_named_parameters_body = generate_body(self, &IterType::NamedIntoIter);
 
-        let item_ty = &self.param_type;
+        let item_ty = &self.parameter_type;
         quote! {
-            fn params(&self) -> Self::ParamIterator<'_, #item_ty> { #params_body }
-            fn params_mut(&mut self) -> Self::ParamIteratorMut<'_, #item_ty> { #params_mut_body }
-            fn into_params(self) -> Self::ParamIntoIterator<#item_ty> { #into_params_body }
+            fn parameters(&self) -> Self::ParameterIterator<'_, #item_ty> {
+                #parameters_body
+            }
+
+            fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, #item_ty> {
+                #parameters_mut_body
+            }
+
+            fn into_parameters(self) -> Self::ParameterIntoIterator<#item_ty> {
+                #into_parameters_body
+            }
+
+            fn named_parameters(&self) -> Self::NamedParameterIterator<'_, #item_ty> {
+                #named_parameters_body
+            }
+
+            fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, #item_ty> {
+                #named_parameters_mut_body
+            }
+
+            fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<#item_ty> {
+                #into_named_parameters_body
+            }
         }
     }
 
-    /// Generates an implementation for the [`Parameterized::from_params_with_remainder`] for the [`Data`] owned by this
-    /// [`CodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete function declaration and
-    /// implementation but without the surrounding `impl` block. For example, the generated code may look something
+    /// Generates an implementation for the [`Parameterized::from_parameters_with_remainder`] for the [`Data`] owned by
+    /// this [`CodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete function declaration
+    /// and implementation but without the surrounding `impl` block. For example, the generated code may look something
     /// like this (with `...` substituted for generated code, of course, and the `ryft` crate possible substituted
     /// as well):
     ///
     /// ```ignore
-    /// fn from_params_with_remainder<I: Iterator<Item = P>>(
+    /// fn from_parameters_with_remainder<I: Iterator<Item = P>>(
     ///     structure: Self::To<ryft::Placeholder>,
-    ///     params: &mut I,
+    ///     parameters: &mut I,
     /// ) -> Result<Self, ryft::Error> {
-    ///     let expected_count = structure.param_count();
+    ///     let expected_count = structure.parameter_count();
     ///     Ok(...)
     /// }
     /// ```
-    fn generate_from_params_with_remainder(&self) -> TokenStream {
-        /// Helper that generates the body portion of the [`Parameterized::from_params_with_remainder`] function for
+    fn generate_from_parameters_with_remainder(&self) -> TokenStream {
+        /// Helper that generates the body portion of the [`Parameterized::from_parameters_with_remainder`] function for
         /// the provided [`Field`]s. The resulting [`TokenStream`] contains a comma-separated list of expressions that
-        /// compute the result of [`Parameterized::from_params_with_remainder`] for each of the provided [`Field`]s.
+        /// compute the result of [`Parameterized::from_parameters_with_remainder`] for each of the provided [`Field`]s.
         /// It is the responsibility of the caller to surround this [`TokenStream`] with braces and/or parenthesis and
         /// to generate the rest of the surrounding code.
         ///
@@ -1202,11 +1580,11 @@ impl CodeGenerator {
         ///     list by invoking [`Field::member`] to construct the appropriate accessor.
         fn generate_body(generator: &CodeGenerator, fields: &[Field], structure: Option<TokenStream>) -> TokenStream {
             let ryft = &generator.ryft_crate;
-            let param_type = &generator.param_type;
+            let parameter_type = &generator.parameter_type;
 
             // Note that `expected_count`, which is referenced by the generated code here is defined in the beginning
-            // of the implementation of the generated [`Parameterized::from_params_with_remainder`] function body.
-            let insufficient_params_error = quote!(#ryft::Error::InsufficientParams { expected_count });
+            // of the implementation of the generated [`Parameterized::from_parameters_with_remainder`] function body.
+            let missing_parameters_error = quote!(#ryft::Error::MissingParameters { expected_count, paths });
 
             fields
                 .iter()
@@ -1214,19 +1592,27 @@ impl CodeGenerator {
                     let prefix = field.ident.as_ref().map(|ident| quote!(#ident:)).unwrap_or(TokenStream::new());
                     let structure = field.member(structure.as_ref());
                     match &field {
-                        Field { is_param: false, .. } => quote!(#prefix #structure),
+                        Field { is_parameter: false, .. } => quote!(#prefix #structure),
                         Field { ty, fields: None, .. } => quote! {
-                            #prefix <#ty as #ryft::Parameterized<#param_type>>::from_params_with_remainder(
+                            #prefix <#ty as #ryft::Parameterized<#parameter_type>>::from_parameters_with_remainder(
                                 #structure,
-                                params,
+                                parameters,
                             ).map_err(|error| match error {
-                                #ryft::Error::InsufficientParams { .. } => #insufficient_params_error,
+                                #ryft::Error::MissingParameters { paths, .. } => #missing_parameters_error,
                                 error => error,
                             })?
                         },
-                        Field { fields: Some(fields), .. } => {
+                        Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                             let fields_expression = generate_body(generator, fields, Some(structure));
                             quote!(#prefix (#fields_expression))
+                        }
+                        Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                            let fields_expression = generate_body(
+                                generator,
+                                std::slice::from_ref(inner_field.as_ref()),
+                                Some(quote!(structure)),
+                            );
+                            quote!(#prefix #structure.map(|structure| Ok(#fields_expression)).transpose()?)
                         }
                     }
                 })
@@ -1244,7 +1630,7 @@ impl CodeGenerator {
                 }
             }
             Data::Enum(EnumData { ident, variants }) => {
-                let variant_from_params_with_remainders = variants.iter().map(|variant| {
+                let variant_from_parameters_with_remainders = variants.iter().map(|variant| {
                     let variant_ident = &variant.ident;
                     let variant_path = quote!(#ident::#variant_ident);
                     let fields = variant.fields.iter().map(|field| field.member(None));
@@ -1255,19 +1641,19 @@ impl CodeGenerator {
                         Kind::Named => quote!(#variant_path { #(#fields,)* } => #variant_path { #result }),
                     }
                 });
-                quote!(match structure { #(#variant_from_params_with_remainders,)* })
+                quote!(match structure { #(#variant_from_parameters_with_remainders,)* })
             }
         };
 
         let ryft = &self.ryft_crate;
-        let param_type = &self.param_type;
-        let self_to_as_parameterized = quote!(<Self::To<#ryft::Placeholder> as Parameterized<#ryft::Placeholder>>);
+        let parameter_type = &self.parameter_type;
+        let self_to_as_parameterized = quote!(<Self::ParameterStructure as #ryft::Parameterized<#ryft::Placeholder>>);
         quote! {
-            fn from_params_with_remainder<I: Iterator<Item = #param_type>>(
+            fn from_parameters_with_remainder<I: Iterator<Item = #parameter_type>>(
                 structure: Self::To<#ryft::Placeholder>,
-                params: &mut I,
+                parameters: &mut I,
             ) -> Result<Self, #ryft::Error> {
-                let expected_count = #self_to_as_parameterized::param_count(&structure);
+                let expected_count = #self_to_as_parameterized::parameter_count(&structure);
                 Ok(#body)
             }
         }
@@ -1277,14 +1663,14 @@ impl CodeGenerator {
     /// [`syn::GenericParam`]s that are referenced by the provided [`Field`]s. This is useful for constructing
     /// [`syn::Generics`]s for types that e.g., only involve [`Parameterized`] [`Field`]s.
     fn generics_for_fields<'s, I: IntoIterator<Item = &'s Field>>(&'s self, fields: I) -> syn::Generics {
-        let field_types = fields.into_iter().filter(|f| f.is_param).map(|f| &f.ty).collect::<Vec<_>>();
-        let params_to_remove = self
+        let field_types = fields.into_iter().filter(|f| f.is_parameter).map(|f| &f.ty).collect::<Vec<_>>();
+        let parameters_to_remove = self
             .generics
             .params
             .iter()
-            .flat_map(|param| param.ident())
+            .flat_map(|parameter| parameter.ident())
             .filter(|ident| !field_types.iter().any(|ty| ty.matches_ident(ident) || ty.references_ident(ident)));
-        self.generics.without_params(params_to_remove)
+        self.generics.without_params(parameters_to_remove)
     }
 }
 
@@ -1335,11 +1721,20 @@ struct Variant {
     kind: Kind,
 }
 
+/// [`Field`]s nested within another [`Field`] for cases where we need to recurse into the nested fields.
+enum NestedFields {
+    /// Tuple [`Field`]s that are nested within a [`Field`] that is a tuple.
+    Tuple(Vec<Field>),
+
+    /// Option [`Field`] that is nested within a [`Field`] that is an [`Option`].
+    Option(Box<Field>),
+}
+
 /// Parsed [`syn::Field`] from a container that was annotated with `#[derive(Parameterized)]`.
 struct Field {
     /// Indicates whether the [`syn::Type`] of this [`Field`] should be bounded by [`Parameterized`].
-    /// This is determined by whether or not this [`Field`]'s type references [`CodeGenerator::param_type`].
-    is_param: bool,
+    /// This is determined by whether this [`Field`]'s type references [`CodeGenerator::parameter_type`].
+    is_parameter: bool,
 
     /// Index of this [`Field`] in the container that it belongs.
     index: usize,
@@ -1350,15 +1745,24 @@ struct Field {
     /// [`syn::Type`] of this [`Field`].
     ty: syn::Type,
 
-    /// Nested [`Field`]s of this [`Field`]. This is optional because it is only relevant for tuples. When a
-    /// [`CodeGenerator`] synthesized [`Parameterized`] implementations it needs to recurse into nested tuple types
-    /// as those types are not [`Parameterized`] by default (this is due to the fact that providing [`Parameterized`]
-    /// implementations for all possible tuple types with arbitrary combinations of [`Parameter`] and non-[`Parameter`]
-    /// fields is too expensive; the number of such combinations grows exponentially with the tuple size).
-    ///
-    /// In summary, the way to interpret this field is that if [`Field::ty`] is a [`syn::Type::Tuple`], then this field
-    /// will be populated with the [`Field`]s extracted from that [`syn::Type::Tuple`].
-    fields: Option<Vec<Field>>,
+    /// Nested [`Field`]s of this [`Field`]. This is optional because it is only relevant for tuple and [`Option`]
+    /// wrappers. When a [`CodeGenerator`] synthesizes [`Parameterized`] implementations it needs to recurse into
+    /// nested tuple types (this is due to the fact that providing [`Parameterized`] implementations for all possible
+    /// tuple types with arbitrary combinations of [`Parameter`] and non-[`Parameter`] fields is too expensive; the
+    /// number of such combinations grows exponentially with the tuple size), and into nested [`Option`] payloads to
+    /// support optional mixed fields without requiring a global container-level `impl Parameterized<P> for Option<T>`,
+    /// which is problematic because we also already have `impl<P: Parameter> Parameter for Option<P>`. In summary,
+    /// this field is populated when [`Self::ty`] is either a [`syn::Type::Tuple`] or an [`Option`] type-path, in which
+    /// case it stores the corresponding extracted nested [`Field`] description.
+    fields: Option<NestedFields>,
+
+    /// Boolean flag indicating whether [`Self::member`] should use the provided receiver directly, without appending
+    /// any member accessor (e.g., `.field` or `.0` to it). This is needed for synthetic nodes that do not correspond
+    /// to an actual struct field or tuple member. In particular, for nested [`Option`]s we recurse by pattern matching
+    /// as `Some(value)`. The synthesized inner field then represents that already-bound `value`, meaning that member
+    /// access must evaluate to `value` directly. Without this marker, recursion would incorrectly try to access
+    /// `value.0` before descending into nested tuple fields.
+    use_receiver_directly: bool,
 }
 
 impl Field {
@@ -1375,11 +1779,13 @@ impl Field {
     /// (e.g., `match &self { Enum(field_0) => ... field_0 ...}`).
     fn member(&self, receiver: Option<&TokenStream>) -> TokenStream {
         let index = syn::Member::Unnamed(self.index.into());
-        match (&self.ident, receiver) {
-            (None, None) => format_ident!("field_{}", self.index).into_token_stream(),
-            (Some(ident), None) => quote!(#ident),
-            (Some(ident), Some(receiver)) => quote!(#receiver.#ident),
-            (None, Some(receiver)) => quote!(#receiver.#index),
+        match (self.use_receiver_directly, &self.ident, receiver) {
+            (true, _, None) => format_ident!("field_{}", self.index).into_token_stream(),
+            (true, _, Some(receiver)) => receiver.clone(),
+            (false, None, None) => format_ident!("field_{}", self.index).into_token_stream(),
+            (false, Some(ident), None) => quote!(#ident),
+            (false, Some(ident), Some(receiver)) => quote!(#receiver.#ident),
+            (false, None, Some(receiver)) => quote!(#receiver.#index),
         }
     }
 }
@@ -1399,16 +1805,760 @@ enum IterType {
     Iter,
     IterMut,
     IntoIter,
+    NamedIter,
+    NamedIterMut,
+    NamedIntoIter,
 }
 
 impl IterType {
+    /// Returns `true` if this [`IterType`] corresponds to a _named_ parameter iterator.
+    fn is_named(&self) -> bool {
+        matches!(self, IterType::NamedIter | IterType::NamedIterMut | IterType::NamedIntoIter)
+    }
+
     /// Returns the name of the associated type of [`Parameterized`] that corresponds to this [`IterType`];
-    /// namely, one of `ParamIterator`, `ParamIteratorMut`, and `ParamIntoIterator`.
-    fn params_assoc_type_name(&self) -> syn::Ident {
+    /// namely, one of `ParameterIterator`, `ParameterIteratorMut`, `ParameterIntoIterator`, `NamedParameterIterator`,
+    /// `NamedParameterIteratorMut`, and `NamedParameterIntoIterator`.
+    fn parameters_assoc_type_name(&self) -> syn::Ident {
         match &self {
-            IterType::Iter => syn::Ident::new("ParamIterator", Span::call_site()),
-            IterType::IterMut => syn::Ident::new("ParamIteratorMut", Span::call_site()),
-            IterType::IntoIter => syn::Ident::new("ParamIntoIterator", Span::call_site()),
+            IterType::Iter => syn::Ident::new("ParameterIterator", Span::call_site()),
+            IterType::IterMut => syn::Ident::new("ParameterIteratorMut", Span::call_site()),
+            IterType::IntoIter => syn::Ident::new("ParameterIntoIterator", Span::call_site()),
+            IterType::NamedIter => syn::Ident::new("NamedParameterIterator", Span::call_site()),
+            IterType::NamedIterMut => syn::Ident::new("NamedParameterIteratorMut", Span::call_site()),
+            IterType::NamedIntoIter => syn::Ident::new("NamedParameterIntoIterator", Span::call_site()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+    use quote::{ToTokens, quote};
+
+    use crate::helpers::idents::IdentHelpers;
+
+    use super::*;
+
+    #[test]
+    fn test_code_generator_add_error_and_compile_error() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        generator.add_error(quote!(field_a), "first error");
+        generator.add_error(quote!(field_b), "second error");
+        let error = generator.compile_error().expect("expected combined compile error").to_string();
+        assert!(error.contains("compile_error"));
+        assert!(error.contains("first error"));
+        assert!(error.contains("second error"));
+    }
+
+    #[test]
+    fn test_code_generator_extract_attributes() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+
+        // Text using valid attributes.
+        let input = syn::parse2(quote! {
+            #[ryft(crate = "wrapped::ryft")]
+            struct Container<P: Parameter> {
+                parameter: P,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_attributes(&input);
+        assert_eq!(generator.ryft_crate.to_token_stream().to_string(), "wrapped :: ryft");
+        assert!(generator.errors.is_empty());
+
+        // Test using invalid attributes.
+        let input = syn::parse2(quote! {
+            #[ryft(crate = "ryft", unknown = "value")]
+            struct Container<P: Parameter> {
+                parameter: P,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_attributes(&input);
+        let errors = generator.errors.iter().map(|error| error.to_string()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("invalid '#[ryft(...)]' attribute: 'unknown'"));
+    }
+
+    #[test]
+    fn test_code_generator_extract_parameter_type() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+
+        // Test extracting the parameter type from a type bound.
+        let input = syn::parse2(quote! {
+            struct Container<P: Parameter, U> {
+                parameter: P,
+                helper: U,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        assert_eq!(generator.parameter_type.to_string(), "P");
+        assert!(generator.errors.is_empty());
+
+        // Test extracting the parameter type from a where clause.
+        let input = syn::parse2(quote! {
+            struct Container<P, U>
+            where
+                P: ryft::Parameter,
+            {
+                parameter: P,
+                helper: U,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        assert_eq!(generator.parameter_type.to_string(), "P");
+        assert!(generator.errors.is_empty());
+
+        // Test extracting the parameter type when there is none.
+        let input = syn::parse2(quote! {
+            struct MissingParameterBound<T> {
+                value: T,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        assert!(
+            generator
+                .errors
+                .iter()
+                .map(|error| error.to_string())
+                .any(|message| message.contains("found no generic types bounded by 'Parameter'"))
+        );
+
+        // Test extracting the parameter type when there are multiple.
+        let input = syn::parse2(quote! {
+            struct MultipleParameterBounds<P: Parameter, Q: ryft::Parameter> {
+                p: P,
+                q: Q,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        assert!(
+            generator
+                .errors
+                .iter()
+                .map(|error| error.to_string())
+                .any(|message| message.contains("found more than one generic types bounded by 'Parameter'"))
+        );
+    }
+
+    #[test]
+    fn test_code_generator_extract_data() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+
+        // Test using a struct with nested fields.
+        let input = syn::parse2(quote! {
+            struct Container<P: Parameter> {
+                parameter: P,
+                nested: (usize, P),
+                helper: usize,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        match &generator.data {
+            Data::Struct(struct_data) => {
+                assert!(matches!(struct_data.kind, Kind::Named));
+                assert_eq!(struct_data.fields.len(), 3);
+                let nested_field = struct_data
+                    .fields
+                    .iter()
+                    .find(|field| field.ident.as_ref().map(|ident| ident == "nested").unwrap_or(false))
+                    .expect("expected to find the 'nested' field");
+                assert!(nested_field.is_parameter);
+                let tuple_fields = match nested_field.fields.as_ref() {
+                    Some(NestedFields::Tuple(fields)) => fields,
+                    _ => panic!("expected nested tuple fields"),
+                };
+                assert_eq!(tuple_fields.len(), 2);
+                assert!(!tuple_fields[0].is_parameter);
+                assert!(tuple_fields[1].is_parameter);
+            }
+            Data::Enum(_) => panic!("expected extracted data to be a struct"),
+        }
+        assert!(generator.errors.is_empty());
+
+        // Test using a struct with nested options containing mixed tuples.
+        let input = syn::parse2(quote! {
+            struct OptionalContainer<P: Parameter> {
+                maybe: Option<(usize, P)>,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        match &generator.data {
+            Data::Struct(struct_data) => {
+                assert!(matches!(struct_data.kind, Kind::Named));
+                assert_eq!(struct_data.fields.len(), 1);
+                let maybe_field = struct_data
+                    .fields
+                    .iter()
+                    .find(|field| field.ident.as_ref().map(|ident| ident == "maybe").unwrap_or(false))
+                    .expect("expected to find the 'maybe' field");
+                assert!(maybe_field.is_parameter);
+                let option_inner = match maybe_field.fields.as_ref() {
+                    Some(NestedFields::Option(field)) => field,
+                    _ => panic!("expected nested option fields"),
+                };
+                assert!(option_inner.use_receiver_directly);
+                let tuple_fields = match option_inner.fields.as_ref() {
+                    Some(NestedFields::Tuple(fields)) => fields,
+                    _ => panic!("expected nested tuple fields inside option"),
+                };
+                assert_eq!(tuple_fields.len(), 2);
+                assert!(!tuple_fields[0].is_parameter);
+                assert!(tuple_fields[1].is_parameter);
+            }
+            Data::Enum(_) => panic!("expected extracted data to be a struct"),
+        }
+        assert!(generator.errors.is_empty());
+
+        // Test using invalid struct field attributes and parameter ownership.
+        let input = syn::parse2(quote! {
+            struct Container<P: Parameter> {
+                #[ryft(crate = "_ryft")]
+                attributed: P,
+                ptr: *const P,
+                reference: &'static P,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        let errors = generator.errors.iter().map(|error| error.to_string()).collect::<Vec<_>>();
+        assert!(errors.iter().any(|message| message.contains(FIELD_ATTRIBUTE_ERROR.trim())));
+        assert!(errors.iter().any(|message| message.contains("pointers are not allowed")));
+        assert!(errors.iter().any(|message| message.contains("references are not allowed")));
+
+        // Test using invalid enum variant attributes.
+        let input = syn::parse2(quote! {
+            enum Container<P: Parameter> {
+                #[ryft(crate = "_ryft")]
+                VariantA(P),
+                VariantB(#[ryft(crate = "_ryft")] P),
+                VariantC {
+                    #[ryft(crate = "_ryft")]
+                    value: P,
+                },
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        let errors = generator.errors.iter().map(|error| error.to_string()).collect::<Vec<_>>();
+        assert_eq!(errors.iter().filter(|message| message.contains(FIELD_ATTRIBUTE_ERROR.trim())).count(), 6);
+
+        // Test using a union.
+        let input = syn::parse2(quote! {
+            union Container<P: Parameter> {
+                value: std::mem::ManuallyDrop<P>,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        assert!(
+            generator
+                .errors
+                .iter()
+                .map(|error| error.to_string())
+                .any(|message| message.contains("does not support unions"))
+        );
+    }
+
+    #[test]
+    fn test_code_generator_extract_generics() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let input = syn::parse2(quote! {
+            struct Container<P: Parameter, T> {
+                parameter: P,
+                helper: T,
+                nested: (P, usize),
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        generator.extract_generics(&input);
+        let where_clause = generator.generics.where_clause.as_ref().expect("expected a where clause");
+        assert!(where_clause.predicates.iter().any(|predicate| match predicate {
+            syn::WherePredicate::Type(predicate_type) => {
+                predicate_type.bounded_ty.matches_ident(&syn::parse_quote!(T))
+                    && predicate_type.bounds.iter().any(|bound| {
+                        matches!(
+                            bound,
+                            syn::TypeParamBound::Trait(trait_bound) if trait_bound.path.is_ident("Clone"),
+                        )
+                    })
+            }
+            _ => false,
+        }));
+        assert!(where_clause.predicates.iter().any(|predicate| match predicate {
+            syn::WherePredicate::Type(predicate_type) => {
+                predicate_type.bounded_ty.references_ident(&syn::parse_quote!(P))
+                    && predicate_type.bounds.iter().any(|bound| match bound {
+                        syn::TypeParamBound::Trait(trait_bound) => trait_bound
+                            .path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident == "Parameterized")
+                            .unwrap_or(false),
+                        _ => false,
+                    })
+            }
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn test_code_generator_check_for_name_conflicts() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let input = syn::parse2(quote! {
+            struct Container<'__p, __P: Parameter, P: Parameter> {
+                marker: std::marker::PhantomData<(&'__p (), __P, P)>,
+            }
+        })
+        .expect("failed to parse derive input");
+        generator.check_for_name_conflicts(&input);
+        let errors = generator.errors.iter().map(|error| error.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(errors.contains("reserved"));
+        assert!(errors.contains("'__p"));
+        assert!(errors.contains("__P"));
+    }
+
+    #[test]
+    fn test_code_generator_generate_assoc_types() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let input = syn::parse2(quote!(
+            struct Container<P: Parameter> {
+                parameter: P,
+                nested: (usize, P),
+                helper: usize,
+            }
+        ))
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        generator.extract_generics(&input);
+        let (assoc_types, additional_types_and_impls) = generator.generate_assoc_types();
+        let assoc_types = assoc_types.to_string();
+        let additional_types_and_impls = additional_types_and_impls.to_string();
+        assert_eq!(
+            assoc_types,
+            indoc! {"
+                type Family = Container < ryft :: Placeholder > ; \
+                type To < __P : ryft :: Parameter > \
+                    = < Self :: Family as ryft :: ParameterizedFamily < __P >> :: To \
+                    where Self :: Family : ryft :: ParameterizedFamily < __P > ; \
+                type ParameterStructure = Self :: To < ryft :: Placeholder > ; \
+                type ParameterIterator < '__p , __P : '__p + ryft :: Parameter , > \
+                    = std :: iter :: Chain < \
+                        < P as ryft :: Parameterized < P >> :: ParameterIterator < '__p , __P > , \
+                        < P as ryft :: Parameterized < P >> :: ParameterIterator < '__p , __P > \
+                    > where Self : '__p ; \
+                type ParameterIteratorMut < '__p , __P : '__p + ryft :: Parameter , > \
+                    = std :: iter :: Chain < \
+                        < P as ryft :: Parameterized < P >> :: ParameterIteratorMut < '__p , __P > , \
+                        < P as ryft :: Parameterized < P >> :: ParameterIteratorMut < '__p , __P > \
+                    > where Self : '__p ; \
+                type ParameterIntoIterator < __P : ryft :: Parameter > \
+                    = std :: iter :: Chain < \
+                        < P as ryft :: Parameterized < P >> :: ParameterIntoIterator < __P > , \
+                        < P as ryft :: Parameterized < P >> :: ParameterIntoIterator < __P > \
+                    > ; \
+                type NamedParameterIterator < '__p , __P : '__p + ryft :: Parameter , > \
+                    = std :: iter :: Chain < \
+                        ryft :: PathPrefixedParameterIterator < \
+                            & '__p __P , \
+                            < P as ryft :: Parameterized < P >> :: NamedParameterIterator < '__p , __P > \
+                        > , \
+                        ryft :: PathPrefixedParameterIterator < \
+                            & '__p __P , \
+                            ryft :: PathPrefixedParameterIterator < \
+                                & '__p __P , \
+                                < P as ryft :: Parameterized < P >> :: NamedParameterIterator < '__p , __P > \
+                            > \
+                        > \
+                    > where Self : '__p ; \
+                type NamedParameterIteratorMut < '__p , __P : '__p + ryft :: Parameter , > \
+                    = std :: iter :: Chain < \
+                        ryft :: PathPrefixedParameterIterator < \
+                            & '__p mut __P , \
+                            < P as ryft :: Parameterized < P >> :: NamedParameterIteratorMut < '__p , __P > \
+                        > , \
+                        ryft :: PathPrefixedParameterIterator < \
+                            & '__p mut __P , \
+                            ryft :: PathPrefixedParameterIterator < \
+                                & '__p mut __P , \
+                                < P as ryft :: Parameterized < P >> :: NamedParameterIteratorMut < '__p , __P > \
+                            > \
+                        > \
+                    > where Self : '__p ; \
+                type NamedParameterIntoIterator < __P : ryft :: Parameter > \
+                    = std :: iter :: Chain < \
+                        ryft :: PathPrefixedParameterIterator < \
+                            __P , \
+                            < P as ryft :: Parameterized < P >> :: NamedParameterIntoIterator < __P > \
+                        > , \
+                        ryft :: PathPrefixedParameterIterator < \
+                            __P , \
+                            ryft :: PathPrefixedParameterIterator < \
+                                __P , \
+                                < P as ryft :: Parameterized < P >> :: NamedParameterIntoIterator < __P > \
+                            > \
+                        > \
+                    > ;\
+            "},
+        );
+        assert_eq!(
+            additional_types_and_impls,
+            indoc! {"
+                # [automatically_derived] \
+                impl < __P : Parameter > ryft :: ParameterizedFamily < __P > for Container < ryft :: Placeholder > \
+                where __P : ryft :: Parameterized < __P , ParameterStructure = ryft :: Placeholder > , \
+                      __P : ryft :: Parameterized < __P , ParameterStructure = ryft :: Placeholder > , \
+                      usize : Clone { type To = Container < __P > ; }\
+            "},
+        );
+    }
+
+    #[test]
+    fn test_code_generator_generate_parameter_count_function() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let input = syn::parse2(quote!(
+            struct Container<P: Parameter> {
+                parameter: P,
+                nested: (usize, P),
+                helper: usize,
+            }
+        ))
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        let generated = generator.generate_parameter_count_function().to_string();
+        assert_eq!(
+            generated,
+            indoc! {"
+                fn parameter_count (& self) -> usize { \
+                    0usize \
+                        + self . parameter . parameter_count () \
+                        + 0usize \
+                        + self . nested . 1 . parameter_count () \
+                }\
+            "},
+        );
+    }
+
+    #[test]
+    fn test_code_generator_generate_parameter_structure_function() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let input = syn::parse2(quote!(
+            struct Container<P: Parameter> {
+                parameter: P,
+                nested: (usize, P),
+                helper: usize,
+            }
+        ))
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        let generated = generator.generate_parameter_structure_function().to_string();
+        assert_eq!(
+            generated,
+            indoc! {"
+                fn parameter_structure (& self) -> Self :: To < ryft :: Placeholder > { \
+                    Container { \
+                        parameter : self . parameter . parameter_structure () , \
+                        nested : (self . nested . 0 . clone () , self . nested . 1 . parameter_structure ()) , \
+                        helper : self . helper . clone () \
+                    } \
+                }\
+            "},
+        );
+    }
+
+    #[test]
+    fn test_code_generator_generate_parameters_functions() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let input = syn::parse2(quote!(
+            struct Container<P: Parameter> {
+                parameter: P,
+                nested: (usize, P),
+                helper: usize,
+            }
+        ))
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        let generated = generator.generate_parameters_functions().to_string();
+        assert_eq!(
+            generated,
+            indoc! {"
+                fn parameters (& self) -> Self :: ParameterIterator < '_ , P > { \
+                    self . parameter . parameters () . chain (self . nested . 1 . parameters ()) \
+                } \
+                fn parameters_mut (& mut self) -> Self :: ParameterIteratorMut < '_ , P > { \
+                    self . parameter . parameters_mut () . chain (self . nested . 1 . parameters_mut ()) \
+                } \
+                fn into_parameters (self) -> Self :: ParameterIntoIterator < P > { \
+                    self . parameter . into_parameters () . chain (self . nested . 1 . into_parameters ()) \
+                } \
+                fn named_parameters (& self) -> Self :: NamedParameterIterator < '_ , P > { \
+                    ryft :: PathPrefixedParameterIterator { \
+                        iterator : self . parameter . named_parameters () , \
+                        segment : ryft :: ParameterPathSegment :: Field (\"parameter\") , \
+                    } \
+                    . chain (ryft :: PathPrefixedParameterIterator { \
+                            iterator : ryft :: PathPrefixedParameterIterator { \
+                                iterator : self . nested . 1 . named_parameters () , \
+                                segment : ryft :: ParameterPathSegment :: TupleIndex (1usize) , \
+                            } , \
+                            segment : ryft :: ParameterPathSegment :: Field (\"nested\") , \
+                        }) \
+                } \
+                fn named_parameters_mut (& mut self) -> Self :: NamedParameterIteratorMut < '_ , P > { \
+                    ryft :: PathPrefixedParameterIterator { \
+                        iterator : self . parameter . named_parameters_mut () , \
+                        segment : ryft :: ParameterPathSegment :: Field (\"parameter\") , \
+                    } \
+                    . chain (ryft :: PathPrefixedParameterIterator { \
+                            iterator : ryft :: PathPrefixedParameterIterator { \
+                                iterator : self . nested . 1 . named_parameters_mut () , \
+                                segment : ryft :: ParameterPathSegment :: TupleIndex (1usize) , \
+                            } , \
+                            segment : ryft :: ParameterPathSegment :: Field (\"nested\") , \
+                        }) \
+                } \
+                fn into_named_parameters (self) -> Self :: NamedParameterIntoIterator < P > { \
+                    ryft :: PathPrefixedParameterIterator { \
+                        iterator : self . parameter . into_named_parameters () , \
+                        segment : ryft :: ParameterPathSegment :: Field (\"parameter\") , \
+                    } \
+                    . chain (ryft :: PathPrefixedParameterIterator { \
+                            iterator : ryft :: PathPrefixedParameterIterator { \
+                                iterator : self . nested . 1 . into_named_parameters () , \
+                                segment : ryft :: ParameterPathSegment :: TupleIndex (1usize) , \
+                            } , \
+                            segment : ryft :: ParameterPathSegment :: Field (\"nested\") , \
+                        }) \
+                }\
+            "},
+        );
+    }
+
+    #[test]
+    fn test_code_generator_generate_from_parameters_with_remainder() {
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::Generics::default(),
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let input = syn::parse2(quote!(
+            struct Container<P: Parameter> {
+                parameter: P,
+                nested: (usize, P),
+                helper: usize,
+            }
+        ))
+        .expect("failed to parse derive input");
+        generator.extract_parameter_type(&input);
+        generator.extract_data(&input);
+        let generated = generator.generate_from_parameters_with_remainder().to_string();
+        assert_eq!(
+            generated,
+            indoc! {"
+                fn from_parameters_with_remainder < I : Iterator < Item = P >> \
+                    (structure : Self :: To < ryft :: Placeholder > , parameters : & mut I ,) \
+                    -> Result < Self , ryft :: Error > { \
+                    let expected_count = < \
+                        Self :: ParameterStructure as ryft :: Parameterized < ryft :: Placeholder >\
+                    > :: parameter_count (& structure) ; \
+                    Ok (Container { \
+                        parameter : < P as ryft :: Parameterized < P >> :: from_parameters_with_remainder (\
+                            structure . parameter , \
+                            parameters ,\
+                        ) \
+                            . map_err (| error | match error { \
+                                ryft :: Error :: MissingParameters { paths , .. } => \
+                                    ryft :: Error :: MissingParameters { expected_count , paths } , \
+                                error => error , \
+                            }) ? , \
+                        nested : (structure . nested . 0 , \
+                            < P as ryft :: Parameterized < P >> :: from_parameters_with_remainder (\
+                                structure . nested . 1 , \
+                                parameters ,\
+                            ) \
+                                . map_err (| error | match error { \
+                                    ryft :: Error :: MissingParameters { paths , .. } => \
+                                        ryft :: Error :: MissingParameters { expected_count , paths } , \
+                                    error => error , \
+                                }) ?) , \
+                        helper : structure . helper \
+                    }) \
+                }\
+            "},
+        );
+    }
+
+    #[test]
+    fn test_code_generator_generics_for_fields() {
+        let generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
+            macro_parameter_type: DEFAULT_MACRO_PARAMETER_TYPE.into(),
+            parameter_type: DEFAULT_PARAMETER_TYPE.into(),
+            generics: syn::parse2::<syn::DeriveInput>(quote!(
+                struct Dummy<P, U, V>
+                where
+                    P: Send,
+                    U: Clone,
+                    V: Default;
+            ))
+            .expect("failed to parse generics")
+            .generics,
+            data: Data::Struct(StructData { ident: Symbol::new("Data").into(), fields: Vec::new(), kind: Kind::Unit }),
+            errors: Vec::new(),
+        };
+        let generics = generator.generics_for_fields([&Field {
+            is_parameter: true,
+            index: 0,
+            ident: Some(syn::parse_quote!(value)),
+            ty: syn::parse_quote!(P),
+            fields: None,
+            use_receiver_directly: false,
+        }]);
+        let rendered_generics = generics.to_token_stream().to_string();
+        assert!(rendered_generics.starts_with("< P >"));
+        assert!(!rendered_generics.contains("U : Clone"));
+        assert!(!rendered_generics.contains("V : Default"));
+        if let Some(where_clause) = generics.where_clause.as_ref() {
+            assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&syn::parse_quote!(U))));
+            assert!(where_clause.predicates.iter().all(|predicate| !predicate.references_ident(&syn::parse_quote!(V))));
+        }
+    }
+
+    #[test]
+    fn test_field_member() {
+        let receiver = quote!(self);
+        let named_field = Field {
+            is_parameter: false,
+            index: 0,
+            ident: Some(syn::parse_quote!(weight)),
+            ty: syn::parse_quote!(usize),
+            fields: None,
+            use_receiver_directly: false,
+        };
+        let unnamed_field = Field {
+            is_parameter: false,
+            index: 1,
+            ident: None,
+            ty: syn::parse_quote!(usize),
+            fields: None,
+            use_receiver_directly: false,
+        };
+        let receiver_field = Field {
+            is_parameter: true,
+            index: 0,
+            ident: None,
+            ty: syn::parse_quote!(usize),
+            fields: None,
+            use_receiver_directly: true,
+        };
+        assert_eq!(named_field.member(None).to_string(), "weight");
+        assert_eq!(named_field.member(Some(&receiver)).to_string(), "self . weight");
+        assert_eq!(unnamed_field.member(None).to_string(), "field_1");
+        assert_eq!(unnamed_field.member(Some(&receiver)).to_string(), "self . 1");
+        assert_eq!(receiver_field.member(Some(&receiver)).to_string(), "self");
     }
 }

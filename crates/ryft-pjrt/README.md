@@ -106,6 +106,8 @@ fn main() {
 
 ## Roadmap / TODOs
 
+- [ ] Can we detect if CUDA, ROCm, etc., is available on the current platform and auto-enable the corresponding
+  features by default, if any of these frameworks are available?
 - [ ] Cache extension lookups on first access so `Api::*_extension` methods avoid repeated linked-list traversal.
   The importance of this TODO item depends heavily on how extensively we need to rely on repeated invocations of
   PJRT extension functions, since each of those calls will require a traversal of that linked list.
