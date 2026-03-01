@@ -1863,8 +1863,10 @@ impl<
     type To = HashMap<K, <F as ParameterizedFamily<P>>::To, S>;
 }
 
-// TODO(eaplatanios): The following `impl` block needs review.
-// TODO(eaplatanios): Document inefficiency due to sorting somewhere.
+// TODO(eaplatanios): Find a simple way to avoid the need for sorting.
+// The [`Parameterized`] implementation for [`HashMap`] is quite inefficient. That is because for most operations that
+// require traversal of the [`HashMap`] we end up having to perform a sort of the results that we obtain (by key) to
+// comply with the requirements of the [`Parameterized`].
 impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
     for HashMap<K, V, S>
 {
@@ -1879,43 +1881,45 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: B
 
     type ParameterIterator<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::vec::IntoIter<&'t V>,
+        std::vec::IntoIter<(K, &'t V)>,
         <V as Parameterized<P>>::ParameterIterator<'t, T>,
-        fn(&'t V) -> <V as Parameterized<P>>::ParameterIterator<'t, T>,
+        fn((K, &'t V)) -> <V as Parameterized<P>>::ParameterIterator<'t, T>,
     >
     where
         Self: 't;
 
     type ParameterIteratorMut<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::vec::IntoIter<&'t mut V>,
+        std::vec::IntoIter<(K, *mut V)>,
         <V as Parameterized<P>>::ParameterIteratorMut<'t, T>,
-        fn(&'t mut V) -> <V as Parameterized<P>>::ParameterIteratorMut<'t, T>,
+        fn((K, *mut V)) -> <V as Parameterized<P>>::ParameterIteratorMut<'t, T>,
     >
     where
         Self: 't;
 
     type ParameterIntoIterator<T: Parameter> = std::iter::FlatMap<
-        std::vec::IntoIter<V>,
+        std::vec::IntoIter<(K, V)>,
         <V as Parameterized<P>>::ParameterIntoIterator<T>,
-        fn(V) -> <V as Parameterized<P>>::ParameterIntoIterator<T>,
+        fn((K, V)) -> <V as Parameterized<P>>::ParameterIntoIterator<T>,
     >;
 
     type NamedParameterIterator<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::vec::IntoIter<(K, &'t V)>,
+        std::vec::IntoIter<(&'t K, &'t V)>,
         PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
-        fn((K, &'t V)) -> PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
+        fn(
+            (&'t K, &'t V),
+        ) -> PathPrefixedParameterIterator<&'t T, <V as Parameterized<P>>::NamedParameterIterator<'t, T>>,
     >
     where
         Self: 't;
 
     type NamedParameterIteratorMut<'t, T: 't + Parameter>
         = std::iter::FlatMap<
-        std::vec::IntoIter<(K, &'t mut V)>,
+        std::vec::IntoIter<(K, *mut V)>,
         PathPrefixedParameterIterator<&'t mut T, <V as Parameterized<P>>::NamedParameterIteratorMut<'t, T>>,
         fn(
-            (K, &'t mut V),
+            (K, *mut V),
         )
             -> PathPrefixedParameterIterator<&'t mut T, <V as Parameterized<P>>::NamedParameterIteratorMut<'t, T>>,
     >
@@ -1934,75 +1938,60 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: B
 
     fn parameter_structure(&self) -> Self::ParameterStructure {
         let mut structure = HashMap::with_capacity_and_hasher(self.len(), self.hasher().clone());
-        let mut sorted_entries =
-            self.iter().map(|(key, value)| (key.clone(), value.parameter_structure())).collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let mut sorted_entries = self.iter().map(|(k, v)| (k.clone(), v.parameter_structure())).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
         structure.extend(sorted_entries);
         structure
     }
 
     fn parameters(&self) -> Self::ParameterIterator<'_, P> {
-        let mut sorted_entries = self.iter().map(|(key, value)| (key.clone(), value)).collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
-        let sorted_values = sorted_entries.into_iter().map(|(_, value)| value).collect::<Vec<_>>();
-        sorted_values.into_iter().flat_map(V::parameters)
+        let mut sorted_entries = self.iter().map(|(k, v)| (k.clone(), v)).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
+        sorted_entries.into_iter().flat_map(|(_, v)| V::parameters(v))
     }
 
     fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> {
-        let mut sorted_entries = self.iter_mut().map(|(key, value)| (key.clone(), value as *mut V)).collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
-        let sorted_values = sorted_entries
-            .into_iter()
-            .map(|(_, value_ptr)| {
-                // SAFETY: Each pointer originates from a distinct `iter_mut()` item, so pointers are unique and
-                // non-overlapping. We do not structurally modify the map after collecting pointers, so they remain
-                // valid for the duration of this traversal.
-                unsafe { &mut *value_ptr }
-            })
-            .collect::<Vec<_>>();
-        sorted_values.into_iter().flat_map(V::parameters_mut)
+        // Note that each pointer below originates from a distinct `iter_mut()` item, and so the pointers hereare unique
+        // and non-overlapping. We do not structurally modify the map after collecting the pointers and so they remain
+        // valid for the duration of this traversal.
+        let mut sorted_entries = self.iter_mut().map(|(k, v)| (k.clone(), v as *mut V)).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
+        sorted_entries.into_iter().flat_map(|(_, v)| V::parameters_mut(unsafe { &mut *v }))
     }
 
     fn into_parameters(self) -> Self::ParameterIntoIterator<P> {
         let mut sorted_entries = self.into_iter().collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
-        let sorted_values = sorted_entries.into_iter().map(|(_, value)| value).collect::<Vec<_>>();
-        sorted_values.into_iter().flat_map(V::into_parameters)
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
+        sorted_entries.into_iter().flat_map(|(_, v)| V::into_parameters(v))
     }
 
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
-        let mut sorted_entries = self.iter().map(|(key, value)| (key.clone(), value)).collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
-        sorted_entries.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters(),
-            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        let mut sorted_entries = self.iter().collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
+        sorted_entries.into_iter().flat_map(|(k, v)| PathPrefixedParameterIterator {
+            iterator: v.named_parameters(),
+            segment: ParameterPathSegment::Key(format!("{k:?}")),
         })
     }
 
     fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> {
-        let mut sorted_entries = self.iter_mut().map(|(key, value)| (key.clone(), value as *mut V)).collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
-        let sorted_entries = sorted_entries
-            .into_iter()
-            .map(|(key, value_ptr)| {
-                // SAFETY: Each pointer originates from a distinct `iter_mut()` item, so pointers are unique and
-                // non-overlapping. We do not structurally modify the map after collecting pointers, so they remain
-                // valid for the duration of this traversal.
-                (key, unsafe { &mut *value_ptr })
-            })
-            .collect::<Vec<_>>();
-        sorted_entries.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
-            iterator: value.named_parameters_mut(),
-            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        // Note that each pointer below originates from a distinct `iter_mut()` item, and so the pointers hereare unique
+        // and non-overlapping. We do not structurally modify the map after collecting the pointers and so they remain
+        // valid for the duration of this traversal.
+        let mut sorted_entries = self.iter_mut().map(|(k, v)| (k.clone(), v as *mut V)).collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
+        sorted_entries.into_iter().flat_map(|(k, v)| PathPrefixedParameterIterator {
+            iterator: (unsafe { &mut *v }).named_parameters_mut(),
+            segment: ParameterPathSegment::Key(format!("{k:?}")),
         })
     }
 
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
         let mut sorted_entries = self.into_iter().collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
-        sorted_entries.into_iter().flat_map(|(key, value)| PathPrefixedParameterIterator {
-            iterator: value.into_named_parameters(),
-            segment: ParameterPathSegment::Key(format!("{key:?}")),
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
+        sorted_entries.into_iter().flat_map(|(k, v)| PathPrefixedParameterIterator {
+            iterator: v.into_named_parameters(),
+            segment: ParameterPathSegment::Key(format!("{k:?}")),
         })
     }
 
@@ -2013,7 +2002,7 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: B
         let expected_count = structure.len();
         let mut values = HashMap::with_capacity_and_hasher(expected_count, structure.hasher().clone());
         let mut sorted_entries = structure.into_iter().collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
         for (key, value_structure) in sorted_entries {
             values.insert(
                 key,
