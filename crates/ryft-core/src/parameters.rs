@@ -1068,55 +1068,51 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Replaces parameters using an optional replacement tree.
-    ///
-    /// This operation merges `replacements` with `self` leaf-wise. Leaves with `Some(value)` in `replacements` take
-    /// precedence over existing leaf values in `self`, while `None` leaves preserve the current value.
-    ///
-    /// # Parameters
-    ///
-    ///   - `replacements`: Optional replacement tree aligned with `self`.
-    ///
-    /// # Returns
-    ///
-    /// A value with the same structure as `self`, where each leaf is either replaced or kept.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the same structural errors as [`Self::combine_parameters`] when the replacement tree shape
-    /// does not align with `self`.
+    /// Replaces nested [`Parameter`]s of type `P` in this value using a structure-aligned `Parameterized<Option<P>>`
+    /// replacement value. For each parameter, [`Some`] in `replacement` overrides the current value from `self`,
+    /// while [`None`] keeps the current value unchanged. If `replacement` is missing parameters for the expected
+    /// structure, this function will return a [`Error::MissingParameters`] error. Furthermore, if `replacement`
+    /// contains extra parameters, this function will return an [`Error::UnusedParameters`] error.
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use ryft_core::parameters::Parameterized;
+    /// # use ryft::Parameterized;
+    ///
     /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    ///
+    /// // Replace only the first field of the second tuple.
     /// let replaced = value.replace_parameters(vec![(None, None), (Some(99), None)])?;
+    ///
     /// assert_eq!(replaced, vec![(1, 2), (99, 4)]);
-    /// # Ok::<(), ryft_core::errors::Error>(())
+    ///
+    /// # Ok::<(), ryft::Error>(())
     /// ```
-    fn replace_parameters(self, replacements: Self::To<Option<P>>) -> Result<Self, Error>
+    fn replace_parameters(self, replacement: Self::To<Option<P>>) -> Result<Self, Error>
     where
         Self::Family: ParameterizedFamily<Option<P>>,
     {
         let structure = self.parameter_structure();
         let expected_count = structure.parameter_count();
         let mut parameters = self.into_parameters();
-        let mut replacements = replacements.into_parameters();
+        let mut replacements = replacement.into_parameters();
         let mut replaced_parameters = Vec::new();
         replaced_parameters.reserve_exact(expected_count);
         for _ in 0..expected_count {
+            // TODO(eaplatanios): Can we collect all missing parameters and include `paths` in the end, same as we are
+            //  doing with a bunch of other functions that are defined earlier in this file?
             let parameter = parameters.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
             let replacement = replacements.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
             replaced_parameters.push(replacement.unwrap_or(parameter));
         }
         if parameters.next().is_some() || replacements.next().is_some() {
+            // TODO(eaplatanios): Can we include `paths` here?
             return Err(Error::UnusedParameters { paths: None });
         }
         Self::from_parameters(structure, replaced_parameters)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Applies optional updates leaf-wise using `update_fn(base, update)` whenever an update is present.
     ///
