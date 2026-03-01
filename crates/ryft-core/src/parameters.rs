@@ -2491,92 +2491,22 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     #[test]
     fn test_parameterized_parameter() {
-        let value = 7_i32;
+        let value = 7i32;
         assert_eq!(value.parameter_count(), 1);
         assert_eq!(value.parameter_structure(), Placeholder);
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![7]);
-        let mut value_for_mutation = value;
-        for parameter in value_for_mutation.parameters_mut() {
-            *parameter += 1;
-        }
-        assert_eq!(value_for_mutation, 8);
-        assert_eq!(value.into_parameters().collect::<Vec<_>>(), vec![7]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
             vec![("$".to_string(), 7)],
         );
-        let mut value_for_named_mutation = value;
-        for (path, parameter) in value_for_named_mutation.named_parameters_mut() {
-            assert_eq!(path.to_string(), "$");
-            *parameter *= 2;
-        }
-        assert_eq!(value_for_named_mutation, 14);
-        assert_eq!(
-            value
-                .into_named_parameters()
-                .map(|(path, parameter)| (path.to_string(), parameter))
-                .collect::<Vec<_>>(),
-            vec![("$".to_string(), 7)],
-        );
         assert_eq!(value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(), vec!["$".to_string()]);
-
-        let mut parameters_with_remainder = vec![10, 20].into_iter();
-        assert_eq!(
-            <i32 as Parameterized<i32>>::from_parameters_with_remainder(Placeholder, &mut parameters_with_remainder),
-            Ok(10)
-        );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![20]);
-        assert_eq!(<i32 as Parameterized<i32>>::from_parameters(Placeholder, vec![30]), Ok(30));
-        assert_eq!(
-            <i32 as Parameterized<i32>>::from_parameters(Placeholder, vec![30, 40]),
-            Err(Error::UnusedParameters { paths: None })
-        );
-        assert_eq!(
-            <i32 as Parameterized<i32>>::from_parameters(Placeholder, Vec::<i32>::new()),
-            Err(Error::MissingParameters { expected_count: 1, paths: None })
-        );
-        assert_eq!(
-            <i32 as Parameterized<i32>>::from_named_parameters(
-                Placeholder,
-                HashMap::from([(ParameterPath::root(), 50)])
-            ),
-            Ok(50)
-        );
-        assert_eq!(
-            <i32 as Parameterized<i32>>::from_named_parameters(
-                Placeholder,
-                HashMap::from([(ParameterPath::root(), 50), (ParameterPath::root().field("extra"), 60),])
-            ),
-            Err(Error::UnusedParameters { paths: None })
-        );
-        assert_eq!(
-            <i32 as Parameterized<i32>>::from_broadcasted_named_parameters(
-                Placeholder,
-                HashMap::from([(ParameterPath::root(), 70)])
-            ),
-            Ok(70)
-        );
-        assert_eq!(value.map_parameters(|parameter| i64::from(parameter) * 10), Ok(70_i64));
-        assert_eq!(value.map_named_parameters(|path, parameter| i64::from(parameter) + (path.len() as i64)), Ok(7_i64));
-        assert_eq!(value.filter_parameters(|_, parameter| *parameter == 7), Ok(Some(7)));
-        assert_eq!(value.partition_parameters(|_, parameter| *parameter == 7), Ok((Some(7), None)));
-        assert_eq!(<i32 as Parameterized<i32>>::combine_parameters(Placeholder, vec![Some(9), None]), Ok(9));
-        assert_eq!(
-            <i32 as Parameterized<i32>>::combine_parameters(Placeholder, vec![Some(9), Some(10)]),
-            Err(Error::AmbiguousParameterCombination { values: vec!["9".to_string(), "10".to_string()] })
-        );
-        assert_eq!(value.replace_parameters(Some(11)), Ok(11));
-        assert_eq!(value.replace_parameters(None), Ok(7));
     }
 
     #[test]
     fn test_parameterized_tuple() {
-        type Tuple12 = (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32);
-        let value: Tuple12 = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+        let value = (0i32, 1i32, 2i32, 3i32, 4i32, 5i32, 6i32, 7i32, 8i32, 9i32, 10i32, 11i32);
         assert_eq!(value.parameter_count(), 12);
         assert_eq!(
             value.parameter_structure(),
@@ -2593,48 +2523,11 @@ mod tests {
                 Placeholder,
                 Placeholder,
                 Placeholder,
-            )
+            ),
         );
-        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],);
-        let mut value_for_mutation = value;
-        for parameter in value_for_mutation.parameters_mut() {
-            *parameter += 10;
-        }
-        assert_eq!(
-            value_for_mutation.parameters().copied().collect::<Vec<_>>(),
-            vec![10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
-        );
-        assert_eq!(value.into_parameters().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],);
+        assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![
-                ("$.0".to_string(), 0),
-                ("$.1".to_string(), 1),
-                ("$.2".to_string(), 2),
-                ("$.3".to_string(), 3),
-                ("$.4".to_string(), 4),
-                ("$.5".to_string(), 5),
-                ("$.6".to_string(), 6),
-                ("$.7".to_string(), 7),
-                ("$.8".to_string(), 8),
-                ("$.9".to_string(), 9),
-                ("$.10".to_string(), 10),
-                ("$.11".to_string(), 11),
-            ],
-        );
-        let mut value_for_named_mutation = value;
-        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
-            *parameter *= 2;
-        }
-        assert_eq!(
-            value_for_named_mutation.parameters().copied().collect::<Vec<_>>(),
-            vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22],
-        );
-        assert_eq!(
-            value
-                .into_named_parameters()
-                .map(|(path, parameter)| (path.to_string(), parameter))
-                .collect::<Vec<_>>(),
             vec![
                 ("$.0".to_string(), 0),
                 ("$.1".to_string(), 1),
@@ -2667,41 +2560,6 @@ mod tests {
                 "$.11".to_string(),
             ],
         );
-        let mut parameters_with_remainder =
-            vec![100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 999].into_iter();
-        assert_eq!(
-            <Tuple12 as Parameterized<i32>>::from_parameters_with_remainder(
-                value.parameter_structure(),
-                &mut parameters_with_remainder
-            ),
-            Ok((100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111)),
-        );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
-        assert_eq!(
-            <Tuple12 as Parameterized<i32>>::from_parameters(
-                value.parameter_structure(),
-                vec![200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211],
-            ),
-            Ok((200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211)),
-        );
-        let mut named_parameters = value.into_named_parameters().collect::<Vec<_>>();
-        named_parameters.reverse();
-        assert_eq!(
-            <Tuple12 as Parameterized<i32>>::from_named_parameters(value.parameter_structure(), named_parameters),
-            Ok(value)
-        );
-        assert_eq!(
-            <Tuple12 as Parameterized<i32>>::from_broadcasted_named_parameters(
-                value.parameter_structure(),
-                HashMap::from([(ParameterPath::root(), 1), (ParameterPath::root().tuple_index(11), 99),]),
-            ),
-            Ok((1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 99)),
-        );
-        assert_eq!(<() as Parameterized<i32>>::from_parameters((), Vec::<i32>::new()), Ok(()));
-        assert_eq!(
-            <() as Parameterized<i32>>::from_parameters((), vec![1]),
-            Err(Error::UnusedParameters { paths: None }),
-        );
     }
 
     #[test]
@@ -2710,36 +2568,11 @@ mod tests {
         assert_eq!(value.parameter_count(), 6);
         assert_eq!(
             value.parameter_structure(),
-            [(Placeholder, Placeholder), (Placeholder, Placeholder), (Placeholder, Placeholder),],
+            [(Placeholder, Placeholder), (Placeholder, Placeholder), (Placeholder, Placeholder)],
         );
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
-        let mut value_for_mutation = value;
-        for parameter in value_for_mutation.parameters_mut() {
-            *parameter += 10;
-        }
-        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![11, 12, 13, 14, 15, 16]);
-        assert_eq!(value.into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![
-                ("$[0].0".to_string(), 1),
-                ("$[0].1".to_string(), 2),
-                ("$[1].0".to_string(), 3),
-                ("$[1].1".to_string(), 4),
-                ("$[2].0".to_string(), 5),
-                ("$[2].1".to_string(), 6),
-            ],
-        );
-        let mut value_for_named_mutation = value;
-        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
-            *parameter *= 3;
-        }
-        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![3, 6, 9, 12, 15, 18]);
-        assert_eq!(
-            value
-                .into_named_parameters()
-                .map(|(path, parameter)| (path.to_string(), parameter))
-                .collect::<Vec<_>>(),
             vec![
                 ("$[0].0".to_string(), 1),
                 ("$[0].1".to_string(), 2),
@@ -2760,44 +2593,6 @@ mod tests {
                 "$[2].1".to_string(),
             ],
         );
-        let mut parameters_with_remainder = vec![10, 20, 30, 40, 50, 60, 999].into_iter();
-        assert_eq!(
-            <[(i32, i32); 3] as Parameterized<i32>>::from_parameters_with_remainder(
-                value.parameter_structure(),
-                &mut parameters_with_remainder
-            ),
-            Ok([(10, 20), (30, 40), (50, 60)]),
-        );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
-        assert_eq!(
-            <[(i32, i32); 3] as Parameterized<i32>>::from_parameters(
-                value.parameter_structure(),
-                vec![10, 20, 30, 40, 50, 60]
-            ),
-            Ok([(10, 20), (30, 40), (50, 60)]),
-        );
-        let mut named_parameters = value.into_named_parameters().collect::<Vec<_>>();
-        named_parameters.reverse();
-        assert_eq!(
-            <[(i32, i32); 3] as Parameterized<i32>>::from_named_parameters(
-                value.parameter_structure(),
-                named_parameters
-            ),
-            Ok(value),
-        );
-        assert_eq!(
-            <[(i32, i32); 3] as Parameterized<i32>>::from_broadcasted_named_parameters(
-                value.parameter_structure(),
-                HashMap::from([
-                    (ParameterPath::root(), 1),
-                    (ParameterPath::root().index(2), 10),
-                    (ParameterPath::root().index(2).tuple_index(1), 20),
-                ]),
-            ),
-            Ok([(1, 1), (1, 1), (10, 20)]),
-        );
-        let filtered = value.filter_parameters(|path, _| path.to_string().ends_with(".1")).unwrap();
-        assert_eq!(filtered.into_parameters().collect::<Vec<_>>(), vec![None, Some(2), None, Some(4), None, Some(6)],);
     }
 
     #[test]
@@ -2806,32 +2601,8 @@ mod tests {
         assert_eq!(value.parameter_count(), 4);
         assert_eq!(value.parameter_structure(), vec![(Placeholder, Placeholder), (Placeholder, Placeholder)]);
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-        let mut value_for_mutation = value.clone();
-        for parameter in value_for_mutation.parameters_mut() {
-            *parameter += 1;
-        }
-        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
-        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![
-                ("$[0].0".to_string(), 1),
-                ("$[0].1".to_string(), 2),
-                ("$[1].0".to_string(), 3),
-                ("$[1].1".to_string(), 4),
-            ],
-        );
-        let mut value_for_named_mutation = value.clone();
-        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
-            *parameter *= 2;
-        }
-        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![2, 4, 6, 8]);
-        assert_eq!(
-            value
-                .clone()
-                .into_named_parameters()
-                .map(|(path, parameter)| (path.to_string(), parameter))
-                .collect::<Vec<_>>(),
             vec![
                 ("$[0].0".to_string(), 1),
                 ("$[0].1".to_string(), 2),
@@ -2843,89 +2614,23 @@ mod tests {
             value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
             vec!["$[0].0".to_string(), "$[0].1".to_string(), "$[1].0".to_string(), "$[1].1".to_string()],
         );
-        let mut parameters_with_remainder = vec![10, 20, 30, 40, 999].into_iter();
-        assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
-                value.parameter_structure(),
-                &mut parameters_with_remainder
-            ),
-            Ok(vec![(10, 20), (30, 40)]),
-        );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
-        assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_parameters(value.parameter_structure(), vec![10, 20, 30, 40]),
-            Ok(vec![(10, 20), (30, 40)]),
-        );
-        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
-        named_parameters.reverse();
-        assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_named_parameters(
-                value.parameter_structure(),
-                named_parameters
-            ),
-            Ok(value.clone()),
-        );
-        assert_eq!(
-            <Vec<(i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-                value.parameter_structure(),
-                HashMap::from([
-                    (ParameterPath::root(), 1),
-                    (ParameterPath::root().index(1), 10),
-                    (ParameterPath::root().index(1).tuple_index(0), 99),
-                ]),
-            ),
-            Ok(vec![(1, 1), (99, 10)]),
-        );
-        assert_eq!(
-            <Vec<i32> as Parameterized<i32>>::from_parameters(vec![Placeholder, Placeholder, Placeholder], vec![1, 2]),
-            Err(Error::MissingParameters { expected_count: 3, paths: None }),
-        );
-        assert_eq!(
-            <Vec<i32> as Parameterized<i32>>::from_named_parameters(
-                vec![Placeholder, Placeholder],
-                vec![
-                    (ParameterPath::root().index(0), 1),
-                    (ParameterPath::root().index(1), 2),
-                    (ParameterPath::root().index(0), 7),
-                ],
-            ),
-            Ok(vec![7, 2]),
-        );
     }
 
     #[test]
     fn test_parameterized_hash_map() {
         let value = HashMap::from([("zeta", (1, 2)), ("alpha", (3, 4)), ("mu", (5, 6))]);
         assert_eq!(value.parameter_count(), 6);
+        assert_eq!(
+            value.parameter_structure(),
+            HashMap::from([
+                ("alpha", (Placeholder, Placeholder)),
+                ("mu", (Placeholder, Placeholder)),
+                ("zeta", (Placeholder, Placeholder)),
+            ]),
+        );
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![3, 4, 5, 6, 1, 2]);
-        let mut value_for_mutation = value.clone();
-        for parameter in value_for_mutation.parameters_mut() {
-            *parameter += 10;
-        }
-        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![13, 14, 15, 16, 11, 12]);
-        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![3, 4, 5, 6, 1, 2]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![
-                ("$[\"alpha\"].0".to_string(), 3),
-                ("$[\"alpha\"].1".to_string(), 4),
-                ("$[\"mu\"].0".to_string(), 5),
-                ("$[\"mu\"].1".to_string(), 6),
-                ("$[\"zeta\"].0".to_string(), 1),
-                ("$[\"zeta\"].1".to_string(), 2),
-            ],
-        );
-        let mut value_for_named_mutation = value.clone();
-        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
-            *parameter *= 2;
-        }
-        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![6, 8, 10, 12, 2, 4]);
-        assert_eq!(
-            value
-                .clone()
-                .into_named_parameters()
-                .map(|(path, parameter)| (path.to_string(), parameter))
-                .collect::<Vec<_>>(),
             vec![
                 ("$[\"alpha\"].0".to_string(), 3),
                 ("$[\"alpha\"].1".to_string(), 4),
@@ -2946,49 +2651,6 @@ mod tests {
                 "$[\"zeta\"].1".to_string(),
             ],
         );
-        let mut parameters_with_remainder = vec![30, 40, 50, 60, 10, 20, 999].into_iter();
-        assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
-                value.parameter_structure(),
-                &mut parameters_with_remainder
-            ),
-            Ok(HashMap::from([("alpha", (30, 40)), ("mu", (50, 60)), ("zeta", (10, 20))])),
-        );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
-        assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(
-                value.parameter_structure(),
-                vec![30, 40, 50, 60, 10, 20],
-            ),
-            Ok(HashMap::from([("alpha", (30, 40)), ("mu", (50, 60)), ("zeta", (10, 20))])),
-        );
-        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
-        named_parameters.reverse();
-        assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_parameters(
-                value.parameter_structure(),
-                named_parameters
-            ),
-            Ok(value.clone()),
-        );
-        assert_eq!(
-            <HashMap<&str, (i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-                value.parameter_structure(),
-                HashMap::from([
-                    (ParameterPath::root(), 1),
-                    (ParameterPath::root().key("mu"), 10,),
-                    (ParameterPath::root().key("zeta").tuple_index(1), 99),
-                ]),
-            ),
-            Ok(HashMap::from([("alpha", (1, 1)), ("mu", (10, 10)), ("zeta", (1, 99))])),
-        );
-        assert_eq!(
-            <HashMap<&str, i32> as Parameterized<i32>>::from_parameters(
-                HashMap::from([("left", Placeholder), ("right", Placeholder), ("middle", Placeholder)]),
-                vec![1, 2],
-            ),
-            Err(Error::MissingParameters { expected_count: 3, paths: None }),
-        );
     }
 
     #[test]
@@ -3000,32 +2662,8 @@ mod tests {
             BTreeMap::from([("left", (Placeholder, Placeholder)), ("right", (Placeholder, Placeholder))]),
         );
         assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-        let mut value_for_mutation = value.clone();
-        for parameter in value_for_mutation.parameters_mut() {
-            *parameter += 10;
-        }
-        assert_eq!(value_for_mutation.parameters().copied().collect::<Vec<_>>(), vec![11, 12, 13, 14]);
-        assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
         assert_eq!(
             value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
-            vec![
-                ("$[\"left\"].0".to_string(), 1),
-                ("$[\"left\"].1".to_string(), 2),
-                ("$[\"right\"].0".to_string(), 3),
-                ("$[\"right\"].1".to_string(), 4),
-            ],
-        );
-        let mut value_for_named_mutation = value.clone();
-        for (_, parameter) in value_for_named_mutation.named_parameters_mut() {
-            *parameter *= 2;
-        }
-        assert_eq!(value_for_named_mutation.parameters().copied().collect::<Vec<_>>(), vec![2, 4, 6, 8]);
-        assert_eq!(
-            value
-                .clone()
-                .into_named_parameters()
-                .map(|(path, parameter)| (path.to_string(), parameter))
-                .collect::<Vec<_>>(),
             vec![
                 ("$[\"left\"].0".to_string(), 1),
                 ("$[\"left\"].1".to_string(), 2),
@@ -3041,57 +2679,6 @@ mod tests {
                 "$[\"right\"].0".to_string(),
                 "$[\"right\"].1".to_string(),
             ],
-        );
-        let mut parameters_with_remainder = vec![10, 20, 30, 40, 999].into_iter();
-        assert_eq!(
-            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters_with_remainder(
-                value.parameter_structure(),
-                &mut parameters_with_remainder
-            ),
-            Ok(BTreeMap::from([("left", (10, 20)), ("right", (30, 40))])),
-        );
-        assert_eq!(parameters_with_remainder.collect::<Vec<_>>(), vec![999]);
-        assert_eq!(
-            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_parameters(
-                value.parameter_structure(),
-                vec![10, 20, 30, 40],
-            ),
-            Ok(BTreeMap::from([("left", (10, 20)), ("right", (30, 40))])),
-        );
-        let mut named_parameters = value.clone().into_named_parameters().collect::<Vec<_>>();
-        named_parameters.reverse();
-        assert_eq!(
-            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_named_parameters(
-                value.parameter_structure(),
-                named_parameters
-            ),
-            Ok(value.clone()),
-        );
-        assert_eq!(
-            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::from_broadcasted_named_parameters(
-                value.parameter_structure(),
-                HashMap::from([
-                    (ParameterPath::root(), 1),
-                    (ParameterPath::root().key("right"), 10,),
-                    (ParameterPath::root().key("right").tuple_index(1), 20),
-                ]),
-            ),
-            Ok(BTreeMap::from([("left", (1, 1)), ("right", (10, 20))])),
-        );
-        let (partition_0, partition_1) =
-            value.clone().partition_parameters(|path, _| path.to_string().starts_with("$[\"right\"]")).unwrap();
-        assert_eq!(partition_0.clone().into_parameters().collect::<Vec<_>>(), vec![None, None, Some(3), Some(4)],);
-        assert_eq!(partition_1.clone().into_parameters().collect::<Vec<_>>(), vec![Some(1), Some(2), None, None],);
-        assert_eq!(
-            <BTreeMap<&str, (i32, i32)> as Parameterized<i32>>::combine_parameters(
-                value.parameter_structure(),
-                vec![partition_0, partition_1],
-            ),
-            Ok(value.clone()),
-        );
-        assert_eq!(
-            value.replace_parameters(BTreeMap::from([("left", (Some(99), None)), ("right", (None, Some(88)))])),
-            Ok(BTreeMap::from([("left", (99, 2)), ("right", (3, 88))])),
         );
     }
 }
