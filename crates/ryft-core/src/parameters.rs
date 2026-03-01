@@ -637,8 +637,8 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming values
     /// from the provided `parameters` to populate its parameters. This function may not consume all the provided
-    /// parameters, but if there are not enough parameters in the provided iterator, it will return an
-    /// [`Error::InsufficientParameters`].
+    /// parameters, but if there are not enough parameters in the provided iterator, it will return a
+    /// [`Error::MissingParameters`] error.
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
@@ -646,7 +646,7 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming values
     /// from the provided `parameters` to populate its parameters. This function expects to fully consume the provided
-    /// iterator. If it does not contain enough values, then it will return an [`Error::InsufficientParameters`], while
+    /// iterator. If it does not contain enough values, then it will return a [`Error::MissingParameters`] error, while
     /// if it contains too many values, it will return an [`Error::UnusedParameters`]. If you do not want to fully
     /// consume the provided iterator, then you must use [`Self::from_parameters_with_remainder`] instead.
     fn from_parameters<I: IntoIterator<Item = P>>(
@@ -664,11 +664,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming named values
     /// from the provided `parameters` to populate its parameters. Unlike [`Self::from_broadcasted_named_parameters`],
     /// this function is strict in that keys in `parameters` must match exactly leaf [`ParameterPath`]s in `structure`,
-    /// and path prefix matching is not being used. If there are not enough named values to reconstruct all leaves,
-    /// then this function will return an [`Error::InsufficientParameters`]. If an expected path is missing, then it
-    /// will return an [`Error::MissingParameterPath`]. If extra paths remain after reconstruction, then it will return
-    /// an [`Error::UnusedParameters`]. For fully worked examples, refer to the examples provided in the top-level
-    /// documentation of the [`Parameterized`] trait.
+    /// and path prefix matching is not being used. If there are missing parameters preventing reconstruction from
+    /// being feasible, then this function will return a [`Error::MissingParameters`] error. Furthermore, if extra
+    /// paths remain after reconstruction, then it will return an [`Error::UnusedParameters`] error. For fully worked
+    /// examples, refer to the examples provided in the top-level documentation of the [`Parameterized`] trait.
     fn from_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
         parameters: I,
@@ -676,13 +675,17 @@ pub trait Parameterized<P: Parameter>: Sized {
         // TODO(eaplatanios): Is performance a concern here where we are collecting into a [`HashMap`]?
         let mut parameters = parameters.into_iter().collect::<HashMap<_, _>>();
         let expected_count = structure.parameter_count();
-        let mut values = Vec::with_capacity(expected_count);
+        let mut values = Vec::new();
+        values.reserve_exact(expected_count);
+        // TODO(eaplatanios): We must collect all missing paths before returning `Error::MissingParameters`.
         for (expected_path, _) in structure.named_parameters() {
             match parameters.remove(&expected_path) {
                 Some(parameter) => values.push(parameter),
-                None if parameters.is_empty() => return Err(Error::InsufficientParameters { expected_count }),
                 None => {
-                    return Err(Error::MissingParameterPath { path: expected_path.to_string() });
+                    return Err(Error::MissingParameters {
+                        expected_count,
+                        paths: Some(vec![expected_path.to_string()]),
+                    });
                 }
             }
         }
@@ -698,10 +701,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// prefixes. Unlike [`Self::from_named_parameters`], this function does not require exact leaf paths, and each
     /// leaf path in `structure` receives the value from the most specific matching path prefix (i.e., the longest
     /// shared path prefix). If any leaf path is not covered by a provided prefix, then this function will return
-    /// an [`Error::MissingPrefixForParameterPath`]. If there are any remaining [`ParameterPath`]s with no match in
-    /// `structure`, then it will return an [`Error::UnusedParameters`]. Note that since one prefix value may need to
-    /// populate multiple leaves, this function requires `P: Clone`. For fully worked examples, refer to the examples
-    /// provided in the top-level documentation of the [`Parameterized`] trait.
+    /// a [`Error::MissingParameters`] error. Furthermore, if there are any remaining [`ParameterPath`]s with no match
+    /// in `structure`, then it will return an [`Error::UnusedParameters`] error. Note that since one prefix value may
+    /// need to populate multiple leaves, this function requires `P: Clone`. For fully worked examples, refer to the
+    /// examples provided in the top-level documentation of the [`Parameterized`] trait.
     fn from_broadcasted_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
         parameters: I,
@@ -710,17 +713,19 @@ pub trait Parameterized<P: Parameter>: Sized {
         P: Clone,
     {
         let paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
+        let expected_count = paths.len();
         let mut path_prefixes = parameters.into_iter().map(|(path, value)| (path, value, 0usize)).collect::<Vec<_>>();
-        let mut broadcasted_parameters = HashMap::with_capacity(paths.len());
+        let mut broadcasted_parameters = HashMap::with_capacity(expected_count);
         for path in paths {
             // TODO(eaplatanios): Is performance a concern here with all these loops and searching?
+            // TODO(eaplatanios): We must collect all missing paths before returning `Error::MissingParameters`.
             let selected_prefix_index = path_prefixes
                 .iter()
                 .enumerate()
                 .filter_map(|(i, (p, _, _))| if p.is_prefix_of(&path) { Some((i, p.len())) } else { None })
                 .max_by(|x, y| x.1.cmp(&y.1))
                 .map(|(i, _)| i)
-                .ok_or_else(|| Error::MissingPrefixForParameterPath { path: path.to_string() })?;
+                .ok_or_else(|| Error::MissingParameters { expected_count, paths: Some(vec![path.to_string()]) })?;
             let (_, value, matched_count) = &mut path_prefixes[selected_prefix_index];
             broadcasted_parameters.insert(path, value.clone());
             *matched_count += 1;
@@ -807,8 +812,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     {
         let mut predicate = predicate;
         let structure = self.parameter_structure();
-        let mut selected_parameters = Vec::with_capacity(structure.parameter_count());
-        let mut rejected_parameters = Vec::with_capacity(structure.parameter_count());
+        let mut selected_parameters = Vec::new();
+        let mut rejected_parameters = Vec::new();
+        selected_parameters.reserve_exact(structure.parameter_count());
+        rejected_parameters.reserve_exact(structure.parameter_count());
         for (path, parameter) in self.into_named_parameters() {
             if predicate(&path, &parameter) {
                 selected_parameters.push(Some(parameter));
@@ -872,8 +879,8 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InsufficientParameters`] if any optional tree is too short, [`Error::MissingParameterPath`]
-    /// if all candidates are `None` for a leaf, and [`Error::UnusedParameters`] if any optional tree has extra leaves.
+    /// Returns [`Error::MissingParameters`] if any optional tree is too short or if all candidates are `None` for a
+    /// leaf, and [`Error::UnusedParameters`] if any optional tree has extra leaves.
     ///
     /// # Example
     ///
@@ -898,16 +905,18 @@ pub trait Parameterized<P: Parameter>: Sized {
         let expected_paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
         let expected_count = expected_paths.len();
         let mut optional_iterators = optional_trees.into_iter().map(|tree| tree.into_parameters()).collect::<Vec<_>>();
-        let mut combined_parameters = Vec::with_capacity(expected_count);
+        let mut combined_parameters = Vec::new();
+        combined_parameters.reserve_exact(expected_count);
         for path in expected_paths {
             let mut selected = None;
             for iterator in &mut optional_iterators {
-                let candidate = iterator.next().ok_or(Error::InsufficientParameters { expected_count })?;
+                let candidate = iterator.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
                 if selected.is_none() {
                     selected = candidate;
                 }
             }
-            let parameter = selected.ok_or_else(|| Error::MissingParameterPath { path: path.to_string() })?;
+            let parameter = selected
+                .ok_or_else(|| Error::MissingParameters { expected_count, paths: Some(vec![path.to_string()]) })?;
             combined_parameters.push(parameter);
         }
         if optional_iterators.iter_mut().any(|iterator| iterator.next().is_some()) {
@@ -970,7 +979,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InsufficientParameters`] or [`Error::UnusedParameters`] when the flattened lengths of
+    /// Returns [`Error::MissingParameters`] or [`Error::UnusedParameters`] when the flattened lengths of
     /// `self` and `updates` do not match.
     ///
     /// # Example
@@ -999,10 +1008,11 @@ pub trait Parameterized<P: Parameter>: Sized {
         let mut parameters = self.into_parameters();
         let mut updates = updates.into_parameters();
         let mut update_fn = update_fn;
-        let mut updated_parameters = Vec::with_capacity(expected_count);
+        let mut updated_parameters = Vec::new();
+        updated_parameters.reserve_exact(expected_count);
         for _ in 0..expected_count {
-            let parameter = parameters.next().ok_or(Error::InsufficientParameters { expected_count })?;
-            let update = updates.next().ok_or(Error::InsufficientParameters { expected_count })?;
+            let parameter = parameters.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
+            let update = updates.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
             let updated = match update {
                 Some(update) => update_fn(parameter, update),
                 None => parameter,
@@ -1243,7 +1253,7 @@ impl<P: Parameter> Parameterized<P> for P {
         _structure: Self::ParameterStructure,
         parameters: &mut I,
     ) -> Result<Self, Error> {
-        parameters.next().ok_or(Error::InsufficientParameters { expected_count: 1 })
+        parameters.next().ok_or(Error::MissingParameters { expected_count: 1, paths: None })
     }
 }
 
@@ -1855,7 +1865,7 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
         for value_structure in structure {
             values.push(V::from_parameters_with_remainder(value_structure, parameters).map_err(
                 |error| match error {
-                    Error::InsufficientParameters { .. } => Error::InsufficientParameters { expected_count },
+                    Error::MissingParameters { paths, .. } => Error::MissingParameters { expected_count, paths },
                     error => error,
                 },
             )?);
@@ -2030,7 +2040,7 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: B
             values.insert(
                 key,
                 V::from_parameters_with_remainder(value_structure, parameters).map_err(|error| match error {
-                    Error::InsufficientParameters { .. } => Error::InsufficientParameters { expected_count },
+                    Error::MissingParameters { paths, .. } => Error::MissingParameters { expected_count, paths },
                     error => error,
                 })?,
             );
@@ -2163,7 +2173,7 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
             values.insert(
                 key,
                 V::from_parameters_with_remainder(value_structure, parameters).map_err(|error| match error {
-                    Error::InsufficientParameters { .. } => Error::InsufficientParameters { expected_count },
+                    Error::MissingParameters { paths, .. } => Error::MissingParameters { expected_count, paths },
                     error => error,
                 })?,
             );
@@ -2567,7 +2577,10 @@ mod tests {
         let structure = vec![(Placeholder, Placeholder)];
         let combined =
             <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(structure, vec![vec![(Some(10), None)]]);
-        assert_eq!(combined, Err(Error::MissingParameterPath { path: "$[0].1".to_string() }));
+        assert_eq!(
+            combined,
+            Err(Error::MissingParameters { expected_count: 2, paths: Some(vec!["$[0].1".to_string()]) }),
+        );
     }
 
     #[test]
@@ -2597,7 +2610,7 @@ mod tests {
     fn test_apply_parameter_updates_reports_shape_mismatch() {
         let value = vec![(1, 2), (3, 4)];
         let updated = value.apply_parameter_updates(vec![(Some(10), None)]);
-        assert_eq!(updated, Err(Error::InsufficientParameters { expected_count: 4 }));
+        assert_eq!(updated, Err(Error::MissingParameters { expected_count: 4, paths: None }));
     }
 
     #[test]
@@ -2914,7 +2927,7 @@ mod tests {
     fn test_from_parameters_reports_insufficient_parameters_for_vec() {
         let structure = vec![Placeholder, Placeholder, Placeholder];
         let result = <Vec<i32> as Parameterized<i32>>::from_parameters(structure, vec![1, 2]);
-        assert_eq!(result, Err(Error::InsufficientParameters { expected_count: 3 }));
+        assert_eq!(result, Err(Error::MissingParameters { expected_count: 3, paths: None }));
     }
 
     #[test]
@@ -2922,7 +2935,7 @@ mod tests {
         let structure = vec![Placeholder, Placeholder, Placeholder];
         let parameters = vec![1, 2].into_named_parameters().collect::<HashMap<_, _>>();
         let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(structure, parameters);
-        assert_eq!(result, Err(Error::InsufficientParameters { expected_count: 3 }));
+        assert_eq!(result, Err(Error::MissingParameters { expected_count: 3, paths: Some(vec!["$[2]".to_string()]) }));
     }
 
     #[test]
@@ -2932,7 +2945,7 @@ mod tests {
         structure.insert("right", Placeholder);
         structure.insert("middle", Placeholder);
         let result = <HashMap<&str, i32> as Parameterized<i32>>::from_parameters(structure, vec![1, 2]);
-        assert_eq!(result, Err(Error::InsufficientParameters { expected_count: 3 }));
+        assert_eq!(result, Err(Error::MissingParameters { expected_count: 3, paths: None }));
     }
 
     #[test]
@@ -2946,7 +2959,7 @@ mod tests {
         let result = <Vec<i32> as Parameterized<i32>>::from_named_parameters(value.parameter_structure(), named);
         assert!(matches!(
             result,
-            Err(Error::MissingParameterPath { path: expected_path }) if expected_path == "$[1]",
+            Err(Error::MissingParameters { expected_count: 2, paths: Some(paths) }) if paths == vec!["$[1]".to_string()],
         ));
     }
 
@@ -2998,7 +3011,10 @@ mod tests {
             structure,
             HashMap::from([(ParameterPath::root().with_segment(ParameterPathSegment::Index(0)), 5)]),
         );
-        assert_eq!(result, Err(Error::MissingPrefixForParameterPath { path: "$[1].0".to_string() }));
+        assert_eq!(
+            result,
+            Err(Error::MissingParameters { expected_count: 4, paths: Some(vec!["$[1].0".to_string()]) }),
+        );
     }
 
     #[test]

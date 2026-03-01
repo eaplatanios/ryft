@@ -17,16 +17,17 @@ pub enum Error {
     )]
     UnusedParameters { paths: Option<Vec<String>> },
 
-    // TODO(eaplatanios): `Error::InsufficientParameters` should also include a [`ParameterPath`] for the missing
-    //  parameter and the same should be used in `from_parameters_with_remainder` whenever relevant.
-    #[error("expected at least {expected_count} parameters but got fewer")]
-    InsufficientParameters { expected_count: usize },
-
-    #[error("missing prefix for parameter at '{path}' path")]
-    MissingPrefixForParameterPath { path: String },
-
-    #[error("missing parameter at '{path}' path")]
-    MissingParameterPath { path: String },
+    #[error(
+        "{}",
+        match paths.as_deref() {
+            None => format!("got fewer parameters than expected; expected at least {expected_count}"),
+            Some(paths) => format!(
+                "got fewer parameters than expected; expected at least {expected_count}; missing parameter paths: {}",
+                paths.iter().map(|path| format!("'{path}'")).collect::<Vec<_>>().join(", "),
+            ),
+        }
+    )]
+    MissingParameters { expected_count: usize, paths: Option<Vec<String>> },
 
     #[error("unknown parameter path '{path}'")]
     UnknownParameterPath { path: String },
