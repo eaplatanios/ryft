@@ -585,41 +585,57 @@ impl DeviceAssignment {
 
     /// Serializes this [`DeviceAssignment`] into a string (i.e., byte array).
     pub fn serialize(&self) -> Result<SerializedDeviceAssignment, Error> {
-        Ok(SerializedDeviceAssignment::Rust { data: self.proto()?.encode_to_vec() })
+        Ok(SerializedDeviceAssignment::from_proto(self.proto()?))
     }
 }
 
 /// Serialized [`DeviceAssignment`].
-pub enum SerializedDeviceAssignment {
-    /// Serialized [`DeviceAssignment`] that was allocated/serialized using [`DeviceAssignment::serialize`].
-    Rust {
-        /// Bytes that correspond to a serialized [`DeviceAssignment`].
-        data: Vec<u8>,
-    },
+pub struct SerializedDeviceAssignment {
+    /// Opaque data handle that represents data associated with this [`SerializedDeviceAssignment`].
+    /// Note that this handle should _never_ be passed to PJRT C API functions. It should only be obtained from such
+    /// functions. That is because it does not have a contract for the underlying memory layout and may also be
+    /// constructed by Rust code (e.g., in [`SerializedDeviceAssignment::from_proto`]).
+    handle: *mut ffi::PJRT_DeviceAssignmentSerialized,
 
-    /// Serialized [`DeviceAssignment`] that was allocated/serialized using the PJRT C API.
-    C {
-        /// Handle that represents this [`SerializedDeviceAssignment`] in the PJRT C API.
-        handle: *mut ffi::PJRT_DeviceAssignmentSerialized,
+    /// Optional function that must be called to free the underlying memory when dropping this instance.
+    deleter: Option<unsafe extern "C" fn(device_assignment: *mut ffi::PJRT_DeviceAssignmentSerialized)>,
 
-        /// Optional function that must be called to free the underlying memory when dropping this instance.
-        deleter: Option<unsafe extern "C" fn(device_assignment: *mut ffi::PJRT_DeviceAssignmentSerialized)>,
+    /// Pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
+    data: *const std::ffi::c_char,
 
-        /// Pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
-        data: *const std::ffi::c_char,
-
-        /// Size (i.e., number of bytes) of this [`SerializedDeviceAssignment`].
-        data_size: usize,
-    },
+    /// Size (i.e., number of bytes) of this [`SerializedDeviceAssignment`].
+    data_size: usize,
 }
 
 impl SerializedDeviceAssignment {
+    /// Constructs a [`SerializedDeviceAssignment`] from the provided C API handle and data.
+    pub(crate) unsafe fn from_c_api(
+        handle: *mut ffi::PJRT_DeviceAssignmentSerialized,
+        deleter: Option<unsafe extern "C" fn(device_assignment: *mut ffi::PJRT_DeviceAssignmentSerialized)>,
+        data: *const std::ffi::c_char,
+        data_size: usize,
+    ) -> Self {
+        Self { handle, deleter, data, data_size }
+    }
+
+    /// Constructs a [`SerializedDeviceAssignment`] from the provided [`DeviceAssignment`] Protobuf message.
+    pub fn from_proto(device_assignment: crate::protos::DeviceAssignment) -> Self {
+        unsafe extern "C" fn delete(handle: *mut ffi::PJRT_DeviceAssignmentSerialized) {
+            if !handle.is_null() {
+                unsafe { drop(Box::from_raw(handle as *mut Vec<u8>)) };
+            }
+        }
+
+        let serialized_device_assignment = Box::new(device_assignment.encode_to_vec());
+        let data = serialized_device_assignment.as_ptr() as *const std::ffi::c_char;
+        let data_size = serialized_device_assignment.len();
+        let handle = Box::into_raw(serialized_device_assignment) as *mut ffi::PJRT_DeviceAssignmentSerialized;
+        Self { handle, deleter: Some(delete), data, data_size }
+    }
+
     /// Returns a pointer to the underlying bytes of this [`SerializedDeviceAssignment`].
     pub fn data(&self) -> &[u8] {
-        match self {
-            Self::Rust { data } => data,
-            Self::C { data, data_size, .. } => unsafe { slice_from_c_api(*data as *const u8, *data_size) },
-        }
+        unsafe { slice_from_c_api(self.data as *const u8, self.data_size) }
     }
 
     /// Returns the Protobuf message that corresponds to this [`SerializedDeviceAssignment`].
@@ -650,8 +666,8 @@ unsafe impl Sync for SerializedDeviceAssignment {}
 
 impl Drop for SerializedDeviceAssignment {
     fn drop(&mut self) {
-        if let Self::C { handle, deleter: Some(deleter), .. } = self {
-            unsafe { deleter(*handle) };
+        if let Some(deleter) = self.deleter {
+            unsafe { deleter(self.handle) };
         }
     }
 }

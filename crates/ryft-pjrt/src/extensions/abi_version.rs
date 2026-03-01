@@ -177,8 +177,7 @@ impl Api {
         &self,
         abi_version: crate::protos::RuntimeAbiVersion,
     ) -> Result<RuntimeAbiVersion, Error> {
-        let serialized_abi_version = SerializedAbiVersion::from_proto(abi_version);
-        self.deserialize_runtime_abi_version(&serialized_abi_version)
+        self.deserialize_runtime_abi_version(&SerializedAbiVersion::from_proto(abi_version))
     }
 
     /// Deserializes a [`RuntimeAbiVersion`] from the provided serialized ABI version.
@@ -206,8 +205,7 @@ impl Api {
         &self,
         abi_version: crate::protos::ExecutableAbiVersion,
     ) -> Result<ExecutableAbiVersion, Error> {
-        let serialized_abi_version = SerializedAbiVersion::from_proto(abi_version);
-        self.deserialize_executable_abi_version(&serialized_abi_version)
+        self.deserialize_executable_abi_version(&SerializedAbiVersion::from_proto(abi_version))
     }
 
     /// Deserializes an [`ExecutableAbiVersion`] from the provided serialized ABI version.
@@ -419,7 +417,10 @@ impl Drop for ExecutableAbiVersion {
 
 /// Serialized [`RuntimeAbiVersion`] or [`ExecutableAbiVersion`].
 pub struct SerializedAbiVersion {
-    /// Handle that represents this [`SerializedAbiVersion`] in the PJRT C API.
+    /// Opaque data handle that represents data associated with this [`SerializedAbiVersion`].
+    /// Note that this handle should _never_ be passed to PJRT C API functions. It should only be obtained from such
+    /// functions. That is because it does not have a contract for the underlying memory layout and may also be
+    /// constructed by Rust code (e.g., in [`SerializedAbiVersion::from_proto`]).
     handle: *mut ffi::PJRT_SerializedProto,
 
     /// Optional function that must be called to free the underlying memory when dropping this instance.
@@ -433,11 +434,6 @@ pub struct SerializedAbiVersion {
 }
 
 impl SerializedAbiVersion {
-    /// Returns a pointer to the underlying bytes of this [`SerializedAbiVersion`].
-    pub fn data(&self) -> &[u8] {
-        unsafe { slice_from_c_api(self.data as *const _, self.data_size) }
-    }
-
     /// Constructs a [`SerializedAbiVersion`] from the provided ABI version Protobuf message.
     fn from_proto<M: Message>(abi_version: M) -> Self {
         unsafe extern "C" fn delete(handle: *mut ffi::PJRT_SerializedProto) {
@@ -445,12 +441,17 @@ impl SerializedAbiVersion {
                 unsafe { drop(Box::from_raw(handle as *mut Vec<u8>)) };
             }
         }
-        
+
         let serialized_abi_version = Box::new(abi_version.encode_to_vec());
         let data = serialized_abi_version.as_ptr() as *const std::ffi::c_char;
         let data_size = serialized_abi_version.len();
         let handle = Box::into_raw(serialized_abi_version) as *mut ffi::PJRT_SerializedProto;
         Self { handle, deleter: Some(delete), data, data_size }
+    }
+    
+    /// Returns a pointer to the underlying bytes of this [`SerializedAbiVersion`].
+    pub fn data(&self) -> &[u8] {
+        unsafe { slice_from_c_api(self.data as *const _, self.data_size) }
     }
 
     /// Returns the Protobuf message that corresponds to this [`SerializedAbiVersion`].

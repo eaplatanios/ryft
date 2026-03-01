@@ -84,7 +84,7 @@ impl FfiExecutionStage {
             ffi::XLA_FFI_ExecutionStage::XLA_FFI_ExecutionStage_EXECUTE => Self::Execution,
         }
     }
-    
+
     /// Returns the [`XLA_FFI_ExecutionStage`](ffi::XLA_FFI_ExecutionStage) that corresponds to this
     /// [`FfiExecutionStage`] and which can be passed to functions in the XLA FFI API.
     pub fn to_c_api(&self) -> ffi::XLA_FFI_ExecutionStage {

@@ -664,11 +664,13 @@ impl<'c> LoadedExecutable<'c> {
                 serialized_device_assignment,
                 serialized_device_assignment_deleter,
             )| {
-                SerializedDeviceAssignment::C {
-                    handle: serialized_device_assignment,
-                    deleter: serialized_device_assignment_deleter,
-                    data: serialized_bytes,
-                    data_size: serialized_bytes_size,
+                unsafe {
+                    SerializedDeviceAssignment::from_c_api(
+                        serialized_device_assignment,
+                        serialized_device_assignment_deleter,
+                        serialized_bytes,
+                        serialized_bytes_size,
+                    )
                 }
                 .deserialize()
             },
