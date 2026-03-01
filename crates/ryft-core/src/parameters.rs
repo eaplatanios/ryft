@@ -982,67 +982,73 @@ pub trait Parameterized<P: Parameter>: Sized {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Combines optional trees into one value using left-to-right `Some` precedence per leaf.
+    /// Combines multiple structure-aligned `Parameterized<Option<P>>` values into a single `Parameterized<P>` value,
+    /// using left-to-right precedence at each parameter location. That is, for each leaf [`ParameterPath`] in
+    /// `structure`, this function selects the first [`Some`] value from `values` and uses it for the corresponding
+    /// location in the resulting [`Parameterized`] value that the function returns. If no [`Some`] value is found for
+    /// some leaf [`ParameterPath`], then this function will return a [`Error::MissingParameters`] error. Furthermore,
+    /// if any of the provided `values` contains additional [`Parameter`]s, beyond those that correspond to ones in
+    /// `structure`, then this function will return an [`Error::UnusedParameters`] error.
     ///
-    /// This is inspired by Equinox
-    /// [`combine`](https://docs.kidger.site/equinox/api/manipulation/#equinoxcombine) and is typically used to undo
-    /// [`Self::filter_parameters`] or [`Self::partition_parameters`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `structure`: Target parameter structure for the reconstructed output.
-    ///   - `optional_trees`: Optional trees with the same structure as `structure`.
-    ///
-    /// # Returns
-    ///
-    /// A reconstructed value where each leaf is the first non-`None` candidate found at that position.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::MissingParameters`] if any optional tree is too short or if all candidates are `None` for a
-    /// leaf, and [`Error::UnusedParameters`] if any optional tree has extra leaves.
+    /// This function is typically used to reconstruct values from the results of calling [`Self::filter_parameters`]
+    /// and [`Self::partition_parameters`]. It is inspired by
+    /// [Equinox's `combine` function](https://docs.kidger.site/equinox/api/manipulation/#equinox.combine).
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use ryft_core::parameters::{Parameterized, Placeholder};
-    /// let structure = vec![(Placeholder, Placeholder)];
-    /// let combined = <Vec<(i32, i32)> as Parameterized<i32>>::combine_parameters(
+    /// # use ryft::Parameterized;
+    ///
+    /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
+    /// let structure = value.parameter_structure();
+    ///
+    /// // Split by top-level element and then reconstruct the original value.
+    /// let (partition_0, partition_1) = value.partition_parameters(|path, _| path.to_string().starts_with("$[0]"))?;
+    /// let combined = Vec::<(i32, i32)>::combine_parameters(
     ///     structure,
-    ///     vec![
-    ///         vec![(Some(10), None)],
-    ///         vec![(Some(20), Some(30))],
-    ///     ],
+    ///     vec![partition_0, partition_1],
     /// )?;
-    /// assert_eq!(combined, vec![(10, 30)]);
-    /// # Ok::<(), ryft_core::errors::Error>(())
+    ///
+    /// assert_eq!(combined, vec![(1, 2), (3, 4)]);
+    ///
+    /// # Ok::<(), ryft::Error>(())
     /// ```
-    fn combine_parameters<I>(structure: Self::ParameterStructure, optional_trees: I) -> Result<Self, Error>
+    fn combine_parameters<I: IntoIterator<Item = Self::To<Option<P>>>>(
+        structure: Self::ParameterStructure,
+        values: I,
+    ) -> Result<Self, Error>
     where
-        I: IntoIterator<Item = Self::To<Option<P>>>,
         Self::Family: ParameterizedFamily<Option<P>>,
     {
+        // TODO(eaplatanios): Is it easy to support broadcasting semantics in this function?
         let expected_paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
         let expected_count = expected_paths.len();
-        let mut optional_iterators = optional_trees.into_iter().map(|tree| tree.into_parameters()).collect::<Vec<_>>();
-        let mut combined_parameters = Vec::new();
-        combined_parameters.reserve_exact(expected_count);
+        let mut value_parameters = values.into_iter().map(|value| value.into_parameters()).collect::<Vec<_>>();
+        let mut parameters = Vec::new();
+        parameters.reserve_exact(expected_count);
         for path in expected_paths {
             let mut selected = None;
-            for iterator in &mut optional_iterators {
+            for iterator in &mut value_parameters {
                 let candidate = iterator.next().ok_or(Error::MissingParameters { expected_count, paths: None })?;
+                // TODO(eaplatanios): Must check for equality when there are more non-None values and
+                //  return an error if ambiguous. The error should be called
+                //  `Error::AmbiguousParameterCombination { values: Vec<...> }`.
                 if selected.is_none() {
                     selected = candidate;
                 }
             }
+            // TODO(eaplatanios): We should be collecting all missing paths and returning them after the loop if
+            //  non-empty similar to what we are doing in `Self::from_named_parameters`.
             let parameter = selected
                 .ok_or_else(|| Error::MissingParameters { expected_count, paths: Some(vec![path.to_string()]) })?;
-            combined_parameters.push(parameter);
+            parameters.push(parameter);
         }
-        if optional_iterators.iter_mut().any(|iterator| iterator.next().is_some()) {
+        // TODO(eaplatanios): We should be collecting paths for unused parameters and including them in the resulting
+        //  `Error::UnusedParameters` error similar to what we are doing in `Self::from_named_parameters`.
+        if value_parameters.iter_mut().any(|iterator| iterator.next().is_some()) {
             return Err(Error::UnusedParameters { paths: None });
         }
-        Self::from_parameters(structure, combined_parameters)
+        Self::from_parameters(structure, parameters)
     }
 
     /// Replaces parameters using an optional replacement tree.
