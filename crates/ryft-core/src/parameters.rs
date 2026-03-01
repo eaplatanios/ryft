@@ -709,37 +709,77 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         P: Clone,
     {
+        // This function uses a small local prefix trie to resolve each leaf parameter path to the most specific
+        // matching prefix (i.e., the longest matching prefix) in path-depth time, instead of scanning all prefixes
+        // for every leaf. That is usually much faster when many prefixes are provided, at the cost of the additional
+        // trie construction/allocation overhead, which can be less favorable for very small prefix sets.
+
+        #[derive(Default)]
+        struct PrefixTrieNode {
+            children: HashMap<ParameterPathSegment, usize>,
+            selected_prefix_index: Option<usize>,
+        }
+
         let paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
         let expected_count = paths.len();
         let mut path_prefixes = parameters.into_iter().map(|(path, value)| (path, value, 0usize)).collect::<Vec<_>>();
-        let mut broadcasted_parameters = HashMap::with_capacity(expected_count);
+
+        // Build a trie of provided path prefixes so that each lef parameter path can be resolved by walking segments
+        // instead of scanning all prefixes. This turns per-path prefix selection into a path-depth walk.
+        let mut prefix_trie = vec![PrefixTrieNode::default()];
+        for (prefix_index, (path, _, _)) in path_prefixes.iter().enumerate() {
+            let mut node_index = 0usize;
+            for segment in path.segments() {
+                let child_index = if let Some(child_index) = prefix_trie[node_index].children.get(segment).copied() {
+                    child_index
+                } else {
+                    prefix_trie.push(PrefixTrieNode::default());
+                    let child_index = prefix_trie.len() - 1;
+                    prefix_trie[node_index].children.insert(segment.clone(), child_index);
+                    child_index
+                };
+                node_index = child_index;
+            }
+            prefix_trie[node_index].selected_prefix_index = Some(prefix_index);
+        }
+
+        // Keep values in `structure.named_parameters()` order so that reconstruction can use `from_parameters`.
+        let mut values = Vec::with_capacity(expected_count);
         let mut missing_paths = Vec::new();
         for path in paths {
-            // TODO(eaplatanios): Is performance a concern here with all these loops and searching?
-            let selected_prefix_index = path_prefixes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (p, _, _))| if p.is_prefix_of(&path) { Some((i, p.len())) } else { None })
-                .max_by(|x, y| x.1.cmp(&y.1))
-                .map(|(i, _)| i);
+            let mut trie_node_index = 0usize;
+            let mut selected_prefix_index = prefix_trie[trie_node_index].selected_prefix_index;
+            // As we descend the trie, track the deepest prefix node encountered. That is the "most specific" match.
+            for segment in path.segments() {
+                let Some(next_trie_node_index) = prefix_trie[trie_node_index].children.get(segment).copied() else {
+                    break;
+                };
+                trie_node_index = next_trie_node_index;
+                if let Some(prefix_index) = prefix_trie[trie_node_index].selected_prefix_index {
+                    selected_prefix_index = Some(prefix_index);
+                }
+            }
             if let Some(selected_prefix_index) = selected_prefix_index {
                 let (_, value, matched_count) = &mut path_prefixes[selected_prefix_index];
-                broadcasted_parameters.insert(path, value.clone());
+                values.push(value.clone());
                 *matched_count += 1;
             } else {
                 missing_paths.push(path.to_string());
             }
         }
-        let unused_prefix_paths = path_prefixes
+
+        let mut unused_prefix_paths = path_prefixes
             .into_iter()
             .filter_map(|(path, _, matched_count)| if matched_count == 0 { Some(path.to_string()) } else { None })
             .collect::<Vec<_>>();
+
         if !missing_paths.is_empty() {
             Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
         } else if !unused_prefix_paths.is_empty() {
+            unused_prefix_paths.sort_unstable();
             Err(Error::UnusedParameters { paths: Some(unused_prefix_paths) })
         } else {
-            Self::from_named_parameters(structure, broadcasted_parameters)
+            Self::from_parameters(structure, values)
         }
     }
 
