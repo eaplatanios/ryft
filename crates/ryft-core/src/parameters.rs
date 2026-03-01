@@ -1100,7 +1100,7 @@ pub trait Parameterized<P: Parameter>: Sized {
         let mut replaced_parameters = Vec::new();
         replaced_parameters.reserve_exact(expected_count);
         let mut missing_paths = Vec::new();
-        
+
         for path in expected_paths {
             let parameter = parameters.next().map(|(_, parameter)| parameter);
             let replacement = replacements.next().map(|(_, replacement)| replacement);
@@ -2035,7 +2035,6 @@ impl<P: Parameter, K: Clone + Debug + Ord, F: ParameterizedFamily<P> + Parameter
     type To = BTreeMap<K, <F as ParameterizedFamily<P>>::To>;
 }
 
-// TODO(eaplatanios): The following `impl` block needs review.
 impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P> for BTreeMap<K, V> {
     type Family = BTreeMapParameterizedFamily<K, V::Family>;
 
@@ -2104,9 +2103,7 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
     }
 
     fn parameter_structure(&self) -> Self::ParameterStructure {
-        let mut structure = BTreeMap::new();
-        structure.extend(self.iter().map(|(key, value)| (key.clone(), value.parameter_structure())));
-        structure
+        BTreeMap::from_iter(self.iter().map(|(key, value)| (key.clone(), value.parameter_structure())))
     }
 
     fn parameters(&self) -> Self::ParameterIterator<'_, P> {
