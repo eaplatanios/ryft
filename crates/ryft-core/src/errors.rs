@@ -34,10 +34,4 @@ pub enum Error {
         values.iter().map(|value| format!("'{value}'")).collect::<Vec<_>>().join(", "),
     )]
     AmbiguousParameterCombination { values: Vec<String> },
-
-    #[error("unknown parameter path '{path}'")]
-    UnknownParameterPath { path: String },
-
-    #[error("expected exactly {expected_count} replacement parameter values but got {actual_count}")]
-    ParameterReplacementCountMismatch { expected_count: usize, actual_count: usize },
 }
