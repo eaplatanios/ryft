@@ -211,15 +211,26 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// entries, reinforcement learning agent observations, etc. Ryft provides built-in [`Parameterized`] implementations
 /// for a wide range of container-like types, including but not limited to:
 ///
-/// TODO(eaplatanios): List of supported types.
+///  - **Parameters:** All `P: Parameter` are `Parameterized<P>`.
+///  - **Tuples:** `()` is `Parameterized<P>` for all `P: Parameter`, `(V0)` is `Parameterized<P>` when
+///    `V0: Parameterized<P>`, `(V0, V1)` is `Parameterized<P>` when `V0: Parameterized<P>` and `V1: Parameterized<P>`,
+///    etc., up to size 12.
+///  - **Arrays:** `[V; N]` is `Parameterized<P>` for any `N` when `V: Parameterized<P>`.
+///  - **Vectors:** `Vec<V>` is `Parameterized<P>` when `V: Parameterized<P>`.
+///  - **Maps:** `HashMap<K, V>` is `Parameterized<P>` when `K: Clone + Debug` and `V: Parameterized<P>`.
+///  - **Phantom Data:** `PhantomData<P>` is `Parameterized<P>` for all `P: Parameter`, containing no parameters.
 ///
-/// Furthermore, Ryft provides a convenient `#[derive(Parameterized)]` macro that can be used to automatically derive
-/// [`Parameterized`] implementations for custom types. Refer to the [`Custom Types`](#custom-types) section below for
-/// more information on that macro.
+/// Note that [`Option<P>`] is not [`Parameterized<P>`] by default. That is because we need `Option<P>` to be a
+/// [`Parameter`] when `P: Parameter` in order to support some of the manipulation functions that are described in the
+/// [_Working with Parameterized Values_](#working-with-parameterized-values) section below.
 ///
-/// The [`Parameterized`] type and the functionality it provides is inspired by
-/// [JAX PyTrees](https://docs.jax.dev/en/latest/pytrees.html#working-with-pytrees)
-/// and [Equinox's PyTree manipulation APIs](https://docs.kidger.site/equinox/api/manipulation/).
+/// Ryft also provides a convenient `#[derive(Parameterized)]` macro that can be used to automatically derive
+/// [`Parameterized`] implementations for custom types. Refer to the [_Custom Types_](#custom-types) section below
+/// for more information on that macro.
+///
+/// The [`Parameterized`] type and the functionality it provides is inspired by and shares a lot of commonalities with
+/// [JAX PyTrees](https://docs.jax.dev/en/latest/pytrees.html#working-with-pytrees) and
+/// [Equinox's PyTree manipulation APIs](https://docs.kidger.site/equinox/api/manipulation/).
 ///
 /// ## Examples
 ///
@@ -255,6 +266,9 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 /// TODO(eaplatanios): Introduce section about the derive macro and include examples.
 ///
+/// # Working with Parameterized Values
+///
+/// TODO(eaplatanios): Talk about our manipulation helpers a bit here but point to their docstrings for details.
 ///
 ///
 ///
@@ -262,17 +276,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 ///
 ///
-///
-///
-/// Any nested container whose leaves implement [`Parameter`] can be traversed as a [`Parameterized`] tree.
-/// A single [`Parameter`] leaf is also a valid tree.
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-/// assert_eq!(value.parameter_count(), 4);
-/// assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-/// ```
 ///
 /// # Common Parameterized Functions
 ///
@@ -1129,7 +1132,6 @@ impl<P, I: Iterator<Item = (ParameterPath, P)>> Iterator for PathPrefixedParamet
     }
 }
 
-/// Parameterization family for leaf parameter types.
 pub struct ParameterParameterizedFamily;
 
 impl<P: Parameter> ParameterizedFamily<P> for ParameterParameterizedFamily {
@@ -1557,18 +1559,18 @@ macro_rules! tuple_named_parameter_into_iterator {
 }
 
 tuple_parameterized_impl!();
-tuple_parameterized_impl!(T0:0);
-tuple_parameterized_impl!(T0:0, T1:1);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10);
-tuple_parameterized_impl!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11);
+tuple_parameterized_impl!(V0:0);
+tuple_parameterized_impl!(V0:0, V1:1);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7, V8:8);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7, V8:8, V9:9);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7, V8:8, V9:9, V10:10);
+tuple_parameterized_impl!(V0:0, V1:1, V2:2, V3:3, V4:4, V5:5, V6:6, V7:7, V8:8, V9:9, V10:10, V11:11);
 
 pub struct ArrayParameterizedFamily<F, const N: usize>(PhantomData<F>);
 
