@@ -671,8 +671,9 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// documentation of the [`Parameterized`] trait.
     fn from_named_parameters(
         structure: Self::ParameterStructure,
-        mut parameters: HashMap<ParameterPath, P>,
+        parameters: HashMap<ParameterPath, P>,
     ) -> Result<Self, Error> {
+        let mut parameters = parameters;
         let expected_count = structure.parameter_count();
         let mut values = Vec::with_capacity(expected_count);
         for (expected_path, _) in structure.named_parameters() {
