@@ -28,13 +28,15 @@ pre-release-replacements = [
 ]
 
 [dependencies]
-ryft-macros.workspace = true
 ryft-mlir = { workspace = true, optional = true }
 ryft-pjrt = { workspace = true, optional = true }
-dyn-clone.workspace = true
+convert_case.workspace = true
 half.workspace = true
 paste.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+ryft = { workspace = true, features = ["xla"] }
 
 [features]
 default = ["xla"]

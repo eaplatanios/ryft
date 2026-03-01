@@ -1,6 +1,17 @@
-# **Ryft Core:** TODO
+# **Ryft Core:** Work-in-Progress Core APIs
 
-TODO(eaplatanios): Add some information about Ryft core.
+> [!WARNING]
+> `ryft` is currently a work in progress and is evolving very actively. APIs and module or crate boundaries may change.
+
+`ryft-core` is intended to host Ryft's core abstractions for tracing, automatic differentiation, and Just-In-Time (JIT)
+compilation. Today, the most complete and usable part of this crate is the
+[`Parameterized`](https://docs.rs/ryft-core/latest/ryft_core/parameters/trait.Parameterized.html) API.
+
+## Coming Soon
+
+`ryft-core` is expected to grow into the main home for higher-level tracing, automatic differentiation,
+and Just-In-Time (JIT) compilation APIs. Those pieces are still being actively developed and are not yet ready
+to take a dependency on.
 
 #### License
 

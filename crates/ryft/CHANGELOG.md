@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Changed
+
+- Significantly enhanced the `Parameterized` trait.
+- Updated the `ryft-pjrt` and `ryft-xla-sys` dependencies.
+
 ## [0.0.1] - 2026-02-22
 
 ### Added

@@ -1,28 +1,28 @@
-error: The '#[derive(ryft::Parameterized)]' macro does not support unions.
+error: the '#[derive(ryft::Parameterized)]' macro does not support unions
  --> tests/parameters/error_unions.rs:4:7
   |
 4 | union UnionWithParameters<P: Parameter> {
   |       ^^^^^^^^^^^^^^^^^^^
 
-error: Found more than one generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute.
+error: found more than one generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute
   --> tests/parameters/error_unions.rs:10:34
    |
 10 | union UnionWithMultipleParameters<P: Copy + Parameter, V: Copy + Parameter> {
    |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[derive(ryft::Parameterized)]' macro does not support unions.
+error: the '#[derive(ryft::Parameterized)]' macro does not support unions
   --> tests/parameters/error_unions.rs:10:7
    |
 10 | union UnionWithMultipleParameters<P: Copy + Parameter, V: Copy + Parameter> {
    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: Found no generic types bounded by 'Parameter'. To use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one. The bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute.
+error: found no generic types bounded by 'Parameter'; to use the ryft '#[derive(Parameterized)]' macro you must bound exactly one type parameter with the 'Parameter' trait; not none and not more than one; the bound must be specified as 'Parameter' or 'ryft::Parameter' where 'ryft' must be substituted for the custom ryft 'crate' provided, if one was provided using the '#[ryft(crate = ...)]' attribute
   --> tests/parameters/error_unions.rs:16:7
    |
 16 | union UnionWithoutParameters<P: Copy, V: Copy> {
    |       ^^^^^^^^^^^^^^^^^^^^^^
 
-error: The '#[derive(ryft::Parameterized)]' macro does not support unions.
+error: the '#[derive(ryft::Parameterized)]' macro does not support unions
   --> tests/parameters/error_unions.rs:16:7
    |
 16 | union UnionWithoutParameters<P: Copy, V: Copy> {

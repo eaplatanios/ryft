@@ -1,7 +1,7 @@
 use proc_macro2::Span;
 use quote::ToTokens;
 
-use crate::helpers::span::with_span;
+use crate::helpers::spans::with_span;
 
 /// Replaces instances of the `Self` type in the provided [`DeriveInput`] with the corresponding fully-qualified
 /// "receiver" type. This is necessary in order to be able to handle recursive types when deriving trait
@@ -58,8 +58,6 @@ impl ReplaceSelf<'_> {
         // Process the where clause, if one exists.
         if let Some(where_clause) = &mut generics.where_clause {
             where_clause.predicates.iter_mut().for_each(|predicate| match predicate {
-                // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-                // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
                 syn::WherePredicate::Lifetime(_) => {}
                 syn::WherePredicate::Type(predicate) => {
                     self.process_type(&mut predicate.bounded_ty);
@@ -88,8 +86,6 @@ impl ReplaceSelf<'_> {
     /// Replaces all instances of `Self` in the provided [`Type`] with [`Self::receiver_type`].
     fn process_type(&self, ty: &mut syn::Type) {
         match ty {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::Type::Array(ty) => {
                 self.process_type(&mut ty.elem);
                 self.process_expression(&mut ty.len);
@@ -128,8 +124,6 @@ impl ReplaceSelf<'_> {
     /// length of arrays (and is only ever called in that context, though it also recurses into such expressions).
     fn process_expression(&self, expr: &mut syn::Expr) {
         match expr {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::Expr::Array(_) | syn::Expr::Assign(_) | syn::Expr::Async(_) | syn::Expr::Await(_) => {}
             syn::Expr::Binary(expr) => {
                 self.process_expression(&mut expr.left);
@@ -193,12 +187,19 @@ impl ReplaceSelf<'_> {
     /// Replaces all instances of `Self` in the provided [`TypeParamBound`] with [`Self::receiver_type`].
     fn process_type_param_bound(&self, bound: &mut syn::TypeParamBound) {
         match bound {
-            // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-            // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
             syn::TypeParamBound::Trait(bound) => self.process_path(&mut bound.path),
-            syn::TypeParamBound::Lifetime(_)
-            | syn::TypeParamBound::PreciseCapture(_) // TODO(eaplatanios): Should we raise an error for this one?
-            | syn::TypeParamBound::Verbatim(_) => {}
+            syn::TypeParamBound::Lifetime(_) | syn::TypeParamBound::Verbatim(_) => {}
+            syn::TypeParamBound::PreciseCapture(capture) => {
+                capture.params.iter_mut().for_each(|param| match param {
+                    syn::CapturedParam::Lifetime(_) => {}
+                    syn::CapturedParam::Ident(ident) if ident == "Self" => {
+                        if let Some(receiver_ident) = self.receiver_type(ident.span()).path.segments.first() {
+                            *ident = receiver_ident.ident.clone();
+                        }
+                    }
+                    _ => {}
+                });
+            }
             _ => {}
         }
     }
@@ -213,8 +214,6 @@ impl ReplaceSelf<'_> {
             syn::PathArguments::None => {}
             syn::PathArguments::AngleBracketed(arguments) => {
                 arguments.args.iter_mut().for_each(|arg| match arg {
-                    // TODO(eaplatanios): Uncomment this once `non_exhaustive_omitted_patterns_lint` is stabilized.
-                    // #![cfg_attr(test, deny(non_exhaustive_omitted_patterns))]
                     syn::GenericArgument::Lifetime(_) => {}
                     syn::GenericArgument::Type(arg) => self.process_type(arg),
                     syn::GenericArgument::Const(_) => {}
@@ -269,5 +268,54 @@ impl ReplaceSelf<'_> {
 
         let segments = std::mem::take(&mut path.segments);
         path.segments = segments.into_pairs().skip(1).collect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::ToTokens;
+
+    use super::replace_self_type;
+
+    #[test]
+    fn test_replace_self_type() {
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            struct Node<T>
+            where
+                Self: Clone,
+                T: Into<Self::Assoc>,
+            {
+                child: Option<Self>,
+                array: [u8; Self::LEN + 1],
+                callback: fn(Self) -> Self::Assoc,
+            }
+        };
+        replace_self_type(&mut input);
+        let rendered = input.to_token_stream().to_string().replace(' ', "");
+        assert!(!rendered.contains("Self"));
+        assert!(rendered.contains("Node<T>:Clone"));
+        assert!(rendered.contains("T:Into<<Node<T>>::Assoc>"));
+        assert!(rendered.contains("Option<Node<T>>"));
+        assert!(rendered.contains("[u8;<Node<T>>::LEN+1]"));
+        assert!(rendered.contains("fn(Node<T>)-><Node<T>>::Assoc"));
+
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            enum Message<T>
+            where
+                T: From<Self::Assoc>,
+            {
+                One(Self),
+                Many([Self; Self::COUNT]),
+                Marker(fn() -> Self::Assoc),
+            }
+        };
+
+        replace_self_type(&mut input);
+        let rendered = input.to_token_stream().to_string().replace(' ', "");
+        assert!(!rendered.contains("Self"));
+        assert!(rendered.contains("T:From<<Message<T>>::Assoc>"));
+        assert!(rendered.contains("One(Message<T>)"));
+        assert!(rendered.contains("Many([Message<T>;<Message<T>>::COUNT])"));
+        assert!(rendered.contains("Marker(fn()-><Message<T>>::Assoc)"));
     }
 }
