@@ -302,24 +302,91 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///    fundamental component of how the core features of Ryft are implemented. This operation is exposed via the
 ///    [`Self::map_parameters`] function.
 ///
-/// Note that these core operations are also supported with _named_ parameters, where each parameter is paired with a
+/// These core operations are also supported with _named_ parameters, where each parameter is paired with a
 /// [`ParameterPath`] specifying where in the nested data structure it belongs. This is useful for things like saving
 /// model checkpoints, etc. These _named_ parameter operation variants are exposed via the [`Self::named_parameters`],
 /// [`Self::named_parameters_mut`], [`Self::into_named_parameters`], [`Self::from_named_parameters`],
 /// [`Self::from_broadcasted_named_parameters`], [`Self::map_named_parameters`], and [`Self::map_named_parameters`]
 /// functions.
 ///
-/// TODO(eaplatanios): Talk about our manipulation helpers a bit here but point to their docstrings for details.
-///  - [`Self::partition_parameters`]
-///  - [`Self::filter_parameters`]
-///  - [`Self::combine_optional_parameters`]
-///  - [`Self::replace_parameters`]
-///  - [`Self::apply_parameter_updates_with`]
-///  - [`Self::apply_parameter_updates`]
-///  - [`Self::tree_at_paths`]
-///  - [`Self::tree_at`]
+/// Note that, the [`Parameterized`] trait also defines a bunch of additional functions that are implemented using the
+/// aforementioned core primitives like [`Self::partition_parameters`], [`Self::filter_parameters`], etc. You should
+/// refer to the full list of the [`Parameterized`] trait functions and their documentation for more information.
 ///
-/// TODO(eaplatanios): Add examples.
+/// ## Examples
+///
+/// The following examples show the flattening, unflattening, and mapping operations in action:
+///
+/// ```rust
+/// # use std::collections::{BTreeMap, HashMap};
+/// # use ryft_core::parameters::{ParameterPath, ParameterPathSegment, Parameterized};
+/// 
+/// type Value = (i32, BTreeMap<&'static str, Vec<i32>>, (i32,));
+/// let value = (1, BTreeMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
+///
+/// // Flattening:
+/// assert_eq!(value.parameters().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+///
+/// // Unflattening:
+/// assert_eq!(
+///     Value::from_parameters(value.parameter_structure(), vec![10, 20, 30, 40, 50])?,
+///     (10, BTreeMap::from([("a", vec![20]), ("b", vec![30, 40])]), (50,)),
+/// );
+///
+/// // Mapping:
+/// assert_eq!(
+///     value.clone().map_parameters(|parameter| (parameter as i64) * 10)?,
+///     (10_i64, BTreeMap::from([("a", vec![20_i64]), ("b", vec![30_i64, 40_i64])]), (50_i64,)),
+/// );
+///
+/// // Flattening to named parameters:
+/// assert_eq!(
+///     value.named_parameters().map(|(path, parameter)| (path.to_string(), *parameter)).collect::<Vec<_>>(),
+///     vec![
+///         ("$.0".to_string(), 1),
+///         ("$.1[\"a\"][0]".to_string(), 2),
+///         ("$.1[\"b\"][0]".to_string(), 3),
+///         ("$.1[\"b\"][1]".to_string(), 4),
+///         ("$.2.0".to_string(), 5),
+///     ],
+/// );
+///
+/// // Unflattening from named parameters:
+/// assert_eq!(
+///     Value::from_named_parameters(
+///         value.parameter_structure(),
+///         value.clone().into_named_parameters().collect::<HashMap<_, _>>(),
+///     )?,
+///     value,
+/// );
+///
+/// // Mapping named parameters:
+/// assert_eq!(
+///     value.clone().map_named_parameters(|path, parameter| (parameter as i64) + (path.len() as i64))?,
+///     (2_i64, BTreeMap::from([("a", vec![5_i64]), ("b", vec![6_i64, 7_i64])]), (7_i64,)),
+/// );
+///
+/// // Unflattening from broadcasted named parameters:
+/// assert_eq!(
+///     Value::from_broadcasted_named_parameters(
+///         value.parameter_structure(),
+///         HashMap::from([
+///             (ParameterPath::root(), 0),
+///             (ParameterPath::root().with_segment(ParameterPathSegment::TupleIndex(1)), 10),
+///             (
+///                 ParameterPath::root()
+///                     .with_segment(ParameterPathSegment::TupleIndex(1))
+///                     .with_segment(ParameterPathSegment::Key(format!("{:?}", "b")))
+///                     .with_segment(ParameterPathSegment::Index(1)),
+///                 30,
+///             ),
+///         ]),
+///     )?,
+///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![10, 30])]), (0,)),
+/// );
+/// 
+/// # Ok::<(), ryft_core::errors::Error>(())
+/// ```
 ///
 /// # Custom Types
 ///
@@ -339,46 +406,6 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 ///
 ///
-///
-///
-/// # Common Parameterized Functions
-///
-/// The most commonly used operations are flattening, rebuilding, and mapping:
-///
-/// - Flatten leaves: [`parameters`](Self::parameters) together with
-///   [`parameter_structure`](Self::parameter_structure).
-/// - Rebuild from leaves: [`from_parameters`](Self::from_parameters) or
-///   [`from_parameters_with_remainder`](Self::from_parameters_with_remainder).
-/// - Map leaves: [`map_parameters`](Self::map_parameters) or [`map_named_parameters`](Self::map_named_parameters).
-///
-/// In direct JAX terms:
-///
-/// - `jax.tree.flatten(x)` corresponds to [`parameters`](Self::parameters) +
-///   [`parameter_structure`](Self::parameter_structure).
-/// - `jax.tree.unflatten(treedef, leaves)` corresponds to [`from_parameters`](Self::from_parameters).
-/// - `jax.tree.map(f, x)` corresponds to [`map_parameters`](Self::map_parameters).
-///
-/// ## Common function: `map_parameters`
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let list_of_lists = vec![vec![1_i32, 2, 3], vec![1, 2], vec![1, 2, 3, 4]];
-/// let doubled = list_of_lists.map_parameters(|value| value * 2)?;
-/// assert_eq!(doubled, vec![vec![2, 4, 6], vec![2, 4], vec![2, 4, 6, 8]]);
-/// # Ok::<(), ryft_core::errors::Error>(())
-/// ```
-///
-/// ## Common function: `map_named_parameters`
-///
-/// ```rust
-/// # use ryft_core::parameters::Parameterized;
-/// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
-/// let scaled = value.map_named_parameters(|path, parameter| {
-///     if path.to_string().ends_with(".1") { parameter * 10 } else { parameter }
-/// })?;
-/// assert_eq!(scaled, vec![(1, 20), (3, 40)]);
-/// # Ok::<(), ryft_core::errors::Error>(())
-/// ```
 ///
 /// # Viewing The Parameterized Definition Of A Value
 ///
