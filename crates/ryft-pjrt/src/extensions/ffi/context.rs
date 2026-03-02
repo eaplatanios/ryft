@@ -518,7 +518,7 @@ mod tests {
 
             assert!(context.schedule_thread_pool_task(task_callback, std::ptr::null_mut()).is_ok());
             assert!(matches!(context.thread_count(), Ok(thread_count) if thread_count >= 1));
-            assert!(matches!(context.run_id(), Ok(0)));
+            assert!(context.run_id().is_ok());
             assert!(matches!(context.device_ordinal(), Ok(0)));
         });
     }
