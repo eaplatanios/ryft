@@ -278,7 +278,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 /// ```rust
 /// # use std::collections::BTreeMap;
-/// # use ryft::*;
+/// # use ryft_core::parameters::*;
 ///
 /// // Simple tuple with 3 [`Parameter`]s.
 /// let value = (1, 2, 3);
@@ -357,7 +357,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///
 /// ```rust
 /// # use std::collections::{BTreeMap, HashMap};
-/// # use ryft::*;
+/// # use ryft_core::parameters::*;
 ///
 /// type Value = (i32, BTreeMap<&'static str, Vec<i32>>, (i32,));
 /// let value = (1, BTreeMap::from([("a", vec![2]), ("b", vec![3, 4])]), (5,));
@@ -423,7 +423,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![10, 30])]), (0,)),
 /// );
 ///
-/// # Ok::<(), ryft::Error>(())
+/// # Ok::<(), ryft_core::errors::Error>(())
 /// ```
 ///
 /// # Custom Parameterized Types
@@ -468,6 +468,16 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// The following examples show how to use the `#[derive(Parameterized)]` macro:
 ///
 /// ```rust
+/// # /// Test-only shim to avoid taking a (circular) dependency on `ryft`.
+/// # mod ryft {
+/// #     pub use ryft_core::errors::Error;
+/// #     pub use ryft_core::parameters::{
+/// #         Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+/// #         PathPrefixedParameterIterator, Placeholder,
+/// #     };
+/// #     pub use ryft_macros::Parameterized;
+/// # }
+/// #
 /// # use ryft::*;
 ///
 /// #[derive(Debug, Clone, PartialEq, Eq, Parameterized)]
@@ -549,7 +559,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     },
 /// );
 ///
-/// # Ok::<(), ryft::Error>(())
+/// # Ok::<(), ryft_core::errors::Error>(())
 /// ```
 pub trait Parameterized<P: Parameter>: Sized {
     /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
@@ -939,7 +949,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// # Example
     ///
     /// ```rust
-    /// # use ryft::Parameterized;
+    /// # use ryft_core::parameters::Parameterized;
     ///
     /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
     ///
@@ -948,7 +958,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// assert_eq!(filtered, vec![(None, Some(2)), (None, Some(4))]);
     ///
-    /// # Ok::<(), ryft::Error>(())
+    /// # Ok::<(), ryft_core::errors::Error>(())
     /// ```
     fn filter_parameters<F: FnMut(&ParameterPath, &P) -> bool>(self, predicate: F) -> Result<Self::To<Option<P>>, Error>
     where
@@ -971,7 +981,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// # Example
     ///
     /// ```rust
-    /// # use ryft::Parameterized;
+    /// # use ryft_core::parameters::Parameterized;
     ///
     /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
     ///
@@ -981,7 +991,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// assert_eq!(partition_0, vec![(None, None), (Some(3), Some(4))]);
     /// assert_eq!(partition_1, vec![(Some(1), Some(2)), (None, None)]);
     ///
-    /// # Ok::<(), ryft::Error>(())
+    /// # Ok::<(), ryft_core::errors::Error>(())
     /// ```
     fn partition_parameters<F: FnMut(&ParameterPath, &P) -> bool>(
         self,
@@ -1027,7 +1037,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// # Example
     ///
     /// ```rust
-    /// # use ryft::Parameterized;
+    /// # use ryft_core::parameters::Parameterized;
     ///
     /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
     /// let structure = value.parameter_structure();
@@ -1041,7 +1051,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// assert_eq!(combined, vec![(1, 2), (3, 4)]);
     ///
-    /// # Ok::<(), ryft::Error>(())
+    /// # Ok::<(), ryft_core::errors::Error>(())
     /// ```
     fn combine_parameters<I: IntoIterator<Item = Self::To<Option<P>>>>(
         structure: Self::ParameterStructure,
@@ -1107,7 +1117,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// # Example
     ///
     /// ```rust
-    /// # use ryft::Parameterized;
+    /// # use ryft_core::parameters::Parameterized;
     ///
     /// let value = vec![(1_i32, 2_i32), (3_i32, 4_i32)];
     ///
@@ -1116,7 +1126,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// assert_eq!(replaced, vec![(1, 2), (99, 4)]);
     ///
-    /// # Ok::<(), ryft::Error>(())
+    /// # Ok::<(), ryft_core::errors::Error>(())
     /// ```
     fn replace_parameters(self, replacement: Self::To<Option<P>>) -> Result<Self, Error>
     where
@@ -2180,6 +2190,17 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+
+    /// Test-only shim to avoid taking a (circular) dependency on `ryft`.
+    pub mod ryft {
+        pub use ryft_macros::Parameterized;
+
+        pub use crate::errors::Error;
+        pub use crate::parameters::{
+            Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+            PathPrefixedParameterIterator, Placeholder,
+        };
+    }
 
     use ryft::*;
 

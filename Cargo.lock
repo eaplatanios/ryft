@@ -1627,7 +1627,7 @@ dependencies = [
  "convert_case",
  "half",
  "paste",
- "ryft",
+ "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",
  "thiserror 2.0.18",
