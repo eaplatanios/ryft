@@ -1634,7 +1634,6 @@ dependencies = [
  "dyn-clone",
  "half",
  "paste",
- "ryft",
  "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",

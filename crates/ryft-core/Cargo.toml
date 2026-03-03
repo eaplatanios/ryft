@@ -37,9 +37,6 @@ half.workspace = true
 paste.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-ryft = { workspace = true, features = ["xla"] }
-
 [features]
 default = ["xla"]
 xla = ["ryft-mlir", "ryft-pjrt"]
