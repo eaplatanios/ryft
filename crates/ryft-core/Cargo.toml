@@ -34,11 +34,16 @@ ryft-pjrt = { workspace = true, optional = true }
 convert_case.workspace = true
 dyn-clone.workspace = true
 half.workspace = true
+ndarray = { workspace = true, optional = true }
 paste.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+ndarray.workspace = true
+
 [features]
 default = ["xla"]
+ndarray = ["dep:ndarray"]
 xla = ["ryft-mlir", "ryft-pjrt"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]

@@ -1,3 +1,9 @@
+//! Vectorization support for `tracing_v2`.
+//!
+//! `Batch<V>` is the current prototype representation for a batched leaf value. It materializes each lane in a `Vec`,
+//! which is simple and works well for tests. A future backend can keep the same public `stack` / `unstack` / `vmap`
+//! surface while swapping in a more efficient batched representation.
+
 use std::ops::{Add, Mul, Neg};
 
 use ryft_macros::Parameter;
@@ -11,32 +17,38 @@ use crate::{
     },
 };
 
+/// Batched leaf value represented as an explicit list of lanes.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct Batch<V> {
     lanes: Vec<V>,
 }
 
 impl<V> Batch<V> {
+    /// Creates a new batched value from a list of lanes.
     #[inline]
     pub fn new(lanes: Vec<V>) -> Self {
         Self { lanes }
     }
 
+    /// Returns the number of lanes.
     #[inline]
     pub fn len(&self) -> usize {
         self.lanes.len()
     }
 
+    /// Returns `true` when the batch contains no lanes.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.lanes.is_empty()
     }
 
+    /// Returns the lanes by shared reference.
     #[inline]
     pub fn lanes(&self) -> &[V] {
         self.lanes.as_slice()
     }
 
+    /// Consumes `self` and returns the underlying lanes.
     #[inline]
     pub fn into_lanes(self) -> Vec<V> {
         self.lanes
@@ -119,6 +131,7 @@ where
     }
 }
 
+/// Stacks a list of structured inputs into one structured value whose leaves are [`Batch`] values.
 pub fn stack<Input, V>(inputs: Vec<Input>) -> Result<Input::To<Batch<V>>, TraceError>
 where
     V: Parameter,
@@ -149,6 +162,7 @@ where
     Ok(Input::To::<Batch<V>>::from_parameters(structure, buckets.into_iter().map(Batch::new))?)
 }
 
+/// Splits a structured batch back into one structured value per lane.
 pub fn unstack<Input, V>(batched: Input::To<Batch<V>>) -> Result<Vec<Input>, TraceError>
 where
     V: Parameter,
@@ -179,6 +193,8 @@ where
         .collect()
 }
 
+/// Maps `function` over a leading batch axis by stacking inputs, running the batched program once, and then
+/// unstacking the result.
 pub fn vmap<'context, Context, F, Input, Output, V>(
     context: &'context mut Context,
     function: F,
@@ -198,4 +214,49 @@ where
     let batched_output = function(&mut batching_context, batched_input);
     let _context = batching_context.finish();
     unstack(batched_output)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tracing_v2::PrototypeContext;
+
+    use super::*;
+
+    #[test]
+    fn stack_and_unstack_round_trip_structured_values() {
+        let batched = stack::<(f64, f64), f64>(vec![(1.0, 2.0), (3.0, 4.0)]).unwrap();
+        assert_eq!(batched.0.lanes(), &[1.0, 3.0]);
+        assert_eq!(batched.1.lanes(), &[2.0, 4.0]);
+
+        let unstacked = unstack::<(f64, f64), f64>(batched).unwrap();
+        assert_eq!(unstacked, vec![(1.0, 2.0), (3.0, 4.0)]);
+    }
+
+    #[test]
+    fn stack_rejects_empty_inputs() {
+        let result = stack::<(f64, f64), f64>(Vec::new());
+        assert!(matches!(result, Err(TraceError::EmptyBatch)));
+    }
+
+    #[test]
+    fn unstack_rejects_mismatched_lane_counts() {
+        let batched = (Batch::new(vec![1.0f64]), Batch::new(vec![2.0f64, 3.0f64]));
+        let result = unstack::<(f64, f64), f64>(batched);
+        assert!(matches!(result, Err(TraceError::MismatchedBatchSize)));
+    }
+
+    #[test]
+    fn vmap_exposes_batch_axis_size() {
+        let mut context = PrototypeContext::default();
+        let outputs: Vec<f64> = vmap(
+            &mut context,
+            |context, inputs: Batch<f64>| {
+                assert_eq!(context.axis_size(), 3);
+                inputs.clone() + inputs.one_like()
+            },
+            vec![1.0f64, 2.0, 3.0],
+        )
+        .unwrap();
+        assert_eq!(outputs, vec![2.0, 3.0, 4.0]);
+    }
 }

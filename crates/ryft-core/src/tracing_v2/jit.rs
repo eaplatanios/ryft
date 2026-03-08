@@ -1,5 +1,12 @@
+//! Just-in-time staging support for `tracing_v2`.
+//!
+//! The current `jit` transform captures a graph of staged primitive applications and replays that graph with the
+//! built-in interpreter. This keeps the API shape close to the eventual compiled-backend design while remaining easy
+//! to test in pure Rust.
+
 use std::{
     cell::RefCell,
+    fmt::Display,
     marker::PhantomData,
     ops::{Add, Mul, Neg},
     rc::Rc,
@@ -17,11 +24,13 @@ use crate::{
     },
 };
 
+/// Tracer used while staging JIT programs.
 #[derive(Clone, Debug, Parameter)]
 pub struct JitTracer<V>
 where
     V: TraceValue,
 {
+    /// Concrete value obtained during eager execution of the staged computation.
     pub value: V,
     atom: AtomId,
     builder: Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>,
@@ -31,12 +40,13 @@ impl<V> JitTracer<V>
 where
     V: TraceValue,
 {
+    /// Returns the staged atom identifier corresponding to this traced value.
     #[inline]
     pub fn atom(&self) -> AtomId {
         self.atom
     }
 
-    fn unary(self, op: StagedOpRef<V>, apply: impl FnOnce(V) -> V) -> Self {
+    pub(crate) fn unary(self, op: StagedOpRef<V>, apply: impl FnOnce(V) -> V) -> Self {
         let value = apply(self.value);
         let atom = self
             .builder
@@ -46,7 +56,7 @@ where
         Self { value, atom, builder: self.builder }
     }
 
-    fn binary(self, rhs: Self, op: StagedOpRef<V>, apply: impl FnOnce(V, V) -> V) -> Self {
+    pub(crate) fn binary(self, rhs: Self, op: StagedOpRef<V>, apply: impl FnOnce(V, V) -> V) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         let value = apply(self.value, rhs.value);
         let atom = self
@@ -145,6 +155,7 @@ where
     }
 }
 
+/// Staged function returned by [`jit`].
 pub struct CompiledFunction<V, Input, Output>
 where
     V: TraceValue,
@@ -162,16 +173,19 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
+    /// Returns the executable identifier allocated by the compilation context.
     #[inline]
     pub fn id(&self) -> usize {
         self.id
     }
 
+    /// Returns the staged graph backing this compiled function.
     #[inline]
     pub fn graph(&self) -> &Graph<StagedOpRef<V>, V, Input, Output> {
         &self.graph
     }
 
+    /// Replays the staged graph on concrete input values.
     pub fn call<Context>(&self, _context: &mut Context, input: Input) -> Result<Output, TraceError>
     where
         Input::ParameterStructure: PartialEq,
@@ -181,6 +195,19 @@ where
     }
 }
 
+impl<V, Input, Output> Display for CompiledFunction<V, Input, Output>
+where
+    V: TraceValue,
+    V::Abstract: Display,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.graph, f)
+    }
+}
+
+/// Stages `function` as a graph and returns both the eager output and the staged program.
 pub fn jit<'context, Context, F, Input, Output, V>(
     context: &'context mut Context,
     function: F,
@@ -229,4 +256,54 @@ where
         marker: PhantomData,
     };
     Ok((output_value, compiled))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tracing_v2::PrototypeContext;
+
+    use super::*;
+
+    #[test]
+    fn jit_tracer_zero_like_adds_constant_atoms() {
+        let mut context = PrototypeContext::default();
+        let jit_context = JitContext::<_, f64>::new(&mut context);
+        let builder = jit_context.staged_builder();
+        let atom = builder.borrow_mut().add_input(&3.0f64);
+        let tracer = JitTracer { value: 3.0, atom, builder };
+        let zero = tracer.zero_like();
+        assert_eq!(zero.value, 0.0);
+        assert!(zero.atom() > atom);
+    }
+
+    #[test]
+    fn compiled_function_replays_staged_graphs() {
+        let mut context = PrototypeContext::default();
+        let (output, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(
+            &mut context,
+            |_, x: JitTracer<f64>| {
+                let squared = x.clone() * x.clone();
+                squared + x.sin()
+            },
+            2.0f64,
+        )
+        .unwrap();
+
+        assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
+        assert_eq!(compiled.call(&mut context, 0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
+        assert_eq!(compiled.graph().input_atoms().len(), 1);
+    }
+
+    #[test]
+    fn compiled_function_display_delegates_to_the_underlying_graph() {
+        let mut context = PrototypeContext::default();
+        let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) =
+            jit(&mut context, |_, x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
+
+        let rendered = compiled.to_string();
+        assert_eq!(rendered, compiled.graph().to_string());
+        assert!(rendered.starts_with("lambda %0:f64[] .\n"));
+        assert!(rendered.contains("mul %0 %0"));
+        assert!(rendered.contains("sin %0"));
+    }
 }

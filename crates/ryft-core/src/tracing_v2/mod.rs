@@ -15,6 +15,7 @@ mod forward;
 mod graph;
 mod jit;
 mod linear;
+mod matmul;
 mod ops;
 mod value;
 
@@ -25,41 +26,56 @@ pub use context::{BatchingContext, CompilationContext, JitContext, JvpContext, P
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, AtomSource, Equation, Graph, GraphBuilder};
 pub use jit::{CompiledFunction, JitTracer, jit};
-pub use linear::{LinearProgram, LinearTerm, Linearized, grad, jvp_program, linearize, vjp};
+pub use linear::{
+    CoordinateValue, DenseJacobian, LinearProgram, LinearTerm, Linearized, grad, hessian, jacfwd, jacrev, jvp_program,
+    linearize, value_and_grad, vjp,
+};
+pub use matmul::{MatMulOp, MatrixAbstract, MatrixOps, MatrixTangentSpace, MatrixTransposeOp, MatrixValue};
 pub use ops::{
     AddOp, BatchOp, CosOp, JvpOp, LinearOp, LinearOpRef, MulOp, NegOp, Op, ScaleOp, SinOp, StagedOp, StagedOpRef,
 };
 pub use value::{FloatExt, OneLike, ScalarAbstract, TraceLeaf, TraceValue, ZeroLike};
 
+/// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TraceError {
+    /// Structured inputs or outputs did not have the same `Parameterized` shape.
     #[error("mismatched parameter structures")]
     MismatchedParameterStructure,
 
+    /// A batching transform encountered zero lanes and therefore could not infer a batch size.
     #[error("encountered an empty batch")]
     EmptyBatch,
 
+    /// A transform needed a seed value but the parameterized value contained no leaves.
     #[error("encountered an empty parameterized value while a seed value was required")]
     EmptyParameterizedValue,
 
+    /// Different batched leaves disagreed on the number of lanes they carried.
     #[error("mismatched batch sizes across batched leaves")]
     MismatchedBatchSize,
 
+    /// A primitive or staged graph received the wrong number of inputs.
     #[error("invalid number of inputs; expected {expected} but got {got}")]
     InvalidInputCount { expected: usize, got: usize },
 
+    /// A primitive or staged graph produced the wrong number of outputs.
     #[error("invalid number of outputs; expected {expected} but got {got}")]
     InvalidOutputCount { expected: usize, got: usize },
 
+    /// A staged graph referenced an atom that was never defined.
     #[error("unbound atom ID: {id}")]
     UnboundAtomId { id: usize },
 
+    /// Abstract evaluation detected incompatible operand metadata for a primitive application.
     #[error("incompatible abstract values while tracing operation '{op}'")]
     IncompatibleAbstractValues { op: &'static str },
 
+    /// An internal tracing invariant was violated while constructing or replaying a program.
     #[error("{0}")]
     InternalInvariantViolation(&'static str),
 
+    /// Wrapper around parameter-lifting failures from the `Parameterized` infrastructure.
     #[error(transparent)]
     Parameter(#[from] crate::errors::Error),
 }
@@ -170,6 +186,49 @@ mod tests {
 
         let gradient = grad(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
         approx_eq(gradient, 4.0 + 2.0f64.cos());
+    }
+
+    #[test]
+    fn value_and_grad_returns_both_outputs() {
+        let mut context = PrototypeContext::default();
+        let (value, gradient) = value_and_grad(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+
+        approx_eq(value, 2.0f64.powi(2) + 2.0f64.sin());
+        approx_eq(gradient, 4.0 + 2.0f64.cos());
+    }
+
+    #[test]
+    fn jacfwd_materializes_a_dense_jacobian() {
+        let mut context = PrototypeContext::default();
+        let jacobian =
+            jacfwd::<PrototypeContext, _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+
+        assert_eq!(jacobian.rows(), 1);
+        assert_eq!(jacobian.cols(), 2);
+        approx_eq(*jacobian.get(0, 0).unwrap(), 3.0 + 2.0f64.cos());
+        approx_eq(*jacobian.get(0, 1).unwrap(), 2.0);
+    }
+
+    #[test]
+    fn jacrev_materializes_the_same_dense_jacobian() {
+        let mut context = PrototypeContext::default();
+        let jacobian =
+            jacrev::<PrototypeContext, _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+
+        assert_eq!(jacobian.rows(), 1);
+        assert_eq!(jacobian.cols(), 2);
+        approx_eq(*jacobian.get(0, 0).unwrap(), 3.0 + 2.0f64.cos());
+        approx_eq(*jacobian.get(0, 1).unwrap(), 2.0);
+    }
+
+    #[test]
+    fn hessian_materializes_a_dense_second_derivative_from_a_gradient_function() {
+        let mut context = PrototypeContext::default();
+        let dense_hessian = hessian(&mut context, first_derivative, 2.0f64).unwrap();
+
+        assert_eq!(dense_hessian.rows(), 1);
+        assert_eq!(dense_hessian.cols(), 1);
+        approx_eq(*dense_hessian.get(0, 0).unwrap(), 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
     }
 
     #[test]

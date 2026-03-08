@@ -1,3 +1,8 @@
+//! Primitive operation traits and scalar primitive implementations for `tracing_v2`.
+//!
+//! The op set is intentionally open: each primitive is represented by its own type implementing one or more
+//! transform-specific traits. This keeps graph representations extensible without requiring central enums.
+
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
@@ -11,17 +16,22 @@ use crate::tracing_v2::{
     graph::AtomId,
 };
 
+/// Core primitive operation interface understood by staged graphs.
 pub trait Op<V>: Debug + Display
 where
     V: TraceValue,
 {
+    /// Returns the stable primitive name used in diagnostics and pretty-printing.
     fn name(&self) -> &'static str;
 
+    /// Computes abstract outputs from abstract inputs without executing the operation.
     fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError>;
 
+    /// Executes the operation on concrete values.
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
 }
 
+/// Marker trait for operations that may appear in JIT-staged graphs.
 pub trait StagedOp<V>: Op<V>
 where
     V: TraceValue,
@@ -35,28 +45,35 @@ where
 {
 }
 
+/// Shared reference to a dynamically dispatched staged operation.
 pub type StagedOpRef<V> = Arc<dyn StagedOp<V>>;
 
+/// Primitive operation with a forward-mode differentiation rule.
 pub trait JvpOp<V>: Op<V>
 where
     V: TraceValue,
 {
+    /// Applies the primitive's forward-mode rule to traced inputs.
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>;
 }
 
+/// Primitive operation with a batching rule used by `vmap`.
 pub trait BatchOp<V>: Op<V>
 where
     V: TraceValue,
 {
+    /// Applies the primitive's batching rule to batched inputs.
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
 
+/// Primitive operation that may appear in a linearized program and therefore supports transposition.
 pub trait LinearOp<V>: Op<V>
 where
     V: TraceValue,
 {
+    /// Applies the primitive's transpose rule to output cotangents.
     fn transpose(
         &self,
         context: &mut TransposeContext<'_, V>,
@@ -65,7 +82,7 @@ where
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>;
 }
-
+/// Shared reference to a dynamically dispatched linear operation.
 pub type LinearOpRef<V> = Arc<dyn LinearOp<V>>;
 
 impl<T, V> Op<V> for Arc<T>
@@ -130,7 +147,6 @@ where
         (**self).transpose(context, inputs, outputs, output_cotangents)
     }
 }
-
 fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {
     if inputs == expected { Ok(()) } else { Err(TraceError::InvalidInputCount { expected, got: inputs }) }
 }
@@ -155,6 +171,7 @@ where
     if inputs[0] == inputs[1] { Ok(inputs[0].clone()) } else { Err(TraceError::IncompatibleAbstractValues { op }) }
 }
 
+/// Elementwise addition primitive.
 #[derive(Clone, Default)]
 pub struct AddOp;
 
@@ -241,6 +258,7 @@ where
     }
 }
 
+/// Elementwise multiplication primitive.
 #[derive(Clone, Default)]
 pub struct MulOp;
 
@@ -314,6 +332,7 @@ where
     }
 }
 
+/// Elementwise negation primitive.
 #[derive(Clone, Default)]
 pub struct NegOp;
 
@@ -389,6 +408,7 @@ where
     }
 }
 
+/// Elementwise sine primitive.
 #[derive(Clone, Default)]
 pub struct SinOp;
 
@@ -449,6 +469,7 @@ where
     }
 }
 
+/// Elementwise cosine primitive.
 #[derive(Clone, Default)]
 pub struct CosOp;
 
@@ -509,6 +530,7 @@ where
     }
 }
 
+/// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]
 pub struct ScaleOp<V>
 where
@@ -521,6 +543,7 @@ impl<V> ScaleOp<V>
 where
     V: TraceValue,
 {
+    /// Creates a new scale operation capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
         Self { factor }
@@ -613,5 +636,69 @@ where
             .graph_builder()
             .add_equation(Arc::new(ScaleOp::new(self.factor().clone())), vec![output_cotangents[0]])?[0];
         Ok(vec![Some(contribution)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{
+        parameters::Placeholder,
+        tracing_v2::{GraphBuilder, ScalarAbstract, TraceError, TransposeContext},
+    };
+
+    use super::*;
+
+    fn approx_eq(left: f64, right: f64) {
+        let delta = (left - right).abs();
+        assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
+    }
+
+    #[test]
+    fn add_abstract_eval_rejects_incompatible_inputs() {
+        let error = <AddOp as Op<f64>>::abstract_eval(&AddOp, &[ScalarAbstract::F32, ScalarAbstract::F64]).unwrap_err();
+        assert_eq!(error, TraceError::IncompatibleAbstractValues { op: "add" });
+    }
+
+    #[test]
+    fn mul_jvp_matches_the_product_rule() {
+        let output = MulOp
+            .jvp::<f64>(&[
+                JvpTracer { primal: 2.0f64, tangent: 3.0f64 },
+                JvpTracer { primal: 5.0f64, tangent: -1.0f64 },
+            ])
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        approx_eq(output.primal, 10.0);
+        approx_eq(output.tangent, 13.0);
+    }
+
+    #[test]
+    fn add_batch_requires_matching_lane_counts() {
+        let error = AddOp.batch(&[Batch::new(vec![1.0f64, 2.0f64]), Batch::new(vec![3.0f64])]).unwrap_err();
+        assert_eq!(error, TraceError::MismatchedBatchSize);
+    }
+
+    #[test]
+    fn scale_transpose_scales_output_cotangents() {
+        let mut forward_builder = GraphBuilder::<LinearOpRef<f64>, f64>::new();
+        let input = forward_builder.add_input(&1.0f64);
+        let output = forward_builder.add_equation(Arc::new(ScaleOp::new(3.0f64)), vec![input]).unwrap()[0];
+
+        let mut transpose_builder = GraphBuilder::<LinearOpRef<f64>, f64>::new();
+        let output_cotangent = transpose_builder.add_input(&1.0f64);
+        let contribution = {
+            let mut transpose_context = TransposeContext::new(&mut transpose_builder);
+            ScaleOp::new(3.0f64)
+                .transpose(&mut transpose_context, &[input], &[output], &[output_cotangent])
+                .unwrap()[0]
+                .unwrap()
+        };
+
+        let transpose_graph = transpose_builder.build::<f64, f64>(vec![contribution], Placeholder, Placeholder);
+        approx_eq(transpose_graph.call(2.0f64).unwrap(), 6.0);
     }
 }
