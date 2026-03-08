@@ -1,0 +1,270 @@
+//! Prototype tracing design for `ryft-core`.
+//!
+//! The key idea in this version is that staged computation is represented using a shared graph over
+//! an open set of operation types:
+//!
+//! - `Parameterized<P>` lifts and lowers structured inputs and outputs.
+//! - `Graph<O, V, In, Out>` is the common staging form.
+//! - Each equation stores an operation object, not a tag enum.
+//! - Primitive ops carry their own `eval`, `jvp`, `batch`, and transpose rules.
+//! - Transform-specific context values thread both top-level runtime state and local staging state.
+
+mod batch;
+mod context;
+mod forward;
+mod graph;
+mod jit;
+mod linear;
+mod ops;
+mod value;
+
+use thiserror::Error;
+
+pub use batch::{Batch, stack, unstack, vmap};
+pub use context::{BatchingContext, CompilationContext, JitContext, JvpContext, PrototypeContext, TransposeContext};
+pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
+pub use graph::{Atom, AtomId, AtomSource, Equation, Graph, GraphBuilder};
+pub use jit::{CompiledFunction, JitTracer, jit};
+pub use linear::{LinearProgram, LinearTerm, Linearized, grad, jvp_program, linearize, vjp};
+pub use ops::{
+    AddOp, BatchOp, CosOp, JvpOp, LinearOp, LinearOpRef, MulOp, NegOp, Op, ScaleOp, SinOp, StagedOp, StagedOpRef,
+};
+pub use value::{FloatExt, OneLike, ScalarAbstract, TraceLeaf, TraceValue, ZeroLike};
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum TraceError {
+    #[error("mismatched parameter structures")]
+    MismatchedParameterStructure,
+
+    #[error("encountered an empty batch")]
+    EmptyBatch,
+
+    #[error("encountered an empty parameterized value while a seed value was required")]
+    EmptyParameterizedValue,
+
+    #[error("mismatched batch sizes across batched leaves")]
+    MismatchedBatchSize,
+
+    #[error("invalid number of inputs; expected {expected} but got {got}")]
+    InvalidInputCount { expected: usize, got: usize },
+
+    #[error("invalid number of outputs; expected {expected} but got {got}")]
+    InvalidOutputCount { expected: usize, got: usize },
+
+    #[error("unbound atom ID: {id}")]
+    UnboundAtomId { id: usize },
+
+    #[error("incompatible abstract values while tracing operation '{op}'")]
+    IncompatibleAbstractValues { op: &'static str },
+
+    #[error("{0}")]
+    InternalInvariantViolation(&'static str),
+
+    #[error(transparent)]
+    Parameter(#[from] crate::errors::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::{Add, Mul, Neg};
+
+    use crate::parameters::{Parameterized, ParameterizedFamily};
+
+    use super::*;
+
+    fn approx_eq(left: f64, right: f64) {
+        let delta = (left - right).abs();
+        assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
+    }
+
+    fn bilinear_sin<Context, T>(_: &mut Context, inputs: (T, T)) -> T
+    where
+        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+    {
+        inputs.0.clone() * inputs.1 + inputs.0.sin()
+    }
+
+    fn quadratic_plus_sin<Context, T>(_: &mut Context, x: T) -> T
+    where
+        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+    {
+        x.clone() * x.clone() + x.sin()
+    }
+
+    fn quartic_plus_sin<Context, T>(_: &mut Context, x: T) -> T
+    where
+        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+    {
+        x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
+    }
+
+    fn first_derivative<Context, V>(context: &mut Context, x: V) -> V
+    where
+        V: TraceValue
+            + OneLike
+            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
+        V::Family: ParameterizedFamily<Linearized<V>>,
+    {
+        grad(context, quartic_plus_sin, x).expect("first derivative should be computable")
+    }
+
+    fn second_derivative<Context, V>(context: &mut Context, x: V) -> V
+    where
+        V: TraceValue
+            + OneLike
+            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
+        V::Family: ParameterizedFamily<Linearized<V>>,
+    {
+        grad(context, first_derivative, x).expect("second derivative should be computable")
+    }
+
+    fn third_derivative<Context, V>(context: &mut Context, x: V) -> V
+    where
+        V: TraceValue
+            + OneLike
+            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
+        V::Family: ParameterizedFamily<Linearized<V>>,
+    {
+        grad(context, second_derivative, x).expect("third derivative should be computable")
+    }
+
+    fn fourth_derivative<Context, V>(context: &mut Context, x: V) -> V
+    where
+        V: TraceValue
+            + OneLike
+            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
+        V::Family: ParameterizedFamily<Linearized<V>>,
+    {
+        grad(context, third_derivative, x).expect("fourth derivative should be computable")
+    }
+
+    fn hessian_style_second_derivative<Context, V>(context: &mut Context, x: V) -> V
+    where
+        V: TraceValue
+            + OneLike
+            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
+        V::Family: ParameterizedFamily<Linearized<V>>,
+    {
+        let (_, second_derivative) = jvp(context, first_derivative, x.clone(), x.one_like())
+            .expect("forward-over-reverse Hessian should succeed");
+        second_derivative
+    }
+
+    #[test]
+    fn forward_mode_uses_parameterized_structure() {
+        let mut context = PrototypeContext::default();
+        let (primal, tangent) = jvp(&mut context, bilinear_sin, (2.0f64, 3.0f64), (1.0f64, -1.0f64)).unwrap();
+        approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
+        approx_eq(tangent, 3.0 - 2.0 + 2.0f64.cos());
+    }
+
+    #[test]
+    fn transposition_drives_reverse_mode() {
+        let mut context = PrototypeContext::default();
+        let (output, pullback) = vjp(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
+
+        let input_cotangent = pullback.call(1.0f64).unwrap();
+        approx_eq(input_cotangent.0, 3.0 + 2.0f64.cos());
+        approx_eq(input_cotangent.1, 2.0);
+
+        let gradient = grad(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+        approx_eq(gradient, 4.0 + 2.0f64.cos());
+    }
+
+    #[test]
+    fn jit_captures_and_replays_a_program() {
+        let mut context = PrototypeContext::default();
+        let (output, compiled) = jit(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
+        assert_eq!(compiled.id(), 0);
+        assert_eq!(context.compiled_program_count(), 1);
+
+        let replayed = compiled.call(&mut context, (5.0f64, -4.0f64)).unwrap();
+        approx_eq(replayed, 5.0 * -4.0 + 5.0f64.sin());
+    }
+
+    #[test]
+    fn vectorization_stacks_and_unstacks_parameterized_inputs() {
+        let mut context = PrototypeContext::default();
+        let outputs =
+            vmap(&mut context, bilinear_sin, vec![(1.0f64, 2.0f64), (3.0f64, 4.0f64), (5.0f64, 6.0f64)]).unwrap();
+
+        let expected = vec![1.0 * 2.0 + 1.0f64.sin(), 3.0 * 4.0 + 3.0f64.sin(), 5.0 * 6.0 + 5.0f64.sin()];
+        assert_eq!(outputs.len(), expected.len());
+        for (left, right) in outputs.into_iter().zip(expected) {
+            approx_eq(left, right);
+        }
+    }
+
+    #[test]
+    fn forward_over_reverse_computes_a_hessian_style_second_derivative() {
+        let mut context = PrototypeContext::default();
+        let (first_derivative_value, second_derivative_value) =
+            jvp(&mut context, first_derivative, 2.0f64, 1.0f64).unwrap();
+
+        approx_eq(first_derivative_value, 4.0 * 2.0f64.powi(3) + 2.0f64.cos());
+        approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
+    }
+
+    #[test]
+    fn higher_order_reverse_mode_computes_a_fourth_derivative() {
+        let mut context = PrototypeContext::default();
+        let fourth_derivative_value = fourth_derivative(&mut context, 2.0f64);
+
+        approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
+    }
+
+    #[test]
+    fn inline_nested_grad_calls_compute_a_fourth_derivative() {
+        let mut context = PrototypeContext::default();
+        let fourth_derivative_value = grad(
+            &mut context,
+            |context, x| {
+                grad(
+                    context,
+                    |context, x| {
+                        grad(
+                            context,
+                            |context, x| grad(context, quartic_plus_sin, x).expect("innermost grad should succeed"),
+                            x,
+                        )
+                        .expect("third derivative should succeed")
+                    },
+                    x,
+                )
+                .expect("second derivative should succeed")
+            },
+            2.0f64,
+        )
+        .expect("fourth derivative should succeed");
+
+        approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
+    }
+
+    #[test]
+    fn jit_can_trace_a_hessian_style_second_derivative() {
+        let mut context = PrototypeContext::default();
+        let (second_derivative_value, compiled) = jit(&mut context, hessian_style_second_derivative, 2.0f64).unwrap();
+
+        approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
+        assert_eq!(compiled.id(), 0);
+        assert_eq!(context.compiled_program_count(), 1);
+
+        let replayed = compiled.call(&mut context, 1.5f64).unwrap();
+        approx_eq(replayed, 12.0 * 1.5f64.powi(2) - 1.5f64.sin());
+    }
+
+    #[test]
+    fn jit_can_trace_a_fourth_derivative() {
+        let mut context = PrototypeContext::default();
+        let (fourth_derivative_value, compiled) = jit(&mut context, fourth_derivative, 2.0f64).unwrap();
+
+        approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
+        assert_eq!(compiled.id(), 0);
+        assert_eq!(context.compiled_program_count(), 1);
+
+        let replayed = compiled.call(&mut context, 0.5f64).unwrap();
+        approx_eq(replayed, 24.0 + 0.5f64.sin());
+    }
+}
