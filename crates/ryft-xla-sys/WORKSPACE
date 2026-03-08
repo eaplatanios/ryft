@@ -6,9 +6,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # XLA
 # ----------------------------------------------------
 
-XLA_COMMIT = "15bc20b490170c25a4f4669d10573c6a601c0077"
+XLA_COMMIT = "88dfac847f3087ac1c08463f52c60ec2f19b27c7"
 
-XLA_SHA256 = "70c643b81f721372e367822e612099bc1f53f12633e5977a85c71dd9bb0c4ed7"
+XLA_SHA256 = "563687f3a04ee1efb5f6ff6cf96be5aa30c9839a16af3f6488f45f1bc01df02f"
 
 JAX_COMMIT = "d40b4c951a9b53207974330c620130f664a0383e"
 
@@ -222,3 +222,4 @@ buildifier_prebuilt_deps()
 load("@buildifier_prebuilt//:defs.bzl", "buildifier_prebuilt_register_toolchains")
 
 buildifier_prebuilt_register_toolchains()
+
