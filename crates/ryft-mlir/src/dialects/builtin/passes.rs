@@ -109,26 +109,26 @@ pub fn register_transforms_passes() {
 }
 
 mlir_pass!(transforms_bubble_down_memory_space_casts_pass, TransformsBubbleDownMemorySpaceCasts);
-mlir_pass!(transforms_cse_pass, TransformsCSE);
-mlir_pass!(transforms_canonicalizer_pass, TransformsCanonicalizer);
+mlir_pass!(transforms_cse_pass, TransformsCSEPass);
+mlir_pass!(transforms_canonicalizer_pass, TransformsCanonicalizerPass);
 mlir_pass!(transforms_composite_fixed_point_pass, TransformsCompositeFixedPointPass);
-mlir_pass!(transforms_control_flow_sink_pass, TransformsControlFlowSink);
-mlir_pass!(transforms_generate_runtime_verification_pass, TransformsGenerateRuntimeVerification);
-mlir_pass!(transforms_inliner_pass, TransformsInliner);
+mlir_pass!(transforms_control_flow_sink_pass, TransformsControlFlowSinkPass);
+mlir_pass!(transforms_generate_runtime_verification_pass, TransformsGenerateRuntimeVerificationPass);
+mlir_pass!(transforms_inliner_pass, TransformsInlinerPass);
 mlir_pass!(transforms_location_snapshot_pass, TransformsLocationSnapshot);
-mlir_pass!(transforms_loop_invariant_code_motion_pass, TransformsLoopInvariantCodeMotion);
-mlir_pass!(transforms_loop_invariant_subset_hoisting_pass, TransformsLoopInvariantSubsetHoisting);
+mlir_pass!(transforms_loop_invariant_code_motion_pass, TransformsLoopInvariantCodeMotionPass);
+mlir_pass!(transforms_loop_invariant_subset_hoisting_pass, TransformsLoopInvariantSubsetHoistingPass);
 mlir_pass!(transforms_mem2reg_pass, TransformsMem2Reg);
 mlir_pass!(transforms_print_ir_pass, TransformsPrintIRPass);
 mlir_pass!(transforms_print_op_stats_pass, TransformsPrintOpStatsPass);
-mlir_pass!(transforms_remove_dead_values_pass, TransformsRemoveDeadValues);
-mlir_pass!(transforms_sccp_pass, TransformsSCCP);
+mlir_pass!(transforms_remove_dead_values_pass, TransformsRemoveDeadValuesPass);
+mlir_pass!(transforms_sccp_pass, TransformsSCCPPass);
 mlir_pass!(transforms_sroa_pass, TransformsSROA);
-mlir_pass!(transforms_strip_debug_info_pass, TransformsStripDebugInfo);
-mlir_pass!(transforms_symbol_dce_pass, TransformsSymbolDCE);
-mlir_pass!(transforms_symbol_privatize_pass, TransformsSymbolPrivatize);
-mlir_pass!(transforms_topological_sort_pass, TransformsTopologicalSort);
-mlir_pass!(transforms_view_op_graph_pass, TransformsViewOpGraph);
+mlir_pass!(transforms_strip_debug_info_pass, TransformsStripDebugInfoPass);
+mlir_pass!(transforms_symbol_dce_pass, TransformsSymbolDCEPass);
+mlir_pass!(transforms_symbol_privatize_pass, TransformsSymbolPrivatizePass);
+mlir_pass!(transforms_topological_sort_pass, TransformsTopologicalSortPass);
+mlir_pass!(transforms_view_op_graph_pass, TransformsViewOpGraphPass);
 
 #[cfg(test)]
 mod tests {

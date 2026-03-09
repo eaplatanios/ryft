@@ -7215,16 +7215,16 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsBubbleDownMemorySpaceCasts();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsCSE() -> MlirPass;
+    pub fn mlirCreateTransformsCSEPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsCSE();
+    pub fn mlirRegisterTransformsCSEPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsCanonicalizer() -> MlirPass;
+    pub fn mlirCreateTransformsCanonicalizerPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsCanonicalizer();
+    pub fn mlirRegisterTransformsCanonicalizerPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateTransformsCompositeFixedPointPass() -> MlirPass;
@@ -7233,22 +7233,22 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsCompositeFixedPointPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsControlFlowSink() -> MlirPass;
+    pub fn mlirCreateTransformsControlFlowSinkPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsControlFlowSink();
+    pub fn mlirRegisterTransformsControlFlowSinkPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsGenerateRuntimeVerification() -> MlirPass;
+    pub fn mlirCreateTransformsGenerateRuntimeVerificationPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsGenerateRuntimeVerification();
+    pub fn mlirRegisterTransformsGenerateRuntimeVerificationPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsInliner() -> MlirPass;
+    pub fn mlirCreateTransformsInlinerPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsInliner();
+    pub fn mlirRegisterTransformsInlinerPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateTransformsLocationSnapshot() -> MlirPass;
@@ -7257,16 +7257,16 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsLocationSnapshot();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsLoopInvariantCodeMotion() -> MlirPass;
+    pub fn mlirCreateTransformsLoopInvariantCodeMotionPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsLoopInvariantCodeMotion();
+    pub fn mlirRegisterTransformsLoopInvariantCodeMotionPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsLoopInvariantSubsetHoisting() -> MlirPass;
+    pub fn mlirCreateTransformsLoopInvariantSubsetHoistingPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsLoopInvariantSubsetHoisting();
+    pub fn mlirRegisterTransformsLoopInvariantSubsetHoistingPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateTransformsMem2Reg() -> MlirPass;
@@ -7287,16 +7287,16 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsPrintOpStatsPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsRemoveDeadValues() -> MlirPass;
+    pub fn mlirCreateTransformsRemoveDeadValuesPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsRemoveDeadValues();
+    pub fn mlirRegisterTransformsRemoveDeadValuesPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsSCCP() -> MlirPass;
+    pub fn mlirCreateTransformsSCCPPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsSCCP();
+    pub fn mlirRegisterTransformsSCCPPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateTransformsSROA() -> MlirPass;
@@ -7305,36 +7305,34 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsSROA();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsStripDebugInfo() -> MlirPass;
+    pub fn mlirCreateTransformsStripDebugInfoPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsStripDebugInfo();
+    pub fn mlirRegisterTransformsStripDebugInfoPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsSymbolDCE() -> MlirPass;
+    pub fn mlirCreateTransformsSymbolDCEPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsSymbolDCE();
+    pub fn mlirRegisterTransformsSymbolDCEPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsSymbolPrivatize() -> MlirPass;
+    pub fn mlirCreateTransformsSymbolPrivatizePass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsSymbolPrivatize();
+    pub fn mlirRegisterTransformsSymbolPrivatizePass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsTopologicalSort() -> MlirPass;
+    pub fn mlirCreateTransformsTopologicalSortPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsTopologicalSort();
+    pub fn mlirRegisterTransformsTopologicalSortPass();
 }
 unsafe extern "C" {
-    #[cfg_attr(target_os = "windows", link_name = "mlirCreateTransformsViewOpGraphPass")]
-    pub fn mlirCreateTransformsViewOpGraph() -> MlirPass;
+    pub fn mlirCreateTransformsViewOpGraphPass() -> MlirPass;
 }
 unsafe extern "C" {
-    #[cfg_attr(target_os = "windows", link_name = "mlirRegisterTransformsViewOpGraphPass")]
-    pub fn mlirRegisterTransformsViewOpGraph();
+    pub fn mlirRegisterTransformsViewOpGraphPass();
 }
 unsafe extern "C" {
     pub fn mlirGetDialectHandle__amdgpu__() -> MlirDialectHandle;
