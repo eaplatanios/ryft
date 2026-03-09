@@ -345,7 +345,7 @@ pub trait NoTerminator<'o, 'c: 'o, 't: 'c>: SingleBlockRegions<'o, 'c, 't> {}
 pub trait OneOperand<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneResult<'o, 'c, 't> {
     /// Returns the input of this [`Operation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 }
 

@@ -521,14 +521,14 @@ mod tests {
         let value_1 = op_1.result(0).unwrap();
         let op_3 = OperationBuilder::new("test.op_3", location).add_operand(value_0).build().unwrap();
         let op_4 = OperationBuilder::new("test.op_4", location).add_operand(value_0).build().unwrap();
-        assert_eq!(op_3.operand(0).unwrap(), value_0);
-        assert_eq!(op_3.operand(0).unwrap(), value_0);
+        assert_eq!(op_3.operand_value(0).unwrap(), value_0);
+        assert_eq!(op_3.operand_value(0).unwrap(), value_0);
         value_0.replace_uses(value_1);
-        assert_eq!(op_3.operand(0).unwrap(), value_1);
-        assert_eq!(op_4.operand(0).unwrap(), value_1);
+        assert_eq!(op_3.operand_value(0).unwrap(), value_1);
+        assert_eq!(op_4.operand_value(0).unwrap(), value_1);
         value_1.replace_uses_except(value_0, &[&op_3]);
-        assert_eq!(op_3.operand(0).unwrap(), value_1);
-        assert_eq!(op_4.operand(0).unwrap(), value_0);
+        assert_eq!(op_3.operand_value(0).unwrap(), value_1);
+        assert_eq!(op_4.operand_value(0).unwrap(), value_0);
     }
 
     #[test]
@@ -605,9 +605,13 @@ mod tests {
         let block_argument_use = block_argument_uses[0];
         assert_eq!(block_argument_use.context(), &context);
         assert_eq!(block_argument_use.value(), block_argument);
-        assert_eq!(block_argument_use.value(), operand);
+        assert_eq!(operand.context(), &context);
+        assert_eq!(operand.value(), block_argument);
+        assert_eq!(block_argument_use.value(), operand.value());
         assert_eq!(block_argument_use.operation(), op);
+        assert_eq!(operand.operation(), op);
         assert_eq!(block_argument_use.operand_index(), 0);
+        assert_eq!(operand.operand_index(), 0);
     }
 
     #[test]

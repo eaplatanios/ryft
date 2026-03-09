@@ -23,12 +23,12 @@ use crate::{
 pub trait ShiftLeftOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`ShiftLeftOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`ShiftLeftOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 
@@ -88,12 +88,12 @@ pub fn shift_left<
 pub trait ShiftRightArithmeticOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`ShiftRightArithmeticOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`ShiftRightArithmeticOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 
@@ -153,12 +153,12 @@ pub fn shift_right_arithmetic<
 pub trait ShiftRightLogicalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`ShiftRightLogicalOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`ShiftRightLogicalOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 

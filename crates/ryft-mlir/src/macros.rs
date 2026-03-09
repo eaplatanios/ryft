@@ -393,12 +393,12 @@ macro_rules! mlir_attribute_field {
 /// pub trait AddOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 ///     /// Returns the left-hand side input of this [`AddOperation`].
 ///     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-///         self.operand(0).unwrap()
+///         self.operand_value(0).unwrap()
 ///     }
 ///
 ///     /// Returns the right-hand side input of this [`AddOperation`].
 ///     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-///         self.operand(1).unwrap()
+///         self.operand_value(1).unwrap()
 ///     }
 /// }
 ///
@@ -818,13 +818,13 @@ macro_rules! mlir_binary_op {
                 #[doc = "Returns the left-hand side input (i.e., first operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn lhs(&self) -> $crate::ValueRef<'o, 'c, 't> {
-                    self.operand(0).unwrap()
+                    self.operand_value(0).unwrap()
                 }
 
                 #[doc = "Returns the right-hand side input (i.e., second operand)"]
                 #[doc = "of this [`" [<$op:camel Operation>] "`]."]
                 fn rhs(&self) -> $crate::ValueRef<'o, 'c, 't> {
-                    self.operand(1).unwrap()
+                    self.operand_value(1).unwrap()
                 }
             }
 

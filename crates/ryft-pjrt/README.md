@@ -106,6 +106,10 @@ fn main() {
 
 ## Roadmap / TODOs
 
+- [ ] There are a few places where we cast `&[u64]` to `&[i64]` (e.g., when passing dimension arrays to the C API).
+  These are not safe and we should be using a safe conversion from `u64` to `i64` ideally. However, in many cases that
+  requires allocating a new array/vector. Can we instead just make a pass to check that the cast is safe for those cases
+  and return an `Error` if it is not.
 - [ ] Can we detect if CUDA, ROCm, etc., is available on the current platform and auto-enable the corresponding
   features by default, if any of these frameworks are available?
 - [ ] Cache extension lookups on first access so `Api::*_extension` methods avoid repeated linked-list traversal.

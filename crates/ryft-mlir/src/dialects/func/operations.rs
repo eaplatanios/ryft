@@ -34,7 +34,7 @@ pub trait CallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn arguments(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operands()
+        self.operand_values()
     }
 
     /// Returns the value of the `no_inline` [`Attribute`] for this [`Operation`]. If `true`, then the compiler will be
@@ -142,7 +142,7 @@ pub fn call<
 pub trait CallIndirectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the [`Value`] that represents the [`Function`](crate::Function) that is being called.
     fn function(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns an [`Iterator`] over the argument [`Value`]s (i.e., the operands) of this [`CallOperation`].
@@ -151,7 +151,7 @@ pub trait CallIndirectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn arguments(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operands().skip(1)
+        self.operand_values().skip(1)
     }
 }
 
@@ -488,7 +488,7 @@ pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn values(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operands()
+        self.operand_values()
     }
 }
 

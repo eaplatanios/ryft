@@ -216,12 +216,12 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 pub trait DynamicReshapeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicReshapeOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the target shape of this [`DynamicReshapeOperation`].
     fn shape(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 
@@ -406,12 +406,12 @@ pub const DYNAMIC_BROADCAST_KNOWN_NON_EXPANDING_DIMENSIONS_ATTRIBUTE: &str = "kn
 pub trait DynamicBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicBroadcastOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the target shape of this [`DynamicBroadcastOperation`].
     fn shape(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the broadcast dimensions of this [`DynamicBroadcastOperation`], which specify
@@ -575,12 +575,12 @@ pub const INTERIOR_PADDING_ATTRIBUTE: &str = "interior_padding";
 pub trait PadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`PadOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the padding value of this [`PadOperation`].
     fn padding_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the edge "low" padding amounts for this [`PadOperation`].
@@ -691,27 +691,27 @@ pub fn pad<
 pub trait DynamicPadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicPadOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the padding value of this [`DynamicPadOperation`].
     fn padding_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the edge "low" padding amounts for this [`DynamicPadOperation`].
     fn edge_padding_low(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(2).unwrap()
+        self.operand_value(2).unwrap()
     }
 
     /// Returns the edge "high" padding amounts for this [`DynamicPadOperation`].
     fn edge_padding_high(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(3).unwrap()
+        self.operand_value(3).unwrap()
     }
 
     /// Returns the interior padding amounts for this [`DynamicPadOperation`].
     fn interior_padding(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(4).unwrap()
+        self.operand_value(4).unwrap()
     }
 }
 
@@ -789,7 +789,7 @@ pub trait ConcatenateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn inputs<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operands()
+        self.operand_values()
     }
 
     /// Returns the dimension along which the input tensors will be concatenated in this [`ConcatenateOperation`].
@@ -980,12 +980,12 @@ pub const DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE: &str = "slice_sizes";
 pub trait DynamicSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicSliceOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the start indices of this [`DynamicSliceOperation`].
     fn start_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (1..self.operand_count()).flat_map(|index| self.operand(index)).collect()
+        (1..self.operand_count()).flat_map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the slice sizes for this [`DynamicSliceOperation`].
@@ -1075,17 +1075,17 @@ pub fn dynamic_slice<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value
 pub trait DynamicUpdateSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicUpdateSliceOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the update value of this [`DynamicUpdateSliceOperation`].
     fn update(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the start indices of this [`DynamicUpdateSliceOperation`].
     fn start_indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        (2..self.operand_count()).flat_map(|index| self.operand(index)).collect()
+        (2..self.operand_count()).flat_map(|index| self.operand_value(index)).collect()
     }
 }
 
@@ -1308,12 +1308,12 @@ pub const GATHER_INDICES_ARE_SORTED_ATTRIBUTE: &str = "indices_are_sorted";
 pub trait GatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`GatherOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the start indices of this [`GatherOperation`].
     fn start_indices(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the dimensions configuration of this [`GatherOperation`].
@@ -1425,17 +1425,17 @@ pub fn gather<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value<'i, 'c
 pub trait DynamicGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`DynamicGatherOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the start indices of this [`DynamicGatherOperation`].
     fn start_indices(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the slice sizes for this [`DynamicGatherOperation`].
     fn slice_sizes(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(2).unwrap()
+        self.operand_value(2).unwrap()
     }
 
     /// Returns the dimensions configuration of this [`DynamicGatherOperation`].
@@ -1690,19 +1690,19 @@ pub trait ScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegio
     /// Returns the inputs of this [`ScatterOperation`].
     fn inputs(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let input_count = (self.operand_count() - 1) / 2;
-        (0..input_count).flat_map(|index| self.operand(index)).collect()
+        (0..input_count).flat_map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the scatter indices of this [`ScatterOperation`].
     fn scatter_indices(&self) -> ValueRef<'o, 'c, 't> {
         let input_count = (self.operand_count() - 1) / 2;
-        self.operand(input_count).unwrap()
+        self.operand_value(input_count).unwrap()
     }
 
     /// Returns the updates of this [`ScatterOperation`].
     fn updates(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let input_count = (self.operand_count() - 1) / 2;
-        (input_count + 1..self.operand_count()).flat_map(|index| self.operand(index)).collect()
+        (input_count + 1..self.operand_count()).flat_map(|index| self.operand_value(index)).collect()
     }
 
     /// Returns the dimensions configuration of this [`ScatterOperation`].
@@ -1823,17 +1823,17 @@ pub const SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE: &str = "window_strides";
 pub trait SelectAndScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input of this [`SelectAndScatterOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the source of this [`SelectAndScatterOperation`].
     fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the initial value of this [`SelectAndScatterOperation`].
     fn initial_value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(2).unwrap()
+        self.operand_value(2).unwrap()
     }
 
     /// Returns the window dimensions for this [`SelectAndScatterOperation`], if specified.

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Changed
+
+- Upgraded the OpenXLA dependency pin to commit `88dfac847f3087ac1c08463f52c60ec2f19b27c7`.
+
 ## [0.0.2] - 2026-03-02
 
 ### Changed

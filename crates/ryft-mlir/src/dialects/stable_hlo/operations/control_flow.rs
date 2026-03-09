@@ -94,7 +94,7 @@ pub fn case<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 pub trait IfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the predicate [`Value`] of this [`IfOperation`] (i.e., its only input/operand).
     fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the `true` branch of this [`IfOperation`].
@@ -237,17 +237,17 @@ pub fn r#while<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 pub trait SelectOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the `predicate` input of this [`SelectOperation`].
     fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the `on_true` input of this [`SelectOperation`].
     fn on_true(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the `on_false` input of this [`SelectOperation`].
     fn on_false(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(2).unwrap()
+        self.operand_value(2).unwrap()
     }
 }
 

@@ -242,9 +242,9 @@ mod tests {
         let op = op.unwrap();
         assert_eq!(op.name(), context.identifier("test.op"));
         assert_eq!(op.operand_count(), 3);
-        assert_eq!(op.operand(0).unwrap(), arg_0);
-        assert_eq!(op.operand(1).unwrap(), arg_1);
-        assert_eq!(op.operand(2).unwrap(), arg_0);
+        assert_eq!(op.operand_value(0).unwrap(), arg_0);
+        assert_eq!(op.operand_value(1).unwrap(), arg_1);
+        assert_eq!(op.operand_value(2).unwrap(), arg_0);
         assert_eq!(op.result_count(), 3);
         assert_eq!(op.result_type(0).unwrap(), i32_type);
         assert_eq!(op.result_type(1).unwrap(), i64_type);
