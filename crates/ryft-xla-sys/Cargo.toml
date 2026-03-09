@@ -1,6 +1,6 @@
 [package]
 name = "ryft-xla-sys"
-version = "0.0.2"
+version = "0.0.3"
 readme = "README.md"
 description = "Ryft bindings for XLA."
 keywords = ["ryft", "xla", "pjrt", "mlir", "gpu"]

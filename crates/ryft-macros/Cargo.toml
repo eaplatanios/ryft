@@ -1,6 +1,6 @@
 [package]
 name = "ryft-macros"
-version = "0.0.2"
+version = "0.0.3"
 readme = "README.md"
 description = "Ryft procedural macros."
 keywords = ["ryft"]

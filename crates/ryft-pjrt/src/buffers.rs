@@ -1163,6 +1163,26 @@ impl Buffer<'_> {
         })
     }
 
+    /// Bitcasts this [`Buffer`] to a new [`BufferSpecification`] (i.e., re-interprets the underlying data
+    /// based on the provided [`BufferSpecification`]).
+    pub fn bitcast<D: AsRef<[u64]>>(&self, specification: BufferSpecification<D>) -> Result<Self, Error> {
+        use ffi::PJRT_Buffer_Bitcast_Args;
+        let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
+        invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_Buffer_Bitcast,
+            {
+                buffer = self.to_c_api(),
+                element_type = specification.element_type.to_c_api(),
+                dims = specification.dimensions.as_ref().as_ptr() as *const i64,
+                num_dims = specification.dimensions.as_ref().len(),
+                device_layout = layout.map(|layout| &layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()),
+            },
+            { out_buffer },
+        )
+        .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client) })
+    }
+
     /// Copies the underlying data of this [`Buffer`] into a [`Vec`] that is allocated on host memory, with the
     /// provided optional [`Layout`]. This is similar to [`Self::copy_to_host_buffer`], except that it allocates
     /// a buffer for the result instead of taking in a reference to a pre-allocated buffer. Refer to the documentation
@@ -2766,6 +2786,41 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_Buffer_OnDeviceSizeInBytes_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_Buffer_Bitcast_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub buffer: *mut PJRT_Buffer,
+        pub element_type: PJRT_Buffer_Type,
+        pub dims: *const i64,
+        pub num_dims: usize,
+        pub device_layout: *mut PJRT_Buffer_MemoryLayout,
+        pub out_buffer: *mut PJRT_Buffer,
+    }
+
+    impl PJRT_Buffer_Bitcast_Args {
+        pub fn new(
+            buffer: *mut PJRT_Buffer,
+            element_type: PJRT_Buffer_Type,
+            dims: *const i64,
+            num_dims: usize,
+            device_layout: *mut PJRT_Buffer_MemoryLayout,
+        ) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                buffer,
+                element_type,
+                dims,
+                num_dims,
+                device_layout,
+                out_buffer: std::ptr::null_mut(),
+            }
+        }
+    }
+
+    pub type PJRT_Buffer_Bitcast = unsafe extern "C" fn(args: *mut PJRT_Buffer_Bitcast_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_Buffer_ToHostBuffer_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -3708,6 +3763,18 @@ mod tests {
         assert_eq!(buffer.is_deleted(), Ok(false));
         assert!(unsafe { buffer.delete() }.is_ok());
         assert_eq!(buffer.is_deleted(), Ok(true));
+    }
+
+    #[test]
+    fn test_buffer_bitcast() {
+        let client = test_cpu_client();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let buffer = client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4u64], None, device, None).unwrap();
+        let buffer = buffer
+            .bitcast(BufferSpecification { element_type: BufferType::U32, dimensions: [1u64], layout: None })
+            .unwrap();
+        assert_eq!(buffer.element_type(), Ok(BufferType::U32));
+        assert_eq!(buffer.dimensions(), Ok([1u64].as_slice()));
     }
 
     #[test]

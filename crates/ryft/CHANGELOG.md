@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Changed
+
+- Updated the `ryft-pjrt` and `ryft-xla-sys` dependencies.
+
 ## [0.0.2] - 2026-03-02
 
 ### Changed

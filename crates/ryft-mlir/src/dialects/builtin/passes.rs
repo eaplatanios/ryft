@@ -48,6 +48,7 @@ mlir_pass!(conversion_math_to_emit_c_pass, ConversionConvertMathToEmitC);
 mlir_pass!(conversion_math_to_funcs_pass, ConversionConvertMathToFuncs);
 mlir_pass!(conversion_math_to_llvm_pass, ConversionConvertMathToLLVMPass);
 mlir_pass!(conversion_math_to_libm_pass, ConversionConvertMathToLibmPass);
+mlir_pass!(conversion_math_to_nvvm_pass, ConversionConvertMathToNVVM);
 mlir_pass!(conversion_math_to_rocdl_pass, ConversionConvertMathToROCDL);
 mlir_pass!(conversion_math_to_spirv_pass, ConversionConvertMathToSPIRVPass);
 mlir_pass!(conversion_math_to_xevm_pass, ConversionConvertMathToXeVM);

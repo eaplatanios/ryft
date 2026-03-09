@@ -356,15 +356,15 @@ pub(crate) mod ffi {
         pub PJRT_Client_Load: Option<PJRT_Client_Load>,
         pub PJRT_LoadedExecutable_AddressableDeviceLogicalIds:
             Option<PJRT_LoadedExecutable_AddressableDeviceLogicalIds>,
+        pub PJRT_Buffer_Bitcast: Option<PJRT_Buffer_Bitcast>,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::versions::ffi::{PJRT_API_MAJOR, PJRT_API_MINOR};
     use crate::{
-        Api, Client, ClientOptions, CpuClientOptions, Error, NamedValue, Plugin, Value, Version, hash_map_from_c_api,
-        load_cpu_plugin, str_from_c_api,
+        Api, Client, ClientOptions, CpuClientOptions, Error, NamedValue, Plugin, VERSION, Value, Version,
+        hash_map_from_c_api, load_cpu_plugin, str_from_c_api,
     };
 
     /// Platform identifier used by [`test_for_each_platform`] to signal which backend is being tested.
@@ -559,25 +559,16 @@ mod tests {
                     assert_eq!(plugin.api().version(), Version { major: 0, minor: 47 });
                 }
                 _ => {
-                    assert_eq!(
-                        plugin.version(),
-                        Version { major: PJRT_API_MAJOR as usize, minor: PJRT_API_MINOR as usize },
-                    );
-                    assert_eq!(
-                        client.version(),
-                        Version { major: PJRT_API_MAJOR as usize, minor: PJRT_API_MINOR as usize },
-                    );
-                    assert_eq!(
-                        plugin.api().version(),
-                        Version { major: PJRT_API_MAJOR as usize, minor: PJRT_API_MINOR as usize },
-                    );
+                    assert_eq!(plugin.version(), VERSION);
+                    assert_eq!(client.version(), VERSION);
+                    assert_eq!(plugin.api().version(), VERSION);
                 }
             };
         });
 
         let plugin = test_cpu_plugin();
         let api = plugin.api();
-        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 13, 8])));
+        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 14, 0])));
         assert_eq!(plugin.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(plugin.attribute("xla_version"), Ok(Value::i64(2)));
         assert_eq!(plugin.attribute("xla_version"), api.attribute("xla_version"));
@@ -585,7 +576,7 @@ mod tests {
             plugin.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = plugin.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 13, 8])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 14, 0])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);

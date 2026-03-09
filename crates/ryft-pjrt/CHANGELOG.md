@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Added
+
+- Added support for the new `PJRT_Buffer_Bitcast` C API function.
+
+### Changed
+
+- Updated our PJRT C API bindings for version `0.98`.
+
 ## [0.0.2] - 2026-03-02
 
 ### Added
