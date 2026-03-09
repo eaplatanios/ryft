@@ -195,7 +195,10 @@ When upgrading the OpenXLA commit used by this crate, treat it as a cross-crate 
 7. Propagate the changes through `crates/ryft-pjrt`, make sure that tests pass, and update
    `crates/ryft-pjrt/CHANGELOG.md` as needed.
 8. Check whether the OpenXLA upgrade changed LLVM; if it did, update `crates/ryft-mlir` as needed, and final update
-   `crates/ryft-mlir/CHANGELOG.md` as needed.
+   `crates/ryft-mlir/CHANGELOG.md` as needed. Note that you may have to do this if the XLA upgrade resulted in a new
+   StableHLO version being supported by our built-in PJRT plugins. If that is the case, you should refer to the
+   [StableHLO repository](https://github.com/openxla/stablehlo/blob/main/stablehlo/dialect/VhloDialect.td#L29)
+   for information on what changed.
 9. Audit downstream crates in this repository and apply any compatibility fixes required by the new XLA revision,
    also updating their corresponding `CHANGELOG.md` files as needed.
 
