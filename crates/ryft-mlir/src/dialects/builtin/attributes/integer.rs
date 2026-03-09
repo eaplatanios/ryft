@@ -1,6 +1,7 @@
 use ryft_xla_sys::bindings::{
-    MlirAttribute, mlirIntegerAttrGet, mlirIntegerAttrGetTypeID, mlirIntegerAttrGetValueInt,
-    mlirIntegerAttrGetValueSInt, mlirIntegerAttrGetValueUInt,
+    MlirAttribute, mlirIntegerAttrGet, mlirIntegerAttrGetFromWords, mlirIntegerAttrGetTypeID,
+    mlirIntegerAttrGetValueBitWidth, mlirIntegerAttrGetValueInt, mlirIntegerAttrGetValueNumWords,
+    mlirIntegerAttrGetValueSInt, mlirIntegerAttrGetValueUInt, mlirIntegerAttrGetValueWords,
 };
 
 use crate::{
@@ -57,6 +58,24 @@ impl<'c, 't> IntegerAttributeRef<'c, 't> {
     /// and fits into an unsigned 64-bit integer.
     pub fn unsigned_value(&self) -> u64 {
         unsafe { mlirIntegerAttrGetValueUInt(self.handle) }
+    }
+
+    /// Returns the bit width of the value stored in this [`IntegerAttributeRef`].
+    pub fn value_bit_width(&self) -> usize {
+        unsafe { mlirIntegerAttrGetValueBitWidth(self.handle) as usize }
+    }
+
+    /// Returns the number of 64-bit words used to represent the value stored in this [`IntegerAttributeRef`].
+    pub fn value_word_count(&self) -> usize {
+        unsafe { mlirIntegerAttrGetValueNumWords(self.handle) as usize }
+    }
+
+    /// Returns the 64-bit words that make up the value stored in this [`IntegerAttributeRef`].
+    /// The words are returned in little-endian order (i.e., least significant word first).
+    pub fn value_words(&self) -> Vec<u64> {
+        let mut words = vec![0; self.value_word_count()];
+        unsafe { mlirIntegerAttrGetValueWords(self.handle, words.as_mut_ptr()) };
+        words
     }
 }
 
@@ -136,6 +155,23 @@ impl<'t> Context<'t> {
         let _guard = self.borrow();
         unsafe { IntegerAttributeRef::from_c_api(mlirIntegerAttrGet(r#type.to_c_api(), value), self).unwrap() }
     }
+
+    /// Creates a new [`IntegerAttributeRef`] owned by this [`Context`] from the provided 64-bit words.
+    /// The words must be provided in little-endian order (i.e., least significant word first).
+    pub fn integer_attribute_from_words<'c, T: IntegerAttributeType<'c, 't>>(
+        &'c self,
+        r#type: T,
+        words: &[u64],
+    ) -> IntegerAttributeRef<'c, 't> {
+        let _guard = self.borrow();
+        unsafe {
+            IntegerAttributeRef::from_c_api(
+                mlirIntegerAttrGetFromWords(r#type.to_c_api(), words.len() as u32, words.as_ptr()),
+                self,
+            )
+            .unwrap()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +201,9 @@ mod tests {
         let attribute: IntegerAttributeRef<'_, '_> = 42u8.into_with_context(&context);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.signless_value(), 42);
+        assert_eq!(attribute.value_bit_width(), 8);
+        assert_eq!(attribute.value_word_count(), 1);
+        assert_eq!(attribute.value_words(), vec![42]);
 
         // Test with signed integer type.
         let attribute: IntegerAttributeRef<'_, '_> = (-100i8).into_with_context(&context);
@@ -180,6 +219,14 @@ mod tests {
         let attribute: IntegerAttributeRef<'_, '_> = 1000usize.into_with_context(&context);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.signless_value(), 1000);
+
+        // Test constructing an integer attribute from an array of words.
+        let words = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+        let attribute = context.integer_attribute_from_words(context.signless_integer_type(128), &words);
+        assert_eq!(&context, attribute.context());
+        assert_eq!(attribute.value_bit_width(), 128);
+        assert_eq!(attribute.value_word_count(), 2);
+        assert_eq!(attribute.value_words(), words);
     }
 
     #[test]

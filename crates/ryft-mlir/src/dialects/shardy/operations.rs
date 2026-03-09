@@ -23,7 +23,7 @@ pub const OUT_SHARDING_ATTRIBUTE: &str = "out_sharding";
 pub trait AllGatherOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`AllGatherOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the gathering-axes payload of this [`AllGatherOperation`].
@@ -85,7 +85,7 @@ pub const REDUCTION_AXES_ATTRIBUTE: &str = "reduction_axes";
 pub trait AllReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`AllReduceOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the reduction-axes payload of this [`AllReduceOperation`].
@@ -147,7 +147,7 @@ pub const SLICING_AXES_ATTRIBUTE: &str = "slicing_axes";
 pub trait AllSliceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`AllSliceOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the slicing-axes payload of this [`AllSliceOperation`].
@@ -209,7 +209,7 @@ pub const PARAMS_ATTRIBUTE: &str = "params";
 pub trait AllToAllOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`AllToAllOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the parameter payload of this [`AllToAllOperation`].
@@ -267,7 +267,7 @@ pub fn all_to_all<
 pub trait CollectivePermuteOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`CollectivePermuteOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns output sharding metadata.
@@ -438,7 +438,7 @@ pub const REDUCE_SCATTER_AXES_ATTRIBUTE: &str = "reduce_scatter_axes";
 pub trait ReduceScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`ReduceScatterOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns reduce-scatter axes metadata.
@@ -501,7 +501,7 @@ pub const AXES_ATTRIBUTE: &str = "axes";
 pub trait ReplicatedToUnreducedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`ReplicatedToUnreducedOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns axes metadata.
@@ -586,7 +586,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 pub trait ShardedToUnreducedOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input tensor of this [`ShardedToUnreducedOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns axes metadata.
@@ -644,7 +644,7 @@ pub fn sharded_to_unreduced<
 pub trait ShardingConstraintOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the constrained input value.
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the requested sharding payload.
@@ -689,7 +689,7 @@ pub const GROUP_ID_ATTRIBUTE: &str = "group_id";
 pub trait ShardingGroupOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the group input tensor.
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the group id.

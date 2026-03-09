@@ -381,7 +381,7 @@ pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn values(&self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        self.operands()
+        self.operand_values()
     }
 }
 
@@ -471,7 +471,10 @@ pub const COMPOSITE_DECOMPOSITION_ATTRIBUTE: &str = "decomposition";
 /// [`Attribute`]s stored in this [`Operation`] under the [`CompositeOperation::composite_attributes`] key. This is
 /// meant to support custom metadata that may be used in [`CompositeOperation::composite_decomposition`]. Finally, this
 /// operation is _versioned_ in order to enable providing compatibility guarantees. Its version is stored in
-/// [`CompositeOperation::composite_version`].
+/// [`CompositeOperation::composite_version`]. [`CompositeOperation`]s may also carry zero or more
+/// [`Region`](crate::Region)s through [`CompositeOperation::composite_regions`] in order to model composite operations
+/// with bodies (e.g., operations like `while` or `reduce`). If the decomposition is inlined, the `regions` will be
+/// ignored.
 ///
 /// The number and types of the operands and results of this [`Operation`] match the number and types of the operands
 /// and results of its [`CompositeOperation::composite_decomposition`].
@@ -507,18 +510,21 @@ pub trait CompositeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             .unwrap_or_else(|| panic!("invalid '{COMPOSITE_NAME_ATTRIBUTE}' attribute in `stable_hlo::composite`"))
     }
 
-    /// Returns the optional version of this [`CompositeOperation`]. Typically, version 0 means that a composite
-    /// operation is under development and does not imply any compatibility guarantees, whereas higher versions do.
-    fn composite_version(&self) -> Option<u64> {
+    /// Returns the version of this [`CompositeOperation`]. Typically, version 0 means that a composite operation is
+    /// under development and does not imply any compatibility guarantees, whereas higher versions do.
+    fn composite_version(&self) -> u32 {
         self.attribute(COMPOSITE_VERSION_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<IntegerAttributeRef>().map(|attribute| attribute.unsigned_value()))
+            .map(|attribute| attribute as u32)
+            .unwrap_or_default()
     }
 
     /// Returns the composite [`Attribute`]s of this [`CompositeOperation`] that will be propagated to
     /// [`CompositeOperation::composite_decomposition`] when this operation is invoked.
-    fn composite_attributes(&self) -> Option<HashMap<StringRef<'c>, AttributeRef<'c, 't>>> {
+    fn composite_attributes(&self) -> HashMap<StringRef<'c>, AttributeRef<'c, 't>> {
         self.attribute(COMPOSITE_ATTRIBUTES_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DictionaryAttributeRef>().map(|attribute| attribute.into()))
+            .unwrap_or_default()
     }
 
     /// Returns the name/symbol of the decomposition [`func::func`](crate::dialects::func::func)  of this
@@ -530,18 +536,24 @@ pub trait CompositeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 panic!("invalid '{COMPOSITE_DECOMPOSITION_ATTRIBUTE}' attribute in `stable_hlo::composite`")
             })
     }
+
+    /// Returns an [`Iterator`] over the [`Region`](crate::Region)s carried by this [`CompositeOperation`].
+    fn composite_regions(&self) -> impl Iterator<Item = RegionRef<'o, 'c, 't>> {
+        self.regions()
+    }
 }
 
 mlir_op!(Composite);
-mlir_op_trait!(Composite, ZeroRegions);
 mlir_op_trait!(Composite, ZeroSuccessors);
 
 /// Constructs a new detached/owned [`CompositeOperation`] at the specified [`Location`]. Refer to the documentation
 /// of [`CompositeOperation`], [`CompositeOperation::composite_name`], [`CompositeOperation::composite_version`],
-/// [`CompositeOperation::composite_attributes`], and [`CompositeOperation::composite_decomposition`], for more
-/// information on the operation semantics and the arguments of this function.
+/// [`CompositeOperation::composite_attributes`], [`CompositeOperation::composite_decomposition`], and
+/// [`CompositeOperation::composite_regions`], for more information on the operation semantics and the arguments of
+/// this function.
 ///
 /// Note that if any of the inputs to this function are invalid, the function may panic!
+#[allow(clippy::too_many_arguments)]
 pub fn composite<
     'v,
     'c: 'v,
@@ -555,10 +567,11 @@ pub fn composite<
     L: Location<'c, 't>,
 >(
     name: N,
-    version: Option<u64>,
+    version: u32,
     attributes: Option<&HashMap<StringRef<'s>, A>>,
     operands: &[V],
     decomposition: D,
+    regions: Vec<DetachedRegion<'c, 't>>,
     result_types: &[T],
     location: L,
 ) -> DetachedCompositeOperation<'c, 't> {
@@ -568,17 +581,18 @@ pub fn composite<
         .add_operands(operands)
         .add_attribute(COMPOSITE_NAME_ATTRIBUTE, name.into_with_context(context))
         .add_attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE, decomposition.into_with_context(context));
-    if let Some(attributes) = attributes {
+    if let Some(attributes) = attributes.filter(|attributes| !attributes.is_empty()) {
         builder = builder.add_attribute(
             COMPOSITE_ATTRIBUTES_ATTRIBUTE,
             DictionaryAttributeRef::from_with_context(attributes, context),
         )
     }
-    if let Some(version) = version {
-        builder = builder.add_attribute(
-            COMPOSITE_VERSION_ATTRIBUTE,
-            context.integer_attribute(context.signless_integer_type(32), version.cast_signed()),
-        );
+    builder = builder.add_attribute(
+        COMPOSITE_VERSION_ATTRIBUTE,
+        context.integer_attribute(context.signless_integer_type(32), i64::from(version)),
+    );
+    if !regions.is_empty() {
+        builder = builder.add_regions(regions);
     }
     builder
         .add_results(result_types)
@@ -1443,21 +1457,31 @@ mod tests {
             let mut block = context.block(&[(tensor_type, location), (tensor_type, location)]);
             let composite_attributes =
                 HashMap::from([(StringRef::from("my_op_attribute"), context.unit_attribute().as_ref())]);
+            let mut composite_region = context.region();
+            let mut composite_region_block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+            composite_region_block.append_operation(stable_hlo::r#return(
+                &composite_region_block.arguments().collect::<Vec<_>>(),
+                location,
+            ));
+            composite_region.append_block(composite_region_block);
             let composite_op = composite(
                 "my_namespace.my_op",
-                Some(1),
+                1,
                 Some(&composite_attributes),
                 &block.arguments().collect::<Vec<_>>(),
                 "my_op",
+                vec![composite_region.into()],
                 &[tensor_type],
                 location,
             );
             assert_eq!(composite_op.composite_name().as_str().unwrap(), "my_namespace.my_op");
-            assert_eq!(composite_op.composite_version(), Some(1));
-            assert_eq!(composite_op.composite_attributes(), Some(composite_attributes));
+            assert_eq!(composite_op.composite_version(), 1);
+            assert_eq!(composite_op.composite_attributes(), composite_attributes);
             assert_eq!(composite_op.composite_decomposition().as_str().unwrap(), "my_op");
+            assert_eq!(composite_op.composite_regions().count(), 1);
             assert_eq!(composite_op.operands().count(), 2);
             assert_eq!(composite_op.results().count(), 1);
+            assert_eq!(composite_op.regions().count(), 1);
             let composite_op = block.append_operation(composite_op);
             block.append_operation(func::r#return(&[composite_op.result(0).unwrap()], location));
             func::func(
@@ -1481,7 +1505,10 @@ mod tests {
                     return %0 : tensor<f32>
                   }
                   func.func @composite_test(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
-                    %0 = stablehlo.composite \"my_namespace.my_op\" %arg0, %arg1 {\
+                    %0 = stablehlo.composite \"my_namespace.my_op\" %arg0, %arg1 ({
+                    ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                      stablehlo.return %arg2, %arg3 : tensor<f32>, tensor<f32>
+                    }) {\
                       composite_attributes = {my_op_attribute}, \
                       decomposition = @my_op, \
                       version = 1 : i32\

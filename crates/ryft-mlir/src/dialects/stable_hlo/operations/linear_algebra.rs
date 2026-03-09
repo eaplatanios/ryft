@@ -706,12 +706,12 @@ pub const DOT_ALGORITHM_ATTRIBUTE: &str = "algorithm";
 pub trait DotGeneralOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`DotGeneralOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`DotGeneralOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the [`DotDimensionsAttributeRef`] of this [`DotGeneralOperation`], specifying its
@@ -955,12 +955,12 @@ pub const CONVOLUTION_PRECISION_ATTRIBUTE: &str = "precision_config";
 pub trait StaticOrDynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the input (i.e., its first operand) of this [`StaticOrDynamicConvolutionOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the kernel (i.e., its second operand) of this [`StaticOrDynamicConvolutionOperation`].
     fn kernel(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the [`ConvolutionDimensionsAttributeRef`] of this [`Operation`].
@@ -1374,7 +1374,7 @@ pub trait DynamicConvolutionOperation<'o, 'c: 'o, 't: 'c>: StaticOrDynamicConvol
     /// in each pair specifies the amount of padding inserted _before_ the values of the tensor on that dimension and
     /// the second number specifies the amount of padding inserted _after_ the values of the tensor on that dimension.
     fn padding(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(2).unwrap()
+        self.operand_value(2).unwrap()
     }
 }
 
@@ -1628,12 +1628,12 @@ pub const TRIANGULAR_SOLVE_TRANSPOSE_A_ATTRIBUTE: &str = "transpose_a";
 pub trait TriangularSolveOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the first input of this [`TriangularSolveOperation`].
     fn a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the second input of this [`TriangularSolveOperation`].
     fn b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns whether the coefficient matrix is placed on the left side for this [`TriangularSolveOperation`].

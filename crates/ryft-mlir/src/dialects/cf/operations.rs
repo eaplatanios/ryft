@@ -8,7 +8,7 @@ pub const ASSERT_MESSAGE_ATTRIBUTE: &str = "msg";
 
 pub trait AssertOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn argument(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     fn message(&self) -> StringRef<'c> {
@@ -70,7 +70,7 @@ pub const CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_s
 
 pub trait ConditionalBranchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn predicate(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     fn on_true_successor_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
@@ -81,7 +81,7 @@ pub trait ConditionalBranchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
             .unwrap_or_else(|| {
                 panic!("invalid '{CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::cond_br`")
             });
-        self.operands().skip(1).take(true_successor_operand_count as usize).collect::<Vec<_>>()
+        self.operand_values().skip(1).take(true_successor_operand_count as usize).collect::<Vec<_>>()
     }
 
     fn on_false_successor_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
@@ -92,7 +92,7 @@ pub trait ConditionalBranchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> 
             .unwrap_or_else(|| {
                 panic!("invalid '{CONDITIONAL_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::cond_br`")
             });
-        self.operands().skip(1 + true_successor_operand_count as usize).collect::<Vec<_>>()
+        self.operand_values().skip(1 + true_successor_operand_count as usize).collect::<Vec<_>>()
     }
 
     fn on_true_successor(&self) -> BlockRef<'o, 'c, 't> {
@@ -168,7 +168,7 @@ pub const SWITCH_OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operand_segment_sizes"
 
 pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     fn flag(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     fn default(&self) -> DefaultSwitchBranch<'o, 'c, 't> {
@@ -179,7 +179,7 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             .unwrap_or_else(|| panic!("invalid '{SWITCH_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::switch`"));
         DefaultSwitchBranch {
             successor: self.successor(0).unwrap(),
-            successor_operands: self.operands().skip(1).take(default_successor_operand_count as usize).collect(),
+            successor_operands: self.operand_values().skip(1).take(default_successor_operand_count as usize).collect(),
         }
     }
 
@@ -196,7 +196,7 @@ pub trait SwitchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())
             .map(|attribute| Vec::<i32>::from(attribute)[1])
             .unwrap_or_else(|| panic!("invalid '{SWITCH_OPERAND_SEGMENT_SIZES_ATTRIBUTE}' attribute in `cf::switch`"));
-        let mut flattened_case_operands = self.operands().skip(1 + default_successor_operand_count as usize);
+        let mut flattened_case_operands = self.operand_values().skip(1 + default_successor_operand_count as usize);
         let case_operand_counts = self
             .attribute(SWITCH_CASE_OPERAND_COUNTS_ATTRIBUTE)
             .and_then(|attribute| attribute.cast::<DenseInteger32ArrayAttributeRef>())

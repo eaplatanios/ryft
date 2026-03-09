@@ -10,7 +10,7 @@ use ryft_xla_sys::bindings::{
     mlirOperationGetDiscardableAttribute, mlirOperationGetDiscardableAttributeByName,
     mlirOperationGetInherentAttributeByName, mlirOperationGetLocation, mlirOperationGetName,
     mlirOperationGetNumAttributes, mlirOperationGetNumDiscardableAttributes, mlirOperationGetNumOperands,
-    mlirOperationGetNumRegions, mlirOperationGetNumResults, mlirOperationGetNumSuccessors, mlirOperationGetOperand,
+    mlirOperationGetNumRegions, mlirOperationGetNumResults, mlirOperationGetNumSuccessors, mlirOperationGetOpOperand,
     mlirOperationGetParentOperation, mlirOperationGetRegion, mlirOperationGetResult, mlirOperationGetSuccessor,
     mlirOperationGetTypeID, mlirOperationHasInherentAttributeByName, mlirOperationHashValue,
     mlirOperationIsBeforeInBlock, mlirOperationMoveAfter, mlirOperationMoveBefore, mlirOperationPrint,
@@ -24,7 +24,7 @@ use ryft_xla_sys::bindings::{
 use crate::support::{write_to_formatter_callback, write_to_string_callback};
 use crate::{
     Attribute, AttributeRef, Block, BlockRef, Context, Identifier, Location, LocationRef, LogicalResult,
-    NamedAttributeRef, OperationResultRef, RegionRef, StringRef, TypeId, TypeRef, Value, ValueRef,
+    NamedAttributeRef, OperandRef, OperationResultRef, RegionRef, StringRef, TypeId, TypeRef, Value, ValueRef,
     write_to_bytes_callback,
 };
 
@@ -419,15 +419,13 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
-    fn operands<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
-        (0..self.operand_count()).map(|index| unsafe {
-            ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context()).unwrap()
-        })
+    fn operands<'r>(&'r self) -> impl Iterator<Item = OperandRef<'o, 'c, 't>> {
+        (0..self.operand_count()).map(|index| self.operand(index).unwrap())
     }
 
     /// Returns the operand at the `index`-pth position in the operands list of this [`Operation`],
     /// and [`None`] if `index` is out of bounds.
-    fn operand(&self, index: usize) -> Option<ValueRef<'o, 'c, 't>> {
+    fn operand(&self, index: usize) -> Option<OperandRef<'o, 'c, 't>> {
         if index >= self.operand_count() {
             None
         } else {
@@ -436,9 +434,24 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
             // to MLIR internals that we have when working with the MLIR C API.
             let _guard = self.context().borrow();
             unsafe {
-                ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context())
+                OperandRef::from_c_api(mlirOperationGetOpOperand(self.to_c_api(), index.cast_signed()), self.context())
             }
         }
+    }
+
+    /// Returns an [`Iterator`] over the operand [`Value`](crate::Value)s of this [`Operation`].
+    ///
+    /// Note that the returned iterator does not hold a borrowed reference to the underlying [`Context`]
+    /// because that would make it impossible to perform mutating operations on that context (e.g., from within
+    /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
+    fn operand_values<'r>(&'r self) -> impl Iterator<Item = ValueRef<'o, 'c, 't>> {
+        self.operands().map(|operand| operand.value())
+    }
+
+    /// Returns the operand [`Value`](crate::Value) at the `index`-pth position in the operands list of this
+    /// [`Operation`], and [`None`] if `index` is out of bounds.
+    fn operand_value(&self, index: usize) -> Option<ValueRef<'o, 'c, 't>> {
+        self.operand(index).map(|operand| operand.value())
     }
 
     /// Returns an [`Iterator`] over the [`Type`](crate::Type)s of the [`Operation::operands`] of this [`Operation`].
@@ -447,13 +460,13 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// because that would make it impossible to perform mutating operations on that context (e.g., from within
     /// [`Pass`](crate::Pass)es) while iterating over the contents of that iterator.
     fn operand_types<'r>(&'r self) -> impl Iterator<Item = TypeRef<'c, 't>> {
-        self.operands().map(|operand| operand.r#type())
+        self.operand_values().map(|operand| operand.r#type())
     }
 
     /// Returns the [`Type`](crate::Type) of the operand at the `index`-pth position in the operands list of this
     /// [`Operation`], and [`None`] if `index` is out of bounds.
     fn operand_type(&self, index: usize) -> Option<TypeRef<'c, 't>> {
-        self.operand(index).map(|operand| operand.r#type())
+        self.operand_value(index).map(|operand| operand.r#type())
     }
 
     /// Replaces the operand at the `index`-pth position in the operands list of this [`Operation`], with the provided
@@ -1292,11 +1305,18 @@ mod tests {
             .add_operand(argument_0)
             .build()
             .unwrap();
-        assert_eq!(op.operand(0), Some(argument_0));
-        assert_eq!(op.operand(1), Some(argument_0));
-        assert_eq!(op.operand(2), Some(argument_0));
+        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_0));
+        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_0));
+        assert_eq!(op.operand(2).map(|operand| operand.value()), Some(argument_0));
+        assert_eq!(op.operand(0).map(|operand| operand.operand_index()), Some(0));
+        assert_eq!(op.operand(1).map(|operand| operand.operand_index()), Some(1));
+        assert_eq!(op.operand(2).map(|operand| operand.operand_index()), Some(2));
         assert!(op.operand(3).is_none());
-        assert_eq!(op.operands().skip(1).collect::<Vec<_>>(), vec![argument_0.clone(), argument_0]);
+        assert_eq!(op.operand_value(0), Some(argument_0));
+        assert_eq!(op.operand_value(1), Some(argument_0));
+        assert_eq!(op.operand_value(2), Some(argument_0));
+        assert!(op.operand_value(3).is_none());
+        assert_eq!(op.operand_values().skip(1).collect::<Vec<_>>(), vec![argument_0.clone(), argument_0]);
         assert_eq!(op.operand_type(0), Some(index_type));
         assert_eq!(op.operand_type(1), Some(index_type));
         assert_eq!(op.operand_type(2), Some(index_type));
@@ -1310,14 +1330,14 @@ mod tests {
         let mut op = block.append_operation(op);
         let argument_1 = block.argument(0).unwrap().as_ref();
         assert!(unsafe { op.replace_operand(0, argument_1) });
-        assert_eq!(op.operand(0).unwrap(), argument_1);
+        assert_eq!(op.operand(0).unwrap().value(), argument_1);
         assert!(unsafe { !op.replace_operand(10, argument_0) });
 
         // Try replacing all operands of an operation.
         let argument_2 = block.argument(1).unwrap().as_ref();
         assert!(unsafe { op.replace_operands(&[argument_1, argument_2, argument_0]) });
-        assert_eq!(op.operand(0), Some(argument_1));
-        assert_eq!(op.operand(1), Some(argument_2));
+        assert_eq!(op.operand(0).map(|operand| operand.value()), Some(argument_1));
+        assert_eq!(op.operand(1).map(|operand| operand.value()), Some(argument_2));
         assert!(unsafe { !op.replace_operands(&[argument_2]) });
     }
 

@@ -7281,10 +7281,10 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsPrintIRPass();
 }
 unsafe extern "C" {
-    pub fn mlirCreateTransformsPrintOpStats() -> MlirPass;
+    pub fn mlirCreateTransformsPrintOpStatsPass() -> MlirPass;
 }
 unsafe extern "C" {
-    pub fn mlirRegisterTransformsPrintOpStats();
+    pub fn mlirRegisterTransformsPrintOpStatsPass();
 }
 unsafe extern "C" {
     pub fn mlirCreateTransformsRemoveDeadValues() -> MlirPass;
@@ -7329,9 +7329,11 @@ unsafe extern "C" {
     pub fn mlirRegisterTransformsTopologicalSort();
 }
 unsafe extern "C" {
+    #[cfg_attr(target_os = "windows", link_name = "mlirCreateTransformsViewOpGraphPass")]
     pub fn mlirCreateTransformsViewOpGraph() -> MlirPass;
 }
 unsafe extern "C" {
+    #[cfg_attr(target_os = "windows", link_name = "mlirRegisterTransformsViewOpGraphPass")]
     pub fn mlirRegisterTransformsViewOpGraph();
 }
 unsafe extern "C" {

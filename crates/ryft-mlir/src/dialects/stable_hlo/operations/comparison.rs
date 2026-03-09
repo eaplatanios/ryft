@@ -97,12 +97,12 @@ pub const COMPARISON_TYPE_ATTRIBUTE: &str = "compare_type";
 pub trait CompareOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`CompareOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`CompareOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the [`ComparisonDirection`] of this [`CompareOperation`].
@@ -177,17 +177,17 @@ pub fn compare<
 pub trait ClampOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the minimum bound of this [`ClampOperation`].
     fn min(&self) -> ValueRef<'o, 'c, 't> {
-        Operation::operand(self, 0).unwrap()
+        Operation::operand_value(self, 0).unwrap()
     }
 
     /// Returns the input (i.e., value to be clamped) of this [`ClampOperation`].
     fn input(&self) -> ValueRef<'o, 'c, 't> {
-        Operation::operand(self, 1).unwrap()
+        Operation::operand_value(self, 1).unwrap()
     }
 
     /// Returns the maximum bound of this [`ClampOperation`].
     fn max(&self) -> ValueRef<'o, 'c, 't> {
-        Operation::operand(self, 2).unwrap()
+        Operation::operand_value(self, 2).unwrap()
     }
 }
 
@@ -253,12 +253,12 @@ pub fn clamp<
 pub trait MaximumOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`MaximumOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`MaximumOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 
@@ -320,12 +320,12 @@ pub fn maximum<
 pub trait MinimumOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`MinimumOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`MinimumOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 

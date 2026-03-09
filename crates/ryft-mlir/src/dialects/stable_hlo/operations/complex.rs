@@ -24,12 +24,12 @@ use crate::{
 pub trait ComplexOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the real part of the complex tensor that this [`ComplexOperation`] constructs.
     fn real(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the imaginary part of the complex tensor that this [`ComplexOperation`] constructs.
     fn imag(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 

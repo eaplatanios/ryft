@@ -30,12 +30,12 @@ use super::{Accuracy, HasAccuracy, RESULT_ACCURACY_ATTRIBUTE};
 pub trait PowerOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the left-hand side input of this [`PowerOperation`].
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the right-hand side input of this [`PowerOperation`].
     fn rhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 }
 

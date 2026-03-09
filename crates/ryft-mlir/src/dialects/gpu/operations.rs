@@ -255,7 +255,7 @@ pub struct LaunchDimensions<'o, 'c: 'o, 't: 'c> {
 pub trait AllReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value being reduced.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the built-in reduction operation, if one is specified.
@@ -308,19 +308,19 @@ pub trait AllocOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.alloc");
-        self.operands().take(sizes[0] as usize).collect::<Vec<_>>()
+        self.operand_values().take(sizes[0] as usize).collect::<Vec<_>>()
     }
 
     /// Returns dynamic size operands.
     fn dynamic_sizes(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.alloc");
-        self.operands().skip(sizes[0] as usize).take(sizes[1] as usize).collect::<Vec<_>>()
+        self.operand_values().skip(sizes[0] as usize).take(sizes[1] as usize).collect::<Vec<_>>()
     }
 
     /// Returns symbol operands.
     fn symbol_operands(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.alloc");
-        self.operands().skip((sizes[0] + sizes[1]) as usize).take(sizes[2] as usize).collect::<Vec<_>>()
+        self.operand_values().skip((sizes[0] + sizes[1]) as usize).take(sizes[2] as usize).collect::<Vec<_>>()
     }
 
     /// Returns the allocated memref result.
@@ -668,17 +668,17 @@ pub trait Create2To4SpMatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the row count operand.
     fn rows(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3)).unwrap()
+        self.operand_value(fixed_operand_start(self, 3)).unwrap()
     }
 
     /// Returns the column count operand.
     fn cols(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 3) + 1).unwrap()
     }
 
     /// Returns the memref operand.
     fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 3) + 2).unwrap()
     }
 
     /// Returns the prune flag attribute.
@@ -1037,19 +1037,19 @@ pub trait CreateDnTensorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.create_dn_tensor");
-        self.operands().take(sizes[0] as usize).collect::<Vec<_>>()
+        self.operand_values().take(sizes[0] as usize).collect::<Vec<_>>()
     }
 
     /// Returns the values buffer operand.
     fn values(&self) -> ValueRef<'o, 'c, 't> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.create_dn_tensor");
-        self.operand(sizes[0] as usize).unwrap()
+        self.operand_value(sizes[0] as usize).unwrap()
     }
 
     /// Returns tensor dimension operands.
     fn dimensions(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.create_dn_tensor");
-        self.operands().skip((sizes[0] + sizes[1]) as usize).take(sizes[2] as usize).collect::<Vec<_>>()
+        self.operand_values().skip((sizes[0] + sizes[1]) as usize).take(sizes[2] as usize).collect::<Vec<_>>()
     }
 
     /// Returns the dense tensor handle result.
@@ -1103,7 +1103,7 @@ pub trait DeallocOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the deallocated memref operand.
     fn memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 1)).unwrap()
+        self.operand_value(fixed_operand_start(self, 1)).unwrap()
     }
 
     /// Returns the optional async token result.
@@ -1145,7 +1145,7 @@ pub trait DestroyDnTensorOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the dense tensor descriptor operand.
     fn dn_tensor(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 1)).unwrap()
+        self.operand_value(fixed_operand_start(self, 1)).unwrap()
     }
 
     /// Returns the optional async token result.
@@ -1188,7 +1188,7 @@ pub trait DestroySpMatOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the sparse matrix descriptor operand.
     fn spmat(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 1)).unwrap()
+        self.operand_value(fixed_operand_start(self, 1)).unwrap()
     }
 
     /// Returns the optional async token result.
@@ -1467,7 +1467,7 @@ pub fn grid_dim<'c, 't: 'c, L: Location<'c, 't>>(
 pub trait HostRegisterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the memref being registered.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 }
 
@@ -1495,7 +1495,7 @@ pub fn host_register<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, '
 pub trait HostUnregisterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the memref being unregistered.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 }
 
@@ -1556,7 +1556,7 @@ pub trait LaunchFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.launch_func");
-        self.operands().take(sizes[0] as usize).collect::<Vec<_>>()
+        self.operand_values().take(sizes[0] as usize).collect::<Vec<_>>()
     }
 
     /// Returns kernel operands passed to the launch.
@@ -1573,7 +1573,7 @@ pub trait LaunchFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             + sizes[8]
             + sizes[9]
             + sizes[10]) as usize;
-        self.operands().skip(prefix).take(sizes[11] as usize).collect::<Vec<_>>()
+        self.operand_values().skip(prefix).take(sizes[11] as usize).collect::<Vec<_>>()
     }
 
     /// Returns the optional async object operand.
@@ -1594,7 +1594,7 @@ pub trait LaunchFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             + sizes[9]
             + sizes[10]
             + sizes[11]) as usize;
-        self.operand(prefix)
+        self.operand_value(prefix)
     }
 
     /// Returns the optional async token result.
@@ -1690,7 +1690,7 @@ pub trait LaunchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
         let sizes = required_dense_i32_attribute(self, OPERAND_SEGMENT_SIZES_ATTRIBUTE, "gpu.launch");
-        self.operands().take(sizes[0] as usize).collect::<Vec<_>>()
+        self.operand_values().take(sizes[0] as usize).collect::<Vec<_>>()
     }
 
     /// Returns optional enclosing module symbol.
@@ -1791,12 +1791,12 @@ pub trait MemcpyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns destination operand.
     fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 2)).unwrap()
+        self.operand_value(fixed_operand_start(self, 2)).unwrap()
     }
 
     /// Returns source operand.
     fn source(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 2) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 2) + 1).unwrap()
     }
 
     /// Returns the optional async token result.
@@ -1842,12 +1842,12 @@ pub trait MemsetOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns destination operand.
     fn destination(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 2)).unwrap()
+        self.operand_value(fixed_operand_start(self, 2)).unwrap()
     }
 
     /// Returns value operand.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 2) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 2) + 1).unwrap()
     }
 
     /// Returns the optional async token result.
@@ -1921,7 +1921,7 @@ pub trait PrintfOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns print arguments.
     fn arguments(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().collect::<Vec<_>>()
+        self.operand_values().collect::<Vec<_>>()
     }
 }
 
@@ -1953,7 +1953,7 @@ pub fn printf<'o, 'c: 'o, 't: 'c, F: IntoWithContext<'c, 't, StringAttributeRef<
 pub trait ReturnOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + ReturnLike<'o, 'c, 't> {
     /// Returns returned values.
     fn values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().collect::<Vec<_>>()
+        self.operand_values().collect::<Vec<_>>()
     }
 }
 
@@ -1982,7 +1982,7 @@ pub fn r#return<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait RotateOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source value.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the rotate offset.
@@ -2042,17 +2042,17 @@ pub fn rotate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 pub trait ShuffleOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the source value.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns the shuffle offset operand.
     fn offset(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns the shuffle width operand.
     fn width(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(2).unwrap()
+        self.operand_value(2).unwrap()
     }
 
     /// Returns the shuffle mode.
@@ -2107,7 +2107,7 @@ pub fn shuffle<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait SetDefaultDeviceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the device index operand.
     fn device_index(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 }
 
@@ -2140,22 +2140,22 @@ pub trait SddmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix A descriptor.
     fn dnmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4)).unwrap()
+        self.operand_value(fixed_operand_start(self, 4)).unwrap()
     }
 
     /// Returns dense matrix B descriptor.
     fn dnmat_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 1).unwrap()
     }
 
     /// Returns sparse matrix C descriptor.
     fn spmat_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 2).unwrap()
     }
 
     /// Returns dense matrix D descriptor.
     fn dnmat_d(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 3).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 3).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2230,27 +2230,27 @@ pub trait SddmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns dense matrix A descriptor.
     fn dnmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5)).unwrap()
+        self.operand_value(fixed_operand_start(self, 5)).unwrap()
     }
 
     /// Returns dense matrix B descriptor.
     fn dnmat_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 1).unwrap()
     }
 
     /// Returns sparse matrix C descriptor.
     fn spmat_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 2).unwrap()
     }
 
     /// Returns dense matrix D descriptor.
     fn dnmat_d(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 3).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 3).unwrap()
     }
 
     /// Returns temporary buffer descriptor.
     fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 4).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 4).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2321,22 +2321,22 @@ pub trait SetCsrPointersOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix descriptor.
     fn spmat(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4)).unwrap()
+        self.operand_value(fixed_operand_start(self, 4)).unwrap()
     }
 
     /// Returns CSR row-position pointer.
     fn row_pos(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 1).unwrap()
     }
 
     /// Returns CSR column-index pointer.
     fn col_idx(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 2).unwrap()
     }
 
     /// Returns CSR values pointer.
     fn values(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 3).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 3).unwrap()
     }
 
     /// Returns the optional async token result.
@@ -2378,22 +2378,22 @@ pub trait SpgemmCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A descriptor.
     fn spmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4)).unwrap()
+        self.operand_value(fixed_operand_start(self, 4)).unwrap()
     }
 
     /// Returns sparse matrix B descriptor.
     fn spmat_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 1).unwrap()
     }
 
     /// Returns sparse matrix C descriptor.
     fn spmat_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 2).unwrap()
     }
 
     /// Returns sparse GEMM descriptor.
     fn spgemm_descr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 3).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 3).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2448,7 +2448,7 @@ pub fn spgemm_copy<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait SpgemmCreateDescrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().collect::<Vec<_>>()
+        self.operand_values().collect::<Vec<_>>()
     }
 
     /// Returns the sparse GEMM descriptor result.
@@ -2488,7 +2488,7 @@ pub trait SpgemmDestroyDescrOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't>
 
     /// Returns sparse GEMM descriptor operand.
     fn spgemm_descr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 1)).unwrap()
+        self.operand_value(fixed_operand_start(self, 1)).unwrap()
     }
 
     /// Returns the optional async token result.
@@ -2524,27 +2524,27 @@ pub trait SpgemmWorkEstimationOrComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<
 
     /// Returns sparse matrix A descriptor.
     fn spmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5)).unwrap()
+        self.operand_value(fixed_operand_start(self, 5)).unwrap()
     }
 
     /// Returns sparse matrix B descriptor.
     fn spmat_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 1).unwrap()
     }
 
     /// Returns sparse matrix C descriptor.
     fn spmat_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 2).unwrap()
     }
 
     /// Returns sparse GEMM descriptor.
     fn spgemm_descr(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 3).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 3).unwrap()
     }
 
     /// Returns temporary buffer descriptor.
     fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 5) + 4).unwrap()
+        self.operand_value(fixed_operand_start(self, 5) + 4).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2638,17 +2638,17 @@ pub trait SpmmBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A descriptor.
     fn spmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3)).unwrap()
+        self.operand_value(fixed_operand_start(self, 3)).unwrap()
     }
 
     /// Returns dense matrix B descriptor.
     fn dnmat_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 3) + 1).unwrap()
     }
 
     /// Returns dense matrix C descriptor.
     fn dnmat_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 3) + 2).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2721,22 +2721,22 @@ pub trait SpmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A descriptor.
     fn spmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4)).unwrap()
+        self.operand_value(fixed_operand_start(self, 4)).unwrap()
     }
 
     /// Returns dense matrix B descriptor.
     fn dnmat_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 1).unwrap()
     }
 
     /// Returns dense matrix C descriptor.
     fn dnmat_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 2).unwrap()
     }
 
     /// Returns temporary buffer descriptor.
     fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 3).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 3).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2805,17 +2805,17 @@ pub trait SpmvBufferSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A descriptor.
     fn spmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3)).unwrap()
+        self.operand_value(fixed_operand_start(self, 3)).unwrap()
     }
 
     /// Returns dense vector X descriptor.
     fn dnvec_x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 3) + 1).unwrap()
     }
 
     /// Returns dense vector Y descriptor.
     fn dnvec_y(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 3) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 3) + 2).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2879,22 +2879,22 @@ pub trait SpmvOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix A descriptor.
     fn spmat_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4)).unwrap()
+        self.operand_value(fixed_operand_start(self, 4)).unwrap()
     }
 
     /// Returns dense vector X descriptor.
     fn dnvec_x(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 1).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 1).unwrap()
     }
 
     /// Returns dense vector Y descriptor.
     fn dnvec_y(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 2).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 2).unwrap()
     }
 
     /// Returns temporary buffer descriptor.
     fn buffer(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 4) + 3).unwrap()
+        self.operand_value(fixed_operand_start(self, 4) + 3).unwrap()
     }
 
     /// Returns transpose mode for matrix A.
@@ -2954,7 +2954,7 @@ pub trait SpmatGetSizeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns sparse matrix descriptor.
     fn spmat(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(fixed_operand_start(self, 1)).unwrap()
+        self.operand_value(fixed_operand_start(self, 1)).unwrap()
     }
 
     /// Returns matrix row count.
@@ -3003,12 +3003,12 @@ pub fn spmat_get_size<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait SubgroupBroadcastOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the value to broadcast.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns optional source lane operand.
     fn lane(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand(1)
+        self.operand_value(1)
     }
 
     /// Returns broadcast type attribute.
@@ -3050,17 +3050,17 @@ pub fn subgroup_broadcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait SubgroupMmaComputeOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns matrix A operand.
     fn matrix_a(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns matrix B operand.
     fn matrix_b(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns accumulator matrix C operand.
     fn matrix_c(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(2).unwrap()
+        self.operand_value(2).unwrap()
     }
 
     /// Returns matrix D result.
@@ -3125,12 +3125,12 @@ pub fn subgroup_mma_constant_matrix<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c,
 pub trait SubgroupMmaElementwiseOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns left-hand-side matrix operand.
     fn lhs(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns optional right-hand-side matrix operand.
     fn rhs(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand(1)
+        self.operand_value(1)
     }
 
     /// Returns elementwise operation kind.
@@ -3172,12 +3172,12 @@ pub fn subgroup_mma_elementwise<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait SubgroupMmaExtractThreadLocalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns source MMA matrix operand.
     fn src_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns optional element index operand.
     fn id(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand(1)
+        self.operand_value(1)
     }
 
     /// Returns extracted thread-local result.
@@ -3211,17 +3211,17 @@ pub fn subgroup_mma_extract_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L:
 pub trait SubgroupMmaInsertThreadLocalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns source thread-local value operand.
     fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns destination MMA matrix operand.
     fn dst_matrix(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns optional element index operand.
     fn id(&self) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand(2)
+        self.operand_value(2)
     }
 
     /// Returns updated matrix result.
@@ -3256,12 +3256,12 @@ pub fn subgroup_mma_insert_thread_local<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>
 pub trait SubgroupMmaLoadMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns source memref operand.
     fn src_memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns memref index operands.
     fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().skip(1).collect::<Vec<_>>()
+        self.operand_values().skip(1).collect::<Vec<_>>()
     }
 
     /// Returns leading-dimension attribute.
@@ -3313,17 +3313,17 @@ pub fn subgroup_mma_load_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
 pub trait SubgroupMmaStoreMatrixOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns source MMA matrix operand.
     fn src(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns destination memref operand.
     fn dst_memref(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(1).unwrap()
+        self.operand_value(1).unwrap()
     }
 
     /// Returns memref index operands.
     fn indices(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().skip(2).collect::<Vec<_>>()
+        self.operand_values().skip(2).collect::<Vec<_>>()
     }
 
     /// Returns leading-dimension attribute.
@@ -3361,7 +3361,7 @@ pub fn subgroup_mma_store_matrix<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait SubgroupReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns reduction input value.
     fn value(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns reduction operation kind.
@@ -3532,12 +3532,12 @@ pub fn thread_id<'c, 't: 'c, L: Location<'c, 't>>(
 pub trait WarpExecuteOnLane0Operation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns lane ID operand.
     fn lane_id(&self) -> ValueRef<'o, 'c, 't> {
-        self.operand(0).unwrap()
+        self.operand_value(0).unwrap()
     }
 
     /// Returns forwarded warp operands.
     fn args(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().skip(1).collect::<Vec<_>>()
+        self.operand_values().skip(1).collect::<Vec<_>>()
     }
 
     /// Returns warp size attribute.
@@ -3585,7 +3585,7 @@ pub fn warp_execute_on_lane_0<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait WaitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns async dependencies.
     fn async_dependencies(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().collect::<Vec<_>>()
+        self.operand_values().collect::<Vec<_>>()
     }
 
     /// Returns the optional async token result.
@@ -3621,7 +3621,7 @@ pub fn wait<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 pub trait YieldOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + ReturnLike<'o, 'c, 't> {
     /// Returns yielded values.
     fn values(&self) -> Vec<ValueRef<'o, 'c, 't>> {
-        self.operands().collect::<Vec<_>>()
+        self.operand_values().collect::<Vec<_>>()
     }
 }
 

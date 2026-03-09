@@ -120,7 +120,7 @@ mlir_pass!(transforms_loop_invariant_code_motion_pass, TransformsLoopInvariantCo
 mlir_pass!(transforms_loop_invariant_subset_hoisting_pass, TransformsLoopInvariantSubsetHoisting);
 mlir_pass!(transforms_mem2reg_pass, TransformsMem2Reg);
 mlir_pass!(transforms_print_ir_pass, TransformsPrintIRPass);
-mlir_pass!(transforms_print_op_stats_pass, TransformsPrintOpStats);
+mlir_pass!(transforms_print_op_stats_pass, TransformsPrintOpStatsPass);
 mlir_pass!(transforms_remove_dead_values_pass, TransformsRemoveDeadValues);
 mlir_pass!(transforms_sccp_pass, TransformsSCCP);
 mlir_pass!(transforms_sroa_pass, TransformsSROA);
