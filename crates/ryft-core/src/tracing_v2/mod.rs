@@ -22,7 +22,7 @@ mod value;
 use thiserror::Error;
 
 pub use batch::{Batch, stack, unstack, vmap};
-pub use context::{BatchingContext, JitContext, JvpContext, TransposeContext};
+pub use context::{BatchingContext, JitContext, JvpContext};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, AtomSource, Equation, Graph, GraphBuilder};
 pub use jit::{CompiledFunction, JitTracer, jit};

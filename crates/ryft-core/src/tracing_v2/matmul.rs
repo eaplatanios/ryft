@@ -16,12 +16,11 @@ use crate::{
     tracing_v2::{
         ScalarAbstract, TraceError, TraceValue,
         batch::Batch as BatchedValue,
-        context::TransposeContext,
         forward::{JvpTracer, TangentSpace},
-        graph::AtomId,
+        graph::{AtomId, GraphBuilder},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{BatchOp, LinearOp, Op},
+        ops::{BatchOp, LinearOp, LinearOpRef, Op},
     },
 };
 
@@ -281,7 +280,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut TransposeContext<'_, V>,
+        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -289,7 +288,7 @@ where
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = context.graph_builder().add_equation(
+        let contribution = builder.add_equation(
             Arc::new(LeftMatMulOp::new(self.factor.clone().transpose_matrix())),
             vec![output_cotangents[0]],
         )?[0];
@@ -358,7 +357,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut TransposeContext<'_, V>,
+        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -366,7 +365,7 @@ where
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = context.graph_builder().add_equation(
+        let contribution = builder.add_equation(
             Arc::new(RightMatMulOp::new(self.factor.clone().transpose_matrix())),
             vec![output_cotangents[0]],
         )?[0];
@@ -414,7 +413,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut TransposeContext<'_, V>,
+        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -422,9 +421,7 @@ where
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = context
-            .graph_builder()
-            .add_equation(Arc::new(LinearMatrixTransposeOp), vec![output_cotangents[0]])?[0];
+        let contribution = builder.add_equation(Arc::new(LinearMatrixTransposeOp), vec![output_cotangents[0]])?[0];
         Ok(vec![Some(contribution)])
     }
 }

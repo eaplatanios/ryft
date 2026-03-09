@@ -11,9 +11,8 @@ use std::{
 use crate::tracing_v2::{
     TraceError, TraceValue,
     batch::Batch,
-    context::TransposeContext,
     forward::{JvpTracer, TangentSpace},
-    graph::AtomId,
+    graph::{AtomId, GraphBuilder},
 };
 
 /// Core primitive operation interface understood by staged graphs.
@@ -76,7 +75,7 @@ where
     /// Applies the primitive's transpose rule to output cotangents.
     fn transpose(
         &self,
-        context: &mut TransposeContext<'_, V>,
+        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -139,12 +138,12 @@ where
     #[inline]
     fn transpose(
         &self,
-        context: &mut TransposeContext<'_, V>,
+        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        (**self).transpose(context, inputs, outputs, output_cotangents)
+        (**self).transpose(builder, inputs, outputs, output_cotangents)
     }
 }
 fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {
@@ -246,7 +245,7 @@ where
 {
     fn transpose(
         &self,
-        _context: &mut TransposeContext<'_, V>,
+        _builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -395,7 +394,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut TransposeContext<'_, V>,
+        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -403,7 +402,7 @@ where
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = context.graph_builder().add_equation(Arc::new(NegOp), vec![output_cotangents[0]])?[0];
+        let contribution = builder.add_equation(Arc::new(NegOp), vec![output_cotangents[0]])?[0];
         Ok(vec![Some(contribution)])
     }
 }
@@ -624,7 +623,7 @@ where
 {
     fn transpose(
         &self,
-        context: &mut TransposeContext<'_, V>,
+        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -632,9 +631,8 @@ where
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = context
-            .graph_builder()
-            .add_equation(Arc::new(ScaleOp::new(self.factor().clone())), vec![output_cotangents[0]])?[0];
+        let contribution =
+            builder.add_equation(Arc::new(ScaleOp::new(self.factor().clone())), vec![output_cotangents[0]])?[0];
         Ok(vec![Some(contribution)])
     }
 }
@@ -645,7 +643,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{GraphBuilder, ScalarAbstract, TraceError, TransposeContext},
+        tracing_v2::{GraphBuilder, ScalarAbstract, TraceError},
     };
 
     use super::*;
@@ -690,13 +688,10 @@ mod tests {
 
         let mut transpose_builder = GraphBuilder::<LinearOpRef<f64>, f64>::new();
         let output_cotangent = transpose_builder.add_input(&1.0f64);
-        let contribution = {
-            let mut transpose_context = TransposeContext::new(&mut transpose_builder);
-            ScaleOp::new(3.0f64)
-                .transpose(&mut transpose_context, &[input], &[output], &[output_cotangent])
-                .unwrap()[0]
-                .unwrap()
-        };
+        let contribution = ScaleOp::new(3.0f64)
+            .transpose(&mut transpose_builder, &[input], &[output], &[output_cotangent])
+            .unwrap()[0]
+            .unwrap();
 
         let transpose_graph = transpose_builder.build::<f64, f64>(vec![contribution], Placeholder, Placeholder);
         approx_eq(transpose_graph.call(2.0f64).unwrap(), 6.0);

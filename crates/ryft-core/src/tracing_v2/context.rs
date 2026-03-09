@@ -65,13 +65,6 @@
 //! - `&mut ()` fits naturally into the existing generic APIs without introducing extra enum structure.
 //!
 //! So the intended "no root state" story is: pass `&mut ()`.
-//!
-//! # Why Does [`TransposeContext`] Look Different?
-//!
-//! [`TransposeContext`] currently does not wrap a generic underlying context. The present transpose pass only needs
-//! mutable access to the linear graph builder used to construct the transposed program; it does not currently require
-//! any runtime capability from a parent context. If that changes later, this type can be extended in the same style
-//! as the other transform contexts.
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -245,38 +238,6 @@ where
     }
 }
 
-/// Context used while transposing a linear program.
-///
-/// [`TransposeContext`] currently contains only the builder into which the transposed linear program is emitted. In
-/// contrast to [`JvpContext`] and [`JitContext`], it does not yet wrap a generic parent context because the current
-/// transpose pass requires only local staging state and no runtime capability.
-///
-/// If future transpose rules need access to backend state, residual environments, or other outer-transform metadata,
-/// this type can be extended to wrap an underlying parent context in the same style as the other transform contexts.
-pub struct TransposeContext<'a, V>
-where
-    V: TraceValue,
-{
-    graph_builder: &'a mut GraphBuilder<LinearOpRef<V>, V>,
-}
-
-impl<'a, V> TransposeContext<'a, V>
-where
-    V: TraceValue,
-{
-    /// Creates a transpose context over `graph_builder`.
-    #[inline]
-    pub(crate) fn new(graph_builder: &'a mut GraphBuilder<LinearOpRef<V>, V>) -> Self {
-        Self { graph_builder }
-    }
-
-    /// Returns the mutable linear graph builder used to emit the transposed program.
-    #[inline]
-    pub(crate) fn graph_builder(&mut self) -> &mut GraphBuilder<LinearOpRef<V>, V> {
-        self.graph_builder
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::tracing_v2::{
@@ -331,11 +292,10 @@ mod tests {
     }
 
     #[test]
-    fn transpose_context_exposes_the_underlying_builder() {
+    fn direct_transpose_builders_support_local_rewrites() {
         let mut builder = GraphBuilder::<LinearOpRef<f64>, f64>::new();
         let input = builder.add_input(&1.0);
-        let mut context = TransposeContext::new(&mut builder);
-        let output = context.graph_builder().add_equation(std::sync::Arc::new(AddOp), vec![input, input]).unwrap();
+        let output = builder.add_equation(std::sync::Arc::new(AddOp), vec![input, input]).unwrap();
         assert_eq!(output.len(), 1);
     }
 

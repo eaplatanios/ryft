@@ -17,7 +17,7 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
         OneLike, TraceError, TraceValue, ZeroLike,
-        context::{JvpContext, TransposeContext},
+        context::JvpContext,
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, Graph, GraphBuilder},
         ops::{AddOp, LinearOpRef, NegOp, ScaleOp},
@@ -174,15 +174,12 @@ where
             let Some(equation_output_cotangents) = equation_output_cotangents else {
                 continue;
             };
-            let input_cotangents = {
-                let mut transpose_context = TransposeContext::new(&mut builder);
-                equation.op.transpose(
-                    &mut transpose_context,
-                    equation.inputs.as_slice(),
-                    equation.outputs.as_slice(),
-                    equation_output_cotangents.as_slice(),
-                )?
-            };
+            let input_cotangents = equation.op.transpose(
+                &mut builder,
+                equation.inputs.as_slice(),
+                equation.outputs.as_slice(),
+                equation_output_cotangents.as_slice(),
+            )?;
             for (input, contribution) in equation.inputs.iter().copied().zip(input_cotangents) {
                 if let Some(contribution) = contribution {
                     accumulate(&mut builder, adjoints.as_mut_slice(), input, contribution);
