@@ -218,7 +218,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::PrototypeContext;
 
     use super::*;
 
@@ -247,7 +246,7 @@ mod tests {
 
     #[test]
     fn vmap_exposes_batch_axis_size() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let outputs: Vec<f64> = vmap(
             &mut context,
             |context, inputs: Batch<f64>| {

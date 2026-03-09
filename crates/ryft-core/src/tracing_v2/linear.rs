@@ -756,7 +756,7 @@ where
 mod tests {
     use std::ops::{Add, Mul, Neg};
 
-    use crate::tracing_v2::{FloatExt, PrototypeContext};
+    use crate::tracing_v2::FloatExt;
 
     use super::*;
 
@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn linearize_returns_the_primal_output_and_pushforward() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (primal, pushforward) = linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn jvp_program_and_linearize_stage_the_same_pushforward() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (_, from_jvp_program) = jvp_program(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
         let (_, from_linearize) = linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
 
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn transposed_linear_program_matches_the_reverse_mode_pullback() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (primal, pushforward) = linearize(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
         let pullback = pushforward.transpose().unwrap();
         let cotangent = pullback.call(1.0f64).unwrap();
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn linear_program_display_delegates_to_the_underlying_graph() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (_, pushforward): (f64, LinearProgram<f64, f64, f64>) =
             linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
 

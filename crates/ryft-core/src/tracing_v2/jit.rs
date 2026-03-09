@@ -18,7 +18,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        CompilationContext, FloatExt, JitContext, OneLike, TraceError, TraceLeaf, TraceValue, ZeroLike,
+        FloatExt, JitContext, OneLike, TraceError, TraceLeaf, TraceValue, ZeroLike,
         graph::{AtomId, Graph, GraphBuilder},
         ops::{AddOp, CosOp, MulOp, NegOp, SinOp, StagedOpRef},
     },
@@ -156,13 +156,16 @@ where
 }
 
 /// Staged function returned by [`jit`].
+///
+/// In the current prototype this type stores only the staged graph and replays it with the built-in interpreter.
+/// Later, once a concrete backend exists, it can grow additional fields that hold backend-specific compiled artifacts
+/// while keeping the same high-level API shape.
 pub struct CompiledFunction<V, Input, Output>
 where
     V: TraceValue,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    id: usize,
     graph: Graph<StagedOpRef<V>, V, Input, Output>,
     marker: PhantomData<fn(Input) -> Output>,
 }
@@ -173,12 +176,6 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    /// Returns the executable identifier allocated by the compilation context.
-    #[inline]
-    pub fn id(&self) -> usize {
-        self.id
-    }
-
     /// Returns the staged graph backing this compiled function.
     #[inline]
     pub fn graph(&self) -> &Graph<StagedOpRef<V>, V, Input, Output> {
@@ -186,6 +183,9 @@ where
     }
 
     /// Replays the staged graph on concrete input values.
+    ///
+    /// The `_context` argument is currently unused by the interpreter-backed prototype. It is still threaded through
+    /// the API so that future backend-backed implementations can access whatever runtime state they need at call time.
     pub fn call<Context>(&self, _context: &mut Context, input: Input) -> Result<Output, TraceError>
     where
         Input::ParameterStructure: PartialEq,
@@ -208,13 +208,15 @@ where
 }
 
 /// Stages `function` as a graph and returns both the eager output and the staged program.
+///
+/// The returned [`CompiledFunction`] currently stores only the staged graph. Later, once a concrete backend exists,
+/// this type can be extended to carry backend-specific compilation artifacts alongside that graph.
 pub fn jit<'context, Context, F, Input, Output, V>(
     context: &'context mut Context,
     function: F,
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    Context: CompilationContext,
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
@@ -245,13 +247,12 @@ where
         (output_structure, output_value, outputs)
     };
 
-    let (context, builder) = jit_context.finish();
+    let (_context, builder) = jit_context.finish();
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
     let compiled = CompiledFunction {
-        id: context.allocate_executable_id(),
         graph: builder.build::<Input, Output>(outputs, input_structure, output_structure),
         marker: PhantomData,
     };
@@ -260,13 +261,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::PrototypeContext;
-
     use super::*;
 
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let jit_context = JitContext::<_, f64>::new(&mut context);
         let builder = jit_context.staged_builder();
         let atom = builder.borrow_mut().add_input(&3.0f64);
@@ -278,7 +277,7 @@ mod tests {
 
     #[test]
     fn compiled_function_replays_staged_graphs() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (output, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(
             &mut context,
             |_, x: JitTracer<f64>| {
@@ -296,7 +295,7 @@ mod tests {
 
     #[test]
     fn compiled_function_display_delegates_to_the_underlying_graph() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) =
             jit(&mut context, |_, x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
 

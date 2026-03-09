@@ -1,27 +1,30 @@
-//! Runtime and transform-local context types for `tracing_v2`.
+﻿//! Runtime and transform-local context types for `tracing_v2`.
 //!
 //! # Why Does `tracing_v2` Need Contexts?
 //!
 //! A tracing transform often needs two qualitatively different kinds of state at the same time:
 //!
 //! 1. **Long-lived runtime or backend state.** This includes resources that should outlive any single trace,
-//!    such as an MLIR context, a PJRT client, executable caches, or monotonically increasing identifiers for
-//!    compiled artifacts.
+//!    such as an MLIR context, a PJRT client, executable caches, device topology information, or any other state
+//!    that conceptually belongs to the runtime as a whole.
 //! 2. **Short-lived transform-local state.** This includes data structures that exist only while a particular
 //!    transformation is active, such as a graph builder used by `jit`, a linear builder used by `jvp`, or the
 //!    current batch axis size used by `vmap`.
 //!
 //! Keeping those two roles in one monolithic context type would make composition awkward. For example, a JVP trace
-//! does not conceptually *own* the global compilation state of the runtime, and a JIT trace does not conceptually
-//! *own* the linearization builder of an enclosing differentiation transform. Instead, each transform should carry
-//! only the local state it is responsible for, while *borrowing* whatever broader runtime or parent transform state
-//! already exists.
+//! does not conceptually *own* the global runtime state of the backend, and a JIT trace does not conceptually *own*
+//! the linearization builder of an enclosing differentiation transform. Instead, each transform should carry only the
+//! local state it is responsible for, while *borrowing* whatever broader runtime or parent-transform state already
+//! exists.
 //!
 //! This module therefore separates context types into two layers:
 //!
-//! - a **top-level context**, such as [`PrototypeContext`], which represents long-lived runtime state;
+//! - a **top-level context**, which represents long-lived runtime state;
 //! - **transform contexts**, such as [`JvpContext`], [`BatchingContext`], and [`JitContext`], which wrap an
 //!   underlying context and add temporary state needed by a specific transformation.
+//!
+//! When no top-level state is needed, the unit type `()` serves as the root context. This is the current default for
+//! tests and examples.
 //!
 //! # Why Do Some Contexts Wrap Another `Context`?
 //!
@@ -36,48 +39,32 @@
 //! ```text
 //! JitContext
 //!   -> JvpContext
-//!        -> PrototypeContext
+//!        -> ()
 //! ```
 //!
 //! In that situation:
 //!
 //! - the [`JitContext`] owns the graph builder for the JIT-staged program;
 //! - the enclosing [`JvpContext`] owns the linear builder for forward-mode differentiation;
-//! - the root [`PrototypeContext`] owns long-lived runtime state such as executable identifiers.
+//! - the root `()` value carries no runtime state at all.
 //!
 //! This is indeed a parent/child relationship between contexts. The nested context stored inside a transform context
 //! is the **parent context in the current transform stack**. It is not required to be the ultimate root context.
 //! That distinction is important because it lets transforms compose without flattening all state into one giant
 //! structure.
 //!
-//! # Why Is There Both `JitContext` and `CompilationContext`?
+//! # Why `()` Instead Of `None`?
 //!
-//! [`JitContext`] and [`CompilationContext`] solve different problems.
+//! If the root context carries no information, the natural Rust representation is the unit type `()`, not `None`.
+//! That is because:
 //!
-//! [`JitContext`] is a **concrete transform-local context**. It exists only while staging a JIT trace and carries
-//! the graph builder for that trace.
+//! - `None` is a value, not a type;
+//! - using `None` would force the API to mention an `Option<T>` type even though there is no meaningful optionality in
+//!   the context model itself;
+//! - `()` cleanly expresses "there is a context slot here, but it carries no data"; and
+//! - `&mut ()` fits naturally into the existing generic APIs without introducing extra enum structure.
 //!
-//! [`CompilationContext`] is a **small capability trait**. It answers a much narrower question: "can this context
-//! allocate identifiers for compiled executables?" Any context that can answer that question may implement the trait,
-//! including:
-//!
-//! - a root runtime context like [`PrototypeContext`];
-//! - a transform context like [`JvpContext`] or [`BatchingContext`] that simply forwards the request to its parent;
-//! - a [`JitContext`] that likewise forwards to its parent.
-//!
-//! This separation matters because many APIs should depend only on a *capability*, not on a specific concrete context
-//! type. In particular, the public [`crate::tracing_v2::jit`] API needs only the ability to allocate an executable id
-//! for the staged program it returns. It does **not** need to know whether it is running directly against the root
-//! runtime context or inside some enclosing transformation. By constraining that API with [`CompilationContext`]
-//! instead of a concrete context type, `jit` can be invoked in both situations.
-//!
-//! Put differently:
-//!
-//! - [`JitContext`] provides the **local state for running the JIT transform**.
-//! - [`CompilationContext`] provides the **minimum shared capability needed to register the result of compilation**.
-//!
-//! That is why transform contexts implement [`CompilationContext`] by delegation: it preserves the ability to compile
-//! from inside nested transform stacks without forcing every transform to manually thread executable-id state.
+//! So the intended "no root state" story is: pass `&mut ()`.
 //!
 //! # Why Does [`TransposeContext`] Look Different?
 //!
@@ -94,72 +81,6 @@ use crate::tracing_v2::{
     ops::{LinearOpRef, StagedOpRef},
 };
 
-/// Capability trait for contexts that can assign identifiers to compiled executables.
-///
-/// This trait is intentionally tiny. It does **not** describe everything a runtime or backend context might know how
-/// to do. Instead, it captures only the specific capability currently needed by the JIT staging pipeline: allocating
-/// a stable identifier for each compiled program.
-///
-/// Using a trait here instead of hard-coding a concrete root context serves two purposes:
-///
-/// 1. It keeps APIs like [`crate::tracing_v2::jit`] generic over the *capability they need* rather than over a
-///    specific context implementation.
-/// 2. It lets transform contexts participate in compilation simply by forwarding the request to the underlying parent
-///    context they wrap.
-///
-/// That forwarding behavior is what allows nested transform stacks to continue supporting JIT staging. For example,
-/// a [`JvpContext`] can implement [`CompilationContext`] by delegating to its parent context, which means `jit` can be
-/// called even while a JVP trace is active.
-pub trait CompilationContext {
-    /// Allocates the next executable identifier.
-    ///
-    /// The returned identifier is expected to be unique within the lifetime of the underlying runtime context.
-    /// In the current prototype this is used only for staged program bookkeeping, but later it may also index caches,
-    /// backend-specific executable registries, or compiled artifact tables.
-    fn allocate_executable_id(&mut self) -> usize;
-}
-
-/// Small in-memory top-level context used by tests and examples.
-///
-/// [`PrototypeContext`] plays the role of the root runtime context in the current prototype. It intentionally keeps
-/// the state minimal so that the tracing design can be exercised without tying it to MLIR, PJRT, or a particular
-/// backend implementation.
-///
-/// Conceptually, this type is where future long-lived backend state would live. For example, a production runtime
-/// context might store:
-///
-/// - an MLIR context or module arena;
-/// - a PJRT client and device topology;
-/// - executable caches;
-/// - backend handles for constant interning or sharded array management.
-///
-/// The current implementation stores only a monotonically increasing executable counter because that is the only
-/// long-lived capability needed by the present prototype.
-#[derive(Clone, Debug, Default)]
-pub struct PrototypeContext {
-    next_executable_id: usize,
-}
-
-impl PrototypeContext {
-    /// Returns the number of compiled programs allocated so far.
-    ///
-    /// Because [`PrototypeContext`] currently allocates executable identifiers sequentially starting from zero, this
-    /// is also equal to the next identifier that would be returned by [`CompilationContext::allocate_executable_id`].
-    #[inline]
-    pub fn compiled_program_count(&self) -> usize {
-        self.next_executable_id
-    }
-}
-
-impl CompilationContext for PrototypeContext {
-    #[inline]
-    fn allocate_executable_id(&mut self) -> usize {
-        let id = self.next_executable_id;
-        self.next_executable_id += 1;
-        id
-    }
-}
-
 /// Context active while staging a JVP / linearization trace.
 ///
 /// [`JvpContext`] is the transform-local context for forward-mode differentiation. It owns the temporary builder used
@@ -172,8 +93,7 @@ impl CompilationContext for PrototypeContext {
 /// - any other context-like object that the caller wishes to make available while the JVP trace is running.
 ///
 /// This design makes transform composition explicit in the type system. A nested `jit` inside a JVP trace can stage
-/// its own graph while still having access to the enclosing JVP context via [`Self::top_level_context`], and any
-/// compilation-related requests can continue to flow outward through delegated trait implementations.
+/// its own graph while still having access to the enclosing JVP context via [`Self::top_level_context`].
 pub struct JvpContext<'a, Context, V>
 where
     V: TraceValue,
@@ -224,17 +144,6 @@ where
     }
 }
 
-impl<Context, V> CompilationContext for JvpContext<'_, Context, V>
-where
-    Context: CompilationContext,
-    V: TraceValue,
-{
-    #[inline]
-    fn allocate_executable_id(&mut self) -> usize {
-        self.context.allocate_executable_id()
-    }
-}
-
 /// Context active while batching a computation with `vmap`-style semantics.
 ///
 /// [`BatchingContext`] carries the batch-axis metadata needed by the current batching transformation while borrowing
@@ -278,29 +187,16 @@ impl<'a, Context> BatchingContext<'a, Context> {
     }
 }
 
-impl<Context> CompilationContext for BatchingContext<'_, Context>
-where
-    Context: CompilationContext,
-{
-    #[inline]
-    fn allocate_executable_id(&mut self) -> usize {
-        self.context.allocate_executable_id()
-    }
-}
-
 /// Context active while staging a JIT graph.
 ///
 /// [`JitContext`] is the transform-local context for JIT staging. It owns the graph builder used to record primitive
 /// applications encountered while tracing the staged computation, while borrowing an underlying parent context of type
 /// `Context`.
 ///
-/// It is important to distinguish this type from [`CompilationContext`]:
-///
-/// - [`JitContext`] stores the **temporary state needed to *perform* JIT tracing**.
-/// - [`CompilationContext`] exposes the **longer-lived capability needed to *register the result* of JIT tracing**.
-///
-/// That distinction is what allows the public `jit` API to work both at the root level and inside nested transform
-/// stacks.
+/// The wrapped `Context` is intentionally left generic and unconstrained. At the moment JIT staging does not require
+/// any special runtime capability beyond whatever state the caller may already be threading through the transform
+/// stack. Later, if a concrete backend such as PJRT requires additional runtime services, those requirements can be
+/// introduced where they are actually needed.
 pub struct JitContext<'a, Context, V>
 where
     V: TraceValue,
@@ -349,17 +245,6 @@ where
     }
 }
 
-impl<Context, V> CompilationContext for JitContext<'_, Context, V>
-where
-    Context: CompilationContext,
-    V: TraceValue,
-{
-    #[inline]
-    fn allocate_executable_id(&mut self) -> usize {
-        self.context.allocate_executable_id()
-    }
-}
-
 /// Context used while transposing a linear program.
 ///
 /// [`TransposeContext`] currently contains only the builder into which the transposed linear program is emitted. In
@@ -402,46 +287,47 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn prototype_context_allocates_monotonic_ids() {
-        let mut context = PrototypeContext::default();
-        assert_eq!(context.allocate_executable_id(), 0);
-        assert_eq!(context.allocate_executable_id(), 1);
-        assert_eq!(context.compiled_program_count(), 2);
+    #[derive(Default)]
+    struct RootContext {
+        visits: usize,
     }
 
     #[test]
-    fn transform_contexts_forward_compilation_context_calls() {
-        let mut top_level = PrototypeContext::default();
+    fn unit_type_serves_as_the_empty_root_context() {
+        let _context = ();
+        let _also_context: () = Default::default();
+    }
+
+    #[test]
+    fn transform_contexts_expose_parent_state() {
+        let mut root = RootContext::default();
         {
-            let mut jvp_context = JvpContext::<_, f64>::new(&mut top_level);
-            assert_eq!(jvp_context.allocate_executable_id(), 0);
-            let _ = jvp_context.top_level_context();
+            let mut jvp_context = JvpContext::<_, f64>::new(&mut root);
+            jvp_context.top_level_context().visits += 1;
         }
         {
-            let mut batching_context = BatchingContext::new(&mut top_level, 3);
+            let mut batching_context = BatchingContext::new(&mut root, 3);
             assert_eq!(batching_context.axis_size(), 3);
-            assert_eq!(batching_context.allocate_executable_id(), 1);
+            batching_context.top_level_context().visits += 1;
         }
         {
-            let mut jit_context = JitContext::<_, f64>::new(&mut top_level);
-            assert_eq!(jit_context.allocate_executable_id(), 2);
+            let mut jit_context = JitContext::<_, f64>::new(&mut root);
+            jit_context.top_level_context().visits += 1;
         }
-        assert_eq!(top_level.compiled_program_count(), 3);
+        assert_eq!(root.visits, 3);
     }
 
     #[test]
-    fn nested_transform_contexts_delegate_compilation_to_the_root_context() {
-        let mut root = PrototypeContext::default();
+    fn nested_transform_contexts_form_a_parent_stack() {
+        let mut root = RootContext::default();
         let mut jvp_context = JvpContext::<_, f64>::new(&mut root);
         {
             let mut jit_context = JitContext::<_, f64>::new(&mut jvp_context);
-            assert_eq!(jit_context.allocate_executable_id(), 0);
-            assert_eq!(jit_context.top_level_context().allocate_executable_id(), 1);
+            jit_context.top_level_context().top_level_context().visits += 1;
         }
-        assert_eq!(jvp_context.allocate_executable_id(), 2);
+        jvp_context.top_level_context().visits += 1;
         let (root, _) = jvp_context.finish();
-        assert_eq!(root.compiled_program_count(), 3);
+        assert_eq!(root.visits, 2);
     }
 
     #[test]
@@ -455,7 +341,7 @@ mod tests {
 
     #[test]
     fn jit_context_builder_tracks_inputs() {
-        let mut top_level = PrototypeContext::default();
+        let mut top_level = ();
         let jit_context = JitContext::<_, f64>::new(&mut top_level);
         let builder: Rc<RefCell<GraphBuilder<StagedOpRef<f64>, f64>>> = jit_context.staged_builder();
         let input = builder.borrow_mut().add_input(&2.0);

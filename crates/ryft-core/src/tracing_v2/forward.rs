@@ -213,7 +213,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::{OneLike, PrototypeContext};
+    use crate::tracing_v2::OneLike;
 
     use super::*;
 
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let result: Result<(f64, f64), TraceError> = jvp::<_, _, _, _, f64>(
             &mut context,
             |_, xs: Vec<Linearized<f64>>| xs[0].clone(),

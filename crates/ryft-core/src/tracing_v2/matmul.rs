@@ -667,9 +667,7 @@ mod tests {
 
     use super::{MatrixOps, MatrixValue};
     use crate::parameters::{Parameterized, ParameterizedFamily};
-    use crate::tracing_v2::{
-        FloatExt, Linearized, OneLike, PrototypeContext, ZeroLike, grad, hessian, jit, jvp, vjp, vmap,
-    };
+    use crate::tracing_v2::{FloatExt, Linearized, OneLike, ZeroLike, grad, hessian, jit, jvp, vjp, vmap};
 
     fn approx_eq_matrix(left: &Array2<f64>, right: &Array2<f64>) {
         assert_eq!(left.shape(), right.shape(), "matrix shapes differ: {:?} vs {:?}", left.shape(), right.shape());
@@ -717,7 +715,7 @@ mod tests {
 
     #[test]
     fn forward_mode_linearizes_matrix_multiplication() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
         let b = arr2(&[[5.0, 6.0], [7.0, 8.0]]);
         let da = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
@@ -732,7 +730,7 @@ mod tests {
 
     #[test]
     fn reverse_mode_transposes_left_and_right_matrix_actions() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
         let b = arr2(&[[2.0, 1.0], [0.0, 3.0]]);
         let cotangent = arr2(&[[1.0, -1.0], [2.0, 0.5]]);
@@ -747,7 +745,7 @@ mod tests {
 
     #[test]
     fn hessian_works_for_three_matrix_multiplications_with_sine_inside() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let x = arr2(&[[0.7f64]]);
         let a = arr2(&[[2.0f64]]);
         let b = arr2(&[[-1.5f64]]);
@@ -767,7 +765,7 @@ mod tests {
 
     #[test]
     fn dense_hessian_materializes_for_three_matrix_multiplications_with_sine_inside() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let x = arr2(&[[0.7f64]]);
         let a = arr2(&[[2.0f64]]);
         let b = arr2(&[[-1.5f64]]);
@@ -789,15 +787,12 @@ mod tests {
 
     #[test]
     fn jit_stages_matrix_multiplication_programs() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
         let b = arr2(&[[2.0, 0.0], [1.0, 2.0]]);
 
         let (output, compiled) = jit(&mut context, bilinear_matmul, (a.clone(), b.clone())).unwrap();
         approx_eq_matrix(&output, &a.matmul(b));
-        assert_eq!(compiled.id(), 0);
-        assert_eq!(context.compiled_program_count(), 1);
-
         let replay_left = arr2(&[[0.0, 1.0], [2.0, 3.0]]);
         let replay_right = arr2(&[[1.0, 4.0], [2.0, 5.0]]);
         let replayed = compiled.call(&mut context, (replay_left.clone(), replay_right.clone())).unwrap();
@@ -806,7 +801,7 @@ mod tests {
 
     #[test]
     fn batching_vectorizes_matrix_multiplication_lane_wise() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let inputs = vec![
             (arr2(&[[1.0, 2.0], [0.0, 1.0]]), arr2(&[[2.0, 0.0], [1.0, 2.0]])),
             (arr2(&[[0.0, 1.0], [3.0, 4.0]]), arr2(&[[1.0, 1.0], [0.0, 2.0]])),

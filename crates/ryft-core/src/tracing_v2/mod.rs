@@ -22,7 +22,7 @@ mod value;
 use thiserror::Error;
 
 pub use batch::{Batch, stack, unstack, vmap};
-pub use context::{BatchingContext, CompilationContext, JitContext, JvpContext, PrototypeContext, TransposeContext};
+pub use context::{BatchingContext, JitContext, JvpContext, TransposeContext};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, AtomSource, Equation, Graph, GraphBuilder};
 pub use jit::{CompiledFunction, JitTracer, jit};
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn forward_mode_uses_parameterized_structure() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (primal, tangent) = jvp(&mut context, bilinear_sin, (2.0f64, 3.0f64), (1.0f64, -1.0f64)).unwrap();
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
         approx_eq(tangent, 3.0 - 2.0 + 2.0f64.cos());
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn transposition_drives_reverse_mode() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (output, pullback) = vjp(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
         approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
 
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn value_and_grad_returns_both_outputs() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (value, gradient) = value_and_grad(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(value, 2.0f64.powi(2) + 2.0f64.sin());
@@ -199,9 +199,8 @@ mod tests {
 
     #[test]
     fn jacfwd_materializes_a_dense_jacobian() {
-        let mut context = PrototypeContext::default();
-        let jacobian =
-            jacfwd::<PrototypeContext, _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let mut context = ();
+        let jacobian = jacfwd::<(), _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         assert_eq!(jacobian.rows(), 1);
         assert_eq!(jacobian.cols(), 2);
@@ -211,9 +210,8 @@ mod tests {
 
     #[test]
     fn jacrev_materializes_the_same_dense_jacobian() {
-        let mut context = PrototypeContext::default();
-        let jacobian =
-            jacrev::<PrototypeContext, _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let mut context = ();
+        let jacobian = jacrev::<(), _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         assert_eq!(jacobian.rows(), 1);
         assert_eq!(jacobian.cols(), 2);
@@ -223,7 +221,7 @@ mod tests {
 
     #[test]
     fn hessian_materializes_a_dense_second_derivative_from_a_gradient_function() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let dense_hessian = hessian(&mut context, first_derivative, 2.0f64).unwrap();
 
         assert_eq!(dense_hessian.rows(), 1);
@@ -233,19 +231,16 @@ mod tests {
 
     #[test]
     fn jit_captures_and_replays_a_program() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (output, compiled) = jit(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
         approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
-        assert_eq!(compiled.id(), 0);
-        assert_eq!(context.compiled_program_count(), 1);
-
         let replayed = compiled.call(&mut context, (5.0f64, -4.0f64)).unwrap();
         approx_eq(replayed, 5.0 * -4.0 + 5.0f64.sin());
     }
 
     #[test]
     fn vectorization_stacks_and_unstacks_parameterized_inputs() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let outputs =
             vmap(&mut context, bilinear_sin, vec![(1.0f64, 2.0f64), (3.0f64, 4.0f64), (5.0f64, 6.0f64)]).unwrap();
 
@@ -258,7 +253,7 @@ mod tests {
 
     #[test]
     fn forward_over_reverse_computes_a_hessian_style_second_derivative() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (first_derivative_value, second_derivative_value) =
             jvp(&mut context, first_derivative, 2.0f64, 1.0f64).unwrap();
 
@@ -268,7 +263,7 @@ mod tests {
 
     #[test]
     fn higher_order_reverse_mode_computes_a_fourth_derivative() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let fourth_derivative_value = fourth_derivative(&mut context, 2.0f64);
 
         approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
@@ -276,7 +271,7 @@ mod tests {
 
     #[test]
     fn inline_nested_grad_calls_compute_a_fourth_derivative() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let fourth_derivative_value = grad(
             &mut context,
             |context, x| {
@@ -303,26 +298,20 @@ mod tests {
 
     #[test]
     fn jit_can_trace_a_hessian_style_second_derivative() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (second_derivative_value, compiled) = jit(&mut context, hessian_style_second_derivative, 2.0f64).unwrap();
 
         approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
-        assert_eq!(compiled.id(), 0);
-        assert_eq!(context.compiled_program_count(), 1);
-
         let replayed = compiled.call(&mut context, 1.5f64).unwrap();
         approx_eq(replayed, 12.0 * 1.5f64.powi(2) - 1.5f64.sin());
     }
 
     #[test]
     fn jit_can_trace_a_fourth_derivative() {
-        let mut context = PrototypeContext::default();
+        let mut context = ();
         let (fourth_derivative_value, compiled) = jit(&mut context, fourth_derivative, 2.0f64).unwrap();
 
         approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
-        assert_eq!(compiled.id(), 0);
-        assert_eq!(context.compiled_program_count(), 1);
-
         let replayed = compiled.call(&mut context, 0.5f64).unwrap();
         approx_eq(replayed, 24.0 + 0.5f64.sin());
     }
