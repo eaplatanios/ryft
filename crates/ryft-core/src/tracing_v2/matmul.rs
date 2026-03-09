@@ -663,8 +663,10 @@ mod tests {
     use ndarray::{Array2, arr2};
 
     use super::{MatrixOps, MatrixValue};
-    use crate::parameters::{Parameterized, ParameterizedFamily};
-    use crate::tracing_v2::{FloatExt, Linearized, OneLike, ZeroLike, grad, hessian, jit, jvp, vjp, vmap};
+    use crate::{
+        parameters::{Parameterized, ParameterizedFamily},
+        tracing_v2::{FloatExt, Linearized, OneLike, ZeroLike, grad, hessian, jit, jvp, test_support, vjp, vmap},
+    };
 
     fn approx_eq_matrix(left: &Array2<f64>, right: &Array2<f64>) {
         assert_eq!(left.shape(), right.shape(), "matrix shapes differ: {:?} vs {:?}", left.shape(), right.shape());
@@ -723,6 +725,7 @@ mod tests {
 
         approx_eq_matrix(&primal, &a.clone().matmul(b.clone()));
         approx_eq_matrix(&tangent, &(da.matmul(b.clone()) + a.matmul(db)));
+        test_support::assert_matrix_pushforward_rendering();
     }
 
     #[test]
@@ -738,6 +741,7 @@ mod tests {
         let (a_bar, b_bar) = pullback.call(cotangent.clone()).unwrap();
         approx_eq_matrix(&a_bar, &cotangent.clone().matmul(b.clone().transpose_matrix()));
         approx_eq_matrix(&b_bar, &a.transpose_matrix().matmul(cotangent));
+        test_support::assert_matrix_pullback_rendering();
     }
 
     #[test]
@@ -758,6 +762,7 @@ mod tests {
 
         let expected = arr2(&[[24.0 * (2.0f64 * 0.7f64).sin()]]);
         approx_eq_matrix(&hessian_times_ones, &expected);
+        test_support::assert_matrix_hessian_style_jit_rendering();
     }
 
     #[test]
@@ -780,6 +785,7 @@ mod tests {
         ]);
 
         approx_eq_matrix(&dense_hessian, &expected);
+        test_support::assert_matrix_hessian_style_jit_rendering();
     }
 
     #[test]
@@ -794,6 +800,7 @@ mod tests {
         let replay_right = arr2(&[[1.0, 4.0], [2.0, 5.0]]);
         let replayed = compiled.call(&mut context, (replay_left.clone(), replay_right.clone())).unwrap();
         approx_eq_matrix(&replayed, &replay_left.matmul(replay_right));
+        test_support::assert_matrix_jit_rendering();
     }
 
     #[test]
@@ -809,5 +816,6 @@ mod tests {
         for (output, (left, right)) in outputs.into_iter().zip(inputs) {
             approx_eq_matrix(&output, &left.matmul(right));
         }
+        test_support::assert_matrix_jit_rendering();
     }
 }

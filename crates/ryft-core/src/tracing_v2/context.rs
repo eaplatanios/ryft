@@ -1,4 +1,4 @@
-﻿//! Runtime and transform-local context types for `tracing_v2`.
+//! Runtime and transform-local context types for `tracing_v2`.
 //!
 //! # Why Does `tracing_v2` Need Contexts?
 //!
@@ -240,10 +240,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::{
-        AddOp,
-        graph::GraphBuilder,
-        ops::{LinearOpRef, StagedOpRef},
+    use indoc::indoc;
+
+    use crate::{
+        parameters::Placeholder,
+        tracing_v2::{
+            AddOp,
+            graph::GraphBuilder,
+            ops::{LinearOpRef, StagedOpRef},
+            test_support,
+        },
     };
 
     use super::*;
@@ -257,6 +263,7 @@ mod tests {
     fn unit_type_serves_as_the_empty_root_context() {
         let _context = ();
         let _also_context: () = Default::default();
+        test_support::assert_reference_graph_rendering();
     }
 
     #[test]
@@ -276,6 +283,7 @@ mod tests {
             jit_context.top_level_context().visits += 1;
         }
         assert_eq!(root.visits, 3);
+        test_support::assert_reference_graph_rendering();
     }
 
     #[test]
@@ -289,6 +297,7 @@ mod tests {
         jvp_context.top_level_context().visits += 1;
         let (root, _) = jvp_context.finish();
         assert_eq!(root.visits, 2);
+        test_support::assert_reference_graph_rendering();
     }
 
     #[test]
@@ -297,6 +306,16 @@ mod tests {
         let input = builder.add_input(&1.0);
         let output = builder.add_equation(std::sync::Arc::new(AddOp), vec![input, input]).unwrap();
         assert_eq!(output.len(), 1);
+        let graph = builder.build::<f64, f64>(vec![output[0]], Placeholder, Placeholder);
+        assert_eq!(
+            graph.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = add %0 %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -306,5 +325,14 @@ mod tests {
         let builder: Rc<RefCell<GraphBuilder<StagedOpRef<f64>, f64>>> = jit_context.staged_builder();
         let input = builder.borrow_mut().add_input(&2.0);
         assert_eq!(input, 0);
+        let graph = builder.borrow().clone().build::<f64, f64>(vec![input], Placeholder, Placeholder);
+        assert_eq!(
+            graph.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
     }
 }

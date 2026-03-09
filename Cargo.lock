@@ -1712,6 +1712,7 @@ dependencies = [
  "convert_case",
  "dyn-clone",
  "half",
+ "indoc",
  "ndarray",
  "paste",
  "ryft-macros",

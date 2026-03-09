@@ -213,7 +213,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::OneLike;
+    use crate::tracing_v2::{OneLike, test_support};
 
     use super::*;
 
@@ -227,6 +227,7 @@ mod tests {
         let ones = dual.one_like();
         assert_eq!(ones.primal, 1.0);
         assert_eq!(ones.tangent, 0.0);
+        test_support::assert_quadratic_pushforward_rendering();
     }
 
     #[test]
@@ -239,5 +240,6 @@ mod tests {
             vec![1.0f64, 2.0f64],
         );
         assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
+        test_support::assert_quadratic_pushforward_rendering();
     }
 }

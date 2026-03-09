@@ -753,7 +753,9 @@ where
 mod tests {
     use std::ops::{Add, Mul, Neg};
 
-    use crate::tracing_v2::FloatExt;
+    use indoc::indoc;
+
+    use crate::tracing_v2::{FloatExt, test_support};
 
     use super::*;
 
@@ -783,6 +785,19 @@ mod tests {
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.call(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
+        assert_eq!(
+            pushforward.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = scale %0
+                    %2:f64[] = scale %0
+                    %3:f64[] = add %1 %2
+                    %4:f64[] = scale %0
+                    %5:f64[] = add %3 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -792,6 +807,20 @@ mod tests {
         let (_, from_linearize) = linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(from_jvp_program.call(1.0f64).unwrap(), from_linearize.call(1.0f64).unwrap());
+        assert_eq!(
+            from_jvp_program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = scale %0
+                    %2:f64[] = scale %0
+                    %3:f64[] = add %1 %2
+                    %4:f64[] = scale %0
+                    %5:f64[] = add %3 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(from_jvp_program.to_string(), from_linearize.to_string());
     }
 
     #[test]
@@ -804,6 +833,19 @@ mod tests {
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
         approx_eq(cotangent.0, 3.0 + 2.0f64.cos());
         approx_eq(cotangent.1, 2.0);
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = scale %0
+                    %2:f64[] = scale %0
+                    %3:f64[] = scale %0
+                    %4:f64[] = add %1 %3
+                    %5:f64[] = const
+                in (%4, %2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -812,10 +854,20 @@ mod tests {
         let (_, pushforward): (f64, LinearProgram<f64, f64, f64>) =
             linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
 
-        let rendered = pushforward.to_string();
-        assert_eq!(rendered, pushforward.graph().to_string());
-        assert!(rendered.starts_with("lambda %0:f64[] .\n"));
-        assert!(rendered.contains("scale %0"));
-        assert!(rendered.ends_with(')'));
+        assert_eq!(
+            pushforward.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = scale %0
+                    %2:f64[] = scale %0
+                    %3:f64[] = add %1 %2
+                    %4:f64[] = scale %0
+                    %5:f64[] = add %3 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(pushforward.to_string(), pushforward.graph().to_string());
+        test_support::assert_quadratic_pushforward_rendering();
     }
 }

@@ -641,9 +641,11 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use indoc::indoc;
+
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{GraphBuilder, ScalarAbstract, TraceError},
+        tracing_v2::{GraphBuilder, ScalarAbstract, TraceError, test_support},
     };
 
     use super::*;
@@ -657,6 +659,7 @@ mod tests {
     fn add_abstract_eval_rejects_incompatible_inputs() {
         let error = <AddOp as Op<f64>>::abstract_eval(&AddOp, &[ScalarAbstract::F32, ScalarAbstract::F64]).unwrap_err();
         assert_eq!(error, TraceError::IncompatibleAbstractValues { op: "add" });
+        test_support::assert_reference_graph_rendering();
     }
 
     #[test]
@@ -672,12 +675,14 @@ mod tests {
 
         approx_eq(output.primal, 10.0);
         approx_eq(output.tangent, 13.0);
+        test_support::assert_bilinear_pushforward_rendering();
     }
 
     #[test]
     fn add_batch_requires_matching_lane_counts() {
         let error = AddOp.batch(&[Batch::new(vec![1.0f64, 2.0f64]), Batch::new(vec![3.0f64])]).unwrap_err();
         assert_eq!(error, TraceError::MismatchedBatchSize);
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
     #[test]
@@ -695,5 +700,14 @@ mod tests {
 
         let transpose_graph = transpose_builder.build::<f64, f64>(vec![contribution], Placeholder, Placeholder);
         approx_eq(transpose_graph.call(2.0f64).unwrap(), 6.0);
+        assert_eq!(
+            transpose_graph.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = scale %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 }

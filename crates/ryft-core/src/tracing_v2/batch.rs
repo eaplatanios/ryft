@@ -218,6 +218,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::tracing_v2::test_support;
 
     use super::*;
 
@@ -229,12 +230,14 @@ mod tests {
 
         let unstacked = unstack::<(f64, f64), f64>(batched).unwrap();
         assert_eq!(unstacked, vec![(1.0, 2.0), (3.0, 4.0)]);
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
     #[test]
     fn stack_rejects_empty_inputs() {
         let result = stack::<(f64, f64), f64>(Vec::new());
         assert!(matches!(result, Err(TraceError::EmptyBatch)));
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
     #[test]
@@ -242,6 +245,7 @@ mod tests {
         let batched = (Batch::new(vec![1.0f64]), Batch::new(vec![2.0f64, 3.0f64]));
         let result = unstack::<(f64, f64), f64>(batched);
         assert!(matches!(result, Err(TraceError::MismatchedBatchSize)));
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
     #[test]
@@ -257,5 +261,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outputs, vec![2.0, 3.0, 4.0]);
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 }

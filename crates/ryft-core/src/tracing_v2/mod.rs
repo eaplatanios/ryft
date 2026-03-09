@@ -17,6 +17,8 @@ mod jit;
 mod linear;
 mod matmul;
 mod ops;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod value;
 
 use thiserror::Error;
@@ -84,7 +86,10 @@ pub enum TraceError {
 mod tests {
     use std::ops::{Add, Mul, Neg};
 
-    use crate::parameters::{Parameterized, ParameterizedFamily};
+    use crate::{
+        parameters::{Parameterized, ParameterizedFamily},
+        tracing_v2::test_support,
+    };
 
     use super::*;
 
@@ -172,6 +177,7 @@ mod tests {
         let (primal, tangent) = jvp(&mut context, bilinear_sin, (2.0f64, 3.0f64), (1.0f64, -1.0f64)).unwrap();
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
         approx_eq(tangent, 3.0 - 2.0 + 2.0f64.cos());
+        test_support::assert_bilinear_pushforward_rendering();
     }
 
     #[test]
@@ -186,6 +192,7 @@ mod tests {
 
         let gradient = grad(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
         approx_eq(gradient, 4.0 + 2.0f64.cos());
+        test_support::assert_bilinear_pullback_rendering();
     }
 
     #[test]
@@ -195,6 +202,7 @@ mod tests {
 
         approx_eq(value, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(gradient, 4.0 + 2.0f64.cos());
+        test_support::assert_quadratic_pushforward_rendering();
     }
 
     #[test]
@@ -206,6 +214,7 @@ mod tests {
         assert_eq!(jacobian.cols(), 2);
         approx_eq(*jacobian.get(0, 0).unwrap(), 3.0 + 2.0f64.cos());
         approx_eq(*jacobian.get(0, 1).unwrap(), 2.0);
+        test_support::assert_bilinear_pushforward_rendering();
     }
 
     #[test]
@@ -217,6 +226,7 @@ mod tests {
         assert_eq!(jacobian.cols(), 2);
         approx_eq(*jacobian.get(0, 0).unwrap(), 3.0 + 2.0f64.cos());
         approx_eq(*jacobian.get(0, 1).unwrap(), 2.0);
+        test_support::assert_bilinear_pullback_rendering();
     }
 
     #[test]
@@ -227,6 +237,7 @@ mod tests {
         assert_eq!(dense_hessian.rows(), 1);
         assert_eq!(dense_hessian.cols(), 1);
         approx_eq(*dense_hessian.get(0, 0).unwrap(), 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
+        test_support::assert_hessian_style_second_derivative_jit_rendering();
     }
 
     #[test]
@@ -236,6 +247,7 @@ mod tests {
         approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
         let replayed = compiled.call(&mut context, (5.0f64, -4.0f64)).unwrap();
         approx_eq(replayed, 5.0 * -4.0 + 5.0f64.sin());
+        test_support::assert_bilinear_jit_rendering();
     }
 
     #[test]
@@ -249,6 +261,7 @@ mod tests {
         for (left, right) in outputs.into_iter().zip(expected) {
             approx_eq(left, right);
         }
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
     #[test]
@@ -259,6 +272,7 @@ mod tests {
 
         approx_eq(first_derivative_value, 4.0 * 2.0f64.powi(3) + 2.0f64.cos());
         approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
+        test_support::assert_hessian_style_second_derivative_jit_rendering();
     }
 
     #[test]
@@ -267,6 +281,7 @@ mod tests {
         let fourth_derivative_value = fourth_derivative(&mut context, 2.0f64);
 
         approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
+        test_support::assert_fourth_derivative_jit_rendering();
     }
 
     #[test]
@@ -294,6 +309,7 @@ mod tests {
         .expect("fourth derivative should succeed");
 
         approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
+        test_support::assert_inline_fourth_derivative_jit_rendering();
     }
 
     #[test]
@@ -304,6 +320,7 @@ mod tests {
         approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
         let replayed = compiled.call(&mut context, 1.5f64).unwrap();
         approx_eq(replayed, 12.0 * 1.5f64.powi(2) - 1.5f64.sin());
+        test_support::assert_hessian_style_second_derivative_jit_rendering();
     }
 
     #[test]
@@ -314,5 +331,6 @@ mod tests {
         approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
         let replayed = compiled.call(&mut context, 0.5f64).unwrap();
         approx_eq(replayed, 24.0 + 0.5f64.sin());
+        test_support::assert_fourth_derivative_jit_rendering();
     }
 }

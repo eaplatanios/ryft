@@ -150,6 +150,8 @@ impl OneLike for f64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::tracing_v2::test_support;
+
     use super::*;
 
     #[test]
@@ -158,6 +160,7 @@ mod tests {
         assert_eq!(2.5f64.abstract_value(), ScalarAbstract::F64);
         assert_eq!(3.0f32.zero_like(), 0.0);
         assert_eq!(3.0f64.one_like(), 1.0);
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
     #[test]
@@ -165,5 +168,6 @@ mod tests {
         let angle = 0.75f64;
         assert_eq!(FloatExt::sin(angle), angle.sin());
         assert_eq!(FloatExt::cos(angle), angle.cos());
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 }

@@ -336,7 +336,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::{AddOp, ScaleOp};
+    use indoc::indoc;
+
+    use crate::{
+        parameters::Placeholder,
+        tracing_v2::{AddOp, ScaleOp, test_support},
+    };
 
     use super::*;
 
@@ -348,15 +353,22 @@ mod tests {
         let two = builder.add_constant(2.0f64);
         let scaled_x = builder.add_equation(std::sync::Arc::new(ScaleOp::new(2.0)), vec![x]).unwrap()[0];
         let sum = builder.add_equation(std::sync::Arc::new(AddOp), vec![scaled_x, y]).unwrap()[0];
-        let graph = builder.build::<(f64, f64), f64>(
-            vec![sum],
-            (crate::parameters::Placeholder, crate::parameters::Placeholder),
-            crate::parameters::Placeholder,
-        );
+        let graph = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(graph.atom(x).unwrap().source, AtomSource::Input));
         assert!(matches!(graph.atom(two).unwrap().source, AtomSource::Constant(_)));
         assert_eq!(graph.call((2.0, 3.0)).unwrap(), 7.0);
+        assert_eq!(
+            graph.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = const
+                    %3:f64[] = scale %0
+                    %4:f64[] = add %3 %1
+                in (%4)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -365,14 +377,18 @@ mod tests {
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_equation(std::sync::Arc::new(AddOp), vec![x, three]).unwrap()[0];
-        let graph =
-            builder.build::<f64, f64>(vec![sum], crate::parameters::Placeholder, crate::parameters::Placeholder);
+        let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
-        let rendered = graph.to_string();
-        assert!(rendered.starts_with("lambda %0:f64[] .\n"));
-        assert!(rendered.contains("let %1:f64[] = const\n"));
-        assert!(rendered.contains("    %2:f64[] = add %0 %1\n"));
-        assert!(rendered.ends_with("in (%2)"));
+        assert_eq!(
+            graph.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                    %2:f64[] = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -380,5 +396,6 @@ mod tests {
         let mut builder = GraphBuilder::<std::sync::Arc<AddOp>, f64>::new();
         let result = builder.add_equation(std::sync::Arc::new(AddOp), vec![42, 99]);
         assert!(matches!(result, Err(TraceError::UnboundAtomId { id: 42 })));
+        test_support::assert_reference_graph_rendering();
     }
 }

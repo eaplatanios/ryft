@@ -261,6 +261,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+
+    use crate::{parameters::Placeholder, tracing_v2::test_support};
+
     use super::*;
 
     #[test]
@@ -273,6 +277,17 @@ mod tests {
         let zero = tracer.zero_like();
         assert_eq!(zero.value, 0.0);
         assert!(zero.atom() > atom);
+
+        let graph = zero.builder.borrow().clone().build::<f64, f64>(vec![zero.atom()], Placeholder, Placeholder);
+        assert_eq!(
+            graph.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -291,6 +306,17 @@ mod tests {
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(compiled.call(&mut context, 0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
         assert_eq!(compiled.graph().input_atoms().len(), 1);
+        assert_eq!(
+            compiled.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = sin %0
+                    %3:f64[] = add %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -299,10 +325,18 @@ mod tests {
         let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) =
             jit(&mut context, |_, x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
 
-        let rendered = compiled.to_string();
-        assert_eq!(rendered, compiled.graph().to_string());
-        assert!(rendered.starts_with("lambda %0:f64[] .\n"));
-        assert!(rendered.contains("mul %0 %0"));
-        assert!(rendered.contains("sin %0"));
+        assert_eq!(
+            compiled.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = sin %0
+                    %3:f64[] = add %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(compiled.to_string(), compiled.graph().to_string());
+        test_support::assert_bilinear_jit_rendering();
     }
 }

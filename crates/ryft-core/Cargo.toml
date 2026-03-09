@@ -39,6 +39,7 @@ paste.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+indoc.workspace = true
 ndarray.workspace = true
 
 [features]
