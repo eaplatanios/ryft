@@ -14,7 +14,7 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing_v0::{Tracer, VariableTracer},
-    types::{ArrayType, Type, Typed},
+    types_v0::{ArrayType, Type, Typed},
 };
 
 // How do we handle things like `grad(lambda x: x**2 if x > 0 else 0.)`? In this case, we need to be able to keep the

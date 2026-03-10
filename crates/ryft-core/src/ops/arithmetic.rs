@@ -10,7 +10,7 @@ use crate::{
     differentiation::JvpTracer,
     programs::{InterpretableOp, LinearInterpretableOp, LinearOp, Op, ProgramError},
     tracing_v0::{Traceable, TraceableOp, Tracer},
-    types::{ArrayStructureType, Typed},
+    types_v0::{ArrayStructureType, Typed},
 };
 
 // ======================================================= NEG =======================================================

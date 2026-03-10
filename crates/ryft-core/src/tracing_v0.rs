@@ -7,7 +7,7 @@ use crate::{
     differentiation::JvpTracer,
     parameters::Parameter,
     programs::{AtomId, ConstantExpression, Op, ProgramBuilder, ProgramError},
-    types::Typed,
+    types_v0::Typed,
 };
 
 // TODO(eaplatanios): Constant folding is unavoidable but can be expensive (e.g., `Tensor @ Tensor`). Can we trace it?

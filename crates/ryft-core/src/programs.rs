@@ -11,7 +11,7 @@ use crate::{
     assert_input_count_matches,
     parameters::{Parameter, Parameterized},
     tracing_v0::Tracer,
-    types::{Type, Typed, array_structure_type::ArrayStructureTypeBroadcastingError},
+    types_v0::{Type, Typed, array_structure_type::ArrayStructureTypeBroadcastingError},
 };
 
 pub type AtomId = usize;

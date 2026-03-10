@@ -8,7 +8,7 @@ use crate::{
     parameters::Parameter,
     programs::{InterpretableOp, Op, ProgramError},
     tracing_v0::{TraceableOp, Tracer},
-    types::Typed,
+    types_v0::Typed,
 };
 
 // ======================================================= SIN =======================================================
