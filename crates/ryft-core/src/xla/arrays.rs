@@ -16,6 +16,11 @@ use ryft_pjrt::{Buffer, BufferType, DeviceId, Error as PjrtError, ExecutionDevic
 
 use super::sharding::{Mesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout};
 
+// TODO(eaplatanios): Introduce [`ElementType`] mirroring [`BufferType`] and offering conversion methods
+//  when the `xla` feature is enabled.
+// TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
+// TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
+
 /// Error type for [`Array`] construction and execution-input preparation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 pub enum ArrayError {
@@ -82,8 +87,10 @@ pub enum ArrayError {
 /// Each entry ties one local [`Buffer`] to one global shard index.
 /// This corresponds to one entry in JAX's `array.addressable_shards`.
 pub struct AddressableShard<'o> {
+    // TODO(eaplatanios): Is this needed?
     shard_index: usize,
     device_id: DeviceId,
+    // TODO(eaplatanios): Is this needed?
     process_index: usize,
     buffer: Buffer<'o>,
 }
