@@ -12,12 +12,11 @@ use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
-use ryft_pjrt::{Buffer, BufferType, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
+use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
 use super::sharding::{Mesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout};
+use crate::types::ElementType;
 
-// TODO(eaplatanios): Introduce [`ElementType`] mirroring [`BufferType`] and offering conversion methods
-//  when the `xla` feature is enabled.
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
 
@@ -42,7 +41,7 @@ pub enum ArrayError {
 
     /// Error returned when a buffer element type does not match the array element type.
     #[error("buffer on device {device_id} has element type {actual}, but array element type is {expected}")]
-    BufferElementTypeMismatch { device_id: DeviceId, expected: BufferType, actual: BufferType },
+    BufferElementTypeMismatch { device_id: DeviceId, expected: ElementType, actual: ElementType },
 
     /// Error returned when a buffer shape dimension cannot be represented as `usize`.
     #[error("buffer on device {device_id} has shape dimension #{dimension}={size}, which does not fit in usize")]
@@ -140,7 +139,7 @@ impl std::fmt::Debug for AddressableShard<'_> {
 /// - addressable device buffers (the local portion of an IFRT array).
 pub struct Array<'o> {
     layout: ShardingLayout,
-    element_type: BufferType,
+    element_type: ElementType,
     addressable_shards: Vec<AddressableShard<'o>>,
     addressable_shard_index_by_device: HashMap<DeviceId, usize>,
 }
@@ -152,7 +151,7 @@ impl<'o> Array<'o> {
     /// shard metadata.
     pub fn new(
         layout: ShardingLayout,
-        element_type: BufferType,
+        element_type: ElementType,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
         let mut seen_devices = HashSet::with_capacity(addressable_buffers.len());
@@ -181,7 +180,7 @@ impl<'o> Array<'o> {
                 });
             }
 
-            let actual_element_type = buffer.element_type()?;
+            let actual_element_type = ElementType::from(buffer.element_type()?);
             if actual_element_type != element_type {
                 return Err(ArrayError::BufferElementTypeMismatch {
                     device_id,
@@ -227,7 +226,7 @@ impl<'o> Array<'o> {
     /// Creates an [`Array`] from shape/type/sharding metadata and local addressable buffers.
     pub fn from_sharding(
         global_shape: Vec<usize>,
-        element_type: BufferType,
+        element_type: ElementType,
         mesh: Mesh,
         partition_spec: PartitionSpec,
         addressable_buffers: Vec<Buffer<'o>>,
@@ -247,7 +246,7 @@ impl<'o> Array<'o> {
     }
 
     /// Returns the global array element type.
-    pub fn element_type(&self) -> BufferType {
+    pub fn element_type(&self) -> ElementType {
         self.element_type
     }
 
@@ -446,6 +445,8 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+    use crate::types::ElementType;
+
     use crate::xla::sharding::{Mesh, MeshAxis, MeshDevice, PartitionDimension, PartitionSpec};
 
     use super::*;
@@ -549,10 +550,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         let lhs_array =
-            Array::from_sharding(vec![8, 4], BufferType::F32, mesh.clone(), lhs_partition_spec.clone(), lhs_buffers)
+            Array::from_sharding(vec![8, 4], ElementType::F32, mesh.clone(), lhs_partition_spec.clone(), lhs_buffers)
                 .unwrap();
         let rhs_array =
-            Array::from_sharding(vec![4, 2], BufferType::F32, mesh.clone(), rhs_partition_spec, rhs_buffers).unwrap();
+            Array::from_sharding(vec![4, 2], ElementType::F32, mesh.clone(), rhs_partition_spec, rhs_buffers).unwrap();
+
+        assert_eq!(lhs_array.element_type(), ElementType::F32);
+        assert_eq!(rhs_array.element_type(), ElementType::F32);
 
         // Derive Shardy attributes from runtime arrays (JIT-style).
         let mesh_operation = lhs_array.to_shardy_mesh_operation("mesh").unwrap();

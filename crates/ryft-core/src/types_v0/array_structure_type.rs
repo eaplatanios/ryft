@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::differentiation::JvpTracer;
-use crate::types::array_type::{ArrayType, ArrayTypeBroadcastingError};
+use crate::types_v0::array_type::{ArrayType, ArrayTypeBroadcastingError};
 
 /// Represents a (possibly) nested data structure over [`ArrayType`]s. Specifically, this represents types
 /// of nested structures over [`ArrayType`]d values. For example, a `JvpTracer<f32, f32>` has type

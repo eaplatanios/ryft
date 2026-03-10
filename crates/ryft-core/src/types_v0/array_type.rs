@@ -11,7 +11,7 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::parameters::Parameter;
-use crate::types::r#type::Type;
+use crate::types_v0::r#type::Type;
 
 /// Represents the primitive data types that can be stored in arrays which range from standard numeric types including
 /// booleans, integers, floating-point numbers, and complex numbers of various precisions to advanced data types that
