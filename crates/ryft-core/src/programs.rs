@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::{
     assert_input_count_matches,
     parameters::{Parameter, Parameterized},
-    tracing::Tracer,
+    tracing_v0::Tracer,
     types::{Type, Typed, array_structure_type::ArrayStructureTypeBroadcastingError},
 };
 

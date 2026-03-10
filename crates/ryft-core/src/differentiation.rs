@@ -13,7 +13,7 @@ use crate::{
     ops::constants::{One, Zero},
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
-    tracing::{Tracer, VariableTracer},
+    tracing_v0::{Tracer, VariableTracer},
     types::{ArrayType, Type, Typed},
 };
 

@@ -4,7 +4,7 @@ use paste::paste;
 use crate::{
     differentiation::{Differentiable, JvpTracer},
     programs::ConstantExpression,
-    tracing::Tracer,
+    tracing_v0::Tracer,
     types::{ArrayType, Type, Typed},
 };
 

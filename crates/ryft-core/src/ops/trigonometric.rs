@@ -7,7 +7,7 @@ use crate::{
     differentiation::JvpTracer,
     parameters::Parameter,
     programs::{InterpretableOp, Op, ProgramError},
-    tracing::{TraceableOp, Tracer},
+    tracing_v0::{TraceableOp, Tracer},
     types::Typed,
 };
 

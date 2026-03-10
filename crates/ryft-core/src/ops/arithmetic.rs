@@ -9,7 +9,7 @@ use crate::{
     assert_input_count_matches,
     differentiation::JvpTracer,
     programs::{InterpretableOp, LinearInterpretableOp, LinearOp, Op, ProgramError},
-    tracing::{Traceable, TraceableOp, Tracer},
+    tracing_v0::{Traceable, TraceableOp, Tracer},
     types::{ArrayStructureType, Typed},
 };
 

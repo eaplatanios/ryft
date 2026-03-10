@@ -5,7 +5,7 @@ use half::{bf16, f16};
 use crate::{
     differentiation::JvpTracer,
     programs::{Constant, ConstantExpression, Program, ProgramType},
-    tracing::{Tracer, VariableTracer},
+    tracing_v0::{Tracer, VariableTracer},
 };
 
 use super::array_type::{ArrayType, DataType};
