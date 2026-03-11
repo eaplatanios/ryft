@@ -3,13 +3,13 @@ use std::fmt::Display;
 #[cfg(feature = "xla")]
 use ryft_pjrt::BufferType;
 
+#[cfg(feature = "xla")]
+use crate::errors::Error;
+
 /// Type of the data stored in an array or scalar value. Specifically, this represents
 /// the type of individual values that are stored in that value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ElementType {
-    /// Invalid [`ElementType`] that serves as a default.
-    Invalid,
-
     /// [`ElementType`] that represents token values that are threaded between side-effecting operations.
     /// This type is only used for values that contain a single token (i.e., that represent scalar values).
     Token,
@@ -151,7 +151,6 @@ pub enum ElementType {
 impl Display for ElementType {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Invalid => "invalid",
             Self::Token => "token",
             Self::Predicate => "pred",
             Self::I1 => "i1",
@@ -189,53 +188,58 @@ impl Display for ElementType {
 
 #[cfg(feature = "xla")]
 impl ElementType {
-    /// Creates an [`ElementType`] from the corresponding PJRT buffer type.
-    pub fn from_buffer_type(element_type: BufferType) -> Self {
-        element_type.into()
+    /// Creates an [`ElementType`] from the provided [`BufferType`]. Returns an [`Error::InvalidElementType`]
+    /// when `buffer_type` is [`BufferType::Invalid`], which is a PJRT-only sentinel value.
+    pub fn from_buffer_type(buffer_type: BufferType) -> Result<Self, Error> {
+        buffer_type.try_into()
     }
 
-    /// Returns the corresponding PJRT buffer type.
+    /// Returns the [`BufferType`] that corresponds to this [`ElementType`].
     pub fn to_buffer_type(self) -> BufferType {
         self.into()
     }
 }
 
 #[cfg(feature = "xla")]
-impl From<BufferType> for ElementType {
-    fn from(element_type: BufferType) -> Self {
-        match element_type {
-            BufferType::Invalid => Self::Invalid,
-            BufferType::Token => Self::Token,
-            BufferType::Predicate => Self::Predicate,
-            BufferType::I1 => Self::I1,
-            BufferType::I2 => Self::I2,
-            BufferType::I4 => Self::I4,
-            BufferType::I8 => Self::I8,
-            BufferType::I16 => Self::I16,
-            BufferType::I32 => Self::I32,
-            BufferType::I64 => Self::I64,
-            BufferType::U1 => Self::U1,
-            BufferType::U2 => Self::U2,
-            BufferType::U4 => Self::U4,
-            BufferType::U8 => Self::U8,
-            BufferType::U16 => Self::U16,
-            BufferType::U32 => Self::U32,
-            BufferType::U64 => Self::U64,
-            BufferType::F4E2M1FN => Self::F4E2M1FN,
-            BufferType::F8E3M4 => Self::F8E3M4,
-            BufferType::F8E4M3 => Self::F8E4M3,
-            BufferType::F8E4M3FN => Self::F8E4M3FN,
-            BufferType::F8E4M3FNUZ => Self::F8E4M3FNUZ,
-            BufferType::F8E4M3B11FNUZ => Self::F8E4M3B11FNUZ,
-            BufferType::F8E5M2 => Self::F8E5M2,
-            BufferType::F8E5M2FNUZ => Self::F8E5M2FNUZ,
-            BufferType::F8E8M0FNU => Self::F8E8M0FNU,
-            BufferType::BF16 => Self::BF16,
-            BufferType::F16 => Self::F16,
-            BufferType::F32 => Self::F32,
-            BufferType::F64 => Self::F64,
-            BufferType::C64 => Self::C64,
-            BufferType::C128 => Self::C128,
+impl TryFrom<BufferType> for ElementType {
+    type Error = Error;
+
+    fn try_from(buffer_type: BufferType) -> Result<Self, Self::Error> {
+        match buffer_type {
+            BufferType::Invalid => {
+                Err(Error::InvalidElementType { message: format!("invalid element type from PJRT: '{buffer_type}'") })
+            }
+            BufferType::Token => Ok(Self::Token),
+            BufferType::Predicate => Ok(Self::Predicate),
+            BufferType::I1 => Ok(Self::I1),
+            BufferType::I2 => Ok(Self::I2),
+            BufferType::I4 => Ok(Self::I4),
+            BufferType::I8 => Ok(Self::I8),
+            BufferType::I16 => Ok(Self::I16),
+            BufferType::I32 => Ok(Self::I32),
+            BufferType::I64 => Ok(Self::I64),
+            BufferType::U1 => Ok(Self::U1),
+            BufferType::U2 => Ok(Self::U2),
+            BufferType::U4 => Ok(Self::U4),
+            BufferType::U8 => Ok(Self::U8),
+            BufferType::U16 => Ok(Self::U16),
+            BufferType::U32 => Ok(Self::U32),
+            BufferType::U64 => Ok(Self::U64),
+            BufferType::F4E2M1FN => Ok(Self::F4E2M1FN),
+            BufferType::F8E3M4 => Ok(Self::F8E3M4),
+            BufferType::F8E4M3 => Ok(Self::F8E4M3),
+            BufferType::F8E4M3FN => Ok(Self::F8E4M3FN),
+            BufferType::F8E4M3FNUZ => Ok(Self::F8E4M3FNUZ),
+            BufferType::F8E4M3B11FNUZ => Ok(Self::F8E4M3B11FNUZ),
+            BufferType::F8E5M2 => Ok(Self::F8E5M2),
+            BufferType::F8E5M2FNUZ => Ok(Self::F8E5M2FNUZ),
+            BufferType::F8E8M0FNU => Ok(Self::F8E8M0FNU),
+            BufferType::BF16 => Ok(Self::BF16),
+            BufferType::F16 => Ok(Self::F16),
+            BufferType::F32 => Ok(Self::F32),
+            BufferType::F64 => Ok(Self::F64),
+            BufferType::C64 => Ok(Self::C64),
+            BufferType::C128 => Ok(Self::C128),
         }
     }
 }
@@ -244,7 +248,6 @@ impl From<BufferType> for ElementType {
 impl From<ElementType> for BufferType {
     fn from(element_type: ElementType) -> Self {
         match element_type {
-            ElementType::Invalid => Self::Invalid,
             ElementType::Token => Self::Token,
             ElementType::Predicate => Self::Predicate,
             ElementType::I1 => Self::I1,
@@ -283,11 +286,13 @@ impl From<ElementType> for BufferType {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "xla")]
+    use crate::errors::Error;
+
+    #[cfg(feature = "xla")]
     use super::BufferType;
     use super::ElementType;
 
     const DISPLAY_CASES: &[(ElementType, &str)] = &[
-        (ElementType::Invalid, "invalid"),
         (ElementType::Token, "token"),
         (ElementType::Predicate, "pred"),
         (ElementType::I1, "i1"),
@@ -330,7 +335,6 @@ mod tests {
 
     #[cfg(feature = "xla")]
     const BUFFER_TYPE_CASES: &[(ElementType, BufferType)] = &[
-        (ElementType::Invalid, BufferType::Invalid),
         (ElementType::Token, BufferType::Token),
         (ElementType::Predicate, BufferType::Predicate),
         (ElementType::I1, BufferType::I1),
@@ -368,8 +372,17 @@ mod tests {
     #[test]
     fn test_element_type_round_trips_with_buffer_type() {
         for &(element_type, buffer_type) in BUFFER_TYPE_CASES {
-            assert_eq!(ElementType::from_buffer_type(buffer_type), element_type);
+            assert_eq!(ElementType::from_buffer_type(buffer_type), Ok(element_type));
             assert_eq!(element_type.to_buffer_type(), buffer_type);
         }
+    }
+
+    #[cfg(feature = "xla")]
+    #[test]
+    fn test_invalid_buffer_type_is_rejected() {
+        assert!(matches!(
+            ElementType::from_buffer_type(BufferType::Invalid),
+            Err(Error::InvalidElementType { message }) if message == "invalid element type: 'invalid'",
+        ));
     }
 }

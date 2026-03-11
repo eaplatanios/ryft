@@ -5,6 +5,9 @@ pub enum Error {
     #[error("runtime error: {message}")]
     RuntimeError { message: String, backtrace: String },
 
+    #[error("{message}")]
+    InvalidElementType { message: String },
+
     #[error(
         "{}",
         match paths.as_deref() {

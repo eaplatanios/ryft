@@ -31,6 +31,10 @@ pub enum ArrayError {
     #[error("{0}")]
     ShardingError(#[from] ShardingError),
 
+    /// Underlying element-type conversion error.
+    #[error("{0}")]
+    ElementTypeError(#[from] crate::errors::Error),
+
     /// Error returned when an addressable buffer is placed on a device not present in the array mesh.
     #[error("addressable buffer is placed on device {device_id}, but that device is not in the mesh")]
     AddressableBufferDeviceNotInMesh { device_id: DeviceId },
@@ -180,7 +184,7 @@ impl<'o> Array<'o> {
                 });
             }
 
-            let actual_element_type = ElementType::from(buffer.element_type()?);
+            let actual_element_type = ElementType::from_buffer_type(buffer.element_type()?)?;
             if actual_element_type != element_type {
                 return Err(ArrayError::BufferElementTypeMismatch {
                     device_id,

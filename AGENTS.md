@@ -67,6 +67,8 @@ update this file so that they do not need to remind you again in the future.
   - third-party crate imports
   - `crate::...` imports
 - Use full words for variable names and avoid abbreviations or shortened versions of words.
+- For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
+  `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
 - Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.
 - Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
 
@@ -139,7 +141,9 @@ update this file so that they do not need to remind you again in the future.
 - On first mention of in-repo entities, use rustdoc links (e.g., ``[`Operation`]``), and use explicit paths (e.g.,
   ``[`Operation`](crate::Operation)``) when not imported in the current scope.
 - For function/method argument documentation strings, use a dedicated `# Parameters` section with this exact bullet 
-  style: ``///   - `arg_name`: description...`` and indent wrapped lines under the bullet.
+  style: ``///   - `arg_name`: description...`` and indent wrapped lines under the bullet. You may skip this section
+  entirely in cases where the arguments do not need a description or where their role is clear from the main description
+  of the function itself.
 - For public `unsafe` APIs, include:
   - what handle/representation is being exposed,
   - why it is unsafe, and
