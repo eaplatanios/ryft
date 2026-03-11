@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
-pub use crate::types_v0::*;
+#[cfg(feature = "xla")]
+use ryft_pjrt::BufferType;
 
 /// Type of the data stored in an array or scalar value. Specifically, this represents
 /// the type of individual values that are stored in that value.
@@ -189,58 +190,58 @@ impl Display for ElementType {
 #[cfg(feature = "xla")]
 impl ElementType {
     /// Creates an [`ElementType`] from the corresponding PJRT buffer type.
-    pub fn from_buffer_type(element_type: ryft_pjrt::BufferType) -> Self {
+    pub fn from_buffer_type(element_type: BufferType) -> Self {
         element_type.into()
     }
 
     /// Returns the corresponding PJRT buffer type.
-    pub fn to_buffer_type(self) -> ryft_pjrt::BufferType {
+    pub fn to_buffer_type(self) -> BufferType {
         self.into()
     }
 }
 
 #[cfg(feature = "xla")]
-impl From<ryft_pjrt::BufferType> for ElementType {
-    fn from(element_type: ryft_pjrt::BufferType) -> Self {
+impl From<BufferType> for ElementType {
+    fn from(element_type: BufferType) -> Self {
         match element_type {
-            ryft_pjrt::BufferType::Invalid => Self::Invalid,
-            ryft_pjrt::BufferType::Token => Self::Token,
-            ryft_pjrt::BufferType::Predicate => Self::Predicate,
-            ryft_pjrt::BufferType::I1 => Self::I1,
-            ryft_pjrt::BufferType::I2 => Self::I2,
-            ryft_pjrt::BufferType::I4 => Self::I4,
-            ryft_pjrt::BufferType::I8 => Self::I8,
-            ryft_pjrt::BufferType::I16 => Self::I16,
-            ryft_pjrt::BufferType::I32 => Self::I32,
-            ryft_pjrt::BufferType::I64 => Self::I64,
-            ryft_pjrt::BufferType::U1 => Self::U1,
-            ryft_pjrt::BufferType::U2 => Self::U2,
-            ryft_pjrt::BufferType::U4 => Self::U4,
-            ryft_pjrt::BufferType::U8 => Self::U8,
-            ryft_pjrt::BufferType::U16 => Self::U16,
-            ryft_pjrt::BufferType::U32 => Self::U32,
-            ryft_pjrt::BufferType::U64 => Self::U64,
-            ryft_pjrt::BufferType::F4E2M1FN => Self::F4E2M1FN,
-            ryft_pjrt::BufferType::F8E3M4 => Self::F8E3M4,
-            ryft_pjrt::BufferType::F8E4M3 => Self::F8E4M3,
-            ryft_pjrt::BufferType::F8E4M3FN => Self::F8E4M3FN,
-            ryft_pjrt::BufferType::F8E4M3FNUZ => Self::F8E4M3FNUZ,
-            ryft_pjrt::BufferType::F8E4M3B11FNUZ => Self::F8E4M3B11FNUZ,
-            ryft_pjrt::BufferType::F8E5M2 => Self::F8E5M2,
-            ryft_pjrt::BufferType::F8E5M2FNUZ => Self::F8E5M2FNUZ,
-            ryft_pjrt::BufferType::F8E8M0FNU => Self::F8E8M0FNU,
-            ryft_pjrt::BufferType::BF16 => Self::BF16,
-            ryft_pjrt::BufferType::F16 => Self::F16,
-            ryft_pjrt::BufferType::F32 => Self::F32,
-            ryft_pjrt::BufferType::F64 => Self::F64,
-            ryft_pjrt::BufferType::C64 => Self::C64,
-            ryft_pjrt::BufferType::C128 => Self::C128,
+            BufferType::Invalid => Self::Invalid,
+            BufferType::Token => Self::Token,
+            BufferType::Predicate => Self::Predicate,
+            BufferType::I1 => Self::I1,
+            BufferType::I2 => Self::I2,
+            BufferType::I4 => Self::I4,
+            BufferType::I8 => Self::I8,
+            BufferType::I16 => Self::I16,
+            BufferType::I32 => Self::I32,
+            BufferType::I64 => Self::I64,
+            BufferType::U1 => Self::U1,
+            BufferType::U2 => Self::U2,
+            BufferType::U4 => Self::U4,
+            BufferType::U8 => Self::U8,
+            BufferType::U16 => Self::U16,
+            BufferType::U32 => Self::U32,
+            BufferType::U64 => Self::U64,
+            BufferType::F4E2M1FN => Self::F4E2M1FN,
+            BufferType::F8E3M4 => Self::F8E3M4,
+            BufferType::F8E4M3 => Self::F8E4M3,
+            BufferType::F8E4M3FN => Self::F8E4M3FN,
+            BufferType::F8E4M3FNUZ => Self::F8E4M3FNUZ,
+            BufferType::F8E4M3B11FNUZ => Self::F8E4M3B11FNUZ,
+            BufferType::F8E5M2 => Self::F8E5M2,
+            BufferType::F8E5M2FNUZ => Self::F8E5M2FNUZ,
+            BufferType::F8E8M0FNU => Self::F8E8M0FNU,
+            BufferType::BF16 => Self::BF16,
+            BufferType::F16 => Self::F16,
+            BufferType::F32 => Self::F32,
+            BufferType::F64 => Self::F64,
+            BufferType::C64 => Self::C64,
+            BufferType::C128 => Self::C128,
         }
     }
 }
 
 #[cfg(feature = "xla")]
-impl From<ElementType> for ryft_pjrt::BufferType {
+impl From<ElementType> for BufferType {
     fn from(element_type: ElementType) -> Self {
         match element_type {
             ElementType::Invalid => Self::Invalid,
@@ -281,6 +282,8 @@ impl From<ElementType> for ryft_pjrt::BufferType {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "xla")]
+    use super::BufferType;
     use super::ElementType;
 
     const DISPLAY_CASES: &[(ElementType, &str)] = &[
@@ -326,39 +329,39 @@ mod tests {
     }
 
     #[cfg(feature = "xla")]
-    const BUFFER_TYPE_CASES: &[(ElementType, ryft_pjrt::BufferType)] = &[
-        (ElementType::Invalid, ryft_pjrt::BufferType::Invalid),
-        (ElementType::Token, ryft_pjrt::BufferType::Token),
-        (ElementType::Predicate, ryft_pjrt::BufferType::Predicate),
-        (ElementType::I1, ryft_pjrt::BufferType::I1),
-        (ElementType::I2, ryft_pjrt::BufferType::I2),
-        (ElementType::I4, ryft_pjrt::BufferType::I4),
-        (ElementType::I8, ryft_pjrt::BufferType::I8),
-        (ElementType::I16, ryft_pjrt::BufferType::I16),
-        (ElementType::I32, ryft_pjrt::BufferType::I32),
-        (ElementType::I64, ryft_pjrt::BufferType::I64),
-        (ElementType::U1, ryft_pjrt::BufferType::U1),
-        (ElementType::U2, ryft_pjrt::BufferType::U2),
-        (ElementType::U4, ryft_pjrt::BufferType::U4),
-        (ElementType::U8, ryft_pjrt::BufferType::U8),
-        (ElementType::U16, ryft_pjrt::BufferType::U16),
-        (ElementType::U32, ryft_pjrt::BufferType::U32),
-        (ElementType::U64, ryft_pjrt::BufferType::U64),
-        (ElementType::F4E2M1FN, ryft_pjrt::BufferType::F4E2M1FN),
-        (ElementType::F8E3M4, ryft_pjrt::BufferType::F8E3M4),
-        (ElementType::F8E4M3, ryft_pjrt::BufferType::F8E4M3),
-        (ElementType::F8E4M3FN, ryft_pjrt::BufferType::F8E4M3FN),
-        (ElementType::F8E4M3FNUZ, ryft_pjrt::BufferType::F8E4M3FNUZ),
-        (ElementType::F8E4M3B11FNUZ, ryft_pjrt::BufferType::F8E4M3B11FNUZ),
-        (ElementType::F8E5M2, ryft_pjrt::BufferType::F8E5M2),
-        (ElementType::F8E5M2FNUZ, ryft_pjrt::BufferType::F8E5M2FNUZ),
-        (ElementType::F8E8M0FNU, ryft_pjrt::BufferType::F8E8M0FNU),
-        (ElementType::BF16, ryft_pjrt::BufferType::BF16),
-        (ElementType::F16, ryft_pjrt::BufferType::F16),
-        (ElementType::F32, ryft_pjrt::BufferType::F32),
-        (ElementType::F64, ryft_pjrt::BufferType::F64),
-        (ElementType::C64, ryft_pjrt::BufferType::C64),
-        (ElementType::C128, ryft_pjrt::BufferType::C128),
+    const BUFFER_TYPE_CASES: &[(ElementType, BufferType)] = &[
+        (ElementType::Invalid, BufferType::Invalid),
+        (ElementType::Token, BufferType::Token),
+        (ElementType::Predicate, BufferType::Predicate),
+        (ElementType::I1, BufferType::I1),
+        (ElementType::I2, BufferType::I2),
+        (ElementType::I4, BufferType::I4),
+        (ElementType::I8, BufferType::I8),
+        (ElementType::I16, BufferType::I16),
+        (ElementType::I32, BufferType::I32),
+        (ElementType::I64, BufferType::I64),
+        (ElementType::U1, BufferType::U1),
+        (ElementType::U2, BufferType::U2),
+        (ElementType::U4, BufferType::U4),
+        (ElementType::U8, BufferType::U8),
+        (ElementType::U16, BufferType::U16),
+        (ElementType::U32, BufferType::U32),
+        (ElementType::U64, BufferType::U64),
+        (ElementType::F4E2M1FN, BufferType::F4E2M1FN),
+        (ElementType::F8E3M4, BufferType::F8E3M4),
+        (ElementType::F8E4M3, BufferType::F8E4M3),
+        (ElementType::F8E4M3FN, BufferType::F8E4M3FN),
+        (ElementType::F8E4M3FNUZ, BufferType::F8E4M3FNUZ),
+        (ElementType::F8E4M3B11FNUZ, BufferType::F8E4M3B11FNUZ),
+        (ElementType::F8E5M2, BufferType::F8E5M2),
+        (ElementType::F8E5M2FNUZ, BufferType::F8E5M2FNUZ),
+        (ElementType::F8E8M0FNU, BufferType::F8E8M0FNU),
+        (ElementType::BF16, BufferType::BF16),
+        (ElementType::F16, BufferType::F16),
+        (ElementType::F32, BufferType::F32),
+        (ElementType::F64, BufferType::F64),
+        (ElementType::C64, BufferType::C64),
+        (ElementType::C128, BufferType::C128),
     ];
 
     #[cfg(feature = "xla")]

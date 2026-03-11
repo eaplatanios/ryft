@@ -142,8 +142,8 @@ pub enum ArrayStructureTypeBroadcastingError {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::array_type::DataType::*;
-    use crate::types::array_type::{Shape, Size};
+    use crate::types_v0::array_type::DataType::*;
+    use crate::types_v0::array_type::{Shape, Size};
 
     use super::*;
 

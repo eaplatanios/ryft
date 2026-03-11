@@ -353,7 +353,7 @@ impl DataType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::DataType;
+    /// # use ryft_core::types_v0::array_type::DataType;
     /// let x = DataType::Boolean;
     /// let y = DataType::UnsignedInt16;
     /// let z = DataType::Float32;
@@ -395,8 +395,8 @@ impl DataType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::DataType;
-    /// # use ryft_core::types::Type;
+    /// # use ryft_core::types_v0::array_type::DataType;
+    /// # use ryft_core::types_v0::Type;
     /// assert!(DataType::Int32.promotable_to(&DataType::Float64));
     /// assert!(DataType::Float32.promotable_to(&DataType::Complex64));
     /// assert!(!DataType::Float64.promotable_to(&DataType::Int32));
@@ -843,7 +843,7 @@ impl Shape {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::{Shape, Size};
+    /// # use ryft_core::types_v0::array_type::{Shape, Size};
     ///
     /// // Scalar.
     /// assert_eq!(Shape::scalar().rank(), 0);
@@ -885,7 +885,7 @@ impl Shape {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::{Shape, Size};
+    /// # use ryft_core::types_v0::array_type::{Shape, Size};
     /// let w = Shape::scalar();
     /// let x = Shape::new(vec![Size::Static(42), Size::Static(42)]);
     /// let y = Shape::new(vec![Size::Dynamic(Some(10))]);
@@ -942,7 +942,7 @@ impl Shape {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::{Shape, Size};
+    /// # use ryft_core::types_v0::array_type::{Shape, Size};
     /// let w = Shape::new(vec![Size::Static(42), Size::Static(42)]);
     /// let x = Shape::new(vec![]);
     /// let y = Shape::new(vec![Size::Dynamic(Some(10))]);
@@ -1031,7 +1031,7 @@ pub enum ShapeBroadcastingError {
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::types::array_type::{ArrayType, DataType, Shape, Size};
+/// # use ryft_core::types_v0::array_type::{ArrayType, DataType, Shape, Size};
 ///
 /// // Boolean scalar.
 /// assert_eq!(
@@ -1085,7 +1085,7 @@ impl ArrayType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::{ArrayType, DataType, Shape, Size};
+    /// # use ryft_core::types_v0::array_type::{ArrayType, DataType, Shape, Size};
     ///
     /// // Boolean scalar.
     /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar()).rank(), 0);
@@ -1126,7 +1126,7 @@ impl ArrayType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::{ArrayType, DataType, Shape, Size};
+    /// # use ryft_core::types_v0::array_type::{ArrayType, DataType, Shape, Size};
     /// let w = ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
     /// let x = ArrayType::new(DataType::Boolean, Shape::scalar());
     /// let y = ArrayType::new(DataType::UnsignedInt16, Shape::new(vec![Size::Dynamic(Some(10))]));
@@ -1170,7 +1170,7 @@ impl ArrayType {
     /// # Examples
     ///
     /// ```rust
-    /// # use ryft_core::types::array_type::{ArrayType, DataType, Shape, Size};
+    /// # use ryft_core::types_v0::array_type::{ArrayType, DataType, Shape, Size};
     /// let w = ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
     /// let x = ArrayType::new(DataType::Boolean, Shape::scalar());
     /// let y = ArrayType::new(DataType::UnsignedInt16, Shape::new(vec![Size::Dynamic(Some(10))]));
