@@ -13,14 +13,14 @@ use ryft_macros::Parameter;
 use crate::parameters::Parameter;
 use crate::types_v0::r#type::Type;
 
-/// Represents the primitive data types that can be stored in arrays which range from standard numeric types including
-/// booleans, integers, floating-point numbers, and complex numbers of various precisions to advanced data types that
-/// mirror [LLVM/MLIR types](https://mlir.llvm.org/docs/Dialects/Builtin) like
-/// [8-bit floating-point variants](https://arxiv.org/abs/2209.05433).
+/// Represents a primitive data type that can be stored in arrays, tensors, matrices, vectors, scalars, etc., which
+/// range from standard numeric types including booleans, integers, floating-point numbers, and complex numbers of
+/// various precisions to advanced data types that mirror [LLVM/MLIR types](https://mlir.llvm.org/docs/Dialects/Builtin)
+/// like [8-bit floating-point variants](https://arxiv.org/abs/2209.05433).
 ///
 /// # Type Promotion
 ///
-/// The data types form a hierarchy for type promotion when data of multiple types is mixed together in an operation,
+/// The data types form a hierarchy for type promotion when data of multiple types are mixed together in operations
 /// that follows the [type promotion semantics of JAX](https://docs.jax.dev/en/latest/type_promotion.html). At a high
 /// level, type promotion is governed by the following rules:
 ///
@@ -36,44 +36,54 @@ use crate::types_v0::r#type::Type;
 /// precision in arbitrary data type conversions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum DataType {
+    /// [`DataType`] that represents token values that are threaded between side-effecting operations.
+    /// This type is only used for values that contain a single token (i.e., that represent scalar values).
+    Token,
+    
     /// Boolean [`DataType`] that represents `true`/`false` values but can be promoted to any other [`DataType`].
     Boolean,
 
+    /// [`DataType`] that represents 1-bit signed integer values, with the only representable values being `0` and `-1`.
+    I1,
+
     /// [`DataType`] that represents 2-bit signed integer values, where the first bit corresponds to the sign.
-    Int2,
+    I2,
 
     /// [`DataType`] that represents 4-bit signed integer values, where the first bit corresponds to the sign.
-    Int4,
+    I4,
 
     /// [`DataType`] that represents 8-bit signed integer values, where the first bit corresponds to the sign.
-    Int8,
+    I8,
 
     /// [`DataType`] that represents 16-bit signed integer values, where the first bit corresponds to the sign.
-    Int16,
+    I16,
 
     /// [`DataType`] that represents 32-bit signed integer values, where the first bit corresponds to the sign.
-    Int32,
+    I32,
 
     /// [`DataType`] that represents 64-bit signed integer values, where the first bit corresponds to the sign.
-    Int64,
+    I64,
+
+    /// [`DataType`] that represents 1-bit unsigned integer values.
+    U1,
 
     /// [`DataType`] that represents 2-bit unsigned integer values.
-    UnsignedInt2,
+    U2,
 
     /// [`DataType`] that represents 4-bit unsigned integer values.
-    UnsignedInt4,
+    U4,
 
     /// [`DataType`] that represents 8-bit unsigned integer values.
-    UnsignedInt8,
+    U8,
 
     /// [`DataType`] that represents 16-bit unsigned integer values.
-    UnsignedInt16,
+    U16,
 
     /// [`DataType`] that represents 32-bit unsigned integer values.
-    UnsignedInt32,
+    U32,
 
     /// [`DataType`] that represents 64-bit unsigned integer values.
-    UnsignedInt64,
+    U64,
 
     /// [`DataType`] that represents 4-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -90,7 +100,7 @@ pub enum DataType {
     ///
     /// The `FN` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
     /// only represent finite values.
-    Float4E2M1FN,
+    F4E2M1FN,
 
     /// [`DataType`] that represents 6-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -107,7 +117,7 @@ pub enum DataType {
     ///
     /// The `FN` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
     /// only represent finite values.
-    Float6E2M3FN,
+    F6E2M3FN,
 
     /// [`DataType`] that represents 6-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -124,7 +134,7 @@ pub enum DataType {
     ///
     /// The `FN` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
     /// only represent finite values.
-    Float6E3M2FN,
+    F6E3M2FN,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -139,7 +149,7 @@ pub enum DataType {
     ///
     /// The value of a number in this representation can be computed as:
     /// `(-1)^S * 2^(E - 3) * (1 * [E == 0] + M_3 * 2^-1 + M_2 * 2^-2 + M_1 * 2^-3 + M_0 * 2^-4)`.
-    Float8E3M4,
+    F8E3M4,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -154,7 +164,7 @@ pub enum DataType {
     ///
     /// The value of a number in this representation can be computed as:
     /// `(-1)^S * 2^(E - 7) * (1 * [E == 0] + M_2 * 2^-1 + M_1 * 2^-2 + M_0 * 2^-3)`.
-    Float8E4M3,
+    F8E4M3,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -171,7 +181,7 @@ pub enum DataType {
     ///
     /// The `FN` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
     /// only represent finite values.
-    Float8E4M3FN,
+    F8E4M3FN,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -189,7 +199,7 @@ pub enum DataType {
     /// The `FNUZ` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type is
     /// not consistent with the IEEE 754 standard. The `FN` indicates that it can only represent finite values, and the
     /// `UZ` stands for "unsigned zero".
-    Float8E4M3FNUZ,
+    F8E4M3FNUZ,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -207,7 +217,7 @@ pub enum DataType {
     /// The `FNUZ` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type is
     /// not consistent with the IEEE 754 standard. The `FN` indicates that it can only represent finite values, and the
     /// `UZ` stands for "unsigned zero".
-    Float8E4M3B11FNUZ,
+    F8E4M3B11FNUZ,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -222,7 +232,7 @@ pub enum DataType {
     ///
     /// The value of a number in this representation can be computed as:
     /// `(-1)^S * 2^(E - 15) * (1 * [E == 0] + M_1 * 2^-1 + M_0 * 2^-2)`.
-    Float8E5M2,
+    F8E5M2,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -240,7 +250,7 @@ pub enum DataType {
     /// The `FNUZ` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type is
     /// not consistent with the IEEE 754 standard. The `FN` indicates that it can only represent finite values, and the
     /// `UZ` stands for "unsigned zero".
-    Float8E5M2FNUZ,
+    F8E5M2FNUZ,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -258,7 +268,7 @@ pub enum DataType {
     /// The `FNU` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type is
     /// not consistent with the IEEE 754 standard. The `FN` indicates that it can only represent finite values, and the
     /// `U` stands for "unsigned".
-    Float8E8M0FNU,
+    F8E8M0FNU,
 
     /// [`DataType`] that represents 16-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -274,11 +284,11 @@ pub enum DataType {
     /// The value of a number in this representation can be computed as:
     /// `(-1)^S * 2^(E - 127) * (1 * [E == 0] + M_6 * 2^-1 + ... + M_0 * 2^-7)`.
     ///
-    /// [`DataType::BFloat16`] has lower precision but higher dynamic range compared to [`DataType::Float16`].
+    /// [`DataType::BF16`] has lower precision but higher dynamic range compared to [`DataType::F16`].
     ///
     /// Refer to [this page](https://en.wikipedia.org/wiki/Bfloat16_floating-point_format) for more information
     /// on this [DataType].
-    BFloat16,
+    BF16,
 
     /// [`DataType`] that represents 16-bit floating-point values following the
     /// [IEEE 754 standard](https://en.wikipedia.org/wiki/IEEE_754), with the following characteristics:
@@ -296,7 +306,7 @@ pub enum DataType {
     ///
     /// Refer to [this page](https://en.wikipedia.org/wiki/Half-precision_floating-point_format) for more information
     /// on this [DataType].
-    Float16,
+    F16,
 
     /// [`DataType`] that represents 32-bit floating-point values following the
     /// [IEEE 754 standard](https://en.wikipedia.org/wiki/IEEE_754), with the following characteristics:
@@ -314,7 +324,7 @@ pub enum DataType {
     ///
     /// Refer to [this page](https://en.wikipedia.org/wiki/Single-precision_floating-point_format) for more information
     /// on this [DataType].
-    Float32,
+    F32,
 
     /// [`DataType`] that represents 32-bit floating-point values following the
     /// [IEEE 754 standard](https://en.wikipedia.org/wiki/IEEE_754), with the following characteristics:
@@ -332,15 +342,15 @@ pub enum DataType {
     ///
     /// Refer to [this page](https://en.wikipedia.org/wiki/Double-precision_floating-point_format) for more information
     /// on this [DataType].
-    Float64,
+    F64,
 
     /// [`DataType`] that represents 64-bit complex numbers where the real and imaginary parts
-    /// are [`DataType::Float32`].
-    Complex64,
+    /// are [`DataType::F32`].
+    C64,
 
     /// [`DataType`] that represents 128-bit complex numbers where the real and imaginary parts
-    /// are [`DataType::Float64`].
-    Complex128,
+    /// are [`DataType::F64`].
+    C128,
 }
 
 impl DataType {
@@ -355,8 +365,8 @@ impl DataType {
     /// ```rust
     /// # use ryft_core::types_v0::array_type::DataType;
     /// let x = DataType::Boolean;
-    /// let y = DataType::UnsignedInt16;
-    /// let z = DataType::Float32;
+    /// let y = DataType::U16;
+    /// let z = DataType::F32;
     ///
     /// assert_eq!(DataType::promoted(&[&x]), Ok(x.clone()));
     /// assert_eq!(DataType::promoted(&[&x, &y]), Ok(y.clone()));
@@ -397,302 +407,334 @@ impl DataType {
     /// ```rust
     /// # use ryft_core::types_v0::array_type::DataType;
     /// # use ryft_core::types_v0::Type;
-    /// assert!(DataType::Int32.promotable_to(&DataType::Float64));
-    /// assert!(DataType::Float32.promotable_to(&DataType::Complex64));
-    /// assert!(!DataType::Float64.promotable_to(&DataType::Int32));
+    /// assert!(DataType::I32.promotable_to(&DataType::F64));
+    /// assert!(DataType::F32.promotable_to(&DataType::C64));
+    /// assert!(!DataType::F64.promotable_to(&DataType::I32));
     /// ```
     #[inline]
     pub fn promotable_to(&self, other: &Self) -> bool {
         match (&self, &other) {
+            (DataType::Token, DataType::Token) => true,
+            (DataType::Token, _) => false,
             (DataType::Boolean, _) => true,
             (_, DataType::Boolean) => false,
             (
-                DataType::Int2,
-                DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16
-                | DataType::UnsignedInt32
-                | DataType::UnsignedInt64,
+                DataType::I1,
+                DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64,
             ) => false,
-            (DataType::Int2, _) => true,
+            (DataType::I1, _) => true,
             (
-                DataType::Int4,
-                DataType::Int2
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16
-                | DataType::UnsignedInt32
-                | DataType::UnsignedInt64,
+                DataType::I2,
+                DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64,
             ) => false,
-            (DataType::Int4, _) => true,
+            (DataType::I2, _) => true,
             (
-                DataType::Int8,
-                DataType::Int2
-                | DataType::Int4
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16
-                | DataType::UnsignedInt32
-                | DataType::UnsignedInt64,
+                DataType::I4,
+                DataType::I1
+                | DataType::I2
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64,
             ) => false,
-            (DataType::Int8, _) => true,
+            (DataType::I4, _) => true,
             (
-                DataType::Int16,
-                DataType::Int2
-                | DataType::Int4
-                | DataType::Int8
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16
-                | DataType::UnsignedInt32
-                | DataType::UnsignedInt64,
+                DataType::I8,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64,
             ) => false,
-            (DataType::Int16, _) => true,
+            (DataType::I8, _) => true,
             (
-                DataType::Int32,
-                DataType::Int2
-                | DataType::Int4
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16
-                | DataType::UnsignedInt32
-                | DataType::UnsignedInt64,
+                DataType::I16,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::I8
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64,
             ) => false,
-            (DataType::Int32, _) => true,
+            (DataType::I16, _) => true,
             (
-                DataType::Int64,
-                DataType::Int2
-                | DataType::Int4
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16
-                | DataType::UnsignedInt32
-                | DataType::UnsignedInt64,
+                DataType::I32,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::I8
+                | DataType::I16
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64,
             ) => false,
-            (DataType::Int64, _) => true,
-            (DataType::UnsignedInt2, DataType::Int2) => false,
-            (DataType::UnsignedInt2, _) => true,
-            (DataType::UnsignedInt4, DataType::Int2 | DataType::Int4 | DataType::UnsignedInt2) => false,
-            (DataType::UnsignedInt4, _) => true,
+            (DataType::I32, _) => true,
             (
-                DataType::UnsignedInt8,
-                DataType::Int2 | DataType::Int4 | DataType::Int8 | DataType::UnsignedInt2 | DataType::UnsignedInt4,
+                DataType::I64,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::I8
+                | DataType::I16
+                | DataType::I32
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64,
             ) => false,
-            (DataType::UnsignedInt8, _) => true,
+            (DataType::I64, _) => true,
+            (DataType::U1, DataType::I1) => false,
+            (DataType::U1, _) => true,
+            (DataType::U2, DataType::I2) => false,
+            (DataType::U2, _) => true,
+            (DataType::U4, DataType::I1 | DataType::I2 | DataType::I4 | DataType::U1 | DataType::U2) => false,
+            (DataType::U4, _) => true,
             (
-                DataType::UnsignedInt16,
-                DataType::Int2
-                | DataType::Int4
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8,
+                DataType::U8,
+                DataType::I1 | DataType::I2 | DataType::I4 | DataType::I8 | DataType::U1 | DataType::U2 | DataType::U4,
             ) => false,
-            (DataType::UnsignedInt16, _) => true,
+            (DataType::U8, _) => true,
             (
-                DataType::UnsignedInt32,
-                DataType::Int2
-                | DataType::Int4
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16,
+                DataType::U16,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::I8
+                | DataType::I16
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8,
             ) => false,
-            (DataType::UnsignedInt32, _) => true,
+            (DataType::U16, _) => true,
             (
-                DataType::UnsignedInt64,
-                DataType::Int2
-                | DataType::Int4
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UnsignedInt2
-                | DataType::UnsignedInt4
-                | DataType::UnsignedInt8
-                | DataType::UnsignedInt16
-                | DataType::UnsignedInt32,
+                DataType::U32,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::I8
+                | DataType::I16
+                | DataType::I32
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16,
             ) => false,
-            (DataType::UnsignedInt64, _) => true,
+            (DataType::U32, _) => true,
             (
-                DataType::Float4E2M1FN,
-                DataType::Float4E2M1FN
-                | DataType::Float6E2M3FN
-                | DataType::Float6E3M2FN
-                | DataType::Float8E3M4
-                | DataType::Float8E4M3
-                | DataType::Float8E5M2
-                | DataType::Float8E4M3FN
-                | DataType::Float8E4M3B11FNUZ
-                | DataType::Float8E5M2FNUZ
-                | DataType::Float8E4M3FNUZ
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
-            ) => true,
-            (DataType::Float4E2M1FN, _) => false,
+                DataType::U64,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::I8
+                | DataType::I16
+                | DataType::I32
+                | DataType::I64
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32,
+            ) => false,
+            (DataType::U64, _) => true,
             (
-                DataType::Float6E2M3FN,
-                DataType::Float6E2M3FN
-                | DataType::Float8E3M4
-                | DataType::Float8E4M3
-                | DataType::Float8E5M2
-                | DataType::Float8E4M3FN
-                | DataType::Float8E4M3B11FNUZ
-                | DataType::Float8E5M2FNUZ
-                | DataType::Float8E4M3FNUZ
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F4E2M1FN,
+                DataType::F4E2M1FN
+                | DataType::F6E2M3FN
+                | DataType::F6E3M2FN
+                | DataType::F8E3M4
+                | DataType::F8E4M3
+                | DataType::F8E5M2
+                | DataType::F8E4M3FN
+                | DataType::F8E4M3B11FNUZ
+                | DataType::F8E5M2FNUZ
+                | DataType::F8E4M3FNUZ
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float6E2M3FN, _) => false,
+            (DataType::F4E2M1FN, _) => false,
             (
-                DataType::Float6E3M2FN,
-                DataType::Float6E3M2FN
-                | DataType::Float8E3M4
-                | DataType::Float8E4M3
-                | DataType::Float8E5M2
-                | DataType::Float8E4M3FN
-                | DataType::Float8E4M3B11FNUZ
-                | DataType::Float8E5M2FNUZ
-                | DataType::Float8E4M3FNUZ
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F6E2M3FN,
+                DataType::F6E2M3FN
+                | DataType::F8E3M4
+                | DataType::F8E4M3
+                | DataType::F8E5M2
+                | DataType::F8E4M3FN
+                | DataType::F8E4M3B11FNUZ
+                | DataType::F8E5M2FNUZ
+                | DataType::F8E4M3FNUZ
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float6E3M2FN, _) => false,
+            (DataType::F6E2M3FN, _) => false,
             (
-                DataType::Float8E3M4,
-                DataType::Float8E3M4
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F6E3M2FN,
+                DataType::F6E3M2FN
+                | DataType::F8E3M4
+                | DataType::F8E4M3
+                | DataType::F8E5M2
+                | DataType::F8E4M3FN
+                | DataType::F8E4M3B11FNUZ
+                | DataType::F8E5M2FNUZ
+                | DataType::F8E4M3FNUZ
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E3M4, _) => false,
+            (DataType::F6E3M2FN, _) => false,
             (
-                DataType::Float8E4M3,
-                DataType::Float8E4M3
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F8E3M4,
+                DataType::F8E3M4
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E4M3, _) => false,
+            (DataType::F8E3M4, _) => false,
             (
-                DataType::Float8E5M2,
-                DataType::Float8E5M2
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F8E4M3,
+                DataType::F8E4M3
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E5M2, _) => false,
+            (DataType::F8E4M3, _) => false,
             (
-                DataType::Float8E4M3FN,
-                DataType::Float8E4M3FN
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F8E5M2,
+                DataType::F8E5M2
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E4M3FN, _) => false,
+            (DataType::F8E5M2, _) => false,
             (
-                DataType::Float8E4M3B11FNUZ,
-                DataType::Float8E4M3B11FNUZ
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F8E4M3FN,
+                DataType::F8E4M3FN
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E4M3B11FNUZ, _) => false,
+            (DataType::F8E4M3FN, _) => false,
             (
-                DataType::Float8E5M2FNUZ,
-                DataType::Float8E5M2FNUZ
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F8E4M3B11FNUZ,
+                DataType::F8E4M3B11FNUZ
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E5M2FNUZ, _) => false,
+            (DataType::F8E4M3B11FNUZ, _) => false,
             (
-                DataType::Float8E4M3FNUZ,
-                DataType::Float8E4M3FNUZ
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F8E5M2FNUZ,
+                DataType::F8E5M2FNUZ
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E4M3FNUZ, _) => false,
+            (DataType::F8E5M2FNUZ, _) => false,
             (
-                DataType::Float8E8M0FNU,
-                DataType::Float8E8M0FNU
-                | DataType::BFloat16
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Complex64
-                | DataType::Complex128,
+                DataType::F8E4M3FNUZ,
+                DataType::F8E4M3FNUZ
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::Float8E8M0FNU, _) => false,
+            (DataType::F8E4M3FNUZ, _) => false,
             (
-                DataType::BFloat16,
-                DataType::BFloat16 | DataType::Float32 | DataType::Float64 | DataType::Complex64 | DataType::Complex128,
+                DataType::F8E8M0FNU,
+                DataType::F8E8M0FNU
+                | DataType::BF16
+                | DataType::F16
+                | DataType::F32
+                | DataType::F64
+                | DataType::C64
+                | DataType::C128,
             ) => true,
-            (DataType::BFloat16, _) => false,
+            (DataType::F8E8M0FNU, _) => false,
             (
-                DataType::Float16,
-                DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Complex64 | DataType::Complex128,
+                DataType::BF16,
+                DataType::BF16 | DataType::F32 | DataType::F64 | DataType::C64 | DataType::C128,
             ) => true,
-            (DataType::Float16, _) => false,
-            (DataType::Float32, DataType::Float32 | DataType::Float64 | DataType::Complex64 | DataType::Complex128) => {
+            (DataType::BF16, _) => false,
+            (
+                DataType::F16,
+                DataType::F16 | DataType::F32 | DataType::F64 | DataType::C64 | DataType::C128,
+            ) => true,
+            (DataType::F16, _) => false,
+            (DataType::F32, DataType::F32 | DataType::F64 | DataType::C64 | DataType::C128) => {
                 true
             }
-            (DataType::Float32, _) => false,
-            (DataType::Float64, DataType::Float64 | DataType::Complex128) => true,
-            (DataType::Float64, _) => false,
-            (DataType::Complex64, DataType::Complex64 | DataType::Complex128) => true,
-            (DataType::Complex64, _) => false,
-            (DataType::Complex128, DataType::Complex128) => true,
-            (DataType::Complex128, _) => false,
+            (DataType::F32, _) => false,
+            (DataType::F64, DataType::F64 | DataType::C128) => true,
+            (DataType::F64, _) => false,
+            (DataType::C64, DataType::C64 | DataType::C128) => true,
+            (DataType::C64, _) => false,
+            (DataType::C128, DataType::C128) => true,
+            (DataType::C128, _) => false,
         }
     }
 }
@@ -709,36 +751,39 @@ impl Type for DataType {
 impl Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self {
+            DataType::Token => write!(f, "token"),
             DataType::Boolean => write!(f, "bool"),
-            DataType::Int2 => write!(f, "i2"),
-            DataType::Int4 => write!(f, "i4"),
-            DataType::Int8 => write!(f, "i8"),
-            DataType::Int16 => write!(f, "i16"),
-            DataType::Int32 => write!(f, "i32"),
-            DataType::Int64 => write!(f, "i64"),
-            DataType::UnsignedInt2 => write!(f, "u2"),
-            DataType::UnsignedInt4 => write!(f, "u4"),
-            DataType::UnsignedInt8 => write!(f, "u8"),
-            DataType::UnsignedInt16 => write!(f, "u16"),
-            DataType::UnsignedInt32 => write!(f, "u32"),
-            DataType::UnsignedInt64 => write!(f, "u64"),
-            DataType::Float4E2M1FN => write!(f, "f4e2m1fn"),
-            DataType::Float6E2M3FN => write!(f, "f6e2m3fn"),
-            DataType::Float6E3M2FN => write!(f, "f6e3m2fn"),
-            DataType::Float8E3M4 => write!(f, "f8e3m4"),
-            DataType::Float8E4M3 => write!(f, "f8e4m3"),
-            DataType::Float8E5M2 => write!(f, "f8e5m2"),
-            DataType::Float8E4M3FN => write!(f, "f8e4m3fn"),
-            DataType::Float8E4M3B11FNUZ => write!(f, "f8e4m3b11fnuz"),
-            DataType::Float8E5M2FNUZ => write!(f, "f8e5m2fnuz"),
-            DataType::Float8E4M3FNUZ => write!(f, "f8e4m3fnuz"),
-            DataType::Float8E8M0FNU => write!(f, "f8e8m0fnu"),
-            DataType::BFloat16 => write!(f, "bf16"),
-            DataType::Float16 => write!(f, "f16"),
-            DataType::Float32 => write!(f, "f32"),
-            DataType::Float64 => write!(f, "f64"),
-            DataType::Complex64 => write!(f, "c64"),
-            DataType::Complex128 => write!(f, "c128"),
+            DataType::I1 => write!(f, "i1"),
+            DataType::I2 => write!(f, "i2"),
+            DataType::I4 => write!(f, "i4"),
+            DataType::I8 => write!(f, "i8"),
+            DataType::I16 => write!(f, "i16"),
+            DataType::I32 => write!(f, "i32"),
+            DataType::I64 => write!(f, "i64"),
+            DataType::U1 => write!(f, "u1"),
+            DataType::U2 => write!(f, "u2"),
+            DataType::U4 => write!(f, "u4"),
+            DataType::U8 => write!(f, "u8"),
+            DataType::U16 => write!(f, "u16"),
+            DataType::U32 => write!(f, "u32"),
+            DataType::U64 => write!(f, "u64"),
+            DataType::F4E2M1FN => write!(f, "f4e2m1fn"),
+            DataType::F6E2M3FN => write!(f, "f6e2m3fn"),
+            DataType::F6E3M2FN => write!(f, "f6e3m2fn"),
+            DataType::F8E3M4 => write!(f, "f8e3m4"),
+            DataType::F8E4M3 => write!(f, "f8e4m3"),
+            DataType::F8E5M2 => write!(f, "f8e5m2"),
+            DataType::F8E4M3FN => write!(f, "f8e4m3fn"),
+            DataType::F8E4M3B11FNUZ => write!(f, "f8e4m3b11fnuz"),
+            DataType::F8E5M2FNUZ => write!(f, "f8e5m2fnuz"),
+            DataType::F8E4M3FNUZ => write!(f, "f8e4m3fnuz"),
+            DataType::F8E8M0FNU => write!(f, "f8e8m0fnu"),
+            DataType::BF16 => write!(f, "bf16"),
+            DataType::F16 => write!(f, "f16"),
+            DataType::F32 => write!(f, "f32"),
+            DataType::F64 => write!(f, "f64"),
+            DataType::C64 => write!(f, "c64"),
+            DataType::C128 => write!(f, "c128"),
         }
     }
 }
@@ -757,10 +802,10 @@ pub enum DataTypePromotionError {
 }
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time
-/// or dynamic in which case their sizes will only be known at runtime at runtime. Dynamic dimensions may optionally
-/// have an upper bound for their size that may be used for optimizations by the compiler. Note that by compilation
-/// here we do not refer to the compilation of the Rust program but rather to the compilation of an array program
-/// within our Rust library.
+/// or dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
+/// bound for their size that may be used for optimizations by the compiler. Note that by compilation here we do not
+/// refer to the compilation of the Rust program but rather to the compilation of an array program within our Rust
+/// library.
 ///
 /// Note that the [`Display`] implementation of [`Size`] renders static sizes as just a number, dynamic sizes
 /// with an upper bound as `<` followed by the upper bound, and dynamic sizes with no upper bound as `*`.
@@ -788,7 +833,7 @@ impl Size {
 
     /// Returns an (exclusive) upper bound for the value of this [`Size`] if such a bound is known.
     /// For [`Size::Static`] sizes, this function will return the underlying value plus one as the upper bound.
-    /// For [`Size::Dynamic`] sizes, this function will return the upper bound for that size, if one exists, and
+    /// For [`Size::Dynamic`] sizes, this function will return the upper bound for that size if one exists, and
     /// `None` otherwise.
     #[inline]
     pub fn upper_bound(&self) -> Option<usize> {
@@ -1041,19 +1086,19 @@ pub enum ShapeBroadcastingError {
 ///
 /// // 64-bit unsigned integer vector with 42 elements.
 /// assert_eq!(
-///   ArrayType::new(DataType::UnsignedInt64, Shape::new(vec![Size::Static(42)])).to_string(),
+///   ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)])).to_string(),
 ///   "u64[42]",
 /// );
 ///
 /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
 /// assert_eq!(
-///   ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))])).to_string(),
+///   ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))])).to_string(),
 ///   "f32[42, <10]",
 /// );
 ///
 /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
 /// assert_eq!(
-///   ArrayType::new(DataType::Complex64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)])).to_string(),
+///   ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)])).to_string(),
 ///   "c64[*, 42]",
 /// );
 /// ```
@@ -1091,13 +1136,13 @@ impl ArrayType {
     /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar()).rank(), 0);
     ///
     /// // 64-bit unsigned integer vector with 42 elements.
-    /// assert_eq!(ArrayType::new(DataType::UnsignedInt64, Shape::new(vec![Size::Static(42)])).rank(), 1);
+    /// assert_eq!(ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)])).rank(), 1);
     ///
     /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
-    /// assert_eq!(ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))])).rank(), 2);
+    /// assert_eq!(ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))])).rank(), 2);
     ///
     /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
-    /// assert_eq!(ArrayType::new(DataType::Complex64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)])).rank(), 2);
+    /// assert_eq!(ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)])).rank(), 2);
     /// ```
     #[inline]
     pub fn rank(&self) -> usize {
@@ -1127,10 +1172,10 @@ impl ArrayType {
     ///
     /// ```rust
     /// # use ryft_core::types_v0::array_type::{ArrayType, DataType, Shape, Size};
-    /// let w = ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
+    /// let w = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
     /// let x = ArrayType::new(DataType::Boolean, Shape::scalar());
-    /// let y = ArrayType::new(DataType::UnsignedInt16, Shape::new(vec![Size::Dynamic(Some(10))]));
-    /// let z = ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]));
+    /// let y = ArrayType::new(DataType::U16, Shape::new(vec![Size::Dynamic(Some(10))]));
+    /// let z = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]));
     ///
     /// assert_eq!(ArrayType::broadcast(&[&x]), Ok(x.clone()));
     /// assert_eq!(ArrayType::broadcast(&[&x, &y]), Ok(y.clone()));
@@ -1171,10 +1216,10 @@ impl ArrayType {
     ///
     /// ```rust
     /// # use ryft_core::types_v0::array_type::{ArrayType, DataType, Shape, Size};
-    /// let w = ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
+    /// let w = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
     /// let x = ArrayType::new(DataType::Boolean, Shape::scalar());
-    /// let y = ArrayType::new(DataType::UnsignedInt16, Shape::new(vec![Size::Dynamic(Some(10))]));
-    /// let z = ArrayType::new(DataType::Float32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]));
+    /// let y = ArrayType::new(DataType::U16, Shape::new(vec![Size::Dynamic(Some(10))]));
+    /// let z = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]));
     ///
     /// assert_eq!(x.broadcast_to(&x), Ok(x.clone()));
     /// assert_eq!(x.broadcast_to(&y), Ok(y.clone()));
@@ -1246,61 +1291,61 @@ mod tests {
     #[test]
     fn test_data_type_promoted() {
         assert_eq!(DataType::promoted(&[&Boolean]), Ok(Boolean));
-        assert_eq!(DataType::promoted(&[&Boolean, &Complex64]), Ok(Complex64));
-        assert_eq!(DataType::promoted(&[&Boolean, &Int2, &Complex64]), Ok(Complex64));
-        assert_eq!(DataType::promoted(&[&Float32, &Int2, &BFloat16]), Ok(Float32));
-        assert_eq!(DataType::promoted(&[&Float16, &BFloat16, &Float64]), Ok(Float64));
-        assert_eq!(DataType::promoted(&[&Float4E2M1FN, &Float6E2M3FN]), Ok(Float6E2M3FN));
+        assert_eq!(DataType::promoted(&[&Boolean, &C64]), Ok(C64));
+        assert_eq!(DataType::promoted(&[&Boolean, &I2, &C64]), Ok(C64));
+        assert_eq!(DataType::promoted(&[&F32, &I2, &BF16]), Ok(F32));
+        assert_eq!(DataType::promoted(&[&F16, &BF16, &F64]), Ok(F64));
+        assert_eq!(DataType::promoted(&[&F4E2M1FN, &F6E2M3FN]), Ok(F6E2M3FN));
 
         assert!(DataType::promoted(&[]).is_err());
-        assert!(DataType::promoted(&[&Float16, &BFloat16]).is_err());
-        assert!(DataType::promoted(&[&Float8E3M4, &Float8E8M0FNU]).is_err());
+        assert!(DataType::promoted(&[&F16, &BF16]).is_err());
+        assert!(DataType::promoted(&[&F8E3M4, &F8E8M0FNU]).is_err());
     }
 
     #[test]
     fn test_data_type_promote_to() {
         assert_eq!(Boolean.promote_to(&Boolean), Ok(Boolean));
-        assert_eq!(Boolean.promote_to(&Complex128), Ok(Complex128));
-        assert_eq!(UnsignedInt4.promote_to(&Int8), Ok(Int8));
-        assert_eq!(Float8E5M2FNUZ.promote_to(&BFloat16), Ok(BFloat16));
-        assert_eq!(BFloat16.promote_to(&Float32), Ok(Float32));
-        assert_eq!(Float64.promote_to(&Complex128), Ok(Complex128));
+        assert_eq!(Boolean.promote_to(&C128), Ok(C128));
+        assert_eq!(U4.promote_to(&I8), Ok(I8));
+        assert_eq!(F8E5M2FNUZ.promote_to(&BF16), Ok(BF16));
+        assert_eq!(BF16.promote_to(&F32), Ok(F32));
+        assert_eq!(F64.promote_to(&C128), Ok(C128));
 
-        assert!(UnsignedInt4.promote_to(&Int4).is_err());
-        assert!(Int16.promote_to(&Boolean).is_err());
-        assert!(Float6E2M3FN.promote_to(&Float4E2M1FN).is_err());
-        assert!(Float6E2M3FN.promote_to(&Float6E3M2FN).is_err());
-        assert!(Float64.promote_to(&Complex64).is_err());
+        assert!(U4.promote_to(&I4).is_err());
+        assert!(I16.promote_to(&Boolean).is_err());
+        assert!(F6E2M3FN.promote_to(&F4E2M1FN).is_err());
+        assert!(F6E2M3FN.promote_to(&F6E3M2FN).is_err());
+        assert!(F64.promote_to(&C64).is_err());
     }
 
     #[test]
     fn test_data_type_promotable_to() {
-        assert!(Boolean.promotable_to(&Float4E2M1FN));
-        assert!(Boolean.promotable_to(&BFloat16));
-        assert!(Boolean.promotable_to(&Complex128));
-        assert!(UnsignedInt4.promotable_to(&UnsignedInt4));
-        assert!(UnsignedInt4.promotable_to(&Int64));
-        assert!(Float8E4M3B11FNUZ.promotable_to(&BFloat16));
-        assert!(Float8E8M0FNU.promotable_to(&Float16));
-        assert!(Float16.promotable_to(&Float32));
-        assert!(Float32.promotable_to(&Complex64));
+        assert!(Boolean.promotable_to(&F4E2M1FN));
+        assert!(Boolean.promotable_to(&BF16));
+        assert!(Boolean.promotable_to(&C128));
+        assert!(U4.promotable_to(&U4));
+        assert!(U4.promotable_to(&I64));
+        assert!(F8E4M3B11FNUZ.promotable_to(&BF16));
+        assert!(F8E8M0FNU.promotable_to(&F16));
+        assert!(F16.promotable_to(&F32));
+        assert!(F32.promotable_to(&C64));
 
-        assert!(!UnsignedInt8.promotable_to(&Int8));
-        assert!(!Int2.promotable_to(&Boolean));
-        assert!(!Float6E2M3FN.promotable_to(&UnsignedInt2));
-        assert!(!Float6E3M2FN.promotable_to(&Float6E2M3FN));
-        assert!(!Float8E4M3B11FNUZ.promotable_to(&Float4E2M1FN));
+        assert!(!U8.promotable_to(&I8));
+        assert!(!I2.promotable_to(&Boolean));
+        assert!(!F6E2M3FN.promotable_to(&U2));
+        assert!(!F6E3M2FN.promotable_to(&F6E2M3FN));
+        assert!(!F8E4M3B11FNUZ.promotable_to(&F4E2M1FN));
     }
 
     #[test]
     fn test_data_type_to_string() {
         assert_eq!(Boolean.to_string(), "bool");
-        assert_eq!(UnsignedInt4.to_string(), "u4");
-        assert_eq!(Int64.to_string(), "i64");
-        assert_eq!(Float8E4M3FNUZ.to_string(), "f8e4m3fnuz");
-        assert_eq!(BFloat16.to_string(), "bf16");
-        assert_eq!(Float64.to_string(), "f64");
-        assert_eq!(Complex128.to_string(), "c128");
+        assert_eq!(U4.to_string(), "u4");
+        assert_eq!(I64.to_string(), "i64");
+        assert_eq!(F8E4M3FNUZ.to_string(), "f8e4m3fnuz");
+        assert_eq!(BF16.to_string(), "bf16");
+        assert_eq!(F64.to_string(), "f64");
+        assert_eq!(C128.to_string(), "c128");
     }
 
     #[test]
@@ -1451,8 +1496,8 @@ mod tests {
         let s2 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(Float32, s1);
-        let t2 = ArrayType::new(Float8E3M4, s2);
+        let t1 = ArrayType::new(F32, s1);
+        let t2 = ArrayType::new(F8E3M4, s2);
 
         assert_eq!(t0.rank(), 0);
         assert_eq!(t1.rank(), 3);
@@ -1464,8 +1509,8 @@ mod tests {
         let s0 = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
         let s1 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
-        let t0 = ArrayType::new(Float32, s0);
-        let t1 = ArrayType::new(Float8E3M4, s1);
+        let t0 = ArrayType::new(F32, s0);
+        let t1 = ArrayType::new(F8E3M4, s1);
 
         assert_eq!(t0.dimension(0), Size::Static(42));
         assert_eq!(t0.dimension(2), Size::Static(2));
@@ -1484,11 +1529,11 @@ mod tests {
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(Float32, s1);
-        let t2 = ArrayType::new(BFloat16, s2);
-        let t3 = ArrayType::new(Float16, s3);
-        let t4 = ArrayType::new(Complex64, s4);
-        let t5 = ArrayType::new(Float8E4M3FN, s5);
+        let t1 = ArrayType::new(F32, s1);
+        let t2 = ArrayType::new(BF16, s2);
+        let t3 = ArrayType::new(F16, s3);
+        let t4 = ArrayType::new(C64, s4);
+        let t5 = ArrayType::new(F8E4M3FN, s5);
 
         assert_eq!(ArrayType::broadcast(&[&t0]), Ok(t0.clone()));
         assert_eq!(ArrayType::broadcast(&[&t0, &t0]), Ok(t0.clone()));
@@ -1517,11 +1562,11 @@ mod tests {
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(Float32, s1);
-        let t2 = ArrayType::new(BFloat16, s2);
-        let t3 = ArrayType::new(Float16, s3);
-        let t4 = ArrayType::new(Complex64, s4);
-        let t5 = ArrayType::new(Float8E4M3FN, s5);
+        let t1 = ArrayType::new(F32, s1);
+        let t2 = ArrayType::new(BF16, s2);
+        let t3 = ArrayType::new(F16, s3);
+        let t4 = ArrayType::new(C64, s4);
+        let t5 = ArrayType::new(F8E4M3FN, s5);
 
         assert_eq!(t0.broadcast_to(&t0), Ok(t0.clone()));
         assert_eq!(t0.broadcast_to(&t1), Ok(t1.clone()));
@@ -1550,11 +1595,11 @@ mod tests {
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(Float32, s1);
-        let t2 = ArrayType::new(BFloat16, s2);
-        let t3 = ArrayType::new(Float16, s3);
-        let t4 = ArrayType::new(Complex64, s4);
-        let t5 = ArrayType::new(Float8E4M3FN, s5);
+        let t1 = ArrayType::new(F32, s1);
+        let t2 = ArrayType::new(BF16, s2);
+        let t3 = ArrayType::new(F16, s3);
+        let t4 = ArrayType::new(C64, s4);
+        let t5 = ArrayType::new(F8E4M3FN, s5);
 
         assert!(t0.broadcastable_to(&t0));
         assert!(t0.broadcastable_to(&t1));
@@ -1583,11 +1628,11 @@ mod tests {
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(Float32, s1);
-        let t2 = ArrayType::new(BFloat16, s2);
-        let t3 = ArrayType::new(Float16, s3);
-        let t4 = ArrayType::new(Complex64, s4);
-        let t5 = ArrayType::new(Float8E4M3FN, s5);
+        let t1 = ArrayType::new(F32, s1);
+        let t2 = ArrayType::new(BF16, s2);
+        let t3 = ArrayType::new(F16, s3);
+        let t4 = ArrayType::new(C64, s4);
+        let t5 = ArrayType::new(F8E4M3FN, s5);
 
         assert_eq!(t0.to_string(), "bool[]");
         assert_eq!(t1.to_string(), "f32[42, 4, 2]");
