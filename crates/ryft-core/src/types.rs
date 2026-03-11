@@ -6,8 +6,8 @@ use ryft_pjrt::BufferType;
 #[cfg(feature = "xla")]
 use crate::errors::Error;
 
-/// Type of the data stored in an array or scalar value. Specifically, this represents
-/// the type of individual values that are stored in that value.
+/// Type of the data stored in an array, tensor, matrix, vector, scalar, etc. Specifically, this represents the type of
+/// individual values that are stored in that array, etc.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ElementType {
     /// [`ElementType`] that represents token values that are threaded between side-effecting operations.
@@ -189,7 +189,7 @@ impl Display for ElementType {
 #[cfg(feature = "xla")]
 impl ElementType {
     /// Creates an [`ElementType`] from the provided [`BufferType`]. Returns an [`Error::InvalidElementType`]
-    /// when `buffer_type` is [`BufferType::Invalid`], which is a PJRT-only sentinel value.
+    /// when the provided [`BufferType`] is [`BufferType::Invalid`], which is a PJRT-only sentinel value.
     pub fn from_buffer_type(buffer_type: BufferType) -> Result<Self, Error> {
         buffer_type.try_into()
     }
@@ -292,97 +292,88 @@ mod tests {
     use super::BufferType;
     use super::ElementType;
 
-    const DISPLAY_CASES: &[(ElementType, &str)] = &[
-        (ElementType::Token, "token"),
-        (ElementType::Predicate, "pred"),
-        (ElementType::I1, "i1"),
-        (ElementType::I2, "i2"),
-        (ElementType::I4, "i4"),
-        (ElementType::I8, "i8"),
-        (ElementType::I16, "i16"),
-        (ElementType::I32, "i32"),
-        (ElementType::I64, "i64"),
-        (ElementType::U1, "u1"),
-        (ElementType::U2, "u2"),
-        (ElementType::U4, "u4"),
-        (ElementType::U8, "u8"),
-        (ElementType::U16, "u16"),
-        (ElementType::U32, "u32"),
-        (ElementType::U64, "u64"),
-        (ElementType::F4E2M1FN, "f4e2m1fn"),
-        (ElementType::F8E3M4, "f8e3m4"),
-        (ElementType::F8E4M3, "f8e4m3"),
-        (ElementType::F8E4M3FN, "f8e4m3fn"),
-        (ElementType::F8E4M3FNUZ, "f8e4m3fnuz"),
-        (ElementType::F8E4M3B11FNUZ, "f8e4m3b11fnuz"),
-        (ElementType::F8E5M2, "f8e5m2"),
-        (ElementType::F8E5M2FNUZ, "f8e5m2fnuz"),
-        (ElementType::F8E8M0FNU, "f8e8m0fnu"),
-        (ElementType::BF16, "bf16"),
-        (ElementType::F16, "f16"),
-        (ElementType::F32, "f32"),
-        (ElementType::F64, "f64"),
-        (ElementType::C64, "c64"),
-        (ElementType::C128, "c128"),
-    ];
-
     #[test]
-    fn test_element_type_display_matches_xla_names() {
-        for &(element_type, expected_name) in DISPLAY_CASES {
+    fn test_element_type() {
+        for &(element_type, expected_name) in &[
+            (ElementType::Token, "token"),
+            (ElementType::Predicate, "pred"),
+            (ElementType::I1, "i1"),
+            (ElementType::I2, "i2"),
+            (ElementType::I4, "i4"),
+            (ElementType::I8, "i8"),
+            (ElementType::I16, "i16"),
+            (ElementType::I32, "i32"),
+            (ElementType::I64, "i64"),
+            (ElementType::U1, "u1"),
+            (ElementType::U2, "u2"),
+            (ElementType::U4, "u4"),
+            (ElementType::U8, "u8"),
+            (ElementType::U16, "u16"),
+            (ElementType::U32, "u32"),
+            (ElementType::U64, "u64"),
+            (ElementType::F4E2M1FN, "f4e2m1fn"),
+            (ElementType::F8E3M4, "f8e3m4"),
+            (ElementType::F8E4M3, "f8e4m3"),
+            (ElementType::F8E4M3FN, "f8e4m3fn"),
+            (ElementType::F8E4M3FNUZ, "f8e4m3fnuz"),
+            (ElementType::F8E4M3B11FNUZ, "f8e4m3b11fnuz"),
+            (ElementType::F8E5M2, "f8e5m2"),
+            (ElementType::F8E5M2FNUZ, "f8e5m2fnuz"),
+            (ElementType::F8E8M0FNU, "f8e8m0fnu"),
+            (ElementType::BF16, "bf16"),
+            (ElementType::F16, "f16"),
+            (ElementType::F32, "f32"),
+            (ElementType::F64, "f64"),
+            (ElementType::C64, "c64"),
+            (ElementType::C128, "c128"),
+        ] {
             assert_eq!(element_type.to_string(), expected_name);
         }
     }
 
     #[cfg(feature = "xla")]
-    const BUFFER_TYPE_CASES: &[(ElementType, BufferType)] = &[
-        (ElementType::Token, BufferType::Token),
-        (ElementType::Predicate, BufferType::Predicate),
-        (ElementType::I1, BufferType::I1),
-        (ElementType::I2, BufferType::I2),
-        (ElementType::I4, BufferType::I4),
-        (ElementType::I8, BufferType::I8),
-        (ElementType::I16, BufferType::I16),
-        (ElementType::I32, BufferType::I32),
-        (ElementType::I64, BufferType::I64),
-        (ElementType::U1, BufferType::U1),
-        (ElementType::U2, BufferType::U2),
-        (ElementType::U4, BufferType::U4),
-        (ElementType::U8, BufferType::U8),
-        (ElementType::U16, BufferType::U16),
-        (ElementType::U32, BufferType::U32),
-        (ElementType::U64, BufferType::U64),
-        (ElementType::F4E2M1FN, BufferType::F4E2M1FN),
-        (ElementType::F8E3M4, BufferType::F8E3M4),
-        (ElementType::F8E4M3, BufferType::F8E4M3),
-        (ElementType::F8E4M3FN, BufferType::F8E4M3FN),
-        (ElementType::F8E4M3FNUZ, BufferType::F8E4M3FNUZ),
-        (ElementType::F8E4M3B11FNUZ, BufferType::F8E4M3B11FNUZ),
-        (ElementType::F8E5M2, BufferType::F8E5M2),
-        (ElementType::F8E5M2FNUZ, BufferType::F8E5M2FNUZ),
-        (ElementType::F8E8M0FNU, BufferType::F8E8M0FNU),
-        (ElementType::BF16, BufferType::BF16),
-        (ElementType::F16, BufferType::F16),
-        (ElementType::F32, BufferType::F32),
-        (ElementType::F64, BufferType::F64),
-        (ElementType::C64, BufferType::C64),
-        (ElementType::C128, BufferType::C128),
-    ];
-
-    #[cfg(feature = "xla")]
     #[test]
-    fn test_element_type_round_trips_with_buffer_type() {
-        for &(element_type, buffer_type) in BUFFER_TYPE_CASES {
-            assert_eq!(ElementType::from_buffer_type(buffer_type), Ok(element_type));
-            assert_eq!(element_type.to_buffer_type(), buffer_type);
-        }
-    }
-
-    #[cfg(feature = "xla")]
-    #[test]
-    fn test_invalid_buffer_type_is_rejected() {
+    fn test_element_type_from_buffer_type() {
         assert!(matches!(
             ElementType::from_buffer_type(BufferType::Invalid),
             Err(Error::InvalidElementType { message }) if message == "invalid element type: 'invalid'",
         ));
+
+        for &(element_type, buffer_type) in &[
+            (ElementType::Token, BufferType::Token),
+            (ElementType::Predicate, BufferType::Predicate),
+            (ElementType::I1, BufferType::I1),
+            (ElementType::I2, BufferType::I2),
+            (ElementType::I4, BufferType::I4),
+            (ElementType::I8, BufferType::I8),
+            (ElementType::I16, BufferType::I16),
+            (ElementType::I32, BufferType::I32),
+            (ElementType::I64, BufferType::I64),
+            (ElementType::U1, BufferType::U1),
+            (ElementType::U2, BufferType::U2),
+            (ElementType::U4, BufferType::U4),
+            (ElementType::U8, BufferType::U8),
+            (ElementType::U16, BufferType::U16),
+            (ElementType::U32, BufferType::U32),
+            (ElementType::U64, BufferType::U64),
+            (ElementType::F4E2M1FN, BufferType::F4E2M1FN),
+            (ElementType::F8E3M4, BufferType::F8E3M4),
+            (ElementType::F8E4M3, BufferType::F8E4M3),
+            (ElementType::F8E4M3FN, BufferType::F8E4M3FN),
+            (ElementType::F8E4M3FNUZ, BufferType::F8E4M3FNUZ),
+            (ElementType::F8E4M3B11FNUZ, BufferType::F8E4M3B11FNUZ),
+            (ElementType::F8E5M2, BufferType::F8E5M2),
+            (ElementType::F8E5M2FNUZ, BufferType::F8E5M2FNUZ),
+            (ElementType::F8E8M0FNU, BufferType::F8E8M0FNU),
+            (ElementType::BF16, BufferType::BF16),
+            (ElementType::F16, BufferType::F16),
+            (ElementType::F32, BufferType::F32),
+            (ElementType::F64, BufferType::F64),
+            (ElementType::C64, BufferType::C64),
+            (ElementType::C128, BufferType::C128),
+        ] {
+            assert_eq!(ElementType::from_buffer_type(buffer_type), Ok(element_type));
+            assert_eq!(element_type.to_buffer_type(), buffer_type);
+        }
     }
 }
