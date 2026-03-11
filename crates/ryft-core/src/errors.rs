@@ -1,13 +1,23 @@
+use std::backtrace::Backtrace;
+
 use thiserror::Error;
 
-#[derive(Error, Clone, Debug, Eq, PartialEq)]
+/// Represents errors that can occur in `ryft-core`.
+#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Error {
-    #[error("runtime error: {message}")]
-    RuntimeError { message: String, backtrace: String },
-
+    /// Error returned when an argument value is invalid.
     #[error("{message}")]
-    InvalidElementType { message: String },
+    InvalidArgument { message: String, backtrace: String },
 
+    /// Error returned when a data type is invalid.
+    #[error("{message}")]
+    InvalidDataType { message: String, backtrace: String },
+
+    /// Error returned when a data type promotion is invalid.
+    #[error("{message}")]
+    InvalidDataTypePromotion { message: String, backtrace: String },
+
+    /// Error returned when extra parameter values remain unused.
     #[error(
         "{}",
         match paths.as_deref() {
@@ -20,6 +30,7 @@ pub enum Error {
     )]
     UnusedParameters { paths: Option<Vec<String>> },
 
+    /// Error returned when parameter values are missing.
     #[error(
         "{}",
         match paths.as_deref() {
@@ -32,9 +43,29 @@ pub enum Error {
     )]
     MissingParameters { expected_count: usize, paths: Option<Vec<String>> },
 
+    /// Error returned when parameter combinations are ambiguous.
     #[error(
         "got ambiguous parameter values while combining parameterized values; conflicting values: {}",
         values.iter().map(|value| format!("'{value}'")).collect::<Vec<_>>().join(", "),
     )]
     AmbiguousParameterCombination { values: Vec<String> },
+}
+
+impl Error {
+    /// Creates a new [`Error::InvalidArgument`].
+    pub fn invalid_argument<M: Into<String>>(message: M) -> Self {
+        Self::InvalidArgument { message: message.into(), backtrace: Backtrace::capture().to_string() }
+    }
+
+    /// Creates a new [`Error::InvalidDataType`].
+    pub fn invalid_data_type<M: Into<String>>(message: M) -> Self {
+        Self::InvalidDataType { message: message.into(), backtrace: Backtrace::capture().to_string() }
+    }
+
+    /// Creates a new [`Error::InvalidDataTypePromotion`].
+    pub fn invalid_data_type_promotion<M: Into<String>>(message: M) -> Self {
+        Self::InvalidDataTypePromotion { message: message.into(), backtrace: Backtrace::capture().to_string() }
+    }
+
+    // TODO(eaplatanios): Add constructors for the parameter-related errors.
 }

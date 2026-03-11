@@ -23,10 +23,9 @@ When asked to implement a change or add a new feature, you must always follow th
 1. **Planning:** Enter plan mode for ANY non-trivial task (e.g., anything that involves 3+ steps or architectural
    decisions). If something goes sideways, STOP and re-plan immediately; do not keep pushing. Use plan mode for
    verification steps; not just for building. Always write detailed specifications upfront to reduce ambiguity.
-   You must start tackling non-trivial tasks by writing a plan to `.agents/tasks/plan_<task_name>.md` with checkable
-   items, letting the user modify it before you start executing on it. While executing on a plan, you must mark
-   completed items as such in that file, adding a high-level summary of what you did for each step in a new review
-   section.
+   You must start tackling non-trivial tasks by writing a plan to `.tasks/plan_<task_name>.md` with checkable items,
+   letting the user modify it before you start executing on it. While executing on a plan, you must mark completed
+   items as such in that file, adding a high-level summary of what you did for each step in a new review section.
 2. **Subagents:** Use subagents liberally to keep the main context clean. Offload research, exploration, and parallel
    analysis to subagents. Always use subagents for complex programs and stick to one task per subagent for focused
    execution.
@@ -79,6 +78,7 @@ update this file so that they do not need to remind you again in the future.
 - Use explicit `match`/`if let` when mapping to domain-specific errors.
 - Use `Result<_, Error>` with the crate-specific `Error` type as the return type for functions that can return errors.
   In the `ryft-pjrt` crate, return `Result<_, Error>` and map null/invalid handles to explicit error variants.
+- Error messages must start with lowercase text and must not end with trailing punctuation.
 - Custom error variants typically carry a `message` and sometimes a `backtrace` via `Backtrace::capture().to_string()`.
 - `unwrap()`/`expect()` are allowed only:
   - in tests, or
