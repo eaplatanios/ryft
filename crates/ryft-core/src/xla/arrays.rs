@@ -184,7 +184,7 @@ impl<'o> Array<'o> {
                 });
             }
 
-            let actual_element_type = ElementType::from_buffer_type(buffer.element_type()?)?;
+            let actual_element_type = ElementType::from_pjrt_buffer_type(buffer.element_type()?)?;
             if actual_element_type != element_type {
                 return Err(ArrayError::BufferElementTypeMismatch {
                     device_id,

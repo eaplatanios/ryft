@@ -188,14 +188,14 @@ impl Display for ElementType {
 
 #[cfg(feature = "xla")]
 impl ElementType {
-    /// Creates an [`ElementType`] from the provided [`BufferType`]. Returns an [`Error::InvalidElementType`]
+    /// Creates an [`ElementType`] from the provided PJRT [`BufferType`]. Returns an [`Error::InvalidElementType`]
     /// when the provided [`BufferType`] is [`BufferType::Invalid`], which is a PJRT-only sentinel value.
-    pub fn from_buffer_type(buffer_type: BufferType) -> Result<Self, Error> {
+    pub fn from_pjrt_buffer_type(buffer_type: BufferType) -> Result<Self, Error> {
         buffer_type.try_into()
     }
 
-    /// Returns the [`BufferType`] that corresponds to this [`ElementType`].
-    pub fn to_buffer_type(self) -> BufferType {
+    /// Returns the PJRT [`BufferType`] that corresponds to this [`ElementType`].
+    pub fn to_pjrt_buffer_type(self) -> BufferType {
         self.into()
     }
 }
@@ -333,9 +333,9 @@ mod tests {
 
     #[cfg(feature = "xla")]
     #[test]
-    fn test_element_type_from_buffer_type() {
+    fn test_element_type_from_pjrt_buffer_type() {
         assert!(matches!(
-            ElementType::from_buffer_type(BufferType::Invalid),
+            ElementType::from_pjrt_buffer_type(BufferType::Invalid),
             Err(Error::InvalidElementType { message }) if message == "invalid element type: 'invalid'",
         ));
 
@@ -372,8 +372,8 @@ mod tests {
             (ElementType::C64, BufferType::C64),
             (ElementType::C128, BufferType::C128),
         ] {
-            assert_eq!(ElementType::from_buffer_type(buffer_type), Ok(element_type));
-            assert_eq!(element_type.to_buffer_type(), buffer_type);
+            assert_eq!(ElementType::from_pjrt_buffer_type(buffer_type), Ok(element_type));
+            assert_eq!(element_type.to_pjrt_buffer_type(), buffer_type);
         }
     }
 }
