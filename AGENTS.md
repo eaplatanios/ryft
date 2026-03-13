@@ -57,6 +57,7 @@ update this file so that they do not need to remind you again in the future.
 - Prefer extending existing modules over creating new small files.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
+- For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
 
 #### Formatting & Naming
 
@@ -68,6 +69,8 @@ update this file so that they do not need to remind you again in the future.
 - Use full words for variable names and avoid abbreviations or shortened versions of words.
 - For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
   `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
+- For user-requested renames or removals, always run a targeted search afterward to verify that no old identifier
+  references remain in the `ryft` codebase.
 - Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.
 - Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
 
@@ -138,6 +141,11 @@ update this file so that they do not need to remind you again in the future.
   documentation unless their name is self-explanatory. If an enum variant requires a documentation string, then you must
   add documentation for all variants in that enum and separate them with an empty line.
 - Prefer descriptive documentation that explains semantics and edge cases and includes examples where appropriate.
+- When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code
+  "matches" another system such as JAX unless the external comparison is itself the point of the documentation.
+- Link to external official documentation when relevant (e.g., for MLIR, StableHLO, PJRT, XLA, Rustonomicon, etc.).
+- When linking external documentation, prefer the most precise relevant page/section instead of just using top-level
+  project pages.
 - On first mention of in-repo entities, use rustdoc links (e.g., ``[`Operation`]``), and use explicit paths (e.g.,
   ``[`Operation`](crate::Operation)``) when not imported in the current scope.
 - For function/method argument documentation strings, use a dedicated `# Parameters` section with this exact bullet 
@@ -150,9 +158,17 @@ update this file so that they do not need to remind you again in the future.
   - why it is still exposed (e.g., extensibility/interoperability).
 - For callback- and threading-heavy code, explain the lifetime/ownership invariants in comments. You can refer to
   documentation strings in the core traits of the `ryft-pjrt` crate for examples of this.
-- Link to external official documentation when relevant (e.g., for MLIR, StableHLO, PJRT, XLA, Rustonomicon, etc.).
-- When linking external documentation, prefer the most precise relevant page/section instead of just using top-level
-  project pages.
+- When using ASCII diagrams or Markdown tables in doc comments, align columns for source readability and indent the
+  block content slightly so that the raw Rust file remains easy to scan.
+- When a `rustdoc` diagram would materially improve documentation clarity, prefer a rendered Mermaid diagram via
+  `aquamarine` over a large ASCII graph, while keeping any supporting tables aligned in the raw source.
+- When a large `rustdoc` table needs color or layout that Markdown cannot express cleanly, prefer theme-aware raw HTML
+  with colors derived from rustdoc CSS variables instead of hard-coded light-theme colors, and prefer a small local
+  `<style>` block with namespaced classes over repeating large inline styles on every cell.
+- Keep raw HTML and CSS in doc comments within the repo's 120-column limit by breaking declarations, tags, and table
+  cells across multiple lines instead of leaving oversized single-line blocks.
+- When revising one sentence inside a documentation paragraph, reread and polish the whole paragraph so the final
+  wording is coherent as a unit instead of sounding locally patched.
 
 ## Testing Style
 
@@ -174,6 +190,8 @@ update this file so that they do not need to remind you again in the future.
 - When similar test patterns repeat, extract helper functions or declarative macros. Prefer to add them to the `tests`
   module at the root `lib.rs` file of the corresponding crate, like we have already done for some helpers in
   `ryft-mlir` and `ryft-pjrt`.
+- In tests, prefer flat sequences of explicit assertions over local helper closures or `for` loops unless the user
+  explicitly asks for the latter.
 
 ## Crate-Specific Conventions
 

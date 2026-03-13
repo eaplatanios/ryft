@@ -142,7 +142,7 @@ pub enum ArrayStructureTypeBroadcastingError {
 
 #[cfg(test)]
 mod tests {
-    use crate::types_v0::array_type::DataType::*;
+    use crate::types::DataType::*;
     use crate::types_v0::array_type::{Shape, Size};
 
     use super::*;
@@ -231,7 +231,7 @@ mod tests {
         let t2 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]));
         let t3 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]));
         let t4 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]));
-        let t5 = ArrayType::new(F8E4M3FN, Shape::new(vec![42.into(), Size::Dynamic(None)]));
+        let t5 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]));
 
         let j0 = JvpTracer {
             value: JvpTracer { value: JvpTracer { value: t0.clone(), tangent: t1.clone() }, tangent: t2.clone() },
@@ -255,7 +255,7 @@ mod tests {
         let t2 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]));
         let t3 = ArrayType::new(F16, Shape::new(vec![4.into(), 1.into()]));
         let t4 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]));
-        let t5 = ArrayType::new(F8E4M3FN, Shape::new(vec![42.into(), Size::Dynamic(None)]));
+        let t5 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]));
         let t6 = ArrayType::new(F32, Shape::new(vec![1.into()]));
         let t7 = ArrayType::new(F32, Shape::new(vec![4.into()]));
         let t8 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));

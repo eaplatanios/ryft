@@ -6,9 +6,10 @@ use crate::{
     differentiation::JvpTracer,
     programs::{Constant, ConstantExpression, Program, ProgramType},
     tracing_v0::{Tracer, VariableTracer},
+    types::DataType,
 };
 
-use super::array_type::{ArrayType, DataType};
+use super::array_type::ArrayType;
 
 // Our tracing module defines its own [DataType] and [Shape] types that ought to be decoupled from the corresponding
 // types that may be used by different kinds of [Parameter]s. This enables us to support multiple different backends
