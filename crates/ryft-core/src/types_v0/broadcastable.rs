@@ -13,7 +13,7 @@ use super::array_type::{ArrayType, ArrayTypeBroadcastingError};
 /// [`Parameterized<ArrayType>`]: values are flattened into their nested [`ArrayType`] leaves, those leaves are
 /// broadcast position-wise with [`ArrayType::broadcast`], and the result is reconstructed using the original
 /// parameter structure.
-pub trait Broadcastable: Type + Sized {
+pub trait Broadcastable: Sized {
     /// Broadcasts the provided values into a single compatible value.
     ///
     /// All inputs must share the same [`Parameterized`] structure. Once that structural check passes, broadcasting is
@@ -23,7 +23,7 @@ pub trait Broadcastable: Type + Sized {
 
 impl<T> Broadcastable for T
 where
-    T: Clone + Type + Parameterized<ArrayType>,
+    T: Clone + Parameterized<ArrayType>,
     T::ParameterStructure: Clone + PartialEq,
 {
     fn broadcast(values: &[&Self]) -> Result<Self, BroadcastingError> {
