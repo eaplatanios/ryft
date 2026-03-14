@@ -58,6 +58,8 @@ update this file so that they do not need to remind you again in the future.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
+- When replacing a bespoke cross-cutting capability with something more general, prefer a small named trait over a
+  higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).
 
 #### Formatting & Naming
 
