@@ -12,7 +12,7 @@ use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v0::Tracer,
     types::{Type, Typed},
-    types_v0::array_structure_type::ArrayStructureTypeBroadcastingError,
+    types_v0::broadcastable::BroadcastingError,
 };
 
 pub type AtomId = usize;
@@ -791,7 +791,7 @@ pub enum ProgramError {
     InvalidAtomType { id: AtomId, expected: String, got: String },
 
     #[error("{0}")]
-    ArrayStructureTypeBroadcastingError(#[from] ArrayStructureTypeBroadcastingError),
+    BroadcastingError(#[from] BroadcastingError),
     //
     // #[error("encountered tracers with mismatched program builders")]
     // MismatchedProgramBuilders,

@@ -14,7 +14,8 @@ use crate::{
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing_v0::{Tracer, VariableTracer},
     types::{Type, Typed},
-    types_v0::ArrayType,
+    types_v0::broadcastable::BroadcastingError,
+    types_v0::{ArrayType, Broadcastable},
 };
 
 // How do we handle things like `grad(lambda x: x**2 if x > 0 else 0.)`? In this case, we need to be able to keep the
@@ -52,6 +53,21 @@ impl<T, V: Differentiable<Tangent>, O, Tangent> Differentiable<Tracer<T, Tangent
 pub struct JvpTracer<Value, Tangent> {
     pub value: Value,
     pub tangent: Tangent,
+}
+
+impl<Value: Broadcastable, Tangent: Broadcastable> Broadcastable for JvpTracer<Value, Tangent> {
+    fn broadcast(values: &[&Self]) -> Result<Self, BroadcastingError> {
+        if values.is_empty() {
+            return Err(BroadcastingError::Empty);
+        }
+
+        let value_types = values.iter().map(|value| &value.value).collect::<Vec<_>>();
+        let tangent_types = values.iter().map(|value| &value.tangent).collect::<Vec<_>>();
+        Ok(Self {
+            value: Value::broadcast(value_types.as_slice())?,
+            tangent: Tangent::broadcast(tangent_types.as_slice())?,
+        })
+    }
 }
 
 impl<Value: Display, Tangent: Display> Display for JvpTracer<Value, Tangent> {

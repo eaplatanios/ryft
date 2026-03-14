@@ -11,7 +11,7 @@ use crate::{
     programs::{InterpretableOp, LinearInterpretableOp, LinearOp, Op, ProgramError},
     tracing_v0::{Traceable, TraceableOp, Tracer},
     types::{Type, Typed},
-    types_v0::ArrayStructureType,
+    types_v0::Broadcastable,
 };
 
 // ======================================================= NEG =======================================================
@@ -100,21 +100,21 @@ impl Display for AddOp {
     }
 }
 
-impl<T: Clone + ArrayStructureType> Op<T> for AddOp {
+impl<T: Clone + Broadcastable> Op<T> for AddOp {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 2);
         Ok(T::broadcast(input_types).map(|tpe| vec![tpe])?)
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Add<Output = V>> InterpretableOp<T, V> for AddOp {
+impl<T: Clone + Broadcastable, V: Clone + Add<Output = V>> InterpretableOp<T, V> for AddOp {
     fn interpret(&self, inputs: &[&V]) -> Result<Vec<V>, ProgramError> {
         assert_input_count_matches!(inputs.len(), 2);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone> LinearOp<T, V> for AddOp {
+impl<T: Clone + Broadcastable, V: Clone> LinearOp<T, V> for AddOp {
     fn transpose(
         &self,
         inputs: &[&Tracer<T, V, Box<dyn LinearOp<T, V>>>],
@@ -127,7 +127,7 @@ impl<T: Clone + ArrayStructureType, V: Clone> LinearOp<T, V> for AddOp {
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Add<Output = V>> LinearInterpretableOp<T, V> for AddOp {}
+impl<T: Clone + Broadcastable, V: Clone + Add<Output = V>> LinearInterpretableOp<T, V> for AddOp {}
 
 impl<V: Add<VR, Output = V>, VT: Add<VTR, Output = VT>, VR, VTR> Add<JvpTracer<VR, VTR>> for JvpTracer<V, VT> {
     type Output = JvpTracer<V, VT>;
@@ -140,7 +140,7 @@ impl<V: Add<VR, Output = V>, VT: Add<VTR, Output = VT>, VR, VTR> Add<JvpTracer<V
 // Tracer<V> + Tracer<V>
 macro_rules! impl_add_for_tracer {
     ($ty:path, value_type_bounds = ($($value_type_bounds:path),*)) => {
-        impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Add for Tracer<T, V, Box<dyn $ty>> {
+        impl<T: Clone + Broadcastable, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Add for Tracer<T, V, Box<dyn $ty>> {
             type Output = Self;
 
             fn add(self, rhs: Self) -> Self::Output {
@@ -170,21 +170,21 @@ impl Display for SubOp {
     }
 }
 
-impl<T: Clone + ArrayStructureType> Op<T> for SubOp {
+impl<T: Clone + Broadcastable> Op<T> for SubOp {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 2);
         Ok(T::broadcast(input_types).map(|tpe| vec![tpe])?)
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Sub<Output = V>> InterpretableOp<T, V> for SubOp {
+impl<T: Clone + Broadcastable, V: Clone + Sub<Output = V>> InterpretableOp<T, V> for SubOp {
     fn interpret(&self, inputs: &[&V]) -> Result<Vec<V>, ProgramError> {
         assert_input_count_matches!(inputs.len(), 2);
         Ok(vec![inputs[0].clone() - inputs[1].clone()])
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Display + Sub<Output = V> + Typed<T>> LinearOp<T, V> for SubOp {
+impl<T: Clone + Broadcastable, V: Clone + Display + Sub<Output = V> + Typed<T>> LinearOp<T, V> for SubOp {
     fn transpose(
         &self,
         inputs: &[&Tracer<T, V, Box<dyn LinearOp<T, V>>>],
@@ -196,10 +196,7 @@ impl<T: Clone + ArrayStructureType, V: Clone + Display + Sub<Output = V> + Typed
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Display + Sub<Output = V> + Typed<T>> LinearInterpretableOp<T, V>
-    for SubOp
-{
-}
+impl<T: Clone + Broadcastable, V: Clone + Display + Sub<Output = V> + Typed<T>> LinearInterpretableOp<T, V> for SubOp {}
 
 impl<V: Sub<VR>, VT: Sub<VTR>, VR, VTR> Sub<JvpTracer<VR, VTR>> for JvpTracer<V, VT> {
     type Output = JvpTracer<V::Output, VT::Output>;
@@ -211,7 +208,7 @@ impl<V: Sub<VR>, VT: Sub<VTR>, VR, VTR> Sub<JvpTracer<VR, VTR>> for JvpTracer<V,
 
 macro_rules! impl_sub_for_tracer {
     ($ty:path, value_type_bounds = ($($value_type_bounds:path),*)) => {
-        impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Sub for Tracer<T, V, Box<dyn $ty>> {
+        impl<T: Clone + Broadcastable, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Sub for Tracer<T, V, Box<dyn $ty>> {
             type Output = Self;
 
             fn sub(self, rhs: Self) -> Self::Output {
@@ -240,14 +237,14 @@ impl Display for MulOp {
     }
 }
 
-impl<T: Clone + ArrayStructureType> Op<T> for MulOp {
+impl<T: Clone + Broadcastable> Op<T> for MulOp {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 2);
         Ok(T::broadcast(input_types).map(|tpe| vec![tpe])?)
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Mul<Output = V>> InterpretableOp<T, V> for MulOp {
+impl<T: Clone + Broadcastable, V: Clone + Mul<Output = V>> InterpretableOp<T, V> for MulOp {
     fn interpret(&self, inputs: &[&V]) -> Result<Vec<V>, ProgramError> {
         assert_input_count_matches!(inputs.len(), 2);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
@@ -269,7 +266,7 @@ impl<V: Clone + Mul<VR> + Mul<VTR, Output: Add<<VT as Mul<VR>>::Output>>, VT: Mu
 
 macro_rules! impl_mul_for_tracer {
     ($ty:path, value_type_bounds = ($($value_type_bounds:path),*)) => {
-        impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Mul for Tracer<T, V, Box<dyn $ty>> {
+        impl<T: Clone + Broadcastable, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Mul for Tracer<T, V, Box<dyn $ty>> {
             type Output = Self;
 
             fn mul(self, rhs: Self) -> Self::Output {
@@ -298,7 +295,7 @@ impl<V: Display> Display for RightMulOp<V> {
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T>> Op<T> for RightMulOp<V> {
+impl<T: Clone + Broadcastable, V: Clone + Display + Typed<T>> Op<T> for RightMulOp<V> {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 1);
         let coefficient_type = self.coefficient.tpe();
@@ -307,7 +304,7 @@ impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T>> Op<T> for Rig
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Mul<Output = V>, R: Clone + Display + Into<V> + Typed<T>>
+impl<T: Clone + Broadcastable, V: Clone + Mul<Output = V>, R: Clone + Display + Into<V> + Typed<T>>
     InterpretableOp<T, V> for RightMulOp<R>
 {
     fn interpret(&self, inputs: &[&V]) -> Result<Vec<V>, ProgramError> {
@@ -316,7 +313,7 @@ impl<T: Clone + ArrayStructureType, V: Clone + Mul<Output = V>, R: Clone + Displ
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T> + 'static, R: Clone + Display + Into<V> + Typed<T>>
+impl<T: Clone + Broadcastable, V: Clone + Display + Typed<T> + 'static, R: Clone + Display + Into<V> + Typed<T>>
     LinearOp<T, V> for RightMulOp<R>
 {
     fn transpose(
@@ -335,7 +332,7 @@ impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T> + 'static, R: 
 }
 
 impl<
-    T: Clone + ArrayStructureType,
+    T: Clone + Broadcastable,
     V: Clone + Display + Mul<Output = V> + Typed<T> + 'static,
     R: Clone + Display + Into<V> + Typed<T>,
 > LinearInterpretableOp<T, V> for RightMulOp<R>
@@ -345,7 +342,7 @@ impl<
 macro_rules! impl_right_mul_for_traceable {
     ($O:path) => {
         impl<
-            T: Clone + ArrayStructureType,
+            T: Clone + Broadcastable,
             V: Clone + Display + Typed<T> + Mul<Output = V> + 'static,
             TR: Typed<T> + Into<V> + Traceable<Value = V>,
         > Mul<TR> for Tracer<T, V, Box<dyn $O>>
@@ -381,7 +378,7 @@ impl<V: Display> Display for LeftMulOp<V> {
     }
 }
 
-impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T>> Op<T> for LeftMulOp<V> {
+impl<T: Clone + Broadcastable, V: Clone + Display + Typed<T>> Op<T> for LeftMulOp<V> {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 1);
         let coefficient_type = self.coefficient.tpe();
@@ -390,7 +387,7 @@ impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T>> Op<T> for Lef
     }
 }
 
-impl<T: Clone + ArrayStructureType, L: Clone + Display + Into<V> + Typed<T>, V: Clone + Mul<Output = V>>
+impl<T: Clone + Broadcastable, L: Clone + Display + Into<V> + Typed<T>, V: Clone + Mul<Output = V>>
     InterpretableOp<T, V> for LeftMulOp<L>
 {
     fn interpret(&self, inputs: &[&V]) -> Result<Vec<V>, ProgramError> {
@@ -399,7 +396,7 @@ impl<T: Clone + ArrayStructureType, L: Clone + Display + Into<V> + Typed<T>, V: 
     }
 }
 
-impl<T: Clone + ArrayStructureType, L: Clone + Display + Into<V> + Typed<T>, V: Clone + Display + Typed<T> + 'static>
+impl<T: Clone + Broadcastable, L: Clone + Display + Into<V> + Typed<T>, V: Clone + Display + Typed<T> + 'static>
     LinearOp<T, V> for LeftMulOp<L>
 {
     fn transpose(
@@ -418,7 +415,7 @@ impl<T: Clone + ArrayStructureType, L: Clone + Display + Into<V> + Typed<T>, V: 
 }
 
 impl<
-    T: Clone + ArrayStructureType,
+    T: Clone + Broadcastable,
     L: Clone + Display + Into<V> + Typed<T>,
     V: Clone + Display + Mul<Output = V> + Typed<T> + 'static,
 > LinearInterpretableOp<T, V> for LeftMulOp<L>
@@ -430,7 +427,7 @@ impl<
 // macro_rules! impl_left_mul_for_traceable {
 //     ($O:path) => {
 //         impl<
-//                 T: Clone + ArrayStructureType,
+//                 T: Clone + Broadcastable,
 //                 V: Clone + Display + Typed<T> + Mul<Output = V> + 'static,
 //                 TR: Typed<T> + Into<V> + Traceable<Value = V>,
 //             > Mul<Tracer<T, V, Box<dyn $O>>> for TR
@@ -455,7 +452,7 @@ impl<
 
 macro_rules! impl_left_mul_for_scalar {
     ($V:path, $O:path) => {
-        impl<T: Clone + ArrayStructureType, V: Clone + Display + Typed<T> + Mul<Output = V> + 'static>
+        impl<T: Clone + Broadcastable, V: Clone + Display + Typed<T> + Mul<Output = V> + 'static>
             Mul<Tracer<T, V, Box<dyn $O>>> for $V
         where
             $V: Typed<T> + Into<V>,
@@ -495,7 +492,7 @@ impl_tracer_left_mul_for_scalars!(i8, i16, i32, i64, u8, u16, u32, u64, bf16, f1
 macro_rules! impl_left_mul_for_jvp_tracer {
     ($op:path) => {
         impl<
-            T: Clone + ArrayStructureType,
+            T: Clone + Broadcastable,
             VL: Into<VR>,
             VTL: Into<VTR>,
             VR: Clone + Display + Typed<T> + Mul<Output = VR> + Mul<VTR, Output = VTR> + 'static,
