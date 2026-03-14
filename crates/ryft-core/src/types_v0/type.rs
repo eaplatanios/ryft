@@ -6,7 +6,7 @@ use crate::{
     differentiation::JvpTracer,
     programs::{Constant, ConstantExpression, Program, ProgramType},
     tracing_v0::{Tracer, VariableTracer},
-    types::DataType,
+    types::data_type::DataType,
 };
 
 use super::array_type::ArrayType;

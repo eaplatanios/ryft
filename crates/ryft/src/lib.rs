@@ -5,7 +5,9 @@ pub use ryft_pjrt as pjrt;
 
 pub use ryft_core::errors::Error;
 pub use ryft_core::parameters::{
-    Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily, PathPrefixedParameterIterator,
-    Placeholder,
+    Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+    PathPrefixedParameterIterator, Placeholder,
 };
+pub use ryft_core::types::Type;
+pub use ryft_core::types::data_type::{DataType, DataTypeError};
 pub use ryft_macros::{Parameter, Parameterized};

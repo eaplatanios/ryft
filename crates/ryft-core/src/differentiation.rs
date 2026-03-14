@@ -9,9 +9,8 @@ use half::{bf16, f16};
 use ryft_macros::Parameter;
 
 use crate::{
-    errors::Error,
     ops::constants::{One, Zero},
-    parameters::{Parameter, Parameterized, ParameterizedFamily},
+    parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing_v0::{Tracer, VariableTracer},
     types_v0::{ArrayType, Type, Typed},
@@ -89,7 +88,7 @@ fn _jvp<
     function: F,
     value: Input,
     tangent: InputTangent,
-) -> Result<(Output, OutputTangent), Error> {
+) -> Result<(Output, OutputTangent), ParameterError> {
     let structure = value.parameter_structure();
     let input_values = value.into_parameters();
     let input_tangents = tangent.into_parameters();
@@ -121,7 +120,7 @@ pub fn jvp<
     function: F,
     value: Input,
     tangent: Input,
-) -> Result<(Output, Output), Error> {
+) -> Result<(Output, Output), ParameterError> {
     _jvp(function, value, tangent)
 }
 
@@ -198,7 +197,7 @@ pub fn _linearize<
 >(
     function: F,
     input: Input,
-) -> Result<(Output, ParameterizedProgram<T, VT, O, InputTangent, OutputTangent>), Error> {
+) -> Result<(Output, ParameterizedProgram<T, VT, O, InputTangent, OutputTangent>), ParameterError> {
     let mut program_builder = ProgramBuilder::<T, VT, O>::new();
     let input_structure = input.parameter_structure();
     let input_tangent_ids = input.parameters().map(|v| program_builder.add_variable(v.tpe())).collect::<Vec<_>>();
@@ -264,7 +263,7 @@ pub fn linearize<
 >(
     function: F,
     input: Input,
-) -> Result<(Output, ParameterizedProgram<T, V, Box<dyn LinearInterpretableOp<T, V>>, Input, Output>), Error> {
+) -> Result<(Output, ParameterizedProgram<T, V, Box<dyn LinearInterpretableOp<T, V>>, Input, Output>), ParameterError> {
     _linearize(function, input)
 }
 

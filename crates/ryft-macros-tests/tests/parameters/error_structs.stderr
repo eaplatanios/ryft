@@ -30,16 +30,16 @@ error[E0283]: type annotations needed
 10 | struct StructWithUnusedParameterType<P: Parameter> {
    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot infer type for type parameter `P` declared on the struct `StructWithUnusedParameterType`
    |
-   = note: cannot satisfy `_: Parameter`
-   = help: the following types implement trait `Parameter`:
+   = note: cannot satisfy `_: ryft::Parameter`
+   = help: the following types implement trait `ryft::Parameter`:
              ArrayType
-             DataType
-             JvpTracer<Value, Tangent>
+             Batch<V>
+             JitTracer<V>
+             LinearTerm<V>
+             MatrixAbstract
              Option<P>
              Placeholder
-             Tracer<T, V, O>
-             bool
-             f32
+             ScalarAbstract
            and $N others
 note: required by a bound in `StructWithUnusedParameterType`
   --> tests/parameters/error_structs.rs:10:41

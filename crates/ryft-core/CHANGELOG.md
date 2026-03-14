@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Added
+
+- Introduced the `Type` trait and the `DataType` type.
+- Introduced more fine-grained error types like `ParameterError` and `DataTypeError`.
+
 ## [0.0.2] - 2026-03-02
 
 ### Changed

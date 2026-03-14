@@ -2,8 +2,6 @@ use std::fmt::Display;
 
 pub mod data_type;
 
-pub use data_type::*;
-
 // TODO(eaplatanios): [DOC].
 // TODO(eaplatanios): Should [`Display`] really be a requirement here?
 pub trait Type: Display {

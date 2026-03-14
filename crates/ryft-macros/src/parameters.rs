@@ -129,7 +129,7 @@ impl CodeGenerator {
     ///         fn from_parameters_with_remainder<I: Iterator<Item = P>>(
     ///             structure: Self::To<ryft::Placeholder>,
     ///             parameters: &mut I,
-    ///         ) -> Result<Self, ryft::Error> {
+    ///         ) -> Result<Self, ryft::ParameterError> {
     ///             let expected_count = structure.parameter_count();
     ///             Ok(...)
     ///         }
@@ -1558,7 +1558,7 @@ impl CodeGenerator {
     /// fn from_parameters_with_remainder<I: Iterator<Item = P>>(
     ///     structure: Self::To<ryft::Placeholder>,
     ///     parameters: &mut I,
-    /// ) -> Result<Self, ryft::Error> {
+    /// ) -> Result<Self, ryft::ParameterError> {
     ///     let expected_count = structure.parameter_count();
     ///     Ok(...)
     /// }
@@ -1584,7 +1584,7 @@ impl CodeGenerator {
 
             // Note that `expected_count`, which is referenced by the generated code here is defined in the beginning
             // of the implementation of the generated [`Parameterized::from_parameters_with_remainder`] function body.
-            let missing_parameters_error = quote!(#ryft::Error::MissingParameters { expected_count, paths });
+            let missing_parameters_error = quote!(#ryft::ParameterError::MissingParameters { expected_count, paths });
 
             fields
                 .iter()
@@ -1598,7 +1598,7 @@ impl CodeGenerator {
                                 #structure,
                                 parameters,
                             ).map_err(|error| match error {
-                                #ryft::Error::MissingParameters { paths, .. } => #missing_parameters_error,
+                                #ryft::ParameterError::MissingParameters { paths, .. } => #missing_parameters_error,
                                 error => error,
                             })?
                         },
@@ -1652,7 +1652,7 @@ impl CodeGenerator {
             fn from_parameters_with_remainder<I: Iterator<Item = #parameter_type>>(
                 structure: Self::To<#ryft::Placeholder>,
                 parameters: &mut I,
-            ) -> Result<Self, #ryft::Error> {
+            ) -> Result<Self, #ryft::ParameterError> {
                 let expected_count = #self_to_as_parameterized::parameter_count(&structure);
                 Ok(#body)
             }
@@ -2460,7 +2460,7 @@ mod tests {
             indoc! {"
                 fn from_parameters_with_remainder < I : Iterator < Item = P >> \
                     (structure : Self :: To < ryft :: Placeholder > , parameters : & mut I ,) \
-                    -> Result < Self , ryft :: Error > { \
+                    -> Result < Self , ryft :: ParameterError > { \
                     let expected_count = < \
                         Self :: ParameterStructure as ryft :: Parameterized < ryft :: Placeholder >\
                     > :: parameter_count (& structure) ; \
@@ -2470,8 +2470,8 @@ mod tests {
                             parameters ,\
                         ) \
                             . map_err (| error | match error { \
-                                ryft :: Error :: MissingParameters { paths , .. } => \
-                                    ryft :: Error :: MissingParameters { expected_count , paths } , \
+                                ryft :: ParameterError :: MissingParameters { paths , .. } => \
+                                    ryft :: ParameterError :: MissingParameters { expected_count , paths } , \
                                 error => error , \
                             }) ? , \
                         nested : (structure . nested . 0 , \
@@ -2480,8 +2480,8 @@ mod tests {
                                 parameters ,\
                             ) \
                                 . map_err (| error | match error { \
-                                    ryft :: Error :: MissingParameters { paths , .. } => \
-                                        ryft :: Error :: MissingParameters { expected_count , paths } , \
+                                    ryft :: ParameterError :: MissingParameters { paths , .. } => \
+                                        ryft :: ParameterError :: MissingParameters { expected_count , paths } , \
                                     error => error , \
                                 }) ?) , \
                         helper : structure . helper \

@@ -110,17 +110,10 @@ help: there is a crate or module with a similar name
 21 - #[ryft(crate = "_ryft")]
 21 + #[ryft(crate = ryft)]
    |
-help: consider importing one of these items
+help: consider importing this enum
    |
- 1 + use std::error::Error;
+ 1 + use ryft::ParameterError;
    |
- 1 + use std::fmt::Error;
-   |
- 1 + use std::io::Error;
-   |
- 1 + use core::error::Error;
-   |
-   = and 2 other candidates
 
 error[E0223]: ambiguous associated type
   --> tests/parameters/error_attributes.rs:20:10

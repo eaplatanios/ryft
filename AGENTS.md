@@ -81,6 +81,8 @@ update this file so that they do not need to remind you again in the future.
 - Use explicit `match`/`if let` when mapping to domain-specific errors.
 - Use `Result<_, Error>` with the crate-specific `Error` type as the return type for functions that can return errors.
   In the `ryft-pjrt` crate, return `Result<_, Error>` and map null/invalid handles to explicit error variants.
+- Colocate domain-specific error types with the module that owns the corresponding API and define those error enums
+  immediately after the imports in that file. Use crate-level umbrella error types only for aggregation/wrapping.
 - Error messages must start with lowercase text and must not end with trailing punctuation.
 - Custom error variants typically carry a `message` and sometimes a `backtrace` via `Backtrace::capture().to_string()`.
 - `unwrap()`/`expect()` are allowed only:

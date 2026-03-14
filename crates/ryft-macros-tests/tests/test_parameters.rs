@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::ops::{Add, Mul};
 
-use ryft::{Parameter, Parameterized, Placeholder};
+use ryft::{Parameter, ParameterError, Parameterized, Placeholder};
 
 /// Helper for asserting that a [`Parameterized`] type has a specific [`Parameterized::ParameterStructure`] type.
 fn assert_parameter_structure_type<P: Parameter, T: Parameterized<P, ParameterStructure = S>, S>() {}
@@ -20,7 +20,7 @@ fn test_simple_struct() {
     let np_1 = 42u64;
     let mut value = Struct { p_0: 4usize, p_1: 2usize, np_0, np_1 };
     let structure = Struct { p_0: Placeholder, p_1: Placeholder, np_0, np_1 };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 2, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 2, paths: None });
 
     assert_parameter_structure_type::<usize, Struct<usize>, Struct<Placeholder>>();
     assert_eq!(value.parameter_count(), 2);
@@ -33,7 +33,7 @@ fn test_simple_struct() {
         Struct::from_parameters(structure.clone(), vec![4i64, 2i64]),
         Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 }),
     );
-    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
+    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ParameterError::UnusedParameters { paths: None }));
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, Struct { p_0: 8usize, p_1: 4usize, np_0, np_1 })
@@ -49,7 +49,7 @@ fn test_tuple_struct() {
     let np_1 = 42u64;
     let mut value = TupleStruct(4usize, 2usize, np_0, np_1);
     let structure = TupleStruct(Placeholder, Placeholder, np_0, np_1);
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 2, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 2, paths: None });
 
     assert_parameter_structure_type::<usize, TupleStruct<usize>, TupleStruct<Placeholder>>();
     assert_eq!(value.parameter_count(), 2);
@@ -64,7 +64,7 @@ fn test_tuple_struct() {
     );
     assert_eq!(
         TupleStruct::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 }
 
@@ -87,7 +87,7 @@ fn test_struct_with_nested_tuples_and_options() {
         np_0,
         np_1,
     };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 3, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 3, paths: None });
 
     assert_eq!(value.parameter_count(), 3);
     assert_eq!(value.parameter_structure(), structure);
@@ -104,7 +104,7 @@ fn test_struct_with_nested_tuples_and_options() {
     );
     assert_eq!(
         StructWithNestedTuples::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
@@ -117,7 +117,7 @@ fn test_struct_with_nested_tuples_and_options() {
     let mut value = StructWithNestedOption { p_0: Some((0usize, (-1i32, 2usize, -42i64, 0usize))), np_0, np_1 };
     let structure =
         StructWithNestedOption { p_0: Some((0usize, (-1i32, Placeholder, -42i64, Placeholder))), np_0, np_1 };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 2, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 2, paths: None });
 
     assert_eq!(value.parameter_count(), 2);
     assert_eq!(value.parameter_structure(), structure);
@@ -134,7 +134,7 @@ fn test_struct_with_nested_tuples_and_options() {
     );
     assert_eq!(
         StructWithNestedOption::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 
     let value = StructWithNestedOption::<usize> { p_0: None, np_0, np_1 };
@@ -149,7 +149,7 @@ fn test_struct_with_nested_tuples_and_options() {
     );
     assert_eq!(
         StructWithNestedOption::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 }
 
@@ -188,7 +188,7 @@ fn test_struct_with_nested_struct() {
         np_0,
         np_1,
     };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 4, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 4, paths: None });
 
     assert_eq!(value.parameter_count(), 4);
     assert_eq!(value.parameter_structure(), structure);
@@ -210,7 +210,7 @@ fn test_struct_with_nested_struct() {
     );
     assert_eq!(
         StructWithNestedStruct::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 }
 
@@ -235,7 +235,7 @@ fn test_empty_struct() {
     );
     assert_eq!(
         EmptyStruct::from_parameters(structure, vec![4i64, 2i64]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 }
 
@@ -264,7 +264,7 @@ fn test_non_empty_struct_with_no_parameters() {
     );
     assert_eq!(
         NonEmptyStruct::from_parameters(structure, vec![4usize, 2usize]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 }
 
@@ -278,7 +278,7 @@ fn test_struct_with_lifetime() {
 
     let mut value = Struct1 { x: 4usize, y: ("hey there", 42usize) };
     let structure = Struct1 { x: Placeholder, y: ("hey there", 42usize) };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 1, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 1, paths: None });
 
     assert_eq!(value.parameter_count(), 1);
     assert_eq!(value.parameter_structure(), structure);
@@ -290,7 +290,10 @@ fn test_struct_with_lifetime() {
         Struct1::from_parameters(structure.clone(), vec![4i64]),
         Ok(Struct1 { x: 4i64, y: ("hey there", 42usize) }),
     );
-    assert_eq!(Struct1::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
+    assert_eq!(
+        Struct1::from_parameters(structure, [0usize; 10]),
+        Err(ParameterError::UnusedParameters { paths: None })
+    );
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
     struct Struct2<'p, V: Parameter> {
@@ -300,7 +303,7 @@ fn test_struct_with_lifetime() {
 
     let mut value = Struct2 { x: 4usize, y: ("hey there", 42usize) };
     let structure = Struct2 { x: Placeholder, y: ("hey there", Placeholder) };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 2, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 2, paths: None });
 
     assert_eq!(value.parameter_count(), 2);
     assert_eq!(value.parameter_structure(), structure);
@@ -312,7 +315,10 @@ fn test_struct_with_lifetime() {
         Struct2::from_parameters(structure.clone(), vec![4i64, 2i64]),
         Ok(Struct2 { x: 4i64, y: ("hey there", 2i64) }),
     );
-    assert_eq!(Struct2::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
+    assert_eq!(
+        Struct2::from_parameters(structure, [0usize; 10]),
+        Err(ParameterError::UnusedParameters { paths: None })
+    );
 }
 
 #[test]
@@ -346,8 +352,8 @@ fn test_simple_enum() {
 
     let mut value = Enum::Parameter1 { field_0: (0usize, -42i64, 4usize), field_1: 2usize };
     let structure = Enum::Parameter1 { field_0: (0usize, Placeholder, 4usize), field_1: 2usize };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 1, paths: None });
-    let unused_parameters_error = Err(ryft::Error::UnusedParameters { paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 1, paths: None });
+    let unused_parameters_error = Err(ParameterError::UnusedParameters { paths: None });
 
     assert_parameter_structure_type::<usize, Enum<usize>, Enum<Placeholder>>();
     assert_eq!(value.parameter_count(), 1);
@@ -390,7 +396,7 @@ fn test_empty_enum() {
     );
     assert_eq!(
         EmptyEnum::from_parameters(structure, vec![0usize, 1usize]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 }
 
@@ -411,7 +417,7 @@ fn test_enum_with_lifetime() {
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 42usize]);
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![42usize]);
     assert_eq!(Enum::from_parameters(structure.clone(), vec![42i32]), Ok(Enum::X(42i32)));
-    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
+    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ParameterError::UnusedParameters { paths: None }));
 
     let mut value = Enum::Y("hey there", 42usize);
     let structure = Enum::Y("hey there", 42usize);
@@ -422,7 +428,7 @@ fn test_enum_with_lifetime() {
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
     assert_eq!(Enum::from_parameters(structure.clone(), Vec::<usize>::new()), Ok(value));
-    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
+    assert_eq!(Enum::from_parameters(structure, [0usize; 10]), Err(ParameterError::UnusedParameters { paths: None }));
 }
 
 #[test]
@@ -625,7 +631,7 @@ fn test_nested_vec() {
 
     let mut value = VecWrapper(vec![4usize, 2usize]);
     let structure = VecWrapper(vec![Placeholder, Placeholder]);
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 2, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 2, paths: None });
 
     assert_eq!(value.parameter_count(), 2);
     assert_eq!(value.parameter_structure(), structure);
@@ -636,7 +642,7 @@ fn test_nested_vec() {
     assert_eq!(VecWrapper::from_parameters(structure.clone(), vec![4i64, 2i64]), Ok(VecWrapper(vec![4i64, 2i64])));
     assert_eq!(
         VecWrapper::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 
     #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
@@ -644,7 +650,7 @@ fn test_nested_vec() {
 
     let mut value = MultiVecWrapper(vec![4usize, 2usize], 0usize, (Vec::new(), vec![vec![42usize]]));
     let structure = MultiVecWrapper(vec![Placeholder, Placeholder], 0usize, (Vec::new(), vec![vec![Placeholder]]));
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 3, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 3, paths: None });
 
     assert_eq!(value.parameter_count(), 3);
     assert_eq!(value.parameter_structure(), structure);
@@ -658,7 +664,7 @@ fn test_nested_vec() {
     );
     assert_eq!(
         MultiVecWrapper::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
@@ -676,7 +682,7 @@ fn test_nested_vec_of_tuples() {
         0usize,
         (Vec::new(), vec![(vec![Placeholder], Placeholder)]),
     );
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 6, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 6, paths: None });
 
     assert_eq!(value.parameter_count(), 6);
     assert_eq!(value.parameter_structure(), structure);
@@ -693,7 +699,7 @@ fn test_nested_vec_of_tuples() {
     );
     assert_eq!(
         NestedVecOfTuples::from_parameters(structure, [0usize; 10]),
-        Err(ryft::Error::UnusedParameters { paths: None }),
+        Err(ParameterError::UnusedParameters { paths: None }),
     );
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
@@ -714,7 +720,7 @@ fn test_generics() {
     let np_1 = 42u64;
     let mut value = Struct { p_0: 4usize, p_1: 2usize, np_0, np_1 };
     let structure = Struct { p_0: Placeholder, p_1: Placeholder, np_0, np_1 };
-    let missing_parameters_error = Err(ryft::Error::MissingParameters { expected_count: 2, paths: None });
+    let missing_parameters_error = Err(ParameterError::MissingParameters { expected_count: 2, paths: None });
 
     assert_eq!(value.parameter_count(), 2);
     assert_eq!(value.parameter_structure(), structure);
@@ -726,7 +732,7 @@ fn test_generics() {
         Struct::from_parameters(structure.clone(), vec![4i64, 2i64]),
         Ok(Struct { p_0: 4i64, p_1: 2i64, np_0, np_1 }),
     );
-    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ryft::Error::UnusedParameters { paths: None }));
+    assert_eq!(Struct::from_parameters(structure, [0usize; 10]), Err(ParameterError::UnusedParameters { paths: None }));
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, Struct { p_0: 8usize, p_1: 4usize, np_0, np_1 })

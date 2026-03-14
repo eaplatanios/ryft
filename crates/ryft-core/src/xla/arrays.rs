@@ -15,7 +15,7 @@ use thiserror::Error;
 use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
 use super::sharding::{Mesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout};
-use crate::types::DataType;
+use crate::types::data_type::{DataType, DataTypeError};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -33,7 +33,7 @@ pub enum ArrayError {
 
     /// Underlying data-type conversion error.
     #[error("{0}")]
-    DataTypeError(#[from] crate::errors::Error),
+    DataTypeError(#[from] DataTypeError),
 
     /// Error returned when an addressable buffer is placed on a device not present in the array mesh.
     #[error("addressable buffer is placed on device {device_id}, but that device is not in the mesh")]
@@ -449,8 +449,7 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::types::DataType;
-
+    use crate::types::data_type::DataType;
     use crate::xla::sharding::{Mesh, MeshAxis, MeshDevice, PartitionDimension, PartitionSpec};
 
     use super::*;

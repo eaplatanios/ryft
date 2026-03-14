@@ -9,6 +9,10 @@
 //! - Primitive ops carry their own `eval`, `jvp`, `batch`, and transpose rules.
 //! - Transform-specific context values thread both top-level runtime state and local staging state.
 
+use thiserror::Error;
+
+use crate::parameters::ParameterError;
+
 mod batch;
 mod context;
 mod forward;
@@ -20,8 +24,6 @@ mod ops;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod value;
-
-use thiserror::Error;
 
 pub use batch::{Batch, stack, unstack, vmap};
 pub use context::{BatchingContext, JitContext, JvpContext};
@@ -79,7 +81,7 @@ pub enum TraceError {
 
     /// Wrapper around parameter-lifting failures from the `Parameterized` infrastructure.
     #[error(transparent)]
-    Parameter(#[from] crate::errors::Error),
+    Parameter(#[from] ParameterError),
 }
 
 #[cfg(test)]
