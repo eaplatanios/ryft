@@ -10,7 +10,8 @@ use crate::{
     differentiation::JvpTracer,
     programs::{InterpretableOp, LinearInterpretableOp, LinearOp, Op, ProgramError},
     tracing_v0::{Traceable, TraceableOp, Tracer},
-    types_v0::{ArrayStructureType, Typed},
+    types::{Type, Typed},
+    types_v0::ArrayStructureType,
 };
 
 // ======================================================= NEG =======================================================
@@ -68,7 +69,7 @@ impl<V: Neg<Output = VN>, VT: Neg<Output = VTN>, VN, VTN> Neg for JvpTracer<V, V
 macro_rules! impl_neg_for_tracer {
     ($ty:path) => { impl_neg_for_tracer!($ty, value_type_bounds = []); };
     ($ty:path, value_type_bounds = [$($value_type_bounds:path),*]) => {
-        impl<T: Clone, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Neg for Tracer<T, V, Box<dyn $ty>> {
+        impl<T: Clone + Type, V: Clone + Display + Typed<T> $(+$value_type_bounds)*> Neg for Tracer<T, V, Box<dyn $ty>> {
             type Output = Self;
 
             fn neg(self) -> Self::Output {

@@ -8,7 +8,7 @@ use crate::{
     parameters::Parameter,
     programs::{InterpretableOp, Op, ProgramError},
     tracing_v0::{TraceableOp, Tracer},
-    types_v0::Typed,
+    types::{Type, Typed},
 };
 
 // ======================================================= SIN =======================================================
@@ -61,7 +61,7 @@ impl<T: Clone, V: Clone + Sin> InterpretableOp<T, V> for SinOp {
 macro_rules! impl_sin_for_tracer {
         ($ty:path) => { impl_sin_for_tracer!($ty, value_type_bounds = []); };
         ($ty:path, value_type_bounds = [$($value_type_bounds:path),*]) => {
-            impl<T: Clone, V: Clone + Display + Sin + Typed<T> $(+$value_type_bounds)*> Sin for Tracer<T, V, Box<dyn $ty>> {
+            impl<T: Clone + Type, V: Clone + Display + Sin + Typed<T> $(+$value_type_bounds)*> Sin for Tracer<T, V, Box<dyn $ty>> {
                 fn sin(self) -> Self {
                     let inputs = vec![&self];
                     let outputs = (Box::new(SinOp) as Box<dyn $ty>).trace(inputs.as_slice()).unwrap();
@@ -127,7 +127,7 @@ impl<T: Clone, V: Clone + Cos> InterpretableOp<T, V> for CosOp {
 macro_rules! impl_cos_for_tracer {
         ($ty:path) => { impl_cos_for_tracer!($ty, value_type_bounds = []); };
         ($ty:path, value_type_bounds = [$($value_type_bounds:path),*]) => {
-            impl<T: Clone, V: Clone + Display + Cos + Typed<T> $(+$value_type_bounds)*> Cos for Tracer<T, V, Box<dyn $ty>> {
+            impl<T: Clone + Type, V: Clone + Display + Cos + Typed<T> $(+$value_type_bounds)*> Cos for Tracer<T, V, Box<dyn $ty>> {
                 fn cos(self) -> Self {
                     let inputs = vec![&self];
                     let outputs = (Box::new(CosOp) as Box<dyn $ty>).trace(inputs.as_slice()).unwrap();

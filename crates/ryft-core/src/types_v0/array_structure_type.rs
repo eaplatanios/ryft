@@ -1,13 +1,14 @@
 use thiserror::Error;
 
 use crate::differentiation::JvpTracer;
+use crate::types::Type;
 use crate::types_v0::array_type::{ArrayType, ArrayTypeBroadcastingError};
 
 /// Represents a (possibly) nested data structure over [`ArrayType`]s. Specifically, this represents types
 /// of nested structures over [`ArrayType`]d values. For example, a `JvpTracer<f32, f32>` has type
 /// `JvpTracer<ArrayType, ArrayType>` and this type itself is an [`ArrayStructureType`], as it holds
 /// two nested [`ArrayType`]s.
-pub trait ArrayStructureType: Sized {
+pub trait ArrayStructureType: Sized + Type {
     /// Returns an [`Iterator`] over the nested [`ArrayType`]s.
     fn types(&self) -> impl Iterator<Item = &ArrayType>;
 

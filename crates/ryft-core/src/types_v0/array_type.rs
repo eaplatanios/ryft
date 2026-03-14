@@ -462,13 +462,13 @@ impl ArrayType {
 }
 
 impl Type for ArrayType {
-    /// Returns `true` if this [`ArrayType`] is a subtype of the provided [`ArrayType`], and `false` otherwise.
+    /// Returns `true` if this [`ArrayType`] is compatible with the provided [`ArrayType`], and `false` otherwise.
     ///
-    /// An array type is considered a subtype of another if it is broadcastable to the other array type. For more
+    /// An array type is considered compatible with another if it is broadcastable to the other array type. For more
     /// information on broadcasting semantics for array types, refer to [`ArrayType::broadcastable_to`] and
     /// [`ArrayType::broadcast_to`].
     #[inline]
-    fn is_subtype_of(&self, other: &Self) -> bool {
+    fn is_compatible_with(&self, other: &Self) -> bool {
         self.broadcastable_to(&other)
     }
 }

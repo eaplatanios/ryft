@@ -5,8 +5,8 @@ use crate::{
     differentiation::{Differentiable, JvpTracer},
     programs::ConstantExpression,
     tracing_v0::Tracer,
-    types::Type,
-    types_v0::{ArrayType, Typed},
+    types::{Type, Typed},
+    types_v0::ArrayType,
 };
 
 /// TODO(eaplatanios): For tracing purposes (primarily) we want to support lazy evaluation of certain types of constant

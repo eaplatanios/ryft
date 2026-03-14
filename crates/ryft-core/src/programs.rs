@@ -11,8 +11,8 @@ use crate::{
     assert_input_count_matches,
     parameters::{Parameter, Parameterized},
     tracing_v0::Tracer,
-    types::Type,
-    types_v0::{Typed, array_structure_type::ArrayStructureTypeBroadcastingError},
+    types::{Type, Typed},
+    types_v0::array_structure_type::ArrayStructureTypeBroadcastingError,
 };
 
 pub type AtomId = usize;
@@ -30,7 +30,7 @@ pub enum ConstantExpression<T, V, O> {
     Expression { tpe: T, op: O, inputs: Vec<ConstantExpression<T, V, O>> },
 }
 
-impl<T: Clone, V: Typed<T>, O> ConstantExpression<T, V, O> {
+impl<T: Clone + Type, V: Typed<T>, O> ConstantExpression<T, V, O> {
     #[inline]
     pub fn new_value(value: V) -> Self {
         let tpe = value.tpe();
@@ -62,7 +62,7 @@ impl<T, V: Display, O: Display> Display for ConstantExpression<T, V, O> {
     }
 }
 
-impl<T: Clone, V: Clone + Typed<T>, O: Clone + InterpretableOp<T, V>> ConstantExpression<T, V, O> {
+impl<T: Clone + Type, V: Clone + Typed<T>, O: Clone + InterpretableOp<T, V>> ConstantExpression<T, V, O> {
     #[inline]
     pub fn value(self) -> V {
         match self {
@@ -84,7 +84,7 @@ pub struct Variable<T> {
     pub tpe: T,
 }
 
-impl<T: Clone> Typed<T> for Variable<T> {
+impl<T: Clone + Type> Typed<T> for Variable<T> {
     #[inline]
     fn tpe(&self) -> T {
         self.tpe.clone()
@@ -368,7 +368,7 @@ impl<T, V, O> Program<T, V, O> {
         // Check that the [Program] output types match the inferred output types.
         for output in &self.outputs {
             if let Some(output_type) = atom_types.get(&output.id) {
-                if !output_type.is_subtype_of(&output.tpe) {
+                if !output_type.is_compatible_with(&output.tpe) {
                     return Err(ProgramError::InvalidAtomType {
                         id: output.id,
                         expected: output.tpe.to_string(),
@@ -407,7 +407,7 @@ impl<T, V, O> Program<T, V, O> {
         for (input_variable, input_value) in self.inputs.iter().zip(inputs.iter()) {
             let expected_type = input_variable.tpe();
             let got_type = input_value.tpe();
-            if !got_type.is_subtype_of(&expected_type) {
+            if !got_type.is_compatible_with(&expected_type) {
                 return Err(ProgramError::InvalidAtomType {
                     id: input_variable.id,
                     expected: expected_type.to_string(),
@@ -489,7 +489,7 @@ impl<T, V, O> Program<T, V, O> {
                             // but if it is, it could indicate a bug in the [Op] type checking or interpretation.
                             let expected_type = output.tpe();
                             let got_type = value.tpe();
-                            if !got_type.is_subtype_of(&expected_type) {
+                            if !got_type.is_compatible_with(&expected_type) {
                                 return Err(ProgramError::InvalidAtomType {
                                     id: output.id,
                                     expected: expected_type.to_string(),
@@ -563,6 +563,18 @@ impl<T> ProgramType<T> {
     }
 }
 
+impl<T: Type> Type for ProgramType<T> {
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        // Program types behave like function types: compatibility is contravariant in inputs, because `self` must
+        // accept everything that `other` may be called with, and covariant in outputs, because `self` must produce
+        // values that are acceptable wherever `other`'s outputs are expected.
+        self.inputs.len() == other.inputs.len()
+            && self.outputs.len() == other.outputs.len()
+            && self.inputs.iter().zip(other.inputs.iter()).all(|(lhs, rhs)| rhs.is_compatible_with(lhs))
+            && self.outputs.iter().zip(other.outputs.iter()).all(|(lhs, rhs)| lhs.is_compatible_with(rhs))
+    }
+}
+
 // TODO(eaplatanios): Clean this up. Also, in the parameterized program rendering, should there be something
 //  about the input and output structures?
 pub struct ParameterizedProgram<T, V: Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
@@ -605,7 +617,7 @@ pub struct ProgramBuilder<T, V, O> {
     atom_count: usize,
 }
 
-impl<T, V, O> ProgramBuilder<T, V, O> {
+impl<T: Type, V, O> ProgramBuilder<T, V, O> {
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -775,7 +787,7 @@ pub enum ProgramError {
     #[error("duplicate atom ID: {id}")]
     DuplicateAtomId { id: AtomId },
 
-    #[error("expected subtype of {expected} for the type of atom {id} but got {got}")]
+    #[error("expected type compatible with {expected} for the type of atom {id} but got {got}")]
     InvalidAtomType { id: AtomId, expected: String, got: String },
 
     #[error("{0}")]

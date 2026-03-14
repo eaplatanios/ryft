@@ -4,8 +4,8 @@ use crate::{
     differentiation::JvpTracer,
     programs::{Constant, ConstantExpression, Program, ProgramType},
     tracing_v0::{Tracer, VariableTracer},
-    types::Type,
     types::data_type::DataType,
+    types::{Type, Typed},
 };
 
 use super::array_type::ArrayType;
@@ -16,13 +16,9 @@ use super::array_type::ArrayType;
 // with both their data type and shape being checked at compile time.
 
 impl<ValueType: Type, TangentType: Type> Type for JvpTracer<ValueType, TangentType> {
-    fn is_subtype_of(&self, other: &Self) -> bool {
-        self.value.is_subtype_of(&other.value) && self.tangent.is_subtype_of(&other.tangent)
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        self.value.is_compatible_with(&other.value) && self.tangent.is_compatible_with(&other.tangent)
     }
-}
-
-pub trait Typed<T> {
-    fn tpe(&self) -> T;
 }
 
 macro_rules! impl_typed_for_scalar {
@@ -49,7 +45,7 @@ impl_typed_for_scalar!(f16, DataType::F16);
 impl_typed_for_scalar!(f32, DataType::F32);
 impl_typed_for_scalar!(f64, DataType::F64);
 
-impl<ValueType: Clone, TangentType: Clone, Value: Typed<ValueType>, Tangent: Typed<TangentType>>
+impl<ValueType: Clone + Type, TangentType: Clone + Type, Value: Typed<ValueType>, Tangent: Typed<TangentType>>
     Typed<JvpTracer<ValueType, TangentType>> for JvpTracer<Value, Tangent>
 {
     fn tpe(&self) -> JvpTracer<ValueType, TangentType> {
@@ -57,13 +53,13 @@ impl<ValueType: Clone, TangentType: Clone, Value: Typed<ValueType>, Tangent: Typ
     }
 }
 
-impl<T, V: Typed<T>> Typed<T> for Constant<V> {
+impl<T: Type, V: Typed<T>> Typed<T> for Constant<V> {
     fn tpe(&self) -> T {
         self.value.tpe()
     }
 }
 
-impl<T: Clone, V, O> Typed<T> for ConstantExpression<T, V, O> {
+impl<T: Clone + Type, V, O> Typed<T> for ConstantExpression<T, V, O> {
     fn tpe(&self) -> T {
         match &self {
             ConstantExpression::Value { tpe, .. } => tpe.clone(),
@@ -72,13 +68,13 @@ impl<T: Clone, V, O> Typed<T> for ConstantExpression<T, V, O> {
     }
 }
 
-impl<T: Clone, V, O> Typed<T> for VariableTracer<T, V, O> {
+impl<T: Clone + Type, V, O> Typed<T> for VariableTracer<T, V, O> {
     fn tpe(&self) -> T {
         self.builder.borrow().atom_type(&self.id).unwrap().clone()
     }
 }
 
-impl<T: Clone, V: Typed<T>, O> Typed<T> for Tracer<T, V, O> {
+impl<T: Clone + Type, V: Typed<T>, O> Typed<T> for Tracer<T, V, O> {
     fn tpe(&self) -> T {
         match &self {
             Tracer::Constant(constant) => constant.tpe(),
@@ -87,7 +83,7 @@ impl<T: Clone, V: Typed<T>, O> Typed<T> for Tracer<T, V, O> {
     }
 }
 
-impl<T: Clone, V: Typed<T>, O> Typed<ProgramType<T>> for Program<T, V, O> {
+impl<T: Clone + Type, V: Typed<T>, O> Typed<ProgramType<T>> for Program<T, V, O> {
     fn tpe(&self) -> ProgramType<T> {
         ProgramType {
             inputs: self.inputs.iter().map(|input| input.tpe().clone()).collect(),

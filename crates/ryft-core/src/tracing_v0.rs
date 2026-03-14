@@ -7,7 +7,7 @@ use crate::{
     differentiation::JvpTracer,
     parameters::Parameter,
     programs::{AtomId, ConstantExpression, Op, ProgramBuilder, ProgramError},
-    types_v0::Typed,
+    types::{Type, Typed},
 };
 
 // TODO(eaplatanios): Constant folding is unavoidable but can be expensive (e.g., `Tensor @ Tensor`). Can we trace it?
@@ -75,20 +75,20 @@ impl<T, V: Display, O: Display> Display for Tracer<T, V, O> {
     }
 }
 
-impl<T: Clone, V: Typed<T>, O> From<V> for Tracer<T, V, O> {
+impl<T: Clone + Type, V: Typed<T>, O> From<V> for Tracer<T, V, O> {
     fn from(value: V) -> Self {
         Tracer::Constant(ConstantExpression::new_value(value))
     }
 }
 
-pub trait TraceableOp<T>: Sized {
+pub trait TraceableOp<T: Type>: Sized {
     fn trace<V: Clone + Display + Typed<T>>(
         &self,
         inputs: &[&Tracer<T, V, Self>],
     ) -> Result<Vec<Tracer<T, V, Self>>, ProgramError>;
 }
 
-impl<T: Clone, O: Sized + Clone + Op<T>> TraceableOp<T> for O {
+impl<T: Clone + Type, O: Sized + Clone + Op<T>> TraceableOp<T> for O {
     fn trace<V: Clone + Display + Typed<T>>(
         &self,
         inputs: &[&Tracer<T, V, Self>],
