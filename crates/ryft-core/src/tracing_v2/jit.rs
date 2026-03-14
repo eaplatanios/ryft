@@ -82,7 +82,7 @@ where
 
 impl<V> ZeroLike for JitTracer<V>
 where
-    V: TraceValue,
+    V: TraceValue + ZeroLike,
 {
     #[inline]
     fn zero_like(&self) -> Self {
@@ -106,7 +106,7 @@ where
 
 impl<V> Add for JitTracer<V>
 where
-    V: TraceValue,
+    V: TraceValue + Add<Output = V>,
 {
     type Output = Self;
 
@@ -118,7 +118,7 @@ where
 
 impl<V> Mul for JitTracer<V>
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     type Output = Self;
 
@@ -130,7 +130,7 @@ where
 
 impl<V> Neg for JitTracer<V>
 where
-    V: TraceValue,
+    V: TraceValue + Neg<Output = V>,
 {
     type Output = Self;
 
@@ -142,7 +142,7 @@ where
 
 impl<V> FloatExt for JitTracer<V>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     #[inline]
     fn sin(self) -> Self {

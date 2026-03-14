@@ -70,13 +70,14 @@ pub trait OneLike: Clone {
     fn one_like(&self) -> Self;
 }
 
-/// Convenience trait for leaves that fully participate in `tracing_v2`.
+/// Convenience trait for stageable leaves used by `tracing_v2`.
 ///
-/// A `TraceValue` can be used as a staged program input/output leaf, as a primal value, and as a tangent/cotangent
-/// constant where appropriate.
-pub trait TraceValue: FloatExt + TraceLeaf + ZeroLike + 'static {}
+/// [`TraceValue`] identifies leaf values that can appear in staged graphs and participate in abstract evaluation. It
+/// deliberately does not imply eager numeric operations such as [`FloatExt`] or differentiation-specific capabilities
+/// such as [`ZeroLike`]. Those requirements live on the primitive operations and transforms that actually use them.
+pub trait TraceValue: TraceLeaf + 'static {}
 
-impl<T> TraceValue for T where T: FloatExt + TraceLeaf + ZeroLike + 'static {}
+impl<T> TraceValue for T where T: TraceLeaf + 'static {}
 
 impl FloatExt for f32 {
     #[inline]

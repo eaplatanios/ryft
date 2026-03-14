@@ -39,7 +39,7 @@ where
 
 impl<V> TangentSpace<V> for V
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
 {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
@@ -97,7 +97,7 @@ where
 
 impl<V, T> ZeroLike for JvpTracer<V, T>
 where
-    V: TraceValue,
+    V: TraceValue + ZeroLike,
     T: TangentSpace<V>,
 {
     #[inline]
@@ -131,7 +131,7 @@ where
 
 impl<V, T> Add for JvpTracer<V, T>
 where
-    V: TraceValue,
+    V: TraceValue + Add<Output = V>,
     T: TangentSpace<V>,
 {
     type Output = Self;
@@ -144,7 +144,7 @@ where
 
 impl<V, T> Mul for JvpTracer<V, T>
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
     T: TangentSpace<V>,
 {
     type Output = Self;
@@ -157,7 +157,7 @@ where
 
 impl<V, T> Neg for JvpTracer<V, T>
 where
-    V: TraceValue,
+    V: TraceValue + Neg<Output = V>,
     T: TangentSpace<V>,
 {
     type Output = Self;
@@ -170,7 +170,7 @@ where
 
 impl<V, T> FloatExt for JvpTracer<V, T>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
     T: TangentSpace<V>,
 {
     #[inline]
@@ -194,7 +194,7 @@ pub fn jvp<'context, Context, F, Input, Output, V>(
     tangents: Input,
 ) -> Result<(Output, Output), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,

@@ -5,11 +5,12 @@
 
 use std::{
     fmt::{Debug, Display},
+    ops::{Add, Mul, Neg},
     sync::Arc,
 };
 
 use crate::tracing_v2::{
-    TraceError, TraceValue,
+    FloatExt, TraceError, TraceValue,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     graph::{AtomId, GraphBuilder},
@@ -188,7 +189,7 @@ impl Display for AddOp {
 
 impl<V> Op<V> for AddOp
 where
-    V: TraceValue,
+    V: TraceValue + Add<Output = V>,
 {
     fn name(&self) -> &'static str {
         "add"
@@ -206,7 +207,7 @@ where
 
 impl<V> JvpOp<V> for AddOp
 where
-    V: TraceValue,
+    V: TraceValue + Add<Output = V>,
 {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -222,7 +223,7 @@ where
 
 impl<V> BatchOp<V> for AddOp
 where
-    V: TraceValue,
+    V: TraceValue + Add<Output = V>,
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
@@ -241,7 +242,7 @@ where
 
 impl<V> LinearOp<V> for AddOp
 where
-    V: TraceValue,
+    V: TraceValue + Add<Output = V>,
 {
     fn transpose(
         &self,
@@ -275,7 +276,7 @@ impl Display for MulOp {
 
 impl<V> Op<V> for MulOp
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     fn name(&self) -> &'static str {
         "mul"
@@ -293,7 +294,7 @@ where
 
 impl<V> JvpOp<V> for MulOp
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -314,7 +315,7 @@ where
 
 impl<V> BatchOp<V> for MulOp
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
@@ -349,7 +350,7 @@ impl Display for NegOp {
 
 impl<V> Op<V> for NegOp
 where
-    V: TraceValue,
+    V: TraceValue + Neg<Output = V>,
 {
     fn name(&self) -> &'static str {
         "neg"
@@ -367,7 +368,7 @@ where
 
 impl<V> JvpOp<V> for NegOp
 where
-    V: TraceValue,
+    V: TraceValue + Neg<Output = V>,
 {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -380,7 +381,7 @@ where
 
 impl<V> BatchOp<V> for NegOp
 where
-    V: TraceValue,
+    V: TraceValue + Neg<Output = V>,
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -390,7 +391,7 @@ where
 
 impl<V> LinearOp<V> for NegOp
 where
-    V: TraceValue,
+    V: TraceValue + Neg<Output = V>,
 {
     fn transpose(
         &self,
@@ -425,7 +426,7 @@ impl Display for SinOp {
 
 impl<V> Op<V> for SinOp
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     fn name(&self) -> &'static str {
         "sin"
@@ -443,7 +444,7 @@ where
 
 impl<V> JvpOp<V> for SinOp
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -460,7 +461,7 @@ where
 
 impl<V> BatchOp<V> for SinOp
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -486,7 +487,7 @@ impl Display for CosOp {
 
 impl<V> Op<V> for CosOp
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     fn name(&self) -> &'static str {
         "cos"
@@ -504,7 +505,7 @@ where
 
 impl<V> JvpOp<V> for CosOp
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -521,7 +522,7 @@ where
 
 impl<V> BatchOp<V> for CosOp
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -574,7 +575,7 @@ where
 
 impl<V> Op<V> for ScaleOp<V>
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     fn name(&self) -> &'static str {
         "scale"
@@ -592,7 +593,7 @@ where
 
 impl<V> JvpOp<V> for ScaleOp<V>
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -609,7 +610,7 @@ where
 
 impl<V> BatchOp<V> for ScaleOp<V>
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -619,7 +620,7 @@ where
 
 impl<V> LinearOp<V> for ScaleOp<V>
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     fn transpose(
         &self,

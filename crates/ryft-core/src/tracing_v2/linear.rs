@@ -16,7 +16,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        OneLike, TraceError, TraceValue, ZeroLike,
+        FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
         context::JvpContext,
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, Graph, GraphBuilder},
@@ -36,7 +36,7 @@ where
 
 impl<V> LinearTerm<V>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     #[inline]
     pub(crate) fn apply_linear_op(self, op: LinearOpRef<V>) -> Self {
@@ -72,7 +72,7 @@ where
 
 impl<V> TangentSpace<V> for LinearTerm<V>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
 {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
@@ -136,6 +136,7 @@ where
     /// Transposes the linear program, turning a pushforward into a pullback.
     pub fn transpose(&self) -> Result<LinearProgram<V, Output, Input>, TraceError>
     where
+        V: FloatExt,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -145,7 +146,7 @@ where
             atom: AtomId,
             contribution: AtomId,
         ) where
-            V: TraceValue,
+            V: TraceValue + FloatExt,
         {
             adjoints[atom] = Some(match adjoints[atom] {
                 Some(existing) => builder
@@ -225,7 +226,7 @@ fn try_jvp_program<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -286,7 +287,7 @@ pub fn jvp_program<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -303,7 +304,7 @@ pub fn linearize<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -319,7 +320,7 @@ fn try_vjp<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -340,7 +341,7 @@ pub fn vjp<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -356,7 +357,7 @@ fn try_grad<'context, Context, F, Input, V>(
     primals: Input,
 ) -> Result<Input, TraceError>
 where
-    V: TraceValue + OneLike,
+    V: TraceValue + FloatExt + ZeroLike + OneLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Result<Linearized<V>, TraceError>,
@@ -372,7 +373,7 @@ pub fn grad<'context, Context, F, Input, V>(
     primals: Input,
 ) -> Result<Input, TraceError>
 where
-    V: TraceValue + OneLike,
+    V: TraceValue + FloatExt + ZeroLike + OneLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Linearized<V>,
@@ -387,7 +388,7 @@ pub fn value_and_grad<'context, Context, F, Input, V>(
     primals: Input,
 ) -> Result<(V, Input), TraceError>
 where
-    V: TraceValue + OneLike,
+    V: TraceValue + FloatExt + ZeroLike + OneLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Linearized<V>,
@@ -398,7 +399,7 @@ where
 }
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
-pub trait CoordinateValue: TraceValue + OneLike {
+pub trait CoordinateValue: TraceValue + ZeroLike + OneLike {
     /// Scalar-like coordinate type used by dense Jacobians and Hessians.
     type Coordinate: Clone + Debug + PartialEq + 'static;
 
@@ -629,7 +630,7 @@ fn try_jacfwd<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue,
+    V: CoordinateValue + FloatExt,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -670,7 +671,7 @@ pub fn jacfwd<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue,
+    V: CoordinateValue + FloatExt,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -686,7 +687,7 @@ fn try_jacrev<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue,
+    V: CoordinateValue + FloatExt,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -721,7 +722,7 @@ pub fn jacrev<'context, Context, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue,
+    V: CoordinateValue + FloatExt,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -741,7 +742,7 @@ pub fn hessian<'context, Context, F, Input, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue,
+    V: CoordinateValue + FloatExt,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Input::To<Linearized<V>>,

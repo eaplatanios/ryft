@@ -14,7 +14,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::Parameter,
     tracing_v2::{
-        ScalarAbstract, TraceError, TraceValue,
+        FloatExt, ScalarAbstract, TraceError, TraceValue, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, GraphBuilder},
@@ -75,7 +75,7 @@ where
 
 impl<V> MatrixTangentSpace<V> for V
 where
-    V: MatrixValue,
+    V: MatrixValue + FloatExt + ZeroLike,
 {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
@@ -480,7 +480,7 @@ where
 
 impl<V> MatrixTangentSpace<V> for LinearTerm<V>
 where
-    V: MatrixValue,
+    V: MatrixValue + FloatExt + ZeroLike,
 {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
@@ -694,6 +694,8 @@ mod tests {
     fn first_matrix_gradient<Context, V>(context: &mut Context, inputs: (V, V, V, V)) -> V
     where
         V: MatrixValue
+            + FloatExt
+            + ZeroLike
             + OneLike
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,
@@ -705,6 +707,8 @@ mod tests {
     fn full_matrix_gradient<Context, V>(context: &mut Context, inputs: (V, V, V, V)) -> (V, V, V, V)
     where
         V: MatrixValue
+            + FloatExt
+            + ZeroLike
             + OneLike
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,

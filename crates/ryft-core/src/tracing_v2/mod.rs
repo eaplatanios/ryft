@@ -124,6 +124,8 @@ mod tests {
     fn first_derivative<Context, V>(context: &mut Context, x: V) -> V
     where
         V: TraceValue
+            + FloatExt
+            + ZeroLike
             + OneLike
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
@@ -134,6 +136,8 @@ mod tests {
     fn second_derivative<Context, V>(context: &mut Context, x: V) -> V
     where
         V: TraceValue
+            + FloatExt
+            + ZeroLike
             + OneLike
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
@@ -144,6 +148,8 @@ mod tests {
     fn third_derivative<Context, V>(context: &mut Context, x: V) -> V
     where
         V: TraceValue
+            + FloatExt
+            + ZeroLike
             + OneLike
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
@@ -154,6 +160,8 @@ mod tests {
     fn fourth_derivative<Context, V>(context: &mut Context, x: V) -> V
     where
         V: TraceValue
+            + FloatExt
+            + ZeroLike
             + OneLike
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
@@ -164,6 +172,8 @@ mod tests {
     fn hessian_style_second_derivative<Context, V>(context: &mut Context, x: V) -> V
     where
         V: TraceValue
+            + FloatExt
+            + ZeroLike
             + OneLike
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,

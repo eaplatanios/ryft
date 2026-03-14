@@ -62,7 +62,7 @@ fn single_output<V>(mut outputs: Vec<Batch<V>>, op: &'static str) -> Batch<V> {
 
 impl<V> Add for Batch<V>
 where
-    V: TraceValue,
+    V: TraceValue + Add<Output = V>,
 {
     type Output = Self;
 
@@ -74,7 +74,7 @@ where
 
 impl<V> Mul for Batch<V>
 where
-    V: TraceValue,
+    V: TraceValue + Mul<Output = V>,
 {
     type Output = Self;
 
@@ -86,7 +86,7 @@ where
 
 impl<V> Neg for Batch<V>
 where
-    V: TraceValue,
+    V: TraceValue + Neg<Output = V>,
 {
     type Output = Self;
 
@@ -98,7 +98,7 @@ where
 
 impl<V> FloatExt for Batch<V>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt,
 {
     #[inline]
     fn sin(self) -> Self {

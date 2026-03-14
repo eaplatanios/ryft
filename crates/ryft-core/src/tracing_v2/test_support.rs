@@ -66,6 +66,8 @@ where
 fn first_derivative<Context, V>(context: &mut Context, x: V) -> V
 where
     V: TraceValue
+        + FloatExt
+        + ZeroLike
         + OneLike
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
@@ -76,6 +78,8 @@ where
 fn second_derivative<Context, V>(context: &mut Context, x: V) -> V
 where
     V: TraceValue
+        + FloatExt
+        + ZeroLike
         + OneLike
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
@@ -86,6 +90,8 @@ where
 fn third_derivative<Context, V>(context: &mut Context, x: V) -> V
 where
     V: TraceValue
+        + FloatExt
+        + ZeroLike
         + OneLike
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
@@ -96,6 +102,8 @@ where
 fn fourth_derivative<Context, V>(context: &mut Context, x: V) -> V
 where
     V: TraceValue
+        + FloatExt
+        + ZeroLike
         + OneLike
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
@@ -106,6 +114,8 @@ where
 fn hessian_style_second_derivative<Context, V>(context: &mut Context, x: V) -> V
 where
     V: TraceValue
+        + FloatExt
+        + ZeroLike
         + OneLike
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
@@ -747,6 +757,8 @@ where
 fn first_matrix_gradient<Context, V>(context: &mut Context, inputs: (V, V, V, V)) -> V
 where
     V: MatrixValue
+        + FloatExt
+        + ZeroLike
         + OneLike
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,
