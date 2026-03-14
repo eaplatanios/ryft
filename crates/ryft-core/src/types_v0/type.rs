@@ -1,11 +1,10 @@
-use std::fmt::Display;
-
 use half::{bf16, f16};
 
 use crate::{
     differentiation::JvpTracer,
     programs::{Constant, ConstantExpression, Program, ProgramType},
     tracing_v0::{Tracer, VariableTracer},
+    types::Type,
     types::data_type::DataType,
 };
 
@@ -15,10 +14,6 @@ use super::array_type::ArrayType;
 // types that may be used by different kinds of [Parameter]s. This enables us to support multiple different backends
 // for just-in-time compilation and numerical computation, some of which may even support statically typed tensors
 // with both their data type and shape being checked at compile time.
-
-pub trait Type: Display {
-    fn is_subtype_of(&self, other: &Self) -> bool;
-}
 
 impl<ValueType: Type, TangentType: Type> Type for JvpTracer<ValueType, TangentType> {
     fn is_subtype_of(&self, other: &Self) -> bool {

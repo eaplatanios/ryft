@@ -13,7 +13,8 @@ use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing_v0::{Tracer, VariableTracer},
-    types_v0::{ArrayType, Type, Typed},
+    types::Type,
+    types_v0::{ArrayType, Typed},
 };
 
 // How do we handle things like `grad(lambda x: x**2 if x > 0 else 0.)`? In this case, we need to be able to keep the
@@ -173,7 +174,7 @@ pub fn differential<
 // TODO(eaplatanios): Can we make [ParameterizedProgram] callable like a function?
 #[inline]
 pub fn _linearize<
-    T: Clone + Debug + Type,
+    T: Clone + Display + Debug + Type,
     O: Clone + LinearOp<T, V> + Debug,
     V: Parameter + Typed<T>,
     VT: Parameter + Clone + Typed<T>,
@@ -235,7 +236,7 @@ pub fn _linearize<
 
 #[inline]
 pub fn linearize<
-    T: Clone + Debug + Type,
+    T: Clone + Display + Debug + Type,
     V: Parameter + Clone + Typed<T>,
     Input: Parameterized<
             V,
@@ -269,7 +270,7 @@ pub fn linearize<
 
 #[inline]
 pub fn linear<
-    T: Clone + Debug + Type,
+    T: Clone + Display + Debug + Type,
     V: Parameter + Clone + ToOwned<Owned = V> + Typed<T>,
     Input: Parameterized<
             V,

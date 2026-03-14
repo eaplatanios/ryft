@@ -11,17 +11,8 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::parameters::Parameter;
-use crate::types::data_type::{DataType, DataTypeError as CoreDataTypeError};
-use crate::types_v0::r#type::Type;
-
-impl Type for DataType {
-    /// Returns `true` if this [`DataType`] is a subtype of the provided [`DataType`] (i.e., that this data type can
-    /// be promoted to the provided data type).
-    #[inline]
-    fn is_subtype_of(&self, other: &Self) -> bool {
-        self.is_promotable_to(*other)
-    }
-}
+use crate::types::data_type::DataTypeError as CoreDataTypeError;
+use crate::types::{DataType, Type};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time
 /// or dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper

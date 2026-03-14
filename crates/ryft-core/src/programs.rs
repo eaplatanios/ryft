@@ -11,7 +11,8 @@ use crate::{
     assert_input_count_matches,
     parameters::{Parameter, Parameterized},
     tracing_v0::Tracer,
-    types_v0::{Type, Typed, array_structure_type::ArrayStructureTypeBroadcastingError},
+    types::Type,
+    types_v0::{Typed, array_structure_type::ArrayStructureTypeBroadcastingError},
 };
 
 pub type AtomId = usize;
@@ -286,7 +287,7 @@ impl<T, V, O> Program<T, V, O> {
     /// Performs type checking for this [Program] and returns an error if there are any typing issues.
     pub fn type_check(&self) -> Result<(), ProgramError>
     where
-        T: Clone + Type,
+        T: Clone + Display + Type,
         V: Typed<T>,
         O: Op<T>,
     {
@@ -391,7 +392,7 @@ impl<T, V, O> Program<T, V, O> {
     // TODO(eaplatanios): Mention memory (i.e., all temporary variables are kept alive throughout the interpretation).
     pub fn interpret(&self, inputs: &[&V]) -> Result<Vec<V>, ProgramError>
     where
-        T: Clone + Type,
+        T: Clone + Display + Type,
         V: ToOwned<Owned = V> + Typed<T>,
         O: InterpretableOp<T, V>,
     {
@@ -583,7 +584,7 @@ impl<T, V: Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>>
 
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
-        T: Clone + Debug + Type,
+        T: Clone + Display + Debug + Type,
         V: ToOwned<Owned = V> + Typed<T> + Parameter,
         O: InterpretableOp<T, V> + Debug,
         Output::ParameterStructure: Clone,
@@ -679,7 +680,7 @@ impl<T, V, O> ProgramBuilder<T, V, O> {
 
     pub fn build(self, inputs: Vec<AtomId>, outputs: Vec<AtomId>) -> Result<Program<T, V, O>, ProgramError>
     where
-        T: Clone + Debug + Type,
+        T: Clone + Display + Debug + Type,
         V: Typed<T>,
         O: Op<T> + Debug,
     {
