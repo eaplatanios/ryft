@@ -940,6 +940,28 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
     }
 
+    /// Broadcasts the named parameters from this [`Parameterized`] value into the provided target `structure`,
+    /// returning a new value of type `T`. This is a convenience wrapper around [`T::from_broadcasted_named_parameters`]
+    /// that pairs each current parameter with its current leaf [`ParameterPath`] and uses those paths as prefixes for
+    /// filling the target structure. As a result, each leaf path in `structure` receives the value from the most
+    /// specific matching current parameter path prefix (i.e., the longest shared prefix among this value's existing
+    /// parameter paths). If the current parameter paths do not cover all target leaves, or if some current parameter
+    /// paths match no target leaf, then this function returns the corresponding [`ParameterError::MissingParameters`]
+    /// or [`ParameterError::UnusedParameters`] error from [`T::from_broadcasted_named_parameters`]. Since one current
+    /// parameter may need to populate multiple leaves in `structure`, this function requires `P: Clone`.
+    fn broadcast_to_parameter_structure<T: Parameterized<P>>(
+        &self,
+        structure: T::ParameterStructure,
+    ) -> Result<T, ParameterError>
+    where
+        P: Clone,
+    {
+        T::from_broadcasted_named_parameters(
+            structure,
+            self.named_parameters().map(|(path, parameter)| (path, parameter.clone())),
+        )
+    }
+
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
     /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the same
     /// order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters`],
@@ -2480,6 +2502,16 @@ mod tests {
                 metadata: (42, "meta"),
             })
         );
+
+        // Test [`Parameterized::broadcast_to_parameter_structure`].
+        assert_eq!(
+            42_i32.broadcast_to_parameter_structure::<(i32, (i32, i32))>((Placeholder, (Placeholder, Placeholder))),
+            Ok((42, (42, 42))),
+        );
+        assert!(matches!(
+            (1_i32, 2_i32).broadcast_to_parameter_structure::<i32>(Placeholder),
+            Err(ParameterError::MissingParameters { .. }),
+        ));
 
         // Test [`Parameterized::map_parameters`].
         assert_eq!(

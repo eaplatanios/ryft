@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added `Parameterized::broadcast_to_parameter_structure`.
 - Introduced the `Type` trait and the `DataType` type.
 - Introduced more fine-grained error types like `ParameterError` and `DataTypeError`.
 
