@@ -103,7 +103,7 @@ impl Display for AddOp {
 impl<T: Clone + Type + Broadcastable> Op<T> for AddOp {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 2);
-        Ok(T::broadcast(input_types).map(|tpe| vec![tpe])?)
+        Ok(T::broadcasted(input_types).map(|tpe| vec![tpe])?)
     }
 }
 
@@ -173,7 +173,7 @@ impl Display for SubOp {
 impl<T: Clone + Type + Broadcastable> Op<T> for SubOp {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 2);
-        Ok(T::broadcast(input_types).map(|tpe| vec![tpe])?)
+        Ok(T::broadcasted(input_types).map(|tpe| vec![tpe])?)
     }
 }
 
@@ -243,7 +243,7 @@ impl Display for MulOp {
 impl<T: Clone + Type + Broadcastable> Op<T> for MulOp {
     fn infer_output_types(&self, input_types: &[&T]) -> Result<Vec<T>, ProgramError> {
         assert_input_count_matches!(input_types.len(), 2);
-        Ok(T::broadcast(input_types).map(|tpe| vec![tpe])?)
+        Ok(T::broadcasted(input_types).map(|tpe| vec![tpe])?)
     }
 }
 
@@ -303,7 +303,7 @@ impl<T: Clone + Type + Broadcastable, V: Clone + Display + Typed<T>> Op<T> for R
         assert_input_count_matches!(input_types.len(), 1);
         let coefficient_type = self.coefficient.tpe();
         let input_types = vec![input_types[0], &coefficient_type];
-        Ok(T::broadcast(input_types.as_slice()).map(|tpe| vec![tpe])?)
+        Ok(T::broadcasted(input_types.as_slice()).map(|tpe| vec![tpe])?)
     }
 }
 
@@ -386,7 +386,7 @@ impl<T: Clone + Type + Broadcastable, V: Clone + Display + Typed<T>> Op<T> for L
         assert_input_count_matches!(input_types.len(), 1);
         let coefficient_type = self.coefficient.tpe();
         let input_types = vec![&coefficient_type, input_types[0]];
-        Ok(T::broadcast(input_types.as_slice()).map(|tpe| vec![tpe])?)
+        Ok(T::broadcasted(input_types.as_slice()).map(|tpe| vec![tpe])?)
     }
 }
 

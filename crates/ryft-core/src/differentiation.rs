@@ -14,7 +14,7 @@ use crate::{
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing_v0::{Tracer, VariableTracer},
     types::{Type, Typed},
-    types_v0::broadcastable::BroadcastingError,
+    types_v0::broadcasting::BroadcastingError,
     types_v0::{ArrayType, Broadcastable},
 };
 
@@ -56,17 +56,16 @@ pub struct JvpTracer<Value, Tangent> {
 }
 
 impl<Value: Broadcastable, Tangent: Broadcastable> Broadcastable for JvpTracer<Value, Tangent> {
-    fn broadcast(values: &[&Self]) -> Result<Self, BroadcastingError> {
-        if values.is_empty() {
-            return Err(BroadcastingError::Empty);
-        }
+    fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError> {
+        Ok(Self { value: self.value.broadcast(&other.value)?, tangent: self.tangent.broadcast(&other.tangent)? })
+    }
 
-        let value_types = values.iter().map(|value| &value.value).collect::<Vec<_>>();
-        let tangent_types = values.iter().map(|value| &value.tangent).collect::<Vec<_>>();
-        Ok(Self {
-            value: Value::broadcast(value_types.as_slice())?,
-            tangent: Tangent::broadcast(tangent_types.as_slice())?,
-        })
+    fn broadcast_to(&self, other: &Self) -> Result<Self, BroadcastingError> {
+        Ok(Self { value: self.value.broadcast_to(&other.value)?, tangent: self.tangent.broadcast_to(&other.tangent)? })
+    }
+
+    fn is_broadcastable_to(&self, other: &Self) -> bool {
+        self.value.is_broadcastable_to(&other.value) && self.tangent.is_broadcastable_to(&other.tangent)
     }
 }
 
