@@ -18,10 +18,12 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, JitContext, OneLike, TraceError, TraceLeaf, TraceValue, ZeroLike,
+        FloatExt, JitContext, OneLike, TraceError, TraceValue, ZeroLike,
         graph::{AtomId, Graph, GraphBuilder},
         ops::{AddOp, CosOp, MulOp, NegOp, SinOp, StagedOpRef},
     },
+    types::Typed,
+    types_v0::ArrayType,
 };
 
 /// Tracer used while staging JIT programs.
@@ -68,17 +70,17 @@ where
     }
 }
 
-impl<V> TraceLeaf for JitTracer<V>
+impl<V> Typed<ArrayType> for JitTracer<V>
 where
     V: TraceValue,
 {
-    type Abstract = V::Abstract;
-
     #[inline]
-    fn abstract_value(&self) -> Self::Abstract {
-        self.value.abstract_value()
+    fn tpe(&self) -> ArrayType {
+        <V as Typed<ArrayType>>::tpe(&self.value)
     }
 }
+
+impl<V> TraceValue for JitTracer<V> where V: TraceValue {}
 
 impl<V> ZeroLike for JitTracer<V>
 where
@@ -198,7 +200,6 @@ where
 impl<V, Input, Output> Display for CompiledFunction<V, Input, Output>
 where
     V: TraceValue,
-    V::Abstract: Display,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {

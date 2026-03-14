@@ -8,6 +8,8 @@ use std::{fmt::Display, marker::PhantomData};
 use crate::{
     parameters::Parameterized,
     tracing_v2::{Op, TraceError, TraceValue},
+    types::Typed,
+    types_v0::ArrayType,
 };
 
 /// Identifier for an atom within a staged graph.
@@ -30,8 +32,8 @@ pub struct Atom<V>
 where
     V: TraceValue,
 {
-    /// Abstract value used for validation and shape propagation.
-    pub abstract_value: V::Abstract,
+    /// Array type used for validation and shape propagation.
+    pub abstract_value: ArrayType,
     /// The way this atom entered the graph.
     pub source: AtomSource<V>,
 }
@@ -84,7 +86,7 @@ where
 
     /// Adds a new input atom with the supplied abstract value.
     #[inline]
-    pub fn add_input_abstract(&mut self, abstract_value: V::Abstract) -> AtomId {
+    pub fn add_input_abstract(&mut self, abstract_value: ArrayType) -> AtomId {
         let id = self.atoms.len();
         self.atoms.push(Atom { abstract_value, source: AtomSource::Input });
         self.input_atoms.push(id);
@@ -94,7 +96,7 @@ where
     /// Adds a new input atom using the abstract value of `example`.
     #[inline]
     pub fn add_input(&mut self, example: &V) -> AtomId {
-        self.add_input_abstract(example.abstract_value())
+        self.add_input_abstract(<V as Typed<ArrayType>>::tpe(example))
     }
 
     /// Adds a constant atom to the graph.
@@ -102,7 +104,7 @@ where
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = self.atoms.len();
         self.atoms
-            .push(Atom { abstract_value: value.abstract_value(), source: AtomSource::Constant(value) });
+            .push(Atom { abstract_value: <V as Typed<ArrayType>>::tpe(&value), source: AtomSource::Constant(value) });
         id
     }
 
@@ -283,7 +285,6 @@ impl<O, V, Input, Output> Display for Graph<O, V, Input, Output>
 where
     O: Clone + Display + Op<V>,
     V: TraceValue,
-    V::Abstract: Display,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {

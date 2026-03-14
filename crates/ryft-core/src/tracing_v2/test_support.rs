@@ -778,8 +778,8 @@ pub(crate) fn assert_matrix_jit_rendering() {
     assert_eq!(
         compiled.to_string(),
         indoc! {"
-            lambda %0:f64[2,2], %1:f64[2,2] .
-            let %2:f64[2,2] = matmul %0 %1
+            lambda %0:f64[2, 2], %1:f64[2, 2] .
+            let %2:f64[2, 2] = matmul %0 %1
             in (%2)
         "}
         .trim_end(),
@@ -797,10 +797,10 @@ pub(crate) fn assert_matrix_pushforward_rendering() {
     assert_eq!(
         pushforward.to_string(),
         indoc! {"
-            lambda %0:f64[2,2], %1:f64[2,2] .
-            let %2:f64[2,2] = right_matmul %0
-                %3:f64[2,2] = left_matmul %1
-                %4:f64[2,2] = add %2 %3
+            lambda %0:f64[2, 2], %1:f64[2, 2] .
+            let %2:f64[2, 2] = right_matmul %0
+                %3:f64[2, 2] = left_matmul %1
+                %4:f64[2, 2] = add %2 %3
             in (%4)
         "}
         .trim_end(),
@@ -818,10 +818,10 @@ pub(crate) fn assert_matrix_pullback_rendering() {
     assert_eq!(
         pullback.to_string(),
         indoc! {"
-            lambda %0:f64[2,2] .
-            let %1:f64[2,2] = left_matmul %0
-                %2:f64[2,2] = right_matmul %0
-                %3:f64[2,2] = const
+            lambda %0:f64[2, 2] .
+            let %1:f64[2, 2] = left_matmul %0
+                %2:f64[2, 2] = right_matmul %0
+                %3:f64[2, 2] = const
             in (%2, %1)
         "}
         .trim_end(),
@@ -850,75 +850,75 @@ pub(crate) fn assert_matrix_hessian_style_jit_rendering() {
     assert_eq!(
         compiled.to_string(),
         indoc! {"
-            lambda %0:f64[1,1], %1:f64[1,1], %2:f64[1,1], %3:f64[1,1] .
-            let %4:f64[1,1] = const
-                %5:f64[1,1] = const
-                %6:f64[1,1] = const
-                %7:f64[1,1] = const
-                %8:f64[1,1] = const
-                %9:f64[1,1] = const
-                %10:f64[1,1] = const
-                %11:f64[1,1] = matmul %0 %1
-                %12:f64[1,1] = sin %11
-                %13:f64[1,1] = cos %11
-                %14:f64[1,1] = cos %11
-                %15:f64[1,1] = sin %11
-                %16:f64[1,1] = matmul %12 %2
-                %17:f64[1,1] = matmul %16 %3
-                %18:f64[1,1] = matrix_transpose %16
-                %19:f64[1,1] = matrix_transpose %3
-                %20:f64[1,1] = matrix_transpose %12
-                %21:f64[1,1] = matrix_transpose %2
-                %22:f64[1,1] = matrix_transpose %0
-                %23:f64[1,1] = matrix_transpose %1
-                %24:f64[1,1] = const
-                %25:f64[1,1] = const
-                %26:f64[1,1] = matmul %18 %24
-                %27:f64[1,1] = matmul %24 %19
-                %28:f64[1,1] = matmul %20 %27
-                %29:f64[1,1] = matmul %27 %21
-                %30:f64[1,1] = mul %14 %29
-                %31:f64[1,1] = matmul %22 %30
-                %32:f64[1,1] = matmul %30 %23
-                %33:f64[1,1] = matmul %4 %1
-                %34:f64[1,1] = matmul %0 %5
-                %35:f64[1,1] = add %33 %34
-                %36:f64[1,1] = mul %13 %35
-                %37:f64[1,1] = mul %15 %35
-                %38:f64[1,1] = neg %37
-                %39:f64[1,1] = matmul %36 %2
-                %40:f64[1,1] = matmul %12 %6
-                %41:f64[1,1] = add %39 %40
-                %42:f64[1,1] = matmul %41 %3
-                %43:f64[1,1] = matmul %16 %7
-                %44:f64[1,1] = add %42 %43
-                %45:f64[1,1] = matrix_transpose %41
-                %46:f64[1,1] = matrix_transpose %7
-                %47:f64[1,1] = matrix_transpose %36
-                %48:f64[1,1] = matrix_transpose %6
-                %49:f64[1,1] = matrix_transpose %4
-                %50:f64[1,1] = matrix_transpose %5
-                %51:f64[1,1] = matmul %45 %24
-                %52:f64[1,1] = matmul %18 %25
-                %53:f64[1,1] = add %51 %52
-                %54:f64[1,1] = matmul %25 %19
-                %55:f64[1,1] = matmul %24 %46
-                %56:f64[1,1] = add %54 %55
-                %57:f64[1,1] = matmul %47 %27
-                %58:f64[1,1] = matmul %20 %56
-                %59:f64[1,1] = add %57 %58
-                %60:f64[1,1] = matmul %56 %21
-                %61:f64[1,1] = matmul %27 %48
-                %62:f64[1,1] = add %60 %61
-                %63:f64[1,1] = mul %29 %38
-                %64:f64[1,1] = mul %14 %62
-                %65:f64[1,1] = add %63 %64
-                %66:f64[1,1] = matmul %49 %30
-                %67:f64[1,1] = matmul %22 %65
-                %68:f64[1,1] = add %66 %67
-                %69:f64[1,1] = matmul %65 %23
-                %70:f64[1,1] = matmul %30 %50
-                %71:f64[1,1] = add %69 %70
+            lambda %0:f64[1, 1], %1:f64[1, 1], %2:f64[1, 1], %3:f64[1, 1] .
+            let %4:f64[1, 1] = const
+                %5:f64[1, 1] = const
+                %6:f64[1, 1] = const
+                %7:f64[1, 1] = const
+                %8:f64[1, 1] = const
+                %9:f64[1, 1] = const
+                %10:f64[1, 1] = const
+                %11:f64[1, 1] = matmul %0 %1
+                %12:f64[1, 1] = sin %11
+                %13:f64[1, 1] = cos %11
+                %14:f64[1, 1] = cos %11
+                %15:f64[1, 1] = sin %11
+                %16:f64[1, 1] = matmul %12 %2
+                %17:f64[1, 1] = matmul %16 %3
+                %18:f64[1, 1] = matrix_transpose %16
+                %19:f64[1, 1] = matrix_transpose %3
+                %20:f64[1, 1] = matrix_transpose %12
+                %21:f64[1, 1] = matrix_transpose %2
+                %22:f64[1, 1] = matrix_transpose %0
+                %23:f64[1, 1] = matrix_transpose %1
+                %24:f64[1, 1] = const
+                %25:f64[1, 1] = const
+                %26:f64[1, 1] = matmul %18 %24
+                %27:f64[1, 1] = matmul %24 %19
+                %28:f64[1, 1] = matmul %20 %27
+                %29:f64[1, 1] = matmul %27 %21
+                %30:f64[1, 1] = mul %14 %29
+                %31:f64[1, 1] = matmul %22 %30
+                %32:f64[1, 1] = matmul %30 %23
+                %33:f64[1, 1] = matmul %4 %1
+                %34:f64[1, 1] = matmul %0 %5
+                %35:f64[1, 1] = add %33 %34
+                %36:f64[1, 1] = mul %13 %35
+                %37:f64[1, 1] = mul %15 %35
+                %38:f64[1, 1] = neg %37
+                %39:f64[1, 1] = matmul %36 %2
+                %40:f64[1, 1] = matmul %12 %6
+                %41:f64[1, 1] = add %39 %40
+                %42:f64[1, 1] = matmul %41 %3
+                %43:f64[1, 1] = matmul %16 %7
+                %44:f64[1, 1] = add %42 %43
+                %45:f64[1, 1] = matrix_transpose %41
+                %46:f64[1, 1] = matrix_transpose %7
+                %47:f64[1, 1] = matrix_transpose %36
+                %48:f64[1, 1] = matrix_transpose %6
+                %49:f64[1, 1] = matrix_transpose %4
+                %50:f64[1, 1] = matrix_transpose %5
+                %51:f64[1, 1] = matmul %45 %24
+                %52:f64[1, 1] = matmul %18 %25
+                %53:f64[1, 1] = add %51 %52
+                %54:f64[1, 1] = matmul %25 %19
+                %55:f64[1, 1] = matmul %24 %46
+                %56:f64[1, 1] = add %54 %55
+                %57:f64[1, 1] = matmul %47 %27
+                %58:f64[1, 1] = matmul %20 %56
+                %59:f64[1, 1] = add %57 %58
+                %60:f64[1, 1] = matmul %56 %21
+                %61:f64[1, 1] = matmul %27 %48
+                %62:f64[1, 1] = add %60 %61
+                %63:f64[1, 1] = mul %29 %38
+                %64:f64[1, 1] = mul %14 %62
+                %65:f64[1, 1] = add %63 %64
+                %66:f64[1, 1] = matmul %49 %30
+                %67:f64[1, 1] = matmul %22 %65
+                %68:f64[1, 1] = add %66 %67
+                %69:f64[1, 1] = matmul %65 %23
+                %70:f64[1, 1] = matmul %30 %50
+                %71:f64[1, 1] = add %69 %70
             in (%71)
         "}
         .trim_end(),

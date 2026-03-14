@@ -3,7 +3,6 @@
 use thiserror::Error;
 
 use crate::parameters::{ParameterError, Parameterized};
-use crate::types::Type;
 
 use super::array_type::{ArrayType, ArrayTypeBroadcastingError};
 

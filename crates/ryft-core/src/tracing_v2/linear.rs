@@ -211,7 +211,6 @@ where
 impl<V, Input, Output> Display for LinearProgram<V, Input, Output>
 where
     V: TraceValue,
-    V::Abstract: Display,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {

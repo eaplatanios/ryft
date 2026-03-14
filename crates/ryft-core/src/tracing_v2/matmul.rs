@@ -9,12 +9,9 @@ use std::{
     sync::Arc,
 };
 
-use ryft_macros::Parameter;
-
 use crate::{
-    parameters::Parameter,
     tracing_v2::{
-        FloatExt, ScalarAbstract, TraceError, TraceValue, ZeroLike,
+        FloatExt, TraceError, TraceValue, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, GraphBuilder},
@@ -22,28 +19,10 @@ use crate::{
         linear::LinearTerm,
         ops::{BatchOp, LinearOp, LinearOpRef, Op},
     },
+    types::{DataType, Typed},
+    types_v0::array_type::{ArrayType, Shape, Size},
 };
 
-/// Abstract matrix metadata used by staged tracing.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Parameter)]
-pub struct MatrixAbstract {
-    /// Scalar dtype of the matrix entries.
-    pub scalar: ScalarAbstract,
-    /// Number of rows.
-    pub rows: usize,
-    /// Number of columns.
-    pub cols: usize,
-}
-
-impl Display for MatrixAbstract {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let scalar = match self.scalar {
-            ScalarAbstract::F32 => "f32",
-            ScalarAbstract::F64 => "f64",
-        };
-        write!(f, "{scalar}[{},{}]", self.rows, self.cols)
-    }
-}
 /// Matrix operations required by the tracing prototype.
 pub trait MatrixOps: Sized {
     /// Matrix multiplication.
@@ -54,9 +33,12 @@ pub trait MatrixOps: Sized {
 }
 
 /// Convenience trait for traceable matrix leaves.
-pub trait MatrixValue: TraceValue<Abstract = MatrixAbstract> + MatrixOps {}
+///
+/// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in this module expect
+/// those array types to describe rank-2 matrices with static dimensions and floating-point element types.
+pub trait MatrixValue: TraceValue + MatrixOps {}
 
-impl<T> MatrixValue for T where T: TraceValue<Abstract = MatrixAbstract> + MatrixOps {}
+impl<T> MatrixValue for T where T: TraceValue + MatrixOps {}
 
 /// Tangent representation for matrix-valued primals.
 pub trait MatrixTangentSpace<V>: TangentSpace<V>
@@ -101,15 +83,36 @@ fn expect_batch_sizes_match<V>(left: &BatchedValue<V>, right: &BatchedValue<V>) 
     if left.len() == right.len() { Ok(()) } else { Err(TraceError::MismatchedBatchSize) }
 }
 
-fn matmul_abstract(lhs: &MatrixAbstract, rhs: &MatrixAbstract, op: &'static str) -> Result<MatrixAbstract, TraceError> {
-    if lhs.scalar != rhs.scalar || lhs.cols != rhs.rows {
-        return Err(TraceError::IncompatibleAbstractValues { op });
-    }
-    Ok(MatrixAbstract { scalar: lhs.scalar, rows: lhs.rows, cols: rhs.cols })
+fn matrix_array_type(data_type: DataType, rows: usize, cols: usize) -> ArrayType {
+    ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
 }
 
-fn transpose_abstract(input: &MatrixAbstract) -> MatrixAbstract {
-    MatrixAbstract { scalar: input.scalar, rows: input.cols, cols: input.rows }
+fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TraceError> {
+    if !matches!(r#type.data_type, DataType::F32 | DataType::F64) || r#type.rank() != 2 {
+        return Err(TraceError::IncompatibleAbstractValues { op });
+    }
+
+    let Size::Static(rows) = r#type.dimension(0) else {
+        return Err(TraceError::IncompatibleAbstractValues { op });
+    };
+    let Size::Static(cols) = r#type.dimension(1) else {
+        return Err(TraceError::IncompatibleAbstractValues { op });
+    };
+    Ok((r#type.data_type, rows, cols))
+}
+
+fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
+    let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
+    let (rhs_data_type, rhs_rows, rhs_cols) = matrix_parts(rhs, op)?;
+    if lhs_data_type != rhs_data_type || lhs_cols != rhs_rows {
+        return Err(TraceError::IncompatibleAbstractValues { op });
+    }
+    Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols))
+}
+
+fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
+    let (data_type, rows, cols) = matrix_parts(input, op)?;
+    Ok(matrix_array_type(data_type, cols, rows))
 }
 
 fn single_batch_output<V>(mut outputs: Vec<BatchedValue<V>>, op: &'static str) -> BatchedValue<V>
@@ -144,7 +147,7 @@ where
         "matmul"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![matmul_abstract(&inputs[0], &inputs[1], "matmul")?])
     }
@@ -198,9 +201,9 @@ where
         "matrix_transpose"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
-        Ok(vec![transpose_abstract(&inputs[0])])
+        Ok(vec![transpose_abstract(&inputs[0], "matrix_transpose")?])
     }
 
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
@@ -263,9 +266,9 @@ where
         "left_matmul"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
-        Ok(vec![matmul_abstract(&self.factor.abstract_value(), &inputs[0], "left_matmul")?])
+        Ok(vec![matmul_abstract(&<V as Typed<ArrayType>>::tpe(&self.factor), &inputs[0], "left_matmul")?])
     }
 
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
@@ -340,9 +343,9 @@ where
         "right_matmul"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
-        Ok(vec![matmul_abstract(&inputs[0], &self.factor.abstract_value(), "right_matmul")?])
+        Ok(vec![matmul_abstract(&inputs[0], &<V as Typed<ArrayType>>::tpe(&self.factor), "right_matmul")?])
     }
 
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
@@ -396,9 +399,9 @@ where
         "linear_matrix_transpose"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
-        Ok(vec![transpose_abstract(&inputs[0])])
+        Ok(vec![transpose_abstract(&inputs[0], "linear_matrix_transpose")?])
     }
 
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
@@ -502,10 +505,12 @@ where
 mod ndarray_support {
     use ndarray::Array2;
 
-    use super::{MatrixAbstract, MatrixOps};
+    use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, FloatExt, OneLike, ScalarAbstract, TraceLeaf, ZeroLike},
+        tracing_v2::{CoordinateValue, FloatExt, OneLike, TraceValue, ZeroLike},
+        types::{DataType, Typed},
+        types_v0::ArrayType,
     };
 
     impl Parameter for Array2<f32> {}
@@ -535,23 +540,23 @@ mod ndarray_support {
         }
     }
 
-    impl TraceLeaf for Array2<f32> {
-        type Abstract = MatrixAbstract;
-
+    impl Typed<ArrayType> for Array2<f32> {
         #[inline]
-        fn abstract_value(&self) -> Self::Abstract {
-            MatrixAbstract { scalar: ScalarAbstract::F32, rows: self.nrows(), cols: self.ncols() }
+        fn tpe(&self) -> ArrayType {
+            matrix_array_type(DataType::F32, self.nrows(), self.ncols())
         }
     }
 
-    impl TraceLeaf for Array2<f64> {
-        type Abstract = MatrixAbstract;
+    impl TraceValue for Array2<f32> {}
 
+    impl Typed<ArrayType> for Array2<f64> {
         #[inline]
-        fn abstract_value(&self) -> Self::Abstract {
-            MatrixAbstract { scalar: ScalarAbstract::F64, rows: self.nrows(), cols: self.ncols() }
+        fn tpe(&self) -> ArrayType {
+            matrix_array_type(DataType::F64, self.nrows(), self.ncols())
         }
     }
+
+    impl TraceValue for Array2<f64> {}
 
     impl ZeroLike for Array2<f32> {
         #[inline]

@@ -9,11 +9,13 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, TraceError, TraceLeaf, TraceValue, ZeroLike,
+        FloatExt, TraceError, TraceValue, ZeroLike,
         context::JvpContext,
         linear::{LinearProgram, Linearized, jvp_program},
         ops::{AddOp, CosOp, JvpOp, MulOp, NegOp, SinOp},
     },
+    types::Typed,
+    types_v0::ArrayType,
 };
 
 /// Tangent representation for a traced primal value.
@@ -82,17 +84,22 @@ where
 {
 }
 
-impl<V, T> TraceLeaf for JvpTracer<V, T>
+impl<V, T> Typed<ArrayType> for JvpTracer<V, T>
 where
     V: TraceValue,
-    T: TangentSpace<V>,
+    T: TangentSpace<V> + 'static,
 {
-    type Abstract = V::Abstract;
-
     #[inline]
-    fn abstract_value(&self) -> Self::Abstract {
-        self.primal.abstract_value()
+    fn tpe(&self) -> ArrayType {
+        <V as Typed<ArrayType>>::tpe(&self.primal)
     }
+}
+
+impl<V, T> TraceValue for JvpTracer<V, T>
+where
+    V: TraceValue,
+    T: TangentSpace<V> + 'static,
+{
 }
 
 impl<V, T> ZeroLike for JvpTracer<V, T>

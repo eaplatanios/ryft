@@ -15,6 +15,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     graph::{AtomId, GraphBuilder},
 };
+use crate::types_v0::ArrayType;
 
 /// Core primitive operation interface understood by staged graphs.
 pub trait Op<V>: Debug + Display
@@ -25,7 +26,7 @@ where
     fn name(&self) -> &'static str;
 
     /// Computes abstract outputs from abstract inputs without executing the operation.
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError>;
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError>;
 
     /// Executes the operation on concrete values.
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
@@ -96,7 +97,7 @@ where
     }
 
     #[inline]
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         (**self).abstract_eval(inputs)
     }
 
@@ -155,7 +156,7 @@ fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<(), 
     if left.len() == right.len() { Ok(()) } else { Err(TraceError::MismatchedBatchSize) }
 }
 
-fn unary_abstract<V>(_op: &'static str, inputs: &[V::Abstract]) -> Result<V::Abstract, TraceError>
+fn unary_abstract<V>(_op: &'static str, inputs: &[ArrayType]) -> Result<ArrayType, TraceError>
 where
     V: TraceValue,
 {
@@ -163,7 +164,7 @@ where
     Ok(inputs[0].clone())
 }
 
-fn binary_same_abstract<V>(op: &'static str, inputs: &[V::Abstract]) -> Result<V::Abstract, TraceError>
+fn binary_same_abstract<V>(op: &'static str, inputs: &[ArrayType]) -> Result<ArrayType, TraceError>
 where
     V: TraceValue,
 {
@@ -195,7 +196,7 @@ where
         "add"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![binary_same_abstract::<V>("add", inputs)?])
     }
 
@@ -282,7 +283,7 @@ where
         "mul"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![binary_same_abstract::<V>("mul", inputs)?])
     }
 
@@ -356,7 +357,7 @@ where
         "neg"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract::<V>("neg", inputs)?])
     }
 
@@ -432,7 +433,7 @@ where
         "sin"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract::<V>("sin", inputs)?])
     }
 
@@ -493,7 +494,7 @@ where
         "cos"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract::<V>("cos", inputs)?])
     }
 
@@ -581,7 +582,7 @@ where
         "scale"
     }
 
-    fn abstract_eval(&self, inputs: &[V::Abstract]) -> Result<Vec<V::Abstract>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract::<V>("scale", inputs)?])
     }
 
@@ -646,7 +647,9 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{GraphBuilder, ScalarAbstract, TraceError, test_support},
+        tracing_v2::{GraphBuilder, TraceError, test_support},
+        types::DataType,
+        types_v0::ArrayType,
     };
 
     use super::*;
@@ -658,7 +661,11 @@ mod tests {
 
     #[test]
     fn add_abstract_eval_rejects_incompatible_inputs() {
-        let error = <AddOp as Op<f64>>::abstract_eval(&AddOp, &[ScalarAbstract::F32, ScalarAbstract::F64]).unwrap_err();
+        let error = <AddOp as Op<f64>>::abstract_eval(
+            &AddOp,
+            &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap_err();
         assert_eq!(error, TraceError::IncompatibleAbstractValues { op: "add" });
         test_support::assert_reference_graph_rendering();
     }

@@ -34,11 +34,11 @@ pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, LinearTerm, Linearized, grad, hessian, jacfwd, jacrev, jvp_program,
     linearize, value_and_grad, vjp,
 };
-pub use matmul::{MatMulOp, MatrixAbstract, MatrixOps, MatrixTangentSpace, MatrixTransposeOp, MatrixValue};
+pub use matmul::{MatMulOp, MatrixOps, MatrixTangentSpace, MatrixTransposeOp, MatrixValue};
 pub use ops::{
     AddOp, BatchOp, CosOp, JvpOp, LinearOp, LinearOpRef, MulOp, NegOp, Op, ScaleOp, SinOp, StagedOp, StagedOpRef,
 };
-pub use value::{FloatExt, OneLike, ScalarAbstract, TraceLeaf, TraceValue, ZeroLike};
+pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

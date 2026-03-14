@@ -3,37 +3,15 @@
 //! The tracing prototype distinguishes between two related concepts:
 //!
 //! - a concrete leaf value such as `f64` or an `ndarray::Array2<f64>`;
-//! - the structural metadata that tracing needs in order to stage programs without inspecting full values.
+//! - the [`ArrayType`](crate::types_v0::ArrayType) metadata that tracing needs in order to stage programs without
+//!   inspecting full values.
 //!
 //! The traits in this module capture that boundary. They are intentionally small so that future tensor-like leaf
 //! types, including PJRT-backed arrays, can adopt the tracing machinery by implementing a compact set of behaviors.
 
-use std::{
-    fmt::{Debug, Display},
-    ops::{Add, Mul, Neg},
-};
+use std::ops::{Add, Mul, Neg};
 
-use ryft_macros::Parameter;
-
-use crate::parameters::Parameter;
-
-/// Abstract shape-and-dtype information for scalar leaves used by the prototype implementation.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Parameter)]
-pub enum ScalarAbstract {
-    /// 32-bit floating-point scalar.
-    F32,
-    /// 64-bit floating-point scalar.
-    F64,
-}
-
-impl Display for ScalarAbstract {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScalarAbstract::F32 => write!(f, "f32[]"),
-            ScalarAbstract::F64 => write!(f, "f64[]"),
-        }
-    }
-}
+use crate::{parameters::Parameter, types::Typed, types_v0::ArrayType};
 
 /// Minimal floating-point surface used by the scalar tracing primitives.
 ///
@@ -44,18 +22,6 @@ pub trait FloatExt: Clone + Add<Output = Self> + Mul<Output = Self> + Neg<Output
 
     /// Computes the elementwise cosine.
     fn cos(self) -> Self;
-}
-
-/// Trait implemented by indivisible tracing leaves.
-///
-/// `TraceLeaf` connects a concrete leaf value to its lightweight abstract value so that graphs can be staged and
-/// validated without materializing every intermediate result.
-pub trait TraceLeaf: Clone + Parameter {
-    /// Abstract metadata used during tracing.
-    type Abstract: Clone + Debug + Eq + PartialEq;
-
-    /// Returns the abstract value corresponding to `self`.
-    fn abstract_value(&self) -> Self::Abstract;
 }
 
 /// Creates a zero value with the same logical shape as `self`.
@@ -73,11 +39,11 @@ pub trait OneLike: Clone {
 /// Convenience trait for stageable leaves used by `tracing_v2`.
 ///
 /// [`TraceValue`] identifies leaf values that can appear in staged graphs and participate in abstract evaluation. It
-/// deliberately does not imply eager numeric operations such as [`FloatExt`] or differentiation-specific capabilities
-/// such as [`ZeroLike`]. Those requirements live on the primitive operations and transforms that actually use them.
-pub trait TraceValue: TraceLeaf + 'static {}
-
-impl<T> TraceValue for T where T: TraceLeaf + 'static {}
+/// ties each runtime leaf to the shared [`ArrayType`](crate::types_v0::ArrayType) descriptor used by `tracing_v2`
+/// via [`Typed`], while deliberately not implying eager numeric operations such as [`FloatExt`] or
+/// differentiation-specific capabilities such as [`ZeroLike`]. Those requirements live on the primitive operations
+/// and transforms that actually use them.
+pub trait TraceValue: Clone + Parameter + Typed<ArrayType> + 'static {}
 
 impl FloatExt for f32 {
     #[inline]
@@ -91,14 +57,7 @@ impl FloatExt for f32 {
     }
 }
 
-impl TraceLeaf for f32 {
-    type Abstract = ScalarAbstract;
-
-    #[inline]
-    fn abstract_value(&self) -> Self::Abstract {
-        ScalarAbstract::F32
-    }
-}
+impl TraceValue for f32 {}
 
 impl ZeroLike for f32 {
     #[inline]
@@ -126,14 +85,7 @@ impl FloatExt for f64 {
     }
 }
 
-impl TraceLeaf for f64 {
-    type Abstract = ScalarAbstract;
-
-    #[inline]
-    fn abstract_value(&self) -> Self::Abstract {
-        ScalarAbstract::F64
-    }
-}
+impl TraceValue for f64 {}
 
 impl ZeroLike for f64 {
     #[inline]
@@ -151,14 +103,18 @@ impl OneLike for f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::test_support;
+    use crate::{
+        tracing_v2::test_support,
+        types::{DataType, Typed},
+        types_v0::ArrayType,
+    };
 
     use super::*;
 
     #[test]
     fn scalar_leaf_traits_report_expected_values() {
-        assert_eq!(1.25f32.abstract_value(), ScalarAbstract::F32);
-        assert_eq!(2.5f64.abstract_value(), ScalarAbstract::F64);
+        assert_eq!(<f32 as Typed<ArrayType>>::tpe(&1.25f32), ArrayType::scalar(DataType::F32));
+        assert_eq!(<f64 as Typed<ArrayType>>::tpe(&2.5f64), ArrayType::scalar(DataType::F64));
         assert_eq!(3.0f32.zero_like(), 0.0);
         assert_eq!(3.0f64.one_like(), 1.0);
         test_support::assert_reference_scalar_sine_jit_rendering();
