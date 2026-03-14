@@ -17,27 +17,10 @@ pub enum DataTypeError {
     InvalidDataType { message: String, backtrace: String },
 
     #[error("cannot construct a promoted data type from an empty collection of data types")]
-    EmptyDataTypePromotionInput { backtrace: String },
+    EmptyPromotionInput { backtrace: String },
 
     #[error("{message}")]
-    InvalidDataTypePromotion { message: String, backtrace: String },
-}
-
-impl DataTypeError {
-    /// Creates a new [`DataTypeError::InvalidDataType`].
-    pub fn invalid_data_type<M: Into<String>>(message: M) -> Self {
-        Self::InvalidDataType { message: message.into(), backtrace: Backtrace::capture().to_string() }
-    }
-
-    /// Creates a new [`DataTypeError::EmptyDataTypePromotionInput`].
-    pub fn empty_data_type_promotion_input() -> Self {
-        Self::EmptyDataTypePromotionInput { backtrace: Backtrace::capture().to_string() }
-    }
-
-    /// Creates a new [`DataTypeError::InvalidDataTypePromotion`].
-    pub fn invalid_data_type_promotion<M: Into<String>>(message: M) -> Self {
-        Self::InvalidDataTypePromotion { message: message.into(), backtrace: Backtrace::capture().to_string() }
-    }
+    InvalidPromotion { message: String, backtrace: String },
 }
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
@@ -1309,9 +1292,8 @@ impl DataType {
     /// This operation is order-invariant, meaning that it returns the same result irrespective of the order in which
     /// the input data types are provided.
     ///
-    /// This function returns [`DataTypeError::EmptyDataTypePromotionInput`] when `data_types` is empty and
-    /// [`DataTypeError::InvalidDataTypePromotion`] when the provided types are incompatible in terms of type
-    /// promotion.
+    /// This function returns [`DataTypeError::EmptyPromotionInput`] when `data_types` is empty and
+    /// [`DataTypeError::InvalidPromotion`] when the provided types are incompatible in terms of type promotion.
     ///
     /// # Examples
     ///
@@ -1327,26 +1309,30 @@ impl DataType {
     #[inline]
     pub fn promoted(data_types: &[Self]) -> Result<Self, DataTypeError> {
         let Some((head, tail)) = data_types.split_first() else {
-            return Err(DataTypeError::empty_data_type_promotion_input());
+            return Err(DataTypeError::EmptyPromotionInput { backtrace: Backtrace::capture().to_string() });
         };
         tail.iter().try_fold(*head, |x, y| {
             DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS[x.index()][y.index()].ok_or_else(|| {
-                DataTypeError::invalid_data_type_promotion(format!(
-                    "cannot promote types `{x}` and `{y}` to a common type",
-                ))
+                DataTypeError::InvalidPromotion {
+                    message: format!("cannot promote types `{x}` and `{y}` to a common type"),
+                    backtrace: Backtrace::capture().to_string(),
+                }
             })
         })
     }
 
     /// Promotes this [`DataType`] to the provided [`DataType`]. This function returns
-    /// [`DataTypeError::InvalidDataTypePromotion`] when the promotion is not allowed. Refer to the documentation of
-    /// [`DataType`] for more information on type promotions and the rules that govern them.
+    /// [`DataTypeError::InvalidPromotion`] when the promotion is not allowed. Refer to the documentation
+    /// of [`DataType`] for more information on type promotions and the rules that govern them.
     #[inline]
     pub fn promote_to(self, other: DataType) -> Result<DataType, DataTypeError> {
         if self.is_promotable_to(other) {
             Ok(other)
         } else {
-            Err(DataTypeError::invalid_data_type_promotion(format!("cannot promote type `{self}` to type `{other}`")))
+            Err(DataTypeError::InvalidPromotion {
+                message: format!("cannot promote type `{self}` to type `{other}`"),
+                backtrace: Backtrace::capture().to_string(),
+            })
         }
     }
 
@@ -1437,9 +1423,10 @@ impl TryFrom<BufferType> for DataType {
 
     fn try_from(buffer_type: BufferType) -> Result<Self, Self::Error> {
         match buffer_type {
-            BufferType::Invalid => {
-                Err(DataTypeError::invalid_data_type(format!("invalid data type from PJRT: '{buffer_type}'")))
-            }
+            BufferType::Invalid => Err(DataTypeError::InvalidDataType {
+                message: format!("invalid data type from PJRT: '{buffer_type}'"),
+                backtrace: Backtrace::capture().to_string(),
+            }),
             BufferType::Token => Ok(Self::Token),
             BufferType::Predicate => Ok(Self::Boolean),
             BufferType::I1 => Ok(Self::I1),
@@ -1566,40 +1553,40 @@ mod tests {
         assert_eq!(DataType::promoted(&[DataType::F16, DataType::BF16, DataType::F64]), Ok(DataType::F64));
         assert_eq!(DataType::promoted(&[DataType::F64, DataType::F16, DataType::BF16]), Ok(DataType::F64));
         assert_eq!(DataType::promoted(&[DataType::BF16, DataType::F64, DataType::F16]), Ok(DataType::F64));
-        assert!(matches!(DataType::promoted(&[]), Err(DataTypeError::EmptyDataTypePromotionInput { .. }),));
+        assert!(matches!(DataType::promoted(&[]), Err(DataTypeError::EmptyPromotionInput { .. }),));
         assert!(matches!(
             DataType::promoted(&[DataType::F8E3M4, DataType::F32]),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `f8e3m4` and `f32` to a common type",
         ));
         assert!(matches!(
             DataType::promoted(&[DataType::F32, DataType::F8E3M4]),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `f32` and `f8e3m4` to a common type",
         ));
         assert!(matches!(
             DataType::promoted(&[DataType::U4, DataType::F8E3M4]),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `u4` and `f8e3m4` to a common type",
         ));
         assert!(matches!(
             DataType::promoted(&[DataType::Boolean, DataType::U1, DataType::F8E3M4]),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `u1` and `f8e3m4` to a common type",
         ));
         assert!(matches!(
             DataType::promoted(&[DataType::F8E3M4, DataType::F8E8M0FNU]),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `f8e3m4` and `f8e8m0fnu` to a common type",
         ));
         assert!(matches!(
             DataType::promoted(&[DataType::F8E8M0FNU, DataType::F8E3M4]),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `f8e8m0fnu` and `f8e3m4` to a common type",
         ));
         assert!(matches!(
             DataType::promoted(&[DataType::F4E2M1FN, DataType::F8E3M4]),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `f4e2m1fn` and `f8e3m4` to a common type",
         ));
     }
@@ -1620,37 +1607,37 @@ mod tests {
         assert_eq!(DataType::F64.promote_to(DataType::C128), Ok(DataType::C128));
         assert!(matches!(
             DataType::Boolean.promote_to(DataType::I1),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `bool` to type `i1`",
         ));
         assert!(matches!(
             DataType::U4.promote_to(DataType::I4),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `u4` to type `i4`",
         ));
         assert!(matches!(
             DataType::I16.promote_to(DataType::Boolean),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `i16` to type `bool`",
         ));
         assert!(matches!(
             DataType::F8E5M2FNUZ.promote_to(DataType::BF16),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `f8e5m2fnuz` to type `bf16`",
         ));
         assert!(matches!(
             DataType::F8E3M4.promote_to(DataType::F4E2M1FN),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `f8e3m4` to type `f4e2m1fn`",
         ));
         assert!(matches!(
             DataType::F8E3M4.promote_to(DataType::F8E4M3FN),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `f8e3m4` to type `f8e4m3fn`",
         ));
         assert!(matches!(
             DataType::F64.promote_to(DataType::C64),
-            Err(DataTypeError::InvalidDataTypePromotion { message, .. })
+            Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `f64` to type `c64`",
         ));
     }

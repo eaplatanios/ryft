@@ -12,7 +12,7 @@ use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v0::Tracer,
     types::{Type, Typed},
-    types_v0::broadcastable::BroadcastingError,
+    types_v0::broadcasting::BroadcastingError,
 };
 
 pub type AtomId = usize;

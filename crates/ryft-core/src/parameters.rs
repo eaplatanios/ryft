@@ -42,23 +42,6 @@ pub enum ParameterError {
     AmbiguousParameterCombination { values: Vec<String> },
 }
 
-impl ParameterError {
-    /// Creates a new [`ParameterError::UnusedParameters`].
-    pub fn unused_parameters(paths: Option<Vec<String>>) -> Self {
-        Self::UnusedParameters { paths }
-    }
-
-    /// Creates a new [`ParameterError::MissingParameters`].
-    pub fn missing_parameters(expected_count: usize, paths: Option<Vec<String>>) -> Self {
-        Self::MissingParameters { expected_count, paths }
-    }
-
-    /// Creates a new [`ParameterError::AmbiguousParameterCombination`].
-    pub fn ambiguous_parameter_combination(values: Vec<String>) -> Self {
-        Self::AmbiguousParameterCombination { values }
-    }
-}
-
 /// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].
 /// A type `X` implements [`SameAs<Y>`] only when `X` and `Y` are the exact same type.
 pub trait SameAs<T> {}
