@@ -23,11 +23,75 @@ pub enum BroadcastingError {
     ParameterError(#[from] ParameterError),
 }
 
-// TODO(eaplatanios): Expand the documentation by explaining how `Parameterized` data structures are handled and also
-//  explaining the NumPy broadcasting semantics based on reading the NumPy docs using our documentation conventions.
-/// Represents [`Type`]s or values that can be broadcast together using a combination of
-/// [NumPy](https://numpy.org/doc/stable/user/basics.broadcasting.html) broadcasting semantics
-/// and recursion into [`Parameterized`] data structures.
+/// Represents [`Type`](crate::types::Type)s or values that can be broadcast together.
+///
+/// Broadcasting in Ryft has two orthogonal components:
+///
+///   - **Parameter Broadcasting:** Each concrete implementer defines what it means to combine two
+///     [`Parameter`](crate::parameters::Parameter)s. For example, [`DataType`] uses data-type promotion, [`Shape`]
+///     follows the standard [NumPy broadcasting rules](https://numpy.org/doc/stable/user/basics.broadcasting.html),
+///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`] independently.
+///   - **Structural Broadcasting:** For [`Parameterized`] values whose leaves are [`ArrayType`]s, Ryft first aligns
+///     the left-hand side to the target parameter structure using [`Parameterized::broadcast_to_parameter_structure`].
+///     That alignment uses path-prefix broadcasting on named parameters, so a value with a smaller compatible parameter
+///     structure can be broadcast into a larger one. Once the structures are aligned, leaf broadcasting is applied
+///     pairwise and the final structured value is reconstructed.
+///
+/// ## NumPy-style Broadcasting Semantics
+///
+/// For [`Shape`]s, Ryft follows the same broadcasting rules that NumPy uses:
+///
+///   - Dimensions are compared from right to left.
+///   - Two aligned dimensions are compatible when they are equal or when one of them is `1`.
+///   - If the operands have different ranks, missing leading dimensions are treated as if they had size `1`.
+///
+/// Conceptually, dimensions of size `1` are stretched to match the other operand. As NumPy notes, that stretching is
+/// a semantic model for compatibility and result-shape inference; it does not imply that an implementation must
+/// materialize expanded copies of the underlying data.
+///
+/// These rules imply that, for example:
+///
+///   - a scalar broadcasts to any shape,
+///   - `(3,)` broadcasts with `(4, 3)` to `(4, 3)`,
+///   - `(4,)` does not broadcast with `(4, 3)` because the trailing dimensions `4` and `3` are incompatible, and
+///   - `(4, 1)` broadcasts with `(3,)` to `(4, 3)`.
+///
+/// The [`Broadcastable::broadcast`] operation is symmetric and returns the least common result that both operands can
+/// broadcast to. The [`Broadcastable::broadcast_to`] operation is directional and requires the left-hand side to
+/// broadcast exactly to the right-hand side's target. The default [`Broadcastable::broadcasted`] helper folds the
+/// symmetric operation over multiple values from left to right.
+///
+/// ## Examples
+///
+/// ```rust
+/// # use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
+/// # use ryft_core::types::data_type::DataType::{Boolean, F32, F64};
+/// # use ryft_core::types_v0::array_type::{ArrayType, Shape};
+/// let x = Shape::new(vec![4.into(), 3.into()]);
+/// let y = Shape::new(vec![3.into()]);
+/// let z = Shape::new(vec![4.into(), 1.into()]);
+/// let w = Shape::new(vec![4.into()]);
+///
+/// assert_eq!(x.broadcast(&y)?, x);
+/// assert_eq!(y.broadcast_to(&x)?, x);
+/// assert_eq!(z.broadcast(&y)?, Shape::new(vec![4.into(), 3.into()]));
+/// assert!(w.broadcast(&x).is_err());
+///
+/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])));
+/// let rhs = (
+///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
+///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+/// );
+///
+/// assert_eq!(
+///     lhs.broadcast(&rhs)?,
+///     (
+///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
+///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()])),
+///     ),
+/// );
+/// # Ok::<(), BroadcastingError>(())
+/// ```
 pub trait Broadcastable: Sized {
     /// Broadcasts this value with `other` and returns the least common result that both values can broadcast to.
     /// This operation is _symmetric_. For example, with [`Shape`] values this returns the smallest shape that both

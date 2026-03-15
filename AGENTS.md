@@ -26,6 +26,8 @@ When asked to implement a change or add a new feature, you must always follow th
    You must start tackling non-trivial tasks by writing a plan to `.tasks/plan_<task_name>.md` with checkable items,
    letting the user modify it before you start executing on it. While executing on a plan, you must mark completed
    items as such in that file, adding a high-level summary of what you did for each step in a new review section.
+   If the user explicitly waives planning for a narrowly scoped follow-up change, execute directly and keep the change
+   tightly scoped instead of forcing a new plan file.
 2. **Subagents:** Use subagents liberally to keep the main context clean. Offload research, exploration, and parallel
    analysis to subagents. Always use subagents for complex programs and stick to one task per subagent for focused
    execution.
@@ -60,6 +62,10 @@ update this file so that they do not need to remind you again in the future.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
 - When replacing a bespoke cross-cutting capability with something more general, prefer a small named trait over a
   higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).
+- When centering a capability on a trait, move the whole API surface onto that trait instead of keeping a split between
+  inherent methods and trait methods, to the extent possible.
+- In capability-focused modules, prefer inlining small single-use local helper functions back into the owning trait
+  impls when that makes the implementation easier to read.
 
 #### Formatting & Naming
 
