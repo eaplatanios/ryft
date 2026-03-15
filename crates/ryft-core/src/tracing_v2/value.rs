@@ -3,7 +3,7 @@
 //! The tracing prototype distinguishes between two related concepts:
 //!
 //! - a concrete leaf value such as `f64` or an `ndarray::Array2<f64>`;
-//! - the [`ArrayType`](crate::types_v0::ArrayType) metadata that tracing needs in order to stage programs without
+//! - the [`ArrayType`](crate::types::ArrayType) metadata that tracing needs in order to stage programs without
 //!   inspecting full values.
 //!
 //! The traits in this module capture that boundary. They are intentionally small so that future tensor-like leaf
@@ -11,7 +11,10 @@
 
 use std::ops::{Add, Mul, Neg};
 
-use crate::{parameters::Parameter, types::Typed, types_v0::ArrayType};
+use crate::{
+    parameters::Parameter,
+    types::{ArrayType, Typed},
+};
 
 /// Minimal floating-point surface used by the scalar tracing primitives.
 ///
@@ -39,7 +42,7 @@ pub trait OneLike: Clone {
 /// Convenience trait for stageable leaves used by `tracing_v2`.
 ///
 /// [`TraceValue`] identifies leaf values that can appear in staged graphs and participate in abstract evaluation. It
-/// ties each runtime leaf to the shared [`ArrayType`](crate::types_v0::ArrayType) descriptor used by `tracing_v2`
+/// ties each runtime leaf to the shared [`ArrayType`](crate::types::ArrayType) descriptor used by `tracing_v2`
 /// via [`Typed`], while deliberately not implying eager numeric operations such as [`FloatExt`] or
 /// differentiation-specific capabilities such as [`ZeroLike`]. Those requirements live on the primitive operations
 /// and transforms that actually use them.
@@ -105,8 +108,8 @@ impl OneLike for f64 {
 mod tests {
     use crate::{
         tracing_v2::test_support,
+        types::ArrayType,
         types::{DataType, Typed},
-        types_v0::ArrayType,
     };
 
     use super::*;

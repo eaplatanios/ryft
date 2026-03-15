@@ -22,8 +22,7 @@ use crate::{
         graph::{AtomId, Graph, GraphBuilder},
         ops::{AddOp, CosOp, MulOp, NegOp, SinOp, StagedOpRef},
     },
-    types::Typed,
-    types_v0::ArrayType,
+    types::{ArrayType, Typed},
 };
 
 /// Tracer used while staging JIT programs.

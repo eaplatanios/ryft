@@ -66,6 +66,8 @@ update this file so that they do not need to remind you again in the future.
   inherent methods and trait methods, to the extent possible.
 - In capability-focused modules, prefer inlining small single-use local helper functions back into the owning trait
   impls when that makes the implementation easier to read.
+- For module moves and path migrations, do not introduce compatibility shims or re-export bridges unless the user
+  explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
 
 #### Formatting & Naming
 

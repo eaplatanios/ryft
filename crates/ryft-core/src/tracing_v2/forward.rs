@@ -14,8 +14,7 @@ use crate::{
         linear::{LinearProgram, Linearized, jvp_program},
         ops::{AddOp, CosOp, JvpOp, MulOp, NegOp, SinOp},
     },
-    types::Typed,
-    types_v0::ArrayType,
+    types::{ArrayType, Typed},
 };
 
 /// Tangent representation for a traced primal value.

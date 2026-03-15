@@ -8,8 +8,7 @@ use std::{fmt::Display, marker::PhantomData};
 use crate::{
     parameters::Parameterized,
     tracing_v2::{Op, TraceError, TraceValue},
-    types::Typed,
-    types_v0::ArrayType,
+    types::{ArrayType, Typed},
 };
 
 /// Identifier for an atom within a staged graph.

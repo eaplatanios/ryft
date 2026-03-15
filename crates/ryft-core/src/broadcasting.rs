@@ -2,9 +2,8 @@ use thiserror::Error;
 
 use crate::{
     parameters::{ParameterError, Parameterized},
-    types::DataType,
     types::data_type::DataTypeError,
-    types_v0::array_type::{ArrayType, Shape, Size},
+    types::{ArrayType, DataType, Shape, Size},
 };
 
 /// Error returned by the operations supported by [`Broadcastable`] types.
@@ -66,7 +65,7 @@ pub enum BroadcastingError {
 /// ```rust
 /// # use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
 /// # use ryft_core::types::data_type::DataType::{Boolean, F32, F64};
-/// # use ryft_core::types_v0::array_type::{ArrayType, Shape};
+/// # use ryft_core::types::{ArrayType, Shape};
 /// let x = Shape::new(vec![4.into(), 3.into()]);
 /// let y = Shape::new(vec![3.into()]);
 /// let z = Shape::new(vec![4.into(), 1.into()]);
@@ -120,14 +119,17 @@ pub trait Broadcastable: Sized {
 }
 
 impl Broadcastable for DataType {
+    #[inline]
     fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError> {
         Ok(DataType::promoted(&[*self, *other])?)
     }
 
+    #[inline]
     fn broadcast_to(&self, other: &Self) -> Result<Self, BroadcastingError> {
         Ok(self.promote_to(*other)?)
     }
 
+    #[inline]
     fn is_broadcastable_to(&self, other: &Self) -> bool {
         self.is_promotable_to(*other)
     }
@@ -261,8 +263,8 @@ mod tests {
     use ryft_macros::Parameterized;
 
     use crate::parameters::{Parameter, ParameterError};
+    use crate::types::Shape;
     use crate::types::data_type::DataType::*;
-    use crate::types_v0::array_type::Shape;
 
     use super::*;
 

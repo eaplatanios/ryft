@@ -14,8 +14,7 @@ use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing_v0::{Tracer, VariableTracer},
-    types::{Type, Typed},
-    types_v0::ArrayType,
+    types::{ArrayType, Type, Typed},
 };
 
 // How do we handle things like `grad(lambda x: x**2 if x > 0 else 0.)`? In this case, we need to be able to keep the
@@ -327,8 +326,7 @@ mod tests {
         trigonometric::{Cos, Sin},
     };
     use crate::types::data_type::DataType::*;
-    use crate::types_v0::ArrayType;
-    use crate::types_v0::array_type::{Shape, Size};
+    use crate::types::{ArrayType, Shape, Size};
 
     use super::*;
 

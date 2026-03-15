@@ -1,5 +1,7 @@
+pub mod array_type;
 pub mod data_type;
 
+pub use array_type::*;
 pub use data_type::*;
 
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that

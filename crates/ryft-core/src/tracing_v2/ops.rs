@@ -15,7 +15,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     graph::{AtomId, GraphBuilder},
 };
-use crate::types_v0::ArrayType;
+use crate::types::ArrayType;
 
 /// Core primitive operation interface understood by staged graphs.
 pub trait Op<V>: Debug + Display
@@ -648,8 +648,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing_v2::{GraphBuilder, TraceError, test_support},
-        types::DataType,
-        types_v0::ArrayType,
+        types::{ArrayType, DataType},
     };
 
     use super::*;

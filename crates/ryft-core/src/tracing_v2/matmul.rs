@@ -19,8 +19,7 @@ use crate::{
         linear::LinearTerm,
         ops::{BatchOp, LinearOp, LinearOpRef, Op},
     },
-    types::{DataType, Typed},
-    types_v0::array_type::{ArrayType, Shape, Size},
+    types::{ArrayType, DataType, Shape, Size, Typed},
 };
 
 /// Matrix operations required by the tracing prototype.
@@ -509,8 +508,7 @@ mod ndarray_support {
     use crate::{
         parameters::Parameter,
         tracing_v2::{CoordinateValue, FloatExt, OneLike, TraceValue, ZeroLike},
-        types::{DataType, Typed},
-        types_v0::ArrayType,
+        types::{ArrayType, DataType, Typed},
     };
 
     impl Parameter for Array2<f32> {}
