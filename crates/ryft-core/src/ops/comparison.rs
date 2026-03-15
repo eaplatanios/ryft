@@ -2,7 +2,7 @@
 
 use half::{bf16, f16};
 
-use crate::differentiation::JvpTracer;
+use crate::differentiation_v0::JvpTracer;
 
 // ======================================================= EQ =======================================================
 
@@ -82,7 +82,7 @@ impl_partial_ord_with_jvp_tracer_rhs!(bool, i8, i16, i32, i64, u8, u16, u32, u64
 #[cfg(test)]
 mod tests {
     use crate::{
-        differentiation::{differential, linear, linearize},
+        differentiation_v0::{differential, linear, linearize},
         ops::{
             constants::Constant,
             trigonometric::{Cos, Sin},

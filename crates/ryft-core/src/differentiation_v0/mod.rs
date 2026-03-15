@@ -1,3 +1,7 @@
+//! Legacy v0 automatic differentiation and related type utilities.
+
+pub mod r#type;
+
 use std::{
     cell::RefCell,
     fmt::{Debug, Display},

@@ -238,8 +238,8 @@ impl Type for ArrayType {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
     use crate::types::{ArrayType, Shape, Size};
-    use crate::types::DataType::{Boolean, BF16, C64, F16, F32, F8E3M4, F8E4M3FN};
 
     #[test]
     fn test_size_value() {

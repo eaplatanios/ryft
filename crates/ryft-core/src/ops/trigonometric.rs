@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    differentiation::JvpTracer,
+    differentiation_v0::JvpTracer,
     parameters::Parameter,
     programs::{InterpretableOp, Op, ProgramError},
     tracing_v0::{TraceableOp, Tracer},

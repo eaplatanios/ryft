@@ -4,7 +4,7 @@ use half::{bf16, f16};
 use ryft_macros::Parameter;
 
 use crate::{
-    differentiation::JvpTracer,
+    differentiation_v0::JvpTracer,
     parameters::Parameter,
     programs::{AtomId, ConstantExpression, Op, ProgramBuilder, ProgramError},
     types::{Type, Typed},

@@ -2,7 +2,7 @@ use half::{bf16, f16};
 use paste::paste;
 
 use crate::{
-    differentiation::{Differentiable, JvpTracer},
+    differentiation_v0::{Differentiable, JvpTracer},
     programs::ConstantExpression,
     tracing_v0::Tracer,
     types::{ArrayType, Type, Typed},

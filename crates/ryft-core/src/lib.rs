@@ -1,5 +1,5 @@
 pub mod broadcasting;
-pub mod differentiation;
+pub mod differentiation_v0;
 pub mod errors;
 pub mod ops;
 pub mod parameters;
@@ -7,7 +7,6 @@ pub mod programs;
 pub mod tracing_v0;
 pub mod tracing_v2;
 pub mod types;
-pub mod types_v0;
 
 #[cfg(feature = "xla")]
 pub mod xla;

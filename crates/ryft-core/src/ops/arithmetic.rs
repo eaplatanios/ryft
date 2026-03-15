@@ -8,7 +8,7 @@ use half::{bf16, f16};
 use crate::{
     assert_input_count_matches,
     broadcasting::Broadcastable,
-    differentiation::JvpTracer,
+    differentiation_v0::JvpTracer,
     programs::{InterpretableOp, LinearInterpretableOp, LinearOp, Op, ProgramError},
     tracing_v0::{Traceable, TraceableOp, Tracer},
     types::{Type, Typed},
