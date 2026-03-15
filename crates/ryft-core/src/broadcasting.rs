@@ -178,296 +178,118 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
     }
 }
 
-// TODO(eaplatanios): Review these tests.
 #[cfg(test)]
 mod tests {
-    use std::vec::IntoIter;
+    use ryft_macros::Parameterized;
 
-    use crate::differentiation::JvpTracer;
-    use crate::parameters::{
-        Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily, Placeholder,
-    };
+    use crate::parameters::{Parameter, ParameterError};
     use crate::types::data_type::DataType::*;
-    use crate::types_v0::array_type::{Shape, Size};
+    use crate::types_v0::array_type::Shape;
 
     use super::*;
 
-    // TODO(eaplatanios): Use `#[derive(Parameterized)]` like in `parameters.rs`.
-    /// Test-only parameterized type whose leaf variant uses the root parameter path.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    enum PrefixBroadcast<P: Parameter> {
-        Leaf(P),
-        Wrapped { inner: P },
-        Pair { left: P, right: P },
-    }
+    // TODO(eaplatanios): Can we add a `test_data_type_broadcasting` test? And an `impl Broadcastable for DataType`?
 
-    /// [`ParameterizedFamily`] for [`PrefixBroadcast`].
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-    struct PrefixBroadcastFamily;
+    #[test]
+    fn test_shape_broadcasting() {
+        let s0 = Shape::new(vec![42.into(), 4.into()]);
+        let s1 = Shape::new(vec![1.into(), 4.into()]);
+        let s2 = Shape::scalar();
+        let s3 = Shape::new(vec![5.into(), 3.into()]);
 
-    impl<P: Parameter> ParameterizedFamily<P> for PrefixBroadcastFamily {
-        type To = PrefixBroadcast<P>;
-    }
+        assert_eq!(s1.broadcast(&s2), Ok(s1.clone()));
+        assert_eq!(s2.broadcast(&s1), Ok(s1.clone()));
+        assert!(matches!(s0.broadcast(&s3), Err(BroadcastingError::IncompatibleShapes { .. })));
 
-    impl<P: Parameter> Parameterized<P> for PrefixBroadcast<P> {
-        type Family = PrefixBroadcastFamily;
-        type To<T: Parameter> = PrefixBroadcast<T>;
-        type ParameterStructure = PrefixBroadcast<Placeholder>;
-        type ParameterIterator<'t, T: 't + Parameter>
-            = IntoIter<&'t T>
-        where
-            Self: 't;
-        type ParameterIteratorMut<'t, T: 't + Parameter>
-            = IntoIter<&'t mut T>
-        where
-            Self: 't;
-        type ParameterIntoIterator<T: Parameter> = IntoIter<T>;
-        type NamedParameterIterator<'t, T: 't + Parameter>
-            = IntoIter<(ParameterPath, &'t T)>
-        where
-            Self: 't;
-        type NamedParameterIteratorMut<'t, T: 't + Parameter>
-            = IntoIter<(ParameterPath, &'t mut T)>
-        where
-            Self: 't;
-        type NamedParameterIntoIterator<T: Parameter> = IntoIter<(ParameterPath, T)>;
+        assert_eq!(s2.broadcast_to(&s1), Ok(s1.clone()));
+        assert!(matches!(s1.broadcast_to(&s2), Err(BroadcastingError::IncompatibleShapes { .. })));
 
-        fn parameter_count(&self) -> usize {
-            match self {
-                Self::Leaf(_) | Self::Wrapped { .. } => 1,
-                Self::Pair { .. } => 2,
-            }
-        }
+        assert_eq!(Shape::broadcasted(&[&s0]), Ok(s0.clone()));
+        assert_eq!(Shape::broadcasted(&[&s1, &s2]), Ok(s1.clone()));
+        assert_eq!(Shape::broadcasted(&[&s2, &s1]), Ok(s1.clone()));
+        assert!(matches!(Shape::broadcasted(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
+        assert!(matches!(Shape::broadcasted(&[&s0, &s3]), Err(BroadcastingError::IncompatibleShapes { .. })));
 
-        fn parameter_structure(&self) -> Self::ParameterStructure {
-            match self {
-                Self::Leaf(_) => PrefixBroadcast::Leaf(Placeholder),
-                Self::Wrapped { .. } => PrefixBroadcast::Wrapped { inner: Placeholder },
-                Self::Pair { .. } => PrefixBroadcast::Pair { left: Placeholder, right: Placeholder },
-            }
-        }
-
-        fn parameters(&self) -> Self::ParameterIterator<'_, P> {
-            match self {
-                Self::Leaf(parameter) => vec![parameter].into_iter(),
-                Self::Wrapped { inner } => vec![inner].into_iter(),
-                Self::Pair { left, right } => vec![left, right].into_iter(),
-            }
-        }
-
-        fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> {
-            match self {
-                Self::Leaf(parameter) => vec![parameter].into_iter(),
-                Self::Wrapped { inner } => vec![inner].into_iter(),
-                Self::Pair { left, right } => vec![left, right].into_iter(),
-            }
-        }
-
-        fn into_parameters(self) -> Self::ParameterIntoIterator<P> {
-            match self {
-                Self::Leaf(parameter) => vec![parameter].into_iter(),
-                Self::Wrapped { inner } => vec![inner].into_iter(),
-                Self::Pair { left, right } => vec![left, right].into_iter(),
-            }
-        }
-
-        fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
-            match self {
-                Self::Leaf(parameter) => vec![(ParameterPath::root(), parameter)].into_iter(),
-                Self::Wrapped { inner } => vec![(ParameterPath::root().field("inner"), inner)].into_iter(),
-                Self::Pair { left, right } => {
-                    vec![(ParameterPath::root().field("left"), left), (ParameterPath::root().field("right"), right)]
-                        .into_iter()
-                }
-            }
-        }
-
-        fn named_parameters_mut(&mut self) -> Self::NamedParameterIteratorMut<'_, P> {
-            match self {
-                Self::Leaf(parameter) => vec![(ParameterPath::root(), parameter)].into_iter(),
-                Self::Wrapped { inner } => vec![(ParameterPath::root().field("inner"), inner)].into_iter(),
-                Self::Pair { left, right } => {
-                    vec![(ParameterPath::root().field("left"), left), (ParameterPath::root().field("right"), right)]
-                        .into_iter()
-                }
-            }
-        }
-
-        fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
-            match self {
-                Self::Leaf(parameter) => vec![(ParameterPath::root(), parameter)].into_iter(),
-                Self::Wrapped { inner } => vec![(ParameterPath::root().field("inner"), inner)].into_iter(),
-                Self::Pair { left, right } => {
-                    vec![(ParameterPath::root().field("left"), left), (ParameterPath::root().field("right"), right)]
-                        .into_iter()
-                }
-            }
-        }
-
-        fn from_parameters_with_remainder<I: Iterator<Item = P>>(
-            structure: Self::ParameterStructure,
-            parameters: &mut I,
-        ) -> Result<Self, ParameterError> {
-            match structure {
-                PrefixBroadcast::Leaf(_) => {
-                    parameters.next().map(Self::Leaf).ok_or_else(|| ParameterError::MissingParameters {
-                        expected_count: 1,
-                        paths: Some(vec![ParameterPath::root().to_string()]),
-                    })
-                }
-                PrefixBroadcast::Wrapped { .. } => {
-                    parameters.next().map(|inner| Self::Wrapped { inner }).ok_or_else(|| {
-                        ParameterError::MissingParameters {
-                            expected_count: 1,
-                            paths: Some(vec![ParameterPath::root().field("inner").to_string()]),
-                        }
-                    })
-                }
-                PrefixBroadcast::Pair { .. } => {
-                    let left = parameters.next();
-                    let right = parameters.next();
-                    match (left, right) {
-                        (Some(left), Some(right)) => Ok(Self::Pair { left, right }),
-                        (left, right) => {
-                            let mut missing_paths = Vec::new();
-                            if left.is_none() {
-                                missing_paths.push(ParameterPath::root().field("left").to_string());
-                            }
-                            if right.is_none() {
-                                missing_paths.push(ParameterPath::root().field("right").to_string());
-                            }
-                            Err(ParameterError::MissingParameters { expected_count: 2, paths: Some(missing_paths) })
-                        }
-                    }
-                }
-            }
-        }
+        assert!(s2.is_broadcastable_to(&s1));
+        assert!(!s0.is_broadcastable_to(&s3));
     }
 
     #[test]
-    fn test_array_type_broadcastable_broadcast() {
+    fn test_array_type_broadcasting() {
         let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
         let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
         let t2 = ArrayType::scalar(Boolean);
         let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
 
-        assert_eq!(<ArrayType as Broadcastable>::broadcasted(&[&t0]), Ok(t0.clone()));
-        assert_eq!(<ArrayType as Broadcastable>::broadcasted(&[&t1, &t2]), Ok(t1.clone()));
-        assert_eq!(<ArrayType as Broadcastable>::broadcasted(&[&t2, &t1]), Ok(t1.clone()));
+        assert_eq!(t1.broadcast(&t2), Ok(t1.clone()));
+        assert_eq!(t2.broadcast(&t1), Ok(t1.clone()));
+        assert!(matches!(t0.broadcast(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
 
-        assert!(matches!(
-            <ArrayType as Broadcastable>::broadcasted(&[]),
-            Err(BroadcastingError::EmptyBroadcastingInput)
-        ));
-        assert!(matches!(
-            <ArrayType as Broadcastable>::broadcasted(&[&t0, &t3]),
-            Err(BroadcastingError::IncompatibleShapes { .. }),
-        ));
+        assert_eq!(t2.broadcast_to(&t1), Ok(t1.clone()));
+        assert!(matches!(t0.broadcast_to(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
+
+        assert_eq!(ArrayType::broadcasted(&[&t0]), Ok(t0.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t1, &t2]), Ok(t1.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t2, &t1]), Ok(t1.clone()));
+        assert!(matches!(ArrayType::broadcasted(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
+        assert!(matches!(ArrayType::broadcasted(&[&t0, &t3]), Err(BroadcastingError::IncompatibleShapes { .. })));
+
+        assert!(t2.is_broadcastable_to(&t1));
+        assert!(!t0.is_broadcastable_to(&t3));
     }
 
     #[test]
-    fn test_jvp_tracer_broadcastable_broadcast() {
-        let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]));
-        let t2 = ArrayType::new(F32, Shape::new(vec![1.into(), 5.into()]));
-        let t3 = ArrayType::new(F32, Shape::new(vec![10.into(), 1.into()]));
-        let t4 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]));
-        let t5 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
-        let t6 = ArrayType::new(F32, Shape::new(vec![4.into(), 2.into()]));
+    fn test_parameterized_array_type_broadcastable() {
+        #[derive(Parameterized, Clone, Debug, Eq, PartialEq)]
+        #[ryft(crate = "crate::parameters")]
+        enum TestEnum<P: Parameter> {
+            Wrapped { inner: P },
+            Pair { left: P, right: P },
+        }
 
-        let j0 = JvpTracer { value: t1.clone(), tangent: t2.clone() };
-        let j1 = JvpTracer { value: t0.clone(), tangent: t3.clone() };
-        let j2 = JvpTracer { value: t1.clone(), tangent: t4.clone() };
-        let j3 = JvpTracer { value: t5.clone(), tangent: t6.clone() };
+        let t0 = TestEnum::Pair {
+            left: ArrayType::scalar(F32),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])),
+        };
 
-        assert_eq!(JvpTracer::<ArrayType, ArrayType>::broadcasted(&[&j0]), Ok(j0.clone()));
-        assert_eq!(JvpTracer::<ArrayType, ArrayType>::broadcasted(&[&j0, &j1]), Ok(j2));
+        let t1 = TestEnum::Pair {
+            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
+        };
 
+        let t2 = TestEnum::Pair {
+            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
+        };
+
+        let t3 = TestEnum::Wrapped { inner: ArrayType::scalar(F32) };
+
+        assert_eq!(t0.broadcast(&t1), Ok(t1.clone()));
         assert!(matches!(
-            JvpTracer::<ArrayType, ArrayType>::broadcasted(&[]),
-            Err(BroadcastingError::EmptyBroadcastingInput)
+            t3.broadcast(&t2),
+            Err(BroadcastingError::ParameterError(ParameterError::MissingParameters { .. })),
         ));
+
+        assert_eq!(t0.broadcast_to(&t1), Ok(t1.clone()));
         assert!(matches!(
-            JvpTracer::<ArrayType, ArrayType>::broadcasted(&[&j0, &j3]),
-            Err(BroadcastingError::IncompatibleShapes { .. }),
+            t3.broadcast_to(&t2),
+            Err(BroadcastingError::ParameterError(ParameterError::MissingParameters { .. })),
         ));
-    }
 
-    #[test]
-    fn test_nested_jvp_tracer_broadcastable_broadcast() {
-        type NestedJvpTracer =
-            JvpTracer<JvpTracer<ArrayType, ArrayType>, JvpTracer<ArrayType, JvpTracer<ArrayType, ArrayType>>>;
-
-        let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]));
-        let t2 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]));
-        let t3 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]));
-        let t4 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]));
-        let t5 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]));
-        let t6 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into(), 2.into()]));
-        let t7 = ArrayType::new(BF16, Shape::new(vec![1.into(), 1.into()]));
-        let t8 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]));
-        let t9 = ArrayType::new(C64, Shape::new(vec![1.into(), 42.into(), 1.into()]));
-        let t11 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]));
-        let t12 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]));
-        let t13 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]));
-        let t14 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]));
-        let t15 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]));
-        let t17 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
-
-        let j0 = NestedJvpTracer {
-            value: JvpTracer { value: t0.clone(), tangent: t1.clone() },
-            tangent: JvpTracer { value: t2.clone(), tangent: JvpTracer { value: t3.clone(), tangent: t4.clone() } },
-        };
-        let j1 = NestedJvpTracer {
-            value: JvpTracer { value: t5.clone(), tangent: t6.clone() },
-            tangent: JvpTracer { value: t7.clone(), tangent: JvpTracer { value: t8.clone(), tangent: t9.clone() } },
-        };
-        let j2 = NestedJvpTracer {
-            value: JvpTracer { value: t15.clone(), tangent: t11.clone() },
-            tangent: JvpTracer { value: t12.clone(), tangent: JvpTracer { value: t13.clone(), tangent: t14.clone() } },
-        };
-        let j3 = NestedJvpTracer {
-            value: JvpTracer { value: t15.clone(), tangent: t17.clone() },
-            tangent: JvpTracer { value: t12.clone(), tangent: JvpTracer { value: t13.clone(), tangent: t14.clone() } },
-        };
-
-        assert_eq!(NestedJvpTracer::broadcasted(&[&j0]), Ok(j0.clone()));
-        assert_eq!(NestedJvpTracer::broadcasted(&[&j0, &j1]), Ok(j2));
-        assert!(
-            matches!(NestedJvpTracer::broadcasted(&[&j0, &j3]), Err(BroadcastingError::IncompatibleShapes { .. }),)
+        assert_eq!(TestEnum::broadcasted(&[&t0]), Ok(t0.clone()));
+        assert_eq!(
+            TestEnum::broadcasted(&[&t0, &t1]),
+            Ok(TestEnum::Pair {
+                left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+                right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
+            }),
         );
-    }
-
-    #[test]
-    fn test_prefix_broadcastable_parameter_structures() {
-        let leaf = PrefixBroadcast::Leaf(ArrayType::scalar(F32));
-        let pair = PrefixBroadcast::Pair {
-            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
-        };
-
-        assert_eq!(leaf.broadcast_to(&pair), Ok(pair.clone()));
-        assert_eq!(leaf.broadcast(&pair), Ok(pair.clone()));
-        assert!(leaf.is_broadcastable_to(&pair));
-    }
-
-    #[test]
-    fn test_incompatible_prefix_broadcastable_parameter_structures() {
-        let wrapped = PrefixBroadcast::Wrapped { inner: ArrayType::scalar(F32) };
-        let pair = PrefixBroadcast::Pair {
-            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
-        };
-
         assert!(matches!(
-            wrapped.broadcast_to(&pair),
+            TestEnum::broadcasted(&[&t3, &t2]),
             Err(BroadcastingError::ParameterError(ParameterError::MissingParameters { .. })),
         ));
-        assert!(matches!(
-            wrapped.broadcast(&pair),
-            Err(BroadcastingError::ParameterError(ParameterError::MissingParameters { .. })),
-        ));
-        assert!(!wrapped.is_broadcastable_to(&pair));
+
+        assert!(t0.is_broadcastable_to(&t1));
+        assert!(!t3.is_broadcastable_to(&t2));
     }
 }

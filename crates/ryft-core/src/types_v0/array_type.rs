@@ -251,8 +251,8 @@ impl Display for ArrayType {
 mod tests {
     use crate::broadcasting::Broadcastable;
 
-    use super::*;
     use super::DataType::*;
+    use super::*;
 
     #[test]
     fn test_size_value() {

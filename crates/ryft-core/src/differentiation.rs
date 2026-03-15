@@ -321,10 +321,14 @@ pub fn linear<
 
 #[cfg(test)]
 mod tests {
+    use crate::broadcasting::{Broadcastable, BroadcastingError};
     use crate::ops::{
         constants::Constant,
         trigonometric::{Cos, Sin},
     };
+    use crate::types::data_type::DataType::*;
+    use crate::types_v0::ArrayType;
+    use crate::types_v0::array_type::{Shape, Size};
 
     use super::*;
 
@@ -370,6 +374,80 @@ mod tests {
 
     fn sin_plus_cos_times_sin<T: Clone + Sin + Cos + Add<Output = T> + Mul<Output = T>>(x: T) -> T {
         x.clone().sin() + x.clone().cos() * x.sin()
+    }
+
+    #[test]
+    fn test_jvp_tracer_broadcastable_broadcast() {
+        let t0 = ArrayType::scalar(Boolean);
+        let t1 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]));
+        let t2 = ArrayType::new(F32, Shape::new(vec![1.into(), 5.into()]));
+        let t3 = ArrayType::new(F32, Shape::new(vec![10.into(), 1.into()]));
+        let t4 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]));
+        let t5 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+        let t6 = ArrayType::new(F32, Shape::new(vec![4.into(), 2.into()]));
+
+        let j0 = JvpTracer { value: t1.clone(), tangent: t2.clone() };
+        let j1 = JvpTracer { value: t0.clone(), tangent: t3.clone() };
+        let j2 = JvpTracer { value: t1.clone(), tangent: t4.clone() };
+        let j3 = JvpTracer { value: t5.clone(), tangent: t6.clone() };
+
+        assert_eq!(JvpTracer::<ArrayType, ArrayType>::broadcasted(&[&j0]), Ok(j0.clone()));
+        assert_eq!(JvpTracer::<ArrayType, ArrayType>::broadcasted(&[&j0, &j1]), Ok(j2));
+
+        assert!(matches!(
+            JvpTracer::<ArrayType, ArrayType>::broadcasted(&[]),
+            Err(BroadcastingError::EmptyBroadcastingInput)
+        ));
+        assert!(matches!(
+            JvpTracer::<ArrayType, ArrayType>::broadcasted(&[&j0, &j3]),
+            Err(BroadcastingError::IncompatibleShapes { .. }),
+        ));
+    }
+
+    #[test]
+    fn test_nested_jvp_tracer_broadcastable_broadcast() {
+        type NestedJvpTracer =
+            JvpTracer<JvpTracer<ArrayType, ArrayType>, JvpTracer<ArrayType, JvpTracer<ArrayType, ArrayType>>>;
+
+        let t0 = ArrayType::scalar(Boolean);
+        let t1 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]));
+        let t2 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]));
+        let t3 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]));
+        let t4 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]));
+        let t5 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]));
+        let t6 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into(), 2.into()]));
+        let t7 = ArrayType::new(BF16, Shape::new(vec![1.into(), 1.into()]));
+        let t8 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]));
+        let t9 = ArrayType::new(C64, Shape::new(vec![1.into(), 42.into(), 1.into()]));
+        let t11 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]));
+        let t12 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]));
+        let t13 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]));
+        let t14 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]));
+        let t15 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]));
+        let t17 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+
+        let j0 = NestedJvpTracer {
+            value: JvpTracer { value: t0.clone(), tangent: t1.clone() },
+            tangent: JvpTracer { value: t2.clone(), tangent: JvpTracer { value: t3.clone(), tangent: t4.clone() } },
+        };
+        let j1 = NestedJvpTracer {
+            value: JvpTracer { value: t5.clone(), tangent: t6.clone() },
+            tangent: JvpTracer { value: t7.clone(), tangent: JvpTracer { value: t8.clone(), tangent: t9.clone() } },
+        };
+        let j2 = NestedJvpTracer {
+            value: JvpTracer { value: t15.clone(), tangent: t11.clone() },
+            tangent: JvpTracer { value: t12.clone(), tangent: JvpTracer { value: t13.clone(), tangent: t14.clone() } },
+        };
+        let j3 = NestedJvpTracer {
+            value: JvpTracer { value: t15.clone(), tangent: t17.clone() },
+            tangent: JvpTracer { value: t12.clone(), tangent: JvpTracer { value: t13.clone(), tangent: t14.clone() } },
+        };
+
+        assert_eq!(NestedJvpTracer::broadcasted(&[&j0]), Ok(j0.clone()));
+        assert_eq!(NestedJvpTracer::broadcasted(&[&j0, &j1]), Ok(j2));
+        assert!(
+            matches!(NestedJvpTracer::broadcasted(&[&j0, &j3]), Err(BroadcastingError::IncompatibleShapes { .. }),)
+        );
     }
 
     #[test]
