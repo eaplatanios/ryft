@@ -153,7 +153,7 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
                 .parameters()
                 .zip(rhs.parameters())
                 .map(|(lhs, rhs)| {
-                    let broadcasted_data_type = DataType::promoted(&[lhs.data_type, rhs.data_type])?;
+                    let broadcasted_data_type = lhs.data_type.broadcast(&rhs.data_type)?;
                     let broadcasted_shape = lhs.shape.broadcast(&rhs.shape)?;
                     Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape))
                 })
@@ -174,7 +174,7 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
             .parameters()
             .zip(other.parameters())
             .map(|(lhs, rhs)| {
-                let broadcasted_data_type = lhs.data_type.promote_to(rhs.data_type)?;
+                let broadcasted_data_type = lhs.data_type.broadcast_to(&rhs.data_type)?;
                 let broadcasted_shape = lhs.shape.broadcast_to(&rhs.shape)?;
                 Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape))
             })
@@ -187,7 +187,7 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
             return false;
         };
         broadcasted_self.parameters().zip(other.parameters()).all(|(lhs, rhs)| {
-            lhs.data_type.is_promotable_to(rhs.data_type) && lhs.shape.is_broadcastable_to(&rhs.shape)
+            lhs.data_type.is_broadcastable_to(&rhs.data_type) && lhs.shape.is_broadcastable_to(&rhs.shape)
         })
     }
 }
