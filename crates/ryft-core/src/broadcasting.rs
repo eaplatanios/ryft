@@ -55,6 +55,20 @@ pub trait Broadcastable: Sized {
     }
 }
 
+impl Broadcastable for DataType {
+    fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError> {
+        Ok(DataType::promoted(&[*self, *other])?)
+    }
+
+    fn broadcast_to(&self, other: &Self) -> Result<Self, BroadcastingError> {
+        Ok(self.promote_to(*other)?)
+    }
+
+    fn is_broadcastable_to(&self, other: &Self) -> bool {
+        self.is_promotable_to(*other)
+    }
+}
+
 impl Broadcastable for Shape {
     fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError> {
         // Handle differing array ranks by (conceptually) padding the shorter shape with ones on the left
@@ -188,7 +202,23 @@ mod tests {
 
     use super::*;
 
-    // TODO(eaplatanios): Can we add a `test_data_type_broadcasting` test? And an `impl Broadcastable for DataType`?
+    #[test]
+    fn test_data_type_broadcasting() {
+        assert_eq!(Boolean.broadcast(&U16), Ok(U16));
+        assert_eq!(U16.broadcast(&Boolean), Ok(U16));
+        assert!(matches!(F8E3M4.broadcast(&F32), Err(BroadcastingError::IncompatibleDataTypes(_))));
+
+        assert_eq!(Boolean.broadcast_to(&U16), Ok(U16));
+        assert!(matches!(F64.broadcast_to(&I32), Err(BroadcastingError::IncompatibleDataTypes(_))));
+
+        assert!(Boolean.is_broadcastable_to(&U16));
+        assert!(!F64.is_broadcastable_to(&I32));
+
+        assert_eq!(DataType::broadcasted(&[&Boolean]), Ok(Boolean));
+        assert_eq!(DataType::broadcasted(&[&Boolean, &U16]), Ok(U16));
+        assert!(matches!(DataType::broadcasted(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
+        assert!(matches!(DataType::broadcasted(&[&F8E3M4, &F32]), Err(BroadcastingError::IncompatibleDataTypes(_))));
+    }
 
     #[test]
     fn test_shape_broadcasting() {
