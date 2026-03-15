@@ -49,11 +49,11 @@ impl Size {
 }
 
 impl Display for Size {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self {
-            Self::Static(size) => write!(f, "{size}"),
-            Self::Dynamic(Some(upper_bound)) => write!(f, "<{upper_bound}"),
-            Self::Dynamic(None) => write!(f, "*"),
+            Self::Static(size) => write!(formatter, "{size}"),
+            Self::Dynamic(Some(upper_bound)) => write!(formatter, "<{upper_bound}"),
+            Self::Dynamic(None) => write!(formatter, "*"),
         }
     }
 }
@@ -125,8 +125,12 @@ impl Shape {
 }
 
 impl Display for Shape {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}]", self.dimensions.iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>().join(", "))
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "[{}]",
+            self.dimensions.iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>().join(", ")
+        )
     }
 }
 
@@ -223,8 +227,8 @@ impl ArrayType {
 }
 
 impl Display for ArrayType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{}", self.data_type, self.shape)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}{}", self.data_type, self.shape)
     }
 }
 

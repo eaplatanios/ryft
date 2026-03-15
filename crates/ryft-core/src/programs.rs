@@ -52,11 +52,16 @@ impl<T: Clone + Type, V: Typed<T>, O> ConstantExpression<T, V, O> {
 }
 
 impl<T, V: Display, O: Display> Display for ConstantExpression<T, V, O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self {
-            ConstantExpression::Value { value, .. } => write!(f, "{value}"),
+            ConstantExpression::Value { value, .. } => write!(formatter, "{value}"),
             ConstantExpression::Expression { op, inputs, .. } => {
-                write!(f, "{}({})", op, inputs.iter().map(|input| input.to_string()).collect::<Vec<_>>().join(", "))
+                write!(
+                    formatter,
+                    "{}({})",
+                    op,
+                    inputs.iter().map(|input| input.to_string()).collect::<Vec<_>>().join(", ")
+                )
             }
         }
     }
@@ -98,8 +103,8 @@ pub trait Op<T>: Display + DynClone {
 }
 
 impl<T> Debug for dyn Op<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self}")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self}")
     }
 }
 
@@ -133,8 +138,8 @@ pub trait InterpretableOp<T, V>: Op<T> {
 }
 
 impl<T, V> Debug for dyn InterpretableOp<T, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self}")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self}")
     }
 }
 
@@ -177,8 +182,8 @@ pub trait LinearOp<T, V>: Op<T> {
 }
 
 impl<T, V> Debug for dyn LinearOp<T, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self}")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self}")
     }
 }
 
@@ -214,8 +219,8 @@ clone_trait_object!(<T, V> LinearOp<T, V>);
 pub trait LinearInterpretableOp<T, V>: LinearOp<T, V> + InterpretableOp<T, V> {}
 
 impl<T, V> Debug for dyn LinearInterpretableOp<T, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self}")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self}")
     }
 }
 
@@ -256,9 +261,9 @@ pub struct Expression<O> {
 }
 
 impl<O: Display> Display for Expression<O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // TODO(eaplatanios): Improve this rendering.
-        write!(f, "{:?} = {} {:?}", self.outputs, self.op, self.inputs)
+        write!(formatter, "{:?} = {} {:?}", self.outputs, self.op, self.inputs)
     }
 }
 
@@ -517,23 +522,23 @@ impl<T, V, O> Program<T, V, O> {
 }
 
 impl<T: Display, V, O: Op<T>> Display for Program<T, V, O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inputs = self
             .inputs
             .iter()
             .map(|input| format!("%{}:{}", input.id, input.tpe))
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "lambda {inputs} .\n")?;
+        write!(formatter, "lambda {inputs} .\n")?;
         for (index, expression) in self.expressions.iter().enumerate() {
             // TODO(eaplatanios): Include types for the outputs.
             let inputs = expression.inputs.iter().map(|input| format!("%{}", input)).collect::<Vec<_>>().join(" ");
             let outputs = expression.outputs.iter().map(|output| format!("%{}", output)).collect::<Vec<_>>().join(", ");
             let prefix = if index == 0 { "let" } else { "   " };
-            write!(f, "{prefix} {outputs} = {} {inputs}\n", expression.op.to_string())?;
+            write!(formatter, "{prefix} {outputs} = {} {inputs}\n", expression.op.to_string())?;
         }
         let outputs = self.outputs.iter().map(|output| format!("%{}", output.id)).collect::<Vec<_>>().join(", ");
-        write!(f, "in ({outputs})")
+        write!(formatter, "in ({outputs})")
         // TODO(eaplatanios): Improve this rendering.
         // { lambda a:float64[] b:float64[] .
         //   let c:float64[] = sin a

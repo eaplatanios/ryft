@@ -87,14 +87,14 @@ impl<P: Parameter> Parameter for Option<P> {}
 pub struct Placeholder;
 
 impl Display for Placeholder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<Parameter>")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<Parameter>")
     }
 }
 
 impl Debug for Placeholder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<Parameter>")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<Parameter>")
     }
 }
 
@@ -219,15 +219,15 @@ impl ParameterPath {
 }
 
 impl Display for ParameterPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "$")?;
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "$")?;
         for segment in self.segments() {
             match segment {
-                ParameterPathSegment::Field(name) => write!(f, ".{name}")?,
-                ParameterPathSegment::Variant(name) => write!(f, ".{}", name.to_case(Case::Snake))?,
-                ParameterPathSegment::TupleIndex(index) => write!(f, ".{index}")?,
-                ParameterPathSegment::Index(index) => write!(f, "[{index}]")?,
-                ParameterPathSegment::Key(key) => write!(f, "[{key}]")?,
+                ParameterPathSegment::Field(name) => write!(formatter, ".{name}")?,
+                ParameterPathSegment::Variant(name) => write!(formatter, ".{}", name.to_case(Case::Snake))?,
+                ParameterPathSegment::TupleIndex(index) => write!(formatter, ".{index}")?,
+                ParameterPathSegment::Index(index) => write!(formatter, "[{index}]")?,
+                ParameterPathSegment::Key(key) => write!(formatter, "[{key}]")?,
             }
         }
         Ok(())
@@ -235,8 +235,8 @@ impl Display for ParameterPath {
 }
 
 impl Debug for ParameterPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ParameterPath[{self}]")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ParameterPath[{self}]")
     }
 }
 

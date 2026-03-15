@@ -1421,10 +1421,10 @@ impl DataType {
 impl TryFrom<BufferType> for DataType {
     type Error = DataTypeError;
 
-    fn try_from(buffer_type: BufferType) -> Result<Self, Self::Error> {
-        match buffer_type {
+    fn try_from(value: BufferType) -> Result<Self, Self::Error> {
+        match value {
             BufferType::Invalid => Err(DataTypeError::InvalidDataType {
-                message: format!("invalid data type from PJRT: '{buffer_type}'"),
+                message: format!("invalid data type from PJRT: '{value}'"),
                 backtrace: Backtrace::capture().to_string(),
             }),
             BufferType::Token => Ok(Self::Token),
@@ -1464,8 +1464,8 @@ impl TryFrom<BufferType> for DataType {
 
 #[cfg(feature = "xla")]
 impl From<DataType> for BufferType {
-    fn from(data_type: DataType) -> Self {
-        match data_type {
+    fn from(value: DataType) -> Self {
+        match value {
             DataType::Token => Self::Token,
             DataType::Boolean => Self::Predicate,
             DataType::I1 => Self::I1,

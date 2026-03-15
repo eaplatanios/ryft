@@ -37,8 +37,8 @@ pub struct VariableTracer<T, V, O> {
 }
 
 impl<T, V, O> Display for VariableTracer<T, V, O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "%{}", self.id)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "%{}", self.id)
     }
 }
 
@@ -67,10 +67,10 @@ impl<T, V, O> Tracer<T, V, O> {
 }
 
 impl<T, V: Display, O: Display> Display for Tracer<T, V, O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self {
-            Tracer::Constant(constant) => write!(f, "{constant}"),
-            Tracer::Variable(variable) => write!(f, "{variable}"),
+            Tracer::Constant(constant) => write!(formatter, "{constant}"),
+            Tracer::Variable(variable) => write!(formatter, "{variable}"),
         }
     }
 }

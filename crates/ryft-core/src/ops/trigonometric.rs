@@ -39,8 +39,8 @@ impl<V: Clone + Parameter + Sin + Cos + Mul<T, Output = T>, T> Sin for JvpTracer
 pub struct SinOp;
 
 impl Display for SinOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Sin")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Sin")
     }
 }
 
@@ -105,8 +105,8 @@ impl<V: Clone + Parameter + Sin + Cos + Neg<Output = V> + Mul<T, Output = T>, T>
 pub struct CosOp;
 
 impl Display for CosOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Cos")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Cos")
     }
 }
 

@@ -20,8 +20,8 @@ use crate::{
 pub struct NegOp;
 
 impl Display for NegOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Neg")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Neg")
     }
 }
 
@@ -95,8 +95,8 @@ impl_neg_for_tracer!(LinearInterpretableOp<T, V>, value_type_bounds = [Clone, Ne
 pub struct AddOp;
 
 impl Display for AddOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Add")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Add")
     }
 }
 
@@ -165,8 +165,8 @@ impl_add_for_tracer!(LinearInterpretableOp<T, V>, value_type_bounds = (Add<Outpu
 pub struct SubOp;
 
 impl Display for SubOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Sub")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Sub")
     }
 }
 
@@ -235,8 +235,8 @@ impl_sub_for_tracer!(LinearInterpretableOp<T, V>, value_type_bounds = (Clone, Su
 pub struct MulOp;
 
 impl Display for MulOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Mul")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Mul")
     }
 }
 
@@ -293,8 +293,8 @@ pub struct RightMulOp<V> {
 }
 
 impl<V: Display> Display for RightMulOp<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RightMul[{}]", self.coefficient)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "RightMul[{}]", self.coefficient)
     }
 }
 
@@ -376,8 +376,8 @@ pub struct LeftMulOp<V> {
 }
 
 impl<V: Display> Display for LeftMulOp<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LeftMul[{}]", self.coefficient)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "LeftMul[{}]", self.coefficient)
     }
 }
 

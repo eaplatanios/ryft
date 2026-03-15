@@ -287,12 +287,12 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");
         let format_typed_atom = |id: AtomId| format!("%{id}:{}", self.atoms[id].abstract_value);
 
         let inputs = self.input_atoms.iter().map(|input| format_typed_atom(*input)).collect::<Vec<_>>().join(", ");
-        writeln!(f, "lambda {inputs} .")?;
+        writeln!(formatter, "lambda {inputs} .")?;
 
         let mut equation_by_first_output = vec![None; self.atoms.len()];
         for (index, equation) in self.equations.iter().enumerate() {
@@ -307,7 +307,7 @@ where
                 AtomSource::Input => {}
                 AtomSource::Constant(_) => {
                     let prefix = if binding_count == 0 { "let" } else { "   " };
-                    writeln!(f, "{prefix} {} = const", format_typed_atom(atom_id))?;
+                    writeln!(formatter, "{prefix} {} = const", format_typed_atom(atom_id))?;
                     binding_count += 1;
                 }
                 AtomSource::Derived => {
@@ -320,9 +320,9 @@ where
                     let inputs = equation.inputs.iter().map(|input| format_atom(*input)).collect::<Vec<_>>().join(" ");
                     let prefix = if binding_count == 0 { "let" } else { "   " };
                     if inputs.is_empty() {
-                        writeln!(f, "{prefix} {outputs} = {}", equation.op)?;
+                        writeln!(formatter, "{prefix} {outputs} = {}", equation.op)?;
                     } else {
-                        writeln!(f, "{prefix} {outputs} = {} {inputs}", equation.op)?;
+                        writeln!(formatter, "{prefix} {outputs} = {} {inputs}", equation.op)?;
                     }
                     binding_count += 1;
                 }
@@ -330,7 +330,7 @@ where
         }
 
         let outputs = self.outputs.iter().map(|output| format_atom(*output)).collect::<Vec<_>>().join(", ");
-        write!(f, "in ({outputs})")
+        write!(formatter, "in ({outputs})")
     }
 }
 

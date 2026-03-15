@@ -1779,6 +1779,7 @@ dependencies = [
  "indoc",
  "ndarray",
  "paste",
+ "pretty_assertions",
  "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",

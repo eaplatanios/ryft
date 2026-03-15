@@ -5,7 +5,7 @@ use half::{bf16, f16};
 use crate::{
     programs::{Constant, ConstantExpression, Program, ProgramType},
     tracing_v0::{Tracer, VariableTracer},
-    types::data_type::DataType,
+    types::data_types::DataType,
     types::{ArrayType, Type, Typed},
 };
 

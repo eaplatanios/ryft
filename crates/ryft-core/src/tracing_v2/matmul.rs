@@ -127,14 +127,14 @@ where
 pub struct MatMulOp;
 
 impl Debug for MatMulOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MatMul")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "MatMul")
     }
 }
 
 impl Display for MatMulOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "matmul")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "matmul")
     }
 }
 
@@ -181,14 +181,14 @@ where
 pub struct MatrixTransposeOp;
 
 impl Debug for MatrixTransposeOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MatrixTranspose")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "MatrixTranspose")
     }
 }
 
 impl Display for MatrixTransposeOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "matrix_transpose")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "matrix_transpose")
     }
 }
 
@@ -243,8 +243,8 @@ impl<V> Debug for LeftMatMulOp<V>
 where
     V: MatrixValue,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LeftMatMul")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "LeftMatMul")
     }
 }
 
@@ -252,8 +252,8 @@ impl<V> Display for LeftMatMulOp<V>
 where
     V: MatrixValue,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "left_matmul")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "left_matmul")
     }
 }
 
@@ -320,8 +320,8 @@ impl<V> Debug for RightMatMulOp<V>
 where
     V: MatrixValue,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RightMatMul")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "RightMatMul")
     }
 }
 
@@ -329,8 +329,8 @@ impl<V> Display for RightMatMulOp<V>
 where
     V: MatrixValue,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "right_matmul")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "right_matmul")
     }
 }
 
@@ -379,14 +379,14 @@ where
 struct LinearMatrixTransposeOp;
 
 impl Debug for LinearMatrixTransposeOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LinearMatrixTranspose")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "LinearMatrixTranspose")
     }
 }
 
 impl Display for LinearMatrixTransposeOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "linear_matrix_transpose")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "linear_matrix_transpose")
     }
 }
 

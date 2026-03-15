@@ -214,8 +214,8 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.graph, f)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.graph, formatter)
     }
 }
 

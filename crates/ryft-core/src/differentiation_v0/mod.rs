@@ -73,8 +73,8 @@ impl<Value: Broadcastable, Tangent: Broadcastable> Broadcastable for JvpTracer<V
 }
 
 impl<Value: Display, Tangent: Display> Display for JvpTracer<Value, Tangent> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ value: {}, tangent: {} }}", self.value, self.tangent)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{{ value: {}, tangent: {} }}", self.value, self.tangent)
     }
 }
 
@@ -329,7 +329,7 @@ mod tests {
         constants::Constant,
         trigonometric::{Cos, Sin},
     };
-    use crate::types::data_type::DataType::*;
+    use crate::types::data_types::DataType::*;
     use crate::types::{ArrayType, Shape, Size};
 
     use super::*;

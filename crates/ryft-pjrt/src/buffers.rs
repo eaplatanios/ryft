@@ -403,8 +403,8 @@ impl TileDimension {
         Self(size as i64)
     }
 
-    /// Creates a new _combined_ [`TileDimension`]. That is a tile dimension that is combined with the next minor
-    /// dimension before tiling is applied, and thus has not fixed size of its own.
+    /// Creates a new _combined_ [`TileDimension`]. That is a tile dimension that is combined with the next more
+    /// minor dimension before tiling is applied, and thus has no fixed size of its own.
     pub fn combined() -> Self {
         Self(i64::MIN)
     }
@@ -448,6 +448,13 @@ pub struct Tile {
     pub dimensions: Vec<TileDimension>,
 }
 
+impl Tile {
+    /// Creates a new [`Tile`] with the provided dimensions.
+    pub fn new(dimensions: Vec<TileDimension>) -> Self {
+        Self { dimensions }
+    }
+}
+
 // Our [`Display`] implementation attempts to match the corresponding XLA rendering.
 impl Display for Tile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -464,6 +471,12 @@ impl Display for Tile {
 impl Debug for Tile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Tile[{self}]")
+    }
+}
+
+impl From<Vec<TileDimension>> for Tile {
+    fn from(dimensions: Vec<TileDimension>) -> Self {
+        Self::new(dimensions)
     }
 }
 

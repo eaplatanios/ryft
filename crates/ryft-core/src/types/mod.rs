@@ -1,8 +1,10 @@
-pub mod array_type;
-pub mod data_type;
+pub mod array_types;
+pub mod data_types;
+pub mod layouts;
 
-pub use array_type::*;
-pub use data_type::*;
+pub use array_types::*;
+pub use data_types::*;
+pub use layouts::*;
 
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that
 /// Ryft needs to reason about values without inspecting the values themselves. Examples include scalar data types such

@@ -14,8 +14,9 @@ use thiserror::Error;
 
 use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
+use crate::types::data_types::{DataType, DataTypeError};
+
 use super::sharding::{Mesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout};
-use crate::types::data_type::{DataType, DataTypeError};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -449,7 +450,7 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::types::data_type::DataType;
+    use crate::types::data_types::DataType;
     use crate::xla::sharding::{Mesh, MeshAxis, MeshDevice, PartitionDimension, PartitionSpec};
 
     use super::*;
