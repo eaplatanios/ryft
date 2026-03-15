@@ -62,7 +62,6 @@ impl TileDimension {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
 impl Display for TileDimension {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -121,7 +120,6 @@ impl Tile {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
 impl Display for Tile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("(")?;
@@ -202,10 +200,9 @@ impl TiledLayout {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
 impl Display for TiledLayout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("{")?;
+        formatter.write_str("tiled{")?;
         let mut dimensions = self.minor_to_major.iter();
         if let Some(first_dimension) = dimensions.next() {
             write!(formatter, "{first_dimension}")?;
@@ -301,16 +298,15 @@ impl StridedLayout {
     }
 }
 
-// Our [`Display`] implementation attempts to match the corresponding XLA rendering.
 impl Display for StridedLayout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("strides(")?;
+        formatter.write_str("strided{")?;
         let mut strides = self.strides.iter();
         if let Some(first_stride) = strides.next() {
             write!(formatter, "{first_stride}")?;
             strides.try_for_each(|stride| write!(formatter, ",{stride}"))?;
         }
-        formatter.write_str(")")
+        formatter.write_str("}")
     }
 }
 
@@ -423,7 +419,6 @@ impl TryFrom<Layout> for PjrtLayout {
     }
 }
 
-// TODO(eaplatanios): Review these unit tests. Should we consider improving the `Display` renderings?
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -473,11 +468,11 @@ mod tests {
         assert_eq!(layout.tile(0), Some(&layout.tiles[0]));
         assert_eq!(layout.tile(1), Some(&layout.tiles[1]));
         assert_eq!(layout.tile(2), None);
-        assert_eq!(format!("{layout}"), "{2,1,0:T(8,*)(4)}");
+        assert_eq!(format!("{layout}"), "tiled{2,1,0:T(8,*)(4)}");
 
         let empty_layout = TiledLayout::new(Vec::new(), Vec::new());
         assert_eq!(empty_layout.rank(), 0);
-        assert_eq!(format!("{empty_layout}"), "{}");
+        assert_eq!(format!("{empty_layout}"), "tiled{}");
     }
 
     #[test]
@@ -485,7 +480,7 @@ mod tests {
         let layout = StridedLayout::new(vec![24, 8, -4]);
         assert_eq!(layout.rank(), 3);
         assert_eq!(layout.strides, vec![24, 8, -4]);
-        assert_eq!(format!("{layout}"), "strides(24,8,-4)");
+        assert_eq!(format!("{layout}"), "strided{24,8,-4}");
     }
 
     #[test]
@@ -494,10 +489,10 @@ mod tests {
             vec![1, 0],
             vec![Tile::new(vec![TileDimension::Sized(4), TileDimension::Combined])],
         ));
-        assert_eq!(format!("{tiled_layout}"), "{1,0:T(4,*)}");
+        assert_eq!(format!("{tiled_layout}"), "tiled{1,0:T(4,*)}");
 
         let strided_layout = Layout::Strided(StridedLayout::new(vec![16, 4]));
-        assert_eq!(format!("{strided_layout}"), "strides(16,4)");
+        assert_eq!(format!("{strided_layout}"), "strided{16,4}");
     }
 
     #[cfg(feature = "xla")]
@@ -522,7 +517,7 @@ mod tests {
 
         let strided_layout = StridedLayout::new(vec![24, 8, -4]);
         let pjrt_strided_layout = PjrtStridedLayout::new(vec![24, 8, -4]);
-        assert_eq!(StridedLayout::from_pjrt_strided_layout(pjrt_strided_layout.clone()), Ok(strided_layout.clone()),);
+        assert_eq!(StridedLayout::from_pjrt_strided_layout(pjrt_strided_layout.clone()), Ok(strided_layout.clone()));
         assert_eq!(strided_layout.clone().to_pjrt_strided_layout(), Ok(pjrt_strided_layout.clone()));
 
         let tiled_layout = Layout::Tiled(tiled_layout);
