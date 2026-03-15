@@ -9,10 +9,10 @@ use thiserror::Error;
 
 use crate::{
     assert_input_count_matches,
+    broadcasting::BroadcastingError,
     parameters::{Parameter, Parameterized},
     tracing_v0::Tracer,
     types::{Type, Typed},
-    types_v0::broadcasting::BroadcastingError,
 };
 
 pub type AtomId = usize;

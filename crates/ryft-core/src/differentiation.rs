@@ -9,13 +9,13 @@ use half::{bf16, f16};
 use ryft_macros::Parameter;
 
 use crate::{
+    broadcasting::{Broadcastable, BroadcastingError},
     ops::constants::{One, Zero},
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily},
     programs::{LinearInterpretableOp, LinearOp, ParameterizedProgram, ProgramBuilder},
     tracing_v0::{Tracer, VariableTracer},
     types::{Type, Typed},
-    types_v0::broadcasting::BroadcastingError,
-    types_v0::{ArrayType, Broadcastable},
+    types_v0::ArrayType,
 };
 
 // How do we handle things like `grad(lambda x: x**2 if x > 0 else 0.)`? In this case, we need to be able to keep the

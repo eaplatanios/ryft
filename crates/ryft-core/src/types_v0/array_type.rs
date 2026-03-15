@@ -6,12 +6,10 @@
 
 use std::fmt::Display;
 
-use thiserror::Error;
-
 use ryft_macros::Parameter;
 
+use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
-use crate::types::data_type::DataTypeError as CoreDataTypeError;
 use crate::types::{DataType, Type};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time
@@ -131,154 +129,12 @@ impl Shape {
             self.dimensions[(self.dimensions.len() as i32 + index) as usize]
         }
     }
-
-    /// Constructs a new [`Shape`] that is the "smallest" shape that all of the provided shapes can be broadcast to
-    /// using [NumPy-like broadcasting semantics](https://numpy.org/doc/stable/user/basics.broadcasting.html). Since
-    /// this shape is the "smallest" such shape, we also know that its number of dimensions must match that of one of
-    /// the provided [`Shape`]s).
-    ///
-    /// Note that this operation is *order-invariant* meaning that it will return the same [`Shape`] irrespective
-    /// of the order in which the input [`Shape`]s are provided.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::types_v0::array_type::{Shape, Size};
-    /// let w = Shape::scalar();
-    /// let x = Shape::new(vec![Size::Static(42), Size::Static(42)]);
-    /// let y = Shape::new(vec![Size::Dynamic(Some(10))]);
-    /// let z = Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]);
-    ///
-    /// assert_eq!(Shape::broadcast(&[&w]), Ok(w.clone()));
-    /// assert_eq!(Shape::broadcast(&[&w, &y]), Ok(y.clone()));
-    /// assert_eq!(Shape::broadcast(&[&w, &z]), Ok(z.clone()));
-    /// assert_eq!(Shape::broadcast(&[&z, &y]), Ok(z.clone()));
-    /// assert_eq!(Shape::broadcast(&[&w, &y, &z]), Ok(z.clone()));
-    /// assert!(Shape::broadcast(&[&x, &w, &y, &z]).is_err());
-    /// ```
-    pub fn broadcast(shapes: &[&Self]) -> Result<Self, ShapeBroadcastingError> {
-        if shapes.is_empty() {
-            return Err(ShapeBroadcastingError::Empty);
-        }
-
-        shapes.iter().fold(Ok(Shape::scalar()), |lhs, rhs| match lhs {
-            Ok(lhs) => {
-                // Handle differing array ranks by (conceptually) padding the shorter shape with ones
-                // on the left (i.e., as a prefix), up to the rank of the longer shape.
-                let broadcast_rank = lhs.rank().max(rhs.rank());
-                let lhs_offset = broadcast_rank - lhs.rank();
-                let rhs_offset = broadcast_rank - rhs.rank();
-                let mut broadcast_dimensions = Vec::with_capacity(broadcast_rank);
-                for i in 0..broadcast_rank {
-                    let lhs_size = if i < lhs_offset { Size::Static(1) } else { lhs.dimensions[i - lhs_offset] };
-                    let rhs_size = if i < rhs_offset { Size::Static(1) } else { rhs.dimensions[i - rhs_offset] };
-                    let broadcast_size = match (&lhs_size, &rhs_size) {
-                        (_, Size::Static(1)) => lhs_size,
-                        (Size::Static(1), _) => rhs_size,
-                        (Size::Static(a), Size::Static(b)) if a == b => lhs_size,
-                        (Size::Dynamic(a), Size::Dynamic(b)) if a == b => lhs_size,
-                        _ => {
-                            return Err(ShapeBroadcastingError::Incompatible { lhs: lhs.clone(), rhs: (*rhs).clone() });
-                        }
-                    };
-                    broadcast_dimensions.push(broadcast_size);
-                }
-
-                Ok(Shape { dimensions: broadcast_dimensions })
-            }
-            Err(error) => Err(error),
-        })
-    }
-
-    /// Broadcasts this [`Shape`] to the provided [`Shape`] using
-    /// [NumPy-like semantics](https://numpy.org/doc/stable/user/basics.broadcasting.html).
-    ///
-    /// Note that this operation is *not necessarily symmetric* meaning that `x.broadcast_to(y)` is not necessarily
-    /// going to be equal `y.broadcast_to(x)` for all `x` and `y`. In fact, it is only going to be equal if `x == y`,
-    /// in which case we will also have `x.broadcast_to(y) == y.broadcast_to(x) == x == y`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::types_v0::array_type::{Shape, Size};
-    /// let w = Shape::new(vec![Size::Static(42), Size::Static(42)]);
-    /// let x = Shape::new(vec![]);
-    /// let y = Shape::new(vec![Size::Dynamic(Some(10))]);
-    /// let z = Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]);
-    ///
-    /// assert_eq!(x.broadcast_to(&x), Ok(x.clone()));
-    /// assert_eq!(x.broadcast_to(&y), Ok(y.clone()));
-    /// assert_eq!(x.broadcast_to(&z), Ok(z.clone()));
-    /// assert!(z.broadcast_to(&y).is_err());
-    /// assert_eq!(x.broadcast_to(&y).unwrap().broadcast_to(&z), Ok(z.clone()));
-    /// assert_eq!(x.broadcast_to(&w), Ok(w.clone()));
-    /// assert!(w.broadcast_to(&x).is_err());
-    /// ```
-    pub fn broadcast_to(&self, other: &Self) -> Result<Self, ShapeBroadcastingError> {
-        if self.rank() > other.rank() {
-            return Err(ShapeBroadcastingError::Incompatible { lhs: self.clone(), rhs: other.clone() });
-        }
-
-        // Handle differing array ranks by (conceptually) padding the dimension sizes of this shape
-        // with ones on the left (i.e., as a prefix), up to the rank of the other shape.
-        let broadcast_rank = other.rank();
-        let offset = broadcast_rank - self.rank();
-        let mut broadcast_shape = Vec::with_capacity(broadcast_rank);
-        for i in 0..broadcast_rank {
-            let lhs_size = if i < offset { Size::Static(1) } else { self.dimensions[i - offset] };
-            let rhs_size = other.dimensions[i];
-            let broadcast_size = match (&lhs_size, &rhs_size) {
-                (Size::Static(1), _) => rhs_size,
-                (Size::Static(a), Size::Static(b)) if a == b => rhs_size,
-                (Size::Dynamic(a), Size::Dynamic(b)) if a == b => rhs_size,
-                _ => return Err(ShapeBroadcastingError::Incompatible { lhs: self.clone(), rhs: other.clone() }),
-            };
-            broadcast_shape.push(broadcast_size);
-        }
-
-        Ok(Self { dimensions: broadcast_shape })
-    }
-
-    /// Returns `true` if this [`Shape`] can be broadcast to the provided [`Shape`], and `false` otherwise.
-    /// Refer to the documentation of [`Shape::broadcast_to`] for more information on [`Shape`] broadcasting.
-    pub fn broadcastable_to(&self, other: &Self) -> bool {
-        if self.rank() > other.rank() {
-            return false;
-        }
-
-        let broadcast_rank = other.rank();
-        let offset = broadcast_rank - self.rank();
-        for i in 0..broadcast_rank {
-            let lhs_size = if i < offset { Size::Static(1) } else { self.dimensions[i - offset] };
-            let rhs_size = other.dimensions[i];
-            match (&lhs_size, &rhs_size) {
-                (Size::Static(1), _) => continue,
-                (Size::Static(a), Size::Static(b)) if a == b => continue,
-                (Size::Dynamic(a), Size::Dynamic(b)) if a == b => continue,
-                _ => return false,
-            };
-        }
-        true
-    }
 }
 
 impl Display for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}]", self.dimensions.iter().map(|dimension| dimension.to_string()).collect::<Vec<_>>().join(", "))
     }
-}
-
-/// Error returned when a [`Shape`] cannot be broadcast to another [`Shape`].
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum ShapeBroadcastingError {
-    /// Error returned when attempting to compute a broadcast [`Shape`] for an empty collection
-    /// of [`Shape`]s (i.e., using [`Shape::broadcast`]).
-    #[error("cannot construct a broadcast shape from an empty collection of shapes")]
-    Empty,
-
-    /// Error returned when a [`Shape`] broadcasting fails due to incompatible shapes.
-    #[error("cannot promote shape `{lhs}` to shape `{rhs}`")]
-    Incompatible { lhs: Shape, rhs: Shape },
 }
 
 /// Represents the type of a potentially multi-dimensional array.
@@ -371,105 +227,17 @@ impl ArrayType {
     pub fn dimension(&self, index: i32) -> Size {
         self.shape.dimension(index)
     }
-
-    /// Constructs a new [`ArrayType`] that is the narrowest array type that all of the provided array types can be
-    /// broadcast to. That new array type has the following properties:
-    ///
-    ///   1. All of the provided array type [`DataType`]s can be promoted to its [`DataType`]. Refer to
-    ///      [`DataType::promoted`] for more information on data type promotion.
-    ///   2. All of the provided array type [`Shape`]s can be broadcast to its [`Shape`]. Refer to [`Shape::broadcast`]
-    ///      for more information on shape broadcasting.
-    ///
-    /// Note that this operation is *order-invariant* meaning that it will return the same [`ArrayType`] irrespective
-    /// of the order in which the input [`ArrayType`]s are provided.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::types::DataType;
-    /// # use ryft_core::types_v0::array_type::{ArrayType, Shape, Size};
-    /// let w = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
-    /// let x = ArrayType::new(DataType::Boolean, Shape::scalar());
-    /// let y = ArrayType::new(DataType::U16, Shape::new(vec![Size::Dynamic(Some(10))]));
-    /// let z = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]));
-    ///
-    /// assert_eq!(ArrayType::broadcast(&[&x]), Ok(x.clone()));
-    /// assert_eq!(ArrayType::broadcast(&[&x, &y]), Ok(y.clone()));
-    /// assert_eq!(ArrayType::broadcast(&[&x, &z]), Ok(z.clone()));
-    /// assert_eq!(ArrayType::broadcast(&[&z, &y]), Ok(z.clone()));
-    /// assert_eq!(ArrayType::broadcast(&[&x, &y, &z]), Ok(z.clone()));
-    /// assert!(ArrayType::broadcast(&[&w, &x, &y, &z]).is_err());
-    /// ```
-    pub fn broadcast(types: &[&Self]) -> Result<Self, ArrayTypeBroadcastingError> {
-        if types.is_empty() {
-            return Err(ArrayTypeBroadcastingError::Empty);
-        }
-
-        types.iter().fold(Ok(Self::scalar(DataType::Boolean)), |lhs, rhs| match lhs {
-            Ok(lhs) => {
-                let broadcast_data_type = DataType::promoted(&[lhs.data_type, rhs.data_type])?;
-                let broadcast_shape = Shape::broadcast(&[&lhs.shape, &rhs.shape])?;
-                Ok(Self { data_type: broadcast_data_type, shape: broadcast_shape })
-            }
-            Err(error) => Err(error),
-        })
-    }
-
-    /// Broadcasts this [`ArrayType`] to the provided [`ArrayType`]. This consists of:
-    ///
-    ///   1. Promoting the underlying [`DataType`] using
-    ///      [JAX-like promotion rules](https://docs.jax.dev/en/latest/type_promotion.html) to the provided
-    ///      array type's [`DataType`].
-    ///   2. Broadcasting the underlying dimension [`Size`]s using
-    ///      [NumPy-like semantics](https://numpy.org/doc/stable/user/basics.broadcasting.html) to the provided
-    ///      array type's dimension [`Size`]s.
-    ///
-    /// Note that this operation is *not necessarily symmetric* meaning that `x.broadcast_to(y)` is not necessarily
-    /// going to be equal `y.broadcast_to(x)` for all `x` and `y`. In fact, it is only going to be equal if `x == y`,
-    /// in which case we will also have `x.broadcast_to(y) == y.broadcast_to(x) == x == y`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use ryft_core::types::DataType;
-    /// # use ryft_core::types_v0::array_type::{ArrayType, Shape, Size};
-    /// let w = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Static(42)]));
-    /// let x = ArrayType::new(DataType::Boolean, Shape::scalar());
-    /// let y = ArrayType::new(DataType::U16, Shape::new(vec![Size::Dynamic(Some(10))]));
-    /// let z = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]));
-    ///
-    /// assert_eq!(x.broadcast_to(&x), Ok(x.clone()));
-    /// assert_eq!(x.broadcast_to(&y), Ok(y.clone()));
-    /// assert_eq!(x.broadcast_to(&z), Ok(z.clone()));
-    /// assert!(z.broadcast_to(&y).is_err());
-    /// assert_eq!(x.broadcast_to(&y).unwrap().broadcast_to(&z), Ok(z.clone()));
-    /// assert_eq!(x.broadcast_to(&w), Ok(w.clone()));
-    /// assert!(w.broadcast_to(&x).is_err());
-    /// ```
-    #[inline]
-    pub fn broadcast_to(&self, other: &Self) -> Result<Self, ArrayTypeBroadcastingError> {
-        let broadcast_data_type = self.data_type.promote_to(other.data_type)?;
-        let broadcast_shape = self.shape.broadcast_to(&other.shape)?;
-        Ok(ArrayType { data_type: broadcast_data_type, shape: broadcast_shape })
-    }
-
-    /// Returns `true` if this [`ArrayType`] can be broadcast to the provided [`ArrayType`], and `false` otherwise.
-    /// Refer to the documentation of [`ArrayType::broadcast_to`] for more information on [`ArrayType`] broadcasting.
-    #[inline]
-    pub fn broadcastable_to(&self, other: &Self) -> bool {
-        self.data_type.is_promotable_to(other.data_type) && self.shape.broadcastable_to(&other.shape)
-    }
 }
 
 impl Type for ArrayType {
     /// Returns `true` if this [`ArrayType`] is compatible with the provided [`ArrayType`], and `false` otherwise.
     ///
     /// An array type is considered compatible with another if it is broadcastable to the other array type. For more
-    /// information on broadcasting semantics for array types, refer to [`ArrayType::broadcastable_to`] and
-    /// [`ArrayType::broadcast_to`].
+    /// information on broadcasting semantics for array types, refer to
+    /// [`Broadcastable::is_broadcastable_to`] and [`Broadcastable::broadcast_to`].
     #[inline]
     fn is_compatible_with(&self, other: &Self) -> bool {
-        self.broadcastable_to(&other)
+        self.is_broadcastable_to(&other)
     }
 }
 
@@ -479,31 +247,12 @@ impl Display for ArrayType {
     }
 }
 
-/// Represents an [`Error`] related to [`ArrayType`] broadcasting. For more information on broadcasting,
-/// refer to [`ArrayType::broadcast`], [`ArrayType::broadcast_to`], and [`ArrayType::broadcastable_to`].
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum ArrayTypeBroadcastingError {
-    /// Error returned when attempting to compute a broadcast [`ArrayType`] for an empty collection of
-    /// [`ArrayType`]s (i.e., using [`ArrayType::broadcast`]).
-    #[error("cannot construct a broadcast array type from an empty collection of array types")]
-    Empty,
-
-    /// Error returned when failing to broadcast two [`ArrayType`]s due to their [`DataType`]s not being
-    /// compatible (i.e., the [`DataType`] of one cannot be promoted to the [`DataType`] of the other).
-    #[error("{0}")]
-    IncompatibleDataTypes(#[from] CoreDataTypeError),
-
-    /// Error returned when failing to broadcast two [`ArrayType`]s due to their [`Shape`]s not being
-    /// compatible (i.e., the [`Shape`] of one cannot be broadcast to the [`Shape`] of the other).
-    #[error("{0}")]
-    IncompatibleShapes(#[from] ShapeBroadcastingError),
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::broadcasting::Broadcastable;
 
-    use DataType::*;
+    use super::*;
+    use super::DataType::*;
 
     #[test]
     fn test_size_value() {
@@ -559,23 +308,23 @@ mod tests {
         let s4 = Shape::new(vec![Size::Dynamic(None), Size::Static(42), Size::Dynamic(None)]);
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
-        assert_eq!(Shape::broadcast(&[&s0]), Ok(s0.clone()));
-        assert_eq!(Shape::broadcast(&[&s0, &s0]), Ok(s0.clone()));
-        assert_eq!(Shape::broadcast(&[&s0, &s1]), Ok(s1.clone()));
-        assert_eq!(Shape::broadcast(&[&s0, &s2]), Ok(s2.clone()));
-        assert_eq!(Shape::broadcast(&[&s0, &s3]), Ok(s3.clone()));
-        assert_eq!(Shape::broadcast(&[&s1, &s0]), Ok(s1.clone()));
-        assert_eq!(Shape::broadcast(&[&s1, &s2]), Ok(s1.clone()));
-        assert_eq!(Shape::broadcast(&[&s2, &s0]), Ok(s2.clone()));
-        assert_eq!(Shape::broadcast(&[&s2, &s3]), Ok(s3.clone()));
-        assert_eq!(Shape::broadcast(&[&s3, &s0]), Ok(s3.clone()));
-        assert_eq!(Shape::broadcast(&[&s3, &s2]), Ok(s3.clone()));
-        assert_eq!(Shape::broadcast(&[&s4, &s5]), Ok(s4.clone()));
+        assert_eq!(Shape::broadcasted(&[&s0]), Ok(s0.clone()));
+        assert_eq!(Shape::broadcasted(&[&s0, &s0]), Ok(s0.clone()));
+        assert_eq!(Shape::broadcasted(&[&s0, &s1]), Ok(s1.clone()));
+        assert_eq!(Shape::broadcasted(&[&s0, &s2]), Ok(s2.clone()));
+        assert_eq!(Shape::broadcasted(&[&s0, &s3]), Ok(s3.clone()));
+        assert_eq!(Shape::broadcasted(&[&s1, &s0]), Ok(s1.clone()));
+        assert_eq!(Shape::broadcasted(&[&s1, &s2]), Ok(s1.clone()));
+        assert_eq!(Shape::broadcasted(&[&s2, &s0]), Ok(s2.clone()));
+        assert_eq!(Shape::broadcasted(&[&s2, &s3]), Ok(s3.clone()));
+        assert_eq!(Shape::broadcasted(&[&s3, &s0]), Ok(s3.clone()));
+        assert_eq!(Shape::broadcasted(&[&s3, &s2]), Ok(s3.clone()));
+        assert_eq!(Shape::broadcasted(&[&s4, &s5]), Ok(s4.clone()));
 
-        assert!(Shape::broadcast(&[]).is_err());
-        assert!(Shape::broadcast(&[&s1, &s3]).is_err());
-        assert!(Shape::broadcast(&[&s1, &s4]).is_err());
-        assert!(Shape::broadcast(&[&s1, &s5]).is_err());
+        assert!(Shape::broadcasted(&[]).is_err());
+        assert!(Shape::broadcasted(&[&s1, &s3]).is_err());
+        assert!(Shape::broadcasted(&[&s1, &s4]).is_err());
+        assert!(Shape::broadcasted(&[&s1, &s5]).is_err());
     }
 
     #[test]
@@ -613,21 +362,21 @@ mod tests {
         let s4 = Shape::new(vec![Size::Dynamic(None), Size::Static(42), Size::Dynamic(None)]);
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
-        assert!(s0.broadcastable_to(&s0));
-        assert!(s0.broadcastable_to(&s1));
-        assert!(s0.broadcastable_to(&s2));
-        assert!(s0.broadcastable_to(&s3));
-        assert!(s2.broadcastable_to(&s1));
-        assert!(s5.broadcastable_to(&s4));
+        assert!(s0.is_broadcastable_to(&s0));
+        assert!(s0.is_broadcastable_to(&s1));
+        assert!(s0.is_broadcastable_to(&s2));
+        assert!(s0.is_broadcastable_to(&s3));
+        assert!(s2.is_broadcastable_to(&s1));
+        assert!(s5.is_broadcastable_to(&s4));
 
-        assert!(!s1.broadcastable_to(&s0));
-        assert!(!s1.broadcastable_to(&s2));
-        assert!(!s1.broadcastable_to(&s3));
-        assert!(!s1.broadcastable_to(&s4));
-        assert!(!s1.broadcastable_to(&s5));
-        assert!(!s2.broadcastable_to(&s0));
-        assert!(!s3.broadcastable_to(&s0));
-        assert!(!s4.broadcastable_to(&s5));
+        assert!(!s1.is_broadcastable_to(&s0));
+        assert!(!s1.is_broadcastable_to(&s2));
+        assert!(!s1.is_broadcastable_to(&s3));
+        assert!(!s1.is_broadcastable_to(&s4));
+        assert!(!s1.is_broadcastable_to(&s5));
+        assert!(!s2.is_broadcastable_to(&s0));
+        assert!(!s3.is_broadcastable_to(&s0));
+        assert!(!s4.is_broadcastable_to(&s5));
     }
 
     #[test]
@@ -692,22 +441,22 @@ mod tests {
         let t4 = ArrayType::new(C64, s4);
         let t5 = ArrayType::new(BF16, s5);
 
-        assert_eq!(ArrayType::broadcast(&[&t0]), Ok(t0.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t0, &t0]), Ok(t0.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t0, &t1]), Ok(t1.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t0, &t2]), Ok(t2.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t0, &t3]), Ok(t3.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t1, &t0]), Ok(t1.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t1, &t2]), Ok(t1.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t2, &t0]), Ok(t2.clone()));
-        assert_eq!(ArrayType::broadcast(&[&t4, &t5]), Ok(t4.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t0]), Ok(t0.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t0, &t0]), Ok(t0.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t0, &t1]), Ok(t1.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t0, &t2]), Ok(t2.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t0, &t3]), Ok(t3.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t1, &t0]), Ok(t1.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t1, &t2]), Ok(t1.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t2, &t0]), Ok(t2.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&t4, &t5]), Ok(t4.clone()));
 
-        assert!(ArrayType::broadcast(&[]).is_err());
-        assert_eq!(ArrayType::broadcast(&[&t2, &t3]), Ok(ArrayType::new(F32, s3.clone())));
-        assert_eq!(ArrayType::broadcast(&[&t3, &t2]), Ok(ArrayType::new(F32, s3.clone())));
-        assert!(ArrayType::broadcast(&[&t1, &t3]).is_err());
-        assert!(ArrayType::broadcast(&[&t1, &t4]).is_err());
-        assert!(ArrayType::broadcast(&[&t1, &t5]).is_err());
+        assert!(ArrayType::broadcasted(&[]).is_err());
+        assert_eq!(ArrayType::broadcasted(&[&t2, &t3]), Ok(ArrayType::new(F32, s3.clone())));
+        assert_eq!(ArrayType::broadcasted(&[&t3, &t2]), Ok(ArrayType::new(F32, s3.clone())));
+        assert!(ArrayType::broadcasted(&[&t1, &t3]).is_err());
+        assert!(ArrayType::broadcasted(&[&t1, &t4]).is_err());
+        assert!(ArrayType::broadcasted(&[&t1, &t5]).is_err());
     }
 
     #[test]
@@ -758,22 +507,22 @@ mod tests {
         let t4 = ArrayType::new(C64, s4);
         let t5 = ArrayType::new(BF16, s5);
 
-        assert!(t0.broadcastable_to(&t0));
-        assert!(t0.broadcastable_to(&t1));
-        assert!(t0.broadcastable_to(&t2));
-        assert!(t0.broadcastable_to(&t3));
-        assert!(t2.broadcastable_to(&t1));
-        assert!(t5.broadcastable_to(&t4));
+        assert!(t0.is_broadcastable_to(&t0));
+        assert!(t0.is_broadcastable_to(&t1));
+        assert!(t0.is_broadcastable_to(&t2));
+        assert!(t0.is_broadcastable_to(&t3));
+        assert!(t2.is_broadcastable_to(&t1));
+        assert!(t5.is_broadcastable_to(&t4));
 
-        assert!(!t1.broadcastable_to(&t0));
-        assert!(!t1.broadcastable_to(&t2));
-        assert!(!t1.broadcastable_to(&t3));
-        assert!(!t1.broadcastable_to(&t4));
-        assert!(!t1.broadcastable_to(&t5));
-        assert!(!t2.broadcastable_to(&t3));
-        assert!(!t3.broadcastable_to(&t0));
-        assert!(!t3.broadcastable_to(&t2));
-        assert!(!t4.broadcastable_to(&t5));
+        assert!(!t1.is_broadcastable_to(&t0));
+        assert!(!t1.is_broadcastable_to(&t2));
+        assert!(!t1.is_broadcastable_to(&t3));
+        assert!(!t1.is_broadcastable_to(&t4));
+        assert!(!t1.is_broadcastable_to(&t5));
+        assert!(!t2.is_broadcastable_to(&t3));
+        assert!(!t3.is_broadcastable_to(&t0));
+        assert!(!t3.is_broadcastable_to(&t2));
+        assert!(!t4.is_broadcastable_to(&t5));
     }
 
     #[test]

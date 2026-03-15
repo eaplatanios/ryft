@@ -1,3 +1,4 @@
+pub mod broadcasting;
 pub mod differentiation;
 pub mod errors;
 pub mod ops;
