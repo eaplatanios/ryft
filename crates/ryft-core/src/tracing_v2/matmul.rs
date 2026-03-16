@@ -83,7 +83,7 @@ fn expect_batch_sizes_match<V>(left: &BatchedValue<V>, right: &BatchedValue<V>) 
 }
 
 fn matrix_array_type(data_type: DataType, rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
+    ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None)
 }
 
 fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TraceError> {

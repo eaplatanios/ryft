@@ -169,7 +169,15 @@ where
     V: TraceValue,
 {
     expect_input_count(inputs.len(), 2)?;
-    if inputs[0] == inputs[1] { Ok(inputs[0].clone()) } else { Err(TraceError::IncompatibleAbstractValues { op }) }
+    if inputs[0].data_type != inputs[1].data_type || inputs[0].shape != inputs[1].shape {
+        Err(TraceError::IncompatibleAbstractValues { op })
+    } else {
+        Ok(ArrayType {
+            data_type: inputs[0].data_type,
+            shape: inputs[0].shape.clone(),
+            layout: if inputs[0].layout == inputs[1].layout { inputs[0].layout.clone() } else { None },
+        })
+    }
 }
 
 /// Elementwise addition primitive.
@@ -648,7 +656,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing_v2::{GraphBuilder, TraceError, test_support},
-        types::{ArrayType, DataType},
+        types::{ArrayType, DataType, Layout, Shape, StridedLayout},
     };
 
     use super::*;
@@ -667,6 +675,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, TraceError::IncompatibleAbstractValues { op: "add" });
         test_support::assert_reference_graph_rendering();
+    }
+
+    #[test]
+    fn add_abstract_eval_drops_layout_when_inputs_disagree() {
+        let output = <AddOp as Op<f64>>::abstract_eval(
+            &AddOp,
+            &[
+                ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![])))),
+                ArrayType::scalar(DataType::F32),
+            ],
+        )
+        .unwrap();
+        assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
     }
 
     #[test]

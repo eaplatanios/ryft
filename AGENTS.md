@@ -68,6 +68,8 @@ update this file so that they do not need to remind you again in the future.
   impls when that makes the implementation easier to read.
 - For module moves and path migrations, do not introduce compatibility shims or re-export bridges unless the user
   explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
+- For enums with straightforward tuple or unit variants, prefer using the variants directly instead of adding
+  redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
 
 #### Formatting & Naming
 
@@ -79,6 +81,8 @@ update this file so that they do not need to remind you again in the future.
 - Use full words for variable names and avoid abbreviations or shortened versions of words.
 - For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
   `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
+- Always name the formatter argument `formatter` in `Display` and `Debug` implementations; do not use `f` or any other
+  shorthand.
 - For user-requested renames or removals, always run a targeted search afterward to verify that no old identifier
   references remain in the `ryft` codebase.
 - Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.

@@ -29,7 +29,9 @@ pub enum BroadcastingError {
 ///   - **Parameter Broadcasting:** Each concrete implementer defines what it means to combine two
 ///     [`Parameter`](crate::parameters::Parameter)s. For example, [`DataType`] uses data-type promotion, [`Shape`]
 ///     follows the standard [NumPy broadcasting rules](https://numpy.org/doc/stable/user/basics.broadcasting.html),
-///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`] independently.
+///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`].
+///     [`Layout`](crate::types::layouts::Layout) metadata is only preserved when both operands already agree on the
+///     same unchanged layout; otherwise the result leaves its layout unspecified.
 ///   - **Structural Broadcasting:** For [`Parameterized`] values whose leaves are [`ArrayType`]s, Ryft first aligns
 ///     the left-hand side to the target parameter structure using [`Parameterized::broadcast_to_parameter_structure`].
 ///     That alignment uses path-prefix broadcasting on named parameters, so a value with a smaller compatible parameter
@@ -76,17 +78,17 @@ pub enum BroadcastingError {
 /// assert_eq!(z.broadcast(&y)?, Shape::new(vec![4.into(), 3.into()]));
 /// assert!(w.broadcast(&x).is_err());
 ///
-/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])));
+/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None));
 /// let rhs = (
-///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
-///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None),
+///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None),
 /// );
 ///
 /// assert_eq!(
 ///     lhs.broadcast(&rhs)?,
 ///     (
-///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
-///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()])),
+///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None),
+///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()]), None),
 ///     ),
 /// );
 /// # Ok::<(), BroadcastingError>(())
@@ -221,7 +223,8 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
                 .map(|(lhs, rhs)| {
                     let broadcasted_data_type = lhs.data_type.broadcast(&rhs.data_type)?;
                     let broadcasted_shape = lhs.shape.broadcast(&rhs.shape)?;
-                    Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape))
+                    let broadcasted_layout = (lhs.layout == rhs.layout).then(|| lhs.layout.clone()).flatten();
+                    Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape, broadcasted_layout))
                 })
                 .collect::<Result<Vec<_>, BroadcastingError>>()?;
             Ok(Self::from_parameters(structure, broadcasted_array_types)?)
@@ -242,7 +245,7 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
             .map(|(lhs, rhs)| {
                 let broadcasted_data_type = lhs.data_type.broadcast_to(&rhs.data_type)?;
                 let broadcasted_shape = lhs.shape.broadcast_to(&rhs.shape)?;
-                Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape))
+                Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape, rhs.layout.clone()))
             })
             .collect::<Result<Vec<_>, BroadcastingError>>()?;
         Ok(Self::from_parameters(structure, broadcasted_array_types)?)
@@ -263,8 +266,8 @@ mod tests {
     use ryft_macros::Parameterized;
 
     use crate::parameters::{Parameter, ParameterError};
-    use crate::types::Shape;
     use crate::types::data_types::DataType::*;
+    use crate::types::{Layout, Shape, StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
 
@@ -312,16 +315,27 @@ mod tests {
 
     #[test]
     fn test_array_type_broadcasting() {
-        let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
-        let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
+        let l0 = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(4)])]));
+        let l1 = Layout::Strided(StridedLayout::new(vec![16, 4]));
+
+        let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None);
+        let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None);
         let t2 = ArrayType::scalar(Boolean);
-        let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+        let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None);
+        let t4 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()));
+        let t5 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()));
+        let t6 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l1));
+        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), Some(l0.clone()));
 
         assert_eq!(t1.broadcast(&t2), Ok(t1.clone()));
         assert_eq!(t2.broadcast(&t1), Ok(t1.clone()));
         assert!(matches!(t0.broadcast(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
+        assert_eq!(t4.broadcast(&t5), Ok(t4.clone()));
+        assert_eq!(t4.broadcast(&t6), Ok(ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None)));
+        assert_eq!(t7.broadcast(&t0), Ok(ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None)));
 
         assert_eq!(t2.broadcast_to(&t1), Ok(t1.clone()));
+        assert_eq!(t2.broadcast_to(&t4), Ok(t4.clone()));
         assert!(matches!(t0.broadcast_to(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
 
         assert_eq!(ArrayType::broadcasted(&[&t0]), Ok(t0.clone()));
@@ -345,17 +359,17 @@ mod tests {
 
         let t0 = TestEnum::Pair {
             left: ArrayType::scalar(F32),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None),
         };
 
         let t1 = TestEnum::Pair {
-            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
-            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
+            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None),
+            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None),
         };
 
         let t2 = TestEnum::Pair {
-            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
+            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()]), None),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None),
         };
 
         let t3 = TestEnum::Wrapped { inner: ArrayType::scalar(F32) };
@@ -376,8 +390,8 @@ mod tests {
         assert_eq!(
             TestEnum::broadcasted(&[&t0, &t1]),
             Ok(TestEnum::Pair {
-                left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
-                right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
+                left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None),
+                right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None),
             }),
         );
         assert!(matches!(
