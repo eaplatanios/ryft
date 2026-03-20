@@ -1,6 +1,8 @@
+pub mod array_types;
 pub mod data_types;
 pub mod layouts;
 
+pub use array_types::*;
 pub use data_types::*;
 pub use layouts::*;
 
