@@ -290,7 +290,7 @@ impl<'o> Array<'o> {
     ///
     ///   - `mesh_symbol_name`: Symbol name used in MLIR (without or with leading `'@'`).
     pub fn to_shardy_mesh_operation<S: AsRef<str>>(&self, mesh_symbol_name: S) -> Result<String, ShardingError> {
-        self.layout.mesh().abstract_mesh().to_shardy_mesh_operation(mesh_symbol_name)
+        self.layout.mesh().logical_mesh().to_shardy_mesh_operation(mesh_symbol_name)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.

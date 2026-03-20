@@ -11,7 +11,7 @@
 //!
 //! | Ryft type | JAX equivalent | Shardy MLIR representation |
 //! |---|---|---|
-//! | [`AbstractMesh`] | Topology of [`jax.sharding.Mesh`][jax-mesh] (axes only) | `sdy.mesh @name = <["axis"=size, ...]>` |
+//! | [`LogicalMesh`] | Logical topology of [`jax.sharding.Mesh`][jax-mesh] (axes only) | `sdy.mesh @name = <["axis"=size, ...]>` |
 //! | [`Mesh`] | [`jax.sharding.Mesh`][jax-mesh] (axes + devices) | `sdy.mesh @name = <["axis"=size, ...]>` |
 //! | [`MeshAxis`] | One entry in `Mesh.shape` | `MeshAxisAttr` (name + size pair) |
 //! | [`MeshDevice`] | One element in `Mesh.devices` | Device ID in `MeshAttr.device_ids` |
@@ -25,13 +25,13 @@
 //! [jax-pspec]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec
 //! [jax-ns]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.NamedSharding
 //!
-//! # Abstract mesh vs concrete mesh
+//! # Logical mesh vs concrete mesh
 //!
-//! [`AbstractMesh`] captures only the logical topology (axis names and sizes) and is used
+//! [`LogicalMesh`] captures only the logical topology (axis names and sizes) and is used
 //! wherever device identity is irrelevant — principally in [`NamedSharding`] and for
 //! rendering Shardy MLIR attributes at compilation time.
 //!
-//! [`Mesh`] wraps an [`AbstractMesh`] and adds a concrete device list, which is needed at
+//! [`Mesh`] wraps a [`LogicalMesh`] and adds a concrete device list, which is needed at
 //! runtime for computing per-device shard metadata in [`ShardingLayout`].
 //!
 //! # Sharding context
@@ -94,7 +94,7 @@
 //!
 //!    ```ignore
 //!    // JAX equivalent: NamedSharding(mesh, spec)
-//!    let sharding = NamedSharding::new(mesh.abstract_mesh().clone(), spec)?;
+//!    let sharding = NamedSharding::new(mesh.logical_mesh().clone(), spec)?;
 //!    ```
 //!
 //! 4. **Compute shard metadata** to determine per-device array slices and identify addressable
@@ -119,7 +119,7 @@
 //!
 //!    ```ignore
 //!    // Generates: sdy.mesh @mesh = <["data"=4, "model"=2]>
-//!    let mesh_op = mesh.abstract_mesh().to_shardy_mesh_operation("mesh")?;
+//!    let mesh_op = mesh.logical_mesh().to_shardy_mesh_operation("mesh")?;
 //!
 //!    // Generates: #sdy.sharding<@mesh, [{"data"}, {}]>
 //!    let attr = sharding.to_shardy_tensor_sharding_attribute("mesh")?;
@@ -412,14 +412,14 @@ impl MeshDevice {
     }
 }
 
-/// Abstract logical mesh topology (axes only, no devices).
+/// Logical mesh topology (axes only, no devices).
 ///
-/// An `AbstractMesh` captures the axis names and sizes of a device mesh without binding to
+/// A `LogicalMesh` captures the axis names and sizes of a device mesh without binding to
 /// specific physical devices. This is the compilation-time view of a mesh: it provides enough
 /// information to generate Shardy MLIR attributes and validate partition specifications, but
 /// does not carry device identity or process ownership.
 ///
-/// Use [`AbstractMesh`] wherever device placement is irrelevant — principally in
+/// Use [`LogicalMesh`] wherever device placement is irrelevant — principally in
 /// [`NamedSharding`] and for rendering Shardy attributes.
 ///
 /// # JAX equivalent
@@ -432,20 +432,20 @@ impl MeshDevice {
 /// # Shardy representation
 ///
 /// Rendered as an `sdy.mesh` operation via
-/// [`to_shardy_mesh_operation`][AbstractMesh::to_shardy_mesh_operation]:
+/// [`to_shardy_mesh_operation`][LogicalMesh::to_shardy_mesh_operation]:
 ///
 /// ```mlir
 /// sdy.mesh @mesh = <["data"=4, "model"=2]>
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AbstractMesh {
+pub struct LogicalMesh {
     axes: Vec<MeshAxis>,
     axis_types: Vec<AxisType>,
     axis_index_by_name: HashMap<String, usize>,
 }
 
-impl AbstractMesh {
-    /// Creates an abstract mesh from named axes.
+impl LogicalMesh {
+    /// Creates a logical mesh from named axes.
     ///
     /// All axis types default to [`AxisType::Auto`], matching JAX's `Mesh` constructor behavior.
     ///
@@ -455,7 +455,7 @@ impl AbstractMesh {
         Self::build(axes, axis_types)
     }
 
-    /// Creates an abstract mesh from named axes with explicit per-axis types.
+    /// Creates a logical mesh from named axes with explicit per-axis types.
     ///
     /// Returns [`ShardingError::AxisTypeCountMismatch`] if `axis_types.len() != axes.len()`.
     pub fn with_axis_types(axes: Vec<MeshAxis>, axis_types: Vec<AxisType>) -> Result<Self, ShardingError> {
@@ -558,7 +558,7 @@ impl AbstractMesh {
             .collect()
     }
 
-    /// Returns a new `AbstractMesh` with selected axes' types changed.
+    /// Returns a new `LogicalMesh` with selected axes' types changed.
     ///
     /// Unknown names in `name_to_type` are silently ignored, matching JAX behavior.
     pub fn with_updated_axis_types(&self, name_to_type: &HashMap<String, AxisType>) -> Self {
@@ -616,8 +616,8 @@ impl AbstractMesh {
 /// `(i, j)` has linear index `i * 2 + j`. This matches NumPy's default C-order and JAX's
 /// `mesh.devices.flat`.
 ///
-/// A `Mesh` wraps an [`AbstractMesh`] (the logical topology) and adds a concrete device
-/// list. Use [`abstract_mesh()`][Mesh::abstract_mesh] to access the topology-only view,
+/// A `Mesh` wraps a [`LogicalMesh`] (the logical topology) and adds a concrete device
+/// list. Use [`logical_mesh()`][Mesh::logical_mesh] to access the topology-only view,
 /// which is needed for [`NamedSharding`] and Shardy attribute rendering.
 ///
 /// # JAX equivalent
@@ -627,7 +627,7 @@ impl AbstractMesh {
 /// | JAX | Ryft |
 /// |---|---|
 /// | `Mesh(np.array(devs).reshape(4, 2), ('data', 'model'))` | `Mesh::new(vec![MeshAxis("data", 4), MeshAxis("model", 2)], devs)` |
-/// | `mesh.shape` | `mesh.abstract_mesh().axes()` |
+/// | `mesh.shape` | `mesh.logical_mesh().axes()` |
 /// | `mesh.devices` (ndarray) | `mesh.devices()` (flat row-major slice) |
 /// | `mesh.size` | `mesh.device_count()` |
 /// | `mesh.local_devices` | filter `mesh.devices()` by `process_index` |
@@ -636,14 +636,14 @@ impl AbstractMesh {
 ///
 /// # Shardy representation
 ///
-/// Rendered via the inner [`AbstractMesh`]:
+/// Rendered via the inner [`LogicalMesh`]:
 ///
 /// ```mlir
 /// sdy.mesh @mesh = <["data"=4, "model"=2]>
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mesh {
-    abstract_mesh: AbstractMesh,
+    logical_mesh: LogicalMesh,
     devices: Vec<MeshDevice>,
     device_index_by_id: HashMap<DeviceId, usize>,
 }
@@ -655,8 +655,8 @@ impl Mesh {
     /// The expected number of `devices` is the product of all `axes` sizes. For an empty axis list, the
     /// expected device count is `1`.
     pub fn new(axes: Vec<MeshAxis>, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
-        let abstract_mesh = AbstractMesh::new(axes)?;
-        Self::from_abstract(abstract_mesh, devices)
+        let logical_mesh = LogicalMesh::new(axes)?;
+        Self::from_logical(logical_mesh, devices)
     }
 
     /// Creates a mesh from named axes, explicit per-axis types, and row-major devices.
@@ -665,13 +665,13 @@ impl Mesh {
         axis_types: Vec<AxisType>,
         devices: Vec<MeshDevice>,
     ) -> Result<Self, ShardingError> {
-        let abstract_mesh = AbstractMesh::with_axis_types(axes, axis_types)?;
-        Self::from_abstract(abstract_mesh, devices)
+        let logical_mesh = LogicalMesh::with_axis_types(axes, axis_types)?;
+        Self::from_logical(logical_mesh, devices)
     }
 
-    /// Creates a mesh from a pre-validated [`AbstractMesh`] and row-major devices.
-    pub fn from_abstract(abstract_mesh: AbstractMesh, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
-        let expected_device_count = abstract_mesh.device_count()?;
+    /// Creates a mesh from a pre-validated [`LogicalMesh`] and row-major devices.
+    pub fn from_logical(logical_mesh: LogicalMesh, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
+        let expected_device_count = logical_mesh.device_count()?;
         if devices.len() != expected_device_count {
             return Err(ShardingError::MeshDeviceCountMismatch {
                 expected_device_count,
@@ -686,32 +686,32 @@ impl Mesh {
             }
         }
 
-        Ok(Self { abstract_mesh, devices, device_index_by_id })
+        Ok(Self { logical_mesh, devices, device_index_by_id })
     }
 
-    /// Returns the abstract mesh (topology only).
-    pub fn abstract_mesh(&self) -> &AbstractMesh {
-        &self.abstract_mesh
+    /// Returns the logical mesh topology (axes only).
+    pub fn logical_mesh(&self) -> &LogicalMesh {
+        &self.logical_mesh
     }
 
     /// Returns the axes of this mesh.
     pub fn axes(&self) -> &[MeshAxis] {
-        self.abstract_mesh.axes()
+        self.logical_mesh.axes()
     }
 
     /// Returns the per-axis types.
     pub fn axis_types(&self) -> &[AxisType] {
-        self.abstract_mesh.axis_types()
+        self.logical_mesh.axis_types()
     }
 
     /// Returns axis names as a convenience accessor.
     pub fn axis_names(&self) -> Vec<&str> {
-        self.abstract_mesh.axis_names()
+        self.logical_mesh.axis_names()
     }
 
     /// Returns axis sizes as a convenience accessor.
     pub fn axis_sizes(&self) -> Vec<usize> {
-        self.abstract_mesh.axis_sizes()
+        self.logical_mesh.axis_sizes()
     }
 
     /// Returns mesh devices in row-major order.
@@ -726,42 +726,42 @@ impl Mesh {
 
     /// Returns the index of `axis_name` in this mesh, if present.
     pub fn axis_index<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.abstract_mesh.axis_index(axis_name)
+        self.logical_mesh.axis_index(axis_name)
     }
 
     /// Returns the size of `axis_name` in this mesh, if present.
     pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.abstract_mesh.axis_size(axis_name)
+        self.logical_mesh.axis_size(axis_name)
     }
 
     /// Returns `true` if all axes have type [`AxisType::Auto`].
     pub fn are_all_axes_auto(&self) -> bool {
-        self.abstract_mesh.are_all_axes_auto()
+        self.logical_mesh.are_all_axes_auto()
     }
 
     /// Returns `true` if all axes have type [`AxisType::Explicit`].
     pub fn are_all_axes_explicit(&self) -> bool {
-        self.abstract_mesh.are_all_axes_explicit()
+        self.logical_mesh.are_all_axes_explicit()
     }
 
     /// Returns `true` if all axes have type [`AxisType::Manual`].
     pub fn are_all_axes_manual(&self) -> bool {
-        self.abstract_mesh.are_all_axes_manual()
+        self.logical_mesh.are_all_axes_manual()
     }
 
     /// Returns the names of axes with type [`AxisType::Auto`].
     pub fn auto_axes(&self) -> Vec<&str> {
-        self.abstract_mesh.auto_axes()
+        self.logical_mesh.auto_axes()
     }
 
     /// Returns the names of axes with type [`AxisType::Explicit`].
     pub fn explicit_axes(&self) -> Vec<&str> {
-        self.abstract_mesh.explicit_axes()
+        self.logical_mesh.explicit_axes()
     }
 
     /// Returns the names of axes with type [`AxisType::Manual`].
     pub fn manual_axes(&self) -> Vec<&str> {
-        self.abstract_mesh.manual_axes()
+        self.logical_mesh.manual_axes()
     }
 
     /// Returns the row-major mesh index of `device_id`, if present.
@@ -795,7 +795,7 @@ impl Mesh {
     /// Returns the mesh coordinate of the device at `device_index`, if valid.
     pub fn coordinate_for_device_index(&self, device_index: usize) -> Option<Vec<usize>> {
         (device_index < self.devices.len()).then(|| {
-            let axis_sizes = self.abstract_mesh.axes.iter().map(MeshAxis::size).collect::<Vec<_>>();
+            let axis_sizes = self.logical_mesh.axes.iter().map(MeshAxis::size).collect::<Vec<_>>();
             coordinate_for_linear_index(device_index, axis_sizes.as_slice())
         })
     }
@@ -1020,11 +1020,11 @@ impl PartitionSpec {
 // Named sharding
 // ---------------------------------------------------------------------------
 
-/// Named sharding defined by an [`AbstractMesh`] and a [`PartitionSpec`].
+/// Named sharding defined by a [`LogicalMesh`] and a [`PartitionSpec`].
 ///
 /// This is the primary user-facing sharding type for compilation-time annotations,
 /// fully describing how a tensor is distributed across a mesh topology. It uses
-/// [`AbstractMesh`] rather than [`Mesh`] because device identity is not needed for
+/// [`LogicalMesh`] rather than [`Mesh`] because device identity is not needed for
 /// generating Shardy MLIR attributes.
 ///
 /// # JAX equivalent
@@ -1034,7 +1034,7 @@ impl PartitionSpec {
 /// ```ignore
 /// // JAX:   NamedSharding(mesh, PartitionSpec('data', None))
 /// // Ryft:
-/// let sharding = NamedSharding::new(abstract_mesh, PartitionSpec::new(vec![
+/// let sharding = NamedSharding::new(logical_mesh, PartitionSpec::new(vec![
 ///     PartitionDimension::sharded("data"),
 ///     PartitionDimension::unsharded(),
 /// ]))?;
@@ -1081,7 +1081,7 @@ impl PartitionSpec {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedSharding {
-    mesh: AbstractMesh,
+    mesh: LogicalMesh,
     partition_spec: PartitionSpec,
     replicated_axes: Vec<String>,
     unreduced_axes: Vec<String>,
@@ -1089,13 +1089,13 @@ pub struct NamedSharding {
 
 impl NamedSharding {
     /// Creates a named sharding with no extra replicated or unreduced axes.
-    pub fn new(mesh: AbstractMesh, partition_spec: PartitionSpec) -> Result<Self, ShardingError> {
+    pub fn new(mesh: LogicalMesh, partition_spec: PartitionSpec) -> Result<Self, ShardingError> {
         Self::with_extra_axes(mesh, partition_spec, Vec::new(), Vec::new())
     }
 
     /// Creates a named sharding with explicit replicated and/or unreduced axes.
     pub fn with_extra_axes(
-        mesh: AbstractMesh,
+        mesh: LogicalMesh,
         partition_spec: PartitionSpec,
         replicated_axes: Vec<String>,
         unreduced_axes: Vec<String>,
@@ -1124,8 +1124,8 @@ impl NamedSharding {
         Ok(Self { mesh, partition_spec, replicated_axes, unreduced_axes })
     }
 
-    /// Returns the abstract mesh of this sharding.
-    pub fn mesh(&self) -> &AbstractMesh {
+    /// Returns the logical mesh of this sharding.
+    pub fn mesh(&self) -> &LogicalMesh {
         &self.mesh
     }
 
@@ -1363,7 +1363,7 @@ impl ShardingLayout {
     /// Returns [`ShardingError::UnconstrainedInLayout`] if the partition spec contains an
     /// `Unconstrained` dimension.
     pub fn new(global_shape: Vec<usize>, mesh: Mesh, partition_spec: PartitionSpec) -> Result<Self, ShardingError> {
-        validate_partition_spec(mesh.abstract_mesh(), &partition_spec)?;
+        validate_partition_spec(mesh.logical_mesh(), &partition_spec)?;
 
         let partition_rank = partition_spec.rank();
         let array_rank = global_shape.len();
@@ -1392,7 +1392,7 @@ impl ShardingLayout {
                     PartitionDimension::Unsharded => ShardSlice::new(0, dimension_size)?,
                     PartitionDimension::Sharded(axis_names) => {
                         let (partition_index, partition_count) = partition_index_for_axes(
-                            mesh.abstract_mesh(),
+                            mesh.logical_mesh(),
                             mesh_coordinate.as_slice(),
                             axis_names.as_slice(),
                         )?;
@@ -1486,9 +1486,9 @@ fn escape_shardy_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Validates a partition spec against an abstract mesh. Returns the set of axis names used.
+/// Validates a partition spec against a logical mesh. Returns the set of axis names used.
 fn validate_partition_spec(
-    mesh: &AbstractMesh,
+    mesh: &LogicalMesh,
     partition_spec: &PartitionSpec,
 ) -> Result<HashSet<String>, ShardingError> {
     let mut used_axes = HashSet::new();
@@ -1527,7 +1527,7 @@ fn coordinate_for_linear_index(mut index: usize, axis_sizes: &[usize]) -> Vec<us
 }
 
 fn partition_index_for_axes(
-    mesh: &AbstractMesh,
+    mesh: &LogicalMesh,
     mesh_coordinate: &[usize],
     axis_names: &[String],
 ) -> Result<(usize, usize), ShardingError> {
@@ -1591,8 +1591,8 @@ fn partition_slice(
 mod tests {
     use super::*;
 
-    fn test_abstract_mesh_2x2() -> AbstractMesh {
-        AbstractMesh::new(vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()]).unwrap()
+    fn test_logical_mesh_2x2() -> LogicalMesh {
+        LogicalMesh::new(vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()]).unwrap()
     }
 
     fn test_mesh_2x2() -> Mesh {
@@ -1602,12 +1602,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AbstractMesh tests
+    // LogicalMesh tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_abstract_mesh_construction_and_lookups() {
-        let mesh = test_abstract_mesh_2x2();
+    fn test_logical_mesh_construction_and_lookups() {
+        let mesh = test_logical_mesh_2x2();
         assert_eq!(mesh.axes().len(), 2);
         assert_eq!(mesh.axis_index("x"), Some(0));
         assert_eq!(mesh.axis_index("y"), Some(1));
@@ -1618,17 +1618,17 @@ mod tests {
     }
 
     #[test]
-    fn test_abstract_mesh_validation() {
+    fn test_logical_mesh_validation() {
         let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("x", 3).unwrap()];
         assert!(matches!(
-            AbstractMesh::new(axes),
+            LogicalMesh::new(axes),
             Err(ShardingError::DuplicateMeshAxisName { axis_name }) if axis_name == "x",
         ));
     }
 
     #[test]
-    fn test_abstract_mesh_shardy_rendering() {
-        let mesh = test_abstract_mesh_2x2();
+    fn test_logical_mesh_shardy_rendering() {
+        let mesh = test_logical_mesh_2x2();
         assert_eq!(mesh.to_shardy_mesh_literal(), "<[\"x\"=2, \"y\"=2]>");
         assert_eq!(mesh.to_shardy_mesh_operation("mesh").unwrap(), "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>");
         assert_eq!(mesh.to_shardy_mesh_operation("@mesh").unwrap(), "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>");
@@ -1641,12 +1641,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_mesh_from_abstract() {
-        let abstract_mesh = test_abstract_mesh_2x2();
+    fn test_mesh_from_logical() {
+        let logical_mesh = test_logical_mesh_2x2();
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
-        let mesh = Mesh::from_abstract(abstract_mesh.clone(), devices).unwrap();
-        assert_eq!(mesh.abstract_mesh(), &abstract_mesh);
-        assert_eq!(mesh.axes(), abstract_mesh.axes());
+        let mesh = Mesh::from_logical(logical_mesh.clone(), devices).unwrap();
+        assert_eq!(mesh.logical_mesh(), &logical_mesh);
+        assert_eq!(mesh.axes(), logical_mesh.axes());
         assert_eq!(mesh.device_count(), 4);
     }
 
@@ -1720,7 +1720,7 @@ mod tests {
 
     #[test]
     fn test_named_sharding_validation() {
-        let mesh = test_abstract_mesh_2x2();
+        let mesh = test_logical_mesh_2x2();
 
         let unknown_axis_partition = PartitionSpec::new(vec![PartitionDimension::sharded("z")]);
         assert!(matches!(
@@ -1744,7 +1744,7 @@ mod tests {
 
     #[test]
     fn test_named_sharding_shardy_rendering() {
-        let mesh = test_abstract_mesh_2x2();
+        let mesh = test_logical_mesh_2x2();
         let partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
@@ -1756,7 +1756,7 @@ mod tests {
 
     #[test]
     fn test_named_sharding_replicated_axes() {
-        let mesh = test_abstract_mesh_2x2();
+        let mesh = test_logical_mesh_2x2();
         let partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], Vec::new()).unwrap();
@@ -1768,7 +1768,7 @@ mod tests {
 
     #[test]
     fn test_named_sharding_unreduced_axes() {
-        let mesh = test_abstract_mesh_2x2();
+        let mesh = test_logical_mesh_2x2();
         let partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, Vec::new(), vec!["y".to_string()]).unwrap();
@@ -1780,7 +1780,7 @@ mod tests {
 
     #[test]
     fn test_named_sharding_replicated_and_unreduced_axes() {
-        let mesh = AbstractMesh::new(vec![
+        let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2).unwrap(),
             MeshAxis::new("y", 2).unwrap(),
             MeshAxis::new("z", 2).unwrap(),
@@ -1797,7 +1797,7 @@ mod tests {
 
     #[test]
     fn test_named_sharding_extra_axis_validation() {
-        let mesh = test_abstract_mesh_2x2();
+        let mesh = test_logical_mesh_2x2();
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
 
         // Unknown extra axis.
@@ -1926,33 +1926,33 @@ mod tests {
     }
 
     #[test]
-    fn test_abstract_mesh_default_axis_types() {
-        let mesh = test_abstract_mesh_2x2();
+    fn test_logical_mesh_default_axis_types() {
+        let mesh = test_logical_mesh_2x2();
         assert_eq!(mesh.axis_types(), &[AxisType::Auto, AxisType::Auto]);
     }
 
     #[test]
-    fn test_abstract_mesh_with_axis_types() {
+    fn test_logical_mesh_with_axis_types() {
         let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
         let types = vec![AxisType::Manual, AxisType::Explicit];
-        let mesh = AbstractMesh::with_axis_types(axes, types).unwrap();
+        let mesh = LogicalMesh::with_axis_types(axes, types).unwrap();
         assert_eq!(mesh.axis_types(), &[AxisType::Manual, AxisType::Explicit]);
     }
 
     #[test]
-    fn test_abstract_mesh_axis_type_count_mismatch() {
+    fn test_logical_mesh_axis_type_count_mismatch() {
         let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
         let types = vec![AxisType::Auto];
         assert!(matches!(
-            AbstractMesh::with_axis_types(axes, types),
+            LogicalMesh::with_axis_types(axes, types),
             Err(ShardingError::AxisTypeCountMismatch { expected: 2, actual: 1 }),
         ));
     }
 
     #[test]
-    fn test_abstract_mesh_axis_type_queries() {
+    fn test_logical_mesh_axis_type_queries() {
         // All auto.
-        let mesh = test_abstract_mesh_2x2();
+        let mesh = test_logical_mesh_2x2();
         assert!(mesh.are_all_axes_auto());
         assert!(!mesh.are_all_axes_explicit());
         assert!(!mesh.are_all_axes_manual());
@@ -1963,7 +1963,7 @@ mod tests {
         // Mixed types.
         let axes = vec![MeshAxis::new("a", 2).unwrap(), MeshAxis::new("b", 2).unwrap(), MeshAxis::new("c", 2).unwrap()];
         let types = vec![AxisType::Auto, AxisType::Explicit, AxisType::Manual];
-        let mesh = AbstractMesh::with_axis_types(axes, types).unwrap();
+        let mesh = LogicalMesh::with_axis_types(axes, types).unwrap();
         assert!(!mesh.are_all_axes_auto());
         assert!(!mesh.are_all_axes_explicit());
         assert!(!mesh.are_all_axes_manual());
@@ -1973,8 +1973,8 @@ mod tests {
     }
 
     #[test]
-    fn test_abstract_mesh_with_updated_axis_types() {
-        let mesh = test_abstract_mesh_2x2();
+    fn test_logical_mesh_with_updated_axis_types() {
+        let mesh = test_logical_mesh_2x2();
         let updates = HashMap::from([("y".to_string(), AxisType::Manual)]);
         let updated = mesh.with_updated_axis_types(&updates);
         assert_eq!(updated.axis_types(), &[AxisType::Auto, AxisType::Manual]);
@@ -1986,8 +1986,8 @@ mod tests {
     }
 
     #[test]
-    fn test_abstract_mesh_axis_names_and_sizes() {
-        let mesh = test_abstract_mesh_2x2();
+    fn test_logical_mesh_axis_names_and_sizes() {
+        let mesh = test_logical_mesh_2x2();
         assert_eq!(mesh.axis_names(), vec!["x", "y"]);
         assert_eq!(mesh.axis_sizes(), vec![2, 2]);
     }

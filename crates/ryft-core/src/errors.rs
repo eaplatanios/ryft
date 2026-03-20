@@ -15,7 +15,7 @@ pub enum Error {
 
     #[error(transparent)]
     Layout(#[from] LayoutError),
-    
+
     #[error(transparent)]
     Broadcasting(#[from] BroadcastingError),
 }
