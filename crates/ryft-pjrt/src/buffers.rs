@@ -403,8 +403,8 @@ impl TileDimension {
         Self(size as i64)
     }
 
-    /// Creates a new _combined_ [`TileDimension`]. That is a tile dimension that is combined with the next minor
-    /// dimension before tiling is applied, and thus has not fixed size of its own.
+    /// Creates a new _combined_ [`TileDimension`]. That is a tile dimension that is combined with the next more
+    /// minor dimension before tiling is applied, and thus has no fixed size of its own.
     pub fn combined() -> Self {
         Self(i64::MIN)
     }
@@ -448,6 +448,13 @@ pub struct Tile {
     pub dimensions: Vec<TileDimension>,
 }
 
+impl Tile {
+    /// Creates a new [`Tile`] with the provided dimensions.
+    pub fn new(dimensions: Vec<TileDimension>) -> Self {
+        Self { dimensions }
+    }
+}
+
 // Our [`Display`] implementation attempts to match the corresponding XLA rendering.
 impl Display for Tile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -467,6 +474,12 @@ impl Debug for Tile {
     }
 }
 
+impl From<Vec<TileDimension>> for Tile {
+    fn from(dimensions: Vec<TileDimension>) -> Self {
+        Self::new(dimensions)
+    }
+}
+
 /// Tiling-based [`Layout`]. Refer to the [official XLA documentation](https://openxla.org/xla/tiled_layout)
 /// for more information.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -474,7 +487,7 @@ pub struct TiledLayout {
     /// Sequence of dimension indices ordered from the most minor (i.e., the one with the fastest varying index)
     /// to the most major (i.e., the one with the slowest varying index). Refer to [`Self::minor_to_major`]
     /// for more information.
-    minor_to_major: Vec<i64>,
+    minor_to_major: Vec<u64>,
 
     /// Flattened list of [`TileDimension`]s across all [`Tile`]s in this [`TiledLayout`].
     tile_dimensions: Vec<TileDimension>,
@@ -491,7 +504,8 @@ impl TiledLayout {
     /// [`PJRT_Buffer_MemoryLayout_Tiled`](ffi::PJRT_Buffer_MemoryLayout_Tiled)
     /// handle that came from a function in the PJRT C API.
     pub(crate) unsafe fn from_c_api(layout: ffi::PJRT_Buffer_MemoryLayout_Tiled) -> Self {
-        let minor_to_major = unsafe { slice_from_c_api(layout.minor_to_major, layout.minor_to_major_size) }.to_vec();
+        let minor_to_major =
+            unsafe { slice_from_c_api(layout.minor_to_major as *const _, layout.minor_to_major_size) }.to_vec();
         let tile_dimension_sizes = unsafe { slice_from_c_api(layout.tile_dim_sizes, layout.num_tiles) }.to_vec();
         let tile_dimensions_count = tile_dimension_sizes.iter().sum();
         let tile_dimensions = unsafe { slice_from_c_api(layout.tile_dims as *const _, tile_dimensions_count) }.to_vec();
@@ -507,7 +521,7 @@ impl TiledLayout {
     /// function is marked as _unsafe_.
     pub(crate) unsafe fn to_c_api(&self) -> ffi::PJRT_Buffer_MemoryLayout_Tiled {
         ffi::PJRT_Buffer_MemoryLayout_Tiled::new(
-            self.minor_to_major.as_ptr(),
+            self.minor_to_major.as_ptr().cast(),
             self.minor_to_major.len(),
             self.tile_dimensions.as_ptr() as *const _,
             self.tile_dimension_sizes.as_ptr(),
@@ -517,7 +531,7 @@ impl TiledLayout {
 
     /// Creates a new [`TiledLayout`] with the provided minor-to-major dimension ordering and [`Tile`]s.
     /// Refer to [`Self::minor_to_major`] and [`Self::tiles`] for information on the function arguments.
-    pub fn new(minor_to_major: Vec<i64>, tiles: Vec<Tile>) -> Self {
+    pub fn new(minor_to_major: Vec<u64>, tiles: Vec<Tile>) -> Self {
         Self {
             minor_to_major,
             tile_dimensions: tiles.iter().flat_map(|tile| tile.dimensions.iter().copied()).collect(),
@@ -532,7 +546,7 @@ impl TiledLayout {
     /// physical dimension (i.e., fastest varying index) and the last the most major (i.e., slowest varying index).
     /// The contents of the vector are the indices of the logical dimensions in the shape. Note that this vector
     /// must have the same length as the number of dimensions (i.e., the rank) of the corresponding [`Buffer`].
-    pub fn minor_to_major(&self) -> &[i64] {
+    pub fn minor_to_major(&self) -> &[u64] {
         self.minor_to_major.as_slice()
     }
 
@@ -768,9 +782,17 @@ impl Layout {
                 minor_to_major
                     .split(',')
                     .map(|dimension| {
-                        dimension.trim().parse::<i64>().map_err(|error| {
+                        let dimension = dimension.trim();
+                        let dimension = dimension.parse::<i64>().map_err(|error| {
                             Error::invalid_argument(format!("invalid dimension index '{dimension}': {error}"))
-                        })
+                        })?;
+                        if dimension < 0 {
+                            Err(Error::invalid_argument(format!(
+                                "invalid dimension index '{dimension}': expected non-negative value",
+                            )))
+                        } else {
+                            Ok(dimension as u64)
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
@@ -850,7 +872,19 @@ impl Layout {
     /// Constructs a [`Layout`] from the provided [`Layout`](crate::protos::Layout) Protobuf.
     pub fn from_proto(layout: crate::protos::Layout) -> Result<Self, Error> {
         Ok(Layout::Tiled(TiledLayout::new(
-            layout.minor_to_major,
+            layout
+                .minor_to_major
+                .into_iter()
+                .map(|dimension| {
+                    if dimension < 0 {
+                        Err(Error::invalid_argument(format!(
+                            "invalid dimension index '{dimension}': expected non-negative value",
+                        )))
+                    } else {
+                        Ok(dimension as u64)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             layout
                 .tiles
                 .into_iter()
@@ -876,7 +910,18 @@ impl Layout {
     pub fn proto(&self) -> Result<crate::protos::Layout, Error> {
         match self {
             Layout::Tiled(layout) => Ok(crate::protos::Layout {
-                minor_to_major: layout.minor_to_major().to_vec(),
+                minor_to_major: layout
+                    .minor_to_major()
+                    .iter()
+                    .copied()
+                    .map(|dimension| {
+                        i64::try_from(dimension).map_err(|_| {
+                            Error::invalid_argument(format!(
+                                "invalid dimension index '{dimension}': expected a `u64` value",
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
                 tiles: layout
                     .tiles()
                     .into_iter()
@@ -3601,7 +3646,7 @@ mod tests {
             Tile { dimensions: vec![TileDimension::sized(4)] },
         ];
         let layout = TiledLayout::new(vec![2, 1, 0], tiles.clone());
-        assert_eq!(unsafe { TiledLayout::from_c_api(layout.to_c_api()) }, layout);
+        assert_eq!(unsafe { TiledLayout::from_c_api(layout.to_c_api()) }, layout.clone());
         assert_eq!(layout.minor_to_major(), &[2, 1, 0]);
         assert_eq!(layout.tiles(), tiles);
         assert_eq!(layout.tile(0), Some(tiles[0].clone()));
@@ -3660,6 +3705,16 @@ mod tests {
         assert!(matches!(
             Layout::from_str("{1,0:Q(123)}"),
             Err(Error::InvalidArgument { message, .. }) if message == "unsupported layout property 'Q'",
+        ));
+        assert!(matches!(
+            Layout::from_str("{-1,0}"),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "invalid dimension index '-1': expected non-negative value",
+        ));
+        assert!(matches!(
+            Layout::from_proto(crate::protos::Layout { minor_to_major: vec![-1, 0], ..Default::default() }),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "invalid dimension index '-1': expected non-negative value",
         ));
 
         // Test creating an invalid [`Layout`].
