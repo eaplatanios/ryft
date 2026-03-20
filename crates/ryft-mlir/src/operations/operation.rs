@@ -11,8 +11,8 @@ use ryft_xla_sys::bindings::{
     mlirOperationGetInherentAttributeByName, mlirOperationGetLocation, mlirOperationGetName,
     mlirOperationGetNumAttributes, mlirOperationGetNumDiscardableAttributes, mlirOperationGetNumOperands,
     mlirOperationGetNumRegions, mlirOperationGetNumResults, mlirOperationGetNumSuccessors, mlirOperationGetOpOperand,
-    mlirOperationGetParentOperation, mlirOperationGetRegion, mlirOperationGetResult, mlirOperationGetSuccessor,
-    mlirOperationGetTypeID, mlirOperationHasInherentAttributeByName, mlirOperationHashValue,
+    mlirOperationGetOperand, mlirOperationGetParentOperation, mlirOperationGetRegion, mlirOperationGetResult,
+    mlirOperationGetSuccessor, mlirOperationGetTypeID, mlirOperationHasInherentAttributeByName, mlirOperationHashValue,
     mlirOperationIsBeforeInBlock, mlirOperationMoveAfter, mlirOperationMoveBefore, mlirOperationPrint,
     mlirOperationPrintWithFlags, mlirOperationPrintWithState, mlirOperationRemoveAttributeByName,
     mlirOperationRemoveDiscardableAttributeByName, mlirOperationSetAttributeByName,
@@ -451,7 +451,17 @@ pub trait Operation<'o, 'c: 'o, 't: 'c>: Sized {
     /// Returns the operand [`Value`](crate::Value) at the `index`-pth position in the operands list of this
     /// [`Operation`], and [`None`] if `index` is out of bounds.
     fn operand_value(&self, index: usize) -> Option<ValueRef<'o, 'c, 't>> {
-        self.operand(index).map(|operand| operand.value())
+        if index >= self.operand_count() {
+            None
+        } else {
+            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+            // from Rust. It is maybe more conservative than would be ideal, but that is due to the limited exposure
+            // to MLIR internals that we have when working with the MLIR C API.
+            let _guard = self.context().borrow();
+            unsafe {
+                ValueRef::from_c_api(mlirOperationGetOperand(self.to_c_api(), index.cast_signed()), self.context())
+            }
+        }
     }
 
     /// Returns an [`Iterator`] over the [`Type`](crate::Type)s of the [`Operation::operands`] of this [`Operation`].
