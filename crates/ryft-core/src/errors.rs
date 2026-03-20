@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::parameters::ParameterError;
-use crate::types::data_types::DataTypeError;
+use crate::types::{DataTypeError, LayoutError};
 
 /// Represents errors that can occur in `ryft-core`.
 #[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
@@ -11,4 +11,7 @@ pub enum Error {
 
     #[error(transparent)]
     DataType(#[from] DataTypeError),
+
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
 }
