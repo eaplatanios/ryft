@@ -6,8 +6,41 @@ use std::marker::PhantomData;
 use convert_case::{Case, Casing};
 use half::{bf16, f16};
 use paste::paste;
+use thiserror::Error;
 
-use crate::errors::Error;
+/// Represents [`Parameter`]-related errors.
+#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ParameterError {
+    #[error(
+        "{}",
+        match paths.as_deref() {
+            None => "got more parameters than expected".to_string(),
+            Some(paths) => format!(
+                "got more parameters than expected; unused parameter paths: {}",
+                paths.iter().map(|path| format!("'{path}'")).collect::<Vec<_>>().join(", "),
+            ),
+        }
+    )]
+    UnusedParameters { paths: Option<Vec<String>> },
+
+    #[error(
+        "{}",
+        match paths.as_deref() {
+            None => format!("got fewer parameters than expected; expected at least {expected_count}"),
+            Some(paths) => format!(
+                "got fewer parameters than expected; expected at least {expected_count}; missing parameter paths: {}",
+                paths.iter().map(|path| format!("'{path}'")).collect::<Vec<_>>().join(", "),
+            ),
+        }
+    )]
+    MissingParameters { expected_count: usize, paths: Option<Vec<String>> },
+
+    #[error(
+        "got ambiguous parameter values while combining parameterized values; conflicting values: {}",
+        values.iter().map(|value| format!("'{value}'")).collect::<Vec<_>>().join(", "),
+    )]
+    AmbiguousParameterCombination { values: Vec<String> },
+}
 
 /// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].
 /// A type `X` implements [`SameAs<Y>`] only when `X` and `Y` are the exact same type.
@@ -54,14 +87,14 @@ impl<P: Parameter> Parameter for Option<P> {}
 pub struct Placeholder;
 
 impl Display for Placeholder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<Parameter>")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<Parameter>")
     }
 }
 
 impl Debug for Placeholder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<Parameter>")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<Parameter>")
     }
 }
 
@@ -186,15 +219,15 @@ impl ParameterPath {
 }
 
 impl Display for ParameterPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "$")?;
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "$")?;
         for segment in self.segments() {
             match segment {
-                ParameterPathSegment::Field(name) => write!(f, ".{name}")?,
-                ParameterPathSegment::Variant(name) => write!(f, ".{}", name.to_case(Case::Snake))?,
-                ParameterPathSegment::TupleIndex(index) => write!(f, ".{index}")?,
-                ParameterPathSegment::Index(index) => write!(f, "[{index}]")?,
-                ParameterPathSegment::Key(key) => write!(f, "[{key}]")?,
+                ParameterPathSegment::Field(name) => write!(formatter, ".{name}")?,
+                ParameterPathSegment::Variant(name) => write!(formatter, ".{}", name.to_case(Case::Snake))?,
+                ParameterPathSegment::TupleIndex(index) => write!(formatter, ".{index}")?,
+                ParameterPathSegment::Index(index) => write!(formatter, "[{index}]")?,
+                ParameterPathSegment::Key(key) => write!(formatter, "[{key}]")?,
             }
         }
         Ok(())
@@ -202,8 +235,8 @@ impl Display for ParameterPath {
 }
 
 impl Debug for ParameterPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ParameterPath[{self}]")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ParameterPath[{self}]")
     }
 }
 
@@ -423,7 +456,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![10, 30])]), (0,)),
 /// );
 ///
-/// # Ok::<(), ryft_core::errors::Error>(())
+/// # Ok::<(), ryft_core::parameters::ParameterError>(())
 /// ```
 ///
 /// # Custom Parameterized Types
@@ -470,7 +503,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// ```rust
 /// # /// Test-only shim to avoid taking a (circular) dependency on `ryft`.
 /// # mod ryft {
-/// #     pub use ryft_core::errors::Error;
+/// #     pub use ryft_core::parameters::ParameterError;
 /// #     pub use ryft_core::parameters::{
 /// #         Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
 /// #         PathPrefixedParameterIterator, Placeholder,
@@ -559,7 +592,7 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     },
 /// );
 ///
-/// # Ok::<(), ryft_core::errors::Error>(())
+/// # Ok::<(), ryft_core::parameters::ParameterError>(())
 /// ```
 pub trait Parameterized<P: Parameter>: Sized {
     /// [`ParameterizedFamily`] that this type belongs to and which can be used to reparameterize it.
@@ -678,26 +711,27 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming values
     /// from the provided `parameters` to populate its parameters. This function may not consume all the provided
     /// parameters, but if there are not enough parameters in the provided iterator, it will return a
-    /// [`Error::MissingParameters`] error.
+    /// [`ParameterError::MissingParameters`] error.
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
-    ) -> Result<Self, Error>;
+    ) -> Result<Self, ParameterError>;
 
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming values
     /// from the provided `parameters` to populate its parameters. This function expects to fully consume the provided
-    /// iterator. If it does not contain enough values, then it will return a [`Error::MissingParameters`] error, while
-    /// if it contains too many values, it will return an [`Error::UnusedParameters`]. If you do not want to fully
-    /// consume the provided iterator, then you must use [`Self::from_parameters_with_remainder`] instead.
+    /// iterator. If it does not contain enough values, then it will return a [`ParameterError::MissingParameters`]
+    /// error, while if it contains too many values, it will return an [`ParameterError::UnusedParameters`]. If you do
+    /// not want to fully consume the provided iterator, then you must use [`Self::from_parameters_with_remainder`]
+    /// instead.
     fn from_parameters<I: IntoIterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: I,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParameterError> {
         let mut parameters = parameters.into_iter();
         let parameterized = Self::from_parameters_with_remainder(structure, &mut parameters)?;
         parameters
             .next()
-            .map(|_| Err(Error::UnusedParameters { paths: None }))
+            .map(|_| Err(ParameterError::UnusedParameters { paths: None }))
             .unwrap_or_else(|| Ok(parameterized))
     }
 
@@ -705,13 +739,14 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// from the provided `parameters` to populate its parameters. Unlike [`Self::from_broadcasted_named_parameters`],
     /// this function is strict in that keys in `parameters` must match exactly leaf [`ParameterPath`]s in `structure`,
     /// and path prefix matching is not being used. If there are missing parameters preventing reconstruction from
-    /// being feasible, then this function will return a [`Error::MissingParameters`] error. Furthermore, if extra
-    /// paths remain after reconstruction, then it will return an [`Error::UnusedParameters`] error. For fully worked
-    /// examples, refer to the examples provided in the top-level documentation of the [`Parameterized`] trait.
+    /// being feasible, then this function will return a [`ParameterError::MissingParameters`] error. Furthermore,
+    /// if extra paths remain after reconstruction, then it will return an [`ParameterError::UnusedParameters`] error.
+    /// For fully worked examples, refer to the examples provided in the top-level documentation of the
+    /// [`Parameterized`] trait.
     fn from_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
         parameters: I,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParameterError> {
         // We try to consume parameters in lockstep with `structure.named_parameters()` first. If we encounter any
         // out-of-order parameters, we lazily materialize the remaining entries into a hash map and continue with
         // keyed lookups.
@@ -807,9 +842,9 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
 
         if !missing_paths.is_empty() {
-            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+            Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) })
         } else if deferred_parameters.is_some_and(|deferred_parameters| !deferred_parameters.is_empty()) {
-            Err(Error::UnusedParameters { paths: None })
+            Err(ParameterError::UnusedParameters { paths: None })
         } else {
             Self::from_parameters(structure, values)
         }
@@ -819,15 +854,15 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// from the provided `parameters` to populate its parameters, where keys in `parameters` are interpreted as path
     /// prefixes. Unlike [`Self::from_named_parameters`], this function does not require exact leaf paths, and each
     /// leaf path in `structure` receives the value from the most specific matching path prefix (i.e., the longest
-    /// shared path prefix). If any leaf path is not covered by a provided prefix, then this function will return
-    /// a [`Error::MissingParameters`] error. Furthermore, if there are any remaining [`ParameterPath`]s with no match
-    /// in `structure`, then it will return an [`Error::UnusedParameters`] error. Note that since one prefix value may
-    /// need to populate multiple leaves, this function requires `P: Clone`. For fully worked examples, refer to the
-    /// examples provided in the top-level documentation of the [`Parameterized`] trait.
+    /// shared path prefix). If any leaf path is not covered by a provided prefix, then this function will return a
+    /// [`ParameterError::MissingParameters`] error. Furthermore, if there are any remaining [`ParameterPath`]s with no
+    /// match in `structure`, then it will return an [`ParameterError::UnusedParameters`] error. Note that since one
+    /// prefix value may need to populate multiple leaves, this function requires `P: Clone`. For fully worked
+    /// examples, refer to the examples provided in the top-level documentation of the [`Parameterized`] trait.
     fn from_broadcasted_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
         parameters: I,
-    ) -> Result<Self, Error>
+    ) -> Result<Self, ParameterError>
     where
         P: Clone,
     {
@@ -896,20 +931,42 @@ pub trait Parameterized<P: Parameter>: Sized {
             .collect::<Vec<_>>();
 
         if !missing_paths.is_empty() {
-            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+            Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) })
         } else if !unused_prefix_paths.is_empty() {
             unused_prefix_paths.sort_unstable();
-            Err(Error::UnusedParameters { paths: Some(unused_prefix_paths) })
+            Err(ParameterError::UnusedParameters { paths: Some(unused_prefix_paths) })
         } else {
             Self::from_parameters(structure, values)
         }
+    }
+
+    /// Broadcasts the named parameters from this [`Parameterized`] value into the provided target `structure`,
+    /// returning a new value of type `T`. This is a convenience wrapper around [`T::from_broadcasted_named_parameters`]
+    /// that pairs each current parameter with its current leaf [`ParameterPath`] and uses those paths as prefixes for
+    /// filling the target structure. As a result, each leaf path in `structure` receives the value from the most
+    /// specific matching current parameter path prefix (i.e., the longest shared prefix among this value's existing
+    /// parameter paths). If the current parameter paths do not cover all target leaves, or if some current parameter
+    /// paths match no target leaf, then this function returns the corresponding [`ParameterError::MissingParameters`]
+    /// or [`ParameterError::UnusedParameters`] error from [`T::from_broadcasted_named_parameters`]. Since one current
+    /// parameter may need to populate multiple leaves in `structure`, this function requires `P: Clone`.
+    fn broadcast_to_parameter_structure<T: Parameterized<P>>(
+        &self,
+        structure: T::ParameterStructure,
+    ) -> Result<T, ParameterError>
+    where
+        P: Clone,
+    {
+        T::from_broadcasted_named_parameters(
+            structure,
+            self.named_parameters().map(|(path, parameter)| (path, parameter.clone())),
+        )
     }
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
     /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the same
     /// order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters`],
     /// [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
-    fn map_parameters<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, Error>
+    fn map_parameters<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, ParameterError>
     where
         Self::Family: ParameterizedFamily<T>,
     {
@@ -924,7 +981,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     fn map_named_parameters<T: Parameter, F: FnMut(&ParameterPath, P) -> T>(
         self,
         map_fn: F,
-    ) -> Result<Self::To<T>, Error>
+    ) -> Result<Self::To<T>, ParameterError>
     where
         Self::Family: ParameterizedFamily<T>,
     {
@@ -958,9 +1015,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// assert_eq!(filtered, vec![(None, Some(2)), (None, Some(4))]);
     ///
-    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// # Ok::<(), ryft_core::parameters::ParameterError>(())
     /// ```
-    fn filter_parameters<F: FnMut(&ParameterPath, &P) -> bool>(self, predicate: F) -> Result<Self::To<Option<P>>, Error>
+    fn filter_parameters<F: FnMut(&ParameterPath, &P) -> bool>(
+        self,
+        predicate: F,
+    ) -> Result<Self::To<Option<P>>, ParameterError>
     where
         Self::Family: ParameterizedFamily<Option<P>>,
     {
@@ -991,12 +1051,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// assert_eq!(partition_0, vec![(None, None), (Some(3), Some(4))]);
     /// assert_eq!(partition_1, vec![(Some(1), Some(2)), (None, None)]);
     ///
-    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// # Ok::<(), ryft_core::parameters::ParameterError>(())
     /// ```
     fn partition_parameters<F: FnMut(&ParameterPath, &P) -> bool>(
         self,
         predicate: F,
-    ) -> Result<(Self::To<Option<P>>, Self::To<Option<P>>), Error>
+    ) -> Result<(Self::To<Option<P>>, Self::To<Option<P>>), ParameterError>
     where
         Self::Family: ParameterizedFamily<Option<P>>,
     {
@@ -1025,10 +1085,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// `structure`, this function selects the first [`Some`] value from `values` and uses it for the corresponding
     /// location in the resulting [`Parameterized`] value that the function returns. If multiple non-`None` values are
     /// present for the same leaf, then they must all be equal, and otherwise this function returns an
-    /// [`Error::AmbiguousParameterCombination`] error. If no [`Some`] value is found for some leaf
-    /// [`ParameterPath`], then this function will return a [`Error::MissingParameters`] error. Furthermore, if any of
-    /// the provided `values` contains additional [`Parameter`]s, beyond those that correspond to ones in `structure`,
-    /// then this function will return an [`Error::UnusedParameters`] error.
+    /// [`ParameterError::AmbiguousParameterCombination`] error. If no [`Some`] value is found for some leaf
+    /// [`ParameterPath`], then this function will return a [`ParameterError::MissingParameters`] error. Furthermore,
+    /// if any of the provided `values` contains additional [`Parameter`]s, beyond those that correspond to ones in
+    /// `structure`, then this function will return an [`ParameterError::UnusedParameters`] error.
     ///
     /// This function is typically used to reconstruct values from the results of calling [`Self::filter_parameters`]
     /// and [`Self::partition_parameters`]. It is inspired by
@@ -1051,12 +1111,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// assert_eq!(combined, vec![(1, 2), (3, 4)]);
     ///
-    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// # Ok::<(), ryft_core::parameters::ParameterError>(())
     /// ```
     fn combine_parameters<I: IntoIterator<Item = Self::To<Option<P>>>>(
         structure: Self::ParameterStructure,
         values: I,
-    ) -> Result<Self, Error>
+    ) -> Result<Self, ParameterError>
     where
         P: Debug + PartialEq,
         Self::Family: ParameterizedFamily<Option<P>>,
@@ -1085,7 +1145,7 @@ pub trait Parameterized<P: Parameter>: Sized {
             if has_missing_candidates || collected_values.is_empty() {
                 missing_paths.push(path.to_string());
             } else if collected_values.len() > 1 {
-                return Err(Error::AmbiguousParameterCombination {
+                return Err(ParameterError::AmbiguousParameterCombination {
                     values: collected_values.into_iter().map(|value| format!("{value:?}")).collect(),
                 });
             } else {
@@ -1099,10 +1159,10 @@ pub trait Parameterized<P: Parameter>: Sized {
             .collect::<Vec<_>>();
 
         if !missing_paths.is_empty() {
-            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+            Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) })
         } else if !unused_paths.is_empty() {
             unused_paths.sort_unstable();
-            Err(Error::UnusedParameters { paths: Some(unused_paths) })
+            Err(ParameterError::UnusedParameters { paths: Some(unused_paths) })
         } else {
             Self::from_parameters(structure, parameters)
         }
@@ -1111,8 +1171,9 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Replaces nested [`Parameter`]s of type `P` in this value using a structure-aligned `Parameterized<Option<P>>`
     /// replacement value. For each parameter, [`Some`] in `replacement` overrides the current value from `self`,
     /// while [`None`] keeps the current value unchanged. If `replacement` is missing parameters for the expected
-    /// structure, this function will return a [`Error::MissingParameters`] error. Furthermore, if `replacement`
-    /// contains extra parameters, this function will return an [`Error::UnusedParameters`] error.
+    /// structure, this function will return a [`ParameterError::MissingParameters`] error. Furthermore, if
+    /// `replacement` contains extra parameters, this function will return an [`ParameterError::UnusedParameters`]
+    /// error.
     ///
     /// # Example
     ///
@@ -1126,9 +1187,9 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// assert_eq!(replaced, vec![(1, 2), (99, 4)]);
     ///
-    /// # Ok::<(), ryft_core::errors::Error>(())
+    /// # Ok::<(), ryft_core::parameters::ParameterError>(())
     /// ```
-    fn replace_parameters(self, replacement: Self::To<Option<P>>) -> Result<Self, Error>
+    fn replace_parameters(self, replacement: Self::To<Option<P>>) -> Result<Self, ParameterError>
     where
         Self::Family: ParameterizedFamily<Option<P>>,
     {
@@ -1157,10 +1218,10 @@ pub trait Parameterized<P: Parameter>: Sized {
             .collect::<Vec<_>>();
 
         if !missing_paths.is_empty() {
-            Err(Error::MissingParameters { expected_count, paths: Some(missing_paths) })
+            Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) })
         } else if !unused_paths.is_empty() {
             unused_paths.sort_unstable();
-            Err(Error::UnusedParameters { paths: Some(unused_paths) })
+            Err(ParameterError::UnusedParameters { paths: Some(unused_paths) })
         } else {
             Self::from_parameters(structure, replaced_parameters)
         }
@@ -1266,8 +1327,8 @@ impl<P: Parameter> Parameterized<P> for P {
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         _structure: Self::ParameterStructure,
         parameters: &mut I,
-    ) -> Result<Self, Error> {
-        parameters.next().ok_or(Error::MissingParameters { expected_count: 1, paths: None })
+    ) -> Result<Self, ParameterError> {
+        parameters.next().ok_or(ParameterError::MissingParameters { expected_count: 1, paths: None })
     }
 }
 
@@ -1346,7 +1407,7 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         _structure: Self::ParameterStructure,
         _parameters: &mut I,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParameterError> {
         Ok(PhantomData)
     }
 }
@@ -1463,7 +1524,7 @@ macro_rules! tuple_parameterized_impl {
                 fn from_parameters_with_remainder<I: Iterator<Item = P>>(
                     structure: Self::ParameterStructure,
                     parameters: &mut I,
-                ) -> Result<Self, Error> {
+                ) -> Result<Self, ParameterError> {
                     let ($([<$T:lower _field>],)*) = structure;
                     $(let [<$T:lower>] = $T::from_parameters_with_remainder([<$T:lower _field>], parameters)?;)*
                     Ok(($([<$T:lower>],)*))
@@ -1746,7 +1807,7 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParameterError> {
         // TODO(eaplatanios): Make this more efficient by using [`std::array::try_from_fn`] once it becomes stable.
         //  Tracking issue: https://github.com/rust-lang/rust/issues/89379.
         Ok(unsafe {
@@ -1875,14 +1936,16 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParameterError> {
         let expected_count = structure.len();
         let mut values = Vec::new();
         values.reserve_exact(expected_count);
         for value_structure in structure {
             values.push(V::from_parameters_with_remainder(value_structure, parameters).map_err(
                 |error| match error {
-                    Error::MissingParameters { paths, .. } => Error::MissingParameters { expected_count, paths },
+                    ParameterError::MissingParameters { paths, .. } => {
+                        ParameterError::MissingParameters { expected_count, paths }
+                    }
                     error => error,
                 },
             )?);
@@ -2038,7 +2101,7 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: B
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParameterError> {
         let expected_count = structure.len();
         let mut values = HashMap::with_capacity_and_hasher(expected_count, structure.hasher().clone());
         let mut sorted_entries = structure.into_iter().collect::<Vec<_>>();
@@ -2047,7 +2110,9 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: B
             values.insert(
                 key,
                 V::from_parameters_with_remainder(value_structure, parameters).map_err(|error| match error {
-                    Error::MissingParameters { paths, .. } => Error::MissingParameters { expected_count, paths },
+                    ParameterError::MissingParameters { paths, .. } => {
+                        ParameterError::MissingParameters { expected_count, paths }
+                    }
                     error => error,
                 })?,
             );
@@ -2171,14 +2236,16 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParameterError> {
         let expected_count = structure.len();
         let mut values = BTreeMap::new();
         for (key, value_structure) in structure {
             values.insert(
                 key,
                 V::from_parameters_with_remainder(value_structure, parameters).map_err(|error| match error {
-                    Error::MissingParameters { paths, .. } => Error::MissingParameters { expected_count, paths },
+                    ParameterError::MissingParameters { paths, .. } => {
+                        ParameterError::MissingParameters { expected_count, paths }
+                    }
                     error => error,
                 })?,
             );
@@ -2195,7 +2262,7 @@ mod tests {
     pub mod ryft {
         pub use ryft_macros::Parameterized;
 
-        pub use crate::errors::Error;
+        pub use crate::parameters::ParameterError;
         pub use crate::parameters::{
             Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
             PathPrefixedParameterIterator, Placeholder,
@@ -2405,7 +2472,7 @@ mod tests {
         );
         assert_eq!(
             Network::from_parameters(structure.clone(), vec![31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 999]),
-            Err(Error::UnusedParameters { paths: None })
+            Err(ParameterError::UnusedParameters { paths: None })
         );
 
         // Test [`Parameterized::from_named_parameters`].
@@ -2435,6 +2502,16 @@ mod tests {
                 metadata: (42, "meta"),
             })
         );
+
+        // Test [`Parameterized::broadcast_to_parameter_structure`].
+        assert_eq!(
+            42_i32.broadcast_to_parameter_structure::<(i32, (i32, i32))>((Placeholder, (Placeholder, Placeholder))),
+            Ok((42, (42, 42))),
+        );
+        assert!(matches!(
+            (1_i32, 2_i32).broadcast_to_parameter_structure::<i32>(Placeholder),
+            Err(ParameterError::MissingParameters { .. }),
+        ));
 
         // Test [`Parameterized::map_parameters`].
         assert_eq!(

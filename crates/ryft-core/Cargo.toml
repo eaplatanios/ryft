@@ -28,15 +28,18 @@ pre-release-replacements = [
 ]
 
 [dependencies]
+ryft-macros.workspace = true
 ryft-mlir = { workspace = true, optional = true }
 ryft-pjrt = { workspace = true, optional = true }
+aquamarine.workspace = true
 convert_case.workspace = true
 half.workspace = true
 paste.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-ryft-macros.workspace = true
+indoc.workspace = true
+pretty_assertions.workspace = true
 
 [features]
 default = ["xla"]

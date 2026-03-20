@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Added
+
+- Added `Parameterized::broadcast_to_parameter_structure`.
+- Introduced more fine-grained error types like `ParameterError`.
+
 ## [0.0.2] - 2026-03-02
 
 ### Changed
