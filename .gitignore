@@ -11,6 +11,7 @@
 .zed
 .history
 .idea
+.tasks
 
 # Python
 .venv
