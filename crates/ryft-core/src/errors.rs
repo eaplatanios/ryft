@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::broadcasting::BroadcastingError;
 use crate::parameters::ParameterError;
 use crate::types::{DataTypeError, LayoutError};
 
@@ -14,4 +15,7 @@ pub enum Error {
 
     #[error(transparent)]
     Layout(#[from] LayoutError),
+    
+    #[error(transparent)]
+    Broadcasting(#[from] BroadcastingError),
 }

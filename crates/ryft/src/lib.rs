@@ -3,6 +3,7 @@ pub use ryft_macros as macros;
 pub use ryft_mlir as mlir;
 pub use ryft_pjrt as pjrt;
 
+pub use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
 pub use ryft_core::errors::Error;
 pub use ryft_core::parameters::{
     Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,

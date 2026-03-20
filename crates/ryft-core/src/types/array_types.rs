@@ -2,8 +2,9 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
+use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
-use crate::types::{DataType, Layout};
+use crate::types::{DataType, Layout, Type};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -241,6 +242,14 @@ impl Display for ArrayType {
             write!(formatter, " layout={layout}")?;
         }
         Ok(())
+    }
+}
+
+impl Type for ArrayType {
+    #[inline]
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        // Note that this compatibility relationship is defined here as a "broadcastability" relationship.
+        self.is_broadcastable_to(&other)
     }
 }
 
