@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Updated our PJRT C API bindings for version `0.98`.
+- Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 
 ## [0.0.2] - 2026-03-02
 
