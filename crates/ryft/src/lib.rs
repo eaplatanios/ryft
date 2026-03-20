@@ -9,6 +9,7 @@ pub use ryft_core::parameters::{
     PathPrefixedParameterIterator, Placeholder,
 };
 pub use ryft_core::types::Type;
+pub use ryft_core::types::array_types::{ArrayType, Shape, Size};
 pub use ryft_core::types::data_types::{DataType, DataTypeError};
 pub use ryft_core::types::layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 pub use ryft_macros::{Parameter, Parameterized};
