@@ -16,7 +16,7 @@ use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, Exe
 
 use crate::types::data_types::{DataType, DataTypeError};
 
-use super::sharding::{Mesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout};
+use super::sharding::{DeviceMesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -232,7 +232,7 @@ impl<'o> Array<'o> {
     pub fn from_sharding(
         global_shape: Vec<usize>,
         element_type: DataType,
-        mesh: Mesh,
+        mesh: DeviceMesh,
         partition_spec: PartitionSpec,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
@@ -451,7 +451,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::{Mesh, MeshAxis, MeshDevice, PartitionDimension, PartitionSpec};
+    use crate::xla::sharding::{DeviceMesh, MeshAxis, MeshDevice, PartitionDimension, PartitionSpec};
 
     use super::*;
 
@@ -508,7 +508,7 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let mesh = Mesh::new(vec![MeshAxis::new("x", 8).unwrap()], mesh_devices).unwrap();
+        let mesh = DeviceMesh::new(vec![MeshAxis::new("x", 8).unwrap()], mesh_devices).unwrap();
 
         let lhs_partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
