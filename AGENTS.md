@@ -70,6 +70,9 @@ update this file so that they do not need to remind you again in the future.
   explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
 - For enums with straightforward tuple or unit variants, prefer using the variants directly instead of adding
   redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
+- When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
+  parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
+  abstraction and keep one source of truth.
 
 #### Formatting & Naming
 
@@ -155,7 +158,9 @@ update this file so that they do not need to remind you again in the future.
 
 - Every struct, enum, trait, module, and function should have a documentation string. Enum variants should have 
   documentation unless their name is self-explanatory. If an enum variant requires a documentation string, then you must
-  add documentation for all variants in that enum and separate them with an empty line.
+  add documentation for all variants in that enum.
+- When enum variants have documentation strings, keep an empty line between adjacent documented variants even for short
+  unit variants or small enums.
 - Prefer descriptive documentation that explains semantics and edge cases and includes examples where appropriate.
 - When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code
   "matches" another system such as JAX unless the external comparison is itself the point of the documentation.
