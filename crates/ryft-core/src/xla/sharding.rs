@@ -251,27 +251,23 @@ pub enum ShardingError {
 /// Each axis in a mesh can be tagged with a `MeshAxisType` that tells the compiler (Shardy/GSPMD)
 /// how to treat shardings along that axis during propagation.
 ///
-/// # JAX equivalent
-///
-/// Corresponds to [`jax.sharding.AxisType`][jax-axis-type]:
-///
-/// | Variant    | Meaning                                                        |
-/// | ---------- | -------------------------------------------------------------- |
-/// | `Auto`     | Compiler decides sharding automatically (default)              |
-/// | `Explicit` | Sharding is part of the type system, propagated at trace time  |
-/// | `Manual`   | User manages all device communication (used with `shard_map`)  |
-///
-/// [jax-axis-type]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.AxisType
+/// This type corresponds to [`jax.sharding.AxisType`](
+/// https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.AxisType).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum MeshAxisType {
-    /// Compiler (Shardy/GSPMD) decides sharding automatically.
+    /// Used to represent mesh axes for which sharding information is inferred by the compiler
+    /// (e.g., Shardy or GSPMD) automatically.
     #[default]
     Auto,
 
-    /// Sharding is part of the type system, propagated at trace time.
+    /// Used to represent mesh axes for which sharding information is represented _explicitly_
+    /// as part of the type system and is propagated during tracing time, before compilation.
     Explicit,
 
-    /// User manages all device communication (used with `shard_map`).
+    // TODO(eaplatanios): Link to the `shard_map` operation once we have it.
+    /// Used to represent mesh axes for which the user manages all device communication explicitly
+    /// (e.g., using an operation like `shard_map`, which is analogous to
+    /// [JAX's `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
     Manual,
 }
 

@@ -13,6 +13,10 @@ compilation. Today, the most complete and usable part of this crate is the
 and Just-In-Time (JIT) compilation APIs. Those pieces are still being actively developed and are not yet ready
 to take a dependency on.
 
+## Roadmap / TODOs
+
+- [ ] Link from the `MeshAxisType::Manual` documentation to the `shard_map` operation once we have it.
+
 #### License
 
 <sup>

@@ -112,6 +112,8 @@ pub enum ShardMapError {
 /// JAX-facing surface. Internally, those partition specs are converted to [`NamedSharding`]
 /// values so that manual axes omitted from a partition spec can be made explicit as replicated
 /// axes in the Shardy lowering.
+///
+/// Reference: https://docs.jax.dev/en/latest/notebooks/shard_map.html.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardMap {
     mesh: LogicalMesh,
