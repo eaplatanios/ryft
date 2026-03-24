@@ -12,7 +12,6 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
         FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
-        context::BatchingContext,
         ops::{AddOp, BatchOp, CosOp, MulOp, NegOp, SinOp},
     },
 };
@@ -195,25 +194,17 @@ where
 
 /// Maps `function` over a leading batch axis by stacking inputs, running the batched program once, and then
 /// unstacking the result.
-pub fn vmap<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
-    function: F,
-    inputs: Vec<Input>,
-) -> Result<Vec<Output>, TraceError>
+pub fn vmap<F, Input, Output, V>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
 where
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Batch<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<Batch<V>>,
-    F: FnOnce(&mut BatchingContext<'context, Context>, Input::To<Batch<V>>) -> Output::To<Batch<V>>,
+    F: FnOnce(Input::To<Batch<V>>) -> Output::To<Batch<V>>,
 {
-    let axis_size = inputs.len();
     let batched_input = stack(inputs)?;
-    let mut batching_context = BatchingContext::new(context, axis_size);
-    let batched_output = function(&mut batching_context, batched_input);
-    let _context = batching_context.finish();
-    unstack(batched_output)
+    unstack(function(batched_input))
 }
 
 #[cfg(test)]
@@ -250,11 +241,9 @@ mod tests {
 
     #[test]
     fn vmap_exposes_batch_axis_size() {
-        let mut context = ();
         let outputs: Vec<f64> = vmap(
-            &mut context,
-            |context, inputs: Batch<f64>| {
-                assert_eq!(context.axis_size(), 3);
+            |inputs: Batch<f64>| {
+                assert_eq!(inputs.len(), 3);
                 inputs.clone() + inputs.one_like()
             },
             vec![1.0f64, 2.0, 3.0],

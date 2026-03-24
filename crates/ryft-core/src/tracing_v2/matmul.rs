@@ -679,14 +679,14 @@ mod tests {
         }
     }
 
-    fn bilinear_matmul<Context, M>(_: &mut Context, inputs: (M, M)) -> M
+    fn bilinear_matmul<M>(inputs: (M, M)) -> M
     where
         M: MatrixOps,
     {
         inputs.0.matmul(inputs.1)
     }
 
-    fn three_matmul_sine<Context, M>(_: &mut Context, inputs: (M, M, M, M)) -> M
+    fn three_matmul_sine<M>(inputs: (M, M, M, M)) -> M
     where
         M: MatrixOps + FloatExt,
     {
@@ -694,7 +694,7 @@ mod tests {
         x.matmul(a).sin().matmul(b).matmul(c)
     }
 
-    fn first_matrix_gradient<Context, V>(context: &mut Context, inputs: (V, V, V, V)) -> V
+    fn first_matrix_gradient<V>(inputs: (V, V, V, V)) -> V
     where
         V: MatrixValue
             + FloatExt
@@ -703,11 +703,11 @@ mod tests {
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,
     {
-        let (x_bar, _, _, _) = grad(context, three_matmul_sine, inputs).expect("matrix gradient should succeed");
+        let (x_bar, _, _, _) = grad(three_matmul_sine, inputs).expect("matrix gradient should succeed");
         x_bar
     }
 
-    fn full_matrix_gradient<Context, V>(context: &mut Context, inputs: (V, V, V, V)) -> (V, V, V, V)
+    fn full_matrix_gradient<V>(inputs: (V, V, V, V)) -> (V, V, V, V)
     where
         V: MatrixValue
             + FloatExt
@@ -716,19 +716,17 @@ mod tests {
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,
     {
-        grad(context, three_matmul_sine, inputs).expect("matrix gradient should succeed")
+        grad(three_matmul_sine, inputs).expect("matrix gradient should succeed")
     }
 
     #[test]
     fn forward_mode_linearizes_matrix_multiplication() {
-        let mut context = ();
         let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
         let b = arr2(&[[5.0, 6.0], [7.0, 8.0]]);
         let da = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
         let db = arr2(&[[1.0, 1.0], [1.0, 1.0]]);
 
-        let (primal, tangent) =
-            jvp(&mut context, bilinear_matmul, (a.clone(), b.clone()), (da.clone(), db.clone())).unwrap();
+        let (primal, tangent) = jvp(bilinear_matmul, (a.clone(), b.clone()), (da.clone(), db.clone())).unwrap();
 
         approx_eq_matrix(&primal, &a.clone().matmul(b.clone()));
         approx_eq_matrix(&tangent, &(da.matmul(b.clone()) + a.matmul(db)));
@@ -737,12 +735,11 @@ mod tests {
 
     #[test]
     fn reverse_mode_transposes_left_and_right_matrix_actions() {
-        let mut context = ();
         let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
         let b = arr2(&[[2.0, 1.0], [0.0, 3.0]]);
         let cotangent = arr2(&[[1.0, -1.0], [2.0, 0.5]]);
 
-        let (output, pullback) = vjp(&mut context, bilinear_matmul, (a.clone(), b.clone())).unwrap();
+        let (output, pullback) = vjp(bilinear_matmul, (a.clone(), b.clone())).unwrap();
         approx_eq_matrix(&output, &a.clone().matmul(b.clone()));
 
         let (a_bar, b_bar) = pullback.call(cotangent.clone()).unwrap();
@@ -753,14 +750,12 @@ mod tests {
 
     #[test]
     fn hessian_works_for_three_matrix_multiplications_with_sine_inside() {
-        let mut context = ();
         let x = arr2(&[[0.7f64]]);
         let a = arr2(&[[2.0f64]]);
         let b = arr2(&[[-1.5f64]]);
         let c = arr2(&[[4.0f64]]);
 
         let (_, hessian_times_ones) = jvp(
-            &mut context,
             first_matrix_gradient,
             (x.clone(), a.clone(), b.clone(), c.clone()),
             (x.one_like(), a.zero_like(), b.zero_like(), c.zero_like()),
@@ -774,7 +769,6 @@ mod tests {
 
     #[test]
     fn dense_hessian_materializes_for_three_matrix_multiplications_with_sine_inside() {
-        let mut context = ();
         let x = arr2(&[[0.7f64]]);
         let a = arr2(&[[2.0f64]]);
         let b = arr2(&[[-1.5f64]]);
@@ -783,7 +777,7 @@ mod tests {
         let cosine = xa.cos();
         let sine = xa.sin();
 
-        let dense_hessian = hessian(&mut context, full_matrix_gradient, (x, a, b, c)).unwrap().to_array2();
+        let dense_hessian = hessian(full_matrix_gradient, (x, a, b, c)).unwrap().to_array2();
         let expected = arr2(&[
             [24.0 * sine, -6.0 * (cosine - 1.4 * sine), 8.0 * cosine, -3.0 * cosine],
             [-6.0 * (cosine - 1.4 * sine), 2.94 * sine, 2.8 * cosine, -1.05 * cosine],
@@ -797,28 +791,26 @@ mod tests {
 
     #[test]
     fn jit_stages_matrix_multiplication_programs() {
-        let mut context = ();
         let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
         let b = arr2(&[[2.0, 0.0], [1.0, 2.0]]);
 
-        let (output, compiled) = jit(&mut context, bilinear_matmul, (a.clone(), b.clone())).unwrap();
+        let (output, compiled) = jit(bilinear_matmul, (a.clone(), b.clone())).unwrap();
         approx_eq_matrix(&output, &a.matmul(b));
         let replay_left = arr2(&[[0.0, 1.0], [2.0, 3.0]]);
         let replay_right = arr2(&[[1.0, 4.0], [2.0, 5.0]]);
-        let replayed = compiled.call(&mut context, (replay_left.clone(), replay_right.clone())).unwrap();
+        let replayed = compiled.call((replay_left.clone(), replay_right.clone())).unwrap();
         approx_eq_matrix(&replayed, &replay_left.matmul(replay_right));
         test_support::assert_matrix_jit_rendering();
     }
 
     #[test]
     fn batching_vectorizes_matrix_multiplication_lane_wise() {
-        let mut context = ();
         let inputs = vec![
             (arr2(&[[1.0, 2.0], [0.0, 1.0]]), arr2(&[[2.0, 0.0], [1.0, 2.0]])),
             (arr2(&[[0.0, 1.0], [3.0, 4.0]]), arr2(&[[1.0, 1.0], [0.0, 2.0]])),
         ];
 
-        let outputs = vmap(&mut context, bilinear_matmul, inputs.clone()).unwrap();
+        let outputs = vmap(bilinear_matmul, inputs.clone()).unwrap();
         assert_eq!(outputs.len(), inputs.len());
         for (output, (left, right)) in outputs.into_iter().zip(inputs) {
             approx_eq_matrix(&output, &left.matmul(right));

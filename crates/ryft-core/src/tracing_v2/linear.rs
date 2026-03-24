@@ -17,7 +17,6 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
         FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
-        context::JvpContext,
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, Graph, GraphBuilder},
         ops::{AddOp, LinearOpRef, NegOp, ScaleOp},
@@ -219,8 +218,7 @@ where
     }
 }
 
-fn try_jvp_program<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+fn try_jvp_program<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
@@ -230,10 +228,7 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(
-        &mut JvpContext<'context, Context, V>,
-        Input::To<Linearized<V>>,
-    ) -> Result<Output::To<Linearized<V>>, TraceError>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let primal_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -242,18 +237,17 @@ where
         .map(|value| value.zero_like())
         .ok_or(TraceError::EmptyParameterizedValue)?;
 
-    let mut jvp_context = JvpContext::new(context);
+    let builder = Rc::new(RefCell::new(GraphBuilder::new()));
     let traced_input = Input::To::<Linearized<V>>::from_parameters(
         input_structure.clone(),
         primal_parameters.into_iter().map(|primal| {
-            let builder = jvp_context.linear_builder();
             let atom = builder.borrow_mut().add_input(&primal);
-            JvpTracer { primal, tangent: LinearTerm { atom, builder } }
+            JvpTracer { primal, tangent: LinearTerm { atom, builder: builder.clone() } }
         }),
     )?;
 
     let (output_structure, primal_outputs, tangent_outputs) = {
-        let traced_output = function(&mut jvp_context, traced_input)?;
+        let traced_output = function(traced_input)?;
         let output_structure = traced_output.parameter_structure();
         let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
         let primal_outputs = traced_outputs.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
@@ -262,7 +256,6 @@ where
     };
 
     let primal_output = Output::from_parameters(output_structure.clone(), primal_outputs)?;
-    let (_context, builder) = jvp_context.finish();
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
@@ -280,8 +273,7 @@ where
 }
 
 /// Runs a forward trace and returns both the primal output and the staged pushforward.
-pub fn jvp_program<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+pub fn jvp_program<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
@@ -291,14 +283,13 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
 {
-    try_jvp_program(context, |context, input| Ok(function(context, input)), primals)
+    try_jvp_program(|input| Ok(function(input)), primals)
 }
 
 /// Alias for [`jvp_program`] that emphasizes the returned linear map.
-pub fn linearize<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+pub fn linearize<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
@@ -308,13 +299,12 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
 {
-    jvp_program(context, function, primals)
+    jvp_program(function, primals)
 }
 
-fn try_vjp<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+fn try_vjp<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
@@ -324,18 +314,14 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(
-        &mut JvpContext<'context, Context, V>,
-        Input::To<Linearized<V>>,
-    ) -> Result<Output::To<Linearized<V>>, TraceError>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
 {
-    let (output, pushforward) = try_jvp_program::<Context, F, Input, Output, V>(context, function, primals)?;
+    let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(function, primals)?;
     Ok((output, pushforward.transpose()?))
 }
 
 /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
-pub fn vjp<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+pub fn vjp<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
@@ -345,54 +331,42 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
 {
-    try_vjp(context, |context, input| Ok(function(context, input)), primals)
+    try_vjp(|input| Ok(function(input)), primals)
 }
 
-fn try_grad<'context, Context, F, Input, V>(
-    context: &'context mut Context,
-    function: F,
-    primals: Input,
-) -> Result<Input, TraceError>
+fn try_grad<F, Input, V>(function: F, primals: Input) -> Result<Input, TraceError>
 where
     V: TraceValue + FloatExt + ZeroLike + OneLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Result<Linearized<V>, TraceError>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Result<Linearized<V>, TraceError>,
 {
-    let (output, pullback): (V, LinearProgram<V, V, Input>) = try_vjp(context, function, primals)?;
+    let (output, pullback): (V, LinearProgram<V, V, Input>) = try_vjp(function, primals)?;
     pullback.call(output.one_like())
 }
 
 /// Computes the reverse-mode gradient of a scalar-output function.
-pub fn grad<'context, Context, F, Input, V>(
-    context: &'context mut Context,
-    function: F,
-    primals: Input,
-) -> Result<Input, TraceError>
+pub fn grad<F, Input, V>(function: F, primals: Input) -> Result<Input, TraceError>
 where
     V: TraceValue + FloatExt + ZeroLike + OneLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Linearized<V>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Linearized<V>,
 {
-    try_grad(context, |context, input| Ok(function(context, input)), primals)
+    try_grad(|input| Ok(function(input)), primals)
 }
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
-pub fn value_and_grad<'context, Context, F, Input, V>(
-    context: &'context mut Context,
-    function: F,
-    primals: Input,
-) -> Result<(V, Input), TraceError>
+pub fn value_and_grad<F, Input, V>(function: F, primals: Input) -> Result<(V, Input), TraceError>
 where
     V: TraceValue + FloatExt + ZeroLike + OneLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Linearized<V>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Linearized<V>,
 {
-    let (output, pullback): (V, LinearProgram<V, V, Input>) = vjp(context, function, primals)?;
+    let (output, pullback): (V, LinearProgram<V, V, Input>) = vjp(function, primals)?;
     let gradient = pullback.call(output.one_like())?;
     Ok((output, gradient))
 }
@@ -623,8 +597,7 @@ where
     Ok(basis)
 }
 
-fn try_jacfwd<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+fn try_jacfwd<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -634,17 +607,14 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(
-        &mut JvpContext<'context, Context, V>,
-        Input::To<Linearized<V>>,
-    ) -> Result<Output::To<Linearized<V>>, TraceError>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let basis_inputs = standard_basis::<Input, V>(&input_structure, input_parameters.as_slice())?;
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pushforward) = try_jvp_program::<Context, F, Input, Output, V>(context, function, primals)?;
+    let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
@@ -664,8 +634,7 @@ where
 }
 
 /// Materializes a dense Jacobian using forward-mode differentiation.
-pub fn jacfwd<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+pub fn jacfwd<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -675,13 +644,12 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
 {
-    try_jacfwd::<Context, _, Input, Output, V>(context, |context, input| Ok(function(context, input)), primals)
+    try_jacfwd::<_, Input, Output, V>(|input| Ok(function(input)), primals)
 }
 
-fn try_jacrev<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+fn try_jacrev<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -691,16 +659,13 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(
-        &mut JvpContext<'context, Context, V>,
-        Input::To<Linearized<V>>,
-    ) -> Result<Output::To<Linearized<V>>, TraceError>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pullback) = try_vjp::<Context, F, Input, Output, V>(context, function, primals)?;
+    let (output, pullback) = try_vjp::<F, Input, Output, V>(function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
@@ -715,8 +680,7 @@ where
 }
 
 /// Materializes a dense Jacobian using reverse-mode differentiation.
-pub fn jacrev<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+pub fn jacrev<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -726,17 +690,16 @@ where
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
 {
-    try_jacrev::<Context, _, Input, Output, V>(context, |context, input| Ok(function(context, input)), primals)
+    try_jacrev::<_, Input, Output, V>(|input| Ok(function(input)), primals)
 }
 
 /// Materializes a dense Hessian by applying `jacfwd` to a gradient helper.
 ///
 /// In the current prototype, callers pass a first-derivative function (for example `first_derivative`)
 /// because Rust does not yet let this API re-instantiate an arbitrary closure at a deeper trace level.
-pub fn hessian<'context, Context, F, Input, V>(
-    context: &'context mut Context,
+pub fn hessian<F, Input, V>(
     gradient_function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
@@ -744,9 +707,9 @@ where
     V: CoordinateValue + FloatExt,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Input::To<Linearized<V>>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Input::To<Linearized<V>>,
 {
-    jacfwd::<Context, F, Input, Input, V>(context, gradient_function, primals)
+    jacfwd::<F, Input, Input, V>(gradient_function, primals)
 }
 
 #[cfg(test)]
@@ -764,14 +727,14 @@ mod tests {
         assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
     }
 
-    fn quadratic_plus_sin<Context, T>(_: &mut Context, x: T) -> T
+    fn quadratic_plus_sin<T>(x: T) -> T
     where
         T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         x.clone() * x.clone() + x.sin()
     }
 
-    fn bilinear_sin<Context, T>(_: &mut Context, inputs: (T, T)) -> T
+    fn bilinear_sin<T>(inputs: (T, T)) -> T
     where
         T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
@@ -780,8 +743,7 @@ mod tests {
 
     #[test]
     fn linearize_returns_the_primal_output_and_pushforward() {
-        let mut context = ();
-        let (primal, pushforward) = linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+        let (primal, pushforward) = linearize(quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.call(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
@@ -802,9 +764,8 @@ mod tests {
 
     #[test]
     fn jvp_program_and_linearize_stage_the_same_pushforward() {
-        let mut context = ();
-        let (_, from_jvp_program) = jvp_program(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
-        let (_, from_linearize) = linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+        let (_, from_jvp_program) = jvp_program(quadratic_plus_sin, 2.0f64).unwrap();
+        let (_, from_linearize) = linearize(quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(from_jvp_program.call(1.0f64).unwrap(), from_linearize.call(1.0f64).unwrap());
         assert_eq!(
@@ -825,8 +786,7 @@ mod tests {
 
     #[test]
     fn transposed_linear_program_matches_the_reverse_mode_pullback() {
-        let mut context = ();
-        let (primal, pushforward) = linearize(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let (primal, pushforward) = linearize(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
         let pullback = pushforward.transpose().unwrap();
         let cotangent = pullback.call(1.0f64).unwrap();
 
@@ -850,9 +810,7 @@ mod tests {
 
     #[test]
     fn linear_program_display_delegates_to_the_underlying_graph() {
-        let mut context = ();
-        let (_, pushforward): (f64, LinearProgram<f64, f64, f64>) =
-            linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+        let (_, pushforward): (f64, LinearProgram<f64, f64, f64>) = linearize(quadratic_plus_sin, 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

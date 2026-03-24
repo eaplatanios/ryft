@@ -2,9 +2,10 @@
 //!
 //! This module provides the tracing-backed `shard_map` surface for `ryft-core::xla`.
 //!
-//! The public entry point is [`shard_map`], which stages a Rust closure over shard-local tensor
-//! types derived from global [`ArrayType`] metadata, lowers the resulting `tracing_v2` graph to
-//! StableHLO/Shardy MLIR, and returns a [`TracedShardMap`] handle for inspection and lowering.
+//! The default public entry point is [`shard_map`], which stages a Rust closure over shard-local
+//! tensor types derived from global [`ArrayType`] metadata, lowers the resulting `tracing_v2`
+//! graph to StableHLO/Shardy MLIR, and returns a [`TracedShardMap`] handle for inspection and
+//! lowering.
 //!
 //! Internally, the module still keeps a small metadata model of JAX's `shard_map`: a logical mesh,
 //! per-input and per-output shardings, and the set of mesh axes that are handled manually inside
@@ -60,9 +61,7 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
-use crate::tracing_v2::{
-    CompiledFunction, FloatExt, JitContext, JitTracer, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
-};
+use crate::tracing_v2::{CompiledFunction, FloatExt, JitTracer, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike};
 use crate::types::{ArrayType, Shape, Size, Typed};
 
 use super::lowering::LoweringError;
@@ -375,18 +374,18 @@ type ShardMapLocalTraceOutput<Output> =
 ///
 /// Mesh axes whose type is [`Manual`](crate::types::MeshAxisType::Manual) define the manual axes
 /// of the computation. Structured `in_specs` and `out_specs` follow the same `Parameterized`
-/// layout as the corresponding input and output types.
+/// layout as the corresponding input and output types. The body closure receives only the traced
+/// local inputs, which lets common cases compile cleanly as `|x| ...` or `|(lhs, rhs)| ...`
+/// without explicit tracer annotations.
 ///
 /// # Parameters
 ///
-///   - `context`: Tracing context threaded through the staged closure.
 ///   - `function`: Body closure to trace over local shard-map values.
 ///   - `global_input_types`: Global input array types used to derive the local body argument types.
 ///   - `mesh`: Logical mesh that the manual computation is defined over.
 ///   - `in_specs`: Structured partition specs for the global inputs.
 ///   - `out_specs`: Structured partition specs for the global outputs.
-pub fn shard_map<'context, Context, F, Input, Output>(
-    context: &'context mut Context,
+pub fn shard_map<F, Input, Output>(
     function: F,
     global_input_types: Input,
     mesh: LogicalMesh,
@@ -400,17 +399,14 @@ where
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output::Family:
         ParameterizedFamily<PartitionSpec> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-    F: FnOnce(
-        &mut JitContext<'context, Context, ShardMapTensor>,
-        ShardMapLocalTraceInput<Input>,
-    ) -> ShardMapLocalTraceOutput<Output>,
+    F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
 {
     let shard_map = ShardMap::new(
         mesh,
         in_specs.into_parameters().collect::<Vec<_>>(),
         out_specs.into_parameters().collect::<Vec<_>>(),
     )?;
-    shard_map.trace(context, function, global_input_types)
+    shard_map.trace(function, global_input_types)
 }
 
 /// Traced shard-map program backed by a staged `tracing_v2` graph.
@@ -592,13 +588,11 @@ impl ShardMap {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Tracing context threaded through the staged closure.
     ///   - `function`: Body closure to trace over local shard-map values.
     ///   - `global_input_types`: Global input array types in the same leaf order as the shard-map
     ///     input shardings.
-    fn trace<'context, Context, F, Input, Output>(
+    fn trace<F, Input, Output>(
         &self,
-        context: &'context mut Context,
         function: F,
         global_input_types: Input,
     ) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
@@ -607,20 +601,15 @@ impl ShardMap {
         Input::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType, ParameterStructure: Clone>,
         Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-        F: FnOnce(
-            &mut JitContext<'context, Context, ShardMapTensor>,
-            ShardMapLocalTraceInput<Input>,
-        ) -> ShardMapLocalTraceOutput<Output>,
+        F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
     {
         let local_input_types = derive_local_input_types(self, &global_input_types)?;
         let traced_inputs = traced_input_tensors(&local_input_types)?;
-        let (local_output_tensors, compiled) = crate::tracing_v2::jit::<
-            Context,
-            _,
-            Input::To<ShardMapTensor>,
-            Output::To<ShardMapTensor>,
-            ShardMapTensor,
-        >(context, function, traced_inputs)?;
+        let (local_output_tensors, compiled) =
+            crate::tracing_v2::jit::<_, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>, ShardMapTensor>(
+                function,
+                traced_inputs,
+            )?;
         let local_output_types = Output::from_parameters(
             local_output_tensors.parameter_structure(),
             local_output_tensors.into_parameters().map(|tensor| tensor.tpe()).collect::<Vec<_>>(),
@@ -1265,8 +1254,7 @@ mod tests {
     fn test_shard_map_function_rejects_mesh_without_manual_axes() {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
-            &mut (),
-            |_, x: ShardMapTracer| x.clone() + x,
+            |x| x.clone() + x,
             global_input_type,
             test_logical_mesh_without_manual_axes(),
             PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
@@ -1450,8 +1438,7 @@ mod tests {
     fn test_shard_map_trace_derives_types_and_renders_mlir() {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
-            &mut (),
-            |_, x: ShardMapTracer| x.clone() + x,
+            |x| x.clone() + x,
             global_input_type.clone(),
             LogicalMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
             PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
@@ -1487,8 +1474,7 @@ mod tests {
     fn test_shard_map_trace_rejects_dynamic_input_types() {
         let dynamic_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]), None);
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
-            &mut (),
-            |_, x: ShardMapTracer| x.clone() + x,
+            |x| x.clone() + x,
             dynamic_input_type,
             LogicalMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
             PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
@@ -1499,6 +1485,35 @@ mod tests {
             result,
             Err(ShardMapTraceError::DynamicShapeNotSupported { value_kind: "input", value_index: 0, dimension: 0 })
         ));
+    }
+
+    #[test]
+    fn test_shard_map_infers_single_input_closure_argument_type() {
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
+            |x| x.clone() + x,
+            global_input_type,
+            LogicalMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main", "mesh").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
     }
 
     #[test]
@@ -1520,8 +1535,7 @@ mod tests {
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
-            &mut (),
-            |_, x: ShardMapTracer| x.clone() + x,
+            |x| x.clone() + x,
             global_input_type,
             device_mesh.logical_mesh().clone(),
             partition_spec.clone(),
@@ -1608,8 +1622,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None),
         );
         let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
-            &mut (),
-            |_, (lhs, rhs): (ShardMapTracer, ShardMapTracer)| lhs.matmul(rhs),
+            |(lhs, rhs)| lhs.matmul(rhs),
             global_input_types,
             device_mesh.logical_mesh().clone(),
             (lhs_partition_spec.clone(), rhs_partition_spec.clone()),

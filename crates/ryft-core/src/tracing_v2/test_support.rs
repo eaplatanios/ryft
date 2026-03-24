@@ -8,9 +8,7 @@ use crate::{
 };
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
-    let mut context = ();
-    let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) =
-        jit(&mut context, |_, x: JitTracer<f64>| x.sin(), 2.0f64).unwrap();
+    let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(|x: JitTracer<f64>| x.sin(), 2.0f64).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -42,28 +40,28 @@ pub(crate) fn assert_reference_graph_rendering() {
     );
 }
 
-fn bilinear_sin<Context, T>(_: &mut Context, inputs: (T, T)) -> T
+fn bilinear_sin<T>(inputs: (T, T)) -> T
 where
     T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
 {
     inputs.0.clone() * inputs.1 + inputs.0.sin()
 }
 
-fn quadratic_plus_sin<Context, T>(_: &mut Context, x: T) -> T
+fn quadratic_plus_sin<T>(x: T) -> T
 where
     T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
 {
     x.clone() * x.clone() + x.sin()
 }
 
-fn quartic_plus_sin<Context, T>(_: &mut Context, x: T) -> T
+fn quartic_plus_sin<T>(x: T) -> T
 where
     T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
 {
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
 }
 
-fn first_derivative<Context, V>(context: &mut Context, x: V) -> V
+fn first_derivative<V>(x: V) -> V
 where
     V: TraceValue
         + FloatExt
@@ -72,10 +70,10 @@ where
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
 {
-    grad(context, quartic_plus_sin, x).expect("first derivative should be computable")
+    grad(quartic_plus_sin, x).expect("first derivative should be computable")
 }
 
-fn second_derivative<Context, V>(context: &mut Context, x: V) -> V
+fn second_derivative<V>(x: V) -> V
 where
     V: TraceValue
         + FloatExt
@@ -84,10 +82,10 @@ where
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
 {
-    grad(context, first_derivative, x).expect("second derivative should be computable")
+    grad(first_derivative, x).expect("second derivative should be computable")
 }
 
-fn third_derivative<Context, V>(context: &mut Context, x: V) -> V
+fn third_derivative<V>(x: V) -> V
 where
     V: TraceValue
         + FloatExt
@@ -96,10 +94,10 @@ where
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
 {
-    grad(context, second_derivative, x).expect("third derivative should be computable")
+    grad(second_derivative, x).expect("third derivative should be computable")
 }
 
-fn fourth_derivative<Context, V>(context: &mut Context, x: V) -> V
+fn fourth_derivative<V>(x: V) -> V
 where
     V: TraceValue
         + FloatExt
@@ -108,10 +106,10 @@ where
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>>,
 {
-    grad(context, third_derivative, x).expect("fourth derivative should be computable")
+    grad(third_derivative, x).expect("fourth derivative should be computable")
 }
 
-fn hessian_style_second_derivative<Context, V>(context: &mut Context, x: V) -> V
+fn hessian_style_second_derivative<V>(x: V) -> V
 where
     V: TraceValue
         + FloatExt
@@ -121,14 +119,13 @@ where
     V::Family: ParameterizedFamily<Linearized<V>>,
 {
     let (_, second_derivative) =
-        jvp(context, first_derivative, x.clone(), x.one_like()).expect("forward-over-reverse Hessian should succeed");
+        jvp(first_derivative, x.clone(), x.one_like()).expect("forward-over-reverse Hessian should succeed");
     second_derivative
 }
 
 pub(crate) fn assert_bilinear_pushforward_rendering() {
-    let mut context = ();
     let (_, pushforward): (f64, LinearProgram<f64, (f64, f64), f64>) =
-        linearize(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        linearize(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
@@ -146,9 +143,7 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
 }
 
 pub(crate) fn assert_bilinear_pullback_rendering() {
-    let mut context = ();
-    let (_, pullback): (f64, LinearProgram<f64, f64, (f64, f64)>) =
-        vjp(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+    let (_, pullback): (f64, LinearProgram<f64, f64, (f64, f64)>) = vjp(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         pullback.to_string(),
@@ -166,9 +161,7 @@ pub(crate) fn assert_bilinear_pullback_rendering() {
 }
 
 pub(crate) fn assert_bilinear_jit_rendering() {
-    let mut context = ();
-    let (_, compiled): (f64, CompiledFunction<f64, (f64, f64), f64>) =
-        jit(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+    let (_, compiled): (f64, CompiledFunction<f64, (f64, f64), f64>) = jit(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -184,9 +177,7 @@ pub(crate) fn assert_bilinear_jit_rendering() {
 }
 
 pub(crate) fn assert_quadratic_pushforward_rendering() {
-    let mut context = ();
-    let (_, pushforward): (f64, LinearProgram<f64, f64, f64>) =
-        linearize(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+    let (_, pushforward): (f64, LinearProgram<f64, f64, f64>) = linearize(quadratic_plus_sin, 2.0f64).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
@@ -203,9 +194,7 @@ pub(crate) fn assert_quadratic_pushforward_rendering() {
     );
 }
 pub(crate) fn assert_hessian_style_second_derivative_jit_rendering() {
-    let mut context = ();
-    let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) =
-        jit(&mut context, hessian_style_second_derivative, 2.0f64).unwrap();
+    let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(hessian_style_second_derivative, 2.0f64).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -281,8 +270,7 @@ pub(crate) fn assert_hessian_style_second_derivative_jit_rendering() {
 }
 
 pub(crate) fn assert_fourth_derivative_jit_rendering() {
-    let mut context = ();
-    let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(&mut context, fourth_derivative, 2.0f64).unwrap();
+    let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(fourth_derivative, 2.0f64).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -565,19 +553,12 @@ pub(crate) fn assert_fourth_derivative_jit_rendering() {
     );
 }
 pub(crate) fn assert_inline_fourth_derivative_jit_rendering() {
-    let mut context = ();
     let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(
-        &mut context,
-        |context, x| {
+        |x| {
             grad(
-                context,
-                |context, x| {
-                    grad(
-                        context,
-                        |context, x| grad(context, quartic_plus_sin, x).expect("innermost grad should succeed"),
-                        x,
-                    )
-                    .expect("third derivative should succeed")
+                |x| {
+                    grad(|x| grad(quartic_plus_sin, x).expect("innermost grad should succeed"), x)
+                        .expect("third derivative should succeed")
                 },
                 x,
             )
@@ -737,7 +718,7 @@ pub(crate) fn assert_inline_fourth_derivative_jit_rendering() {
 use ndarray::{Array2, arr2};
 
 #[cfg(any(feature = "ndarray", test))]
-fn bilinear_matmul<Context, M>(_: &mut Context, inputs: (M, M)) -> M
+fn bilinear_matmul<M>(inputs: (M, M)) -> M
 where
     M: MatrixOps,
 {
@@ -745,7 +726,7 @@ where
 }
 
 #[cfg(any(feature = "ndarray", test))]
-fn three_matmul_sine<Context, M>(_: &mut Context, inputs: (M, M, M, M)) -> M
+fn three_matmul_sine<M>(inputs: (M, M, M, M)) -> M
 where
     M: MatrixOps + FloatExt,
 {
@@ -754,7 +735,7 @@ where
 }
 
 #[cfg(any(feature = "ndarray", test))]
-fn first_matrix_gradient<Context, V>(context: &mut Context, inputs: (V, V, V, V)) -> V
+fn first_matrix_gradient<V>(inputs: (V, V, V, V)) -> V
 where
     V: MatrixValue
         + FloatExt
@@ -763,17 +744,16 @@ where
         + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,
 {
-    let (x_bar, _, _, _) = grad(context, three_matmul_sine, inputs).expect("matrix gradient should succeed");
+    let (x_bar, _, _, _) = grad(three_matmul_sine, inputs).expect("matrix gradient should succeed");
     x_bar
 }
 
 #[cfg(any(feature = "ndarray", test))]
 pub(crate) fn assert_matrix_jit_rendering() {
-    let mut context = ();
     let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
     let b = arr2(&[[2.0, 0.0], [1.0, 2.0]]);
     let (_, compiled): (Array2<f64>, CompiledFunction<Array2<f64>, (Array2<f64>, Array2<f64>), Array2<f64>>) =
-        jit(&mut context, bilinear_matmul, (a, b)).unwrap();
+        jit(bilinear_matmul, (a, b)).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -788,11 +768,10 @@ pub(crate) fn assert_matrix_jit_rendering() {
 
 #[cfg(any(feature = "ndarray", test))]
 pub(crate) fn assert_matrix_pushforward_rendering() {
-    let mut context = ();
     let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
     let b = arr2(&[[2.0, 0.0], [1.0, 2.0]]);
     let (_, pushforward): (Array2<f64>, LinearProgram<Array2<f64>, (Array2<f64>, Array2<f64>), Array2<f64>>) =
-        linearize(&mut context, bilinear_matmul, (a, b)).unwrap();
+        linearize(bilinear_matmul, (a, b)).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
@@ -809,11 +788,10 @@ pub(crate) fn assert_matrix_pushforward_rendering() {
 
 #[cfg(any(feature = "ndarray", test))]
 pub(crate) fn assert_matrix_pullback_rendering() {
-    let mut context = ();
     let a = arr2(&[[1.0, 2.0], [3.0, 4.0]]);
     let b = arr2(&[[2.0, 0.0], [1.0, 2.0]]);
     let (_, pullback): (Array2<f64>, LinearProgram<Array2<f64>, Array2<f64>, (Array2<f64>, Array2<f64>)>) =
-        vjp(&mut context, bilinear_matmul, (a, b)).unwrap();
+        vjp(bilinear_matmul, (a, b)).unwrap();
 
     assert_eq!(
         pullback.to_string(),
@@ -829,7 +807,6 @@ pub(crate) fn assert_matrix_pullback_rendering() {
 }
 #[cfg(any(feature = "ndarray", test))]
 pub(crate) fn assert_matrix_hessian_style_jit_rendering() {
-    let mut context = ();
     let x = arr2(&[[0.7f64]]);
     let a = arr2(&[[2.0f64]]);
     let b = arr2(&[[-1.5f64]]);
@@ -838,10 +815,9 @@ pub(crate) fn assert_matrix_hessian_style_jit_rendering() {
         Array2<f64>,
         CompiledFunction<Array2<f64>, (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), Array2<f64>>,
     ) = jit(
-        &mut context,
-        |context, inputs| {
+        |inputs| {
             let seeds = (inputs.0.one_like(), inputs.1.zero_like(), inputs.2.zero_like(), inputs.3.zero_like());
-            jvp(context, first_matrix_gradient, inputs, seeds).expect("matrix Hessian should succeed").1
+            jvp(first_matrix_gradient, inputs, seeds).expect("matrix Hessian should succeed").1
         },
         (x, a, b, c),
     )

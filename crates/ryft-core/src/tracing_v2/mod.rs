@@ -7,14 +7,13 @@
 //! - `Graph<O, V, In, Out>` is the common staging form.
 //! - Each equation stores an operation object, not a tag enum.
 //! - Primitive ops carry their own `eval`, `jvp`, `batch`, and transpose rules.
-//! - Transform-specific context values thread both top-level runtime state and local staging state.
+//! - Tracer values carry the transform-local state needed to stage nested traces.
 
 use thiserror::Error;
 
 use crate::parameters::ParameterError;
 
 mod batch;
-mod context;
 mod forward;
 mod graph;
 mod jit;
@@ -26,7 +25,6 @@ pub(crate) mod test_support;
 mod value;
 
 pub use batch::{Batch, stack, unstack, vmap};
-pub use context::{BatchingContext, JitContext, JvpContext};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, AtomSource, Equation, Graph, GraphBuilder};
 pub use jit::{CompiledFunction, JitTracer, jit};
@@ -100,28 +98,28 @@ mod tests {
         assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
     }
 
-    fn bilinear_sin<Context, T>(_: &mut Context, inputs: (T, T)) -> T
+    fn bilinear_sin<T>(inputs: (T, T)) -> T
     where
         T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin()
     }
 
-    fn quadratic_plus_sin<Context, T>(_: &mut Context, x: T) -> T
+    fn quadratic_plus_sin<T>(x: T) -> T
     where
         T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         x.clone() * x.clone() + x.sin()
     }
 
-    fn quartic_plus_sin<Context, T>(_: &mut Context, x: T) -> T
+    fn quartic_plus_sin<T>(x: T) -> T
     where
         T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
     }
 
-    fn first_derivative<Context, V>(context: &mut Context, x: V) -> V
+    fn first_derivative<V>(x: V) -> V
     where
         V: TraceValue
             + FloatExt
@@ -130,10 +128,10 @@ mod tests {
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
     {
-        grad(context, quartic_plus_sin, x).expect("first derivative should be computable")
+        grad(quartic_plus_sin, x).expect("first derivative should be computable")
     }
 
-    fn second_derivative<Context, V>(context: &mut Context, x: V) -> V
+    fn second_derivative<V>(x: V) -> V
     where
         V: TraceValue
             + FloatExt
@@ -142,10 +140,10 @@ mod tests {
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
     {
-        grad(context, first_derivative, x).expect("second derivative should be computable")
+        grad(first_derivative, x).expect("second derivative should be computable")
     }
 
-    fn third_derivative<Context, V>(context: &mut Context, x: V) -> V
+    fn third_derivative<V>(x: V) -> V
     where
         V: TraceValue
             + FloatExt
@@ -154,10 +152,10 @@ mod tests {
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
     {
-        grad(context, second_derivative, x).expect("third derivative should be computable")
+        grad(second_derivative, x).expect("third derivative should be computable")
     }
 
-    fn fourth_derivative<Context, V>(context: &mut Context, x: V) -> V
+    fn fourth_derivative<V>(x: V) -> V
     where
         V: TraceValue
             + FloatExt
@@ -166,10 +164,10 @@ mod tests {
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
     {
-        grad(context, third_derivative, x).expect("fourth derivative should be computable")
+        grad(third_derivative, x).expect("fourth derivative should be computable")
     }
 
-    fn hessian_style_second_derivative<Context, V>(context: &mut Context, x: V) -> V
+    fn hessian_style_second_derivative<V>(x: V) -> V
     where
         V: TraceValue
             + FloatExt
@@ -178,15 +176,14 @@ mod tests {
             + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
         V::Family: ParameterizedFamily<Linearized<V>>,
     {
-        let (_, second_derivative) = jvp(context, first_derivative, x.clone(), x.one_like())
-            .expect("forward-over-reverse Hessian should succeed");
+        let (_, second_derivative) =
+            jvp(first_derivative, x.clone(), x.one_like()).expect("forward-over-reverse Hessian should succeed");
         second_derivative
     }
 
     #[test]
     fn forward_mode_uses_parameterized_structure() {
-        let mut context = ();
-        let (primal, tangent) = jvp(&mut context, bilinear_sin, (2.0f64, 3.0f64), (1.0f64, -1.0f64)).unwrap();
+        let (primal, tangent) = jvp(bilinear_sin, (2.0f64, 3.0f64), (1.0f64, -1.0f64)).unwrap();
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
         approx_eq(tangent, 3.0 - 2.0 + 2.0f64.cos());
         test_support::assert_bilinear_pushforward_rendering();
@@ -194,23 +191,21 @@ mod tests {
 
     #[test]
     fn transposition_drives_reverse_mode() {
-        let mut context = ();
-        let (output, pullback) = vjp(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let (output, pullback) = vjp(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
         approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
 
         let input_cotangent = pullback.call(1.0f64).unwrap();
         approx_eq(input_cotangent.0, 3.0 + 2.0f64.cos());
         approx_eq(input_cotangent.1, 2.0);
 
-        let gradient = grad(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+        let gradient = grad(quadratic_plus_sin, 2.0f64).unwrap();
         approx_eq(gradient, 4.0 + 2.0f64.cos());
         test_support::assert_bilinear_pullback_rendering();
     }
 
     #[test]
     fn value_and_grad_returns_both_outputs() {
-        let mut context = ();
-        let (value, gradient) = value_and_grad(&mut context, quadratic_plus_sin, 2.0f64).unwrap();
+        let (value, gradient) = value_and_grad(quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(value, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(gradient, 4.0 + 2.0f64.cos());
@@ -219,8 +214,7 @@ mod tests {
 
     #[test]
     fn jacfwd_materializes_a_dense_jacobian() {
-        let mut context = ();
-        let jacobian = jacfwd::<(), _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let jacobian = jacfwd::<_, (f64, f64), f64, f64>(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         assert_eq!(jacobian.rows(), 1);
         assert_eq!(jacobian.cols(), 2);
@@ -231,8 +225,7 @@ mod tests {
 
     #[test]
     fn jacrev_materializes_the_same_dense_jacobian() {
-        let mut context = ();
-        let jacobian = jacrev::<(), _, (f64, f64), f64, f64>(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let jacobian = jacrev::<_, (f64, f64), f64, f64>(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         assert_eq!(jacobian.rows(), 1);
         assert_eq!(jacobian.cols(), 2);
@@ -243,8 +236,7 @@ mod tests {
 
     #[test]
     fn hessian_materializes_a_dense_second_derivative_from_a_gradient_function() {
-        let mut context = ();
-        let dense_hessian = hessian(&mut context, first_derivative, 2.0f64).unwrap();
+        let dense_hessian = hessian(first_derivative, 2.0f64).unwrap();
 
         assert_eq!(dense_hessian.rows(), 1);
         assert_eq!(dense_hessian.cols(), 1);
@@ -254,19 +246,16 @@ mod tests {
 
     #[test]
     fn jit_captures_and_replays_a_program() {
-        let mut context = ();
-        let (output, compiled) = jit(&mut context, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let (output, compiled) = jit(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
         approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
-        let replayed = compiled.call(&mut context, (5.0f64, -4.0f64)).unwrap();
+        let replayed = compiled.call((5.0f64, -4.0f64)).unwrap();
         approx_eq(replayed, 5.0 * -4.0 + 5.0f64.sin());
         test_support::assert_bilinear_jit_rendering();
     }
 
     #[test]
     fn vectorization_stacks_and_unstacks_parameterized_inputs() {
-        let mut context = ();
-        let outputs =
-            vmap(&mut context, bilinear_sin, vec![(1.0f64, 2.0f64), (3.0f64, 4.0f64), (5.0f64, 6.0f64)]).unwrap();
+        let outputs = vmap(bilinear_sin, vec![(1.0f64, 2.0f64), (3.0f64, 4.0f64), (5.0f64, 6.0f64)]).unwrap();
 
         let expected = vec![1.0 * 2.0 + 1.0f64.sin(), 3.0 * 4.0 + 3.0f64.sin(), 5.0 * 6.0 + 5.0f64.sin()];
         assert_eq!(outputs.len(), expected.len());
@@ -278,9 +267,7 @@ mod tests {
 
     #[test]
     fn forward_over_reverse_computes_a_hessian_style_second_derivative() {
-        let mut context = ();
-        let (first_derivative_value, second_derivative_value) =
-            jvp(&mut context, first_derivative, 2.0f64, 1.0f64).unwrap();
+        let (first_derivative_value, second_derivative_value) = jvp(first_derivative, 2.0f64, 1.0f64).unwrap();
 
         approx_eq(first_derivative_value, 4.0 * 2.0f64.powi(3) + 2.0f64.cos());
         approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
@@ -289,8 +276,7 @@ mod tests {
 
     #[test]
     fn higher_order_reverse_mode_computes_a_fourth_derivative() {
-        let mut context = ();
-        let fourth_derivative_value = fourth_derivative(&mut context, 2.0f64);
+        let fourth_derivative_value = fourth_derivative(2.0f64);
 
         approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
         test_support::assert_fourth_derivative_jit_rendering();
@@ -298,19 +284,12 @@ mod tests {
 
     #[test]
     fn inline_nested_grad_calls_compute_a_fourth_derivative() {
-        let mut context = ();
         let fourth_derivative_value = grad(
-            &mut context,
-            |context, x| {
+            |x| {
                 grad(
-                    context,
-                    |context, x| {
-                        grad(
-                            context,
-                            |context, x| grad(context, quartic_plus_sin, x).expect("innermost grad should succeed"),
-                            x,
-                        )
-                        .expect("third derivative should succeed")
+                    |x| {
+                        grad(|x| grad(quartic_plus_sin, x).expect("innermost grad should succeed"), x)
+                            .expect("third derivative should succeed")
                     },
                     x,
                 )
@@ -326,22 +305,20 @@ mod tests {
 
     #[test]
     fn jit_can_trace_a_hessian_style_second_derivative() {
-        let mut context = ();
-        let (second_derivative_value, compiled) = jit(&mut context, hessian_style_second_derivative, 2.0f64).unwrap();
+        let (second_derivative_value, compiled) = jit(hessian_style_second_derivative, 2.0f64).unwrap();
 
         approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
-        let replayed = compiled.call(&mut context, 1.5f64).unwrap();
+        let replayed = compiled.call(1.5f64).unwrap();
         approx_eq(replayed, 12.0 * 1.5f64.powi(2) - 1.5f64.sin());
         test_support::assert_hessian_style_second_derivative_jit_rendering();
     }
 
     #[test]
     fn jit_can_trace_a_fourth_derivative() {
-        let mut context = ();
-        let (fourth_derivative_value, compiled) = jit(&mut context, fourth_derivative, 2.0f64).unwrap();
+        let (fourth_derivative_value, compiled) = jit(fourth_derivative, 2.0f64).unwrap();
 
         approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
-        let replayed = compiled.call(&mut context, 0.5f64).unwrap();
+        let replayed = compiled.call(0.5f64).unwrap();
         approx_eq(replayed, 24.0 + 0.5f64.sin());
         test_support::assert_fourth_derivative_jit_rendering();
     }

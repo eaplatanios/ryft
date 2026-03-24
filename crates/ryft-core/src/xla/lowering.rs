@@ -525,7 +525,7 @@ mod tests {
     use crate::tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike};
     use crate::types::{MeshAxisType, Shape};
 
-    use super::super::shard_map::{ShardMapTracer, TracedShardMap, shard_map as traced_shard_map};
+    use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use super::super::sharding::{LogicalMesh, MeshAxis, PartitionDimension, PartitionSpec};
     use super::*;
 
@@ -553,8 +553,7 @@ mod tests {
     fn test_to_mlir_module_renders_a_full_add_module() {
         let global_input_type = test_vector_type(8);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
-            &mut (),
-            |_, x: ShardMapTracer| x.clone() + x,
+            |x| x.clone() + x,
             global_input_type,
             test_manual_mesh("x", 4),
             PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
@@ -583,8 +582,7 @@ mod tests {
     fn test_to_mlir_module_renders_constants_and_supported_ops() {
         let global_input_type = test_matrix_type(4, 4);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
-            &mut (),
-            |_, x: ShardMapTracer| {
+            |x| {
                 let product = x.clone().transpose_matrix().matmul(x);
                 let waveform = (-product).cos().sin();
                 (waveform.clone() * waveform.one_like()) + waveform.zero_like()

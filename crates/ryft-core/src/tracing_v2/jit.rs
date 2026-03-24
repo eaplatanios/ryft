@@ -18,7 +18,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, JitContext, OneLike, TraceError, TraceValue, ZeroLike,
+        FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
         graph::{AtomId, Graph, GraphBuilder},
         ops::{AddOp, CosOp, MulOp, NegOp, SinOp, StagedOpRef},
     },
@@ -198,10 +198,7 @@ where
     }
 
     /// Replays the staged graph on concrete input values.
-    ///
-    /// The `_context` argument is currently unused by the interpreter-backed prototype. It is still threaded through
-    /// the API so that future backend-backed implementations can access whatever runtime state they need at call time.
-    pub fn call<Context>(&self, _context: &mut Context, input: Input) -> Result<Output, TraceError>
+    pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
@@ -225,8 +222,7 @@ where
 ///
 /// The returned [`CompiledFunction`] currently stores only the staged graph. Later, once a concrete backend exists,
 /// this type can be extended to carry backend-specific compilation artifacts alongside that graph.
-pub fn jit<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
+pub fn jit<F, Input, Output, V>(
     function: F,
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
@@ -236,22 +232,21 @@ where
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<JitTracer<V>>,
-    F: FnOnce(&mut JitContext<'context, Context, V>, Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
 {
     let input_structure = input.parameter_structure();
-    let mut jit_context = JitContext::new(context);
+    let builder = Rc::new(RefCell::new(GraphBuilder::new()));
+    let staging_error = Rc::new(RefCell::new(None));
     let traced_input = Input::To::<JitTracer<V>>::from_parameters(
         input_structure.clone(),
         input.into_parameters().map(|value| {
-            let builder = jit_context.staged_builder();
             let atom = builder.borrow_mut().add_input(&value);
-            let staging_error = jit_context.staging_error();
-            JitTracer { value, atom, builder, staging_error }
+            JitTracer { value, atom, builder: builder.clone(), staging_error: staging_error.clone() }
         }),
     )?;
 
     let (output_structure, output_value, outputs) = {
-        let traced_output = function(&mut jit_context, traced_input);
+        let traced_output = function(traced_input);
         let output_structure = traced_output.parameter_structure();
         let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
         let output_value = Output::from_parameters(
@@ -262,7 +257,6 @@ where
         (output_structure, output_value, outputs)
     };
 
-    let (_context, builder, staging_error) = jit_context.finish();
     if let Some(error) = staging_error.borrow_mut().take() {
         return Err(error);
     }
@@ -279,6 +273,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use indoc::indoc;
 
     use crate::{parameters::Placeholder, tracing_v2::test_support};
@@ -287,11 +283,10 @@ mod tests {
 
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
-        let mut context = ();
-        let jit_context = JitContext::<_, f64>::new(&mut context);
-        let builder = jit_context.staged_builder();
+        let builder = Rc::new(RefCell::new(GraphBuilder::new()));
+        let staging_error = Rc::new(RefCell::new(None));
         let atom = builder.borrow_mut().add_input(&3.0f64);
-        let tracer = JitTracer { value: 3.0, atom, builder, staging_error: jit_context.staging_error() };
+        let tracer = JitTracer { value: 3.0, atom, builder, staging_error };
         let zero = tracer.zero_like();
         assert_eq!(zero.value, 0.0);
         assert!(zero.atom() > atom);
@@ -310,10 +305,8 @@ mod tests {
 
     #[test]
     fn compiled_function_replays_staged_graphs() {
-        let mut context = ();
         let (output, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(
-            &mut context,
-            |_, x: JitTracer<f64>| {
+            |x: JitTracer<f64>| {
                 let squared = x.clone() * x.clone();
                 squared + x.sin()
             },
@@ -322,7 +315,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
-        assert_eq!(compiled.call(&mut context, 0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
+        assert_eq!(compiled.call(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
         assert_eq!(compiled.graph().input_atoms().len(), 1);
         assert_eq!(
             compiled.to_string(),
@@ -364,7 +357,6 @@ mod tests {
             }
         }
 
-        let mut context = ();
         let result: Result<
             (
                 TestAbstractValue,
@@ -372,8 +364,7 @@ mod tests {
             ),
             TraceError,
         > = jit(
-            &mut context,
-            |_, inputs: (JitTracer<TestAbstractValue>, JitTracer<TestAbstractValue>)| inputs.0 + inputs.1,
+            |inputs: (JitTracer<TestAbstractValue>, JitTracer<TestAbstractValue>)| inputs.0 + inputs.1,
             (
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F32) },
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F64) },
@@ -385,9 +376,8 @@ mod tests {
 
     #[test]
     fn compiled_function_display_delegates_to_the_underlying_graph() {
-        let mut context = ();
         let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) =
-            jit(&mut context, |_, x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
+            jit(|x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
 
         assert_eq!(
             compiled.to_string(),

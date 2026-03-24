@@ -10,7 +10,6 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
         FloatExt, TraceError, TraceValue, ZeroLike,
-        context::JvpContext,
         linear::{LinearProgram, Linearized, jvp_program},
         ops::{AddOp, CosOp, JvpOp, MulOp, NegOp, SinOp},
     },
@@ -193,26 +192,20 @@ where
 /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
 ///
 /// The returned pair is `(primal_output, tangent_output)`.
-pub fn jvp<'context, Context, F, Input, Output, V>(
-    context: &'context mut Context,
-    function: F,
-    primals: Input,
-    tangents: Input,
-) -> Result<(Output, Output), TraceError>
+pub fn jvp<F, Input, Output, V>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
 where
     V: TraceValue + FloatExt + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Linearized<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(&mut JvpContext<'context, Context, V>, Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
 {
     if primals.parameter_structure() != tangents.parameter_structure() {
         return Err(TraceError::MismatchedParameterStructure);
     }
 
-    let (primal_output, tangent_program): (Output, LinearProgram<V, Input, Output>) =
-        jvp_program(context, function, primals)?;
+    let (primal_output, tangent_program): (Output, LinearProgram<V, Input, Output>) = jvp_program(function, primals)?;
     let tangent_output = tangent_program.call(tangents)?;
     Ok((primal_output, tangent_output))
 }
@@ -238,13 +231,8 @@ mod tests {
 
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
-        let mut context = ();
-        let result: Result<(f64, f64), TraceError> = jvp::<_, _, _, _, f64>(
-            &mut context,
-            |_, xs: Vec<Linearized<f64>>| xs[0].clone(),
-            vec![2.0f64],
-            vec![1.0f64, 2.0f64],
-        );
+        let result: Result<(f64, f64), TraceError> =
+            jvp::<_, _, _, f64>(|xs: Vec<Linearized<f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
         test_support::assert_quadratic_pushforward_rendering();
     }
