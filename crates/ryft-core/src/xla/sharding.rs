@@ -146,9 +146,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use thiserror::Error;
-
+use ryft_mlir::Context as MlirContext;
+use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, MeshAttributeRef, TensorShardingAttributeRef};
 use ryft_pjrt::DeviceId;
+use thiserror::Error;
 
 use crate::types::MeshAxisType;
 
@@ -597,6 +598,12 @@ impl LogicalMesh {
         let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name)?;
         Ok(format!("sdy.mesh @{mesh_symbol_name} = {}", self.to_shardy_mesh_literal()))
     }
+
+    /// Builds this mesh as a typed Shardy mesh attribute.
+    pub(crate) fn to_shardy_mesh_attribute<'c, 't>(&self, context: &'c MlirContext<'t>) -> MeshAttributeRef<'c, 't> {
+        let axes = self.axes.iter().map(|axis| context.shardy_mesh_axis(axis.name(), axis.size())).collect::<Vec<_>>();
+        context.shardy_mesh(axes.as_slice(), &[])
+    }
 }
 
 /// Logical mesh of devices used by sharding layouts.
@@ -1008,6 +1015,30 @@ impl PartitionSpec {
         literal.push(']');
         literal
     }
+
+    /// Builds this partition specification as typed Shardy dimension shardings.
+    pub(crate) fn to_shardy_dimension_shardings<'c, 't>(
+        &self,
+        context: &'c MlirContext<'t>,
+        sharding_context: ShardingContext,
+    ) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
+        self.dimensions
+            .iter()
+            .map(|dimension| match dimension {
+                PartitionDimension::Unsharded => context.shardy_dimension_sharding(
+                    &[],
+                    matches!(sharding_context, ShardingContext::ExplicitSharding),
+                    None,
+                ),
+                PartitionDimension::Sharded(axis_names) => {
+                    let axes =
+                        axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)).collect::<Vec<_>>();
+                    context.shardy_dimension_sharding(axes.as_slice(), true, None)
+                }
+                PartitionDimension::Unconstrained => context.shardy_dimension_sharding(&[], false, None),
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,6 +1220,34 @@ impl NamedSharding {
 
         result.push('>');
         Ok(result)
+    }
+
+    /// Builds this sharding as a typed Shardy tensor-sharding attribute.
+    pub(crate) fn to_shardy_tensor_sharding<'c, 't, S: AsRef<str>>(
+        &self,
+        mesh_symbol_name: S,
+        context: &'c MlirContext<'t>,
+        sharding_context: ShardingContext,
+    ) -> Result<TensorShardingAttributeRef<'c, 't>, ShardingError> {
+        let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name)?;
+        let mesh_symbol_ref = context.flat_symbol_ref_attribute(mesh_symbol_name.as_str());
+        let dim_shardings = self.partition_spec.to_shardy_dimension_shardings(context, sharding_context);
+        let replicated_axes = self
+            .replicated_axes
+            .iter()
+            .map(|axis_name| context.shardy_axis_ref(axis_name, None))
+            .collect::<Vec<_>>();
+        let unreduced_axes = self
+            .unreduced_axes
+            .iter()
+            .map(|axis_name| context.shardy_axis_ref(axis_name, None))
+            .collect::<Vec<_>>();
+        Ok(context.shardy_tensor_sharding(
+            mesh_symbol_ref,
+            dim_shardings.as_slice(),
+            replicated_axes.as_slice(),
+            unreduced_axes.as_slice(),
+        ))
     }
 }
 
@@ -1466,7 +1525,7 @@ impl ShardingLayout {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-fn normalize_mesh_symbol_name<S: AsRef<str>>(mesh_symbol_name: S) -> Result<String, ShardingError> {
+pub(crate) fn normalize_mesh_symbol_name<S: AsRef<str>>(mesh_symbol_name: S) -> Result<String, ShardingError> {
     let mesh_symbol_name = mesh_symbol_name.as_ref().trim();
     if mesh_symbol_name.is_empty() {
         return Err(ShardingError::EmptyMeshSymbolName);

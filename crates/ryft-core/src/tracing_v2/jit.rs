@@ -35,6 +35,7 @@ where
     pub value: V,
     atom: AtomId,
     builder: Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>,
+    staging_error: Rc<RefCell<Option<TraceError>>>,
 }
 
 impl<V> JitTracer<V>
@@ -49,23 +50,36 @@ where
 
     pub(crate) fn unary(self, op: StagedOpRef<V>, apply: impl FnOnce(V) -> V) -> Self {
         let value = apply(self.value);
-        let atom = self
-            .builder
-            .borrow_mut()
-            .add_equation(op, vec![self.atom])
-            .expect("staging a unary op should succeed")[0];
-        Self { value, atom, builder: self.builder }
+        let atom = if self.staging_error.borrow().is_some() {
+            self.atom
+        } else {
+            match self.builder.borrow_mut().add_equation(op, vec![self.atom]) {
+                Ok(outputs) => outputs[0],
+                Err(error) => {
+                    *self.staging_error.borrow_mut() = Some(error);
+                    self.atom
+                }
+            }
+        };
+        Self { value, atom, builder: self.builder, staging_error: self.staging_error }
     }
 
     pub(crate) fn binary(self, rhs: Self, op: StagedOpRef<V>, apply: impl FnOnce(V, V) -> V) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
+        debug_assert!(Rc::ptr_eq(&self.staging_error, &rhs.staging_error));
         let value = apply(self.value, rhs.value);
-        let atom = self
-            .builder
-            .borrow_mut()
-            .add_equation(op, vec![self.atom, rhs.atom])
-            .expect("staging a binary op should succeed")[0];
-        Self { value, atom, builder: self.builder }
+        let atom = if self.staging_error.borrow().is_some() {
+            self.atom
+        } else {
+            match self.builder.borrow_mut().add_equation(op, vec![self.atom, rhs.atom]) {
+                Ok(outputs) => outputs[0],
+                Err(error) => {
+                    *self.staging_error.borrow_mut() = Some(error);
+                    self.atom
+                }
+            }
+        };
+        Self { value, atom, builder: self.builder, staging_error: self.staging_error }
     }
 }
 
@@ -89,7 +103,7 @@ where
     fn zero_like(&self) -> Self {
         let value = self.value.zero_like();
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { value, atom, builder: self.builder.clone() }
+        Self { value, atom, builder: self.builder.clone(), staging_error: self.staging_error.clone() }
     }
 }
 
@@ -101,7 +115,7 @@ where
     fn one_like(&self) -> Self {
         let value = self.value.one_like();
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { value, atom, builder: self.builder.clone() }
+        Self { value, atom, builder: self.builder.clone(), staging_error: self.staging_error.clone() }
     }
 }
 
@@ -231,7 +245,8 @@ where
         input.into_parameters().map(|value| {
             let builder = jit_context.staged_builder();
             let atom = builder.borrow_mut().add_input(&value);
-            JitTracer { value, atom, builder }
+            let staging_error = jit_context.staging_error();
+            JitTracer { value, atom, builder, staging_error }
         }),
     )?;
 
@@ -247,7 +262,10 @@ where
         (output_structure, output_value, outputs)
     };
 
-    let (_context, builder) = jit_context.finish();
+    let (_context, builder, staging_error) = jit_context.finish();
+    if let Some(error) = staging_error.borrow_mut().take() {
+        return Err(error);
+    }
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
@@ -273,7 +291,7 @@ mod tests {
         let jit_context = JitContext::<_, f64>::new(&mut context);
         let builder = jit_context.staged_builder();
         let atom = builder.borrow_mut().add_input(&3.0f64);
-        let tracer = JitTracer { value: 3.0, atom, builder };
+        let tracer = JitTracer { value: 3.0, atom, builder, staging_error: jit_context.staging_error() };
         let zero = tracer.zero_like();
         assert_eq!(zero.value, 0.0);
         assert!(zero.atom() > atom);
@@ -317,6 +335,52 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn jit_returns_abstract_eval_errors_instead_of_panicking() {
+        use ryft_macros::Parameter;
+
+        use crate::types::{ArrayType, DataType, Typed};
+
+        #[derive(Clone, Debug, Parameter)]
+        struct TestAbstractValue {
+            r#type: ArrayType,
+        }
+
+        impl Typed<ArrayType> for TestAbstractValue {
+            fn tpe(&self) -> ArrayType {
+                self.r#type.clone()
+            }
+        }
+
+        impl TraceValue for TestAbstractValue {}
+
+        impl Add for TestAbstractValue {
+            type Output = Self;
+
+            fn add(self, _rhs: Self) -> Self::Output {
+                self
+            }
+        }
+
+        let mut context = ();
+        let result: Result<
+            (
+                TestAbstractValue,
+                CompiledFunction<TestAbstractValue, (TestAbstractValue, TestAbstractValue), TestAbstractValue>,
+            ),
+            TraceError,
+        > = jit(
+            &mut context,
+            |_, inputs: (JitTracer<TestAbstractValue>, JitTracer<TestAbstractValue>)| inputs.0 + inputs.1,
+            (
+                TestAbstractValue { r#type: ArrayType::scalar(DataType::F32) },
+                TestAbstractValue { r#type: ArrayType::scalar(DataType::F64) },
+            ),
+        );
+
+        assert!(matches!(result, Err(TraceError::IncompatibleAbstractValues { op: "add" })));
     }
 
     #[test]

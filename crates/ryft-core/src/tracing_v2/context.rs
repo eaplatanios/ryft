@@ -196,6 +196,7 @@ where
 {
     context: &'a mut Context,
     staged_builder: Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>,
+    staging_error: Rc<RefCell<Option<crate::tracing_v2::TraceError>>>,
 }
 
 impl<'a, Context, V> JitContext<'a, Context, V>
@@ -208,7 +209,11 @@ where
     /// trace as it executes eagerly.
     #[inline]
     pub(crate) fn new(context: &'a mut Context) -> Self {
-        Self { context, staged_builder: Rc::new(RefCell::new(GraphBuilder::new())) }
+        Self {
+            context,
+            staged_builder: Rc::new(RefCell::new(GraphBuilder::new())),
+            staging_error: Rc::new(RefCell::new(None)),
+        }
     }
 
     /// Returns the underlying context borrowed by this JIT context.
@@ -228,13 +233,25 @@ where
         self.staged_builder.clone()
     }
 
+    /// Returns shared access to the first staging error encountered during this JIT trace.
+    #[inline]
+    pub(crate) fn staging_error(&self) -> Rc<RefCell<Option<crate::tracing_v2::TraceError>>> {
+        self.staging_error.clone()
+    }
+
     /// Finishes the JIT trace and returns both the parent context and the staged graph builder.
     ///
     /// This is used internally once tracing is complete and the accumulated builder is ready to be finalized into a
     /// [`crate::tracing_v2::CompiledFunction`].
     #[inline]
-    pub(crate) fn finish(self) -> (&'a mut Context, Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>) {
-        (self.context, self.staged_builder)
+    pub(crate) fn finish(
+        self,
+    ) -> (
+        &'a mut Context,
+        Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>,
+        Rc<RefCell<Option<crate::tracing_v2::TraceError>>>,
+    ) {
+        (self.context, self.staged_builder, self.staging_error)
     }
 }
 
