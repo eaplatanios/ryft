@@ -525,7 +525,7 @@ mod tests {
     use crate::tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike};
     use crate::types::{MeshAxisType, Shape};
 
-    use super::super::shard_map::{ShardMap, ShardMapTracer, TracedShardMap};
+    use super::super::shard_map::{ShardMapTracer, TracedShardMap, shard_map as traced_shard_map};
     use super::super::sharding::{LogicalMesh, MeshAxis, PartitionDimension, PartitionSpec};
     use super::*;
 
@@ -545,30 +545,22 @@ mod tests {
         traced: &TracedShardMap<ArrayType, ArrayType>,
         function_name: &str,
         mesh_symbol_name: &str,
-    ) -> Result<String, LoweringError> {
-        super::to_mlir_module(
-            traced.shard_map(),
-            traced.compiled().graph(),
-            traced.global_input_types(),
-            traced.local_input_types(),
-            traced.global_output_types(),
-            traced.local_output_types(),
-            function_name,
-            mesh_symbol_name,
-        )
+    ) -> Result<String, super::super::shard_map::ShardMapTraceError> {
+        traced.to_mlir_module(function_name, mesh_symbol_name)
     }
 
     #[test]
     fn test_to_mlir_module_renders_a_full_add_module() {
-        let shard_map = ShardMap::new(
+        let global_input_type = test_vector_type(8);
+        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+            &mut (),
+            |_, x: ShardMapTracer| x.clone() + x,
+            global_input_type,
             test_manual_mesh("x", 4),
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
         )
         .unwrap();
-        let global_input_type = test_vector_type(8);
-        let traced: TracedShardMap<ArrayType, ArrayType> =
-            shard_map.trace(&mut (), |_, x: ShardMapTracer| x.clone() + x, global_input_type).unwrap();
 
         assert_eq!(
             lower_traced_module(&traced, "main", "mesh").unwrap(),
@@ -589,24 +581,20 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_renders_constants_and_supported_ops() {
-        let shard_map = ShardMap::new(
+        let global_input_type = test_matrix_type(4, 4);
+        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+            &mut (),
+            |_, x: ShardMapTracer| {
+                let product = x.clone().transpose_matrix().matmul(x);
+                let waveform = (-product).cos().sin();
+                (waveform.clone() * waveform.one_like()) + waveform.zero_like()
+            },
+            global_input_type,
             test_manual_mesh("x", 2),
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()])],
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()])],
+            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]),
         )
         .unwrap();
-        let global_input_type = test_matrix_type(4, 4);
-        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map
-            .trace(
-                &mut (),
-                |_, x: ShardMapTracer| {
-                    let product = x.clone().transpose_matrix().matmul(x);
-                    let waveform = (-product).cos().sin();
-                    (waveform.clone() * waveform.one_like()) + waveform.zero_like()
-                },
-                global_input_type,
-            )
-            .unwrap();
 
         assert_eq!(
             lower_traced_module(&traced, "kernel", "mesh").unwrap(),

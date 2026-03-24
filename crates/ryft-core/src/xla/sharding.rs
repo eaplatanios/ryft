@@ -151,6 +151,7 @@ use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, MeshAttributeRe
 use ryft_pjrt::DeviceId;
 use thiserror::Error;
 
+use crate::parameters::Parameter;
 use crate::types::MeshAxisType;
 
 // ---------------------------------------------------------------------------
@@ -949,7 +950,7 @@ impl PartitionDimension {
 /// [{}, {}]               <- P() with rank 2, ExplicitSharding
 /// [{?}]                  <- P(UNCONSTRAINED)
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub struct PartitionSpec {
     dimensions: Vec<PartitionDimension>,
 }

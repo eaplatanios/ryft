@@ -1,25 +1,29 @@
 //! Manual SPMD metadata for Shardy `sdy.manual_computation`.
 //!
-//! This module provides a small `ryft-core::xla` representation of the metadata carried by
-//! JAX's `shard_map`: a logical mesh, per-input and per-output shardings, and the set of mesh
-//! axes that are handled manually inside the computation body.
+//! This module provides the tracing-backed `shard_map` surface for `ryft-core::xla`.
 //!
-//! `ShardMap` still owns the metadata-only part of that model:
+//! The public entry point is [`shard_map`], which stages a Rust closure over shard-local tensor
+//! types derived from global [`ArrayType`] metadata, lowers the resulting `tracing_v2` graph to
+//! StableHLO/Shardy MLIR, and returns a [`TracedShardMap`] handle for inspection and lowering.
+//!
+//! Internally, the module still keeps a small metadata model of JAX's `shard_map`: a logical mesh,
+//! per-input and per-output shardings, and the set of mesh axes that are handled manually inside
+//! the computation body. That internal metadata is responsible for:
 //!
 //! - validating manual-axis usage against a [`LogicalMesh`],
 //! - deriving body-local shapes from global shapes, and
 //! - rendering the Shardy attributes needed by `sdy.manual_computation`.
 //!
-//! `TracedShardMap` extends that metadata with a staged `tracing_v2` body graph. The traced path
+//! [`TracedShardMap`] extends that metadata with a staged `tracing_v2` body graph. The traced path
 //! can derive body-local input types from global input types, trace a Rust closure over those
 //! local tensor types, and lower the resulting staged body to StableHLO/Shardy MLIR.
 //!
 //! # Relationship to existing sharding types
 //!
-//! `ShardMap` accepts [`PartitionSpec`] values as its public input surface, but internally it
+//! The public [`shard_map`] function accepts structured [`PartitionSpec`] values and internally
 //! lowers them to [`NamedSharding`] values.
 //!
-//! `ShardMap` derives its manual axes from the mesh itself: every axis whose type is
+//! The shard-map implementation derives its manual axes from the mesh itself: every axis whose type is
 //! [`Manual`](crate::types::MeshAxisType::Manual) is treated as manual for the
 //! `sdy.manual_computation` region.
 //!
@@ -31,10 +35,10 @@
 //!
 //! # Shardy correspondence
 //!
-//! The public helpers on [`ShardMap`] render the three attributes attached to
+//! The internal metadata helpers render the three attributes attached to
 //! `sdy.manual_computation`:
 //!
-//! | `ShardMap` data      | Shardy attribute    |
+//! | shard-map data       | Shardy attribute    |
 //! | -------------------- | ------------------- |
 //! | input shardings      | `in_shardings=[...]`  |
 //! | output shardings     | `out_shardings=[...]` |
@@ -64,9 +68,9 @@ use crate::types::{ArrayType, Shape, Size, Typed};
 use super::lowering::LoweringError;
 use super::sharding::{LogicalMesh, NamedSharding, PartitionDimension, PartitionSpec, ShardingError};
 
-/// Error type for [`ShardMap`] construction, local-shape derivation, and Shardy rendering.
+/// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
-pub enum ShardMapError {
+pub(crate) enum ShardMapError {
     /// Underlying error returned by the mesh/sharding layer.
     #[error("{0}")]
     ShardingError(#[from] ShardingError),
@@ -74,14 +78,6 @@ pub enum ShardMapError {
     /// Error returned when a mesh used for `ShardMap` has no manual axes.
     #[error("shard_map requires at least one mesh axis with type manual")]
     MeshHasNoManualAxes,
-
-    /// Error returned when an input index does not exist.
-    #[error("input index {input_index} is out of range for {input_count} input sharding(s)")]
-    InvalidInputIndex { input_index: usize, input_count: usize },
-
-    /// Error returned when an output index does not exist.
-    #[error("output index {output_index} is out of range for {output_count} output sharding(s)")]
-    InvalidOutputIndex { output_index: usize, output_count: usize },
 
     /// Error returned when a partitioned dimension uses a free axis more major than a manual axis.
     #[error(
@@ -117,12 +113,49 @@ pub enum ShardMapError {
     },
 }
 
-/// Error type for tracing and lowering [`ShardMap`] bodies.
+/// Error type for tracing and lowering `xla::shard_map` bodies.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 pub enum ShardMapTraceError {
-    /// Underlying error returned by the metadata-only shard-map layer.
+    /// Underlying error returned by the mesh/sharding layer.
     #[error("{0}")]
-    ShardMapError(#[from] ShardMapError),
+    ShardingError(#[from] ShardingError),
+
+    /// Error returned when a mesh used for `shard_map` has no manual axes.
+    #[error("shard_map requires at least one mesh axis with type manual")]
+    MeshHasNoManualAxes,
+
+    /// Error returned when a partitioned dimension uses a free axis more major than a manual axis.
+    #[error(
+        "{value_kind} sharding #{value_index} dimension #{dimension} uses free axis '{free_axis_name}' \
+         more major than manual axis '{manual_axis_name}'"
+    )]
+    ManualAxisMustPrecedeFreeAxis {
+        value_kind: &'static str,
+        value_index: usize,
+        dimension: usize,
+        free_axis_name: String,
+        manual_axis_name: String,
+    },
+
+    /// Error returned when a provided global shape rank does not match the sharding rank.
+    #[error(
+        "{value_kind} sharding #{value_index} has rank {partition_rank}, but the provided shape \
+         has rank {shape_rank}"
+    )]
+    RankMismatch { value_kind: &'static str, value_index: usize, partition_rank: usize, shape_rank: usize },
+
+    /// Error returned when a manual axis would require padding in the local body shape.
+    #[error(
+        "{value_kind} sharding #{value_index} dimension #{dimension} has size {dimension_size}, \
+         which is not divisible by manual partition count {manual_partition_count}"
+    )]
+    ManualAxisIntroducesPadding {
+        value_kind: &'static str,
+        value_index: usize,
+        dimension: usize,
+        dimension_size: usize,
+        manual_partition_count: usize,
+    },
 
     /// Underlying tracing error returned while staging a shard-map body.
     #[error("{0}")]
@@ -155,13 +188,55 @@ pub enum ShardMapTraceError {
 
 impl From<LoweringError> for ShardMapTraceError {
     fn from(error: LoweringError) -> Self {
-        Self::LoweringFailure { message: error.to_string() }
+        match error {
+            LoweringError::ShardMapError(error) => Self::from(error),
+            LoweringError::ShardingError(error) => Self::ShardingError(error),
+            error => Self::LoweringFailure { message: error.to_string() },
+        }
+    }
+}
+
+impl From<ShardMapError> for ShardMapTraceError {
+    fn from(error: ShardMapError) -> Self {
+        match error {
+            ShardMapError::ShardingError(error) => Self::ShardingError(error),
+            ShardMapError::MeshHasNoManualAxes => Self::MeshHasNoManualAxes,
+            ShardMapError::ManualAxisMustPrecedeFreeAxis {
+                value_kind,
+                value_index,
+                dimension,
+                free_axis_name,
+                manual_axis_name,
+            } => Self::ManualAxisMustPrecedeFreeAxis {
+                value_kind,
+                value_index,
+                dimension,
+                free_axis_name,
+                manual_axis_name,
+            },
+            ShardMapError::RankMismatch { value_kind, value_index, partition_rank, shape_rank } => {
+                Self::RankMismatch { value_kind, value_index, partition_rank, shape_rank }
+            }
+            ShardMapError::ManualAxisIntroducesPadding {
+                value_kind,
+                value_index,
+                dimension,
+                dimension_size,
+                manual_partition_count,
+            } => Self::ManualAxisIntroducesPadding {
+                value_kind,
+                value_index,
+                dimension,
+                dimension_size,
+                manual_partition_count,
+            },
+        }
     }
 }
 
 /// Constant kind tracked for shard-map body tracing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum ShardMapConstantKind {
+pub(crate) enum ShardMapConstantKind {
     /// Zero splat constant.
     Zero,
 
@@ -178,7 +253,7 @@ pub struct ShardMapTensor {
 
 impl ShardMapTensor {
     /// Creates a traced shard-map tensor with the provided type.
-    pub fn new(r#type: ArrayType) -> Self {
+    pub(crate) fn new(r#type: ArrayType) -> Self {
         Self { r#type, constant_kind: None }
     }
 
@@ -187,12 +262,12 @@ impl ShardMapTensor {
     }
 
     /// Returns the underlying array type.
-    pub fn r#type(&self) -> &ArrayType {
+    pub(crate) fn r#type(&self) -> &ArrayType {
         &self.r#type
     }
 
     /// Returns the tracked constant kind, if this value came from `zero_like()` or `one_like()`.
-    pub fn constant_kind(&self) -> Option<ShardMapConstantKind> {
+    pub(crate) fn constant_kind(&self) -> Option<ShardMapConstantKind> {
         self.constant_kind
     }
 }
@@ -284,13 +359,59 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging shard-map bodies.
-pub type ShardMapTracer = JitTracer<ShardMapTensor>;
+pub(crate) type ShardMapTracer = JitTracer<ShardMapTensor>;
 
 type ShardMapLocalTraceInput<Input> =
     <<Input as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
 
 type ShardMapLocalTraceOutput<Output> =
     <<Output as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
+
+/// Stages a traced shard-map body over the provided mesh and partition specs.
+///
+/// This is the ergonomic public entry point for traced XLA shard-map staging. It mirrors the
+/// function-first shape of JAX's `shard_map` while adapting it to Rust and `tracing_v2` by
+/// requiring explicit `global_input_types`.
+///
+/// Mesh axes whose type is [`Manual`](crate::types::MeshAxisType::Manual) define the manual axes
+/// of the computation. Structured `in_specs` and `out_specs` follow the same `Parameterized`
+/// layout as the corresponding input and output types.
+///
+/// # Parameters
+///
+///   - `context`: Tracing context threaded through the staged closure.
+///   - `function`: Body closure to trace over local shard-map values.
+///   - `global_input_types`: Global input array types used to derive the local body argument types.
+///   - `mesh`: Logical mesh that the manual computation is defined over.
+///   - `in_specs`: Structured partition specs for the global inputs.
+///   - `out_specs`: Structured partition specs for the global outputs.
+pub fn shard_map<'context, Context, F, Input, Output>(
+    context: &'context mut Context,
+    function: F,
+    global_input_types: Input,
+    mesh: LogicalMesh,
+    in_specs: Input::To<PartitionSpec>,
+    out_specs: Output::To<PartitionSpec>,
+) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
+where
+    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Input::Family:
+        ParameterizedFamily<PartitionSpec> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Output::Family:
+        ParameterizedFamily<PartitionSpec> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
+    F: FnOnce(
+        &mut JitContext<'context, Context, ShardMapTensor>,
+        ShardMapLocalTraceInput<Input>,
+    ) -> ShardMapLocalTraceOutput<Output>,
+{
+    let shard_map = ShardMap::new(
+        mesh,
+        in_specs.into_parameters().collect::<Vec<_>>(),
+        out_specs.into_parameters().collect::<Vec<_>>(),
+    )?;
+    shard_map.trace(context, function, global_input_types)
+}
 
 /// Traced shard-map program backed by a staged `tracing_v2` graph.
 pub struct TracedShardMap<Input, Output>
@@ -322,7 +443,7 @@ where
 ///
 /// Reference: https://docs.jax.dev/en/latest/notebooks/shard_map.html.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShardMap {
+pub(crate) struct ShardMap {
     mesh: LogicalMesh,
     in_shardings: Vec<NamedSharding>,
     out_shardings: Vec<NamedSharding>,
@@ -340,7 +461,7 @@ impl ShardMap {
     ///   - `mesh`: Logical mesh that the manual computation is defined over.
     ///   - `in_specs`: Per-input partition specs for the global inputs.
     ///   - `out_specs`: Per-output partition specs for the global outputs.
-    pub fn new(
+    fn new(
         mesh: LogicalMesh,
         in_specs: Vec<PartitionSpec>,
         out_specs: Vec<PartitionSpec>,
@@ -351,22 +472,22 @@ impl ShardMap {
     }
 
     /// Returns the logical mesh of this manual computation.
-    pub fn mesh(&self) -> &LogicalMesh {
+    pub(crate) fn mesh(&self) -> &LogicalMesh {
         &self.mesh
     }
 
     /// Returns the validated per-input shardings.
-    pub fn in_shardings(&self) -> &[NamedSharding] {
+    pub(crate) fn in_shardings(&self) -> &[NamedSharding] {
         self.in_shardings.as_slice()
     }
 
     /// Returns the validated per-output shardings.
-    pub fn out_shardings(&self) -> &[NamedSharding] {
+    pub(crate) fn out_shardings(&self) -> &[NamedSharding] {
         self.out_shardings.as_slice()
     }
 
     /// Returns the manual mesh axes in mesh order.
-    pub fn manual_axes(&self) -> Vec<&str> {
+    fn manual_axes(&self) -> Vec<&str> {
         self.mesh.manual_axes()
     }
 
@@ -380,12 +501,8 @@ impl ShardMap {
     ///
     ///   - `input_index`: Index of the input sharding to use.
     ///   - `global_shape`: Global input shape associated with that input.
-    pub fn local_input_shape(&self, input_index: usize, global_shape: &[usize]) -> Result<Vec<usize>, ShardMapError> {
-        let sharding = self
-            .in_shardings
-            .get(input_index)
-            .ok_or(ShardMapError::InvalidInputIndex { input_index, input_count: self.in_shardings.len() })?;
-        local_shape_for_sharding(sharding, global_shape, "input", input_index)
+    fn local_input_shape(&self, input_index: usize, global_shape: &[usize]) -> Result<Vec<usize>, ShardMapError> {
+        local_shape_for_sharding(&self.in_shardings[input_index], global_shape, "input", input_index)
     }
 
     /// Returns the local body shape for output `output_index`.
@@ -394,12 +511,9 @@ impl ShardMap {
     ///
     ///   - `output_index`: Index of the output sharding to use.
     ///   - `global_shape`: Global output shape associated with that output.
-    pub fn local_output_shape(&self, output_index: usize, global_shape: &[usize]) -> Result<Vec<usize>, ShardMapError> {
-        let sharding = self
-            .out_shardings
-            .get(output_index)
-            .ok_or(ShardMapError::InvalidOutputIndex { output_index, output_count: self.out_shardings.len() })?;
-        local_shape_for_sharding(sharding, global_shape, "output", output_index)
+    #[cfg(test)]
+    fn local_output_shape(&self, output_index: usize, global_shape: &[usize]) -> Result<Vec<usize>, ShardMapError> {
+        local_shape_for_sharding(&self.out_shardings[output_index], global_shape, "output", output_index)
     }
 
     /// Renders the Shardy `in_shardings=[...]` attribute payload.
@@ -410,10 +524,8 @@ impl ShardMap {
     /// # Parameters
     ///
     ///   - `mesh_symbol_name`: Symbol name used by the surrounding `sdy.mesh` declaration.
-    pub fn to_shardy_in_shardings_attribute<S: AsRef<str>>(
-        &self,
-        mesh_symbol_name: S,
-    ) -> Result<String, ShardMapError> {
+    #[cfg(test)]
+    fn to_shardy_in_shardings_attribute<S: AsRef<str>>(&self, mesh_symbol_name: S) -> Result<String, ShardMapError> {
         render_shardy_sharding_list(self.in_shardings.as_slice(), mesh_symbol_name)
     }
 
@@ -422,15 +534,14 @@ impl ShardMap {
     /// # Parameters
     ///
     ///   - `mesh_symbol_name`: Symbol name used by the surrounding `sdy.mesh` declaration.
-    pub fn to_shardy_out_shardings_attribute<S: AsRef<str>>(
-        &self,
-        mesh_symbol_name: S,
-    ) -> Result<String, ShardMapError> {
+    #[cfg(test)]
+    fn to_shardy_out_shardings_attribute<S: AsRef<str>>(&self, mesh_symbol_name: S) -> Result<String, ShardMapError> {
         render_shardy_sharding_list(self.out_shardings.as_slice(), mesh_symbol_name)
     }
 
     /// Renders the Shardy `manual_axes={...}` attribute payload.
-    pub fn to_shardy_manual_axes_attribute(&self) -> String {
+    #[cfg(test)]
+    fn to_shardy_manual_axes_attribute(&self) -> String {
         let manual_axes = self.manual_axes();
         render_shardy_axes(manual_axes.as_slice())
     }
@@ -440,7 +551,8 @@ impl ShardMap {
     /// # Parameters
     ///
     ///   - `mesh_symbol_name`: Symbol name used by the surrounding `sdy.mesh` declaration.
-    pub fn to_shardy_manual_computation_attributes<S: AsRef<str>>(
+    #[cfg(test)]
+    fn to_shardy_manual_computation_attributes<S: AsRef<str>>(
         &self,
         mesh_symbol_name: S,
     ) -> Result<String, ShardMapError> {
@@ -484,7 +596,7 @@ impl ShardMap {
     ///   - `function`: Body closure to trace over local shard-map values.
     ///   - `global_input_types`: Global input array types in the same leaf order as the shard-map
     ///     input shardings.
-    pub fn trace<'context, Context, F, Input, Output>(
+    fn trace<'context, Context, F, Input, Output>(
         &self,
         context: &'context mut Context,
         function: F,
@@ -533,11 +645,6 @@ where
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<ShardMapTensor>,
 {
-    /// Returns the underlying metadata-only shard-map description.
-    pub fn shard_map(&self) -> &ShardMap {
-        &self.shard_map
-    }
-
     /// Returns the global input types used to derive the traced local body inputs.
     pub fn global_input_types(&self) -> &Input {
         &self.global_input_types
@@ -556,11 +663,6 @@ where
     /// Returns the reconstructed global output types implied by the traced body and output shardings.
     pub fn global_output_types(&self) -> &Output {
         &self.global_output_types
-    }
-
-    /// Returns the staged `tracing_v2` program backing this traced shard-map.
-    pub fn compiled(&self) -> &CompiledFunction<ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>> {
-        &self.compiled
     }
 
     /// Renders a full StableHLO/Shardy MLIR module for this traced shard-map.
@@ -709,12 +811,12 @@ fn global_shape_for_sharding(
     output_index: usize,
 ) -> Result<Vec<usize>, ShardMapTraceError> {
     if partition_spec.rank() != local_shape.len() {
-        return Err(ShardMapTraceError::ShardMapError(ShardMapError::RankMismatch {
+        return Err(ShardMapTraceError::RankMismatch {
             value_kind: "output",
             value_index: output_index,
             partition_rank: partition_spec.rank(),
             shape_rank: local_shape.len(),
-        }));
+        });
     }
 
     let manual_axis_names = mesh.manual_axes().into_iter().collect::<HashSet<_>>();
@@ -730,9 +832,9 @@ fn global_shape_for_sharding(
                     .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                     .try_fold(1usize, |partition_count, axis_name| {
                         let axis_size = mesh.axis_size(axis_name).ok_or_else(|| {
-                            ShardMapTraceError::ShardMapError(ShardMapError::ShardingError(
-                                ShardingError::UnknownMeshAxis { axis_name: axis_name.clone() },
-                            ))
+                            ShardMapTraceError::ShardingError(ShardingError::UnknownMeshAxis {
+                                axis_name: axis_name.clone(),
+                            })
                         })?;
                         partition_count.checked_mul(axis_size).ok_or_else(|| ShardMapTraceError::Overflow {
                             context: format!(
@@ -876,6 +978,7 @@ fn local_shape_for_sharding(
     Ok(local_shape)
 }
 
+#[cfg(test)]
 fn render_shardy_sharding_list<S: AsRef<str>>(
     shardings: &[NamedSharding],
     mesh_symbol_name: S,
@@ -954,6 +1057,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
         .collect()
 }
 
+#[cfg(test)]
 fn stripped_shardy_tensor_sharding<S: AsRef<str>>(
     sharding: &NamedSharding,
     mesh_symbol_name: S,
@@ -994,6 +1098,7 @@ fn stripped_shardy_tensor_sharding<S: AsRef<str>>(
     Ok(result)
 }
 
+#[cfg(test)]
 fn render_manual_computation_dimensions(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -> String {
     let manual_axis_names = mesh.manual_axes().into_iter().collect::<HashSet<_>>();
     let has_free_axes = mesh.axes().len() > manual_axis_names.len();
@@ -1036,6 +1141,7 @@ fn render_manual_computation_dimensions(mesh: &LogicalMesh, partition_spec: &Par
     result
 }
 
+#[cfg(test)]
 fn render_shardy_axes<A: AsRef<str>>(axis_names: &[A]) -> String {
     let mut result = String::from("{");
     for (axis_index, axis_name) in axis_names.iter().enumerate() {
@@ -1050,6 +1156,7 @@ fn render_shardy_axes<A: AsRef<str>>(axis_names: &[A]) -> String {
     result
 }
 
+#[cfg(test)]
 fn escape_shardy_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -1155,10 +1262,18 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_rejects_mesh_without_manual_axes() {
-        let result = ShardMap::new(test_logical_mesh_without_manual_axes(), Vec::new(), Vec::new());
+    fn test_shard_map_function_rejects_mesh_without_manual_axes() {
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
+            &mut (),
+            |_, x: ShardMapTracer| x.clone() + x,
+            global_input_type,
+            test_logical_mesh_without_manual_axes(),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+        );
 
-        assert_eq!(result, Err(ShardMapError::MeshHasNoManualAxes));
+        assert!(matches!(result, Err(ShardMapTraceError::MeshHasNoManualAxes)));
     }
 
     #[test]
@@ -1254,25 +1369,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_local_shape_rejects_invalid_indices() {
-        let shard_map = ShardMap::new(
-            test_logical_mesh_2x2(),
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
-        )
-        .unwrap();
-
-        assert_eq!(
-            shard_map.local_input_shape(1, &[8]),
-            Err(ShardMapError::InvalidInputIndex { input_index: 1, input_count: 1 })
-        );
-        assert_eq!(
-            shard_map.local_output_shape(1, &[8]),
-            Err(ShardMapError::InvalidOutputIndex { output_index: 1, output_count: 1 })
-        );
-    }
-
-    #[test]
     fn test_shard_map_renders_in_shardings_attribute() {
         let shard_map = ShardMap::new(
             test_logical_mesh_2x2(),
@@ -1352,15 +1448,16 @@ mod tests {
 
     #[test]
     fn test_shard_map_trace_derives_types_and_renders_mlir() {
-        let shard_map = ShardMap::new(
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
+            &mut (),
+            |_, x: ShardMapTracer| x.clone() + x,
+            global_input_type.clone(),
             LogicalMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
         )
         .unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
-        let traced: TracedShardMap<ArrayType, ArrayType> =
-            shard_map.trace(&mut (), |_, x: ShardMapTracer| x.clone() + x, global_input_type.clone()).unwrap();
 
         assert_eq!(traced.global_input_types(), &global_input_type);
         assert_eq!(traced.local_input_types(), &ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None));
@@ -1388,16 +1485,15 @@ mod tests {
 
     #[test]
     fn test_shard_map_trace_rejects_dynamic_input_types() {
-        let shard_map = ShardMap::new(
-            LogicalMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
-            vec![PartitionSpec::new(vec![PartitionDimension::sharded("x")])],
-        )
-        .unwrap();
         let dynamic_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]), None);
-
-        let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> =
-            shard_map.trace(&mut (), |_, x: ShardMapTracer| x.clone() + x, dynamic_input_type);
+        let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
+            &mut (),
+            |_, x: ShardMapTracer| x.clone() + x,
+            dynamic_input_type,
+            LogicalMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+        );
 
         assert!(matches!(
             result,
@@ -1422,15 +1518,16 @@ mod tests {
             DeviceMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()], mesh_devices).unwrap();
 
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
-        let shard_map = ShardMap::new(
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
+            &mut (),
+            |_, x: ShardMapTracer| x.clone() + x,
+            global_input_type,
             device_mesh.logical_mesh().clone(),
-            vec![partition_spec.clone()],
-            vec![partition_spec.clone()],
+            partition_spec.clone(),
+            partition_spec.clone(),
         )
         .unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
-        let traced: TracedShardMap<ArrayType, ArrayType> =
-            shard_map.trace(&mut (), |_, x: ShardMapTracer| x.clone() + x, global_input_type).unwrap();
         let mlir_program = traced.to_mlir_module("main", "mesh").unwrap();
 
         let input_buffers = client_devices
@@ -1506,19 +1603,19 @@ mod tests {
         let rhs_partition_spec = PartitionSpec::replicated(2);
         let output_partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
-        let shard_map = ShardMap::new(
-            device_mesh.logical_mesh().clone(),
-            vec![lhs_partition_spec.clone(), rhs_partition_spec.clone()],
-            vec![output_partition_spec.clone()],
-        )
-        .unwrap();
         let global_input_types = (
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None),
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None),
         );
-        let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map
-            .trace(&mut (), |_, (lhs, rhs): (ShardMapTracer, ShardMapTracer)| lhs.matmul(rhs), global_input_types)
-            .unwrap();
+        let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
+            &mut (),
+            |_, (lhs, rhs): (ShardMapTracer, ShardMapTracer)| lhs.matmul(rhs),
+            global_input_types,
+            device_mesh.logical_mesh().clone(),
+            (lhs_partition_spec.clone(), rhs_partition_spec.clone()),
+            output_partition_spec.clone(),
+        )
+        .unwrap();
         let mlir_program = traced.to_mlir_module("main", "mesh").unwrap();
 
         assert_eq!(
