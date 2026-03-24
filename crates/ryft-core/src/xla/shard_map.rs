@@ -18,7 +18,7 @@
 //! lowers them to [`NamedSharding`] values.
 //!
 //! `ShardMap` derives its manual axes from the mesh itself: every axis whose type is
-//! [`Manual`](super::sharding::MeshAxisType::Manual) is treated as manual for the
+//! [`Manual`](crate::types::MeshAxisType::Manual) is treated as manual for the
 //! `sdy.manual_computation` region.
 //!
 //! This matters because Shardy requires each manual axis to be made explicit in every
@@ -106,7 +106,7 @@ pub enum ShardMapError {
 /// A `ShardMap` stores the mesh plus the validated per-input and per-output shardings.
 ///
 /// The manual axes are not stored separately; they are always derived from the mesh axes whose
-/// type is [`Manual`](super::sharding::MeshAxisType::Manual).
+/// type is [`Manual`](crate::types::MeshAxisType::Manual).
 ///
 /// The public constructors accept [`PartitionSpec`] values because that is the natural
 /// JAX-facing surface. Internally, those partition specs are converted to [`NamedSharding`]
@@ -124,7 +124,7 @@ pub struct ShardMap {
 impl ShardMap {
     /// Creates a `ShardMap` whose manual axes are derived from the mesh.
     ///
-    /// Every mesh axis with type [`Manual`](super::sharding::MeshAxisType::Manual) is treated as
+    /// Every mesh axis with type [`Manual`](crate::types::MeshAxisType::Manual) is treated as
     /// manual inside the body. The constructor returns [`ShardMapError::MeshHasNoManualAxes`] if
     /// the mesh contains no manual axes.
     ///
@@ -508,11 +508,10 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use super::*;
+    use crate::types::MeshAxisType;
     use crate::types::data_types::DataType;
     use crate::xla::arrays::Array;
-    use crate::xla::sharding::{
-        DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, PartitionDimension, PartitionSpec, ShardingContext,
-    };
+    use crate::xla::sharding::{DeviceMesh, MeshAxis, MeshDevice, PartitionDimension, PartitionSpec, ShardingContext};
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![

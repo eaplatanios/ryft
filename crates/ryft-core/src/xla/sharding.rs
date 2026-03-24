@@ -150,6 +150,8 @@ use thiserror::Error;
 
 use ryft_pjrt::DeviceId;
 
+use crate::types::MeshAxisType;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -240,32 +242,6 @@ pub enum ShardingError {
     /// Error returned when the same axis appears in both the replicated and unreduced sets.
     #[error("axis '{axis_name}' appears in both replicated and unreduced sets")]
     AxisInBothReplicatedAndUnreduced { axis_name: String },
-}
-
-// ---------------------------------------------------------------------------
-// Mesh axis type
-// ---------------------------------------------------------------------------
-
-/// [`MeshAxis`] type which controls sharding constraint propagation. Each axis in a [`Mesh`] can be tagged with a
-/// [`MeshAxisType`] that tells the compiler (e.g., Shardy or [GSPMD](https://arxiv.org/abs/2105.04663)) how to treat
-/// shardings along that axis during sharding constraint propagation. This type corresponds to
-/// [`jax.sharding.AxisType`](https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.AxisType).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub enum MeshAxisType {
-    /// Used to represent mesh axes for which sharding information is inferred by the compiler
-    /// (e.g., Shardy or [GSPMD](https://arxiv.org/abs/2105.04663)) automatically.
-    #[default]
-    Auto,
-
-    /// Used to represent mesh axes for which sharding information is represented _explicitly_
-    /// as part of the type system and is propagated during tracing time, before compilation.
-    Explicit,
-
-    // TODO(eaplatanios): Link to the `shard_map` operation once we have it.
-    /// Used to represent mesh axes for which the user manages all device communication explicitly
-    /// (e.g., using an operation like `shard_map`, which is analogous to
-    /// [JAX's `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
-    Manual,
 }
 
 // ---------------------------------------------------------------------------

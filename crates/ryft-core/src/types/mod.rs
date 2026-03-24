@@ -1,10 +1,12 @@
 pub mod array_types;
 pub mod data_types;
 pub mod layouts;
+pub mod sharding;
 
 pub use array_types::*;
 pub use data_types::*;
 pub use layouts::*;
+pub use sharding::*;
 
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that
 /// Ryft needs to reason about values without inspecting the values themselves. Examples include scalar data types such
