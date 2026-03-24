@@ -1174,6 +1174,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use super::*;
+    use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
     use crate::types::MeshAxisType;
     use crate::types::data_types::DataType;
     use crate::xla::arrays::Array;
@@ -1234,6 +1235,13 @@ mod tests {
         let first = f32::from_ne_bytes(bytes[..size_of::<f32>()].try_into().unwrap());
         let second = f32::from_ne_bytes(bytes[size_of::<f32>()..].try_into().unwrap());
         [first, second]
+    }
+
+    fn assert_two_f32s_approx_eq(actual: [f32; 2], expected: [f32; 2]) {
+        let first_delta = (actual[0] - expected[0]).abs();
+        let second_delta = (actual[1] - expected[1]).abs();
+        assert!(first_delta <= 1e-5, "expected {} ~= {}; absolute error {}", actual[0], expected[0], first_delta);
+        assert!(second_delta <= 1e-5, "expected {} ~= {}; absolute error {}", actual[1], expected[1], second_delta);
     }
 
     #[test]
@@ -1720,6 +1728,117 @@ mod tests {
             let row = *row_start_by_device.get(&device_id).unwrap() as f32;
             assert_eq!(values[0], 4.0 * row + 8.0);
             assert_eq!(values[1], 4.0 * row + 4.0);
+        }
+    }
+
+    #[test]
+    fn test_traced_shard_map_composes_grad_and_vmap_on_cpu() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .expect("failed to create 4-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+
+        let mesh_devices = client_devices
+            .iter()
+            .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
+            .collect::<Vec<_>>();
+        let device_mesh =
+            DeviceMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()], mesh_devices).unwrap();
+
+        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
+            |x| {
+                let gradient = grad(|y| y.sin(), x.clone()).expect("gradient inside shard_map should succeed");
+                let lanes: Vec<ShardMapTracer> =
+                    vmap(|y| y.clone() + y.one_like(), vec![gradient.clone(), gradient]).expect("vmap should succeed");
+                lanes[0].clone() + lanes[1].clone()
+            },
+            global_input_type,
+            device_mesh.logical_mesh().clone(),
+            partition_spec.clone(),
+            partition_spec.clone(),
+        )
+        .unwrap();
+        let mlir_program = traced.to_mlir_module("main", "mesh").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %cst = stablehlo.constant dense<0.000000e+00> : tensor<2xf32>
+                      %1 = stablehlo.sine %arg1 : tensor<2xf32>
+                      %2 = stablehlo.cosine %arg1 : tensor<2xf32>
+                      %cst_0 = stablehlo.constant dense<1.000000e+00> : tensor<2xf32>
+                      %3 = stablehlo.multiply %2, %cst_0 : tensor<2xf32>
+                      %cst_1 = stablehlo.constant dense<1.000000e+00> : tensor<2xf32>
+                      %cst_2 = stablehlo.constant dense<1.000000e+00> : tensor<2xf32>
+                      %4 = stablehlo.add %3, %cst_1 : tensor<2xf32>
+                      %5 = stablehlo.add %3, %cst_2 : tensor<2xf32>
+                      %6 = stablehlo.add %4, %5 : tensor<2xf32>
+                      sdy.return %6 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        f32_values_to_bytes(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let input_array =
+            Array::from_sharding(vec![8], DataType::F32, device_mesh, partition_spec, input_buffers).unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 4);
+        let expected_values_by_device = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let first_input = device_index as f32 * 2.0 + 1.0;
+                let second_input = device_index as f32 * 2.0 + 2.0;
+                (device.id().unwrap(), [2.0 * first_input.cos() + 2.0, 2.0 * second_input.cos() + 2.0])
+            })
+            .collect::<HashMap<_, _>>();
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap();
+
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+            output.done.r#await().unwrap();
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_two_f32s_approx_eq(
+                two_f32s_from_bytes(output_bytes.as_slice()),
+                *expected_values_by_device.get(&device_id).unwrap(),
+            );
         }
     }
 
