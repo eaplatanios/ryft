@@ -246,17 +246,14 @@ pub enum ShardingError {
 // Mesh axis type
 // ---------------------------------------------------------------------------
 
-/// Per-axis property that controls sharding propagation behavior.
-///
-/// Each axis in a mesh can be tagged with a `MeshAxisType` that tells the compiler (Shardy/GSPMD)
-/// how to treat shardings along that axis during propagation.
-///
-/// This type corresponds to [`jax.sharding.AxisType`](
-/// https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.AxisType).
+/// [`MeshAxis`] type which controls sharding constraint propagation. Each axis in a [`Mesh`] can be tagged with a
+/// [`MeshAxisType`] that tells the compiler (e.g., Shardy or [GSPMD](https://arxiv.org/abs/2105.04663)) how to treat
+/// shardings along that axis during sharding constraint propagation. This type corresponds to
+/// [`jax.sharding.AxisType`](https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.AxisType).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum MeshAxisType {
     /// Used to represent mesh axes for which sharding information is inferred by the compiler
-    /// (e.g., Shardy or GSPMD) automatically.
+    /// (e.g., Shardy or [GSPMD](https://arxiv.org/abs/2105.04663)) automatically.
     #[default]
     Auto,
 
