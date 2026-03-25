@@ -20,6 +20,7 @@ mod jit;
 mod linear;
 mod matmul;
 mod ops;
+mod program;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod value;
@@ -33,11 +34,11 @@ pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, LinearTerm, Linearized, grad, hessian, jacfwd, jacrev, jvp_program,
     linearize, value_and_grad, vjp,
 };
-pub(crate) use linear::{try_jvp_program, try_vjp};
 pub use matmul::{MatMulOp, MatrixOps, MatrixTangentSpace, MatrixTransposeOp, MatrixValue};
 pub use ops::{
     AddOp, BatchOp, CosOp, JvpOp, LinearOp, LinearOpRef, MulOp, NegOp, Op, ScaleOp, SinOp, StagedOp, StagedOpRef,
 };
+pub use program::{Program, ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
@@ -92,10 +93,7 @@ pub enum TraceError {
 mod tests {
     use std::ops::{Add, Mul, Neg};
 
-    use crate::{
-        parameters::{Parameterized, ParameterizedFamily},
-        tracing_v2::test_support,
-    };
+    use crate::tracing_v2::test_support;
 
     use super::*;
 
@@ -125,62 +123,96 @@ mod tests {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
     }
 
+    trait HigherOrderScalarValue:
+        TraceValue
+        + Clone
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + Add<Output = Self>
+        + Mul<Output = Self>
+        + Neg<Output = Self>
+    {
+        fn first_derivative(self) -> Self;
+
+        fn second_derivative(self) -> Self;
+
+        fn third_derivative(self) -> Self;
+
+        fn fourth_derivative(self) -> Self;
+    }
+
+    impl HigherOrderScalarValue for f64 {
+        fn first_derivative(self) -> Self {
+            grad(quartic_plus_sin, self).expect("first derivative should be computable")
+        }
+
+        fn second_derivative(self) -> Self {
+            grad(first_derivative, self).expect("second derivative should be computable")
+        }
+
+        fn third_derivative(self) -> Self {
+            grad(second_derivative, self).expect("third derivative should be computable")
+        }
+
+        fn fourth_derivative(self) -> Self {
+            grad(third_derivative, self).expect("fourth derivative should be computable")
+        }
+    }
+
+    impl<V> HigherOrderScalarValue for JitTracer<V>
+    where
+        V: HigherOrderScalarValue,
+    {
+        fn first_derivative(self) -> Self {
+            grad(quartic_plus_sin, self).expect("first derivative should be computable")
+        }
+
+        fn second_derivative(self) -> Self {
+            grad(first_derivative, self).expect("second derivative should be computable")
+        }
+
+        fn third_derivative(self) -> Self {
+            grad(second_derivative, self).expect("third derivative should be computable")
+        }
+
+        fn fourth_derivative(self) -> Self {
+            grad(third_derivative, self).expect("fourth derivative should be computable")
+        }
+    }
+
     fn first_derivative<V>(x: V) -> V
     where
-        V: TraceValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
-        V::Family: ParameterizedFamily<Linearized<V>>,
+        V: HigherOrderScalarValue,
     {
-        grad(quartic_plus_sin, x).expect("first derivative should be computable")
+        V::first_derivative(x)
     }
 
     fn second_derivative<V>(x: V) -> V
     where
-        V: TraceValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
-        V::Family: ParameterizedFamily<Linearized<V>>,
+        V: HigherOrderScalarValue,
     {
-        grad(first_derivative, x).expect("second derivative should be computable")
+        V::second_derivative(x)
     }
 
     fn third_derivative<V>(x: V) -> V
     where
-        V: TraceValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
-        V::Family: ParameterizedFamily<Linearized<V>>,
+        V: HigherOrderScalarValue,
     {
-        grad(second_derivative, x).expect("third derivative should be computable")
+        V::third_derivative(x)
     }
 
     fn fourth_derivative<V>(x: V) -> V
     where
-        V: TraceValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
-        V::Family: ParameterizedFamily<Linearized<V>>,
+        V: HigherOrderScalarValue,
     {
-        grad(third_derivative, x).expect("fourth derivative should be computable")
+        V::fourth_derivative(x)
     }
 
     fn hessian_style_second_derivative<V>(x: V) -> V
     where
-        V: TraceValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
-        V::Family: ParameterizedFamily<Linearized<V>>,
+        V: HigherOrderScalarValue + TraceValue,
     {
         let (_, second_derivative) =
             jvp(first_derivative, x.clone(), x.one_like()).expect("forward-over-reverse Hessian should succeed");

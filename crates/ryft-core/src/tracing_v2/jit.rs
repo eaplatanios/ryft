@@ -19,8 +19,9 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
         FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
-        graph::{AtomId, Graph, GraphBuilder},
+        graph::AtomId,
         ops::{AddOp, CosOp, MulOp, NegOp, SinOp, StagedOpRef},
+        program::{Program, ProgramBuilder},
     },
     types::{ArrayType, Typed},
 };
@@ -34,7 +35,7 @@ where
     /// Concrete value obtained during eager execution of the staged computation.
     pub value: V,
     atom: AtomId,
-    builder: Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>,
+    builder: Rc<RefCell<ProgramBuilder<V>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
 }
 
@@ -49,7 +50,7 @@ where
     }
 
     #[inline]
-    pub(crate) fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>> {
+    pub(crate) fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
         self.builder.clone()
     }
 
@@ -62,7 +63,7 @@ where
     pub(crate) fn from_staged_parts(
         value: V,
         atom: AtomId,
-        builder: Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>,
+        builder: Rc<RefCell<ProgramBuilder<V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
     ) -> Self {
         Self { value, atom, builder, staging_error }
@@ -243,7 +244,7 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    graph: Graph<StagedOpRef<V>, V, Input, Output>,
+    program: Program<V, Input, Output>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
@@ -254,7 +255,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
     fn clone(&self) -> Self {
-        Self { graph: self.graph.clone(), marker: PhantomData }
+        Self { program: self.program.clone(), marker: PhantomData }
     }
 }
 
@@ -265,14 +266,25 @@ where
     Output: Parameterized<V>,
 {
     #[inline]
-    pub(crate) fn from_graph(graph: Graph<StagedOpRef<V>, V, Input, Output>) -> Self {
-        Self { graph, marker: PhantomData }
+    pub(crate) fn from_graph(graph: crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output>) -> Self {
+        Self::from_program(Program::from_graph(graph))
+    }
+
+    #[inline]
+    pub(crate) fn from_program(program: Program<V, Input, Output>) -> Self {
+        Self { program, marker: PhantomData }
     }
 
     /// Returns the staged graph backing this compiled function.
     #[inline]
-    pub fn graph(&self) -> &Graph<StagedOpRef<V>, V, Input, Output> {
-        &self.graph
+    pub fn graph(&self) -> &crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output> {
+        self.program.graph()
+    }
+
+    /// Returns the staged program backing this compiled function.
+    #[inline]
+    pub fn program(&self) -> &Program<V, Input, Output> {
+        &self.program
     }
 
     /// Replays the staged graph on concrete input values.
@@ -281,7 +293,7 @@ where
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
-        self.graph.call(input)
+        self.program.call(input)
     }
 }
 
@@ -292,14 +304,14 @@ where
     Output: Parameterized<V>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.graph, formatter)
+        Display::fmt(&self.program, formatter)
     }
 }
 
-pub(crate) fn try_jit<F, Input, Output, V>(
+pub(crate) fn try_trace_program<F, Input, Output, V>(
     function: F,
     input: Input,
-) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
+) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -309,7 +321,7 @@ where
     F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
 {
     let input_structure = input.parameter_structure();
-    let builder = Rc::new(RefCell::new(GraphBuilder::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
     let staging_error = Rc::new(RefCell::new(None));
     let traced_input = Input::To::<JitTracer<V>>::from_parameters(
         input_structure.clone(),
@@ -338,11 +350,25 @@ where
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
-    let compiled = CompiledFunction {
-        graph: builder.build::<Input, Output>(outputs, input_structure, output_structure),
-        marker: PhantomData,
-    };
-    Ok((output_value, compiled))
+    let program =
+        Program::from_graph(builder.build::<Input, Output>(outputs, input_structure, output_structure)).simplify()?;
+    Ok((output_value, program))
+}
+
+pub(crate) fn try_jit<F, Input, Output, V>(
+    function: F,
+    input: Input,
+) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
+where
+    V: TraceValue,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
+{
+    let (output, program) = try_trace_program(function, input)?;
+    Ok((output, CompiledFunction::from_program(program)))
 }
 
 /// Stages `function` as a graph and returns both the eager output and the staged program.
@@ -370,7 +396,10 @@ mod tests {
 
     use indoc::indoc;
 
-    use crate::{parameters::Placeholder, tracing_v2::test_support};
+    use crate::{
+        parameters::Placeholder,
+        tracing_v2::{GraphBuilder, test_support},
+    };
 
     use super::*;
 

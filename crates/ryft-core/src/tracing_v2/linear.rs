@@ -13,13 +13,21 @@ use std::{
 
 use ryft_macros::Parameter;
 
+#[cfg(feature = "xla")]
+use crate::xla::{
+    try_apply_shard_map_program_jvp_rule, try_grad_traced_xla_inputs, try_transpose_shard_map_program_op,
+    uses_traced_xla_grad,
+};
 use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily},
+    parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
         forward::{JvpTracer, TangentSpace},
-        graph::{AtomId, Graph, GraphBuilder},
-        ops::{AddOp, LinearOpRef, NegOp, ScaleOp},
+        graph::{AtomId, Graph},
+        jit::{JitTracer, try_trace_program},
+        matmul::{LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixOps, MatrixTransposeOp, RightMatMulOp},
+        ops::{AddOp, CosOp, JvpOp, MulOp, NegOp, Op, ScaleOp, SinOp},
+        program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };
 
@@ -30,7 +38,7 @@ where
     V: TraceValue,
 {
     atom: AtomId,
-    builder: Rc<RefCell<GraphBuilder<LinearOpRef<V>, V>>>,
+    builder: Rc<RefCell<ProgramBuilder<V>>>,
 }
 
 impl<V> LinearTerm<V>
@@ -38,18 +46,23 @@ where
     V: TraceValue + FloatExt,
 {
     #[inline]
-    pub(crate) fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<LinearOpRef<V>, V>>> {
+    pub(crate) fn atom(&self) -> AtomId {
+        self.atom
+    }
+
+    #[inline]
+    pub(crate) fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
         self.builder.clone()
     }
 
     #[inline]
-    pub(crate) fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<GraphBuilder<LinearOpRef<V>, V>>>) -> Self {
+    pub(crate) fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<V>>>) -> Self {
         Self { atom, builder }
     }
 
     pub(crate) fn apply_staged_op(
         inputs: &[Self],
-        op: LinearOpRef<V>,
+        op: ProgramOpRef<V>,
         output_count: usize,
     ) -> Result<Vec<Self>, TraceError> {
         if inputs.is_empty() {
@@ -72,7 +85,7 @@ where
     }
 
     #[inline]
-    pub(crate) fn apply_linear_op(self, op: LinearOpRef<V>) -> Self {
+    pub(crate) fn apply_linear_op(self, op: ProgramOpRef<V>) -> Self {
         let atom = self
             .builder
             .borrow_mut()
@@ -105,7 +118,7 @@ where
 
 impl<V> TangentSpace<V> for LinearTerm<V>
 where
-    V: TraceValue + FloatExt + ZeroLike,
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
 {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
@@ -140,7 +153,7 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    graph: Graph<LinearOpRef<V>, V, Input, Output>,
+    program: Program<V, Input, Output>,
     zero: V,
     marker: PhantomData<fn(Input) -> Output>,
 }
@@ -152,7 +165,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
     fn clone(&self) -> Self {
-        Self { graph: self.graph.clone(), zero: self.zero.clone(), marker: PhantomData }
+        Self { program: self.program.clone(), zero: self.zero.clone(), marker: PhantomData }
     }
 }
 
@@ -162,10 +175,21 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
+    #[inline]
+    pub(crate) fn from_program(program: Program<V, Input, Output>, zero: V) -> Self {
+        Self { program, zero, marker: PhantomData }
+    }
+
     /// Returns the staged graph backing this linear program.
     #[inline]
-    pub fn graph(&self) -> &Graph<LinearOpRef<V>, V, Input, Output> {
-        &self.graph
+    pub fn graph(&self) -> &Graph<ProgramOpRef<V>, V, Input, Output> {
+        self.program.graph()
+    }
+
+    /// Returns the canonical staged program backing this linear program.
+    #[inline]
+    pub fn program(&self) -> &Program<V, Input, Output> {
+        &self.program
     }
 
     /// Applies the linear program to a concrete input tangent or cotangent.
@@ -174,81 +198,17 @@ where
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
-        self.graph.call(input)
+        self.program.call(input)
     }
 
     /// Transposes the linear program, turning a pushforward into a pullback.
     pub fn transpose(&self) -> Result<LinearProgram<V, Output, Input>, TraceError>
     where
-        V: FloatExt,
+        V: FloatExt + ZeroLike + MatrixOps,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn accumulate<V>(
-            builder: &mut GraphBuilder<LinearOpRef<V>, V>,
-            adjoints: &mut [Option<AtomId>],
-            atom: AtomId,
-            contribution: AtomId,
-        ) where
-            V: TraceValue + FloatExt,
-        {
-            adjoints[atom] = Some(match adjoints[atom] {
-                Some(existing) => builder
-                    .add_equation(Arc::new(AddOp), vec![existing, contribution])
-                    .expect("accumulating cotangents should succeed")[0],
-                None => contribution,
-            });
-        }
-
-        let mut builder = GraphBuilder::<LinearOpRef<V>, V>::new();
-        let mut output_cotangent_inputs = Vec::with_capacity(self.graph.outputs().len());
-        for output in self.graph.outputs() {
-            let abstract_value =
-                self.graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?.abstract_value.clone();
-            output_cotangent_inputs.push(builder.add_input_abstract(abstract_value));
-        }
-
-        let mut adjoints = vec![None; self.graph.atom_count()];
-        for (cotangent, output) in output_cotangent_inputs.into_iter().zip(self.graph.outputs().iter().copied()) {
-            accumulate(&mut builder, adjoints.as_mut_slice(), output, cotangent);
-        }
-
-        for equation in self.graph.equations().iter().rev() {
-            let equation_output_cotangents =
-                equation.outputs.iter().map(|output| adjoints[*output]).collect::<Option<Vec<_>>>();
-            let Some(equation_output_cotangents) = equation_output_cotangents else {
-                continue;
-            };
-            let input_cotangents = equation.op.transpose(
-                &mut builder,
-                equation.inputs.as_slice(),
-                equation.outputs.as_slice(),
-                equation_output_cotangents.as_slice(),
-            )?;
-            for (input, contribution) in equation.inputs.iter().copied().zip(input_cotangents) {
-                if let Some(contribution) = contribution {
-                    accumulate(&mut builder, adjoints.as_mut_slice(), input, contribution);
-                }
-            }
-        }
-
-        let zero_atom = builder.add_constant(self.zero.clone());
-        let outputs = self
-            .graph
-            .input_atoms()
-            .iter()
-            .copied()
-            .map(|input| adjoints[input].unwrap_or(zero_atom))
-            .collect::<Vec<_>>();
-        Ok(LinearProgram {
-            graph: builder.build::<Output, Input>(
-                outputs,
-                self.graph.output_structure().clone(),
-                self.graph.input_structure().clone(),
-            ),
-            zero: self.zero.clone(),
-            marker: PhantomData,
-        })
+        transpose_linear_program(self)
     }
 }
 
@@ -259,8 +219,535 @@ where
     Output: Parameterized<V>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.graph, formatter)
+        Display::fmt(&self.program, formatter)
     }
+}
+
+fn apply_program_jvp_rule<V>(
+    op: &dyn Op<V>,
+    inputs: &[JvpTracer<V, LinearTerm<V>>],
+) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+where
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+{
+    if let Some(add) = op.as_any().downcast_ref::<AddOp>() {
+        return add.jvp(inputs);
+    }
+    if let Some(mul) = op.as_any().downcast_ref::<MulOp>() {
+        return mul.jvp(inputs);
+    }
+    if let Some(neg) = op.as_any().downcast_ref::<NegOp>() {
+        return neg.jvp(inputs);
+    }
+    if let Some(sin) = op.as_any().downcast_ref::<SinOp>() {
+        return sin.jvp(inputs);
+    }
+    if let Some(cos) = op.as_any().downcast_ref::<CosOp>() {
+        return cos.jvp(inputs);
+    }
+    if let Some(scale) = op.as_any().downcast_ref::<ScaleOp<V>>() {
+        return scale.jvp(inputs);
+    }
+    if op.as_any().downcast_ref::<MatMulOp>().is_some() {
+        return Ok(vec![inputs[0].clone().matmul(inputs[1].clone())]);
+    }
+    if op.as_any().downcast_ref::<MatrixTransposeOp>().is_some() {
+        return Ok(vec![inputs[0].clone().transpose_matrix()]);
+    }
+    if let Some(left_matmul) = op.as_any().downcast_ref::<LeftMatMulOp<V>>() {
+        return Ok(vec![JvpTracer {
+            primal: left_matmul.factor().clone().matmul(inputs[0].primal.clone()),
+            tangent: LinearTerm::from_staged_parts(inputs[0].tangent.atom, inputs[0].tangent.builder_handle())
+                .apply_linear_op(Arc::new(LeftMatMulOp::new(left_matmul.factor().clone()))),
+        }]);
+    }
+    if let Some(right_matmul) = op.as_any().downcast_ref::<RightMatMulOp<V>>() {
+        return Ok(vec![JvpTracer {
+            primal: inputs[0].primal.clone().matmul(right_matmul.factor().clone()),
+            tangent: LinearTerm::from_staged_parts(inputs[0].tangent.atom, inputs[0].tangent.builder_handle())
+                .apply_linear_op(Arc::new(RightMatMulOp::new(right_matmul.factor().clone()))),
+        }]);
+    }
+    if op.as_any().downcast_ref::<LinearMatrixTransposeOp>().is_some() {
+        return Ok(vec![JvpTracer {
+            primal: inputs[0].primal.clone().transpose_matrix(),
+            tangent: LinearTerm::from_staged_parts(inputs[0].tangent.atom, inputs[0].tangent.builder_handle())
+                .apply_linear_op(Arc::new(LinearMatrixTransposeOp)),
+        }]);
+    }
+    #[cfg(feature = "xla")]
+    if let Some(result) = try_apply_shard_map_program_jvp_rule(op, inputs) {
+        return result;
+    }
+    Err(TraceError::HigherOrderOpFailure {
+        op: "linearize_program",
+        message: format!("JVP rule for staged op '{}' is not implemented", op.name()),
+    })
+}
+
+fn transpose_program_op<V>(
+    op: &dyn Op<V>,
+    builder: &mut ProgramBuilder<V>,
+    inputs: &[AtomId],
+    outputs: &[AtomId],
+    output_cotangents: &[AtomId],
+) -> Result<Vec<Option<AtomId>>, TraceError>
+where
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+{
+    if let Some(_add) = op.as_any().downcast_ref::<AddOp>() {
+        if inputs.len() != 2 {
+            return Err(TraceError::InvalidInputCount { expected: 2, got: inputs.len() });
+        }
+        if outputs.len() != 1 {
+            return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+        }
+        if output_cotangents.len() != 1 {
+            return Err(TraceError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+        }
+        return Ok(vec![Some(output_cotangents[0]), Some(output_cotangents[0])]);
+    }
+    if let Some(_neg) = op.as_any().downcast_ref::<NegOp>() {
+        if inputs.len() != 1 {
+            return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        let contribution = builder.add_equation(Arc::new(NegOp), vec![output_cotangents[0]])?[0];
+        return Ok(vec![Some(contribution)]);
+    }
+    if let Some(scale) = op.as_any().downcast_ref::<ScaleOp<V>>() {
+        if inputs.len() != 1 {
+            return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        let contribution =
+            builder.add_equation(Arc::new(ScaleOp::new(scale.factor().clone())), vec![output_cotangents[0]])?[0];
+        return Ok(vec![Some(contribution)]);
+    }
+    if let Some(left_matmul) = op.as_any().downcast_ref::<LeftMatMulOp<V>>() {
+        if inputs.len() != 1 {
+            return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        let contribution = builder.add_equation(
+            Arc::new(LeftMatMulOp::new(left_matmul.factor().clone().transpose_matrix())),
+            vec![output_cotangents[0]],
+        )?[0];
+        return Ok(vec![Some(contribution)]);
+    }
+    if let Some(right_matmul) = op.as_any().downcast_ref::<RightMatMulOp<V>>() {
+        if inputs.len() != 1 {
+            return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        let contribution = builder.add_equation(
+            Arc::new(RightMatMulOp::new(right_matmul.factor().clone().transpose_matrix())),
+            vec![output_cotangents[0]],
+        )?[0];
+        return Ok(vec![Some(contribution)]);
+    }
+    if let Some(_linear_transpose) = op.as_any().downcast_ref::<LinearMatrixTransposeOp>() {
+        if inputs.len() != 1 {
+            return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+        }
+        let contribution = builder.add_equation(Arc::new(LinearMatrixTransposeOp), vec![output_cotangents[0]])?[0];
+        return Ok(vec![Some(contribution)]);
+    }
+    #[cfg(feature = "xla")]
+    if let Some(result) = try_transpose_shard_map_program_op(op, builder, inputs, outputs, output_cotangents) {
+        return result;
+    }
+    Err(TraceError::HigherOrderOpFailure {
+        op: "transpose_linear_program",
+        message: format!("transpose rule for staged op '{}' is not implemented", op.name()),
+    })
+}
+
+pub(crate) fn linearize_program<V, Input, Output>(
+    program: &Program<V, Input, Output>,
+) -> Result<LinearProgram<V, Input, Output>, TraceError>
+where
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+{
+    fn tangent_for_atom<V, Input, Output>(
+        graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
+        builder: &Rc<RefCell<ProgramBuilder<V>>>,
+        tangents: &mut [Option<LinearTerm<V>>],
+        atom_id: AtomId,
+    ) -> Result<LinearTerm<V>, TraceError>
+    where
+        V: TraceValue + FloatExt + ZeroLike,
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+    {
+        if let Some(term) = tangents[atom_id].clone() {
+            return Ok(term);
+        }
+        let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
+        let tangent_atom = builder.borrow_mut().add_constant(atom.example_value.zero_like());
+        let tangent = LinearTerm::from_staged_parts(tangent_atom, builder.clone());
+        tangents[atom_id] = Some(tangent.clone());
+        Ok(tangent)
+    }
+
+    let graph = program.graph();
+    let zero = graph
+        .input_atoms()
+        .first()
+        .and_then(|input_atom| graph.atom(*input_atom))
+        .map(|atom| atom.example_value.zero_like())
+        .ok_or(TraceError::EmptyParameterizedValue)?;
+    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    let mut tangents = vec![None; graph.atom_count()];
+    for input_atom in graph.input_atoms().iter().copied() {
+        let input = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+        let tangent_atom = builder
+            .borrow_mut()
+            .add_input_abstract(input.abstract_value.clone(), input.example_value.zero_like());
+        tangents[input_atom] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
+    }
+
+    for equation in graph.equations() {
+        let input_duals = equation
+            .inputs
+            .iter()
+            .copied()
+            .map(|input_atom| {
+                let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+                Ok(JvpTracer {
+                    primal: atom.example_value.clone(),
+                    tangent: tangent_for_atom(graph, &builder, tangents.as_mut_slice(), input_atom)?,
+                })
+            })
+            .collect::<Result<Vec<_>, TraceError>>()?;
+        let output_duals = apply_program_jvp_rule(equation.op.as_ref(), input_duals.as_slice())?;
+        if output_duals.len() != equation.outputs.len() {
+            return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
+        }
+        for (output_atom, output_dual) in equation.outputs.iter().copied().zip(output_duals.into_iter()) {
+            tangents[output_atom] = Some(output_dual.tangent);
+        }
+    }
+
+    let output_tangents = graph
+        .outputs()
+        .iter()
+        .copied()
+        .map(|output_atom| {
+            tangent_for_atom(graph, &builder, tangents.as_mut_slice(), output_atom).map(|term| term.atom)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(tangents);
+    let builder = match Rc::try_unwrap(builder) {
+        Ok(builder) => builder.into_inner(),
+        Err(_) => {
+            return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
+        }
+    };
+    Ok(LinearProgram {
+        program: Program::from_graph(builder.build::<Input, Output>(
+            output_tangents,
+            graph.input_structure().clone(),
+            graph.output_structure().clone(),
+        ))
+        .simplify()?,
+        zero,
+        marker: PhantomData,
+    })
+}
+
+pub(crate) fn transpose_linear_program<V, Input, Output>(
+    program: &LinearProgram<V, Input, Output>,
+) -> Result<LinearProgram<V, Output, Input>, TraceError>
+where
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+{
+    fn accumulate<V>(
+        builder: &mut ProgramBuilder<V>,
+        adjoints: &mut [Option<AtomId>],
+        atom: AtomId,
+        contribution: AtomId,
+    ) -> Result<(), TraceError>
+    where
+        V: TraceValue + FloatExt,
+    {
+        adjoints[atom] = Some(match adjoints[atom] {
+            Some(existing) => builder.add_equation(Arc::new(AddOp), vec![existing, contribution])?[0],
+            None => contribution,
+        });
+        Ok(())
+    }
+
+    let graph = program.program.graph();
+    let mut builder = ProgramBuilder::<V>::new();
+    let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
+    for output in graph.outputs() {
+        let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
+        output_cotangent_inputs.push(
+            builder.add_input_abstract(output_atom.abstract_value.clone(), output_atom.example_value.zero_like()),
+        );
+    }
+
+    let mut adjoints = vec![None; graph.atom_count()];
+    for (cotangent, output) in output_cotangent_inputs.into_iter().zip(graph.outputs().iter().copied()) {
+        accumulate(&mut builder, adjoints.as_mut_slice(), output, cotangent)?;
+    }
+
+    for equation in graph.equations().iter().rev() {
+        let equation_output_cotangents =
+            equation.outputs.iter().map(|output| adjoints[*output]).collect::<Option<Vec<_>>>();
+        let Some(equation_output_cotangents) = equation_output_cotangents else {
+            continue;
+        };
+        let input_cotangents = transpose_program_op(
+            equation.op.as_ref(),
+            &mut builder,
+            equation.inputs.as_slice(),
+            equation.outputs.as_slice(),
+            equation_output_cotangents.as_slice(),
+        )?;
+        for (input, contribution) in equation.inputs.iter().copied().zip(input_cotangents) {
+            if let Some(contribution) = contribution {
+                accumulate(&mut builder, adjoints.as_mut_slice(), input, contribution)?;
+            }
+        }
+    }
+
+    let zero_atom = builder.add_constant(program.zero.clone());
+    let outputs = graph
+        .input_atoms()
+        .iter()
+        .copied()
+        .map(|input| adjoints[input].unwrap_or(zero_atom))
+        .collect::<Vec<_>>();
+    Ok(LinearProgram {
+        program: Program::from_graph(builder.build::<Output, Input>(
+            outputs,
+            graph.output_structure().clone(),
+            graph.input_structure().clone(),
+        ))
+        .simplify()?,
+        zero: program.zero.clone(),
+        marker: PhantomData,
+    })
+}
+
+fn lift_traced_constant<V>(constant: &V, inputs: &[JitTracer<V>]) -> Result<JitTracer<V>, TraceError>
+where
+    V: TraceValue,
+{
+    let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+    let atom = exemplar.builder_handle().borrow_mut().add_constant(constant.clone());
+    Ok(JitTracer::from_staged_parts(constant.clone(), atom, exemplar.builder_handle(), exemplar.staging_error_handle()))
+}
+
+trait ReplayProgramValue<V>: Clone
+where
+    V: TraceValue,
+{
+    fn lift_constant(constant: &V, inputs: &[Self]) -> Result<Self, TraceError>;
+
+    fn apply_program_op(op: &dyn Op<V>, inputs: Vec<Self>) -> Result<Vec<Self>, TraceError>;
+}
+
+impl<V> ReplayProgramValue<V> for JitTracer<V>
+where
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps,
+{
+    fn lift_constant(constant: &V, inputs: &[Self]) -> Result<Self, TraceError> {
+        lift_traced_constant(constant, inputs)
+    }
+
+    fn apply_program_op(op: &dyn Op<V>, inputs: Vec<Self>) -> Result<Vec<Self>, TraceError> {
+        if op.as_any().downcast_ref::<AddOp>().is_some() {
+            return Ok(vec![inputs[0].clone() + inputs[1].clone()]);
+        }
+        if op.as_any().downcast_ref::<MulOp>().is_some() {
+            return Ok(vec![inputs[0].clone() * inputs[1].clone()]);
+        }
+        if op.as_any().downcast_ref::<NegOp>().is_some() {
+            return Ok(vec![-inputs[0].clone()]);
+        }
+        if op.as_any().downcast_ref::<SinOp>().is_some() {
+            return Ok(vec![inputs[0].clone().sin()]);
+        }
+        if op.as_any().downcast_ref::<CosOp>().is_some() {
+            return Ok(vec![inputs[0].clone().cos()]);
+        }
+        if let Some(scale) = op.as_any().downcast_ref::<ScaleOp<V>>() {
+            let factor = Self::lift_constant(scale.factor(), inputs.as_slice())?;
+            return Ok(vec![factor * inputs[0].clone()]);
+        }
+        if op.as_any().downcast_ref::<MatMulOp>().is_some() {
+            return Ok(vec![inputs[0].clone().matmul(inputs[1].clone())]);
+        }
+        if op.as_any().downcast_ref::<MatrixTransposeOp>().is_some()
+            || op.as_any().downcast_ref::<LinearMatrixTransposeOp>().is_some()
+        {
+            return Ok(vec![inputs[0].clone().transpose_matrix()]);
+        }
+        if let Some(left_matmul) = op.as_any().downcast_ref::<LeftMatMulOp<V>>() {
+            let factor = Self::lift_constant(left_matmul.factor(), inputs.as_slice())?;
+            return Ok(vec![factor.matmul(inputs[0].clone())]);
+        }
+        if let Some(right_matmul) = op.as_any().downcast_ref::<RightMatMulOp<V>>() {
+            let factor = Self::lift_constant(right_matmul.factor(), inputs.as_slice())?;
+            return Ok(vec![inputs[0].clone().matmul(factor)]);
+        }
+        Err(TraceError::HigherOrderOpFailure {
+            op: "replay_program_graph",
+            message: format!("replaying staged op '{}' is not implemented", op.name()),
+        })
+    }
+}
+
+impl<V> ReplayProgramValue<V> for Linearized<JitTracer<V>>
+where
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps,
+{
+    fn lift_constant(constant: &V, inputs: &[Self]) -> Result<Self, TraceError> {
+        let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+        let primal = lift_traced_constant(constant, std::slice::from_ref(&exemplar.primal))?;
+        let tangent_atom = exemplar.tangent.builder_handle().borrow_mut().add_constant(primal.zero_like());
+        let tangent = LinearTerm::from_staged_parts(tangent_atom, exemplar.tangent.builder_handle());
+        Ok(Linearized { primal, tangent })
+    }
+
+    fn apply_program_op(op: &dyn Op<V>, inputs: Vec<Self>) -> Result<Vec<Self>, TraceError> {
+        if op.as_any().downcast_ref::<AddOp>().is_some() {
+            return Ok(vec![inputs[0].clone() + inputs[1].clone()]);
+        }
+        if op.as_any().downcast_ref::<MulOp>().is_some() {
+            return Ok(vec![inputs[0].clone() * inputs[1].clone()]);
+        }
+        if op.as_any().downcast_ref::<NegOp>().is_some() {
+            return Ok(vec![-inputs[0].clone()]);
+        }
+        if op.as_any().downcast_ref::<SinOp>().is_some() {
+            return Ok(vec![inputs[0].clone().sin()]);
+        }
+        if op.as_any().downcast_ref::<CosOp>().is_some() {
+            return Ok(vec![inputs[0].clone().cos()]);
+        }
+        if let Some(scale) = op.as_any().downcast_ref::<ScaleOp<V>>() {
+            let factor = Self::lift_constant(scale.factor(), inputs.as_slice())?;
+            return Ok(vec![factor * inputs[0].clone()]);
+        }
+        if op.as_any().downcast_ref::<MatMulOp>().is_some() {
+            return Ok(vec![inputs[0].clone().matmul(inputs[1].clone())]);
+        }
+        if op.as_any().downcast_ref::<MatrixTransposeOp>().is_some()
+            || op.as_any().downcast_ref::<LinearMatrixTransposeOp>().is_some()
+        {
+            return Ok(vec![inputs[0].clone().transpose_matrix()]);
+        }
+        if let Some(left_matmul) = op.as_any().downcast_ref::<LeftMatMulOp<V>>() {
+            let factor = Self::lift_constant(left_matmul.factor(), inputs.as_slice())?;
+            return Ok(vec![factor.matmul(inputs[0].clone())]);
+        }
+        if let Some(right_matmul) = op.as_any().downcast_ref::<RightMatMulOp<V>>() {
+            let factor = Self::lift_constant(right_matmul.factor(), inputs.as_slice())?;
+            return Ok(vec![inputs[0].clone().matmul(factor)]);
+        }
+        Err(TraceError::HigherOrderOpFailure {
+            op: "replay_program_graph",
+            message: format!("replaying staged op '{}' is not implemented", op.name()),
+        })
+    }
+}
+
+fn replay_program_graph<GraphInput, GraphOutput, V, R>(
+    graph: &Graph<ProgramOpRef<V>, V, GraphInput, GraphOutput>,
+    inputs: Vec<R>,
+) -> Result<Vec<R>, TraceError>
+where
+    GraphInput: Parameterized<V>,
+    GraphOutput: Parameterized<V>,
+    V: TraceValue,
+    R: ReplayProgramValue<V>,
+{
+    let mut values = vec![None; graph.atom_count()];
+    for (atom_id, value) in graph.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
+        values[atom_id] = Some(value);
+    }
+
+    let mut equation_by_first_output = vec![None; graph.atom_count()];
+    for (equation_index, equation) in graph.equations().iter().enumerate() {
+        if let Some(first_output) = equation.outputs.first() {
+            equation_by_first_output[*first_output] = Some(equation_index);
+        }
+    }
+
+    for atom_id in 0..graph.atom_count() {
+        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
+        match atom.source {
+            crate::tracing_v2::AtomSource::Input => {}
+            crate::tracing_v2::AtomSource::Constant => {
+                let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
+                if seed_inputs.is_empty() {
+                    return Err(TraceError::EmptyParameterizedValue);
+                }
+                values[atom_id] = Some(R::lift_constant(&atom.example_value, seed_inputs.as_slice())?);
+            }
+            crate::tracing_v2::AtomSource::Derived => {
+                let Some(equation_index) = equation_by_first_output[atom_id] else {
+                    continue;
+                };
+                let equation = &graph.equations()[equation_index];
+                let input_values = equation
+                    .inputs
+                    .iter()
+                    .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let outputs = R::apply_program_op(equation.op.as_ref(), input_values)?;
+                for (output_atom, output_value) in equation.outputs.iter().copied().zip(outputs) {
+                    values[output_atom] = Some(output_value);
+                }
+            }
+        }
+    }
+
+    graph
+        .outputs()
+        .iter()
+        .map(|output| values[*output].clone().ok_or(TraceError::UnboundAtomId { id: *output }))
+        .collect()
+}
+
+fn try_linearize_traced_program<V>(
+    program: &Program<V, Vec<V>, Vec<V>>,
+    primals: Vec<JitTracer<V>>,
+) -> Result<(Vec<JitTracer<V>>, LinearProgram<JitTracer<V>, Vec<JitTracer<V>>, Vec<JitTracer<V>>>), TraceError>
+where
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps,
+{
+    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
+    let input_count = primals.len();
+    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    let traced_input = primals
+        .into_iter()
+        .map(|primal| {
+            let atom = builder.borrow_mut().add_input(&primal);
+            Linearized { primal, tangent: LinearTerm::from_staged_parts(atom, builder.clone()) }
+        })
+        .collect::<Vec<_>>();
+    let traced_output = replay_program_graph(program.graph(), traced_input)?;
+    let primal_outputs = traced_output.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
+    let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom()).collect::<Vec<_>>();
+    drop(traced_output);
+    let builder = match Rc::try_unwrap(builder) {
+        Ok(builder) => builder.into_inner(),
+        Err(_) => {
+            return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
+        }
+    };
+    let program = Program::from_graph(builder.build::<Vec<JitTracer<V>>, Vec<JitTracer<V>>>(
+        tangent_outputs,
+        vec![Placeholder; input_count],
+        vec![Placeholder; primal_outputs.len()],
+    ))
+    .simplify()?;
+    Ok((primal_outputs, LinearProgram::from_program(program, zero)))
 }
 
 pub(crate) fn try_jvp_program<F, Input, Output, V>(
@@ -268,53 +755,15 @@ pub(crate) fn try_jvp_program<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike,
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
 {
-    let input_structure = primals.parameter_structure();
-    let primal_parameters = primals.into_parameters().collect::<Vec<_>>();
-    let zero = primal_parameters
-        .first()
-        .map(|value| value.zero_like())
-        .ok_or(TraceError::EmptyParameterizedValue)?;
-
-    let builder = Rc::new(RefCell::new(GraphBuilder::new()));
-    let traced_input = Input::To::<Linearized<V>>::from_parameters(
-        input_structure.clone(),
-        primal_parameters.into_iter().map(|primal| {
-            let atom = builder.borrow_mut().add_input(&primal);
-            JvpTracer { primal, tangent: LinearTerm { atom, builder: builder.clone() } }
-        }),
-    )?;
-
-    let (output_structure, primal_outputs, tangent_outputs) = {
-        let traced_output = function(traced_input)?;
-        let output_structure = traced_output.parameter_structure();
-        let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
-        let primal_outputs = traced_outputs.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
-        let tangent_outputs = traced_outputs.into_iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
-        (output_structure, primal_outputs, tangent_outputs)
-    };
-
-    let primal_output = Output::from_parameters(output_structure.clone(), primal_outputs)?;
-    let builder = match Rc::try_unwrap(builder) {
-        Ok(builder) => builder.into_inner(),
-        Err(_) => {
-            return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
-        }
-    };
-    Ok((
-        primal_output,
-        LinearProgram {
-            graph: builder.build::<Input, Output>(tangent_outputs, input_structure, output_structure),
-            zero,
-            marker: PhantomData,
-        },
-    ))
+    let (primal_output, program) = try_trace_program(function, primals)?;
+    Ok((primal_output, linearize_program(&program)?))
 }
 
 /// Runs a forward trace and returns both the primal output and the staged pushforward.
@@ -323,12 +772,12 @@ pub fn jvp_program<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike,
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
 {
     try_jvp_program(|input| Ok(function(input)), primals)
 }
@@ -339,12 +788,12 @@ pub fn linearize<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike,
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
 {
     jvp_program(function, primals)
 }
@@ -354,12 +803,12 @@ pub(crate) fn try_vjp<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike,
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
 {
     let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(function, primals)?;
     Ok((output, pushforward.transpose()?))
@@ -371,45 +820,152 @@ pub fn vjp<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike,
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
 {
     try_vjp(|input| Ok(function(input)), primals)
 }
 
 fn try_grad<F, Input, V>(function: F, primals: Input) -> Result<Input, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Result<Linearized<V>, TraceError>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<JitTracer<V>, TraceError>,
 {
     let (output, pullback): (V, LinearProgram<V, V, Input>) = try_vjp(function, primals)?;
     pullback.call(output.one_like())
 }
 
-/// Computes the reverse-mode gradient of a scalar-output function.
-pub fn grad<F, Input, V>(function: F, primals: Input) -> Result<Input, TraceError>
+/// Marker trait for concrete leaf types that use the standard public [`grad`] entry point.
+pub(crate) trait GradConcreteLeaf: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps {}
+
+impl GradConcreteLeaf for f32 {}
+
+impl GradConcreteLeaf for f64 {}
+
+#[cfg(any(feature = "ndarray", test))]
+impl GradConcreteLeaf for ndarray::Array2<f32> {}
+
+#[cfg(any(feature = "ndarray", test))]
+impl GradConcreteLeaf for ndarray::Array2<f64> {}
+
+/// Dispatch trait used by [`grad`] so it can operate both on concrete values and on already traced values.
+#[doc(hidden)]
+pub trait GradInvocationLeaf<Input>: Parameter + Sized
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Linearized<V>,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 {
-    try_grad(|input| Ok(function(input)), primals)
+    /// Base leaf value used for the staged inner program.
+    type Base: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps;
+
+    /// Return type produced by [`grad`] for the corresponding input regime.
+    type Return;
+
+    /// Traced input type expected by the user-provided function.
+    type FunctionInput;
+
+    /// Invokes [`grad`] for one concrete leaf regime.
+    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>;
+}
+
+impl<V, Input> GradInvocationLeaf<Input> for V
+where
+    V: GradConcreteLeaf,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+{
+    type Base = V;
+    type Return = Input;
+    type FunctionInput = Input::To<JitTracer<V>>;
+
+    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>,
+    {
+        try_grad(|input| Ok(function(input)), primals)
+    }
+}
+
+impl<V, Input> GradInvocationLeaf<Input> for JitTracer<V>
+where
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Input::Family: ParameterizedFamily<V>,
+{
+    type Base = V;
+    type Return = Input;
+    type FunctionInput = Input;
+
+    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>,
+    {
+        #[cfg(feature = "xla")]
+        if uses_traced_xla_grad::<V>() {
+            return try_grad_traced_xla_inputs::<V, Input, F>(function, primals);
+        }
+
+        let input_structure = primals.parameter_structure();
+        let traced_primals = primals.into_parameters().collect::<Vec<_>>();
+        let staged_primals = Input::To::<V>::from_parameters(
+            input_structure.clone(),
+            traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+        )?;
+        let (_, traced_program): (V, Program<V, Input::To<V>, V>) = try_trace_program(
+            |staged_input| {
+                let adapted_input = Input::from_parameters(
+                    input_structure.clone(),
+                    staged_input.into_parameters().collect::<Vec<_>>(),
+                )?;
+                Ok(function(adapted_input))
+            },
+            staged_primals,
+        )?;
+        let traced_program = Program::from_graph(
+            traced_program
+                .graph()
+                .clone_with_structures::<Vec<V>, Vec<V>>(vec![Placeholder; traced_primals.len()], vec![Placeholder; 1]),
+        )
+        .simplify()?;
+        let (outputs, pushforward) = try_linearize_traced_program(&traced_program, traced_primals)?;
+        if outputs.len() != 1 {
+            return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+        }
+        let pullback = pushforward.transpose()?;
+        let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
+        Ok(Input::from_parameters(input_structure, traced_gradient)?)
+    }
+}
+
+/// Computes the reverse-mode gradient of a scalar-output function.
+pub fn grad<F, Input, Leaf>(
+    function: F,
+    primals: Input,
+) -> Result<<Leaf as GradInvocationLeaf<Input>>::Return, TraceError>
+where
+    Leaf: GradInvocationLeaf<Input>,
+    Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(
+        <Leaf as GradInvocationLeaf<Input>>::FunctionInput,
+    ) -> JitTracer<<Leaf as GradInvocationLeaf<Input>>::Base>,
+{
+    Leaf::invoke(function, primals)
 }
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 pub fn value_and_grad<F, Input, V>(function: F, primals: Input) -> Result<(V, Input), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Linearized<V>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> JitTracer<V>,
 {
     let (output, pullback): (V, LinearProgram<V, V, Input>) = vjp(function, primals)?;
     let gradient = pullback.call(output.one_like())?;
@@ -647,12 +1203,12 @@ fn try_jacfwd<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + FloatExt,
+    V: CoordinateValue + FloatExt + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -684,12 +1240,12 @@ pub fn jacfwd<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + FloatExt,
+    V: CoordinateValue + FloatExt + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
 {
     try_jacfwd::<_, Input, Output, V>(|input| Ok(function(input)), primals)
 }
@@ -699,12 +1255,12 @@ fn try_jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + FloatExt,
+    V: CoordinateValue + FloatExt + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Result<Output::To<Linearized<V>>, TraceError>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -730,12 +1286,12 @@ pub fn jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + FloatExt,
+    V: CoordinateValue + FloatExt + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
 {
     try_jacrev::<_, Input, Output, V>(|input| Ok(function(input)), primals)
 }
@@ -749,10 +1305,10 @@ pub fn hessian<F, Input, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + FloatExt,
+    V: CoordinateValue + FloatExt + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Input::To<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Input::To<JitTracer<V>>,
 {
     jacfwd::<F, Input, Input, V>(gradient_function, primals)
 }
@@ -844,10 +1400,9 @@ mod tests {
                 lambda %0:f64[] .
                 let %1:f64[] = scale %0
                     %2:f64[] = scale %0
-                    %3:f64[] = scale %0
-                    %4:f64[] = add %1 %3
-                    %5:f64[] = const
-                in (%4, %2)
+                    %3:f64[] = add %1 %2
+                    %4:f64[] = scale %0
+                in (%3, %4)
             "}
             .trim_end(),
         );

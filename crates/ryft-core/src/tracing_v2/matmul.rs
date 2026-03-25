@@ -39,6 +39,30 @@ pub trait MatrixValue: TraceValue + MatrixOps {}
 
 impl<T> MatrixValue for T where T: TraceValue + MatrixOps {}
 
+impl MatrixOps for f32 {
+    #[inline]
+    fn matmul(self, rhs: Self) -> Self {
+        self * rhs
+    }
+
+    #[inline]
+    fn transpose_matrix(self) -> Self {
+        self
+    }
+}
+
+impl MatrixOps for f64 {
+    #[inline]
+    fn matmul(self, rhs: Self) -> Self {
+        self * rhs
+    }
+
+    #[inline]
+    fn transpose_matrix(self) -> Self {
+        self
+    }
+}
+
 /// Tangent representation for matrix-valued primals.
 pub trait MatrixTangentSpace<V>: TangentSpace<V>
 where
@@ -229,8 +253,9 @@ where
     }
 }
 
+/// Linear map `tangent -> factor @ tangent`.
 #[derive(Clone)]
-struct LeftMatMulOp<V>
+pub(crate) struct LeftMatMulOp<V>
 where
     V: MatrixValue,
 {
@@ -242,8 +267,13 @@ where
     V: MatrixValue,
 {
     #[inline]
-    fn new(factor: V) -> Self {
+    pub(crate) fn new(factor: V) -> Self {
         Self { factor }
+    }
+
+    #[inline]
+    pub(crate) fn factor(&self) -> &V {
+        &self.factor
     }
 }
 
@@ -288,6 +318,18 @@ where
     }
 }
 
+impl<V> BatchOp<V> for LeftMatMulOp<V>
+where
+    V: MatrixValue,
+{
+    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![BatchedValue::new(
+            inputs[0].lanes().iter().cloned().map(|lane| self.factor.clone().matmul(lane)).collect(),
+        )])
+    }
+}
+
 impl<V> LinearOp<V> for LeftMatMulOp<V>
 where
     V: MatrixValue,
@@ -310,8 +352,9 @@ where
     }
 }
 
+/// Linear map `tangent -> tangent @ factor`.
 #[derive(Clone)]
-struct RightMatMulOp<V>
+pub(crate) struct RightMatMulOp<V>
 where
     V: MatrixValue,
 {
@@ -323,8 +366,13 @@ where
     V: MatrixValue,
 {
     #[inline]
-    fn new(factor: V) -> Self {
+    pub(crate) fn new(factor: V) -> Self {
         Self { factor }
+    }
+
+    #[inline]
+    pub(crate) fn factor(&self) -> &V {
+        &self.factor
     }
 }
 
@@ -369,6 +417,18 @@ where
     }
 }
 
+impl<V> BatchOp<V> for RightMatMulOp<V>
+where
+    V: MatrixValue,
+{
+    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![BatchedValue::new(
+            inputs[0].lanes().iter().cloned().map(|lane| lane.matmul(self.factor.clone())).collect(),
+        )])
+    }
+}
+
 impl<V> LinearOp<V> for RightMatMulOp<V>
 where
     V: MatrixValue,
@@ -391,8 +451,9 @@ where
     }
 }
 
+/// Linear transpose primitive used inside matrix-valued pushforwards and pullbacks.
 #[derive(Clone, Default)]
-struct LinearMatrixTransposeOp;
+pub(crate) struct LinearMatrixTransposeOp;
 
 impl Debug for LinearMatrixTransposeOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -426,6 +487,16 @@ where
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])
+    }
+}
+
+impl<V> BatchOp<V> for LinearMatrixTransposeOp
+where
+    V: MatrixValue,
+{
+    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])
     }
 }
 
@@ -686,10 +757,7 @@ mod tests {
     use ndarray::{Array2, arr2};
 
     use super::{MatrixOps, MatrixValue};
-    use crate::{
-        parameters::{Parameterized, ParameterizedFamily},
-        tracing_v2::{FloatExt, Linearized, OneLike, ZeroLike, grad, hessian, jit, jvp, test_support, vjp, vmap},
-    };
+    use crate::tracing_v2::{FloatExt, JitTracer, OneLike, ZeroLike, grad, hessian, jit, jvp, test_support, vjp, vmap};
 
     fn approx_eq_matrix(left: &Array2<f64>, right: &Array2<f64>) {
         assert_eq!(left.shape(), right.shape(), "matrix shapes differ: {:?} vs {:?}", left.shape(), right.shape());
@@ -714,29 +782,38 @@ mod tests {
         x.matmul(a).sin().matmul(b).matmul(c)
     }
 
+    trait HigherOrderMatrixValue: MatrixValue + FloatExt + ZeroLike + OneLike + Sized {
+        fn full_matrix_gradient(inputs: (Self, Self, Self, Self)) -> (Self, Self, Self, Self);
+    }
+
+    impl HigherOrderMatrixValue for Array2<f64> {
+        fn full_matrix_gradient(inputs: (Self, Self, Self, Self)) -> (Self, Self, Self, Self) {
+            grad(three_matmul_sine, inputs).expect("matrix gradient should succeed")
+        }
+    }
+
+    impl<V> HigherOrderMatrixValue for JitTracer<V>
+    where
+        V: HigherOrderMatrixValue,
+    {
+        fn full_matrix_gradient(inputs: (Self, Self, Self, Self)) -> (Self, Self, Self, Self) {
+            grad(three_matmul_sine, inputs).expect("matrix gradient should succeed")
+        }
+    }
+
     fn first_matrix_gradient<V>(inputs: (V, V, V, V)) -> V
     where
-        V: MatrixValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
-        V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,
+        V: HigherOrderMatrixValue,
     {
-        let (x_bar, _, _, _) = grad(three_matmul_sine, inputs).expect("matrix gradient should succeed");
+        let (x_bar, _, _, _) = V::full_matrix_gradient(inputs);
         x_bar
     }
 
     fn full_matrix_gradient<V>(inputs: (V, V, V, V)) -> (V, V, V, V)
     where
-        V: MatrixValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Parameterized<V, To<Linearized<V>> = Linearized<V>, ParameterStructure: Clone + PartialEq>,
-        V::Family: ParameterizedFamily<Linearized<V>, To = Linearized<V>>,
+        V: HigherOrderMatrixValue,
     {
-        grad(three_matmul_sine, inputs).expect("matrix gradient should succeed")
+        V::full_matrix_gradient(inputs)
     }
 
     #[test]

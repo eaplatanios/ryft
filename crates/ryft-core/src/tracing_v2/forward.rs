@@ -10,7 +10,9 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
         FloatExt, TraceError, TraceValue, ZeroLike,
-        linear::{LinearProgram, Linearized, jvp_program},
+        jit::JitTracer,
+        linear::{LinearProgram, jvp_program},
+        matmul::MatrixOps,
         ops::{AddOp, CosOp, JvpOp, MulOp, NegOp, SinOp},
     },
     types::{ArrayType, Typed},
@@ -194,12 +196,12 @@ where
 /// The returned pair is `(primal_output, tangent_output)`.
 pub fn jvp<F, Input, Output, V>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike,
+    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Linearized<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<Linearized<V>>,
-    F: FnOnce(Input::To<Linearized<V>>) -> Output::To<Linearized<V>>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
 {
     if primals.parameter_structure() != tangents.parameter_structure() {
         return Err(TraceError::MismatchedParameterStructure);
@@ -232,7 +234,7 @@ mod tests {
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
         let result: Result<(f64, f64), TraceError> =
-            jvp::<_, _, _, f64>(|xs: Vec<Linearized<f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
+            jvp::<_, _, _, f64>(|xs: Vec<JitTracer<f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
         test_support::assert_quadratic_pushforward_rendering();
     }

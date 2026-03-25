@@ -13,7 +13,9 @@ use crate::tracing_v2::{AtomSource, Graph, StagedOpRef};
 use crate::types::{ArrayType, DataType, Size};
 
 use super::LogicalMesh;
-use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor, StagedShardMapOp};
+use super::shard_map::{
+    LinearTensorShardMapOp, ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor, StagedShardMapOp,
+};
 use super::sharding::{ShardingContext, ShardingError, normalize_mesh_symbol_name};
 
 /// Error type for StableHLO/Shardy lowering.
@@ -66,6 +68,10 @@ pub(crate) enum LoweringError {
     /// Error returned when one traced XLA graph mixes shard maps from incompatible meshes.
     #[error("traced XLA lowering requires all nested shard maps to use the same logical mesh")]
     IncompatibleNestedMeshes,
+
+    /// Error returned when simplifying a staged program prior to lowering fails.
+    #[error("failed to simplify staged XLA program before lowering: {message}")]
+    SimplificationFailure { message: String },
 }
 
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
@@ -268,6 +274,17 @@ where
                 None => mesh = Some(shard_map_op.body.shard_map.mesh().clone()),
             }
             mesh = collect_nested_shard_map_mesh(shard_map_op.body.compiled.graph(), mesh)?;
+            continue;
+        }
+        if let Some(linear_shard_map_op) = equation.op.as_any().downcast_ref::<LinearTensorShardMapOp>() {
+            match &mesh {
+                Some(existing_mesh) if existing_mesh != linear_shard_map_op.eval_body.shard_map.mesh() => {
+                    return Err(LoweringError::IncompatibleNestedMeshes);
+                }
+                Some(_) => {}
+                None => mesh = Some(linear_shard_map_op.eval_body.shard_map.mesh().clone()),
+            }
+            mesh = collect_nested_shard_map_mesh(linear_shard_map_op.eval_body.compiled.graph(), mesh)?;
         }
     }
     Ok(mesh)
@@ -303,7 +320,7 @@ where
         let atom = graph.atom(atom_id).expect("atom IDs should be dense");
         let lowered_value = match &atom.source {
             AtomSource::Input => None,
-            AtomSource::Constant(value) => Some(lower_constant(atom_id, value, block, context, location)?),
+            AtomSource::Constant => Some(lower_constant(atom_id, &atom.example_value, block, context, location)?),
             AtomSource::Derived => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
@@ -431,13 +448,41 @@ where
 {
     let equation = &graph.equations()[equation_index];
     if let Some(shard_map_op) = equation.op.as_any().downcast_ref::<StagedShardMapOp>() {
+        let simplified_body = shard_map_op
+            .body
+            .simplified()
+            .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
         let results = lower_manual_computation(
             block,
             input_values,
-            &shard_map_op.body.shard_map,
-            shard_map_op.body.compiled.graph(),
-            shard_map_op.body.local_input_types.as_slice(),
-            shard_map_op.body.global_output_types.as_slice(),
+            &simplified_body.shard_map,
+            simplified_body.compiled.graph(),
+            simplified_body.local_input_types.as_slice(),
+            simplified_body.global_output_types.as_slice(),
+            mesh_symbol_name,
+            context,
+            location,
+        )?;
+        if results.len() != 1 {
+            return Err(LoweringError::UnsupportedOutputCount {
+                op: equation.op.name().to_string(),
+                output_count: results.len(),
+            });
+        }
+        return Ok(results[0]);
+    }
+    if let Some(linear_shard_map_op) = equation.op.as_any().downcast_ref::<LinearTensorShardMapOp>() {
+        let simplified_body = linear_shard_map_op
+            .eval_body
+            .simplified()
+            .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+        let results = lower_manual_computation(
+            block,
+            input_values,
+            &simplified_body.shard_map,
+            simplified_body.compiled.graph(),
+            simplified_body.local_input_types.as_slice(),
+            simplified_body.global_output_types.as_slice(),
             mesh_symbol_name,
             context,
             location,

@@ -51,7 +51,7 @@ where
 }
 
 /// Shared reference to a dynamically dispatched staged operation.
-pub type StagedOpRef<V> = Arc<dyn StagedOp<V>>;
+pub type StagedOpRef<V> = Arc<dyn Op<V>>;
 
 /// Primitive operation with a forward-mode differentiation rule.
 pub trait JvpOp<V>: Op<V>
