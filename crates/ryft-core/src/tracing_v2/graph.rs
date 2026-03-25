@@ -180,6 +180,26 @@ where
     marker: PhantomData<fn(Input) -> Output>,
 }
 
+impl<O, V, Input, Output> Clone for Graph<O, V, Input, Output>
+where
+    O: Clone + Op<V>,
+    V: TraceValue,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            atoms: self.atoms.clone(),
+            input_atoms: self.input_atoms.clone(),
+            equations: self.equations.clone(),
+            outputs: self.outputs.clone(),
+            input_structure: self.input_structure.clone(),
+            output_structure: self.output_structure.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
 impl<O, V, Input, Output> Graph<O, V, Input, Output>
 where
     O: Clone + Op<V>,
@@ -227,6 +247,27 @@ where
     #[inline]
     pub fn output_structure(&self) -> &Output::ParameterStructure {
         &self.output_structure
+    }
+
+    /// Clones this graph while replacing only the typed input/output structures.
+    pub fn clone_with_structures<NewInput, NewOutput>(
+        &self,
+        input_structure: NewInput::ParameterStructure,
+        output_structure: NewOutput::ParameterStructure,
+    ) -> Graph<O, V, NewInput, NewOutput>
+    where
+        NewInput: Parameterized<V>,
+        NewOutput: Parameterized<V>,
+    {
+        Graph {
+            atoms: self.atoms.clone(),
+            input_atoms: self.input_atoms.clone(),
+            equations: self.equations.clone(),
+            outputs: self.outputs.clone(),
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        }
     }
 
     /// Interprets the staged graph on concrete input values.

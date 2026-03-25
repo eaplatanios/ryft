@@ -4,6 +4,7 @@
 //! transform-specific traits. This keeps graph representations extensible without requiring central enums.
 
 use std::{
+    any::Any,
     fmt::{Debug, Display},
     ops::{Add, Mul, Neg},
     sync::Arc,
@@ -22,6 +23,9 @@ pub trait Op<V>: Debug + Display
 where
     V: TraceValue,
 {
+    /// Returns this operation as [`Any`] for downcasting.
+    fn as_any(&self) -> &dyn Any;
+
     /// Returns the stable primitive name used in diagnostics and pretty-printing.
     fn name(&self) -> &'static str;
 
@@ -91,6 +95,11 @@ where
     T: Op<V> + ?Sized,
     V: TraceValue,
 {
+    #[inline]
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+
     #[inline]
     fn name(&self) -> &'static str {
         (**self).name()
@@ -200,6 +209,10 @@ impl<V> Op<V> for AddOp
 where
     V: TraceValue + Add<Output = V>,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "add"
     }
@@ -287,6 +300,10 @@ impl<V> Op<V> for MulOp
 where
     V: TraceValue + Mul<Output = V>,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "mul"
     }
@@ -361,6 +378,10 @@ impl<V> Op<V> for NegOp
 where
     V: TraceValue + Neg<Output = V>,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "neg"
     }
@@ -437,6 +458,10 @@ impl<V> Op<V> for SinOp
 where
     V: TraceValue + FloatExt,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "sin"
     }
@@ -498,6 +523,10 @@ impl<V> Op<V> for CosOp
 where
     V: TraceValue + FloatExt,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "cos"
     }
@@ -586,6 +615,10 @@ impl<V> Op<V> for ScaleOp<V>
 where
     V: TraceValue + Mul<Output = V>,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "scale"
     }

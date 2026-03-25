@@ -142,6 +142,10 @@ impl<V> Op<V> for MatMulOp
 where
     V: MatrixValue,
 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "matmul"
     }
@@ -196,6 +200,10 @@ impl<V> Op<V> for MatrixTransposeOp
 where
     V: MatrixValue,
 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "matrix_transpose"
     }
@@ -261,6 +269,10 @@ impl<V> Op<V> for LeftMatMulOp<V>
 where
     V: MatrixValue,
 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "left_matmul"
     }
@@ -338,6 +350,10 @@ impl<V> Op<V> for RightMatMulOp<V>
 where
     V: MatrixValue,
 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "right_matmul"
     }
@@ -394,6 +410,10 @@ impl<V> Op<V> for LinearMatrixTransposeOp
 where
     V: MatrixValue,
 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "linear_matrix_transpose"
     }

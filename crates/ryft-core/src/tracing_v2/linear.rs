@@ -38,6 +38,40 @@ where
     V: TraceValue + FloatExt,
 {
     #[inline]
+    pub(crate) fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<LinearOpRef<V>, V>>> {
+        self.builder.clone()
+    }
+
+    #[inline]
+    pub(crate) fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<GraphBuilder<LinearOpRef<V>, V>>>) -> Self {
+        Self { atom, builder }
+    }
+
+    pub(crate) fn apply_staged_op(
+        inputs: &[Self],
+        op: LinearOpRef<V>,
+        output_count: usize,
+    ) -> Result<Vec<Self>, TraceError> {
+        if inputs.is_empty() {
+            return Err(TraceError::EmptyParameterizedValue);
+        }
+
+        let builder = inputs[0].builder.clone();
+        if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
+            return Err(TraceError::InternalInvariantViolation(
+                "linear tracer inputs for one staged op must share the same builder",
+            ));
+        }
+
+        let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
+        let output_atoms = builder.borrow_mut().add_equation(op, input_atoms)?;
+        if output_atoms.len() != output_count {
+            return Err(TraceError::InvalidOutputCount { expected: output_count, got: output_atoms.len() });
+        }
+        Ok(output_atoms.into_iter().map(|atom| Self { atom, builder: builder.clone() }).collect())
+    }
+
+    #[inline]
     pub(crate) fn apply_linear_op(self, op: LinearOpRef<V>) -> Self {
         let atom = self
             .builder
@@ -109,6 +143,17 @@ where
     graph: Graph<LinearOpRef<V>, V, Input, Output>,
     zero: V,
     marker: PhantomData<fn(Input) -> Output>,
+}
+
+impl<V, Input, Output> Clone for LinearProgram<V, Input, Output>
+where
+    V: TraceValue + Clone,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+{
+    fn clone(&self) -> Self {
+        Self { graph: self.graph.clone(), zero: self.zero.clone(), marker: PhantomData }
+    }
 }
 
 impl<V, Input, Output> LinearProgram<V, Input, Output>
@@ -218,7 +263,7 @@ where
     }
 }
 
-fn try_jvp_program<F, Input, Output, V>(
+pub(crate) fn try_jvp_program<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
@@ -304,7 +349,7 @@ where
     jvp_program(function, primals)
 }
 
-fn try_vjp<F, Input, Output, V>(
+pub(crate) fn try_vjp<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>

@@ -27,11 +27,13 @@ mod value;
 pub use batch::{Batch, stack, unstack, vmap};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, AtomSource, Equation, Graph, GraphBuilder};
+pub(crate) use jit::try_jit;
 pub use jit::{CompiledFunction, JitTracer, jit};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, LinearTerm, Linearized, grad, hessian, jacfwd, jacrev, jvp_program,
     linearize, value_and_grad, vjp,
 };
+pub(crate) use linear::{try_jvp_program, try_vjp};
 pub use matmul::{MatMulOp, MatrixOps, MatrixTangentSpace, MatrixTransposeOp, MatrixValue};
 pub use ops::{
     AddOp, BatchOp, CosOp, JvpOp, LinearOp, LinearOpRef, MulOp, NegOp, Op, ScaleOp, SinOp, StagedOp, StagedOpRef,
@@ -76,6 +78,10 @@ pub enum TraceError {
     /// An internal tracing invariant was violated while constructing or replaying a program.
     #[error("{0}")]
     InternalInvariantViolation(&'static str),
+
+    /// A higher-order traced operation failed while deriving or replaying its internal program.
+    #[error("higher-order op '{op}' failed: {message}")]
+    HigherOrderOpFailure { op: &'static str, message: String },
 
     /// Wrapper around parameter-lifting failures from the `Parameterized` infrastructure.
     #[error(transparent)]

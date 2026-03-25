@@ -12,7 +12,8 @@ use crate::parameters::Parameterized;
 use crate::tracing_v2::{AtomSource, Graph, StagedOpRef};
 use crate::types::{ArrayType, DataType, Size};
 
-use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
+use super::LogicalMesh;
+use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor, StagedShardMapOp};
 use super::sharding::{ShardingContext, ShardingError, normalize_mesh_symbol_name};
 
 /// Error type for StableHLO/Shardy lowering.
@@ -61,6 +62,10 @@ pub(crate) enum LoweringError {
     /// Error returned when the constructed MLIR module fails verification.
     #[error("constructed MLIR module failed verification during XLA lowering")]
     MlirVerificationFailure,
+
+    /// Error returned when one traced XLA graph mixes shard maps from incompatible meshes.
+    #[error("traced XLA lowering requires all nested shard maps to use the same logical mesh")]
+    IncompatibleNestedMeshes,
 }
 
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
@@ -93,10 +98,6 @@ where
     let module = context.module(location);
 
     let global_input_tensor_types = global_input_types
-        .iter()
-        .map(|array_type| lower_tensor_type(array_type, &context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-    let local_input_tensor_types = local_input_types
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
@@ -147,79 +148,19 @@ where
                 .as_slice(),
         );
         let outer_inputs = (0..global_input_tensor_types.len())
-            .map(|index| function_block.argument(index).expect("function block arguments should exist"))
+            .map(|index| function_block.argument(index).expect("function block arguments should exist").as_ref())
             .collect::<Vec<_>>();
-        let mut body_region = context.region();
-        let mut body_block = context.block(
-            local_input_tensor_types
-                .iter()
-                .map(|tensor_type| (*tensor_type, location))
-                .collect::<Vec<_>>()
-                .as_slice(),
-        );
-
-        let mut atom_values = vec![None; graph.atom_count()];
-        for (input_index, atom_id) in graph.input_atoms().iter().copied().enumerate() {
-            atom_values[atom_id] =
-                Some(body_block.argument(input_index).expect("body block arguments should exist").as_ref());
-        }
-
-        let mut equation_by_first_output = vec![None; graph.atom_count()];
-        for (equation_index, equation) in graph.equations().iter().enumerate() {
-            if let Some(first_output) = equation.outputs.first() {
-                equation_by_first_output[*first_output] = Some(equation_index);
-            }
-        }
-
-        for atom_id in 0..graph.atom_count() {
-            let atom = graph.atom(atom_id).expect("atom IDs should be dense");
-            let lowered_value = match &atom.source {
-                AtomSource::Input => None,
-                AtomSource::Constant(value) => {
-                    Some(lower_constant(atom_id, value, &mut body_block, &context, location)?)
-                }
-                AtomSource::Derived => {
-                    let Some(equation_index) = equation_by_first_output[atom_id] else {
-                        continue;
-                    };
-                    let equation = &graph.equations()[equation_index];
-                    if equation.outputs.len() != 1 {
-                        return Err(LoweringError::UnsupportedOutputCount {
-                            op: equation.op.name().to_string(),
-                            output_count: equation.outputs.len(),
-                        });
-                    }
-                    let inputs = equation
-                        .inputs
-                        .iter()
-                        .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Some(lower_equation(graph, equation_index, inputs.as_slice(), &mut body_block, &context, location)?)
-                }
-            };
-            if let Some(lowered_value) = lowered_value {
-                atom_values[atom_id] = Some(lowered_value);
-            }
-        }
-
-        let body_outputs = graph
-            .outputs()
-            .iter()
-            .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
-            .collect::<Result<Vec<_>, _>>()?;
-        body_block.append_operation(shardy::r#return(body_outputs.as_slice(), location));
-        body_region.append_block(body_block);
-
-        let manual_computation = function_block.append_operation(shardy::manual_computation(
+        let manual_results = lower_manual_computation(
+            &mut function_block,
             outer_inputs.as_slice(),
-            global_output_tensor_types.as_slice(),
-            shard_map.to_shardy_in_shardings(mesh_symbol_name.as_str(), &context)?,
-            shard_map.to_shardy_out_shardings(mesh_symbol_name.as_str(), &context)?,
-            shard_map.to_shardy_manual_axes(&context),
-            body_region,
+            shard_map,
+            graph,
+            local_input_types.as_slice(),
+            global_output_types.as_slice(),
+            mesh_symbol_name.as_str(),
+            &context,
             location,
-        ));
-        let manual_results = manual_computation.results().collect::<Vec<_>>();
+        )?;
         function_block.append_operation(func::r#return(manual_results.as_slice(), location));
 
         func::func(
@@ -235,6 +176,222 @@ where
     }
 
     Ok(module.to_string())
+}
+
+/// Lowers an arbitrary traced XLA graph to a textual StableHLO/Shardy MLIR module.
+pub(crate) fn to_mlir_module_for_graph<Input, Output, GraphInput, GraphOutput, S, M>(
+    graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    global_input_types: &Input,
+    global_output_types: &Output,
+    function_name: S,
+    mesh_symbol_name: M,
+) -> Result<String, LoweringError>
+where
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
+    GraphInput: Parameterized<ShardMapTensor>,
+    GraphOutput: Parameterized<ShardMapTensor>,
+    S: AsRef<str>,
+    M: AsRef<str>,
+{
+    let function_name = normalize_function_name(function_name.as_ref())?;
+    let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name.as_ref())?;
+    let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
+    let global_output_types = global_output_types.parameters().cloned().collect::<Vec<_>>();
+
+    let context = MlirContext::new();
+    let location = context.unknown_location();
+    let module = context.module(location);
+
+    if let Some(mesh) = collect_nested_shard_map_mesh(graph, None)? {
+        let mesh_attribute = mesh.to_shardy_mesh_attribute(&context);
+        module.body().append_operation(shardy::mesh(mesh_symbol_name.as_str(), mesh_attribute, location));
+    }
+
+    let global_input_tensor_types = global_input_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, &context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let global_output_tensor_types = global_output_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, &context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let function_arguments = global_input_tensor_types
+        .iter()
+        .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+        .collect::<Vec<_>>();
+    let function_results = global_output_tensor_types
+        .iter()
+        .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+        .collect::<Vec<_>>();
+
+    module.body().append_operation({
+        let mut function_block = context.block(
+            global_input_tensor_types
+                .iter()
+                .map(|tensor_type| (*tensor_type, location))
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        let outputs = lower_graph_outputs(graph, &mut function_block, mesh_symbol_name.as_str(), &context, location)?;
+        function_block.append_operation(func::r#return(outputs.as_slice(), location));
+        func::func(
+            function_name.as_str(),
+            func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
+            function_block.into(),
+            location,
+        )
+    });
+
+    if !module.verify() {
+        return Err(LoweringError::MlirVerificationFailure);
+    }
+    Ok(module.to_string())
+}
+
+fn collect_nested_shard_map_mesh<GraphInput, GraphOutput>(
+    graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    existing: Option<LogicalMesh>,
+) -> Result<Option<LogicalMesh>, LoweringError>
+where
+    GraphInput: Parameterized<ShardMapTensor>,
+    GraphOutput: Parameterized<ShardMapTensor>,
+{
+    let mut mesh = existing;
+    for equation in graph.equations() {
+        if let Some(shard_map_op) = equation.op.as_any().downcast_ref::<StagedShardMapOp>() {
+            match &mesh {
+                Some(existing_mesh) if existing_mesh != shard_map_op.body.shard_map.mesh() => {
+                    return Err(LoweringError::IncompatibleNestedMeshes);
+                }
+                Some(_) => {}
+                None => mesh = Some(shard_map_op.body.shard_map.mesh().clone()),
+            }
+            mesh = collect_nested_shard_map_mesh(shard_map_op.body.compiled.graph(), mesh)?;
+        }
+    }
+    Ok(mesh)
+}
+
+/// Lowers one traced graph to values inside a block.
+fn lower_graph_outputs<'b, 'c: 'b, 't: 'c, B, GraphInput, GraphOutput, L>(
+    graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    block: &mut B,
+    mesh_symbol_name: &str,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    GraphInput: Parameterized<ShardMapTensor>,
+    GraphOutput: Parameterized<ShardMapTensor>,
+    L: Location<'c, 't> + Copy,
+{
+    let mut atom_values = vec![None; graph.atom_count()];
+    for (input_index, atom_id) in graph.input_atoms().iter().copied().enumerate() {
+        atom_values[atom_id] = Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
+    }
+
+    let mut equation_by_first_output = vec![None; graph.atom_count()];
+    for (equation_index, equation) in graph.equations().iter().enumerate() {
+        if let Some(first_output) = equation.outputs.first() {
+            equation_by_first_output[*first_output] = Some(equation_index);
+        }
+    }
+
+    for atom_id in 0..graph.atom_count() {
+        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
+        let lowered_value = match &atom.source {
+            AtomSource::Input => None,
+            AtomSource::Constant(value) => Some(lower_constant(atom_id, value, block, context, location)?),
+            AtomSource::Derived => {
+                let Some(equation_index) = equation_by_first_output[atom_id] else {
+                    continue;
+                };
+                let equation = &graph.equations()[equation_index];
+                if equation.outputs.len() != 1 {
+                    return Err(LoweringError::UnsupportedOutputCount {
+                        op: equation.op.name().to_string(),
+                        output_count: equation.outputs.len(),
+                    });
+                }
+                let inputs = equation
+                    .inputs
+                    .iter()
+                    .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(lower_equation(
+                    graph,
+                    equation_index,
+                    inputs.as_slice(),
+                    block,
+                    mesh_symbol_name,
+                    context,
+                    location,
+                )?)
+            }
+        };
+        if let Some(lowered_value) = lowered_value {
+            atom_values[atom_id] = Some(lowered_value);
+        }
+    }
+
+    graph
+        .outputs()
+        .iter()
+        .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// Lowers one `sdy.manual_computation` operation, including its nested body graph.
+fn lower_manual_computation<'b, 'c: 'b, 't: 'c, B, GraphInput, GraphOutput, L>(
+    block: &mut B,
+    outer_inputs: &[ValueRef<'b, 'c, 't>],
+    shard_map: &ShardMap,
+    graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    local_input_types: &[ArrayType],
+    global_output_types: &[ArrayType],
+    mesh_symbol_name: &str,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    GraphInput: Parameterized<ShardMapTensor>,
+    GraphOutput: Parameterized<ShardMapTensor>,
+    L: Location<'c, 't> + Copy,
+{
+    let local_input_tensor_types = local_input_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let global_output_tensor_types = global_output_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut body_region = context.region();
+    let mut body_block = context.block(
+        local_input_tensor_types
+            .iter()
+            .map(|tensor_type| (*tensor_type, location))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let body_outputs = lower_graph_outputs(graph, &mut body_block, mesh_symbol_name, context, location)?;
+    body_block.append_operation(shardy::r#return(body_outputs.as_slice(), location));
+    body_region.append_block(body_block);
+
+    let manual_computation = block.append_operation(shardy::manual_computation(
+        outer_inputs,
+        global_output_tensor_types.as_slice(),
+        shard_map.to_shardy_in_shardings(mesh_symbol_name, context)?,
+        shard_map.to_shardy_out_shardings(mesh_symbol_name, context)?,
+        shard_map.to_shardy_manual_axes(context),
+        body_region,
+        location,
+    ));
+    Ok(manual_computation.results().map(|result| result.as_ref()).collect::<Vec<_>>())
 }
 
 /// Lowers a traced constant atom to a StableHLO constant operation and returns its result value.
@@ -262,6 +419,7 @@ fn lower_equation<'b, 'c: 'b, 't: 'c, B, GraphInput, GraphOutput, L>(
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut B,
+    mesh_symbol_name: &str,
     context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
@@ -272,6 +430,27 @@ where
     L: Location<'c, 't> + Copy,
 {
     let equation = &graph.equations()[equation_index];
+    if let Some(shard_map_op) = equation.op.as_any().downcast_ref::<StagedShardMapOp>() {
+        let results = lower_manual_computation(
+            block,
+            input_values,
+            &shard_map_op.body.shard_map,
+            shard_map_op.body.compiled.graph(),
+            shard_map_op.body.local_input_types.as_slice(),
+            shard_map_op.body.global_output_types.as_slice(),
+            mesh_symbol_name,
+            context,
+            location,
+        )?;
+        if results.len() != 1 {
+            return Err(LoweringError::UnsupportedOutputCount {
+                op: equation.op.name().to_string(),
+                output_count: results.len(),
+            });
+        }
+        return Ok(results[0]);
+    }
+
     let output_type = lower_tensor_type(
         &graph.atom(equation.outputs[0]).expect("equation output should exist").abstract_value,
         context,

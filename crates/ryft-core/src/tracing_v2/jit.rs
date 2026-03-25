@@ -48,6 +48,68 @@ where
         self.atom
     }
 
+    #[inline]
+    pub(crate) fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>> {
+        self.builder.clone()
+    }
+
+    #[inline]
+    pub(crate) fn staging_error_handle(&self) -> Rc<RefCell<Option<TraceError>>> {
+        self.staging_error.clone()
+    }
+
+    #[inline]
+    pub(crate) fn from_staged_parts(
+        value: V,
+        atom: AtomId,
+        builder: Rc<RefCell<GraphBuilder<StagedOpRef<V>, V>>>,
+        staging_error: Rc<RefCell<Option<TraceError>>>,
+    ) -> Self {
+        Self { value, atom, builder, staging_error }
+    }
+
+    pub(crate) fn apply_staged_op(
+        inputs: &[Self],
+        op: StagedOpRef<V>,
+        output_values: Vec<V>,
+    ) -> Result<Vec<Self>, TraceError> {
+        if inputs.is_empty() {
+            return Err(TraceError::EmptyParameterizedValue);
+        }
+
+        let builder = inputs[0].builder.clone();
+        let staging_error = inputs[0].staging_error.clone();
+        if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
+            return Err(TraceError::InternalInvariantViolation(
+                "jit tracer inputs for one staged op must share the same builder",
+            ));
+        }
+        if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&staging_error, &input.staging_error)) {
+            return Err(TraceError::InternalInvariantViolation(
+                "jit tracer inputs for one staged op must share the same staging error handle",
+            ));
+        }
+
+        let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
+        let output_atoms = if staging_error.borrow().is_some() {
+            vec![inputs[0].atom; output_values.len()]
+        } else {
+            match builder.borrow_mut().add_equation(op, input_atoms) {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    *staging_error.borrow_mut() = Some(error);
+                    vec![inputs[0].atom; output_values.len()]
+                }
+            }
+        };
+
+        Ok(output_values
+            .into_iter()
+            .zip(output_atoms)
+            .map(|(value, atom)| Self { value, atom, builder: builder.clone(), staging_error: staging_error.clone() })
+            .collect())
+    }
+
     pub(crate) fn unary(self, op: StagedOpRef<V>, apply: impl FnOnce(V) -> V) -> Self {
         let value = apply(self.value);
         let atom = if self.staging_error.borrow().is_some() {
@@ -185,12 +247,28 @@ where
     marker: PhantomData<fn(Input) -> Output>,
 }
 
+impl<V, Input, Output> Clone for CompiledFunction<V, Input, Output>
+where
+    V: TraceValue,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+{
+    fn clone(&self) -> Self {
+        Self { graph: self.graph.clone(), marker: PhantomData }
+    }
+}
+
 impl<V, Input, Output> CompiledFunction<V, Input, Output>
 where
     V: TraceValue,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
+    #[inline]
+    pub(crate) fn from_graph(graph: Graph<StagedOpRef<V>, V, Input, Output>) -> Self {
+        Self { graph, marker: PhantomData }
+    }
+
     /// Returns the staged graph backing this compiled function.
     #[inline]
     pub fn graph(&self) -> &Graph<StagedOpRef<V>, V, Input, Output> {
@@ -218,11 +296,7 @@ where
     }
 }
 
-/// Stages `function` as a graph and returns both the eager output and the staged program.
-///
-/// The returned [`CompiledFunction`] currently stores only the staged graph. Later, once a concrete backend exists,
-/// this type can be extended to carry backend-specific compilation artifacts alongside that graph.
-pub fn jit<F, Input, Output, V>(
+pub(crate) fn try_jit<F, Input, Output, V>(
     function: F,
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
@@ -232,7 +306,7 @@ where
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<JitTracer<V>>,
-    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
 {
     let input_structure = input.parameter_structure();
     let builder = Rc::new(RefCell::new(GraphBuilder::new()));
@@ -246,7 +320,7 @@ where
     )?;
 
     let (output_structure, output_value, outputs) = {
-        let traced_output = function(traced_input);
+        let traced_output = function(traced_input)?;
         let output_structure = traced_output.parameter_structure();
         let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
         let output_value = Output::from_parameters(
@@ -269,6 +343,25 @@ where
         marker: PhantomData,
     };
     Ok((output_value, compiled))
+}
+
+/// Stages `function` as a graph and returns both the eager output and the staged program.
+///
+/// The returned [`CompiledFunction`] currently stores only the staged graph. Later, once a concrete backend exists,
+/// this type can be extended to carry backend-specific compilation artifacts alongside that graph.
+pub fn jit<F, Input, Output, V>(
+    function: F,
+    input: Input,
+) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
+where
+    V: TraceValue,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
+{
+    try_jit(|traced_input| Ok(function(traced_input)), input)
 }
 
 #[cfg(test)]
