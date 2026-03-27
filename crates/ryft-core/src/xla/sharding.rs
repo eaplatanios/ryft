@@ -208,10 +208,6 @@ pub enum ShardingError {
     #[error("partition index {partition_index} is out of range for partition count {partition_count}")]
     InvalidPartitionIndex { partition_index: usize, partition_count: usize },
 
-    /// Error returned when the number of axis types does not match the number of axes.
-    #[error("expected {expected} axis type(s), but got {actual}")]
-    MeshAxisTypeCountMismatch { expected: usize, actual: usize },
-
     /// Error returned when a replicated/unreduced axis in a [`NamedSharding`] does not exist in the mesh.
     #[error("replicated/unreduced axis '{name}' does not exist in the mesh")]
     UnknownExtraAxis { name: String },
@@ -346,26 +342,6 @@ impl LogicalMesh {
     ///
     /// Validates that all axis names are non-empty, all sizes are positive, and names are unique.
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
-        Self::build(axes)
-    }
-
-    /// Creates a logical mesh from named axes with explicit per-axis types.
-    ///
-    /// This is a convenience constructor that overrides the types already stored on `axes`.
-    ///
-    /// Returns [`ShardingError::MeshAxisTypeCountMismatch`] if `axis_types.len() != axes.len()`.
-    pub fn with_axis_types(axes: Vec<MeshAxis>, axis_types: Vec<MeshAxisType>) -> Result<Self, ShardingError> {
-        if axis_types.len() != axes.len() {
-            return Err(ShardingError::MeshAxisTypeCountMismatch { expected: axes.len(), actual: axis_types.len() });
-        }
-
-        let axes = axes
-            .into_iter()
-            .zip(axis_types)
-            .map(|(axis, r#type)| {
-                MeshAxis::new(axis.name, axis.size, r#type).expect("logical meshes only contain validated mesh axes")
-            })
-            .collect();
         Self::build(axes)
     }
 
@@ -566,18 +542,6 @@ impl DeviceMesh {
     /// expected device count is `1`.
     pub fn new(axes: Vec<MeshAxis>, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
         let logical_mesh = LogicalMesh::new(axes)?;
-        Self::from_logical(logical_mesh, devices)
-    }
-
-    /// Creates a mesh from named axes, explicit per-axis types, and row-major devices.
-    ///
-    /// This is a convenience constructor that overrides the types already stored on `axes`.
-    pub fn with_axis_types(
-        axes: Vec<MeshAxis>,
-        axis_types: Vec<MeshAxisType>,
-        devices: Vec<MeshDevice>,
-    ) -> Result<Self, ShardingError> {
-        let logical_mesh = LogicalMesh::with_axis_types(axes, axis_types)?;
         Self::from_logical(logical_mesh, devices)
     }
 
@@ -1850,17 +1814,6 @@ mod tests {
     }
 
     #[test]
-    fn test_logical_mesh_with_axis_types() {
-        let axes = vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ];
-        let types = vec![MeshAxisType::Manual, MeshAxisType::Explicit];
-        let mesh = LogicalMesh::with_axis_types(axes, types).unwrap();
-        assert_eq!(mesh.axis_types(), vec![MeshAxisType::Manual, MeshAxisType::Explicit]);
-    }
-
-    #[test]
     fn test_logical_mesh_preserves_axis_types_from_axes() {
         let axes = vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -1868,19 +1821,6 @@ mod tests {
         ];
         let mesh = LogicalMesh::new(axes).unwrap();
         assert_eq!(mesh.axis_types(), vec![MeshAxisType::Manual, MeshAxisType::Explicit]);
-    }
-
-    #[test]
-    fn test_logical_mesh_axis_type_count_mismatch() {
-        let axes = vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ];
-        let types = vec![MeshAxisType::Auto];
-        assert!(matches!(
-            LogicalMesh::with_axis_types(axes, types),
-            Err(ShardingError::MeshAxisTypeCountMismatch { expected: 2, actual: 1 }),
-        ));
     }
 
     #[test]
@@ -1897,11 +1837,10 @@ mod tests {
         // Mixed types.
         let axes = vec![
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("b", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("c", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("b", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("c", 2, MeshAxisType::Manual).unwrap(),
         ];
-        let types = vec![MeshAxisType::Auto, MeshAxisType::Explicit, MeshAxisType::Manual];
-        let mesh = LogicalMesh::with_axis_types(axes, types).unwrap();
+        let mesh = LogicalMesh::new(axes).unwrap();
         assert!(!mesh.are_all_axes_auto());
         assert!(!mesh.are_all_axes_explicit());
         assert!(!mesh.are_all_axes_manual());
@@ -1931,14 +1870,13 @@ mod tests {
     }
 
     #[test]
-    fn test_device_mesh_with_axis_types() {
+    fn test_device_mesh_preserves_axis_types_from_axes() {
         let axes = vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ];
-        let types = vec![MeshAxisType::Explicit, MeshAxisType::Manual];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 0), MeshDevice::new(3, 0)];
-        let mesh = DeviceMesh::with_axis_types(axes, types, devices).unwrap();
+        let mesh = DeviceMesh::new(axes, devices).unwrap();
         assert_eq!(mesh.axis_types(), vec![MeshAxisType::Explicit, MeshAxisType::Manual]);
     }
 
