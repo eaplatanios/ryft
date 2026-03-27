@@ -22,7 +22,7 @@ mod forward;
 pub(crate) mod graph;
 mod jit;
 mod linear;
-pub(crate) mod matmul;
+pub(crate) mod operations;
 pub(crate) mod ops;
 pub(crate) mod program;
 #[cfg(test)]
@@ -30,7 +30,6 @@ pub(crate) mod test_support;
 mod value;
 
 pub use batch::{Batch, stack, unstack, vmap};
-pub(crate) use batch::{FlatTracedVMap, VMapOp};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub(crate) use graph::{AtomId, AtomSource, Graph, GraphBuilder};
 pub(crate) use jit::try_jit;
@@ -40,7 +39,7 @@ pub use linear::{
     value_and_grad, vjp,
 };
 pub(crate) use linear::{LinearTerm, Linearized};
-pub use matmul::{MatrixOps, MatrixTangentSpace, MatrixValue};
+pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub(crate) use ops::{Op, StagedOpRef};
 pub(crate) use program::{Program, ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};

@@ -20,7 +20,8 @@ use crate::{
     tracing_v2::{
         FloatExt, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
         graph::AtomId,
-        ops::{AddOp, CosOp, MulOp, NegOp, SinOp, StagedOpRef},
+        operations::{AddOp, CosOp, MulOp, NegOp, SinOp},
+        ops::StagedOpRef,
         program::{Program, ProgramBuilder},
     },
     types::{ArrayType, Typed},

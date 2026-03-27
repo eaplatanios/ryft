@@ -538,9 +538,11 @@ mod tests {
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
-        let scaled_x =
-            builder.add_equation(std::sync::Arc::new(tracing_v2::ops::ScaleOp::new(2.0)), vec![x]).unwrap()[0];
-        let sum = builder.add_equation(std::sync::Arc::new(tracing_v2::ops::AddOp), vec![scaled_x, y]).unwrap()[0];
+        let scaled_x = builder
+            .add_equation(std::sync::Arc::new(tracing_v2::operations::ScaleOp::new(2.0)), vec![x])
+            .unwrap()[0];
+        let sum =
+            builder.add_equation(std::sync::Arc::new(tracing_v2::operations::AddOp), vec![scaled_x, y]).unwrap()[0];
         let graph = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(graph.atom(x).unwrap().source, AtomSource::Input));
@@ -564,7 +566,7 @@ mod tests {
         let mut builder = GraphBuilder::<std::sync::Arc<dyn crate::tracing_v2::ops::Op<f64>>, f64>::new();
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_equation(std::sync::Arc::new(tracing_v2::ops::AddOp), vec![x, three]).unwrap()[0];
+        let sum = builder.add_equation(std::sync::Arc::new(tracing_v2::operations::AddOp), vec![x, three]).unwrap()[0];
         let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
         assert_eq!(
@@ -581,8 +583,8 @@ mod tests {
 
     #[test]
     fn graph_builder_rejects_unbound_inputs() {
-        let mut builder = GraphBuilder::<std::sync::Arc<tracing_v2::ops::AddOp>, f64>::new();
-        let result = builder.add_equation(std::sync::Arc::new(tracing_v2::ops::AddOp), vec![42, 99]);
+        let mut builder = GraphBuilder::<std::sync::Arc<tracing_v2::operations::AddOp>, f64>::new();
+        let result = builder.add_equation(std::sync::Arc::new(tracing_v2::operations::AddOp), vec![42, 99]);
         assert!(matches!(result, Err(TraceError::UnboundAtomId { id: 42 })));
         test_support::assert_reference_graph_rendering();
     }

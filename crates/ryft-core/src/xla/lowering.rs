@@ -11,13 +11,14 @@ use ryft_mlir::{
 };
 
 use crate::parameters::Parameterized;
-use crate::tracing_v2::{AtomSource, FlatTracedVMap, Graph, ProgramOpRef, StagedOpRef, TraceValue, VMapOp};
+use crate::tracing_v2::{
+    AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
+    operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp},
+};
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
 use super::LogicalMesh;
-use super::shard_map::{
-    LinearShardMapEvalMode, ShardMap, ShardMapConstantKind, ShardMapError, ShardMapOp, ShardMapTensor,
-};
+use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
 use super::sharding::{MeshAxis, ShardingContext, ShardingError, normalize_mesh_symbol_name};
 
 /// Error type for StableHLO/Shardy lowering.
@@ -1870,7 +1871,7 @@ mod tests {
                   func.func @kernel(%arg0: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg1: tensor<2x4xf32>) {
                       %1 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
-                      %2 = stablehlo.dot_general %1, %arg1, contracting_dims = [1] x [0] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>
+                      %2 = stablehlo.dot_general %1, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>
                       %3 = stablehlo.negate %2 : tensor<4x4xf32>
                       %4 = stablehlo.cosine %3 : tensor<4x4xf32>
                       %5 = stablehlo.sine %4 : tensor<4x4xf32>
@@ -1905,9 +1906,9 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<2x2xf64>) -> (tensor<2x2xf64>, tensor<2x2xf64>) {
                     %cst = stablehlo.constant dense<[[5.000000e+00, 6.000000e+00], [7.000000e+00, 8.000000e+00]]> : tensor<2x2xf64>
-                    %0 = stablehlo.dot_general %arg0, %cst, contracting_dims = [1] x [1] : (tensor<2x2xf64>, tensor<2x2xf64>) -> tensor<2x2xf64>
+                    %0 = stablehlo.dot_general %arg0, %cst, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf64>, tensor<2x2xf64>) -> tensor<2x2xf64>
                     %cst_0 = stablehlo.constant dense<[[1.000000e+00, 2.000000e+00], [3.000000e+00, 4.000000e+00]]> : tensor<2x2xf64>
-                    %1 = stablehlo.dot_general %arg0, %cst_0, contracting_dims = [0] x [0] : (tensor<2x2xf64>, tensor<2x2xf64>) -> tensor<2x2xf64>
+                    %1 = stablehlo.dot_general %arg0, %cst_0, contracting_dims = [0] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf64>, tensor<2x2xf64>) -> tensor<2x2xf64>
                     %2 = stablehlo.transpose %1, dims = [1, 0] : (tensor<2x2xf64>) -> tensor<2x2xf64>
                     return %0, %2 : tensor<2x2xf64>, tensor<2x2xf64>
                   }

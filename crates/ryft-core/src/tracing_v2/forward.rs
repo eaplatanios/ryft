@@ -9,11 +9,11 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
         jit::JitTracer,
         linear::{LinearProgram, jvp_program, try_jvp_traced},
-        matmul::MatrixOps,
-        ops::{AddOp, CosOp, JvpOp, MulOp, NegOp, SinOp},
+        operations::{AddOp, CosOp, MulOp, NegOp, SinOp},
+        ops::JvpOp,
     },
     types::{ArrayType, Typed},
 };

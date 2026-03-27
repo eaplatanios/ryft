@@ -16,12 +16,12 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        FloatExt, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, Graph},
         jit::{JitTracer, try_trace_program},
-        matmul::MatrixOps,
-        ops::{AddOp, NegOp, Op, ScaleOp},
+        operations::{AddOp, NegOp, ScaleOp},
+        ops::Op,
         program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };

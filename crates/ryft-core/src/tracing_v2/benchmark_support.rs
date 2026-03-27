@@ -362,7 +362,7 @@ mod tests {
     fn test_emit_scalar_grad_of_vmap_keeps_dynamic_cosine() {
         let records = emit_scalar_grad_of_vmap().unwrap();
         assert_eq!(records.len(), 1);
-        assert!(records[0].raw_ir.contains("stablehlo.cosine %2"));
+        assert!(records[0].raw_ir.contains("stablehlo.cosine %arg0"));
         assert!(!records[0].raw_ir.contains("-0.41614683654714241"));
     }
 

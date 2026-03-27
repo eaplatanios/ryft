@@ -2,7 +2,7 @@ use std::ops::{Add, Mul, Neg};
 
 use indoc::indoc;
 
-use crate::tracing_v2::ops::AddOp;
+use crate::tracing_v2::operations::AddOp;
 use crate::{
     parameters::Placeholder,
     tracing_v2::{self, *},

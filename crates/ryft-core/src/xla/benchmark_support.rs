@@ -10,11 +10,13 @@ use crate::tracing_v2::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
         record, summarize_graph,
     },
-    grad, vmap,
+    grad,
+    operations::{LinearShardMapEvalMode, ShardMapOp},
+    vmap,
 };
 use crate::types::{ArrayType, DataType, MeshAxisType, Shape, Size};
 
-use super::shard_map::{FlatTracedShardMap, LinearShardMapEvalMode, ShardMapOp, ShardMapTensor, ShardMapTracer};
+use super::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer};
 use super::sharding::{LogicalMesh, MeshAxis, PartitionDimension, PartitionSpec};
 use super::{TracedXlaProgram, shard_map, trace};
 
