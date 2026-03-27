@@ -9,9 +9,9 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, TraceError, TraceValue, ZeroLike,
+        FloatExt, TraceError, TraceValue, TransformLeaf, ZeroLike,
         jit::JitTracer,
-        linear::{LinearProgram, jvp_program},
+        linear::{LinearProgram, jvp_program, try_jvp_traced},
         matmul::MatrixOps,
         ops::{AddOp, CosOp, JvpOp, MulOp, NegOp, SinOp},
     },
@@ -127,6 +127,28 @@ where
 /// Standard dual number representation used for first-order forward-mode evaluation.
 pub type Dual<V> = JvpTracer<V, V>;
 
+/// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
+#[doc(hidden)]
+pub(crate) trait JvpInvocationLeaf<Input, Output>: Parameter + Sized
+where
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Output: Parameterized<Self, ParameterStructure: Clone>,
+{
+    /// Base leaf value used for the staged inner program.
+    type Base: TraceValue + FloatExt + ZeroLike + MatrixOps;
+
+    /// Input type expected by the user-provided function.
+    type FunctionInput;
+
+    /// Output type produced by the user-provided function.
+    type FunctionOutput;
+
+    /// Invokes [`jvp`] for one leaf regime.
+    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput;
+}
+
 fn single_output<V, T>(mut outputs: Vec<JvpTracer<V, T>>, op: &'static str) -> JvpTracer<V, T>
 where
     V: TraceValue,
@@ -191,25 +213,69 @@ where
     }
 }
 
+impl<V, Input, Output> JvpInvocationLeaf<Input, Output> for V
+where
+    V: TransformLeaf,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    Output: Parameterized<Self, ParameterStructure: Clone>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+{
+    type Base = V;
+    type FunctionInput = Input::To<JitTracer<V>>;
+    type FunctionOutput = Output::To<JitTracer<V>>;
+
+    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
+    {
+        if primals.parameter_structure() != tangents.parameter_structure() {
+            return Err(TraceError::MismatchedParameterStructure);
+        }
+
+        let (primal_output, tangent_program): (Output, LinearProgram<V, Input, Output>) =
+            jvp_program(function, primals)?;
+        let tangent_output = tangent_program.call(tangents)?;
+        Ok((primal_output, tangent_output))
+    }
+}
+
+impl<V, Input, Output> JvpInvocationLeaf<Input, Output> for JitTracer<V>
+where
+    V: TransformLeaf,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Input::Family: ParameterizedFamily<V>,
+    Output: Parameterized<Self, ParameterStructure: Clone>,
+    Output::Family: ParameterizedFamily<V>,
+    Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
+    Output::To<V>: Parameterized<V, To<JitTracer<V>> = Output>,
+{
+    type Base = V;
+    type FunctionInput = Input;
+    type FunctionOutput = Output;
+
+    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
+    {
+        try_jvp_traced(|input| Ok(function(input)), primals, tangents)
+    }
+}
+
 /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
 ///
 /// The returned pair is `(primal_output, tangent_output)`.
-pub fn jvp<F, Input, Output, V>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+#[allow(private_bounds, private_interfaces)]
+pub fn jvp<F, Input, Output, Leaf>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<V>>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<JitTracer<V>>,
-    F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
+    Leaf: JvpInvocationLeaf<Input, Output>,
+    Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
+    Output: Parameterized<Leaf, ParameterStructure: Clone>,
+    F: FnOnce(
+        <Leaf as JvpInvocationLeaf<Input, Output>>::FunctionInput,
+    ) -> <Leaf as JvpInvocationLeaf<Input, Output>>::FunctionOutput,
 {
-    if primals.parameter_structure() != tangents.parameter_structure() {
-        return Err(TraceError::MismatchedParameterStructure);
-    }
-
-    let (primal_output, tangent_program): (Output, LinearProgram<V, Input, Output>) = jvp_program(function, primals)?;
-    let tangent_output = tangent_program.call(tangents)?;
-    Ok((primal_output, tangent_output))
+    Leaf::invoke(function, primals, tangents)
 }
 
 #[cfg(test)]
@@ -234,7 +300,7 @@ mod tests {
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
         let result: Result<(f64, f64), TraceError> =
-            jvp::<_, _, _, f64>(|xs: Vec<JitTracer<f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
+            jvp(|xs: Vec<JitTracer<f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
         test_support::assert_quadratic_pushforward_rendering();
     }

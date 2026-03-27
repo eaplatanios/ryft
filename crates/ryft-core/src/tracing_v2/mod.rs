@@ -13,33 +13,53 @@ use thiserror::Error;
 
 use crate::parameters::ParameterError;
 
-mod batch;
+pub(crate) mod batch;
+#[cfg(feature = "benchmarking")]
+pub(crate) mod benchmark_support;
+#[cfg(feature = "benchmarking")]
+pub mod benchmarking;
 mod forward;
-mod graph;
+pub(crate) mod graph;
 mod jit;
 mod linear;
-mod matmul;
-mod ops;
-mod program;
+pub(crate) mod matmul;
+pub(crate) mod ops;
+pub(crate) mod program;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod value;
 
 pub use batch::{Batch, stack, unstack, vmap};
+pub(crate) use batch::{FlatTracedVMap, VMapOp};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub use graph::{Atom, AtomId, AtomSource, Equation, Graph, GraphBuilder};
+pub(crate) use graph::{AtomId, AtomSource, Graph, GraphBuilder};
 pub(crate) use jit::try_jit;
 pub use jit::{CompiledFunction, JitTracer, jit};
 pub use linear::{
-    CoordinateValue, DenseJacobian, LinearProgram, LinearTerm, Linearized, grad, hessian, jacfwd, jacrev, jvp_program,
-    linearize, value_and_grad, vjp,
+    CoordinateValue, DenseJacobian, LinearProgram, grad, hessian, jacfwd, jacrev, jvp_program, linearize,
+    value_and_grad, vjp,
 };
-pub use matmul::{MatMulOp, MatrixOps, MatrixTangentSpace, MatrixTransposeOp, MatrixValue};
-pub use ops::{
-    AddOp, BatchOp, CosOp, JvpOp, LinearOp, LinearOpRef, MulOp, NegOp, Op, ScaleOp, SinOp, StagedOp, StagedOpRef,
-};
-pub use program::{Program, ProgramBuilder, ProgramOpRef};
+pub(crate) use linear::{LinearTerm, Linearized};
+pub use matmul::{MatrixOps, MatrixTangentSpace, MatrixValue};
+pub(crate) use ops::{Op, StagedOpRef};
+pub(crate) use program::{Program, ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};
+
+/// Canonical concrete leaf types supported by the public `tracing_v2` transform entry points.
+///
+/// This trait is intentionally not implemented for [`JitTracer`]. Higher-order transform composition should go
+/// through staged replay rather than recursively instantiating `JitTracer<JitTracer<...>>`.
+pub(crate) trait TransformLeaf: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps {}
+
+impl TransformLeaf for f32 {}
+
+impl TransformLeaf for f64 {}
+
+#[cfg(any(feature = "ndarray", test))]
+impl TransformLeaf for ndarray::Array2<f32> {}
+
+#[cfg(any(feature = "ndarray", test))]
+impl TransformLeaf for ndarray::Array2<f64> {}
 
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -87,277 +107,4 @@ pub enum TraceError {
     /// Wrapper around parameter-lifting failures from the `Parameterized` infrastructure.
     #[error(transparent)]
     Parameter(#[from] ParameterError),
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ops::{Add, Mul, Neg};
-
-    use crate::tracing_v2::test_support;
-
-    use super::*;
-
-    fn approx_eq(left: f64, right: f64) {
-        let delta = (left - right).abs();
-        assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
-    }
-
-    fn bilinear_sin<T>(inputs: (T, T)) -> T
-    where
-        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-    {
-        inputs.0.clone() * inputs.1 + inputs.0.sin()
-    }
-
-    fn quadratic_plus_sin<T>(x: T) -> T
-    where
-        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-    {
-        x.clone() * x.clone() + x.sin()
-    }
-
-    fn quartic_plus_sin<T>(x: T) -> T
-    where
-        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
-    {
-        x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
-    }
-
-    trait HigherOrderScalarValue:
-        TraceValue
-        + Clone
-        + FloatExt
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + Add<Output = Self>
-        + Mul<Output = Self>
-        + Neg<Output = Self>
-    {
-        fn first_derivative(self) -> Self;
-
-        fn second_derivative(self) -> Self;
-
-        fn third_derivative(self) -> Self;
-
-        fn fourth_derivative(self) -> Self;
-    }
-
-    impl HigherOrderScalarValue for f64 {
-        fn first_derivative(self) -> Self {
-            grad(quartic_plus_sin, self).expect("first derivative should be computable")
-        }
-
-        fn second_derivative(self) -> Self {
-            grad(first_derivative, self).expect("second derivative should be computable")
-        }
-
-        fn third_derivative(self) -> Self {
-            grad(second_derivative, self).expect("third derivative should be computable")
-        }
-
-        fn fourth_derivative(self) -> Self {
-            grad(third_derivative, self).expect("fourth derivative should be computable")
-        }
-    }
-
-    impl<V> HigherOrderScalarValue for JitTracer<V>
-    where
-        V: HigherOrderScalarValue,
-    {
-        fn first_derivative(self) -> Self {
-            grad(quartic_plus_sin, self).expect("first derivative should be computable")
-        }
-
-        fn second_derivative(self) -> Self {
-            grad(first_derivative, self).expect("second derivative should be computable")
-        }
-
-        fn third_derivative(self) -> Self {
-            grad(second_derivative, self).expect("third derivative should be computable")
-        }
-
-        fn fourth_derivative(self) -> Self {
-            grad(third_derivative, self).expect("fourth derivative should be computable")
-        }
-    }
-
-    fn first_derivative<V>(x: V) -> V
-    where
-        V: HigherOrderScalarValue,
-    {
-        V::first_derivative(x)
-    }
-
-    fn second_derivative<V>(x: V) -> V
-    where
-        V: HigherOrderScalarValue,
-    {
-        V::second_derivative(x)
-    }
-
-    fn third_derivative<V>(x: V) -> V
-    where
-        V: HigherOrderScalarValue,
-    {
-        V::third_derivative(x)
-    }
-
-    fn fourth_derivative<V>(x: V) -> V
-    where
-        V: HigherOrderScalarValue,
-    {
-        V::fourth_derivative(x)
-    }
-
-    fn hessian_style_second_derivative<V>(x: V) -> V
-    where
-        V: HigherOrderScalarValue + TraceValue,
-    {
-        let (_, second_derivative) =
-            jvp(first_derivative, x.clone(), x.one_like()).expect("forward-over-reverse Hessian should succeed");
-        second_derivative
-    }
-
-    #[test]
-    fn forward_mode_uses_parameterized_structure() {
-        let (primal, tangent) = jvp(bilinear_sin, (2.0f64, 3.0f64), (1.0f64, -1.0f64)).unwrap();
-        approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
-        approx_eq(tangent, 3.0 - 2.0 + 2.0f64.cos());
-        test_support::assert_bilinear_pushforward_rendering();
-    }
-
-    #[test]
-    fn transposition_drives_reverse_mode() {
-        let (output, pullback) = vjp(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
-        approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
-
-        let input_cotangent = pullback.call(1.0f64).unwrap();
-        approx_eq(input_cotangent.0, 3.0 + 2.0f64.cos());
-        approx_eq(input_cotangent.1, 2.0);
-
-        let gradient = grad(quadratic_plus_sin, 2.0f64).unwrap();
-        approx_eq(gradient, 4.0 + 2.0f64.cos());
-        test_support::assert_bilinear_pullback_rendering();
-    }
-
-    #[test]
-    fn value_and_grad_returns_both_outputs() {
-        let (value, gradient) = value_and_grad(quadratic_plus_sin, 2.0f64).unwrap();
-
-        approx_eq(value, 2.0f64.powi(2) + 2.0f64.sin());
-        approx_eq(gradient, 4.0 + 2.0f64.cos());
-        test_support::assert_quadratic_pushforward_rendering();
-    }
-
-    #[test]
-    fn jacfwd_materializes_a_dense_jacobian() {
-        let jacobian = jacfwd::<_, (f64, f64), f64, f64>(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
-
-        assert_eq!(jacobian.rows(), 1);
-        assert_eq!(jacobian.cols(), 2);
-        approx_eq(*jacobian.get(0, 0).unwrap(), 3.0 + 2.0f64.cos());
-        approx_eq(*jacobian.get(0, 1).unwrap(), 2.0);
-        test_support::assert_bilinear_pushforward_rendering();
-    }
-
-    #[test]
-    fn jacrev_materializes_the_same_dense_jacobian() {
-        let jacobian = jacrev::<_, (f64, f64), f64, f64>(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
-
-        assert_eq!(jacobian.rows(), 1);
-        assert_eq!(jacobian.cols(), 2);
-        approx_eq(*jacobian.get(0, 0).unwrap(), 3.0 + 2.0f64.cos());
-        approx_eq(*jacobian.get(0, 1).unwrap(), 2.0);
-        test_support::assert_bilinear_pullback_rendering();
-    }
-
-    #[test]
-    fn hessian_materializes_a_dense_second_derivative_from_a_gradient_function() {
-        let dense_hessian = hessian(first_derivative, 2.0f64).unwrap();
-
-        assert_eq!(dense_hessian.rows(), 1);
-        assert_eq!(dense_hessian.cols(), 1);
-        approx_eq(*dense_hessian.get(0, 0).unwrap(), 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
-        test_support::assert_hessian_style_second_derivative_jit_rendering();
-    }
-
-    #[test]
-    fn jit_captures_and_replays_a_program() {
-        let (output, compiled) = jit(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
-        approx_eq(output, 2.0 * 3.0 + 2.0f64.sin());
-        let replayed = compiled.call((5.0f64, -4.0f64)).unwrap();
-        approx_eq(replayed, 5.0 * -4.0 + 5.0f64.sin());
-        test_support::assert_bilinear_jit_rendering();
-    }
-
-    #[test]
-    fn vectorization_stacks_and_unstacks_parameterized_inputs() {
-        let outputs = vmap(bilinear_sin, vec![(1.0f64, 2.0f64), (3.0f64, 4.0f64), (5.0f64, 6.0f64)]).unwrap();
-
-        let expected = vec![1.0 * 2.0 + 1.0f64.sin(), 3.0 * 4.0 + 3.0f64.sin(), 5.0 * 6.0 + 5.0f64.sin()];
-        assert_eq!(outputs.len(), expected.len());
-        for (left, right) in outputs.into_iter().zip(expected) {
-            approx_eq(left, right);
-        }
-        test_support::assert_reference_scalar_sine_jit_rendering();
-    }
-
-    #[test]
-    fn forward_over_reverse_computes_a_hessian_style_second_derivative() {
-        let (first_derivative_value, second_derivative_value) = jvp(first_derivative, 2.0f64, 1.0f64).unwrap();
-
-        approx_eq(first_derivative_value, 4.0 * 2.0f64.powi(3) + 2.0f64.cos());
-        approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
-        test_support::assert_hessian_style_second_derivative_jit_rendering();
-    }
-
-    #[test]
-    fn higher_order_reverse_mode_computes_a_fourth_derivative() {
-        let fourth_derivative_value = fourth_derivative(2.0f64);
-
-        approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
-        test_support::assert_fourth_derivative_jit_rendering();
-    }
-
-    #[test]
-    fn inline_nested_grad_calls_compute_a_fourth_derivative() {
-        let fourth_derivative_value = grad(
-            |x| {
-                grad(
-                    |x| {
-                        grad(|x| grad(quartic_plus_sin, x).expect("innermost grad should succeed"), x)
-                            .expect("third derivative should succeed")
-                    },
-                    x,
-                )
-                .expect("second derivative should succeed")
-            },
-            2.0f64,
-        )
-        .expect("fourth derivative should succeed");
-
-        approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
-        test_support::assert_inline_fourth_derivative_jit_rendering();
-    }
-
-    #[test]
-    fn jit_can_trace_a_hessian_style_second_derivative() {
-        let (second_derivative_value, compiled) = jit(hessian_style_second_derivative, 2.0f64).unwrap();
-
-        approx_eq(second_derivative_value, 12.0 * 2.0f64.powi(2) - 2.0f64.sin());
-        let replayed = compiled.call(1.5f64).unwrap();
-        approx_eq(replayed, 12.0 * 1.5f64.powi(2) - 1.5f64.sin());
-        test_support::assert_hessian_style_second_derivative_jit_rendering();
-    }
-
-    #[test]
-    fn jit_can_trace_a_fourth_derivative() {
-        let (fourth_derivative_value, compiled) = jit(fourth_derivative, 2.0f64).unwrap();
-
-        approx_eq(fourth_derivative_value, 24.0 + 2.0f64.sin());
-        let replayed = compiled.call(0.5f64).unwrap();
-        approx_eq(replayed, 24.0 + 0.5f64.sin());
-        test_support::assert_fourth_derivative_jit_rendering();
-    }
 }

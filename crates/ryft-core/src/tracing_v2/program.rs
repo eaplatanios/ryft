@@ -12,13 +12,13 @@ use crate::{
 };
 
 /// Shared operation reference used by the canonical staged program IR.
-pub type ProgramOpRef<V> = Arc<dyn Op<V>>;
+pub(crate) type ProgramOpRef<V> = Arc<dyn Op<V>>;
 
 /// Shared builder used by the canonical staged program IR.
-pub type ProgramBuilder<V> = GraphBuilder<ProgramOpRef<V>, V>;
+pub(crate) type ProgramBuilder<V> = GraphBuilder<ProgramOpRef<V>, V>;
 
 /// Canonical staged program used by `tracing_v2`.
-pub struct Program<V, Input, Output>
+pub(crate) struct Program<V, Input, Output>
 where
     V: TraceValue,
     Input: Parameterized<V>,
@@ -47,19 +47,19 @@ where
 {
     /// Creates a program from an existing staged graph.
     #[inline]
-    pub fn from_graph(graph: Graph<ProgramOpRef<V>, V, Input, Output>) -> Self {
+    pub(crate) fn from_graph(graph: Graph<ProgramOpRef<V>, V, Input, Output>) -> Self {
         Self { graph, marker: PhantomData }
     }
 
     /// Returns the underlying staged graph.
     #[inline]
-    pub fn graph(&self) -> &Graph<ProgramOpRef<V>, V, Input, Output> {
+    pub(crate) fn graph(&self) -> &Graph<ProgramOpRef<V>, V, Input, Output> {
         &self.graph
     }
 
     /// Replays the staged program on concrete input values.
     #[inline]
-    pub fn call(&self, input: Input) -> Result<Output, TraceError>
+    pub(crate) fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
@@ -68,7 +68,7 @@ where
     }
 
     /// Eliminates dead constants and equations that do not contribute to the program outputs.
-    pub fn simplify(&self) -> Result<Self, TraceError>
+    pub(crate) fn simplify(&self) -> Result<Self, TraceError>
     where
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,

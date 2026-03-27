@@ -18,7 +18,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
+        FloatExt, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
         graph::AtomId,
         ops::{AddOp, CosOp, MulOp, NegOp, SinOp, StagedOpRef},
         program::{Program, ProgramBuilder},
@@ -43,12 +43,6 @@ impl<V> JitTracer<V>
 where
     V: TraceValue,
 {
-    /// Returns the staged atom identifier corresponding to this traced value.
-    #[inline]
-    pub fn atom(&self) -> AtomId {
-        self.atom
-    }
-
     #[inline]
     pub(crate) fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
         self.builder.clone()
@@ -160,7 +154,7 @@ impl<V> TraceValue for JitTracer<V> where V: TraceValue {}
 
 impl<V> ZeroLike for JitTracer<V>
 where
-    V: TraceValue + ZeroLike,
+    V: TransformLeaf,
 {
     #[inline]
     fn zero_like(&self) -> Self {
@@ -172,7 +166,7 @@ where
 
 impl<V> OneLike for JitTracer<V>
 where
-    V: TraceValue + OneLike,
+    V: TransformLeaf,
 {
     #[inline]
     fn one_like(&self) -> Self {
@@ -184,7 +178,7 @@ where
 
 impl<V> Add for JitTracer<V>
 where
-    V: TraceValue + Add<Output = V>,
+    V: TransformLeaf + Add<Output = V>,
 {
     type Output = Self;
 
@@ -196,7 +190,7 @@ where
 
 impl<V> Mul for JitTracer<V>
 where
-    V: TraceValue + Mul<Output = V>,
+    V: TransformLeaf + Mul<Output = V>,
 {
     type Output = Self;
 
@@ -208,7 +202,7 @@ where
 
 impl<V> Neg for JitTracer<V>
 where
-    V: TraceValue + Neg<Output = V>,
+    V: TransformLeaf + Neg<Output = V>,
 {
     type Output = Self;
 
@@ -220,7 +214,7 @@ where
 
 impl<V> FloatExt for JitTracer<V>
 where
-    V: TraceValue + FloatExt,
+    V: TransformLeaf,
 {
     #[inline]
     fn sin(self) -> Self {
@@ -277,13 +271,13 @@ where
 
     /// Returns the staged graph backing this compiled function.
     #[inline]
-    pub fn graph(&self) -> &crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output> {
+    pub(crate) fn graph(&self) -> &crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output> {
         self.program.graph()
     }
 
     /// Returns the staged program backing this compiled function.
     #[inline]
-    pub fn program(&self) -> &Program<V, Input, Output> {
+    pub(crate) fn program(&self) -> &Program<V, Input, Output> {
         &self.program
     }
 
@@ -308,9 +302,10 @@ where
     }
 }
 
-pub(crate) fn try_trace_program<F, Input, Output, V>(
+fn try_trace_program_with_options<F, Input, Output, V>(
     function: F,
     input: Input,
+    simplify_program: bool,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
     V: TraceValue,
@@ -350,9 +345,24 @@ where
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
-    let program =
-        Program::from_graph(builder.build::<Input, Output>(outputs, input_structure, output_structure)).simplify()?;
+    let program = Program::from_graph(builder.build::<Input, Output>(outputs, input_structure, output_structure));
+    let program = if simplify_program { program.simplify()? } else { program };
     Ok((output_value, program))
+}
+
+pub(crate) fn try_trace_program<F, Input, Output, V>(
+    function: F,
+    input: Input,
+) -> Result<(Output, Program<V, Input, Output>), TraceError>
+where
+    V: TraceValue,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
+{
+    try_trace_program_with_options(function, input, true)
 }
 
 pub(crate) fn try_jit<F, Input, Output, V>(
@@ -411,9 +421,9 @@ mod tests {
         let tracer = JitTracer { value: 3.0, atom, builder, staging_error };
         let zero = tracer.zero_like();
         assert_eq!(zero.value, 0.0);
-        assert!(zero.atom() > atom);
+        assert!(zero.atom > atom);
 
-        let graph = zero.builder.borrow().clone().build::<f64, f64>(vec![zero.atom()], Placeholder, Placeholder);
+        let graph = zero.builder.borrow().clone().build::<f64, f64>(vec![zero.atom], Placeholder, Placeholder);
         assert_eq!(
             graph.to_string(),
             indoc! {"
@@ -456,7 +466,10 @@ mod tests {
     fn jit_returns_abstract_eval_errors_instead_of_panicking() {
         use ryft_macros::Parameter;
 
-        use crate::types::{ArrayType, DataType, Typed};
+        use crate::{
+            tracing_v2::{FloatExt, MatrixOps, OneLike, TransformLeaf, ZeroLike},
+            types::{ArrayType, DataType, Typed},
+        };
 
         #[derive(Clone, Debug, Parameter)]
         struct TestAbstractValue {
@@ -478,6 +491,56 @@ mod tests {
                 self
             }
         }
+
+        impl Mul for TestAbstractValue {
+            type Output = Self;
+
+            fn mul(self, _rhs: Self) -> Self::Output {
+                self
+            }
+        }
+
+        impl Neg for TestAbstractValue {
+            type Output = Self;
+
+            fn neg(self) -> Self::Output {
+                self
+            }
+        }
+
+        impl FloatExt for TestAbstractValue {
+            fn sin(self) -> Self {
+                self
+            }
+
+            fn cos(self) -> Self {
+                self
+            }
+        }
+
+        impl ZeroLike for TestAbstractValue {
+            fn zero_like(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        impl OneLike for TestAbstractValue {
+            fn one_like(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        impl MatrixOps for TestAbstractValue {
+            fn matmul(self, _rhs: Self) -> Self {
+                self
+            }
+
+            fn transpose_matrix(self) -> Self {
+                self
+            }
+        }
+
+        impl TransformLeaf for TestAbstractValue {}
 
         let result: Result<
             (

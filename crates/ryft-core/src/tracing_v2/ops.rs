@@ -10,16 +10,29 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(feature = "xla")]
+use ryft_mlir::dialects::stable_hlo;
+#[cfg(feature = "xla")]
+use ryft_mlir::{Block, Operation, Value, ValueRef};
+
 use crate::tracing_v2::{
-    FloatExt, TraceError, TraceValue,
+    FloatExt, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    graph::{AtomId, GraphBuilder},
+    graph::AtomId,
+    jit::JitTracer,
+    linear::LinearTerm,
+    matmul::MatrixOps,
+    program::ProgramBuilder,
 };
 use crate::types::ArrayType;
+#[cfg(feature = "xla")]
+use crate::xla::lowering::{
+    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
+};
 
 /// Core primitive operation interface understood by staged graphs.
-pub trait Op<V>: Debug + Display
+pub(crate) trait Op<V>: Debug + Display
 where
     V: TraceValue,
 {
@@ -34,27 +47,87 @@ where
 
     /// Executes the operation on concrete values.
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
-}
 
-/// Marker trait for operations that may appear in JIT-staged graphs.
-pub trait StagedOp<V>: Op<V>
-where
-    V: TraceValue,
-{
-}
+    /// Replays this staged op while tracing a linearized JIT program.
+    fn replay_linearized_jit(
+        &self,
+        _inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "replay_program_graph",
+            message: format!("replaying linearized values through staged op '{}' is not implemented", self.name()),
+        })
+    }
 
-impl<T, V> StagedOp<V> for T
-where
-    T: Op<V>,
-    V: TraceValue,
-{
+    /// Applies this op's program-level JVP rule while linearizing a staged program.
+    fn apply_program_jvp_rule(
+        &self,
+        _inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "linearize_program",
+            message: format!("JVP rule for staged op '{}' is not implemented", self.name()),
+        })
+    }
+
+    /// Applies this op's transpose rule while transposing a linearized staged program.
+    fn transpose_program_op(
+        &self,
+        _builder: &mut ProgramBuilder<V>,
+        _inputs: &[AtomId],
+        _outputs: &[AtomId],
+        _output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "transpose_linear_program",
+            message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
+        })
+    }
+
+    /// Lowers this op inside a plain StableHLO MLIR graph.
+    #[cfg(feature = "xla")]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        _input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        _lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        Err(LoweringError::UnsupportedOp { op: self.name().to_string() })
+    }
+
+    /// Lowers this op inside a Shardy/StableHLO MLIR graph for traced XLA programs.
+    #[cfg(feature = "xla")]
+    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+        &self,
+        _input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        Err(LoweringError::UnsupportedOp { op: self.name().to_string() })
+    }
 }
 
 /// Shared reference to a dynamically dispatched staged operation.
-pub type StagedOpRef<V> = Arc<dyn Op<V>>;
+pub(crate) type StagedOpRef<V> = Arc<dyn Op<V>>;
 
 /// Primitive operation with a forward-mode differentiation rule.
-pub trait JvpOp<V>: Op<V>
+pub(crate) trait JvpOp<V>: Op<V>
 where
     V: TraceValue,
 {
@@ -65,30 +138,13 @@ where
 }
 
 /// Primitive operation with a batching rule used by `vmap`.
-pub trait BatchOp<V>: Op<V>
+pub(crate) trait BatchOp<V>: Op<V>
 where
     V: TraceValue,
 {
     /// Applies the primitive's batching rule to batched inputs.
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
-
-/// Primitive operation that may appear in a linearized program and therefore supports transposition.
-pub trait LinearOp<V>: Op<V>
-where
-    V: TraceValue,
-{
-    /// Applies the primitive's transpose rule to output cotangents.
-    fn transpose(
-        &self,
-        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>;
-}
-/// Shared reference to a dynamically dispatched linear operation.
-pub type LinearOpRef<V> = Arc<dyn LinearOp<V>>;
 
 impl<T, V> Op<V> for Arc<T>
 where
@@ -113,6 +169,71 @@ where
     #[inline]
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         (**self).eval(inputs)
+    }
+
+    #[inline]
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        (**self).replay_linearized_jit(inputs)
+    }
+
+    #[inline]
+    fn apply_program_jvp_rule(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        (**self).apply_program_jvp_rule(inputs)
+    }
+
+    #[inline]
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
+    }
+
+    #[cfg(feature = "xla")]
+    #[inline]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        (**self).lower_plain_mlir(input_values, output_types, mode, lowerer)
+    }
+
+    #[cfg(feature = "xla")]
+    #[inline]
+    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        (**self).lower_shard_map_mlir(input_values, output_types, lowerer)
     }
 }
 
@@ -140,29 +261,21 @@ where
         (**self).batch(inputs)
     }
 }
-
-impl<T, V> LinearOp<V> for Arc<T>
-where
-    T: LinearOp<V> + ?Sized,
-    V: TraceValue,
-{
-    #[inline]
-    fn transpose(
-        &self,
-        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        (**self).transpose(builder, inputs, outputs, output_cotangents)
-    }
-}
 fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {
     if inputs == expected { Ok(()) } else { Err(TraceError::InvalidInputCount { expected, got: inputs }) }
 }
 
 fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<(), TraceError> {
     if left.len() == right.len() { Ok(()) } else { Err(TraceError::MismatchedBatchSize) }
+}
+
+pub(crate) fn lift_jit_constant<V>(constant: &V, exemplar: &JitTracer<V>) -> JitTracer<V>
+where
+    V: TraceValue,
+{
+    let builder = exemplar.builder_handle();
+    let atom = builder.borrow_mut().add_constant(constant.clone());
+    JitTracer::from_staged_parts(constant.clone(), atom, builder, exemplar.staging_error_handle())
 }
 
 fn unary_abstract<V>(_op: &'static str, inputs: &[ArrayType]) -> Result<ArrayType, TraceError>
@@ -191,7 +304,7 @@ where
 
 /// Elementwise addition primitive.
 #[derive(Clone, Default)]
-pub struct AddOp;
+pub(crate) struct AddOp;
 
 impl Debug for AddOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -224,6 +337,74 @@ where
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 2)?;
+        Ok(vec![JvpTracer {
+            primal: inputs[0].primal.clone() + inputs[1].primal.clone(),
+            tangent: inputs[0].tangent.clone().add(inputs[1].tangent.clone()),
+        }])
+    }
+
+    fn apply_program_jvp_rule(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        self.jvp(inputs)
+    }
+
+    fn transpose_program_op(
+        &self,
+        _builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        expect_input_count(inputs.len(), 2)?;
+        expect_input_count(outputs.len(), 1)?;
+        expect_input_count(output_cotangents.len(), 1)?;
+        Ok(vec![Some(output_cotangents[0]), Some(output_cotangents[0])])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let operation =
+            lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
+        Ok(vec![operation.result(0).expect("stablehlo.add should return one result").as_ref()])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let operation =
+            lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
+        Ok(vec![operation.result(0).expect("stablehlo.add should return one result").as_ref()])
     }
 }
 
@@ -262,27 +443,9 @@ where
     }
 }
 
-impl<V> LinearOp<V> for AddOp
-where
-    V: TraceValue + Add<Output = V>,
-{
-    fn transpose(
-        &self,
-        _builder: &mut GraphBuilder<LinearOpRef<V>, V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        expect_input_count(inputs.len(), 2)?;
-        expect_input_count(outputs.len(), 1)?;
-        expect_input_count(output_cotangents.len(), 1)?;
-        Ok(vec![Some(output_cotangents[0]), Some(output_cotangents[0])])
-    }
-}
-
 /// Elementwise multiplication primitive.
 #[derive(Clone, Default)]
-pub struct MulOp;
+pub(crate) struct MulOp;
 
 impl Debug for MulOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -315,6 +478,67 @@ where
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 2)?;
+        let left = &inputs[0];
+        let right = &inputs[1];
+        Ok(vec![JvpTracer {
+            primal: left.primal.clone() * right.primal.clone(),
+            tangent: LinearTerm::add(
+                LinearTerm::scale(left.tangent.clone(), right.primal.clone()),
+                LinearTerm::scale(right.tangent.clone(), left.primal.clone()),
+            ),
+        }])
+    }
+
+    fn apply_program_jvp_rule(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        self.jvp(inputs)
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let operation =
+            lowerer
+                .block
+                .append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
+        Ok(vec![operation.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let operation =
+            lowerer
+                .block
+                .append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
+        Ok(vec![operation.result(0).expect("stablehlo.multiply should return one result").as_ref()])
     }
 }
 
@@ -360,7 +584,7 @@ where
 
 /// Elementwise negation primitive.
 #[derive(Clone, Default)]
-pub struct NegOp;
+pub(crate) struct NegOp;
 
 impl Debug for NegOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -394,6 +618,70 @@ where
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![-inputs[0].clone()])
     }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: inputs[0].tangent.clone().neg() }])
+    }
+
+    fn apply_program_jvp_rule(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        self.jvp(inputs)
+    }
+
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        expect_input_count(outputs.len(), 1)?;
+        expect_input_count(output_cotangents.len(), 1)?;
+        let contribution = builder.add_equation(Arc::new(NegOp), vec![output_cotangents[0]])?[0];
+        Ok(vec![Some(contribution)])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let operation = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+        Ok(vec![operation.result(0).expect("stablehlo.negate should return one result").as_ref()])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let operation = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+        Ok(vec![operation.result(0).expect("stablehlo.negate should return one result").as_ref()])
+    }
 }
 
 impl<V> JvpOp<V> for NegOp
@@ -419,28 +707,9 @@ where
     }
 }
 
-impl<V> LinearOp<V> for NegOp
-where
-    V: TraceValue + Neg<Output = V>,
-{
-    fn transpose(
-        &self,
-        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
-        expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = builder.add_equation(Arc::new(NegOp), vec![output_cotangents[0]])?[0];
-        Ok(vec![Some(contribution)])
-    }
-}
-
 /// Elementwise sine primitive.
 #[derive(Clone, Default)]
-pub struct SinOp;
+pub(crate) struct SinOp;
 
 impl Debug for SinOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -474,6 +743,65 @@ where
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().sin()])
     }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        let input = &inputs[0];
+        Ok(vec![JvpTracer {
+            primal: input.primal.clone().sin(),
+            tangent: LinearTerm::scale(input.tangent.clone(), input.primal.clone().cos()),
+        }])
+    }
+
+    fn apply_program_jvp_rule(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        self.jvp(inputs)
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let operation = lowerer.block.append_operation(stable_hlo::sine(
+            input_values[0],
+            stable_hlo::Accuracy::Default,
+            lowerer.location,
+        ));
+        Ok(vec![operation.result(0).expect("stablehlo.sine should return one result").as_ref()])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let operation = lowerer.block.append_operation(stable_hlo::sine(
+            input_values[0],
+            stable_hlo::Accuracy::Default,
+            lowerer.location,
+        ));
+        Ok(vec![operation.result(0).expect("stablehlo.sine should return one result").as_ref()])
+    }
 }
 
 impl<V> JvpOp<V> for SinOp
@@ -505,7 +833,7 @@ where
 
 /// Elementwise cosine primitive.
 #[derive(Clone, Default)]
-pub struct CosOp;
+pub(crate) struct CosOp;
 
 impl Debug for CosOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -539,6 +867,65 @@ where
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().cos()])
     }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        let input = &inputs[0];
+        Ok(vec![JvpTracer {
+            primal: input.primal.clone().cos(),
+            tangent: LinearTerm::neg(LinearTerm::scale(input.tangent.clone(), input.primal.clone().sin())),
+        }])
+    }
+
+    fn apply_program_jvp_rule(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        self.jvp(inputs)
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let operation = lowerer.block.append_operation(stable_hlo::cosine(
+            input_values[0],
+            stable_hlo::Accuracy::Default,
+            lowerer.location,
+        ));
+        Ok(vec![operation.result(0).expect("stablehlo.cosine should return one result").as_ref()])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let operation = lowerer.block.append_operation(stable_hlo::cosine(
+            input_values[0],
+            stable_hlo::Accuracy::Default,
+            lowerer.location,
+        ));
+        Ok(vec![operation.result(0).expect("stablehlo.cosine should return one result").as_ref()])
+    }
 }
 
 impl<V> JvpOp<V> for CosOp
@@ -570,7 +957,7 @@ where
 
 /// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]
-pub struct ScaleOp<V>
+pub(crate) struct ScaleOp<V>
 where
     V: TraceValue,
 {
@@ -631,6 +1018,70 @@ where
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
+        Ok(vec![JvpTracer {
+            primal: factor.clone() * inputs[0].primal.clone(),
+            tangent: inputs[0].tangent.clone().scale(factor),
+        }])
+    }
+
+    fn apply_program_jvp_rule(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        self.jvp(inputs)
+    }
+
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError>
+    where
+        V: FloatExt + ZeroLike + MatrixOps,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        expect_input_count(outputs.len(), 1)?;
+        expect_input_count(output_cotangents.len(), 1)?;
+        let contribution =
+            builder.add_equation(Arc::new(ScaleOp::new(self.factor().clone())), vec![output_cotangents[0]])?[0];
+        Ok(vec![Some(contribution)])
+    }
+
+    #[cfg(feature = "xla")]
+    fn lower_plain_mlir<'b, 'c, 't>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let factor = match mode {
+            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(self.factor())?,
+            PlainMlirLoweringMode::Packed { .. } => {
+                lowerer.lower_packed_literal_value(self.factor(), &output_types[0])?
+            }
+        };
+        let operation = lowerer.block.append_operation(stable_hlo::multiply(factor, input_values[0], lowerer.location));
+        Ok(vec![operation.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+    }
 }
 
 impl<V> JvpOp<V> for ScaleOp<V>
@@ -660,26 +1111,6 @@ where
     }
 }
 
-impl<V> LinearOp<V> for ScaleOp<V>
-where
-    V: TraceValue + Mul<Output = V>,
-{
-    fn transpose(
-        &self,
-        builder: &mut GraphBuilder<LinearOpRef<V>, V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
-        expect_input_count(output_cotangents.len(), 1)?;
-        let contribution =
-            builder.add_equation(Arc::new(ScaleOp::new(self.factor().clone())), vec![output_cotangents[0]])?[0];
-        Ok(vec![Some(contribution)])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -688,7 +1119,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{GraphBuilder, TraceError, test_support},
+        tracing_v2::{TraceError, test_support},
         types::{ArrayType, DataType, Layout, Shape, StridedLayout},
     };
 
@@ -748,14 +1179,14 @@ mod tests {
 
     #[test]
     fn scale_transpose_scales_output_cotangents() {
-        let mut forward_builder = GraphBuilder::<LinearOpRef<f64>, f64>::new();
+        let mut forward_builder = ProgramBuilder::<f64>::new();
         let input = forward_builder.add_input(&1.0f64);
         let output = forward_builder.add_equation(Arc::new(ScaleOp::new(3.0f64)), vec![input]).unwrap()[0];
 
-        let mut transpose_builder = GraphBuilder::<LinearOpRef<f64>, f64>::new();
+        let mut transpose_builder = ProgramBuilder::<f64>::new();
         let output_cotangent = transpose_builder.add_input(&1.0f64);
         let contribution = ScaleOp::new(3.0f64)
-            .transpose(&mut transpose_builder, &[input], &[output], &[output_cotangent])
+            .transpose_program_op(&mut transpose_builder, &[input], &[output], &[output_cotangent])
             .unwrap()[0]
             .unwrap();
 

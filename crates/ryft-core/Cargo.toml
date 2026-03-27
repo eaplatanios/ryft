@@ -37,6 +37,8 @@ dyn-clone.workspace = true
 half.workspace = true
 ndarray = { workspace = true, optional = true }
 paste.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -46,6 +48,7 @@ pretty_assertions.workspace = true
 
 [features]
 default = ["xla"]
+benchmarking = []
 ndarray = ["dep:ndarray"]
 xla = ["ryft-mlir", "ryft-pjrt"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
@@ -54,3 +57,8 @@ rocm-7 = ["ryft-pjrt/rocm-7"]
 tpu = ["ryft-pjrt/tpu"]
 neuron = ["ryft-pjrt/neuron"]
 metal = ["ryft-pjrt/metal"]
+
+[[bin]]
+name = "ir_benchmark"
+path = "src/bin/ir_benchmark.rs"
+required-features = ["benchmarking", "ndarray", "xla"]

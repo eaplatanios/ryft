@@ -12,11 +12,11 @@ use crate::{
 };
 
 /// Identifier for an atom within a staged graph.
-pub type AtomId = usize;
+pub(crate) type AtomId = usize;
 
 /// Origin of a staged atom.
 #[derive(Clone, Debug)]
-pub enum AtomSource {
+pub(crate) enum AtomSource {
     /// Atom introduced as a graph input.
     Input,
     /// Atom introduced as a literal constant.
@@ -27,7 +27,7 @@ pub enum AtomSource {
 
 /// Staged atom carrying abstract metadata and provenance.
 #[derive(Clone, Debug)]
-pub struct Atom<V>
+pub(crate) struct Atom<V>
 where
     V: TraceValue,
 {
@@ -41,7 +41,7 @@ where
 
 /// Single equation in a staged graph.
 #[derive(Clone, Debug)]
-pub struct Equation<O> {
+pub(crate) struct Equation<O> {
     /// Operation applied by this equation.
     pub op: O,
     /// Input atoms consumed by the equation.
@@ -52,7 +52,7 @@ pub struct Equation<O> {
 
 /// Builder for staged graphs.
 #[derive(Clone, Debug)]
-pub struct GraphBuilder<O, V>
+pub(crate) struct GraphBuilder<O, V>
 where
     O: Clone + Op<V>,
     V: TraceValue,
@@ -69,25 +69,20 @@ where
 {
     /// Creates an empty builder.
     #[inline]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { atoms: Vec::new(), input_atoms: Vec::new(), equations: Vec::new() }
     }
 
     /// Returns the number of atoms allocated so far.
-    #[inline]
-    pub fn atom_count(&self) -> usize {
-        self.atoms.len()
-    }
-
     /// Returns the atom with the provided identifier.
     #[inline]
-    pub fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
+    pub(crate) fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
         self.atoms.get(id)
     }
 
     /// Adds a new input atom with the supplied abstract value.
     #[inline]
-    pub fn add_input_abstract(&mut self, abstract_value: ArrayType, example_value: V) -> AtomId {
+    pub(crate) fn add_input_abstract(&mut self, abstract_value: ArrayType, example_value: V) -> AtomId {
         let id = self.atoms.len();
         self.atoms.push(Atom { abstract_value, example_value, source: AtomSource::Input });
         self.input_atoms.push(id);
@@ -96,13 +91,13 @@ where
 
     /// Adds a new input atom using the abstract value of `example`.
     #[inline]
-    pub fn add_input(&mut self, example: &V) -> AtomId {
+    pub(crate) fn add_input(&mut self, example: &V) -> AtomId {
         self.add_input_abstract(<V as Typed<ArrayType>>::tpe(example), example.clone())
     }
 
     /// Adds a constant atom to the graph.
     #[inline]
-    pub fn add_constant(&mut self, value: V) -> AtomId {
+    pub(crate) fn add_constant(&mut self, value: V) -> AtomId {
         let id = self.atoms.len();
         self.atoms.push(Atom {
             abstract_value: <V as Typed<ArrayType>>::tpe(&value),
@@ -113,7 +108,7 @@ where
     }
 
     /// Adds a staged equation, validating its inputs through abstract evaluation first.
-    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError> {
+    pub(crate) fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError> {
         let input_abstracts = inputs
             .iter()
             .map(|input| {
@@ -146,7 +141,7 @@ where
     }
 
     /// Finalizes the builder into a graph with the given input/output structures.
-    pub fn build<Input, Output>(
+    pub(crate) fn build<Input, Output>(
         self,
         outputs: Vec<AtomId>,
         input_structure: Input::ParameterStructure,
@@ -179,7 +174,7 @@ where
 }
 
 /// Executable staged graph over an open operation set.
-pub struct Graph<O, V, Input, Output>
+pub(crate) struct Graph<O, V, Input, Output>
 where
     O: Clone + Op<V>,
     V: TraceValue,
@@ -224,48 +219,48 @@ where
 {
     /// Returns the number of atoms in the graph.
     #[inline]
-    pub fn atom_count(&self) -> usize {
+    pub(crate) fn atom_count(&self) -> usize {
         self.atoms.len()
     }
 
     /// Returns the atom with the provided identifier.
     #[inline]
-    pub fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
+    pub(crate) fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
         self.atoms.get(id)
     }
 
     /// Returns the graph input atoms in parameter order.
     #[inline]
-    pub fn input_atoms(&self) -> &[AtomId] {
+    pub(crate) fn input_atoms(&self) -> &[AtomId] {
         self.input_atoms.as_slice()
     }
 
     /// Returns the equations in execution order.
     #[inline]
-    pub fn equations(&self) -> &[Equation<O>] {
+    pub(crate) fn equations(&self) -> &[Equation<O>] {
         self.equations.as_slice()
     }
 
     /// Returns the output atoms in parameter order.
     #[inline]
-    pub fn outputs(&self) -> &[AtomId] {
+    pub(crate) fn outputs(&self) -> &[AtomId] {
         self.outputs.as_slice()
     }
 
     /// Returns the expected input parameter structure.
     #[inline]
-    pub fn input_structure(&self) -> &Input::ParameterStructure {
+    pub(crate) fn input_structure(&self) -> &Input::ParameterStructure {
         &self.input_structure
     }
 
     /// Returns the output parameter structure.
     #[inline]
-    pub fn output_structure(&self) -> &Output::ParameterStructure {
+    pub(crate) fn output_structure(&self) -> &Output::ParameterStructure {
         &self.output_structure
     }
 
     /// Clones this graph while replacing only the typed input/output structures.
-    pub fn clone_with_structures<NewInput, NewOutput>(
+    pub(crate) fn clone_with_structures<NewInput, NewOutput>(
         &self,
         input_structure: NewInput::ParameterStructure,
         output_structure: NewOutput::ParameterStructure,
@@ -286,7 +281,7 @@ where
     }
 
     /// Interprets the staged graph on concrete input values.
-    pub fn call(&self, input: Input) -> Result<Output, TraceError>
+    pub(crate) fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
@@ -336,7 +331,7 @@ where
     }
 
     /// Eliminates dead constants and equations that do not contribute to the graph outputs.
-    pub fn simplify(&self) -> Result<Self, TraceError>
+    pub(crate) fn simplify(&self) -> Result<Self, TraceError>
     where
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
@@ -532,19 +527,20 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{AddOp, ScaleOp, test_support},
+        tracing_v2::{self, test_support},
     };
 
     use super::*;
 
     #[test]
     fn graph_builder_tracks_atom_sources_and_executes() {
-        let mut builder = GraphBuilder::<std::sync::Arc<dyn crate::tracing_v2::Op<f64>>, f64>::new();
+        let mut builder = GraphBuilder::<std::sync::Arc<dyn crate::tracing_v2::ops::Op<f64>>, f64>::new();
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
-        let scaled_x = builder.add_equation(std::sync::Arc::new(ScaleOp::new(2.0)), vec![x]).unwrap()[0];
-        let sum = builder.add_equation(std::sync::Arc::new(AddOp), vec![scaled_x, y]).unwrap()[0];
+        let scaled_x =
+            builder.add_equation(std::sync::Arc::new(tracing_v2::ops::ScaleOp::new(2.0)), vec![x]).unwrap()[0];
+        let sum = builder.add_equation(std::sync::Arc::new(tracing_v2::ops::AddOp), vec![scaled_x, y]).unwrap()[0];
         let graph = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(graph.atom(x).unwrap().source, AtomSource::Input));
@@ -565,10 +561,10 @@ mod tests {
 
     #[test]
     fn graph_display_uses_typed_jaxpr_like_rendering() {
-        let mut builder = GraphBuilder::<std::sync::Arc<dyn crate::tracing_v2::Op<f64>>, f64>::new();
+        let mut builder = GraphBuilder::<std::sync::Arc<dyn crate::tracing_v2::ops::Op<f64>>, f64>::new();
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_equation(std::sync::Arc::new(AddOp), vec![x, three]).unwrap()[0];
+        let sum = builder.add_equation(std::sync::Arc::new(tracing_v2::ops::AddOp), vec![x, three]).unwrap()[0];
         let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
         assert_eq!(
@@ -585,8 +581,8 @@ mod tests {
 
     #[test]
     fn graph_builder_rejects_unbound_inputs() {
-        let mut builder = GraphBuilder::<std::sync::Arc<AddOp>, f64>::new();
-        let result = builder.add_equation(std::sync::Arc::new(AddOp), vec![42, 99]);
+        let mut builder = GraphBuilder::<std::sync::Arc<tracing_v2::ops::AddOp>, f64>::new();
+        let result = builder.add_equation(std::sync::Arc::new(tracing_v2::ops::AddOp), vec![42, 99]);
         assert!(matches!(result, Err(TraceError::UnboundAtomId { id: 42 })));
         test_support::assert_reference_graph_rendering();
     }
