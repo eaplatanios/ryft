@@ -32,8 +32,13 @@ pub enum MeshAxisType {
 /// behavior for that axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MeshAxis {
+    /// Name of this [`MeshAxis`].
     pub name: String,
+
+    /// Number of devices along this [`MeshAxis`].
     pub size: usize,
+
+    /// Type of this [`MeshAxis`], controlling sharding propagation behavior.
     pub r#type: MeshAxisType,
 }
 

@@ -1137,17 +1137,12 @@ fn local_shape_for_sharding(
             PartitionDimension::Sharded(axis_names) => axis_names
                 .iter()
                 .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
-                .try_fold(1usize, |partition_count, axis_name| {
+                .try_fold(1usize, |partition_count, axis_name| -> Result<usize, ShardMapError> {
                     let axis_size = sharding
                         .mesh()
                         .axis_size(axis_name)
                         .ok_or_else(|| ShardingError::UnknownMeshAxis { name: axis_name.clone() })?;
-                    partition_count.checked_mul(axis_size).ok_or_else(|| ShardingError::Overflow {
-                        context: format!(
-                            "computing manual partition count for {value_kind} sharding \
-                                 #{value_index} dimension #{dimension}"
-                        ),
-                    })
+                    Ok(partition_count * axis_size)
                 })?,
             PartitionDimension::Unsharded | PartitionDimension::Unconstrained => 1,
         };
@@ -1960,7 +1955,7 @@ mod tests {
         let row_start_by_device = execution_device_ids
             .iter()
             .map(|device_id| {
-                let row_start = lhs_array.shard_for_device(*device_id).unwrap().slices()[0].start();
+                let row_start = lhs_array.shard_for_device(*device_id).unwrap().slices()[0].start;
                 (*device_id, row_start)
             })
             .collect::<HashMap<_, _>>();

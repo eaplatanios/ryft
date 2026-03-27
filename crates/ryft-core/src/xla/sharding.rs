@@ -148,6 +148,7 @@
 //! where accessing `.data` on a non-addressable shard raises an error.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use ryft_mlir::Context as MlirContext;
 use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, MeshAttributeRef, TensorShardingAttributeRef};
@@ -197,23 +198,15 @@ pub enum ShardingError {
 
     /// Error returned when a partition specification rank does not match the array rank.
     #[error("partition specification rank {partition_rank} does not match array rank {array_rank}")]
-    RankMismatch { partition_rank: usize, array_rank: usize },
+    PartitionRankMismatch { partition_rank: usize, array_rank: usize },
 
     /// Error returned when computing partition slices with an invalid partition count.
-    #[error("partition count must be > 0")]
-    InvalidPartitionCount,
+    #[error("partition count must be > 0, but got {count}")]
+    InvalidPartitionCount { count: usize },
 
     /// Error returned when a partition index is out of range.
     #[error("partition index {partition_index} is out of range for partition count {partition_count}")]
     InvalidPartitionIndex { partition_index: usize, partition_count: usize },
-
-    /// Error returned when an invalid slice range is constructed.
-    #[error("invalid shard slice range [{start}, {end})")]
-    InvalidShardSlice { start: usize, end: usize },
-
-    /// Error returned when arithmetic overflows while building shard metadata.
-    #[error("overflow while {context}")]
-    Overflow { context: String },
 
     /// Error returned when an `Unconstrained` dimension appears in a [`ShardingLayout`].
     ///
@@ -420,12 +413,8 @@ impl LogicalMesh {
     }
 
     /// Returns the total number of devices implied by axis sizes.
-    pub fn device_count(&self) -> Result<usize, ShardingError> {
-        self.axes.iter().try_fold(1usize, |count, axis| {
-            count.checked_mul(axis.size).ok_or_else(|| ShardingError::Overflow {
-                context: "computing mesh device count from axis sizes".to_string(),
-            })
-        })
+    pub fn device_count(&self) -> usize {
+        self.axes.iter().fold(1usize, |count, axis| count * axis.size)
     }
 
     /// Returns the index of `axis_name` in this mesh, if present.
@@ -601,7 +590,7 @@ impl DeviceMesh {
 
     /// Creates a mesh from a pre-validated [`LogicalMesh`] and row-major devices.
     pub fn from_logical(logical_mesh: LogicalMesh, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
-        let expected_device_count = logical_mesh.device_count()?;
+        let expected_device_count = logical_mesh.device_count();
         if devices.len() != expected_device_count {
             return Err(ShardingError::MeshDeviceCountMismatch {
                 expected_device_count,
@@ -1187,41 +1176,7 @@ impl NamedSharding {
 /// For an unsharded dimension, the slice spans the full extent `[0, dim_size)`. For a sharded
 /// dimension, the slice covers the partition assigned to a specific device based on its mesh
 /// coordinate.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ShardSlice {
-    start: usize,
-    end: usize,
-}
-
-impl ShardSlice {
-    /// Creates a new shard slice.
-    pub fn new(start: usize, end: usize) -> Result<Self, ShardingError> {
-        if start > end {
-            return Err(ShardingError::InvalidShardSlice { start, end });
-        }
-        Ok(Self { start, end })
-    }
-
-    /// Inclusive start index.
-    pub fn start(&self) -> usize {
-        self.start
-    }
-
-    /// Exclusive end index.
-    pub fn end(&self) -> usize {
-        self.end
-    }
-
-    /// Length of this slice.
-    pub fn len(&self) -> usize {
-        self.end - self.start
-    }
-
-    /// Returns `true` iff this slice is empty.
-    pub fn is_empty(&self) -> bool {
-        self.start == self.end
-    }
-}
+pub type ShardSlice = Range<usize>;
 
 /// Metadata for one global shard of a distributed array.
 ///
@@ -1348,7 +1303,7 @@ impl ShardingLayout {
         let partition_rank = partition_spec.rank();
         let array_rank = global_shape.len();
         if partition_rank != array_rank {
-            return Err(ShardingError::RankMismatch { partition_rank, array_rank });
+            return Err(ShardingError::PartitionRankMismatch { partition_rank, array_rank });
         }
 
         // Reject Unconstrained dimensions.
@@ -1369,7 +1324,7 @@ impl ShardingLayout {
             let mut shape = Vec::with_capacity(global_shape.len());
             for (dimension, dimension_size) in global_shape.iter().copied().enumerate() {
                 let slice = match &partition_spec.dimensions()[dimension] {
-                    PartitionDimension::Unsharded => ShardSlice::new(0, dimension_size)?,
+                    PartitionDimension::Unsharded => 0..dimension_size,
                     PartitionDimension::Sharded(axis_names) => {
                         let (partition_index, partition_count) = partition_index_for_axes(
                             mesh.logical_mesh(),
@@ -1507,15 +1462,8 @@ fn partition_index_for_axes(
         let axis_size = mesh.axes()[axis_index].size;
         let axis_coordinate = mesh_coordinate[axis_index];
 
-        partition_index = partition_index
-            .checked_mul(axis_size)
-            .and_then(|value| value.checked_add(axis_coordinate))
-            .ok_or_else(|| ShardingError::Overflow {
-            context: format!("computing partition index for axis '{axis_name}'"),
-        })?;
-        partition_count = partition_count.checked_mul(axis_size).ok_or_else(|| ShardingError::Overflow {
-            context: format!("computing partition count for axis '{axis_name}'"),
-        })?;
+        partition_index = partition_index * axis_size + axis_coordinate;
+        partition_count *= axis_size;
     }
 
     Ok((partition_index, partition_count))
@@ -1527,7 +1475,7 @@ fn partition_slice(
     partition_index: usize,
 ) -> Result<ShardSlice, ShardingError> {
     if partition_count == 0 {
-        return Err(ShardingError::InvalidPartitionCount);
+        return Err(ShardingError::InvalidPartitionCount { count: partition_count });
     }
     if partition_index >= partition_count {
         return Err(ShardingError::InvalidPartitionIndex { partition_index, partition_count });
@@ -1537,16 +1485,11 @@ fn partition_slice(
     let remainder = dimension_size % partition_count;
     let extra_before = partition_index.min(remainder);
 
-    let start = partition_index
-        .checked_mul(base_size)
-        .and_then(|value| value.checked_add(extra_before))
-        .ok_or_else(|| ShardingError::Overflow { context: "computing shard-slice start index".to_string() })?;
+    let start = partition_index * base_size + extra_before;
     let size = base_size + usize::from(partition_index < remainder);
-    let end = start
-        .checked_add(size)
-        .ok_or_else(|| ShardingError::Overflow { context: "computing shard-slice end index".to_string() })?;
+    let end = start + size;
 
-    ShardSlice::new(start, end)
+    Ok(start..end)
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,7 +1530,7 @@ mod tests {
         assert_eq!(mesh.axis_index("z"), None);
         assert_eq!(mesh.axis_size("x"), Some(2));
         assert_eq!(mesh.axis_size("y"), Some(2));
-        assert_eq!(mesh.device_count().unwrap(), 4);
+        assert_eq!(mesh.device_count(), 4);
     }
 
     #[test]
@@ -1806,8 +1749,13 @@ mod tests {
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("y")]);
         assert!(matches!(
             ShardingLayout::new(vec![8usize], mesh, partition_spec),
-            Err(ShardingError::RankMismatch { partition_rank: 2, array_rank: 1 }),
+            Err(ShardingError::PartitionRankMismatch { partition_rank: 2, array_rank: 1 }),
         ));
+    }
+
+    #[test]
+    fn test_partition_slice_rejects_zero_partition_count() {
+        assert!(matches!(partition_slice(8, 0, 0), Err(ShardingError::InvalidPartitionCount { count: 0 }),));
     }
 
     #[test]
@@ -1830,13 +1778,13 @@ mod tests {
 
         let shard0 = layout.shard_for_device(0).unwrap();
         assert_eq!(shard0.shape(), &[4, 3]);
-        assert_eq!(shard0.slices()[0], ShardSlice::new(0, 4).unwrap());
-        assert_eq!(shard0.slices()[1], ShardSlice::new(0, 3).unwrap());
+        assert_eq!(shard0.slices()[0], 0..4);
+        assert_eq!(shard0.slices()[1], 0..3);
 
         let shard3 = layout.shard_for_device(3).unwrap();
         assert_eq!(shard3.shape(), &[4, 3]);
-        assert_eq!(shard3.slices()[0], ShardSlice::new(4, 8).unwrap());
-        assert_eq!(shard3.slices()[1], ShardSlice::new(3, 6).unwrap());
+        assert_eq!(shard3.slices()[0], 4..8);
+        assert_eq!(shard3.slices()[1], 3..6);
     }
 
     #[test]
@@ -1849,11 +1797,11 @@ mod tests {
 
         let shard0 = layout.shard_for_device(0).unwrap();
         assert_eq!(shard0.shape(), &[3]);
-        assert_eq!(shard0.slices()[0], ShardSlice::new(0, 3).unwrap());
+        assert_eq!(shard0.slices()[0], 0..3);
 
         let shard1 = layout.shard_for_device(1).unwrap();
         assert_eq!(shard1.shape(), &[2]);
-        assert_eq!(shard1.slices()[0], ShardSlice::new(3, 5).unwrap());
+        assert_eq!(shard1.slices()[0], 3..5);
     }
 
     #[test]
@@ -1863,10 +1811,10 @@ mod tests {
             PartitionSpec::new(vec![PartitionDimension::sharded_by(["x".to_string(), "y".to_string()])]);
         let layout = ShardingLayout::new(vec![10], mesh, partition_spec).unwrap();
 
-        assert_eq!(layout.shard_for_device(0).unwrap().slices()[0], ShardSlice::new(0, 3).unwrap());
-        assert_eq!(layout.shard_for_device(1).unwrap().slices()[0], ShardSlice::new(3, 6).unwrap());
-        assert_eq!(layout.shard_for_device(2).unwrap().slices()[0], ShardSlice::new(6, 8).unwrap());
-        assert_eq!(layout.shard_for_device(3).unwrap().slices()[0], ShardSlice::new(8, 10).unwrap());
+        assert_eq!(layout.shard_for_device(0).unwrap().slices()[0], 0..3);
+        assert_eq!(layout.shard_for_device(1).unwrap().slices()[0], 3..6);
+        assert_eq!(layout.shard_for_device(2).unwrap().slices()[0], 6..8);
+        assert_eq!(layout.shard_for_device(3).unwrap().slices()[0], 8..10);
     }
 
     #[test]
