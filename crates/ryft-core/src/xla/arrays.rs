@@ -16,7 +16,9 @@ use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, Exe
 
 use crate::types::data_types::{DataType, DataTypeError};
 
-use super::sharding::{DeviceMesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout};
+use super::sharding::{
+    DeviceMesh, PartitionSpec, SHARDY_MESH_SYMBOL_NAME, ShardDescriptor, ShardingContext, ShardingError, ShardingLayout,
+};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -286,41 +288,24 @@ impl<'o> Array<'o> {
 
     /// Renders the Shardy mesh declaration (`sdy.mesh`) implied by this array's sharding.
     ///
-    /// # Parameters
     ///
-    ///   - `mesh_symbol_name`: Symbol name used in MLIR (without or with leading `'@'`).
-    pub fn to_shardy_mesh_operation<S: AsRef<str>>(&self, mesh_symbol_name: S) -> Result<String, ShardingError> {
-        self.layout.mesh().logical_mesh().to_shardy_mesh_operation(mesh_symbol_name)
+    /// Uses the canonical `@mesh` symbol name.
+    pub fn to_shardy_mesh_operation(&self) -> String {
+        self.layout.mesh().logical_mesh().to_shardy_mesh_operation()
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
     ///
     /// Uses [`ShardingContext::ExplicitSharding`] because runtime arrays have fully determined shardings.
     ///
-    /// # Parameters
     ///
-    ///   - `mesh_symbol_name`: Symbol name used by the corresponding `sdy.mesh` op (without or with leading `'@'`).
-    pub fn to_shardy_tensor_sharding_attribute<S: AsRef<str>>(
-        &self,
-        mesh_symbol_name: S,
-    ) -> Result<String, ShardingError> {
-        let mesh_symbol_name_str = {
-            let s = mesh_symbol_name.as_ref().trim();
-            let s = s.strip_prefix('@').unwrap_or(s);
-            s.to_string()
-        };
+    /// Uses the canonical `@mesh` symbol name.
+    pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
         let dim_shardings = self
             .layout
             .partition_spec()
             .to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding);
-        if mesh_symbol_name_str.is_empty() || mesh_symbol_name_str.chars().any(char::is_whitespace) {
-            return Err(if mesh_symbol_name_str.is_empty() {
-                ShardingError::EmptyMeshSymbolName
-            } else {
-                ShardingError::InvalidMeshSymbolName { mesh_symbol_name: mesh_symbol_name_str }
-            });
-        }
-        Ok(format!("#sdy.sharding<@{mesh_symbol_name_str}, {dim_shardings}>"))
+        format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}>")
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].
@@ -451,7 +436,8 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::{DeviceMesh, MeshAxis, MeshDevice, PartitionDimension, PartitionSpec};
+    use crate::types::{MeshAxis, MeshAxisType};
+    use crate::xla::sharding::{DeviceMesh, MeshDevice, PartitionDimension, PartitionSpec};
 
     use super::*;
 
@@ -508,7 +494,7 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let mesh = DeviceMesh::new(vec![MeshAxis::new("x", 8).unwrap()], mesh_devices).unwrap();
+        let mesh = DeviceMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()], mesh_devices).unwrap();
 
         let lhs_partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
@@ -563,10 +549,10 @@ mod tests {
         assert_eq!(rhs_array.element_type(), DataType::F32);
 
         // Derive Shardy attributes from runtime arrays (JIT-style).
-        let mesh_operation = lhs_array.to_shardy_mesh_operation("mesh").unwrap();
-        let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute("mesh").unwrap();
-        let rhs_sharding_attribute = rhs_array.to_shardy_tensor_sharding_attribute("mesh").unwrap();
-        let output_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute("mesh").unwrap();
+        let mesh_operation = lhs_array.to_shardy_mesh_operation();
+        let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute();
+        let rhs_sharding_attribute = rhs_array.to_shardy_tensor_sharding_attribute();
+        let output_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute();
 
         assert_eq!(mesh_operation, "sdy.mesh @mesh = <[\"x\"=8]>");
         assert_eq!(lhs_sharding_attribute, "#sdy.sharding<@mesh, [{\"x\"}, {}]>");

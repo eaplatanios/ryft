@@ -106,11 +106,11 @@ where
 
     /// Lowers this op inside a Shardy/StableHLO MLIR graph for traced XLA programs.
     #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+    fn lower_shard_map_mlir<'b, 'c, 't>(
         &self,
         _input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
-        _lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+        _lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
@@ -220,11 +220,11 @@ where
 
     #[cfg(feature = "xla")]
     #[inline]
-    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+    fn lower_shard_map_mlir<'b, 'c, 't>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,

@@ -15,11 +15,11 @@ use crate::tracing_v2::{
     AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
     operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp},
 };
-use crate::types::{ArrayType, DataType, Shape, Size, Typed};
+use crate::types::{ArrayType, DataType, MeshAxis, Shape, Size, Typed};
 
 use super::LogicalMesh;
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
-use super::sharding::{MeshAxis, ShardingContext, ShardingError, normalize_mesh_symbol_name};
+use super::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardingContext, ShardingError};
 
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -146,12 +146,9 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 }
 
 /// Lowering helper passed to op-owned traced XLA MLIR lowering hooks.
-pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c, 'm> {
+pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c> {
     /// Owning block receiving the lowered operations.
     pub(crate) block: BlockRef<'b, 'c, 't>,
-
-    /// Mesh symbol used for nested Shardy manual computations.
-    pub(crate) mesh_symbol_name: &'m str,
 
     /// MLIR context owning the block and created operations.
     pub(crate) context: &'c MlirContext<'t>,
@@ -160,7 +157,7 @@ pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c, 'm> {
     pub(crate) location: LocationRef<'c, 't>,
 }
 
-impl<'b, 'c: 'b, 't: 'c, 'm> ShardMapMlirLowerer<'b, 'c, 't, 'm> {
+impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one tensor type inside this lowering context.
     pub(crate) fn lower_tensor_type(
         &self,
@@ -208,7 +205,6 @@ impl<'b, 'c: 'b, 't: 'c, 'm> ShardMapMlirLowerer<'b, 'c, 't, 'm> {
             graph,
             local_input_types,
             global_output_types,
-            self.mesh_symbol_name,
             self.context,
             self.location,
         )
@@ -220,19 +216,12 @@ impl<'b, 'c: 'b, 't: 'c, 'm> ShardMapMlirLowerer<'b, 'c, 't, 'm> {
         eval_mode: &LinearShardMapEvalMode,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_linear_shard_map_eval_mode(
-            eval_mode,
-            input_values,
-            &mut self.block,
-            self.mesh_symbol_name,
-            self.context,
-            self.location,
-        )
+        lower_linear_shard_map_eval_mode(eval_mode, input_values, &mut self.block, self.context, self.location)
     }
 }
 
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
-pub(crate) fn to_mlir_module<Input, Output, GraphInput, GraphOutput, S, M>(
+pub(crate) fn to_mlir_module<Input, Output, GraphInput, GraphOutput, S>(
     shard_map: &ShardMap,
     graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
     global_input_types: &Input,
@@ -240,7 +229,6 @@ pub(crate) fn to_mlir_module<Input, Output, GraphInput, GraphOutput, S, M>(
     global_output_types: &Output,
     _local_output_types: &Output,
     function_name: S,
-    mesh_symbol_name: M,
 ) -> Result<String, LoweringError>
 where
     Input: Parameterized<ArrayType>,
@@ -248,10 +236,8 @@ where
     GraphInput: Parameterized<ShardMapTensor>,
     GraphOutput: Parameterized<ShardMapTensor>,
     S: AsRef<str>,
-    M: AsRef<str>,
 {
     let function_name = normalize_function_name(function_name.as_ref())?;
-    let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name.as_ref())?;
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
     let local_input_types = local_input_types.parameters().cloned().collect::<Vec<_>>();
     let global_output_types = global_output_types.parameters().cloned().collect::<Vec<_>>();
@@ -269,17 +255,13 @@ where
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
     let mesh_attribute = shard_map.mesh().to_shardy_mesh_attribute(&context);
-    module.body().append_operation(shardy::mesh(mesh_symbol_name.as_str(), mesh_attribute, location));
+    module.body().append_operation(shardy::mesh(SHARDY_MESH_SYMBOL_NAME, mesh_attribute, location));
 
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(shard_map.in_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy_tensor_sharding(
-                mesh_symbol_name.as_str(),
-                &context,
-                ShardingContext::ExplicitSharding,
-            )?;
+            let sharding = sharding.to_shardy_tensor_sharding(&context, ShardingContext::ExplicitSharding);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -290,11 +272,7 @@ where
         .iter()
         .zip(shard_map.out_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy_tensor_sharding(
-                mesh_symbol_name.as_str(),
-                &context,
-                ShardingContext::ExplicitSharding,
-            )?;
+            let sharding = sharding.to_shardy_tensor_sharding(&context, ShardingContext::ExplicitSharding);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -321,7 +299,6 @@ where
             graph,
             local_input_types.as_slice(),
             global_output_types.as_slice(),
-            mesh_symbol_name.as_str(),
             &context,
             location.as_ref(),
         )?;
@@ -343,12 +320,11 @@ where
 }
 
 /// Lowers an arbitrary traced XLA graph to a textual StableHLO/Shardy MLIR module.
-pub(crate) fn to_mlir_module_for_graph<Input, Output, GraphInput, GraphOutput, S, M>(
+pub(crate) fn to_mlir_module_for_graph<Input, Output, GraphInput, GraphOutput, S>(
     graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
-    mesh_symbol_name: M,
 ) -> Result<String, LoweringError>
 where
     Input: Parameterized<ArrayType>,
@@ -356,10 +332,8 @@ where
     GraphInput: Parameterized<ShardMapTensor>,
     GraphOutput: Parameterized<ShardMapTensor>,
     S: AsRef<str>,
-    M: AsRef<str>,
 {
     let function_name = normalize_function_name(function_name.as_ref())?;
-    let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name.as_ref())?;
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
     let global_output_types = global_output_types.parameters().cloned().collect::<Vec<_>>();
 
@@ -369,7 +343,7 @@ where
 
     if let Some(mesh) = collect_nested_shard_map_mesh(graph, None)? {
         let mesh_attribute = mesh.to_shardy_mesh_attribute(&context);
-        module.body().append_operation(shardy::mesh(mesh_symbol_name.as_str(), mesh_attribute, location));
+        module.body().append_operation(shardy::mesh(SHARDY_MESH_SYMBOL_NAME, mesh_attribute, location));
     }
 
     let global_input_tensor_types = global_input_types
@@ -399,13 +373,7 @@ where
         );
         {
             let mut function_block_ref = function_block.as_ref();
-            let outputs = lower_graph_outputs(
-                graph,
-                &mut function_block_ref,
-                mesh_symbol_name.as_str(),
-                &context,
-                location.as_ref(),
-            )?;
+            let outputs = lower_graph_outputs(graph, &mut function_block_ref, &context, location.as_ref())?;
             function_block_ref.append_operation(func::r#return(outputs.as_slice(), location));
         }
         func::func(
@@ -633,8 +601,8 @@ fn collect_nested_linear_shard_map_mesh(
 fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, LoweringError> {
     let mut merged_axes = existing.axes().iter().cloned().collect::<Vec<MeshAxis>>();
     for incoming_axis in incoming.axes() {
-        match existing.axis_size(incoming_axis.name()) {
-            Some(existing_size) if existing_size != incoming_axis.size() => {
+        match existing.axis_size(incoming_axis.name.as_str()) {
+            Some(existing_size) if existing_size != incoming_axis.size => {
                 return Err(LoweringError::IncompatibleNestedMeshes);
             }
             Some(_) => {}
@@ -1220,7 +1188,6 @@ where
 fn lower_graph_outputs<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
     graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
     block: &mut BlockRef<'b, 'c, 't>,
-    mesh_symbol_name: &str,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
@@ -1257,15 +1224,8 @@ where
                     .iter()
                     .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
-                let lowered_outputs = lower_equation(
-                    graph,
-                    equation_index,
-                    inputs.as_slice(),
-                    block,
-                    mesh_symbol_name,
-                    context,
-                    location,
-                )?;
+                let lowered_outputs =
+                    lower_equation(graph, equation_index, inputs.as_slice(), block, context, location)?;
                 for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
                     atom_values[output_atom] = Some(lowered_output);
                 }
@@ -1288,7 +1248,6 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
     graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
-    mesh_symbol_name: &str,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
@@ -1315,8 +1274,7 @@ where
     );
     {
         let mut body_block_ref = body_block.as_ref();
-        let body_outputs =
-            lower_graph_outputs(graph, &mut body_block_ref, mesh_symbol_name, context, location.as_ref())?;
+        let body_outputs = lower_graph_outputs(graph, &mut body_block_ref, context, location.as_ref())?;
         body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location));
     }
     body_region.append_block(body_block);
@@ -1324,8 +1282,8 @@ where
     let manual_computation = block.append_operation(shardy::manual_computation(
         outer_inputs,
         global_output_tensor_types.as_slice(),
-        shard_map.to_shardy_in_shardings(mesh_symbol_name, context)?,
-        shard_map.to_shardy_out_shardings(mesh_symbol_name, context)?,
+        shard_map.to_shardy_in_shardings(context),
+        shard_map.to_shardy_out_shardings(context),
         shard_map.to_shardy_manual_axes(context),
         body_region,
         location,
@@ -1338,7 +1296,6 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
     eval_mode: &LinearShardMapEvalMode,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
-    mesh_symbol_name: &str,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
@@ -1354,7 +1311,6 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 simplified_body.compiled.graph(),
                 simplified_body.local_input_types.as_slice(),
                 simplified_body.global_output_types.as_slice(),
-                mesh_symbol_name,
                 context,
                 location,
             )
@@ -1371,7 +1327,6 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 residual_body.compiled.graph(),
                 residual_body.local_input_types.as_slice(),
                 residual_body.global_output_types.as_slice(),
-                mesh_symbol_name,
                 context,
                 location,
             )?;
@@ -1392,7 +1347,6 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 apply_body.compiled.graph(),
                 apply_body.local_input_types.as_slice(),
                 apply_body.global_output_types.as_slice(),
-                mesh_symbol_name,
                 context,
                 location,
             )
@@ -1538,7 +1492,6 @@ fn lower_equation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
-    mesh_symbol_name: &str,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
@@ -1552,7 +1505,7 @@ where
         .iter()
         .map(|output| graph.atom(*output).expect("equation output should exist").abstract_value.clone())
         .collect::<Vec<_>>();
-    let mut lowerer = ShardMapMlirLowerer { block: *block, mesh_symbol_name, context, location };
+    let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
     equation.op.lower_shard_map_mlir(input_values, output_types.as_slice(), &mut lowerer)
 }
 
@@ -1784,14 +1737,14 @@ mod tests {
     use ndarray::{Array2, arr2};
 
     use crate::tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike};
-    use crate::types::{MeshAxisType, Shape};
+    use crate::types::{MeshAxis, MeshAxisType, Shape};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
-    use super::super::sharding::{LogicalMesh, MeshAxis, PartitionDimension, PartitionSpec};
+    use super::super::sharding::{LogicalMesh, PartitionDimension, PartitionSpec};
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
-        LogicalMesh::new(vec![MeshAxis::with_type(axis_name, axis_size, MeshAxisType::Manual).unwrap()]).unwrap()
+        LogicalMesh::new(vec![MeshAxis::new(axis_name, axis_size, MeshAxisType::Manual).unwrap()]).unwrap()
     }
 
     fn test_vector_type(length: usize) -> ArrayType {
@@ -1805,9 +1758,8 @@ mod tests {
     fn lower_traced_module(
         traced: &TracedShardMap<ArrayType, ArrayType>,
         function_name: &str,
-        mesh_symbol_name: &str,
     ) -> Result<String, super::super::shard_map::ShardMapTraceError> {
-        traced.to_mlir_module(function_name, mesh_symbol_name)
+        traced.to_mlir_module(function_name)
     }
 
     #[cfg(feature = "ndarray")]
@@ -1831,7 +1783,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            lower_traced_module(&traced, "main", "mesh").unwrap(),
+            lower_traced_module(&traced, "main").unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
@@ -1864,7 +1816,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            lower_traced_module(&traced, "kernel", "mesh").unwrap(),
+            lower_traced_module(&traced, "kernel").unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>

@@ -119,11 +119,11 @@ where
     }
 
     #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+    fn lower_shard_map_mlir<'b, 'c, 't>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let output_type = lowerer.lower_tensor_type(&output_types[0])?;
         let operation = lowerer.block.append_operation(stable_hlo::dot_general(

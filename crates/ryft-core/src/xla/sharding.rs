@@ -51,14 +51,17 @@
 //!    // 1D mesh for data parallelism across 8 devices.
 //!    // JAX equivalent: Mesh(devices, ('batch',))
 //!    let mesh = DeviceMesh::new(
-//!        vec![MeshAxis::new("batch", 8)?],
+//!        vec![MeshAxis::new("batch", 8, MeshAxisType::Auto)?],
 //!        mesh_devices,
 //!    )?;
 //!
 //!    // 2D mesh for data + model parallelism.
 //!    // JAX equivalent: Mesh(np.array(devices).reshape(4, 2), ('data', 'model'))
 //!    let mesh = DeviceMesh::new(
-//!        vec![MeshAxis::new("data", 4)?, MeshAxis::new("model", 2)?],
+//!        vec![
+//!            MeshAxis::new("data", 4, MeshAxisType::Auto)?,
+//!            MeshAxis::new("model", 2, MeshAxisType::Auto)?,
+//!        ],
 //!        mesh_devices,
 //!    )?;
 //!    ```
@@ -119,10 +122,10 @@
 //!
 //!    ```ignore
 //!    // Generates: sdy.mesh @mesh = <["data"=4, "model"=2]>
-//!    let mesh_op = mesh.logical_mesh().to_shardy_mesh_operation("mesh")?;
+//!    let mesh_op = mesh.logical_mesh().to_shardy_mesh_operation();
 //!
 //!    // Generates: #sdy.sharding<@mesh, [{"data"}, {}]>
-//!    let attr = sharding.to_shardy_tensor_sharding_attribute("mesh")?;
+//!    let attr = sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding);
 //!    ```
 //!
 //! # Multi-host and addressability
@@ -148,11 +151,10 @@ use std::collections::{HashMap, HashSet};
 
 use ryft_mlir::Context as MlirContext;
 use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, MeshAttributeRef, TensorShardingAttributeRef};
-use ryft_pjrt::DeviceId;
 use thiserror::Error;
 
 use crate::parameters::Parameter;
-use crate::types::MeshAxisType;
+use crate::types::{DeviceId, MeshAxis, MeshAxisType};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -165,13 +167,13 @@ pub enum ShardingError {
     #[error("mesh axis names must be non-empty")]
     EmptyMeshAxisName,
 
-    /// Error returned when a mesh axis has size `0`.
-    #[error("mesh axis '{axis_name}' must have size > 0")]
-    InvalidMeshAxisSize { axis_name: String },
-
     /// Error returned when mesh axis names are not unique.
-    #[error("mesh axis '{axis_name}' appears more than once")]
-    DuplicateMeshAxisName { axis_name: String },
+    #[error("mesh axis '{name}' appears more than once")]
+    DuplicateMeshAxisName { name: String },
+
+    /// Error returned when a mesh axis has an invalid size.
+    #[error("mesh axis '{name}' must have size > 0, but got {size}")]
+    InvalidMeshAxisSize { name: String, size: usize },
 
     /// Error returned when device IDs in a mesh are not unique.
     #[error("mesh device id {device_id} appears more than once")]
@@ -182,24 +184,16 @@ pub enum ShardingError {
     MeshDeviceCountMismatch { expected_device_count: usize, actual_device_count: usize },
 
     /// Error returned when partitioning references a mesh axis that does not exist.
-    #[error("partitioning references unknown mesh axis '{axis_name}'")]
-    UnknownMeshAxis { axis_name: String },
+    #[error("partitioning references unknown mesh axis '{name}'")]
+    UnknownMeshAxis { name: String },
 
     /// Error returned when a partitioned dimension references no mesh axes.
     #[error("partition specification dimension #{dimension} has an empty mesh-axis list")]
     EmptyPartitionAxisList { dimension: usize },
 
     /// Error returned when a mesh axis appears more than once in the partition specification.
-    #[error("mesh axis '{axis_name}' is used multiple times in the partition specification")]
-    DuplicatePartitionAxis { axis_name: String },
-
-    /// Error returned when a mesh symbol name used to render Shardy attributes is empty.
-    #[error("mesh symbol names used in Shardy attributes must be non-empty")]
-    EmptyMeshSymbolName,
-
-    /// Error returned when a mesh symbol name used to render Shardy attributes is invalid.
-    #[error("invalid mesh symbol name '{mesh_symbol_name}' used in Shardy attributes")]
-    InvalidMeshSymbolName { mesh_symbol_name: String },
+    #[error("mesh axis '{name}' is used multiple times in the partition specification")]
+    DuplicatePartitionAxis { name: String },
 
     /// Error returned when a partition specification rank does not match the array rank.
     #[error("partition specification rank {partition_rank} does not match array rank {array_rank}")]
@@ -233,18 +227,21 @@ pub enum ShardingError {
     MeshAxisTypeCountMismatch { expected: usize, actual: usize },
 
     /// Error returned when a replicated/unreduced axis in a [`NamedSharding`] does not exist in the mesh.
-    #[error("replicated/unreduced axis '{axis_name}' does not exist in the mesh")]
-    UnknownExtraAxis { axis_name: String },
+    #[error("replicated/unreduced axis '{name}' does not exist in the mesh")]
+    UnknownExtraAxis { name: String },
 
     /// Error returned when a replicated/unreduced axis in a [`NamedSharding`] is already used
     /// in the partition specification.
-    #[error("replicated/unreduced axis '{axis_name}' is already used in the partition specification")]
-    ExtraAxisConflictsWithPartition { axis_name: String },
+    #[error("replicated/unreduced axis '{name}' is already used in the partition specification")]
+    ExtraAxisConflictsWithPartition { name: String },
 
     /// Error returned when the same axis appears in both the replicated and unreduced sets.
-    #[error("axis '{axis_name}' appears in both replicated and unreduced sets")]
-    AxisInBothReplicatedAndUnreduced { axis_name: String },
+    #[error("axis '{name}' appears in both replicated and unreduced sets")]
+    AxisInBothReplicatedAndUnreduced { name: String },
 }
+
+/// Canonical symbol name used for emitted Shardy mesh declarations and references.
+pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
 
 // ---------------------------------------------------------------------------
 // Sharding context
@@ -276,80 +273,6 @@ pub enum ShardingContext {
 // ---------------------------------------------------------------------------
 // Mesh-related types
 // ---------------------------------------------------------------------------
-
-/// A named axis in a logical device mesh.
-///
-/// Each axis represents one dimension of the device grid with a human-readable name, a
-/// size (the number of devices along that dimension), and a [`MeshAxisType`] that controls
-/// sharding propagation behavior for that axis.
-///
-/// # JAX equivalent
-///
-/// In JAX, mesh axes are defined implicitly by the shape and `axis_names` arguments to
-/// [`jax.sharding.Mesh`][jax-mesh]. For example, in
-/// `Mesh(np.array(devices).reshape(4, 2), ('data', 'model'))`, the `'data'` axis has size 4
-/// and the `'model'` axis has size 2. Here, each axis is an explicit first-class value:
-///
-/// ```ignore
-/// let data_axis = MeshAxis::new("data", 4)?;   // JAX: axis_names[0]='data', shape=(4,...)
-/// let model_axis = MeshAxis::new("model", 2)?;  // JAX: axis_names[1]='model', shape=(...,2)
-/// let manual_axis = MeshAxis::with_type("manual", 2, MeshAxisType::Manual)?;
-/// ```
-///
-/// [jax-mesh]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.Mesh
-///
-/// # Shardy representation
-///
-/// Each `MeshAxis` corresponds to one [`MeshAxisAttr`][sdy-mesh] entry in a Shardy
-/// `sdy.mesh` operation:
-///
-/// ```mlir
-/// sdy.mesh @mesh = <["data"=4, "model"=2]>
-/// //                 ^^^^^^^^^  ^^^^^^^^^^
-/// //                 MeshAxis   MeshAxis
-/// ```
-///
-/// [sdy-mesh]: https://openxla.org/shardy/sdy_dialect#sdymesh_sdymeshop
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MeshAxis {
-    name: String,
-    size: usize,
-    r#type: MeshAxisType,
-}
-
-impl MeshAxis {
-    /// Creates a mesh axis with type [`MeshAxisType::Auto`].
-    pub fn new<N: Into<String>>(name: N, size: usize) -> Result<Self, ShardingError> {
-        Self::with_type(name, size, MeshAxisType::Auto)
-    }
-
-    /// Creates a mesh axis with an explicit mesh-axis type.
-    pub fn with_type<N: Into<String>>(name: N, size: usize, r#type: MeshAxisType) -> Result<Self, ShardingError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(ShardingError::EmptyMeshAxisName);
-        }
-        if size == 0 {
-            return Err(ShardingError::InvalidMeshAxisSize { axis_name: name });
-        }
-        Ok(Self { name, size, r#type })
-    }
-
-    /// Name of this axis.
-    pub fn name(&self) -> &str {
-        self.name.as_str()
-    }
-
-    /// Size of this axis.
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Type of this axis.
-    pub fn r#type(&self) -> MeshAxisType {
-        self.r#type
-    }
-}
 
 /// Device entry in a logical mesh.
 ///
@@ -433,8 +356,7 @@ pub struct LogicalMesh {
 impl LogicalMesh {
     /// Creates a logical mesh from named axes.
     ///
-    /// Preserves the type of each provided axis. Axes created via [`MeshAxis::new`] default to
-    /// [`MeshAxisType::Auto`], matching JAX's `Mesh` constructor behavior.
+    /// Preserves the type of each provided axis.
     ///
     /// Validates that all axis names are non-empty, all sizes are positive, and names are unique.
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
@@ -454,7 +376,9 @@ impl LogicalMesh {
         let axes = axes
             .into_iter()
             .zip(axis_types)
-            .map(|(axis, r#type)| MeshAxis { name: axis.name, size: axis.size, r#type })
+            .map(|(axis, r#type)| {
+                MeshAxis::new(axis.name, axis.size, r#type).expect("logical meshes only contain validated mesh axes")
+            })
             .collect();
         Self::build(axes)
     }
@@ -466,10 +390,10 @@ impl LogicalMesh {
                 return Err(ShardingError::EmptyMeshAxisName);
             }
             if axis.size == 0 {
-                return Err(ShardingError::InvalidMeshAxisSize { axis_name: axis.name.clone() });
+                return Err(ShardingError::InvalidMeshAxisSize { name: axis.name.clone(), size: axis.size });
             }
             if axis_index_by_name.insert(axis.name.clone(), axis_index).is_some() {
-                return Err(ShardingError::DuplicateMeshAxisName { axis_name: axis.name.clone() });
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
             }
         }
         Ok(Self { axes, axis_index_by_name })
@@ -482,17 +406,17 @@ impl LogicalMesh {
 
     /// Returns the per-axis types.
     pub fn axis_types(&self) -> Vec<MeshAxisType> {
-        self.axes.iter().map(MeshAxis::r#type).collect()
+        self.axes.iter().map(|axis| axis.r#type).collect()
     }
 
     /// Returns axis names as a convenience accessor.
     pub fn axis_names(&self) -> Vec<&str> {
-        self.axes.iter().map(|a| a.name()).collect()
+        self.axes.iter().map(|axis| axis.name.as_str()).collect()
     }
 
     /// Returns axis sizes as a convenience accessor.
     pub fn axis_sizes(&self) -> Vec<usize> {
-        self.axes.iter().map(|a| a.size()).collect()
+        self.axes.iter().map(|axis| axis.size).collect()
     }
 
     /// Returns the total number of devices implied by axis sizes.
@@ -516,17 +440,17 @@ impl LogicalMesh {
 
     /// Returns `true` if all axes have type [`MeshAxisType::Auto`].
     pub fn are_all_axes_auto(&self) -> bool {
-        self.axes.iter().all(|axis| axis.r#type() == MeshAxisType::Auto)
+        self.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto)
     }
 
     /// Returns `true` if all axes have type [`MeshAxisType::Explicit`].
     pub fn are_all_axes_explicit(&self) -> bool {
-        self.axes.iter().all(|axis| axis.r#type() == MeshAxisType::Explicit)
+        self.axes.iter().all(|axis| axis.r#type == MeshAxisType::Explicit)
     }
 
     /// Returns `true` if all axes have type [`MeshAxisType::Manual`].
     pub fn are_all_axes_manual(&self) -> bool {
-        self.axes.iter().all(|axis| axis.r#type() == MeshAxisType::Manual)
+        self.axes.iter().all(|axis| axis.r#type == MeshAxisType::Manual)
     }
 
     /// Returns the names of axes with type [`MeshAxisType::Auto`].
@@ -545,7 +469,10 @@ impl LogicalMesh {
     }
 
     fn axes_with_type(&self, axis_type: MeshAxisType) -> Vec<&str> {
-        self.axes.iter().filter_map(|axis| (axis.r#type() == axis_type).then_some(axis.name())).collect()
+        self.axes
+            .iter()
+            .filter_map(|axis| (axis.r#type == axis_type).then_some(axis.name.as_str()))
+            .collect()
     }
 
     /// Returns a new `LogicalMesh` with selected axes' types changed.
@@ -556,9 +483,9 @@ impl LogicalMesh {
             .axes
             .iter()
             .cloned()
-            .map(|mut axis| {
-                axis.r#type = name_to_type.get(axis.name()).copied().unwrap_or(axis.r#type());
-                axis
+            .map(|axis| {
+                let r#type = name_to_type.get(axis.name.as_str()).copied().unwrap_or(axis.r#type);
+                MeshAxis::new(axis.name, axis.size, r#type).expect("logical meshes only contain validated mesh axes")
             })
             .collect();
         Self { axes, axis_index_by_name: self.axis_index_by_name.clone() }
@@ -575,9 +502,9 @@ impl LogicalMesh {
                 literal.push_str(", ");
             }
             literal.push('"');
-            literal.push_str(escape_shardy_string(axis.name()).as_str());
+            literal.push_str(escape_shardy_string(axis.name.as_str()).as_str());
             literal.push_str("\"=");
-            literal.push_str(axis.size().to_string().as_str());
+            literal.push_str(axis.size.to_string().as_str());
         }
         literal.push_str("]>");
         literal
@@ -592,17 +519,19 @@ impl LogicalMesh {
     /// sdy.mesh @mesh = <["data"=4, "model"=2]>
     /// ```
     ///
-    /// # Parameters
     ///
-    ///   - `mesh_symbol_name`: Symbol name used in MLIR (without or with leading `'@'`).
-    pub fn to_shardy_mesh_operation<S: AsRef<str>>(&self, mesh_symbol_name: S) -> Result<String, ShardingError> {
-        let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name)?;
-        Ok(format!("sdy.mesh @{mesh_symbol_name} = {}", self.to_shardy_mesh_literal()))
+    /// Uses the canonical `@mesh` symbol name.
+    pub fn to_shardy_mesh_operation(&self) -> String {
+        format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = {}", self.to_shardy_mesh_literal())
     }
 
     /// Builds this mesh as a typed Shardy mesh attribute.
     pub(crate) fn to_shardy_mesh_attribute<'c, 't>(&self, context: &'c MlirContext<'t>) -> MeshAttributeRef<'c, 't> {
-        let axes = self.axes.iter().map(|axis| context.shardy_mesh_axis(axis.name(), axis.size())).collect::<Vec<_>>();
+        let axes = self
+            .axes
+            .iter()
+            .map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size))
+            .collect::<Vec<_>>();
         context.shardy_mesh(axes.as_slice(), &[])
     }
 }
@@ -650,8 +579,7 @@ pub struct DeviceMesh {
 impl DeviceMesh {
     /// Creates a mesh from named axes and row-major devices.
     ///
-    /// Preserves the type of each provided axis. Axes created via [`MeshAxis::new`] default to
-    /// [`MeshAxisType::Auto`].
+    /// Preserves the type of each provided axis.
     /// The expected number of `devices` is the product of all `axes` sizes. For an empty axis list, the
     /// expected device count is `1`.
     pub fn new(axes: Vec<MeshAxis>, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
@@ -797,7 +725,7 @@ impl DeviceMesh {
     /// Returns the mesh coordinate of the device at `device_index`, if valid.
     pub fn coordinate_for_device_index(&self, device_index: usize) -> Option<Vec<usize>> {
         (device_index < self.devices.len()).then(|| {
-            let axis_sizes = self.logical_mesh.axes.iter().map(MeshAxis::size).collect::<Vec<_>>();
+            let axis_sizes = self.logical_mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>();
             coordinate_for_linear_index(device_index, axis_sizes.as_slice())
         })
     }
@@ -1132,10 +1060,10 @@ impl NamedSharding {
         let mut extra_set = HashSet::new();
         for axis_name in replicated_axes.iter().chain(unreduced_axes.iter()) {
             if mesh.axis_index(axis_name).is_none() {
-                return Err(ShardingError::UnknownExtraAxis { axis_name: axis_name.clone() });
+                return Err(ShardingError::UnknownExtraAxis { name: axis_name.clone() });
             }
             if partition_used.contains(axis_name.as_str()) {
-                return Err(ShardingError::ExtraAxisConflictsWithPartition { axis_name: axis_name.clone() });
+                return Err(ShardingError::ExtraAxisConflictsWithPartition { name: axis_name.clone() });
             }
         }
         for axis_name in &replicated_axes {
@@ -1143,7 +1071,7 @@ impl NamedSharding {
         }
         for axis_name in &unreduced_axes {
             if extra_set.contains(axis_name) {
-                return Err(ShardingError::AxisInBothReplicatedAndUnreduced { axis_name: axis_name.clone() });
+                return Err(ShardingError::AxisInBothReplicatedAndUnreduced { name: axis_name.clone() });
             }
         }
 
@@ -1182,16 +1110,12 @@ impl NamedSharding {
     ///
     /// # Parameters
     ///
-    ///   - `mesh_symbol_name`: Symbol name used by the corresponding `sdy.mesh` op (without or with leading `'@'`).
     ///   - `context`: Controls open/closed rendering for unsharded dimensions.
-    pub fn to_shardy_tensor_sharding_attribute<S: AsRef<str>>(
-        &self,
-        mesh_symbol_name: S,
-        context: ShardingContext,
-    ) -> Result<String, ShardingError> {
-        let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name)?;
+    ///
+    /// Uses the canonical `@mesh` symbol name.
+    pub fn to_shardy_tensor_sharding_attribute(&self, context: ShardingContext) -> String {
         let dim_shardings = self.partition_spec.to_shardy_dimension_shardings_literal(context);
-        let mut result = format!("#sdy.sharding<@{mesh_symbol_name}, {dim_shardings}");
+        let mut result = format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}");
 
         if !self.replicated_axes.is_empty() {
             result.push_str(", replicated={");
@@ -1220,18 +1144,16 @@ impl NamedSharding {
         }
 
         result.push('>');
-        Ok(result)
+        result
     }
 
     /// Builds this sharding as a typed Shardy tensor-sharding attribute.
-    pub(crate) fn to_shardy_tensor_sharding<'c, 't, S: AsRef<str>>(
+    pub(crate) fn to_shardy_tensor_sharding<'c, 't>(
         &self,
-        mesh_symbol_name: S,
         context: &'c MlirContext<'t>,
         sharding_context: ShardingContext,
-    ) -> Result<TensorShardingAttributeRef<'c, 't>, ShardingError> {
-        let mesh_symbol_name = normalize_mesh_symbol_name(mesh_symbol_name)?;
-        let mesh_symbol_ref = context.flat_symbol_ref_attribute(mesh_symbol_name.as_str());
+    ) -> TensorShardingAttributeRef<'c, 't> {
+        let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
         let dim_shardings = self.partition_spec.to_shardy_dimension_shardings(context, sharding_context);
         let replicated_axes = self
             .replicated_axes
@@ -1243,12 +1165,12 @@ impl NamedSharding {
             .iter()
             .map(|axis_name| context.shardy_axis_ref(axis_name, None))
             .collect::<Vec<_>>();
-        Ok(context.shardy_tensor_sharding(
+        context.shardy_tensor_sharding(
             mesh_symbol_ref,
             dim_shardings.as_slice(),
             replicated_axes.as_slice(),
             unreduced_axes.as_slice(),
-        ))
+        )
     }
 }
 
@@ -1526,20 +1448,6 @@ impl ShardingLayout {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn normalize_mesh_symbol_name<S: AsRef<str>>(mesh_symbol_name: S) -> Result<String, ShardingError> {
-    let mesh_symbol_name = mesh_symbol_name.as_ref().trim();
-    if mesh_symbol_name.is_empty() {
-        return Err(ShardingError::EmptyMeshSymbolName);
-    }
-
-    let mesh_symbol_name = mesh_symbol_name.strip_prefix('@').unwrap_or(mesh_symbol_name);
-    if mesh_symbol_name.is_empty() || mesh_symbol_name.chars().any(char::is_whitespace) {
-        return Err(ShardingError::InvalidMeshSymbolName { mesh_symbol_name: mesh_symbol_name.to_string() });
-    }
-
-    Ok(mesh_symbol_name.to_string())
-}
-
 fn escape_shardy_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -1559,10 +1467,10 @@ fn validate_partition_spec(
             let mut axes_in_dimension = HashSet::new();
             for axis_name in axis_names {
                 if mesh.axis_index(axis_name).is_none() {
-                    return Err(ShardingError::UnknownMeshAxis { axis_name: axis_name.clone() });
+                    return Err(ShardingError::UnknownMeshAxis { name: axis_name.clone() });
                 }
                 if !axes_in_dimension.insert(axis_name.clone()) || !used_axes.insert(axis_name.clone()) {
-                    return Err(ShardingError::DuplicatePartitionAxis { axis_name: axis_name.clone() });
+                    return Err(ShardingError::DuplicatePartitionAxis { name: axis_name.clone() });
                 }
             }
         }
@@ -1595,8 +1503,8 @@ fn partition_index_for_axes(
     for axis_name in axis_names {
         let axis_index = mesh
             .axis_index(axis_name)
-            .ok_or_else(|| ShardingError::UnknownMeshAxis { axis_name: axis_name.clone() })?;
-        let axis_size = mesh.axes()[axis_index].size();
+            .ok_or_else(|| ShardingError::UnknownMeshAxis { name: axis_name.clone() })?;
+        let axis_size = mesh.axes()[axis_index].size;
         let axis_coordinate = mesh_coordinate[axis_index];
 
         partition_index = partition_index
@@ -1650,11 +1558,18 @@ mod tests {
     use super::*;
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
-        LogicalMesh::new(vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()]).unwrap()
+        LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap()
     }
 
     fn test_device_mesh_2x2() -> DeviceMesh {
-        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
         DeviceMesh::new(axes, devices).unwrap()
     }
@@ -1677,10 +1592,13 @@ mod tests {
 
     #[test]
     fn test_logical_mesh_validation() {
-        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("x", 3).unwrap()];
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 3, MeshAxisType::Auto).unwrap(),
+        ];
         assert!(matches!(
             LogicalMesh::new(axes),
-            Err(ShardingError::DuplicateMeshAxisName { axis_name }) if axis_name == "x",
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
         ));
     }
 
@@ -1688,10 +1606,7 @@ mod tests {
     fn test_logical_mesh_shardy_rendering() {
         let mesh = test_logical_mesh_2x2();
         assert_eq!(mesh.to_shardy_mesh_literal(), "<[\"x\"=2, \"y\"=2]>");
-        assert_eq!(mesh.to_shardy_mesh_operation("mesh").unwrap(), "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>");
-        assert_eq!(mesh.to_shardy_mesh_operation("@mesh").unwrap(), "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>");
-        assert!(matches!(mesh.to_shardy_mesh_operation(" "), Err(ShardingError::EmptyMeshSymbolName)));
-        assert!(matches!(mesh.to_shardy_mesh_operation("my mesh"), Err(ShardingError::InvalidMeshSymbolName { .. })));
+        assert_eq!(mesh.to_shardy_mesh_operation(), "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>");
     }
 
     // -----------------------------------------------------------------------
@@ -1720,20 +1635,23 @@ mod tests {
 
     #[test]
     fn test_device_mesh_validation() {
-        assert!(matches!(MeshAxis::new("", 4), Err(ShardingError::EmptyMeshAxisName)));
+        assert!(matches!(MeshAxis::new("", 4, MeshAxisType::Auto), Err(ShardingError::EmptyMeshAxisName)));
         assert!(matches!(
-            MeshAxis::new("x", 0),
-            Err(ShardingError::InvalidMeshAxisSize { axis_name }) if axis_name == "x",
+            MeshAxis::new("x", 0, MeshAxisType::Auto),
+            Err(ShardingError::InvalidMeshAxisSize { name, size }) if name == "x" && size == 0,
         ));
 
-        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("x", 2).unwrap()];
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+        ];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 0), MeshDevice::new(3, 0)];
         assert!(matches!(
             DeviceMesh::new(axes, devices),
-            Err(ShardingError::DuplicateMeshAxisName { axis_name }) if axis_name == "x",
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
         ));
 
-        let axes = vec![MeshAxis::new("x", 2).unwrap()];
+        let axes = vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(0, 0)];
         assert!(matches!(
             DeviceMesh::new(axes, devices),
@@ -1783,14 +1701,14 @@ mod tests {
         let unknown_axis_partition = PartitionSpec::new(vec![PartitionDimension::sharded("z")]);
         assert!(matches!(
             NamedSharding::new(mesh.clone(), unknown_axis_partition),
-            Err(ShardingError::UnknownMeshAxis { axis_name }) if axis_name == "z",
+            Err(ShardingError::UnknownMeshAxis { name }) if name == "z",
         ));
 
         let duplicate_axis_partition =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("x")]);
         assert!(matches!(
             NamedSharding::new(mesh.clone(), duplicate_axis_partition),
-            Err(ShardingError::DuplicatePartitionAxis { axis_name }) if axis_name == "x",
+            Err(ShardingError::DuplicatePartitionAxis { name }) if name == "x",
         ));
 
         let empty_axis_partition = PartitionSpec::new(vec![PartitionDimension::Sharded(Vec::new())]);
@@ -1807,7 +1725,7 @@ mod tests {
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute("mesh", ShardingContext::ExplicitSharding).unwrap(),
+            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}, {}]>"
         );
     }
@@ -1819,7 +1737,7 @@ mod tests {
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], Vec::new()).unwrap();
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute("mesh", ShardingContext::ExplicitSharding).unwrap(),
+            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], replicated={\"y\"}>"
         );
     }
@@ -1831,7 +1749,7 @@ mod tests {
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, Vec::new(), vec!["y".to_string()]).unwrap();
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute("mesh", ShardingContext::ExplicitSharding).unwrap(),
+            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>"
         );
     }
@@ -1839,16 +1757,16 @@ mod tests {
     #[test]
     fn test_named_sharding_replicated_and_unreduced_axes() {
         let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2).unwrap(),
-            MeshAxis::new("y", 2).unwrap(),
-            MeshAxis::new("z", 2).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
         let sharding =
             NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], vec!["z".to_string()]).unwrap();
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute("mesh", ShardingContext::ExplicitSharding).unwrap(),
+            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}], replicated={\"y\"}, unreduced={\"z\"}>"
         );
     }
@@ -1861,19 +1779,19 @@ mod tests {
         // Unknown extra axis.
         assert!(matches!(
             NamedSharding::with_extra_axes(mesh.clone(), partition_spec.clone(), vec!["z".to_string()], Vec::new()),
-            Err(ShardingError::UnknownExtraAxis { axis_name }) if axis_name == "z",
+            Err(ShardingError::UnknownExtraAxis { name }) if name == "z",
         ));
 
         // Conflicts with partition spec.
         assert!(matches!(
             NamedSharding::with_extra_axes(mesh.clone(), partition_spec.clone(), vec!["x".to_string()], Vec::new()),
-            Err(ShardingError::ExtraAxisConflictsWithPartition { axis_name }) if axis_name == "x",
+            Err(ShardingError::ExtraAxisConflictsWithPartition { name }) if name == "x",
         ));
 
         // Same axis in both replicated and unreduced.
         assert!(matches!(
             NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], vec!["y".to_string()]),
-            Err(ShardingError::AxisInBothReplicatedAndUnreduced { axis_name }) if axis_name == "y",
+            Err(ShardingError::AxisInBothReplicatedAndUnreduced { name }) if name == "y",
         ));
     }
 
@@ -1923,7 +1841,7 @@ mod tests {
 
     #[test]
     fn test_sharding_layout_uneven_partitioning() {
-        let axes = vec![MeshAxis::new("x", 2).unwrap()];
+        let axes = vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
         let mesh = DeviceMesh::new(axes, devices).unwrap();
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
@@ -1985,14 +1903,14 @@ mod tests {
 
     #[test]
     fn test_mesh_axis_default_type() {
-        let axis = MeshAxis::new("x", 2).unwrap();
-        assert_eq!(axis.r#type(), MeshAxisType::Auto);
+        let axis = MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap();
+        assert_eq!(axis.r#type, MeshAxisType::Auto);
     }
 
     #[test]
     fn test_mesh_axis_with_explicit_type() {
-        let axis = MeshAxis::with_type("x", 2, MeshAxisType::Manual).unwrap();
-        assert_eq!(axis.r#type(), MeshAxisType::Manual);
+        let axis = MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap();
+        assert_eq!(axis.r#type, MeshAxisType::Manual);
     }
 
     #[test]
@@ -2003,7 +1921,10 @@ mod tests {
 
     #[test]
     fn test_logical_mesh_with_axis_types() {
-        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ];
         let types = vec![MeshAxisType::Manual, MeshAxisType::Explicit];
         let mesh = LogicalMesh::with_axis_types(axes, types).unwrap();
         assert_eq!(mesh.axis_types(), vec![MeshAxisType::Manual, MeshAxisType::Explicit]);
@@ -2012,8 +1933,8 @@ mod tests {
     #[test]
     fn test_logical_mesh_preserves_axis_types_from_axes() {
         let axes = vec![
-            MeshAxis::with_type("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::with_type("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ];
         let mesh = LogicalMesh::new(axes).unwrap();
         assert_eq!(mesh.axis_types(), vec![MeshAxisType::Manual, MeshAxisType::Explicit]);
@@ -2021,7 +1942,10 @@ mod tests {
 
     #[test]
     fn test_logical_mesh_axis_type_count_mismatch() {
-        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ];
         let types = vec![MeshAxisType::Auto];
         assert!(matches!(
             LogicalMesh::with_axis_types(axes, types),
@@ -2041,7 +1965,11 @@ mod tests {
         assert!(mesh.manual_axes().is_empty());
 
         // Mixed types.
-        let axes = vec![MeshAxis::new("a", 2).unwrap(), MeshAxis::new("b", 2).unwrap(), MeshAxis::new("c", 2).unwrap()];
+        let axes = vec![
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("b", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("c", 2, MeshAxisType::Auto).unwrap(),
+        ];
         let types = vec![MeshAxisType::Auto, MeshAxisType::Explicit, MeshAxisType::Manual];
         let mesh = LogicalMesh::with_axis_types(axes, types).unwrap();
         assert!(!mesh.are_all_axes_auto());
@@ -2074,7 +2002,10 @@ mod tests {
 
     #[test]
     fn test_device_mesh_with_axis_types() {
-        let axes = vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::new("y", 2).unwrap()];
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ];
         let types = vec![MeshAxisType::Explicit, MeshAxisType::Manual];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 0), MeshDevice::new(3, 0)];
         let mesh = DeviceMesh::with_axis_types(axes, types, devices).unwrap();
@@ -2097,7 +2028,7 @@ mod tests {
     #[test]
     fn test_device_mesh_is_multi_process() {
         // Single process.
-        let axes = vec![MeshAxis::new("x", 2).unwrap()];
+        let axes = vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
         let mesh = DeviceMesh::new(axes, devices).unwrap();
         assert!(!mesh.is_multi_process());

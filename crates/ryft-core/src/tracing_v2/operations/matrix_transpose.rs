@@ -114,11 +114,11 @@ where
     }
 
     #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+    fn lower_shard_map_mlir<'b, 'c, 't>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let operation =
             lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));

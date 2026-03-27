@@ -14,10 +14,10 @@ use crate::tracing_v2::{
     operations::{LinearShardMapEvalMode, ShardMapOp},
     vmap,
 };
-use crate::types::{ArrayType, DataType, MeshAxisType, Shape, Size};
+use crate::types::{ArrayType, DataType, MeshAxis, MeshAxisType, Shape, Size};
 
 use super::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer};
-use super::sharding::{LogicalMesh, MeshAxis, PartitionDimension, PartitionSpec};
+use super::sharding::{LogicalMesh, PartitionDimension, PartitionSpec};
 use super::{TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -34,19 +34,25 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
 
 /// Returns the canonical single-axis manual mesh used by the benchmark cases.
 fn benchmark_mesh() -> LogicalMesh {
-    LogicalMesh::new(vec![MeshAxis::with_type("x", 4, MeshAxisType::Manual).unwrap()]).unwrap()
+    LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap()
 }
 
 /// Returns the outer mesh used by the nested shard-map benchmark.
 fn nested_outer_mesh() -> LogicalMesh {
-    LogicalMesh::new(vec![MeshAxis::with_type("x", 2, MeshAxisType::Manual).unwrap(), MeshAxis::new("y", 2).unwrap()])
-        .unwrap()
+    LogicalMesh::new(vec![
+        MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+        MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+    ])
+    .unwrap()
 }
 
 /// Returns the inner mesh used by the nested shard-map benchmark.
 fn nested_inner_mesh() -> LogicalMesh {
-    LogicalMesh::new(vec![MeshAxis::new("x", 2).unwrap(), MeshAxis::with_type("y", 2, MeshAxisType::Manual).unwrap()])
-        .unwrap()
+    LogicalMesh::new(vec![
+        MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+        MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+    ])
+    .unwrap()
 }
 
 /// Returns a one-dimensional sharded partition spec.
@@ -165,7 +171,6 @@ where
             traced.global_input_types(),
             traced.global_output_types(),
             "main",
-            "mesh",
         )?,
         summary,
     )])

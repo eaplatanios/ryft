@@ -277,11 +277,11 @@ impl Op<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 
-    fn lower_shard_map_mlir<'b, 'c, 't, 'm>(
+    fn lower_shard_map_mlir<'b, 'c, 't>(
         &self,
         input_values: &[ryft_mlir::ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't, 'm>,
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ryft_mlir::ValueRef<'b, 'c, 't>>, LoweringError> {
         if let Some(eval_mode) = self.eval_mode() {
             return lowerer.lower_linear_shard_map_eval_mode(eval_mode, input_values);
