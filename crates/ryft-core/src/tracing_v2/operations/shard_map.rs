@@ -495,6 +495,7 @@ fn named_sharding_with_partition_spec(
         sharding.replicated_axes().to_vec(),
         sharding.unreduced_axes().to_vec(),
     )
+    .map(|sharding| sharding.project_for_traced_sharding())
     .ok()
 }
 
@@ -533,6 +534,7 @@ fn merge_named_sharding_axes(
         replicated_axes,
         unreduced_axes,
     )
+    .map(|sharding| sharding.project_for_traced_sharding())
     .ok()
 }
 

@@ -396,6 +396,11 @@ impl LogicalMesh {
         self.axis_index(axis_name).map(|axis_index| self.axes[axis_index].size)
     }
 
+    /// Returns the type of `axis_name` in this mesh, if present.
+    fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
+        self.axis_index(axis_name).map(|axis_index| self.axes[axis_index].r#type)
+    }
+
     /// Returns `true` if all axes have type [`MeshAxisType::Auto`].
     pub fn are_all_axes_auto(&self) -> bool {
         self.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto)
@@ -431,6 +436,15 @@ impl LogicalMesh {
             .iter()
             .filter_map(|axis| (axis.r#type == axis_type).then_some(axis.name.as_str()))
             .collect()
+    }
+
+    /// Returns `true` if `axis_name` remains visible in traced/type-level sharding semantics.
+    ///
+    /// JAX hides `Auto` mesh axes from type-specified shardings while keeping `Explicit` axes
+    /// visible. `Manual` axes remain visible for traced `shard_map` semantics because the
+    /// manual-computation body still refers to them explicitly.
+    fn is_axis_visible_in_traced_sharding(&self, axis_name: &str) -> bool {
+        matches!(self.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
     }
 
     /// Returns a new `LogicalMesh` with selected axes' types changed.
@@ -854,6 +868,34 @@ impl PartitionSpec {
         self.dimensions.len()
     }
 
+    /// Projects this partition specification into the traced/type-level sharding view of `mesh`.
+    ///
+    /// `Auto` mesh axes are hidden from traced shardings, so any dimension sharded only by auto
+    /// axes becomes [`Unsharded`](PartitionDimension::Unsharded) in the projected view.
+    fn project_for_traced_sharding(&self, mesh: &LogicalMesh) -> Self {
+        let dimensions = self
+            .dimensions
+            .iter()
+            .map(|dimension| match dimension {
+                PartitionDimension::Unsharded => PartitionDimension::Unsharded,
+                PartitionDimension::Unconstrained => PartitionDimension::Unconstrained,
+                PartitionDimension::Sharded(axis_names) => {
+                    let visible_axis_names = axis_names
+                        .iter()
+                        .filter(|axis_name| mesh.is_axis_visible_in_traced_sharding(axis_name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if visible_axis_names.is_empty() {
+                        PartitionDimension::Unsharded
+                    } else {
+                        PartitionDimension::Sharded(visible_axis_names)
+                    }
+                }
+            })
+            .collect();
+        Self { dimensions }
+    }
+
     /// Renders this partition specification as a Shardy dimension list literal.
     ///
     /// The output is a bracket-enclosed, comma-separated list of dimension shardings suitable
@@ -1042,6 +1084,28 @@ impl NamedSharding {
     /// Returns explicitly unreduced axes.
     pub fn unreduced_axes(&self) -> &[String] {
         self.unreduced_axes.as_slice()
+    }
+
+    /// Projects this sharding into traced/type-level semantics by hiding `Auto` mesh axes.
+    ///
+    /// This mirrors JAX's distinction between concrete shardings and type-specified shardings:
+    /// auto axes may exist in the concrete mesh and runtime placement, but they are omitted from
+    /// the traced sharding view carried by types.
+    pub(crate) fn project_for_traced_sharding(&self) -> Self {
+        let partition_spec = self.partition_spec.project_for_traced_sharding(&self.mesh);
+        let replicated_axes = self
+            .replicated_axes
+            .iter()
+            .filter(|axis_name| self.mesh.is_axis_visible_in_traced_sharding(axis_name))
+            .cloned()
+            .collect();
+        let unreduced_axes = self
+            .unreduced_axes
+            .iter()
+            .filter(|axis_name| self.mesh.is_axis_visible_in_traced_sharding(axis_name))
+            .cloned()
+            .collect();
+        Self { mesh: self.mesh.clone(), partition_spec, replicated_axes, unreduced_axes }
     }
 
     /// Renders this sharding as a Shardy tensor sharding attribute.
@@ -1573,6 +1637,30 @@ mod tests {
         assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint), "[{?}]");
     }
 
+    #[test]
+    fn test_partition_spec_project_for_traced_sharding_hides_auto_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("model", 4, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("batch", 8, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let spec = PartitionSpec::new(vec![
+            PartitionDimension::sharded_by(["data", "model", "batch"]),
+            PartitionDimension::sharded("model"),
+            PartitionDimension::unsharded(),
+        ]);
+
+        assert_eq!(
+            spec.project_for_traced_sharding(&mesh),
+            PartitionSpec::new(vec![
+                PartitionDimension::sharded_by(["data", "batch"]),
+                PartitionDimension::unsharded(),
+                PartitionDimension::unsharded(),
+            ])
+        );
+    }
+
     // -----------------------------------------------------------------------
     // NamedSharding tests
     // -----------------------------------------------------------------------
@@ -1652,6 +1740,29 @@ mod tests {
             sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}], replicated={\"y\"}, unreduced={\"z\"}>"
         );
+    }
+
+    #[test]
+    fn test_named_sharding_project_for_traced_sharding_filters_auto_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("w", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let sharding = NamedSharding::with_extra_axes(
+            mesh,
+            PartitionSpec::new(vec![PartitionDimension::sharded_by(["x", "y", "z"])]),
+            vec!["w".to_string()],
+            Vec::new(),
+        )
+        .unwrap();
+        let projected = sharding.project_for_traced_sharding();
+
+        assert_eq!(projected.partition_spec(), &PartitionSpec::new(vec![PartitionDimension::sharded_by(["x", "z"])]));
+        assert!(projected.replicated_axes().is_empty());
+        assert!(projected.unreduced_axes().is_empty());
     }
 
     #[test]

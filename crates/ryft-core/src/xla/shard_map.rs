@@ -526,7 +526,8 @@ where
 ///
 /// The public constructors accept [`PartitionSpec`] values because that is the natural
 /// JAX-facing surface. Internally, those partition specs are converted to [`NamedSharding`]
-/// values while preserving the original partitioning surface used by JAX.
+/// values and then projected into traced/type-level semantics, so `Auto` mesh axes remain
+/// hidden while `Manual` axes still drive the manual-computation body.
 ///
 /// Reference: https://docs.jax.dev/en/latest/notebooks/shard_map.html.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1058,7 +1059,7 @@ fn build_named_shardings(
         .enumerate()
         .map(|(value_index, partition_spec)| {
             validate_manual_axis_order(&partition_spec, &manual_axis_names, value_kind, value_index)?;
-            Ok(NamedSharding::new(mesh.clone(), partition_spec)?)
+            Ok(NamedSharding::new(mesh.clone(), partition_spec)?.project_for_traced_sharding())
         })
         .collect()
 }
@@ -1379,6 +1380,14 @@ mod tests {
         .unwrap()
     }
 
+    fn test_logical_mesh_data_model_explicit() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("data", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("model", 4, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap()
+    }
+
     fn test_logical_mesh_without_manual_axes() -> LogicalMesh {
         LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
@@ -1580,6 +1589,18 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(shard_map.to_shardy_in_shardings_attribute(), r#"[<@mesh, [{"data", ?}]>]"#);
+    }
+
+    #[test]
+    fn test_shard_map_renders_explicit_axes_in_traced_shardings() {
+        let shard_map = ShardMap::new(
+            test_logical_mesh_data_model_explicit(),
+            vec![PartitionSpec::new(vec![PartitionDimension::sharded_by(["data", "model"])])],
+            Vec::new(),
+        )
+        .unwrap();
+
         assert_eq!(shard_map.to_shardy_in_shardings_attribute(), r#"[<@mesh, [{"data", "model", ?}]>]"#);
     }
 
@@ -1661,6 +1682,38 @@ mod tests {
                       sdy.return %1 : tensor<2xf32>
                     } : (tensor<8xf32>) -> tensor<8xf32>
                     return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_shard_map_trace_hides_auto_axes_in_type_level_shardings() {
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(16)]), None);
+        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
+            |x| x.clone() + x,
+            global_input_type.clone(),
+            test_logical_mesh_data_model(),
+            PartitionSpec::new(vec![PartitionDimension::sharded_by(["data", "model"])]),
+            PartitionSpec::new(vec![PartitionDimension::sharded_by(["data", "model"])]),
+        )
+        .unwrap();
+
+        assert_eq!(traced.global_input_types(), &global_input_type);
+        assert_eq!(traced.local_input_types(), &ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None));
+        assert_eq!(traced.global_output_types(), &global_input_type);
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["data"=2, "model"=4]>
+                  func.func @main(%arg0: tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data"}]>}) -> (tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"data", ?}]>] out_shardings=[<@mesh, [{"data", ?}]>] manual_axes={"data"} (%arg1: tensor<8xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<8xf32>
+                      sdy.return %1 : tensor<8xf32>
+                    } : (tensor<16xf32>) -> tensor<16xf32>
+                    return %0 : tensor<16xf32>
                   }
                 }
             "#}
