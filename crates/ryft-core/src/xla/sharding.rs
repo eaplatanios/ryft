@@ -208,13 +208,6 @@ pub enum ShardingError {
     #[error("partition index {partition_index} is out of range for partition count {partition_count}")]
     InvalidPartitionIndex { partition_index: usize, partition_count: usize },
 
-    /// Error returned when an `Unconstrained` dimension appears in a [`ShardingLayout`].
-    ///
-    /// `Unconstrained` dimensions are valid in [`PartitionSpec`] and [`NamedSharding`] (they
-    /// render as open `{?}` in Shardy), but cannot be used to compute concrete shard slices.
-    #[error("partition specification dimension #{dimension} is unconstrained and cannot be used in a sharding layout")]
-    UnconstrainedInLayout { dimension: usize },
-
     /// Error returned when the number of axis types does not match the number of axes.
     #[error("expected {expected} axis type(s), but got {actual}")]
     MeshAxisTypeCountMismatch { expected: usize, actual: usize },
@@ -783,9 +776,9 @@ pub enum PartitionDimension {
 
     /// Dimension is unconstrained — the Shardy propagator is free to decide how to shard it.
     ///
-    /// Equivalent to `PartitionSpec.UNCONSTRAINED` in JAX. This is only meaningful in
-    /// constraint annotations; it cannot be used in a [`ShardingLayout`] because concrete
-    /// shard slices cannot be computed without knowing the partitioning.
+    /// Equivalent to `PartitionSpec.UNCONSTRAINED` in JAX. This is primarily meaningful in
+    /// constraint annotations. When used in a [`ShardingLayout`], it is ignored for concrete
+    /// slice computation and therefore behaves like a full-range dimension for shard metadata.
     Unconstrained,
 }
 
@@ -1275,10 +1268,6 @@ impl ShardDescriptor {
 /// descriptors are useful for understanding the full distribution and for generating
 /// compiler-level sharding annotations.
 ///
-/// # Unconstrained dimensions
-///
-/// [`PartitionDimension::Unconstrained`] cannot appear in a `ShardingLayout` — construction
-/// will return [`ShardingError::UnconstrainedInLayout`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardingLayout {
     global_shape: Vec<usize>,
@@ -1290,9 +1279,6 @@ pub struct ShardingLayout {
 
 impl ShardingLayout {
     /// Constructs shard metadata for all devices in the mesh.
-    ///
-    /// Returns [`ShardingError::UnconstrainedInLayout`] if the partition spec contains an
-    /// `Unconstrained` dimension.
     pub fn new(
         global_shape: Vec<usize>,
         mesh: DeviceMesh,
@@ -1304,13 +1290,6 @@ impl ShardingLayout {
         let array_rank = global_shape.len();
         if partition_rank != array_rank {
             return Err(ShardingError::PartitionRankMismatch { partition_rank, array_rank });
-        }
-
-        // Reject Unconstrained dimensions.
-        for (dimension, partition_dimension) in partition_spec.dimensions().iter().enumerate() {
-            if matches!(partition_dimension, PartitionDimension::Unconstrained) {
-                return Err(ShardingError::UnconstrainedInLayout { dimension });
-            }
         }
 
         let mut shards = Vec::with_capacity(mesh.device_count());
@@ -1333,10 +1312,7 @@ impl ShardingLayout {
                         )?;
                         partition_slice(dimension_size, partition_count, partition_index)?
                     }
-                    PartitionDimension::Unconstrained => {
-                        // Already rejected above; this is unreachable.
-                        unreachable!()
-                    }
+                    PartitionDimension::Unconstrained => 0..dimension_size,
                 };
                 shape.push(slice.len());
                 slices.push(slice);
@@ -1759,14 +1735,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_layout_unconstrained_rejected() {
+    fn test_sharding_layout_unconstrained_is_ignored() {
         let mesh = test_device_mesh_2x2();
         let partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unconstrained()]);
-        assert!(matches!(
-            ShardingLayout::new(vec![8, 6], mesh, partition_spec),
-            Err(ShardingError::UnconstrainedInLayout { dimension: 1 }),
-        ));
+        let layout = ShardingLayout::new(vec![8, 6], mesh, partition_spec).unwrap();
+
+        let shard0 = layout.shard_for_device(0).unwrap();
+        let shard3 = layout.shard_for_device(3).unwrap();
+        assert_eq!(shard0.slices()[0], 0..4);
+        assert_eq!(shard0.slices()[1], 0..6);
+        assert_eq!(shard3.slices()[0], 4..8);
+        assert_eq!(shard3.slices()[1], 0..6);
+        assert_eq!(shard0.shape(), &[4, 6]);
+        assert_eq!(shard3.shape(), &[4, 6]);
     }
 
     #[test]
