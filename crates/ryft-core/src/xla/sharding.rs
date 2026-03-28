@@ -34,12 +34,12 @@
 //! [`DeviceMesh`] wraps a [`LogicalMesh`] and adds a concrete device list, which is needed at
 //! runtime for computing per-device shard metadata in [`ShardingLayout`].
 //!
-//! # Sharding context
+//! # Generic vs specialized Shardy lowering
 //!
-//! [`ShardingContext`] controls how unsharded and unconstrained dimensions are rendered in
-//! Shardy MLIR. `ExplicitSharding` produces closed dimensions (`{}`), while
-//! `ShardingConstraint` leaves unsharded dimensions open (`{?}`), allowing the Shardy
-//! propagator to fill them in.
+//! The generic [`ShardingSpecification`] and [`NamedSharding`] renderers emit fully explicit
+//! Shardy shardings, where unsharded dimensions are closed (`{}`). Specialized lowering sites
+//! such as `shard_map` can still compute open dimensions (`{?}`) when that is required by
+//! Shardy's manual-computation semantics.
 //!
 //! # Practical usage
 //!
@@ -128,7 +128,7 @@
 //!    let mesh_op = mesh_module.body().append_operation(mesh_op);
 //!
 //!    // Generates: #sdy.sharding<@mesh, [{"data"}, {}]>
-//!    let attr = sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding);
+//!    let attr = sharding.to_shardy_tensor_sharding_attribute();
 //!    ```
 //!
 //! # Multi-host and addressability
@@ -162,33 +162,6 @@ use crate::sharding::{
 };
 
 // ---------------------------------------------------------------------------
-// Sharding context
-// ---------------------------------------------------------------------------
-
-/// Controls how sharding dimensions are rendered in Shardy MLIR attributes.
-///
-/// In Shardy's sharding representation, each dimension can be *closed* (fixed set of axes,
-/// propagator will not change it) or *open* (ends with `?`, propagator may add axes).
-///
-/// | Variant              | `Unsharded` renders as | `Sharded(["x"])` renders as | `Unconstrained` renders as |
-/// | -------------------- | ----------------------- | --------------------------- | -------------------------- |
-/// | `ExplicitSharding`   | `{}` (closed)           | `{"x"}` (closed)            | `{?}` (open)               |
-/// | `ShardingConstraint` | `{?}` (open)            | `{"x"}` (closed)            | `{?}` (open)               |
-///
-/// Use `ExplicitSharding` when the sharding is fully determined (e.g., from a runtime array
-/// in a JIT flow). Use `ShardingConstraint` when annotating an intermediate value where
-/// unsharded dimensions should remain open for the propagator.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ShardingContext {
-    /// Fully determined sharding: unsharded dimensions are closed (`{}`).
-    ExplicitSharding,
-
-    /// Constraint hint: unsharded dimensions are open (`{?}`), allowing the propagator to
-    /// assign axes.
-    ShardingConstraint,
-}
-
-// ---------------------------------------------------------------------------
 // Sharding specification
 // ---------------------------------------------------------------------------
 
@@ -217,15 +190,15 @@ pub enum ShardingContext {
 ///
 /// # Shardy representation
 ///
-/// Each `ShardingDimension` maps to a [`DimensionShardingAttr`][sdy-dim] in Shardy MLIR.
-/// The rendering depends on the [`ShardingContext`]:
+/// Each `ShardingDimension` maps to a [`DimensionShardingAttr`][sdy-dim] in the generic
+/// Shardy lowering:
 ///
-/// | `ShardingDimension`  | `ExplicitSharding`    | `ShardingConstraint` |
-/// | --------------------- | --------------------- | -------------------- |
-/// | `Unsharded`           | `{}` (closed)         | `{?}` (open)         |
-/// | `Sharded(["x"])`      | `{"x"}` (closed)      | `{"x"}` (closed)     |
-/// | `Sharded(["x", "y"])` | `{"x", "y"}` (closed) | `{"x", "y"}` (closed) |
-/// | `Unconstrained`       | `{?}` (open)          | `{?}` (open)         |
+/// | `ShardingDimension`   | Generic rendering      |
+/// | --------------------- | ---------------------- |
+/// | `Unsharded`           | `{}` (closed)          |
+/// | `Sharded(["x"])`      | `{"x"}` (closed)       |
+/// | `Sharded(["x", "y"])` | `{"x", "y"}` (closed) |
+/// | `Unconstrained`       | `{?}` (open)          |
 ///
 /// [sdy-dim]: https://openxla.org/shardy/sharding_representation
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -334,10 +307,9 @@ pub(crate) fn escape_shardy_string(value: &str) -> String {
 /// [`to_shardy_dimension_shardings_literal`][ShardingSpecification::to_shardy_dimension_shardings_literal]:
 ///
 /// ```text
-/// [{"data"}, {}]         <- P('data', None) with ExplicitSharding
-/// [{"data"}, {?}]        <- P('data', None) with ShardingConstraint
+/// [{"data"}, {}]         <- P('data', None)
 /// [{"data"}, {"model"}]  <- P('data', 'model')
-/// [{}, {}]               <- P() with rank 2, ExplicitSharding
+/// [{}, {}]               <- P() with rank 2
 /// [{?}]                  <- P(UNCONSTRAINED)
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
@@ -427,19 +399,16 @@ impl ShardingSpecification {
     /// The output is a bracket-enclosed, comma-separated list of dimension shardings suitable
     /// for embedding in a `#sdy.sharding<...>` attribute.
     ///
-    /// The `context` parameter controls whether unsharded dimensions are rendered as closed
-    /// (`{}`) or open (`{?}`). See [`ShardingContext`] for details.
-    pub fn to_shardy_dimension_shardings_literal(&self, context: ShardingContext) -> String {
+    /// Unsharded dimensions render as closed (`{}`), while unconstrained dimensions render as
+    /// open (`{?}`).
+    pub fn to_shardy_dimension_shardings_literal(&self) -> String {
         let mut literal = String::from("[");
         for (dimension_index, dimension) in self.dimensions.iter().enumerate() {
             if dimension_index > 0 {
                 literal.push_str(", ");
             }
             match dimension {
-                ShardingDimension::Unsharded => match context {
-                    ShardingContext::ExplicitSharding => literal.push_str("{}"),
-                    ShardingContext::ShardingConstraint => literal.push_str("{?}"),
-                },
+                ShardingDimension::Unsharded => literal.push_str("{}"),
                 ShardingDimension::Sharded(axis_names) => {
                     literal.push('{');
                     for (axis_index, axis_name) in axis_names.iter().enumerate() {
@@ -463,16 +432,11 @@ impl ShardingSpecification {
     pub(crate) fn to_shardy_dimension_shardings<'c, 't>(
         &self,
         context: &'c MlirContext<'t>,
-        sharding_context: ShardingContext,
     ) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
         self.dimensions
             .iter()
             .map(|dimension| match dimension {
-                ShardingDimension::Unsharded => context.shardy_dimension_sharding(
-                    &[],
-                    matches!(sharding_context, ShardingContext::ExplicitSharding),
-                    None,
-                ),
+                ShardingDimension::Unsharded => context.shardy_dimension_sharding(&[], true, None),
                 ShardingDimension::Sharded(axis_names) => {
                     let axes =
                         axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)).collect::<Vec<_>>();
@@ -606,13 +570,9 @@ impl NamedSharding {
     /// #sdy.sharding<@mesh, [{"x"}, {}], replicated={"y"}>
     /// ```
     ///
-    /// # Parameters
-    ///
-    ///   - `context`: Controls open/closed rendering for unsharded dimensions.
-    ///
     /// Uses the canonical `@mesh` symbol name.
-    pub fn to_shardy_tensor_sharding_attribute(&self, context: ShardingContext) -> String {
-        let dim_shardings = self.sharding_specification.to_shardy_dimension_shardings_literal(context);
+    pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
+        let dim_shardings = self.sharding_specification.to_shardy_dimension_shardings_literal();
         let mut result = format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}");
 
         let replicated_axes = self.replicated_axes();
@@ -650,10 +610,9 @@ impl NamedSharding {
     pub(crate) fn to_shardy_tensor_sharding<'c, 't>(
         &self,
         context: &'c MlirContext<'t>,
-        sharding_context: ShardingContext,
     ) -> TensorShardingAttributeRef<'c, 't> {
         let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
-        let dim_shardings = self.sharding_specification.to_shardy_dimension_shardings(context, sharding_context);
+        let dim_shardings = self.sharding_specification.to_shardy_dimension_shardings(context);
         let replicated_axes = self
             .replicated_axes()
             .iter()
@@ -997,23 +956,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_specification_shardy_rendering_explicit() {
+    fn test_sharding_specification_shardy_rendering() {
         let spec = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
-        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding), "[{\"x\"}, {}]");
-    }
-
-    #[test]
-    fn test_sharding_specification_shardy_rendering_constraint() {
-        let spec = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
-        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint), "[{\"x\"}, {?}]");
+        assert_eq!(spec.to_shardy_dimension_shardings_literal(), "[{\"x\"}, {}]");
     }
 
     #[test]
     fn test_sharding_specification_shardy_rendering_unconstrained() {
         let spec = ShardingSpecification::new(vec![ShardingDimension::unconstrained()]);
-        // Unconstrained is always open, regardless of context.
-        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding), "[{?}]");
-        assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint), "[{?}]");
+        assert_eq!(spec.to_shardy_dimension_shardings_literal(), "[{?}]");
     }
 
     #[test]
@@ -1076,10 +1027,7 @@ mod tests {
         let sharding_specification =
             ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
         let sharding = NamedSharding::new(mesh, sharding_specification).unwrap();
-        assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
-            "#sdy.sharding<@mesh, [{\"x\"}, {}]>"
-        );
+        assert_eq!(sharding.to_shardy_tensor_sharding_attribute(), "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
     }
 
     #[test]
@@ -1095,7 +1043,7 @@ mod tests {
 
         assert_eq!(sharding.replicated_axes(), vec!["y"]);
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
+            sharding.to_shardy_tensor_sharding_attribute(),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], replicated={\"y\"}>"
         );
     }
@@ -1108,7 +1056,7 @@ mod tests {
                 .with_unreduced_axes(["y"]);
         let sharding = NamedSharding::new(mesh, sharding_specification).unwrap();
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
+            sharding.to_shardy_tensor_sharding_attribute(),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>"
         );
     }
@@ -1127,7 +1075,7 @@ mod tests {
 
         assert_eq!(sharding.replicated_axes(), vec!["y"]);
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
+            sharding.to_shardy_tensor_sharding_attribute(),
             "#sdy.sharding<@mesh, [{\"x\"}], replicated={\"y\"}, unreduced={\"z\"}>"
         );
     }

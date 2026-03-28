@@ -22,7 +22,7 @@ use crate::types::data_types::{DataType, DataTypeError};
 
 use crate::sharding::DeviceMesh;
 
-use super::sharding::{ShardDescriptor, ShardingContext, ShardingLayout, ShardingSpecification};
+use super::sharding::{ShardDescriptor, ShardingLayout, ShardingSpecification};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -307,15 +307,9 @@ impl<'o> Array<'o> {
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
     ///
-    /// Uses [`ShardingContext::ExplicitSharding`] because runtime arrays have fully determined shardings.
-    ///
-    ///
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
-        let dim_shardings = self
-            .layout
-            .sharding_specification()
-            .to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding);
+        let dim_shardings = self.layout.sharding_specification().to_shardy_dimension_shardings_literal();
         format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}>")
     }
 

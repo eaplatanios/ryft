@@ -1396,7 +1396,7 @@ mod tests {
     use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
     use crate::types::data_types::DataType;
     use crate::xla::arrays::Array;
-    use crate::xla::sharding::{ShardingContext, ShardingDimension, ShardingSpecification};
+    use crate::xla::sharding::{ShardingDimension, ShardingSpecification};
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
@@ -2359,10 +2359,8 @@ mod tests {
         assert_eq!(shard_map.local_input_shape(0, &[8]).unwrap(), vec![2]);
         assert_eq!(shard_map.local_output_shape(0, &[8]).unwrap(), vec![2]);
 
-        let input_sharding =
-            shard_map.in_shardings()[0].to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding);
-        let output_sharding =
-            shard_map.out_shardings()[0].to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding);
+        let input_sharding = shard_map.in_shardings()[0].to_shardy_tensor_sharding_attribute();
+        let output_sharding = shard_map.out_shardings()[0].to_shardy_tensor_sharding_attribute();
         let manual_computation_attributes = shard_map.to_shardy_manual_computation_attributes();
         let context = MlirContext::new();
         let mesh_module = context.module(context.unknown_location());

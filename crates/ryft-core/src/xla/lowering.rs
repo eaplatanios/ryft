@@ -19,8 +19,6 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
-use super::sharding::ShardingContext;
-
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum LoweringError {
@@ -261,7 +259,7 @@ where
         .iter()
         .zip(shard_map.in_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy_tensor_sharding(&context, ShardingContext::ExplicitSharding);
+            let sharding = sharding.to_shardy_tensor_sharding(&context);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -272,7 +270,7 @@ where
         .iter()
         .zip(shard_map.out_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy_tensor_sharding(&context, ShardingContext::ExplicitSharding);
+            let sharding = sharding.to_shardy_tensor_sharding(&context);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
