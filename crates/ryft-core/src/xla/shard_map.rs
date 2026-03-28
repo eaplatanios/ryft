@@ -52,6 +52,8 @@ use std::ops::{Add, Mul, Neg};
 use std::{collections::HashSet, fmt::Debug};
 
 use ryft_macros::Parameter;
+#[cfg(test)]
+use ryft_mlir::Block;
 use ryft_mlir::Context as MlirContext;
 use ryft_mlir::dialects::shardy::{
     DimensionShardingAttributeRef, ManualAxesAttributeRef, TensorShardingAttributeRef,
@@ -60,14 +62,14 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::sharding::{MeshAxisType, ShardingError};
+use crate::sharding::{LogicalMesh, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, ShardingError};
 use crate::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
 };
 use crate::types::{ArrayType, Shape, Size, Typed};
 
 use super::lowering::LoweringError;
-use super::sharding::{LogicalMesh, NamedSharding, PartitionDimension, PartitionSpec, SHARDY_MESH_SYMBOL_NAME};
+use super::sharding::{NamedSharding, PartitionDimension, PartitionSpec};
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -2340,7 +2342,12 @@ mod tests {
         let output_sharding =
             shard_map.out_shardings()[0].to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding);
         let manual_computation_attributes = shard_map.to_shardy_manual_computation_attributes();
-        let mesh_operation = shard_map.mesh().to_shardy_mesh_operation();
+        let context = MlirContext::new();
+        let mesh_module = context.module(context.unknown_location());
+        let mesh_operation = mesh_module
+            .body()
+            .append_operation(shard_map.mesh().to_shardy_mesh(context.unknown_location()))
+            .to_string();
 
         let mlir_program = format!(
             r#"

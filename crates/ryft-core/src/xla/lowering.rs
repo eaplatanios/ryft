@@ -11,16 +11,15 @@ use ryft_mlir::{
 };
 
 use crate::parameters::Parameterized;
-use crate::sharding::ShardingError;
+use crate::sharding::{LogicalMesh, SHARDY_MESH_SYMBOL_NAME, ShardingError};
 use crate::tracing_v2::{
     AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
     operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp},
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
-use super::LogicalMesh;
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
-use super::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardingContext};
+use super::sharding::ShardingContext;
 
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -255,8 +254,8 @@ where
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
-    let mesh_attribute = shard_map.mesh().to_shardy_mesh_attribute(&context);
-    module.body().append_operation(shardy::mesh(SHARDY_MESH_SYMBOL_NAME, mesh_attribute, location));
+    let mesh_operation = shard_map.mesh().to_shardy_mesh(location);
+    module.body().append_operation(mesh_operation);
 
     let function_arguments = global_input_tensor_types
         .iter()
@@ -343,8 +342,8 @@ where
     let module = context.module(location);
 
     if let Some(mesh) = collect_nested_shard_map_mesh(graph, None)? {
-        let mesh_attribute = mesh.to_shardy_mesh_attribute(&context);
-        module.body().append_operation(shardy::mesh(SHARDY_MESH_SYMBOL_NAME, mesh_attribute, location));
+        let mesh_operation = mesh.to_shardy_mesh(location);
+        module.body().append_operation(mesh_operation);
     }
 
     let global_input_tensor_types = global_input_types
@@ -1742,7 +1741,9 @@ mod tests {
     use crate::types::Shape;
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
-    use super::super::sharding::{LogicalMesh, PartitionDimension, PartitionSpec};
+    use crate::sharding::LogicalMesh;
+
+    use super::super::sharding::{PartitionDimension, PartitionSpec};
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {

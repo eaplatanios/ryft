@@ -122,7 +122,12 @@
 //!
 //!    ```ignore
 //!    // Generates: sdy.mesh @mesh = <["data"=4, "model"=2]>
-//!    let mesh_op = mesh.logical_mesh().to_shardy_mesh_operation();
+//!    let context = MlirContext::new();
+//!    let mesh_module = context.module(context.unknown_location());
+//!    let mesh_op = mesh
+//!        .logical_mesh()
+//!        .to_shardy_mesh_operation(context.unknown_location());
+//!    let mesh_op = mesh_module.body().append_operation(mesh_op);
 //!
 //!    // Generates: #sdy.sharding<@mesh, [{"data"}, {}]>
 //!    let attr = sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding);
@@ -150,14 +155,13 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+#[cfg(test)]
+use ryft_mlir::Block;
 use ryft_mlir::Context as MlirContext;
-use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, MeshAttributeRef, TensorShardingAttributeRef};
+use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, TensorShardingAttributeRef};
 
 use crate::parameters::Parameter;
-use crate::sharding::{DeviceId, MeshAxis, MeshAxisType, ShardingError};
-
-/// Canonical symbol name used for emitted Shardy mesh declarations and references.
-pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
+use crate::sharding::{DeviceId, LogicalMesh, MeshAxis, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, ShardingError};
 
 // ---------------------------------------------------------------------------
 // Sharding context
@@ -235,125 +239,6 @@ impl MeshDevice {
     /// Process index of the host owning this device.
     pub fn process_index(&self) -> usize {
         self.process_index
-    }
-}
-
-/// Logical mesh topology (axes only, no devices).
-///
-/// A `LogicalMesh` captures the axis names and sizes of a device mesh without binding to
-/// specific physical devices. This is the compilation-time view of a mesh: it provides enough
-/// information to generate Shardy MLIR attributes and validate partition specifications, but
-/// does not carry device identity or process ownership.
-///
-/// Use [`LogicalMesh`] wherever device placement is irrelevant — principally in
-/// [`NamedSharding`] and for rendering Shardy attributes.
-///
-/// # JAX equivalent
-///
-/// This corresponds to the topology portion of [`jax.sharding.Mesh`][jax-mesh] — the
-/// `axis_names` and `shape` without the `devices` array.
-///
-/// [jax-mesh]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.Mesh
-///
-/// # Shardy representation
-///
-/// Rendered as an `sdy.mesh` operation via
-/// [`to_shardy_mesh_operation`][LogicalMesh::to_shardy_mesh_operation]:
-///
-/// ```mlir
-/// sdy.mesh @mesh = <["data"=4, "model"=2]>
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogicalMesh {
-    /// Named axes that define this logical mesh topology.
-    pub axes: Vec<MeshAxis>,
-
-    /// Mapping from mesh axis names to their position in [`Self::axes`].
-    pub axis_indices: HashMap<String, usize>,
-}
-
-impl LogicalMesh {
-    /// Creates a logical mesh from named axes.
-    ///
-    /// Preserves the type of each provided axis.
-    ///
-    /// Validates that all axis names are non-empty, all sizes are positive, and names are unique.
-    pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
-        let mut axis_indices = HashMap::with_capacity(axes.len());
-        for (axis_index, axis) in axes.iter().enumerate() {
-            if axis.name.is_empty() {
-                return Err(ShardingError::EmptyMeshAxisName);
-            }
-            if axis.size == 0 {
-                return Err(ShardingError::EmptyMeshAxis { name: axis.name.clone() });
-            }
-            if axis_indices.insert(axis.name.clone(), axis_index).is_some() {
-                return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
-            }
-        }
-        Ok(Self { axes, axis_indices })
-    }
-
-    /// Returns the size of `axis_name` in this mesh, if present.
-    pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].size)
-    }
-
-    /// Returns the type of `axis_name` in this mesh, if present.
-    pub fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
-        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].r#type)
-    }
-
-    /// Returns the total number of devices implied by axis sizes.
-    pub fn device_count(&self) -> usize {
-        self.axes.iter().fold(1usize, |count, axis| count * axis.size)
-    }
-}
-
-#[cfg(feature = "xla")]
-impl LogicalMesh {
-    /// Renders this mesh as the right-hand side of a Shardy `sdy.mesh` declaration.
-    ///
-    /// Example output for axes `("x", 8)` and `("y", 2)`:
-    /// `<["x"=8, "y"=2]>`.
-    pub fn to_shardy_mesh_literal(&self) -> String {
-        let mut literal = String::from("<[");
-        for (axis_index, axis) in self.axes.iter().enumerate() {
-            if axis_index > 0 {
-                literal.push_str(", ");
-            }
-            literal.push('"');
-            literal.push_str(escape_shardy_string(axis.name.as_str()).as_str());
-            literal.push_str("\"=");
-            literal.push_str(axis.size.to_string().as_str());
-        }
-        literal.push_str("]>");
-        literal
-    }
-
-    /// Renders a complete Shardy `sdy.mesh` operation declaration.
-    ///
-    /// The output is a valid MLIR operation that can be placed at module scope in a StableHLO
-    /// program. For example:
-    ///
-    /// ```text
-    /// sdy.mesh @mesh = <["data"=4, "model"=2]>
-    /// ```
-    ///
-    ///
-    /// Uses the canonical `@mesh` symbol name.
-    pub fn to_shardy_mesh_operation(&self) -> String {
-        format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = {}", self.to_shardy_mesh_literal())
-    }
-
-    /// Builds this mesh as a typed Shardy mesh attribute.
-    pub(crate) fn to_shardy_mesh_attribute<'c, 't>(&self, context: &'c MlirContext<'t>) -> MeshAttributeRef<'c, 't> {
-        let axes = self
-            .axes
-            .iter()
-            .map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size))
-            .collect::<Vec<_>>();
-        context.shardy_mesh(axes.as_slice(), &[])
     }
 }
 
@@ -557,6 +442,12 @@ impl PartitionDimension {
     pub fn unconstrained() -> Self {
         Self::Unconstrained
     }
+}
+
+/// Escapes a string for inclusion in quoted Shardy text syntax.
+#[cfg(feature = "xla")]
+pub(crate) fn escape_shardy_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Partition specification for all logical array dimensions.
@@ -1168,14 +1059,6 @@ impl ShardingLayout {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
-fn escape_shardy_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 /// Validates a partition spec against a logical mesh.
 fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -> Result<(), ShardingError> {
     let mut used_axes = HashSet::new();
@@ -1294,8 +1177,12 @@ mod tests {
     #[test]
     fn test_logical_mesh_shardy_rendering() {
         let mesh = test_logical_mesh_2x2();
-        assert_eq!(mesh.to_shardy_mesh_literal(), "<[\"x\"=2, \"y\"=2]>");
-        assert_eq!(mesh.to_shardy_mesh_operation(), "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>");
+        let context = MlirContext::new();
+        let module = context.module(context.unknown_location());
+        assert_eq!(
+            module.body().append_operation(mesh.to_shardy_mesh(context.unknown_location())).to_string(),
+            "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>"
+        );
     }
 
     // -----------------------------------------------------------------------

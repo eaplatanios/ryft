@@ -1,8 +1,9 @@
+use std::collections::HashMap;
+
 use thiserror::Error;
 
-/// Type alias used to represent [`Device`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
-/// and, on multi-host environments, are also unique across all devices and all hosts.
-pub type DeviceId = usize;
+#[cfg(feature = "xla")]
+use ryft_mlir::{Location, dialects::shardy};
 
 /// Represents sharding-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -47,15 +48,14 @@ pub enum MeshAxisType {
     /// type-level sharding metadata and propagated before compilation.
     Explicit,
 
-    // TODO(eaplatanios): Link to the `shard_map` operation once we have it.
     /// Used for mesh axes for which the user manages all device communication explicitly
-    /// (e.g., using an operation like `shard_map` which is analogous to
+    /// (e.g., using an operation like [`shard_map`] which is analogous to
     /// [JAX's `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
     Manual,
 }
 
-/// Named axis in a [`LogicalMesh`]. Each axis represents one dimension of the device grid with a human-readable name, a
-/// size (i.e., the number of devices along that dimension), and a [`MeshAxisType`] that controls sharding propagation
+/// Named axis in a [`LogicalMesh`]. Each axis represents one dimension of the device grid with a human-readable name,
+/// a size (i.e., the number of devices along that dimension), and a [`MeshAxisType`] that controls sharding propagation
 /// behavior for that axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MeshAxis {
@@ -82,3 +82,86 @@ impl MeshAxis {
         }
     }
 }
+
+/// Logical mesh that represent a device topology that is to be used for sharding. A [`LogicalMesh`] captures the mesh
+/// axis names, sizes, and types of a device mesh without binding to physical devices. This is the compilation-time view
+/// of a mesh: it provides enough information to validate partition specifications and generate sharding-related code
+/// (e.g., [Shardy](https://openxla.org/shardy) MLIR attributes), but it does not carry any device-specific information.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalMesh {
+    /// Named and sized axes that define this logical mesh topology.
+    pub axes: Vec<MeshAxis>,
+
+    /// Mapping from [`MeshAxis`] names to their indices/positions in [`Self::axes`].
+    pub axis_indices: HashMap<String, usize>,
+}
+
+impl LogicalMesh {
+    /// Creates a new [`LogicalMesh`].
+    pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
+        let mut axis_indices = HashMap::with_capacity(axes.len());
+        for (axis_index, axis) in axes.iter().enumerate() {
+            if axis.name.is_empty() {
+                return Err(ShardingError::EmptyMeshAxisName);
+            }
+            if axis.size == 0 {
+                return Err(ShardingError::EmptyMeshAxis { name: axis.name.clone() });
+            }
+            if axis_indices.insert(axis.name.clone(), axis_index).is_some() {
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
+            }
+        }
+        Ok(Self { axes, axis_indices })
+    }
+
+    /// Returns the rank (i.e., number of axes) of this [`LogicalMesh`].
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.axes.len()
+    }
+
+    /// Returns the size of the [`MeshAxis`] in this [`LogicalMesh`] with the provided name, if such an axis exists.
+    #[inline]
+    pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
+        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].size)
+    }
+
+    /// Returns the type of the [`MeshAxis`] in this [`LogicalMesh`] with the provided name, if such an axis exists.
+    #[inline]
+    pub fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
+        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].r#type)
+    }
+
+    /// Returns the total number of devices that the topology defined by this [`LogicalMesh`] contains.
+    #[inline]
+    pub fn device_count(&self) -> usize {
+        self.axes.iter().fold(1usize, |count, axis| count * axis.size)
+    }
+}
+
+/// Canonical symbol name used for emitted Shardy [`LogicalMesh`] declarations and references.
+#[cfg(feature = "xla")]
+pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
+
+#[cfg(feature = "xla")]
+impl LogicalMesh {
+    /// Constructs a new [`shardy::DetachedMeshOperation`] that corresponds to this [`LogicalMesh`].
+    /// The mesh in the returned operation will be named `"mesh"`.
+    pub fn to_shardy_mesh<'c, 't: 'c, L: Location<'c, 't>>(
+        &self,
+        location: L,
+    ) -> shardy::DetachedMeshOperation<'c, 't> {
+        let context = location.context();
+        let axes = self
+            .axes
+            .iter()
+            .map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size))
+            .collect::<Vec<_>>();
+        let attribute = context.shardy_mesh(axes.as_slice(), &[]);
+        shardy::mesh(SHARDY_MESH_SYMBOL_NAME, attribute, location)
+    }
+}
+
+/// Type alias used to represent [`Device`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
+/// and, on multi-host environments, are also unique across all devices and all hosts.
+pub type DeviceId = usize;

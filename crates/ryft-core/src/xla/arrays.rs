@@ -12,14 +12,15 @@ use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
+#[cfg(test)]
+use ryft_mlir::Block;
+use ryft_mlir::{Location, dialects::shardy::DetachedMeshOperation};
 use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
-use crate::sharding::ShardingError;
+use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardingError};
 use crate::types::data_types::{DataType, DataTypeError};
 
-use super::sharding::{
-    DeviceMesh, PartitionSpec, SHARDY_MESH_SYMBOL_NAME, ShardDescriptor, ShardingContext, ShardingLayout,
-};
+use super::sharding::{DeviceMesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingLayout};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -287,12 +288,19 @@ impl<'o> Array<'o> {
             .and_then(|addressable_shard| self.layout.shard(addressable_shard.shard_index()))
     }
 
-    /// Renders the Shardy mesh declaration (`sdy.mesh`) implied by this array's sharding.
+    /// Builds the detached Shardy mesh declaration (`sdy.mesh`) implied by this array's sharding.
     ///
+    /// # Parameters
+    ///
+    ///   - `location`: MLIR location attached to the emitted mesh operation.
     ///
     /// Uses the canonical `@mesh` symbol name.
-    pub fn to_shardy_mesh_operation(&self) -> String {
-        self.layout.mesh().logical_mesh().to_shardy_mesh_operation()
+    pub fn to_shardy_mesh_operation<'c, 't, L>(&self, location: L) -> DetachedMeshOperation<'c, 't>
+    where
+        't: 'c,
+        L: Location<'c, 't>,
+    {
+        self.layout.mesh().logical_mesh().to_shardy_mesh(location)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
@@ -550,7 +558,12 @@ mod tests {
         assert_eq!(rhs_array.element_type(), DataType::F32);
 
         // Derive Shardy attributes from runtime arrays (JIT-style).
-        let mesh_operation = lhs_array.to_shardy_mesh_operation();
+        let context = ryft_mlir::Context::new();
+        let mesh_module = context.module(context.unknown_location());
+        let mesh_operation = mesh_module
+            .body()
+            .append_operation(lhs_array.to_shardy_mesh_operation(context.unknown_location()))
+            .to_string();
         let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute();
         let rhs_sharding_attribute = rhs_array.to_shardy_tensor_sharding_attribute();
         let output_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute();
