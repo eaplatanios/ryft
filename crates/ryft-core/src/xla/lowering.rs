@@ -1778,8 +1778,8 @@ mod tests {
             |x| x.clone() + x,
             global_input_type,
             test_manual_mesh("x", 4),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
         )
         .unwrap();
 
@@ -1811,8 +1811,14 @@ mod tests {
             },
             global_input_type,
             test_manual_mesh("x", 2),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]),
+            ShardingSpecification::new(
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                vec![],
+            ),
+            ShardingSpecification::new(
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                vec![],
+            ),
         )
         .unwrap();
 

@@ -58,12 +58,12 @@ fn nested_inner_mesh() -> LogicalMesh {
 
 /// Returns a one-dimensional sharded sharding specification.
 fn sharded_1d_sharding_specification() -> ShardingSpecification {
-    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])])
+    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![])
 }
 
 /// Returns a two-dimensional row-sharded sharding specification.
 fn row_sharded_sharding_specification() -> ShardingSpecification {
-    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![])
 }
 
 /// Returns a two-dimensional replicated sharding specification.
@@ -290,7 +290,7 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
 /// Emits the nested traced `shard_map` benchmark.
 fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let outer_sharding_specification = sharded_1d_sharding_specification();
-    let inner_sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["y"])]);
+    let inner_sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["y"])], vec![]);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let outer_mesh = nested_outer_mesh();

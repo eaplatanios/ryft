@@ -506,8 +506,10 @@ mod tests {
         )
         .unwrap();
 
-        let lhs_sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
+        let lhs_sharding_specification = ShardingSpecification::new(
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+            vec![],
+        );
         let rhs_sharding_specification = ShardingSpecification::replicated(2);
 
         // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).

@@ -490,12 +490,13 @@ fn named_sharding_with_sharding_specification(
     sharding: &crate::xla::sharding::NamedSharding,
     sharding_specification: crate::xla::sharding::ShardingSpecification,
 ) -> Option<crate::xla::sharding::NamedSharding> {
-    crate::xla::sharding::NamedSharding::new(
-        sharding.mesh().clone(),
-        sharding_specification.with_unreduced_axes(sharding.sharding_specification().unreduced_axes.iter().cloned()),
-    )
-    .map(|sharding| sharding.project_for_traced_sharding())
-    .ok()
+    let sharding_specification = crate::xla::sharding::ShardingSpecification::new(
+        sharding_specification.dimensions,
+        sharding.sharding_specification().unreduced_axes.clone(),
+    );
+    crate::xla::sharding::NamedSharding::new(sharding.mesh().clone(), sharding_specification)
+        .map(|sharding| sharding.project_for_traced_sharding())
+        .ok()
 }
 
 /// Returns whether one named sharding is fully replicated over its ranked dimensions.
@@ -520,12 +521,11 @@ fn merge_named_sharding_axes(
         }
     }
 
-    crate::xla::sharding::NamedSharding::new(
-        left.mesh().clone(),
-        sharding_specification.with_unreduced_axes(unreduced_axes),
-    )
-    .map(|sharding| sharding.project_for_traced_sharding())
-    .ok()
+    let sharding_specification =
+        crate::xla::sharding::ShardingSpecification::new(sharding_specification.dimensions, unreduced_axes);
+    crate::xla::sharding::NamedSharding::new(left.mesh().clone(), sharding_specification)
+        .map(|sharding| sharding.project_for_traced_sharding())
+        .ok()
 }
 
 /// Infers the output sharding of one sharding-preserving unary op.
@@ -546,7 +546,7 @@ fn infer_transpose_output_sharding(
     let dimensions = &input.sharding_specification().dimensions;
     named_sharding_with_sharding_specification(
         input,
-        crate::xla::sharding::ShardingSpecification::new(vec![dimensions[1].clone(), dimensions[0].clone()]),
+        crate::xla::sharding::ShardingSpecification::new(vec![dimensions[1].clone(), dimensions[0].clone()], vec![]),
     )
 }
 
@@ -587,7 +587,10 @@ fn infer_matmul_output_sharding(
     merge_named_sharding_axes(
         left,
         right,
-        crate::xla::sharding::ShardingSpecification::new(vec![left_dimensions[0].clone(), right_dimensions[1].clone()]),
+        crate::xla::sharding::ShardingSpecification::new(
+            vec![left_dimensions[0].clone(), right_dimensions[1].clone()],
+            vec![],
+        ),
     )
 }
 
