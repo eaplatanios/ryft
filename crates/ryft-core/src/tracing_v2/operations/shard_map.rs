@@ -19,7 +19,7 @@ use crate::{
             FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
             ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap,
         },
-        sharding::ShardingSpecification,
+        sharding::Sharding,
     },
 };
 
@@ -487,29 +487,25 @@ fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<b
 
 /// Clones one sharding while replacing only its ranked dimensions.
 fn sharding_with_dimensions(
-    sharding: &crate::xla::sharding::ShardingSpecification,
+    sharding: &crate::xla::sharding::Sharding,
     dimensions: Vec<ShardingDimension>,
-) -> Option<crate::xla::sharding::ShardingSpecification> {
-    crate::xla::sharding::ShardingSpecification::new(
-        sharding.mesh().clone(),
-        dimensions,
-        sharding.unreduced_axes.clone(),
-    )
-    .map(|sharding| sharding.project_for_traced_sharding())
-    .ok()
+) -> Option<crate::xla::sharding::Sharding> {
+    crate::xla::sharding::Sharding::new(sharding.mesh().clone(), dimensions, sharding.unreduced_axes.clone())
+        .map(|sharding| sharding.project_for_traced_sharding())
+        .ok()
 }
 
 /// Returns whether one sharding is fully replicated over its ranked dimensions.
-fn is_replicated_sharding(sharding: &crate::xla::sharding::ShardingSpecification) -> bool {
+fn is_replicated_sharding(sharding: &crate::xla::sharding::Sharding) -> bool {
     sharding.dimensions.iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
 }
 
 /// Merges unreduced-axis sets from two shardings while preserving mesh validation.
 fn merge_sharding_axes(
-    left: &crate::xla::sharding::ShardingSpecification,
-    right: &crate::xla::sharding::ShardingSpecification,
-    sharding_specification: crate::xla::sharding::ShardingSpecification,
-) -> Option<crate::xla::sharding::ShardingSpecification> {
+    left: &crate::xla::sharding::Sharding,
+    right: &crate::xla::sharding::Sharding,
+    sharding: crate::xla::sharding::Sharding,
+) -> Option<crate::xla::sharding::Sharding> {
     let mut unreduced_axes = left.unreduced_axes.clone();
     for axis_name in &right.unreduced_axes {
         if !unreduced_axes.contains(axis_name) {
@@ -517,26 +513,18 @@ fn merge_sharding_axes(
         }
     }
 
-    crate::xla::sharding::ShardingSpecification::new(
-        left.mesh().clone(),
-        sharding_specification.dimensions,
-        unreduced_axes,
-    )
-    .map(|sharding| sharding.project_for_traced_sharding())
-    .ok()
+    crate::xla::sharding::Sharding::new(left.mesh().clone(), sharding.dimensions, unreduced_axes)
+        .map(|sharding| sharding.project_for_traced_sharding())
+        .ok()
 }
 
 /// Infers the output sharding of one sharding-preserving unary op.
-fn infer_unary_output_sharding(
-    input: &crate::xla::sharding::ShardingSpecification,
-) -> Option<crate::xla::sharding::ShardingSpecification> {
+fn infer_unary_output_sharding(input: &crate::xla::sharding::Sharding) -> Option<crate::xla::sharding::Sharding> {
     sharding_with_dimensions(input, input.dimensions.clone())
 }
 
 /// Infers the output sharding of one transpose op over a rank-2 tensor.
-fn infer_transpose_output_sharding(
-    input: &crate::xla::sharding::ShardingSpecification,
-) -> Option<crate::xla::sharding::ShardingSpecification> {
+fn infer_transpose_output_sharding(input: &crate::xla::sharding::Sharding) -> Option<crate::xla::sharding::Sharding> {
     if input.rank() != 2 {
         return None;
     }
@@ -547,9 +535,9 @@ fn infer_transpose_output_sharding(
 
 /// Infers the output sharding of one binary elementwise op.
 fn infer_binary_elementwise_output_sharding(
-    left: &crate::xla::sharding::ShardingSpecification,
-    right: &crate::xla::sharding::ShardingSpecification,
-) -> Option<crate::xla::sharding::ShardingSpecification> {
+    left: &crate::xla::sharding::Sharding,
+    right: &crate::xla::sharding::Sharding,
+) -> Option<crate::xla::sharding::Sharding> {
     if left == right {
         return Some(left.clone());
     }
@@ -564,9 +552,9 @@ fn infer_binary_elementwise_output_sharding(
 
 /// Infers the output sharding of one rank-2 matrix multiplication.
 fn infer_matmul_output_sharding(
-    left: &crate::xla::sharding::ShardingSpecification,
-    right: &crate::xla::sharding::ShardingSpecification,
-) -> Option<crate::xla::sharding::ShardingSpecification> {
+    left: &crate::xla::sharding::Sharding,
+    right: &crate::xla::sharding::Sharding,
+) -> Option<crate::xla::sharding::Sharding> {
     if left.rank() != 2 || right.rank() != 2 {
         return None;
     }
@@ -582,7 +570,7 @@ fn infer_matmul_output_sharding(
     merge_sharding_axes(
         left,
         right,
-        crate::xla::sharding::ShardingSpecification::new(
+        crate::xla::sharding::Sharding::new(
             left.mesh().clone(),
             vec![left_dimensions[0].clone(), right_dimensions[1].clone()],
             vec![],
@@ -592,9 +580,7 @@ fn infer_matmul_output_sharding(
 }
 
 /// Infers per-atom shardings for one simplified transpose body.
-fn infer_atom_shardings_for_transpose_body(
-    body: &FlatTracedShardMap,
-) -> Vec<Option<crate::xla::sharding::ShardingSpecification>> {
+fn infer_atom_shardings_for_transpose_body(body: &FlatTracedShardMap) -> Vec<Option<crate::xla::sharding::Sharding>> {
     let graph = body.compiled.graph();
     let equation_by_output = equation_by_output(graph);
     let mut atom_shardings = vec![None; graph.atom_count()];
@@ -1369,18 +1355,16 @@ fn trace_flat_shard_map<F, Input, Output>(
     function: F,
     global_input_types: Input,
     mesh: LogicalMesh,
-    in_specs: Input::To<ShardingSpecification>,
-    out_specs: Output::To<ShardingSpecification>,
+    in_specs: Input::To<Sharding>,
+    out_specs: Output::To<Sharding>,
 ) -> Result<FlatTracedShardMap, ShardMapTraceError>
 where
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<ShardingSpecification>
-        + ParameterizedFamily<ShardMapTensor>
-        + ParameterizedFamily<ShardMapTracer>,
+    Input::Family:
+        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<ShardingSpecification>
-        + ParameterizedFamily<ShardMapTensor>
-        + ParameterizedFamily<ShardMapTracer>,
+    Output::Family:
+        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
     F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
 {
     let shard_map = ShardMap::new(
@@ -1420,13 +1404,13 @@ where
     )?)
 }
 
-fn reparameterize_sharding_specifications<Source, Target>(
+fn reparameterize_shardings<Source, Target>(
     specs: Source,
     target_structure: Target::ParameterStructure,
 ) -> Result<Target, ShardMapTraceError>
 where
-    Source: Parameterized<ShardingSpecification>,
-    Target: Parameterized<ShardingSpecification>,
+    Source: Parameterized<Sharding>,
+    Target: Parameterized<Sharding>,
 {
     Ok(Target::from_parameters(target_structure, specs.into_parameters().collect::<Vec<_>>())?)
 }
@@ -1437,11 +1421,11 @@ impl ShardMapInvocationLeaf for ArrayType {
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ShardingSpecification>
+            + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output::Family: ParameterizedFamily<ShardingSpecification>
+        Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Linearized<ShardMapTracer>>;
@@ -1450,17 +1434,17 @@ impl ShardMapInvocationLeaf for ArrayType {
         function: F,
         inputs: Input,
         mesh: LogicalMesh,
-        in_specs: Input::To<ShardingSpecification>,
-        out_specs: Output::To<ShardingSpecification>,
+        in_specs: Input::To<Sharding>,
+        out_specs: Output::To<Sharding>,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ShardingSpecification>
+            + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output::Family: ParameterizedFamily<ShardingSpecification>
+        Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Linearized<ShardMapTracer>>,
@@ -1491,11 +1475,11 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ShardingSpecification>
+            + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output::Family: ParameterizedFamily<ShardingSpecification>
+        Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Linearized<ShardMapTracer>>;
@@ -1504,17 +1488,17 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
         function: F,
         inputs: Input,
         mesh: LogicalMesh,
-        in_specs: Input::To<ShardingSpecification>,
-        out_specs: Output::To<ShardingSpecification>,
+        in_specs: Input::To<Sharding>,
+        out_specs: Output::To<Sharding>,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ShardingSpecification>
+            + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output::Family: ParameterizedFamily<ShardingSpecification>
+        Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Linearized<ShardMapTracer>>,
@@ -1522,9 +1506,9 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
     {
         let output_structure = out_specs.parameter_structure();
         let global_input_types = global_input_types_from_traced_inputs(&inputs)?;
-        let global_in_specs = reparameterize_sharding_specifications::<
-            Input::To<ShardingSpecification>,
-            <Input::To<ArrayType> as Parameterized<ArrayType>>::To<ShardingSpecification>,
+        let global_in_specs = reparameterize_shardings::<
+            Input::To<Sharding>,
+            <Input::To<ArrayType> as Parameterized<ArrayType>>::To<Sharding>,
         >(in_specs, global_input_types.parameter_structure())?;
         let traced_inputs = inputs.into_parameters().collect::<Vec<_>>();
         let traced = trace_flat_shard_map::<F, Input::To<ArrayType>, Output>(
@@ -1544,11 +1528,11 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ShardingSpecification>
+            + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output::Family: ParameterizedFamily<ShardingSpecification>
+        Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Linearized<ShardMapTracer>>;
@@ -1557,17 +1541,17 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
         function: F,
         inputs: Input,
         mesh: LogicalMesh,
-        in_specs: Input::To<ShardingSpecification>,
-        out_specs: Output::To<ShardingSpecification>,
+        in_specs: Input::To<Sharding>,
+        out_specs: Output::To<Sharding>,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
-            + ParameterizedFamily<ShardingSpecification>
+            + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
         Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output::Family: ParameterizedFamily<ShardingSpecification>
+        Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
             + ParameterizedFamily<Linearized<ShardMapTracer>>,
@@ -1584,9 +1568,9 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
             input_structure,
             global_input_primals.parameters().map(Typed::tpe).collect::<Vec<_>>(),
         )?;
-        let global_in_specs = reparameterize_sharding_specifications::<
-            Input::To<ShardingSpecification>,
-            <Input::To<ArrayType> as Parameterized<ArrayType>>::To<ShardingSpecification>,
+        let global_in_specs = reparameterize_shardings::<
+            Input::To<Sharding>,
+            <Input::To<ArrayType> as Parameterized<ArrayType>>::To<Sharding>,
         >(in_specs, global_input_types.parameter_structure())?;
         let traced = trace_flat_shard_map::<F, Input::To<ArrayType>, Output>(
             function,

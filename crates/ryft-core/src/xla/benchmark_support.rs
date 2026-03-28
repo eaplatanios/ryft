@@ -18,7 +18,7 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, DataType, Shape, Size};
 
 use super::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer};
-use super::sharding::ShardingSpecification;
+use super::sharding::Sharding;
 use super::{TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -56,24 +56,20 @@ fn nested_inner_mesh() -> LogicalMesh {
     .unwrap()
 }
 
-/// Returns a one-dimensional sharded sharding specification.
-fn sharded_1d_sharding_specification(mesh: &LogicalMesh) -> ShardingSpecification {
-    ShardingSpecification::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap()
+/// Returns a one-dimensional sharding.
+fn sharded_1d_sharding(mesh: &LogicalMesh) -> Sharding {
+    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap()
 }
 
-/// Returns a two-dimensional row-sharded sharding specification.
-fn row_sharded_sharding_specification(mesh: &LogicalMesh) -> ShardingSpecification {
-    ShardingSpecification::new(
-        mesh.clone(),
-        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        vec![],
-    )
-    .unwrap()
+/// Returns a two-dimensional row-sharded sharding.
+fn row_sharded_sharding(mesh: &LogicalMesh) -> Sharding {
+    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![])
+        .unwrap()
 }
 
-/// Returns a two-dimensional replicated sharding specification.
-fn replicated_2d_sharding_specification(mesh: &LogicalMesh) -> ShardingSpecification {
-    ShardingSpecification::replicated(mesh.clone(), 2)
+/// Returns a two-dimensional replicated sharding.
+fn replicated_2d_sharding(mesh: &LogicalMesh) -> Sharding {
+    Sharding::replicated(mesh.clone(), 2)
 }
 
 /// Returns a rank-1 benchmark array type.
@@ -185,7 +181,7 @@ where
 /// Emits the basic traced `shard_map` benchmark.
 fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let mesh = benchmark_mesh();
-    let sharding_specification = sharded_1d_sharding_specification(&mesh);
+    let sharding = sharded_1d_sharding(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let mesh = mesh.clone();
@@ -194,8 +190,8 @@ fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
                     |local_x: ShardMapTracer| local_x.sin(),
                     x,
                     mesh.clone(),
-                    sharding_specification.clone(),
-                    sharding_specification.clone(),
+                    sharding.clone(),
+                    sharding.clone(),
                 )
                 .unwrap_or_else(|error| panic!("basic shard_map IR benchmark should trace: {error}"))
             }
@@ -208,9 +204,9 @@ fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 /// Emits the traced `shard_map` matrix-multiplication benchmark.
 fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let mesh = benchmark_mesh();
-    let lhs_spec = row_sharded_sharding_specification(&mesh);
-    let rhs_spec = replicated_2d_sharding_specification(&mesh);
-    let out_spec = row_sharded_sharding_specification(&mesh);
+    let lhs_spec = row_sharded_sharding(&mesh);
+    let rhs_spec = replicated_2d_sharding(&mesh);
+    let out_spec = row_sharded_sharding(&mesh);
     let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
         {
             let mesh = mesh.clone();
@@ -233,7 +229,7 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 /// Emits the traced reverse-mode-around-`shard_map` benchmark.
 fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let mesh = benchmark_mesh();
-    let sharding_specification = sharded_1d_sharding_specification(&mesh);
+    let sharding = sharded_1d_sharding(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let mesh = mesh.clone();
@@ -241,14 +237,14 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
                 grad(
                     {
                         let mesh = mesh.clone();
-                        let sharding_specification = sharding_specification.clone();
+                        let sharding = sharding.clone();
                         move |y: ShardMapTracer| {
                             shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                                 |local_x: ShardMapTracer| local_x.sin(),
                                 y,
                                 mesh.clone(),
-                                sharding_specification.clone(),
-                                sharding_specification.clone(),
+                                sharding.clone(),
+                                sharding.clone(),
                             )
                             .unwrap_or_else(|error| {
                                 panic!("grad-around-shard-map IR benchmark should trace the inner shard_map: {error}")
@@ -270,7 +266,7 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
 /// Emits the traced reverse-mode-inside-`shard_map` benchmark.
 fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let mesh = benchmark_mesh();
-    let sharding_specification = sharded_1d_sharding_specification(&mesh);
+    let sharding = sharded_1d_sharding(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let mesh = mesh.clone();
@@ -283,8 +279,8 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
                     },
                     x,
                     mesh.clone(),
-                    sharding_specification.clone(),
-                    sharding_specification.clone(),
+                    sharding.clone(),
+                    sharding.clone(),
                 )
                 .unwrap_or_else(|error| {
                     panic!("shard_map grad-inside IR benchmark should trace the shard_map: {error}")
@@ -300,9 +296,8 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
 fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let outer_mesh = nested_outer_mesh();
     let inner_mesh = nested_inner_mesh();
-    let outer_sharding_specification = sharded_1d_sharding_specification(&outer_mesh);
-    let inner_sharding_specification =
-        ShardingSpecification::new(inner_mesh.clone(), vec![ShardingDimension::sharded(["y"])], vec![]).unwrap();
+    let outer_sharding = sharded_1d_sharding(&outer_mesh);
+    let inner_sharding = Sharding::new(inner_mesh.clone(), vec![ShardingDimension::sharded(["y"])], vec![]).unwrap();
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let outer_mesh = outer_mesh.clone();
@@ -316,8 +311,8 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
                                 |inner_x: ShardMapTracer| inner_x.clone() + inner_x,
                                 outer_x.clone(),
                                 inner_mesh.clone(),
-                                inner_sharding_specification.clone(),
-                                inner_sharding_specification.clone(),
+                                inner_sharding.clone(),
+                                inner_sharding.clone(),
                             )
                             .unwrap_or_else(|error| {
                                 panic!("nested shard_map IR benchmark should trace the inner shard_map: {error}")
@@ -327,8 +322,8 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
                     },
                     x,
                     outer_mesh.clone(),
-                    outer_sharding_specification.clone(),
-                    outer_sharding_specification.clone(),
+                    outer_sharding.clone(),
+                    outer_sharding.clone(),
                 )
                 .unwrap_or_else(|error| {
                     panic!("nested shard_map IR benchmark should trace the outer shard_map: {error}")
@@ -343,7 +338,7 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 /// Emits the traced `shard_map` benchmark that composes reverse mode and batching inside the body.
 fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let mesh = benchmark_mesh();
-    let sharding_specification = sharded_1d_sharding_specification(&mesh);
+    let sharding = sharded_1d_sharding(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let mesh = mesh.clone();
@@ -364,8 +359,8 @@ fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, Benc
                     },
                     x,
                     mesh.clone(),
-                    sharding_specification.clone(),
-                    sharding_specification.clone(),
+                    sharding.clone(),
+                    sharding.clone(),
                 )
                 .unwrap_or_else(|error| panic!("shard_map grad+vmap IR benchmark should trace the shard_map: {error}"))
             }

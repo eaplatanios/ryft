@@ -1741,7 +1741,7 @@ mod tests {
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use crate::sharding::{LogicalMesh, ShardingDimension};
 
-    use super::super::sharding::ShardingSpecification;
+    use super::super::sharding::Sharding;
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -1779,8 +1779,8 @@ mod tests {
             |x| x.clone() + x,
             global_input_type,
             mesh.clone(),
-            ShardingSpecification::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
-            ShardingSpecification::new(mesh, vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
         )
         .unwrap();
 
@@ -1813,18 +1813,14 @@ mod tests {
             },
             global_input_type,
             mesh.clone(),
-            ShardingSpecification::new(
+            Sharding::new(
                 mesh.clone(),
                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
                 vec![],
             )
             .unwrap(),
-            ShardingSpecification::new(
-                mesh,
-                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                vec![],
-            )
-            .unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![])
+                .unwrap(),
         )
         .unwrap();
 

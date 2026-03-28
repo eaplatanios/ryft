@@ -22,10 +22,9 @@ use crate::types::data_types::{DataType, DataTypeError};
 
 use crate::sharding::DeviceMesh;
 
-use super::sharding::{ShardDescriptor, ShardingLayout, ShardingSpecification};
+use super::sharding::{ShardDescriptor, Sharding, ShardingLayout};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
-// TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
 
 /// Error type for [`Array`] construction and execution-input preparation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -239,10 +238,10 @@ impl<'o> Array<'o> {
         global_shape: Vec<usize>,
         element_type: DataType,
         mesh: DeviceMesh,
-        sharding_specification: ShardingSpecification,
+        sharding: Sharding,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
-        let layout = ShardingLayout::new(global_shape, mesh, sharding_specification)?;
+        let layout = ShardingLayout::new(global_shape, mesh, sharding)?;
         Self::new(layout, element_type, addressable_buffers)
     }
 
@@ -309,7 +308,7 @@ impl<'o> Array<'o> {
     ///
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
-        self.layout.sharding_specification().to_shardy_tensor_sharding_attribute()
+        self.layout.sharding().to_shardy_tensor_sharding_attribute()
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].
@@ -441,7 +440,7 @@ mod tests {
 
     use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, ShardingDimension};
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::ShardingSpecification;
+    use crate::xla::sharding::Sharding;
 
     use super::*;
 
@@ -504,13 +503,13 @@ mod tests {
         )
         .unwrap();
 
-        let lhs_sharding_specification = ShardingSpecification::new(
+        let lhs_sharding = Sharding::new(
             mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             vec![],
         )
         .unwrap();
-        let rhs_sharding_specification = ShardingSpecification::replicated(mesh.logical_mesh.clone(), 2);
+        let rhs_sharding = Sharding::replicated(mesh.logical_mesh.clone(), 2);
 
         // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).
         // Row i is [i, i+1, i+2, i+3].
@@ -551,17 +550,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lhs_array = Array::from_sharding(
-            vec![8, 4],
-            DataType::F32,
-            mesh.clone(),
-            lhs_sharding_specification.clone(),
-            lhs_buffers,
-        )
-        .unwrap();
+        let lhs_array =
+            Array::from_sharding(vec![8, 4], DataType::F32, mesh.clone(), lhs_sharding.clone(), lhs_buffers).unwrap();
         let rhs_array =
-            Array::from_sharding(vec![4, 2], DataType::F32, mesh.clone(), rhs_sharding_specification, rhs_buffers)
-                .unwrap();
+            Array::from_sharding(vec![4, 2], DataType::F32, mesh.clone(), rhs_sharding, rhs_buffers).unwrap();
 
         assert_eq!(lhs_array.element_type(), DataType::F32);
         assert_eq!(rhs_array.element_type(), DataType::F32);

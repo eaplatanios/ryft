@@ -33,11 +33,11 @@ pub enum ShardingError {
     #[error("mesh mismatch; expected '{expected:?}' but got '{actual:?}'")]
     MeshMismatch { expected: LogicalMesh, actual: LogicalMesh },
 
-    #[error("sharding specification dimension #{dimension} has no axes")]
-    EmptyShardingSpecification { dimension: usize },
+    #[error("sharding dimension #{dimension} has no axes")]
+    EmptySharding { dimension: usize },
 
-    #[error("sharding specification rank ({sharding_rank}) does not match array rank ({array_rank})")]
-    ShardingSpecificationRankMismatch { sharding_rank: usize, array_rank: usize },
+    #[error("sharding rank ({sharding_rank}) does not match array rank ({array_rank})")]
+    ShardingRankMismatch { sharding_rank: usize, array_rank: usize },
 }
 
 /// [`MeshAxis`] type which controls sharding constraint propagation. Each axis in a [`LogicalMesh`] can be tagged with
