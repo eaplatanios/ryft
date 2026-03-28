@@ -22,7 +22,7 @@ use crate::types::data_types::{DataType, DataTypeError};
 
 use crate::sharding::DeviceMesh;
 
-use super::sharding::{PartitionSpec, ShardDescriptor, ShardingContext, ShardingLayout};
+use super::sharding::{ShardDescriptor, ShardingContext, ShardingLayout, ShardingSpecification};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -146,7 +146,7 @@ impl std::fmt::Debug for AddressableShard<'_> {
 /// - each addressable buffer is mapped to its global shard index.
 ///
 /// In JAX terminology, this is the runtime pairing of:
-/// - sharding metadata (mesh + partition spec), and
+/// - sharding metadata (mesh + sharding specification), and
 /// - addressable device buffers (the local portion of an IFRT array).
 pub struct Array<'o> {
     layout: ShardingLayout,
@@ -239,10 +239,10 @@ impl<'o> Array<'o> {
         global_shape: Vec<usize>,
         element_type: DataType,
         mesh: DeviceMesh,
-        partition_spec: PartitionSpec,
+        sharding_specification: ShardingSpecification,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
-        let layout = ShardingLayout::new(global_shape, mesh, partition_spec)?;
+        let layout = ShardingLayout::new(global_shape, mesh, sharding_specification)?;
         Self::new(layout, element_type, addressable_buffers)
     }
 
@@ -314,7 +314,7 @@ impl<'o> Array<'o> {
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
         let dim_shardings = self
             .layout
-            .partition_spec()
+            .sharding_specification()
             .to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding);
         format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}>")
     }
@@ -450,7 +450,7 @@ mod tests {
     use crate::sharding::{DeviceMesh, LogicalMesh};
     use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::{PartitionDimension, PartitionSpec};
+    use crate::xla::sharding::{ShardingDimension, ShardingSpecification};
 
     use super::*;
 
@@ -513,9 +513,9 @@ mod tests {
         )
         .unwrap();
 
-        let lhs_partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]);
-        let rhs_partition_spec = PartitionSpec::replicated(2);
+        let lhs_sharding_specification =
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
+        let rhs_sharding_specification = ShardingSpecification::replicated(2);
 
         // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).
         // Row i is [i, i+1, i+2, i+3].
@@ -556,11 +556,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lhs_array =
-            Array::from_sharding(vec![8, 4], DataType::F32, mesh.clone(), lhs_partition_spec.clone(), lhs_buffers)
-                .unwrap();
+        let lhs_array = Array::from_sharding(
+            vec![8, 4],
+            DataType::F32,
+            mesh.clone(),
+            lhs_sharding_specification.clone(),
+            lhs_buffers,
+        )
+        .unwrap();
         let rhs_array =
-            Array::from_sharding(vec![4, 2], DataType::F32, mesh.clone(), rhs_partition_spec, rhs_buffers).unwrap();
+            Array::from_sharding(vec![4, 2], DataType::F32, mesh.clone(), rhs_sharding_specification, rhs_buffers)
+                .unwrap();
 
         assert_eq!(lhs_array.element_type(), DataType::F32);
         assert_eq!(rhs_array.element_type(), DataType::F32);

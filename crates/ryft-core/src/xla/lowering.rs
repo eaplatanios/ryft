@@ -1743,7 +1743,7 @@ mod tests {
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use crate::sharding::LogicalMesh;
 
-    use super::super::sharding::{PartitionDimension, PartitionSpec};
+    use super::super::sharding::{ShardingDimension, ShardingSpecification};
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -1780,8 +1780,8 @@ mod tests {
             |x| x.clone() + x,
             global_input_type,
             test_manual_mesh("x", 4),
-            PartitionSpec::new(vec![PartitionDimension::sharded(["x"])]),
-            PartitionSpec::new(vec![PartitionDimension::sharded(["x"])]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])]),
         )
         .unwrap();
 
@@ -1813,8 +1813,8 @@ mod tests {
             },
             global_input_type,
             test_manual_mesh("x", 2),
-            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]),
-            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]),
         )
         .unwrap();
 
