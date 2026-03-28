@@ -11,15 +11,16 @@ use ryft_mlir::{
 };
 
 use crate::parameters::Parameterized;
+use crate::sharding::{MeshAxis, ShardingError};
 use crate::tracing_v2::{
     AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
     operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp},
 };
-use crate::types::{ArrayType, DataType, MeshAxis, Shape, Size, Typed};
+use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
 use super::LogicalMesh;
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
-use super::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardingContext, ShardingError};
+use super::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardingContext};
 
 /// Error type for StableHLO/Shardy lowering.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -1736,8 +1737,9 @@ mod tests {
     #[cfg(feature = "ndarray")]
     use ndarray::{Array2, arr2};
 
+    use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike};
-    use crate::types::{MeshAxis, MeshAxisType, Shape};
+    use crate::types::Shape;
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use super::super::sharding::{LogicalMesh, PartitionDimension, PartitionSpec};

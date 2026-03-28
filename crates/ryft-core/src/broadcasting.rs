@@ -6,7 +6,7 @@ use crate::{
     types::{ArrayType, DataType, Shape, Size},
 };
 
-/// Error returned by the operations supported by [`Broadcastable`] types.
+/// Represents broadcasting-related errors.
 #[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum BroadcastingError {
     #[error("cannot broadcast an empty collection of types")]

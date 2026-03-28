@@ -4,6 +4,7 @@
 //! higher-order `shard_map` operation.
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
+use crate::sharding::{MeshAxis, MeshAxisType};
 use crate::tracing_v2::{
     FloatExt, MatrixOps, OneLike, Program,
     benchmarking::{
@@ -14,7 +15,7 @@ use crate::tracing_v2::{
     operations::{LinearShardMapEvalMode, ShardMapOp},
     vmap,
 };
-use crate::types::{ArrayType, DataType, MeshAxis, MeshAxisType, Shape, Size};
+use crate::types::{ArrayType, DataType, Shape, Size};
 
 use super::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer};
 use super::sharding::{LogicalMesh, PartitionDimension, PartitionSpec};

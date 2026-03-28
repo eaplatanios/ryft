@@ -10,5 +10,5 @@ pub use shard_map::{ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_
 
 pub use sharding::{
     DeviceMesh, LogicalMesh, MeshDevice, NamedSharding, PartitionDimension, PartitionSpec, ShardDescriptor, ShardSlice,
-    ShardingContext, ShardingError, ShardingLayout,
+    ShardingContext, ShardingLayout,
 };

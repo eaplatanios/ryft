@@ -25,7 +25,7 @@
 //! lowers them to [`NamedSharding`] values.
 //!
 //! The shard-map implementation derives its manual axes from the mesh itself: every axis whose type is
-//! [`Manual`](crate::types::MeshAxisType::Manual) is treated as manual for the
+//! [`Manual`](crate::sharding::MeshAxisType::Manual) is treated as manual for the
 //! `sdy.manual_computation` region.
 //!
 //! This matters because the surrounding mesh still determines which axes are handled manually
@@ -60,15 +60,14 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::sharding::ShardingError;
 use crate::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
 };
 use crate::types::{ArrayType, Shape, Size, Typed};
 
 use super::lowering::LoweringError;
-use super::sharding::{
-    LogicalMesh, NamedSharding, PartitionDimension, PartitionSpec, SHARDY_MESH_SYMBOL_NAME, ShardingError,
-};
+use super::sharding::{LogicalMesh, NamedSharding, PartitionDimension, PartitionSpec, SHARDY_MESH_SYMBOL_NAME};
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -448,7 +447,7 @@ where
 /// function-first shape of JAX's `shard_map` while adapting it to Rust and `tracing_v2` by
 /// requiring explicit `global_input_types`.
 ///
-/// Mesh axes whose type is [`Manual`](crate::types::MeshAxisType::Manual) define the manual axes
+/// Mesh axes whose type is [`Manual`](crate::sharding::MeshAxisType::Manual) define the manual axes
 /// of the computation. Structured `in_specs` and `out_specs` follow the same `Parameterized`
 /// layout as the corresponding input and output types. The body closure receives only the traced
 /// local inputs, which lets common cases compile cleanly as `|x| ...` or `|(lhs, rhs)| ...`
@@ -522,7 +521,7 @@ where
 /// A `ShardMap` stores the mesh plus the validated per-input and per-output shardings.
 ///
 /// The manual axes are not stored separately; they are always derived from the mesh axes whose
-/// type is [`Manual`](crate::types::MeshAxisType::Manual).
+/// type is [`Manual`](crate::sharding::MeshAxisType::Manual).
 ///
 /// The public constructors accept [`PartitionSpec`] values because that is the natural
 /// JAX-facing surface. Internally, those partition specs are converted to [`NamedSharding`]
@@ -540,7 +539,7 @@ pub(crate) struct ShardMap {
 impl ShardMap {
     /// Creates a `ShardMap` whose manual axes are derived from the mesh.
     ///
-    /// Every mesh axis with type [`Manual`](crate::types::MeshAxisType::Manual) is treated as
+    /// Every mesh axis with type [`Manual`](crate::sharding::MeshAxisType::Manual) is treated as
     /// manual inside the body. The constructor returns [`ShardMapError::MeshHasNoManualAxes`] if
     /// the mesh contains no manual axes.
     ///
@@ -1363,9 +1362,9 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use super::*;
+    use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
     use crate::types::data_types::DataType;
-    use crate::types::{MeshAxis, MeshAxisType};
     use crate::xla::arrays::Array;
     use crate::xla::sharding::{DeviceMesh, MeshDevice, PartitionDimension, PartitionSpec, ShardingContext};
 

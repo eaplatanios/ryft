@@ -152,54 +152,9 @@ use std::ops::Range;
 
 use ryft_mlir::Context as MlirContext;
 use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, MeshAttributeRef, TensorShardingAttributeRef};
-use thiserror::Error;
 
 use crate::parameters::Parameter;
-use crate::types::{DeviceId, MeshAxis, MeshAxisType};
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-/// Error type for mesh/sharding definitions and shard layout construction.
-#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ShardingError {
-    /// Error returned when a mesh axis name is empty.
-    #[error("mesh axis names must be non-empty")]
-    EmptyMeshAxisName,
-
-    /// Error returned when mesh axis names are not unique.
-    #[error("mesh axis '{name}' appears more than once")]
-    DuplicateMeshAxisName { name: String },
-
-    /// Error returned when a mesh axis has an invalid size.
-    #[error("mesh axis '{name}' must have size > 0, but got {size}")]
-    InvalidMeshAxisSize { name: String, size: usize },
-
-    /// Error returned when device IDs in a mesh are not unique.
-    #[error("mesh device id {device_id} appears more than once")]
-    DuplicateMeshDeviceId { device_id: DeviceId },
-
-    /// Error returned when the number of mesh devices does not match the product of axis sizes.
-    #[error("mesh has {actual_device_count} device(s), but axis sizes imply {expected_device_count} device(s)")]
-    MeshDeviceCountMismatch { expected_device_count: usize, actual_device_count: usize },
-
-    /// Error returned when sharding metadata references a mesh axis that does not exist.
-    #[error("unknown mesh axis '{name}'")]
-    UnknownMeshAxisName { name: String },
-
-    /// Error returned when a partitioned dimension references no mesh axes.
-    #[error("partition specification dimension #{dimension} has an empty mesh-axis list")]
-    NoPartitionAxes { dimension: usize },
-
-    /// Error returned when a mesh axis appears more than once in the partition specification.
-    #[error("mesh axis '{name}' is used multiple times in the partition specification")]
-    DuplicatePartitionAxis { name: String },
-
-    /// Error returned when a partition specification rank does not match the array rank.
-    #[error("partition specification rank {partition_rank} does not match array rank {array_rank}")]
-    PartitionRankMismatch { partition_rank: usize, array_rank: usize },
-}
+use crate::sharding::{DeviceId, MeshAxis, MeshAxisType, ShardingError};
 
 /// Canonical symbol name used for emitted Shardy mesh declarations and references.
 pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
@@ -331,7 +286,7 @@ impl LogicalMesh {
                 return Err(ShardingError::EmptyMeshAxisName);
             }
             if axis.size == 0 {
-                return Err(ShardingError::InvalidMeshAxisSize { name: axis.name.clone(), size: axis.size });
+                return Err(ShardingError::EmptyMeshAxis { name: axis.name.clone() });
             }
             if axis_index_by_name.insert(axis.name.clone(), axis_index).is_some() {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
@@ -543,15 +498,15 @@ impl DeviceMesh {
         let expected_device_count = logical_mesh.device_count();
         if devices.len() != expected_device_count {
             return Err(ShardingError::MeshDeviceCountMismatch {
-                expected_device_count,
-                actual_device_count: devices.len(),
+                expected_count: expected_device_count,
+                actual_count: devices.len(),
             });
         }
 
         let mut device_index_by_id = HashMap::with_capacity(devices.len());
         for (device_index, device) in devices.iter().enumerate() {
             if device_index_by_id.insert(device.id, device_index).is_some() {
-                return Err(ShardingError::DuplicateMeshDeviceId { device_id: device.id });
+                return Err(ShardingError::DuplicateMeshDeviceId { id: device.id });
             }
         }
 
@@ -1285,7 +1240,7 @@ impl ShardingLayout {
         let partition_rank = partition_spec.rank();
         let array_rank = global_shape.len();
         if partition_rank != array_rank {
-            return Err(ShardingError::PartitionRankMismatch { partition_rank, array_rank });
+            return Err(ShardingError::PartitionSpecificationRankMismatch { partition_rank, array_rank });
         }
 
         let mut shards = Vec::with_capacity(mesh.device_count());
@@ -1400,7 +1355,7 @@ fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -
     for (dimension, partition_dimension) in partition_spec.dimensions().iter().enumerate() {
         if let PartitionDimension::Sharded(axis_names) = partition_dimension {
             if axis_names.is_empty() {
-                return Err(ShardingError::NoPartitionAxes { dimension });
+                return Err(ShardingError::EmptyPartitionSpecification { dimension });
             }
 
             let mut axes_in_dimension = HashSet::new();
@@ -1409,7 +1364,7 @@ fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -
                     return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
                 }
                 if !axes_in_dimension.insert(axis_name.clone()) || !used_axes.insert(axis_name.clone()) {
-                    return Err(ShardingError::DuplicatePartitionAxis { name: axis_name.clone() });
+                    return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
                 }
             }
         }
@@ -1545,7 +1500,7 @@ mod tests {
         assert!(matches!(MeshAxis::new("", 4, MeshAxisType::Auto), Err(ShardingError::EmptyMeshAxisName)));
         assert!(matches!(
             MeshAxis::new("x", 0, MeshAxisType::Auto),
-            Err(ShardingError::InvalidMeshAxisSize { name, size }) if name == "x" && size == 0,
+            Err(ShardingError::EmptyMeshAxis { name }) if name == "x",
         ));
 
         let axes = vec![
@@ -1562,7 +1517,7 @@ mod tests {
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(0, 0)];
         assert!(matches!(
             DeviceMesh::new(axes, devices),
-            Err(ShardingError::DuplicateMeshDeviceId { device_id }) if device_id == 0,
+            Err(ShardingError::DuplicateMeshDeviceId { id }) if id == 0,
         ));
     }
 
@@ -1641,13 +1596,13 @@ mod tests {
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("x")]);
         assert!(matches!(
             NamedSharding::new(mesh.clone(), duplicate_axis_partition),
-            Err(ShardingError::DuplicatePartitionAxis { name }) if name == "x",
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
         ));
 
         let empty_axis_partition = PartitionSpec::new(vec![PartitionDimension::Sharded(Vec::new())]);
         assert!(matches!(
             NamedSharding::new(mesh, empty_axis_partition),
-            Err(ShardingError::NoPartitionAxes { dimension }) if dimension == 0,
+            Err(ShardingError::EmptyPartitionSpecification { dimension }) if dimension == 0,
         ));
     }
 
@@ -1760,7 +1715,7 @@ mod tests {
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("y")]);
         assert!(matches!(
             ShardingLayout::new(vec![8usize], mesh, partition_spec),
-            Err(ShardingError::PartitionRankMismatch { partition_rank: 2, array_rank: 1 }),
+            Err(ShardingError::PartitionSpecificationRankMismatch { partition_rank: 2, array_rank: 1 }),
         ));
     }
 
