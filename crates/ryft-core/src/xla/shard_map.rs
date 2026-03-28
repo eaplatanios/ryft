@@ -62,14 +62,14 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::sharding::{LogicalMesh, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, ShardingError};
+use crate::sharding::{LogicalMesh, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, ShardingDimension, ShardingError};
 use crate::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
 };
 use crate::types::{ArrayType, Shape, Size, Typed};
 
 use super::lowering::LoweringError;
-use super::sharding::{NamedSharding, ShardingDimension, ShardingSpecification};
+use super::sharding::{NamedSharding, ShardingSpecification};
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -1044,7 +1044,7 @@ fn global_shape_for_sharding(
                             ),
                         })
                     })?,
-                ShardingDimension::Unsharded | ShardingDimension::Unconstrained => 1,
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => 1,
             };
 
             local_dimension_size
@@ -1166,7 +1166,7 @@ fn local_shape_for_sharding(
                         .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.clone() })?;
                     Ok(partition_count * axis_size)
                 })?,
-            ShardingDimension::Unsharded | ShardingDimension::Unconstrained => 1,
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => 1,
         };
 
         if dimension_size % manual_partition_count != 0 {
@@ -1256,7 +1256,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
         .dimensions
         .iter()
         .map(|partition_dimension| match partition_dimension {
-            ShardingDimension::Unsharded => context.shardy_dimension_sharding(&[], !has_unused_free_axes, None),
+            ShardingDimension::Replicated => context.shardy_dimension_sharding(&[], !has_unused_free_axes, None),
             ShardingDimension::Sharded(axis_names) => {
                 let axes =
                     axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)).collect::<Vec<_>>();
@@ -1329,7 +1329,7 @@ fn render_manual_computation_dimensions(mesh: &LogicalMesh, sharding_specificati
         }
 
         match partition_dimension {
-            ShardingDimension::Unsharded => {
+            ShardingDimension::Replicated => {
                 if has_unused_free_axes {
                     result.push_str("{?}");
                 } else {
@@ -1392,11 +1392,12 @@ mod tests {
     use super::*;
     use crate::sharding::DeviceMesh;
     use crate::sharding::MeshDevice;
+    use crate::sharding::ShardingDimension;
     use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
     use crate::types::data_types::DataType;
     use crate::xla::arrays::Array;
-    use crate::xla::sharding::{ShardingDimension, ShardingSpecification};
+    use crate::xla::sharding::ShardingSpecification;
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
@@ -1561,7 +1562,7 @@ mod tests {
             Vec::new(),
             vec![ShardingSpecification::new(vec![
                 ShardingDimension::sharded(["data"]),
-                ShardingDimension::unsharded(),
+                ShardingDimension::replicated(),
             ])],
         )
         .unwrap();
@@ -1650,7 +1651,7 @@ mod tests {
             ])
             .unwrap(),
             Vec::new(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::unsharded()])],
+            vec![ShardingSpecification::new(vec![ShardingDimension::replicated()])],
         )
         .unwrap();
 
@@ -1964,10 +1965,10 @@ mod tests {
         .unwrap();
 
         let lhs_sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
         let rhs_sharding_specification = ShardingSpecification::replicated(2);
         let output_sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
         let global_input_types = (
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None),
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None),

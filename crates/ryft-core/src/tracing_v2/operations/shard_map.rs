@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     parameters::{Parameterized, ParameterizedFamily},
-    sharding::LogicalMesh,
+    sharding::{LogicalMesh, ShardingDimension},
     tracing_v2::{
         AtomId, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op, ProgramBuilder,
         TraceError, TraceValue, ZeroLike,
@@ -504,7 +504,7 @@ fn is_replicated_sharding(sharding: &crate::xla::sharding::NamedSharding) -> boo
         .sharding_specification()
         .dimensions
         .iter()
-        .all(|dimension| matches!(dimension, crate::xla::sharding::ShardingDimension::Unsharded))
+        .all(|dimension| matches!(dimension, ShardingDimension::Replicated))
 }
 
 /// Merges unreduced-axis sets from two shardings while preserving mesh validation.
@@ -578,8 +578,8 @@ fn infer_matmul_output_sharding(
 
     let left_dimensions = &left.sharding_specification().dimensions;
     let right_dimensions = &right.sharding_specification().dimensions;
-    if !matches!(left_dimensions[1], crate::xla::sharding::ShardingDimension::Unsharded)
-        || !matches!(right_dimensions[0], crate::xla::sharding::ShardingDimension::Unsharded)
+    if !matches!(left_dimensions[1], ShardingDimension::Replicated)
+        || !matches!(right_dimensions[0], ShardingDimension::Replicated)
     {
         return None;
     }

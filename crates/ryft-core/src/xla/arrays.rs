@@ -441,11 +441,9 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::sharding::MeshDevice;
-    use crate::sharding::{DeviceMesh, LogicalMesh};
-    use crate::sharding::{MeshAxis, MeshAxisType};
+    use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, ShardingDimension};
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::{ShardingDimension, ShardingSpecification};
+    use crate::xla::sharding::ShardingSpecification;
 
     use super::*;
 
@@ -509,7 +507,7 @@ mod tests {
         .unwrap();
 
         let lhs_sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
         let rhs_sharding_specification = ShardingSpecification::replicated(2);
 
         // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).

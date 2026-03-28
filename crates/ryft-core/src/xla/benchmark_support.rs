@@ -4,7 +4,7 @@
 //! higher-order `shard_map` operation.
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType};
+use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
 use crate::tracing_v2::{
     FloatExt, MatrixOps, OneLike, Program,
     benchmarking::{
@@ -18,7 +18,7 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, DataType, Shape, Size};
 
 use super::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer};
-use super::sharding::{ShardingDimension, ShardingSpecification};
+use super::sharding::ShardingSpecification;
 use super::{TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -63,7 +63,7 @@ fn sharded_1d_sharding_specification() -> ShardingSpecification {
 
 /// Returns a two-dimensional row-sharded sharding specification.
 fn row_sharded_sharding_specification() -> ShardingSpecification {
-    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()])
+    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
 }
 
 /// Returns a two-dimensional replicated sharding specification.

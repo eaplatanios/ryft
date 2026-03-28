@@ -327,6 +327,42 @@ impl DeviceMesh {
     }
 }
 
+/// Describes how a single dimension of an array/tensor is distributed across [`LogicalMesh`] axes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ShardingDimension {
+    /// Dimension that is replicated across the devices in a mesh instead of being sharded/partitioned.
+    Replicated,
+
+    /// Dimension that is sharded/partitioned by the mesh axes with the specified names. The dimension is sharded along
+    /// the product of the specified axes, in major to minor order. For example, with a `4x2` mesh with `"data"` and
+    /// `"model"` axes and `Sharded(["data", "model"])`, a dimension of size `24` is split into `4 * 2 = 8` partitions.
+    Sharded(Vec<String>),
+
+    /// Dimension that is unconstrained when it comes to sharding, meaning that the compiler is free to decide
+    /// if and how to shard it.
+    Unconstrained,
+}
+
+impl ShardingDimension {
+    /// Creates a new [`Self::Replicated`].
+    #[inline]
+    pub fn replicated() -> Self {
+        Self::Replicated
+    }
+
+    /// Creates a new [`Self::Sharded`].
+    #[inline]
+    pub fn sharded<N: Into<String>, I: IntoIterator<Item = N>>(axis_names: I) -> Self {
+        Self::Sharded(axis_names.into_iter().map(Into::into).collect())
+    }
+
+    /// Creates a new [`Self::Unconstrained`].
+    #[inline]
+    pub fn unconstrained() -> Self {
+        Self::Unconstrained
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

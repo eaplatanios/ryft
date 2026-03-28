@@ -1739,9 +1739,9 @@ mod tests {
     use crate::types::Shape;
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
-    use crate::sharding::LogicalMesh;
+    use crate::sharding::{LogicalMesh, ShardingDimension};
 
-    use super::super::sharding::{ShardingDimension, ShardingSpecification};
+    use super::super::sharding::ShardingSpecification;
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -1811,8 +1811,8 @@ mod tests {
             },
             global_input_type,
             test_manual_mesh("x", 2),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]),
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]),
         )
         .unwrap();
 

@@ -37,7 +37,7 @@
 //! # Generic vs specialized Shardy lowering
 //!
 //! The generic [`ShardingSpecification`] and [`NamedSharding`] renderers emit fully explicit
-//! Shardy shardings, where unsharded dimensions are closed (`{}`). Specialized lowering sites
+//! Shardy shardings, where replicated dimensions are closed (`{}`). Specialized lowering sites
 //! such as `shard_map` can still compute open dimensions (`{?}`) when that is required by
 //! Shardy's manual-computation semantics.
 //!
@@ -73,7 +73,7 @@
 //!    // JAX equivalent: PartitionSpec('data', None)
 //!    let spec = ShardingSpecification::new(vec![
 //!        ShardingDimension::sharded(["data"]),
-//!        ShardingDimension::unsharded(),
+//!        ShardingDimension::replicated(),
 //!    ]);
 //!
 //!    // Shard dim 0 along both "data" and "model" axes.
@@ -158,97 +158,13 @@ use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, TensorShardingA
 
 use crate::parameters::Parameter;
 use crate::sharding::{
-    DeviceMesh, LogicalMesh, MeshAxisType, MeshDevice, MeshDeviceId, SHARDY_MESH_SYMBOL_NAME, ShardingError,
+    DeviceMesh, LogicalMesh, MeshAxisType, MeshDevice, MeshDeviceId, SHARDY_MESH_SYMBOL_NAME, ShardingDimension,
+    ShardingError,
 };
 
 // ---------------------------------------------------------------------------
 // Sharding specification
 // ---------------------------------------------------------------------------
-
-/// Sharding assignment for one logical array dimension.
-///
-/// Each element of a [`ShardingSpecification`] is a `ShardingDimension` describing how the
-/// corresponding tensor dimension is distributed across mesh axes.
-///
-/// # JAX equivalent
-///
-/// This is equivalent to one entry in JAX's [`PartitionSpec`][jax-pspec]:
-///
-/// | JAX `PartitionSpec` element   | `ShardingDimension`                                   |
-/// | ----------------------------- | ------------------------------------------------------ |
-/// | `None`                        | [`Unsharded`][ShardingDimension::Unsharded]           |
-/// | `'axis_name'`                 | [`sharded(["axis_name"])`][ShardingDimension::sharded] |
-/// | `('axis_a', 'axis_b')`        | [`sharded(["axis_a", "axis_b"])`][ShardingDimension::sharded] |
-/// | `PartitionSpec.UNCONSTRAINED` | [`Unconstrained`][ShardingDimension::Unconstrained]   |
-///
-/// [jax-pspec]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec
-///
-/// When multiple mesh axes are listed (the `Sharded` variant), the dimension is sharded
-/// along their product, major to minor. For example, with a 4x2 mesh and
-/// `Sharded(["data", "model"])`, a dimension of size 24 is split into `4 * 2 = 8`
-/// partitions.
-///
-/// # Shardy representation
-///
-/// Each `ShardingDimension` maps to a [`DimensionShardingAttr`][sdy-dim] in the generic
-/// Shardy lowering:
-///
-/// | `ShardingDimension`   | Generic rendering      |
-/// | --------------------- | ---------------------- |
-/// | `Unsharded`           | `{}` (closed)          |
-/// | `Sharded(["x"])`      | `{"x"}` (closed)       |
-/// | `Sharded(["x", "y"])` | `{"x", "y"}` (closed) |
-/// | `Unconstrained`       | `{?}` (open)          |
-///
-/// [sdy-dim]: https://openxla.org/shardy/sharding_representation
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ShardingDimension {
-    /// Dimension is replicated / unpartitioned.
-    ///
-    /// Equivalent to `None` in JAX's `PartitionSpec`. The entire extent of this dimension is
-    /// present on every device (with respect to this dimension; other dimensions may still
-    /// shard the tensor).
-    Unsharded,
-
-    /// Dimension is partitioned by the provided mesh axis names from major to minor.
-    ///
-    /// Equivalent to a single axis name `'x'` (when `len == 1`) or a tuple of axis names
-    /// `('x', 'y')` (when `len > 1`) in JAX's `PartitionSpec`. The total number of
-    /// partitions along this dimension equals the product of the referenced axis sizes.
-    Sharded(Vec<String>),
-
-    /// Dimension is unconstrained - the Shardy propagator is free to decide how to shard it.
-    ///
-    /// Equivalent to `PartitionSpec.UNCONSTRAINED` in JAX. This is primarily meaningful in
-    /// constraint annotations. When used in a [`ShardingLayout`], it is ignored for concrete
-    /// slice computation and therefore behaves like a full-range dimension for shard metadata.
-    Unconstrained,
-}
-
-impl ShardingDimension {
-    /// Creates an unsharded sharding dimension.
-    ///
-    /// Equivalent to `None` in JAX's `PartitionSpec`.
-    pub fn unsharded() -> Self {
-        Self::Unsharded
-    }
-
-    /// Creates a sharded dimension using one or more mesh axes, from major to minor.
-    ///
-    /// Equivalent to `'axis_name'` in JAX's `PartitionSpec` when exactly one axis name is
-    /// provided, or to `('axis_a', 'axis_b')` when multiple axis names are provided. The
-    /// dimension is split along the product of the referenced axis sizes.
-    pub fn sharded<N: Into<String>, I: IntoIterator<Item = N>>(axis_names: I) -> Self {
-        Self::Sharded(axis_names.into_iter().map(Into::into).collect())
-    }
-
-    /// Creates an unconstrained sharding dimension.
-    ///
-    /// Equivalent to `PartitionSpec.UNCONSTRAINED` in JAX.
-    pub fn unconstrained() -> Self {
-        Self::Unconstrained
-    }
-}
 
 /// Sharding specification for all logical array dimensions.
 ///
@@ -261,11 +177,11 @@ impl ShardingDimension {
 ///
 /// | JAX                     | Ryft                                           |
 /// | ----------------------- | ---------------------------------------------- |
-/// | `P('data', None)`       | `new(vec![sharded(["data"]), unsharded()])`      |
+/// | `P('data', None)`       | `new(vec![sharded(["data"]), replicated()])`     |
 /// | `P('data', 'model')`    | `new(vec![sharded(["data"]), sharded(["model"])])` |
-/// | `P(('data', 'model'),)` | `new(vec![sharded(["data", "model"])])`          |
-/// | `P()` (replicated)      | `replicated(2)`                                |
-/// | `P(UNCONSTRAINED)`      | `new(vec![unconstrained()])`                   |
+/// | `P(('data', 'model'),)` | `new(vec![sharded(["data", "model"])])`            |
+/// | `P()` (replicated)      | `replicated(2)`                                   |
+/// | `P(UNCONSTRAINED)`      | `new(vec![unconstrained()])`                      |
 ///
 /// [jax-pspec]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec
 ///
@@ -282,7 +198,7 @@ impl ShardingDimension {
 /// ```ignore
 /// let spec = ShardingSpecification::new(vec![
 ///     ShardingDimension::sharded(["data"]),
-///     ShardingDimension::unsharded(),
+///     ShardingDimension::replicated(),
 /// ])
 /// .with_unreduced_axes(["model"]);
 ///
@@ -322,11 +238,11 @@ impl ShardingSpecification {
 
     /// Creates a fully replicated specification for an array with rank `rank`.
     ///
-    /// All dimensions are [`Unsharded`][ShardingDimension::Unsharded], meaning the full
+    /// All dimensions are [`Replicated`][ShardingDimension::Replicated], meaning the full
     /// tensor is present on every device. Equivalent to `ShardingSpecification()` in JAX (padded
     /// to the tensor rank with `None`).
     pub fn replicated(rank: usize) -> Self {
-        Self { dimensions: vec![ShardingDimension::Unsharded; rank], unreduced_axes: Vec::new() }
+        Self { dimensions: vec![ShardingDimension::Replicated; rank], unreduced_axes: Vec::new() }
     }
 
     /// Returns a copy of this sharding specification with explicit unreduced axes attached.
@@ -352,13 +268,13 @@ impl ShardingSpecification {
     /// Projects this sharding specification into the traced/type-level sharding view of `mesh`.
     ///
     /// `Auto` mesh axes are hidden from traced shardings, so any dimension sharded only by auto
-    /// axes becomes [`Unsharded`](ShardingDimension::Unsharded) in the projected view.
+    /// axes becomes [`Replicated`](ShardingDimension::Replicated) in the projected view.
     fn project_for_traced_sharding(&self, mesh: &LogicalMesh) -> Self {
         let dimensions = self
             .dimensions
             .iter()
             .map(|dimension| match dimension {
-                ShardingDimension::Unsharded => ShardingDimension::Unsharded,
+                ShardingDimension::Replicated => ShardingDimension::Replicated,
                 ShardingDimension::Unconstrained => ShardingDimension::Unconstrained,
                 ShardingDimension::Sharded(axis_names) => {
                     let visible_axis_names = axis_names
@@ -369,7 +285,7 @@ impl ShardingSpecification {
                         .cloned()
                         .collect::<Vec<_>>();
                     if visible_axis_names.is_empty() {
-                        ShardingDimension::Unsharded
+                        ShardingDimension::Replicated
                     } else {
                         ShardingDimension::Sharded(visible_axis_names)
                     }
@@ -395,7 +311,7 @@ impl ShardingSpecification {
         self.dimensions
             .iter()
             .map(|dimension| match dimension {
-                ShardingDimension::Unsharded => context.shardy_dimension_sharding(&[], true, None),
+                ShardingDimension::Replicated => context.shardy_dimension_sharding(&[], true, None),
                 ShardingDimension::Sharded(axis_names) => {
                     let axes =
                         axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)).collect::<Vec<_>>();
@@ -428,7 +344,7 @@ impl ShardingSpecification {
 /// // Ryft:
 /// let sharding = NamedSharding::new(logical_mesh, ShardingSpecification::new(vec![
 ///     ShardingDimension::sharded(["data"]),
-///     ShardingDimension::unsharded(),
+///     ShardingDimension::replicated(),
 /// ]))?;
 /// ```
 ///
@@ -572,7 +488,7 @@ impl NamedSharding {
 /// holds. This is analogous to one element of the index tuple in JAX's `Shard.index`, which
 /// uses Python `slice` objects (e.g., `slice(0, 4)`).
 ///
-/// For an unsharded dimension, the slice spans the full extent `[0, dim_size)`. For a sharded
+/// For a replicated dimension, the slice spans the full extent `[0, dim_size)`. For a sharded
 /// dimension, the slice covers the partition assigned to a specific device based on its mesh
 /// coordinate.
 pub type ShardSlice = Range<usize>;
@@ -709,7 +625,7 @@ impl ShardingLayout {
             let mut shape = Vec::with_capacity(global_shape.len());
             for (dimension, dimension_size) in global_shape.iter().copied().enumerate() {
                 let slice = match &sharding_specification.dimensions[dimension] {
-                    ShardingDimension::Unsharded => 0..dimension_size,
+                    ShardingDimension::Replicated => 0..dimension_size,
                     ShardingDimension::Sharded(axis_names) => {
                         let mut partition_index = 0usize;
                         let mut partition_count = 1usize;
@@ -877,14 +793,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ShardingDimension / ShardingSpecification tests
+    // ShardingSpecification tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_partition_dimension_unconstrained() {
-        let dim = ShardingDimension::unconstrained();
-        assert!(matches!(dim, ShardingDimension::Unconstrained));
-    }
 
     #[test]
     fn test_sharding_specification_project_for_traced_sharding_hides_auto_axes() {
@@ -897,7 +807,7 @@ mod tests {
         let spec = ShardingSpecification::new(vec![
             ShardingDimension::sharded(["data", "model", "batch"]),
             ShardingDimension::sharded(["model"]),
-            ShardingDimension::unsharded(),
+            ShardingDimension::replicated(),
         ])
         .with_unreduced_axes(["model", "batch"]);
 
@@ -905,8 +815,8 @@ mod tests {
             spec.project_for_traced_sharding(&mesh),
             ShardingSpecification::new(vec![
                 ShardingDimension::sharded(["data", "batch"]),
-                ShardingDimension::unsharded(),
-                ShardingDimension::unsharded(),
+                ShardingDimension::replicated(),
+                ShardingDimension::replicated(),
             ])
             .with_unreduced_axes(["batch"])
         );
@@ -944,7 +854,7 @@ mod tests {
     fn test_named_sharding_shardy_rendering() {
         let mesh = test_logical_mesh_2x2();
         let sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
         let sharding = NamedSharding::new(mesh, sharding_specification).unwrap();
         assert_eq!(sharding.to_shardy_tensor_sharding_attribute(), "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
     }
@@ -957,7 +867,7 @@ mod tests {
         ])
         .unwrap();
         let sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
         let sharding = NamedSharding::new(mesh, sharding_specification).unwrap();
 
         assert_eq!(sharding.replicated_axes(), vec!["y"]);
@@ -971,7 +881,7 @@ mod tests {
     fn test_named_sharding_unreduced_axes() {
         let mesh = test_logical_mesh_2x2();
         let sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()])
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .with_unreduced_axes(["y"]);
         let sharding = NamedSharding::new(mesh, sharding_specification).unwrap();
         assert_eq!(
@@ -1154,7 +1064,7 @@ mod tests {
     fn test_sharding_layout_mesh_and_sharding_specification_accessors() {
         let mesh = test_device_mesh_2x2();
         let sharding_specification =
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]);
         let layout = ShardingLayout::new(vec![8, 6], mesh.clone(), sharding_specification.clone()).unwrap();
 
         assert_eq!(layout.mesh(), &mesh);
