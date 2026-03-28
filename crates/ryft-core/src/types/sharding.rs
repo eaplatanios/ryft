@@ -22,7 +22,7 @@ pub enum MeshAxisType {
 
     // TODO(eaplatanios): Link to the `shard_map` operation once we have it.
     /// Used for mesh axes for which the user manages all device communication explicitly
-    /// (e.g., using an operation like `shard_map`, which is analogous to
+    /// (e.g., using an operation like `shard_map` which is analogous to
     /// [JAX's `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
     Manual,
 }

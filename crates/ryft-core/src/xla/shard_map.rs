@@ -1025,7 +1025,7 @@ fn global_shape_for_sharding(
                     .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                     .try_fold(1usize, |partition_count, axis_name| {
                         let axis_size = mesh.axis_size(axis_name).ok_or_else(|| {
-                            ShardMapTraceError::ShardingError(ShardingError::UnknownMeshAxis {
+                            ShardMapTraceError::ShardingError(ShardingError::UnknownMeshAxisName {
                                 name: axis_name.clone(),
                             })
                         })?;
@@ -1110,6 +1110,9 @@ fn used_axes_in_partition_spec(partition_spec: &PartitionSpec) -> HashSet<&str> 
             }
         }
     }
+    for axis_name in partition_spec.unreduced_axes() {
+        used_axes.insert(axis_name.as_str());
+    }
     used_axes
 }
 
@@ -1142,7 +1145,7 @@ fn local_shape_for_sharding(
                     let axis_size = sharding
                         .mesh()
                         .axis_size(axis_name)
-                        .ok_or_else(|| ShardingError::UnknownMeshAxis { name: axis_name.clone() })?;
+                        .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.clone() })?;
                     Ok(partition_count * axis_size)
                 })?,
             PartitionDimension::Unsharded | PartitionDimension::Unconstrained => 1,
@@ -1193,12 +1196,13 @@ fn manual_computation_tensor_sharding<'c, 't>(
 ) -> TensorShardingAttributeRef<'c, 't> {
     let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
     let dim_shardings = manual_computation_dimension_shardings(sharding.mesh(), sharding.partition_spec(), context);
-    let replicated_axes = sharding
-        .replicated_axes()
+    let replicated_axis_names = sharding.replicated_axes();
+    let replicated_axes = replicated_axis_names
         .iter()
         .map(|axis_name| context.shardy_axis_ref(axis_name, None))
         .collect::<Vec<_>>();
     let unreduced_axes = sharding
+        .partition_spec()
         .unreduced_axes()
         .iter()
         .map(|axis_name| context.shardy_axis_ref(axis_name, None))
@@ -1249,9 +1253,10 @@ fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
         render_manual_computation_dimensions(sharding.mesh(), sharding.partition_spec())
     );
 
-    if !sharding.replicated_axes().is_empty() {
+    let replicated_axes = sharding.replicated_axes();
+    if !replicated_axes.is_empty() {
         result.push_str(", replicated={");
-        for (axis_index, axis_name) in sharding.replicated_axes().iter().enumerate() {
+        for (axis_index, axis_name) in replicated_axes.iter().enumerate() {
             if axis_index > 0 {
                 result.push_str(", ");
             }
@@ -1262,9 +1267,9 @@ fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
         result.push('}');
     }
 
-    if !sharding.unreduced_axes().is_empty() {
+    if !sharding.partition_spec().unreduced_axes().is_empty() {
         result.push_str(", unreduced={");
-        for (axis_index, axis_name) in sharding.unreduced_axes().iter().enumerate() {
+        for (axis_index, axis_name) in sharding.partition_spec().unreduced_axes().iter().enumerate() {
             if axis_index > 0 {
                 result.push_str(", ");
             }
@@ -1458,8 +1463,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(shard_map.manual_axes(), vec!["x", "y"]);
-        assert!(shard_map.in_shardings()[0].replicated_axes().is_empty());
-        assert!(shard_map.out_shardings()[0].replicated_axes().is_empty());
+        assert_eq!(shard_map.in_shardings()[0].replicated_axes(), vec!["y"]);
+        assert_eq!(shard_map.out_shardings()[0].replicated_axes(), vec!["y"]);
     }
 
     #[test]
@@ -1577,7 +1582,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(shard_map.to_shardy_in_shardings_attribute(), r#"[<@mesh, [{"x"}]>]"#);
+        assert_eq!(shard_map.to_shardy_in_shardings_attribute(), r#"[<@mesh, [{"x"}], replicated={"y"}>]"#);
     }
 
     #[test]
@@ -1617,7 +1622,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(shard_map.to_shardy_out_shardings_attribute(), r#"[<@mesh, [{?}]>]"#);
+        assert_eq!(shard_map.to_shardy_out_shardings_attribute(), r#"[<@mesh, [{?}], replicated={"x"}>]"#);
     }
 
     #[test]
@@ -1944,8 +1949,8 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=8]>
-                  func.func @main(%arg0: tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}, %arg1: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) -> (tensor<8x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
-                    %0 = sdy.manual_computation(%arg0, %arg1) in_shardings=[<@mesh, [{"x"}, {}]>, <@mesh, [{}, {}]>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg2: tensor<1x4xf32>, %arg3: tensor<4x2xf32>) {
+                  func.func @main(%arg0: tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}, %arg1: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={"x"}>}) -> (tensor<8x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1) in_shardings=[<@mesh, [{"x"}, {}]>, <@mesh, [{}, {}], replicated={"x"}>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg2: tensor<1x4xf32>, %arg3: tensor<4x2xf32>) {
                       %1 = stablehlo.dot_general %arg2, %arg3, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<1x4xf32>, tensor<4x2xf32>) -> tensor<1x2xf32>
                       sdy.return %1 : tensor<1x2xf32>
                     } : (tensor<8x4xf32>, tensor<4x2xf32>) -> tensor<8x2xf32>

@@ -184,13 +184,13 @@ pub enum ShardingError {
     #[error("mesh has {actual_device_count} device(s), but axis sizes imply {expected_device_count} device(s)")]
     MeshDeviceCountMismatch { expected_device_count: usize, actual_device_count: usize },
 
-    /// Error returned when partitioning references a mesh axis that does not exist.
-    #[error("partitioning references unknown mesh axis '{name}'")]
-    UnknownMeshAxis { name: String },
+    /// Error returned when sharding metadata references a mesh axis that does not exist.
+    #[error("unknown mesh axis '{name}'")]
+    UnknownMeshAxisName { name: String },
 
     /// Error returned when a partitioned dimension references no mesh axes.
     #[error("partition specification dimension #{dimension} has an empty mesh-axis list")]
-    EmptyPartitionAxisList { dimension: usize },
+    NoPartitionAxes { dimension: usize },
 
     /// Error returned when a mesh axis appears more than once in the partition specification.
     #[error("mesh axis '{name}' is used multiple times in the partition specification")]
@@ -199,27 +199,6 @@ pub enum ShardingError {
     /// Error returned when a partition specification rank does not match the array rank.
     #[error("partition specification rank {partition_rank} does not match array rank {array_rank}")]
     PartitionRankMismatch { partition_rank: usize, array_rank: usize },
-
-    /// Error returned when computing partition slices with an invalid partition count.
-    #[error("partition count must be > 0, but got {count}")]
-    InvalidPartitionCount { count: usize },
-
-    /// Error returned when a partition index is out of range.
-    #[error("partition index {partition_index} is out of range for partition count {partition_count}")]
-    InvalidPartitionIndex { partition_index: usize, partition_count: usize },
-
-    /// Error returned when a replicated/unreduced axis in a [`NamedSharding`] does not exist in the mesh.
-    #[error("replicated/unreduced axis '{name}' does not exist in the mesh")]
-    UnknownExtraAxis { name: String },
-
-    /// Error returned when a replicated/unreduced axis in a [`NamedSharding`] is already used
-    /// in the partition specification.
-    #[error("replicated/unreduced axis '{name}' is already used in the partition specification")]
-    ExtraAxisConflictsWithPartition { name: String },
-
-    /// Error returned when the same axis appears in both the replicated and unreduced sets.
-    #[error("axis '{name}' appears in both replicated and unreduced sets")]
-    AxisInBothReplicatedAndUnreduced { name: String },
 }
 
 /// Canonical symbol name used for emitted Shardy mesh declarations and references.
@@ -806,7 +785,7 @@ impl PartitionDimension {
 /// Partition specification for all logical array dimensions.
 ///
 /// A sequence of per-dimension [`PartitionDimension`] entries describing how a tensor is
-/// distributed across a mesh.
+/// distributed across a mesh, plus any unreduced mesh axes needed to model partial reductions.
 ///
 /// # JAX equivalent
 ///
@@ -841,12 +820,13 @@ impl PartitionDimension {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub struct PartitionSpec {
     dimensions: Vec<PartitionDimension>,
+    unreduced_axes: Vec<String>,
 }
 
 impl PartitionSpec {
     /// Creates a partition specification from per-dimension assignments.
     pub fn new(dimensions: Vec<PartitionDimension>) -> Self {
-        Self { dimensions }
+        Self { dimensions, unreduced_axes: Vec::new() }
     }
 
     /// Creates a fully replicated specification for an array with rank `rank`.
@@ -855,12 +835,32 @@ impl PartitionSpec {
     /// tensor is present on every device. Equivalent to `PartitionSpec()` in JAX (padded
     /// to the tensor rank with `None`).
     pub fn replicated(rank: usize) -> Self {
-        Self { dimensions: vec![PartitionDimension::Unsharded; rank] }
+        Self { dimensions: vec![PartitionDimension::Unsharded; rank], unreduced_axes: Vec::new() }
+    }
+
+    /// Returns a copy of this partition specification with explicit unreduced axes attached.
+    ///
+    /// These axes are carried separately from the ranked dimension list because they represent
+    /// partial-reduction state rather than per-dimension partitioning.
+    pub fn with_unreduced_axes<I, N>(mut self, axis_names: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<String>,
+    {
+        let mut seen = HashSet::new();
+        self.unreduced_axes =
+            axis_names.into_iter().map(Into::into).filter(|axis_name| seen.insert(axis_name.clone())).collect();
+        self
     }
 
     /// Returns per-dimension partition assignments.
     pub fn dimensions(&self) -> &[PartitionDimension] {
         self.dimensions.as_slice()
+    }
+
+    /// Returns the unreduced mesh axes attached to this partition specification.
+    pub fn unreduced_axes(&self) -> &[String] {
+        self.unreduced_axes.as_slice()
     }
 
     /// Rank represented by this partition specification.
@@ -893,7 +893,13 @@ impl PartitionSpec {
                 }
             })
             .collect();
-        Self { dimensions }
+        let unreduced_axes = self
+            .unreduced_axes
+            .iter()
+            .filter(|axis_name| mesh.is_axis_visible_in_traced_sharding(axis_name))
+            .cloned()
+            .collect();
+        Self { dimensions, unreduced_axes }
     }
 
     /// Renders this partition specification as a Shardy dimension list literal.
@@ -989,9 +995,9 @@ impl PartitionSpec {
 /// In Shardy's [`TensorShardingAttr`][sdy-tensor], axes not used in any dimension sharding
 /// can be explicitly listed as *replicated* or *unreduced*:
 ///
-/// - **Replicated axes** indicate that the tensor is fully replicated along those mesh axes.
-/// - **Unreduced axes** indicate a partial reduction: the tensor has been partitioned but the
-///   all-reduce has not yet been applied.
+/// - **Replicated axes** are derived from visible mesh axes not used by the partition spec.
+/// - **Unreduced axes** are stored on the [`PartitionSpec`] and indicate a partial reduction:
+///   the tensor has been partitioned but the all-reduce has not yet been applied.
 ///
 /// These are rendered as trailing `replicated={"y"}` and `unreduced={"z"}` in the Shardy
 /// attribute:
@@ -1009,8 +1015,8 @@ impl PartitionSpec {
 ///
 /// - Every mesh axis referenced in the partition specification exists in the mesh.
 /// - No mesh axis is used more than once across all dimensions of the partition specification.
-/// - Replicated and unreduced axes exist in the mesh, are not used in the partition
-///   specification, and do not overlap with each other.
+/// - Every unreduced axis exists in the mesh and is not already used in the partition
+///   specification.
 ///
 /// # Shardy representation
 ///
@@ -1025,45 +1031,13 @@ impl PartitionSpec {
 pub struct NamedSharding {
     mesh: LogicalMesh,
     partition_spec: PartitionSpec,
-    replicated_axes: Vec<String>,
-    unreduced_axes: Vec<String>,
 }
 
 impl NamedSharding {
-    /// Creates a named sharding with no extra replicated or unreduced axes.
+    /// Creates a named sharding from a logical mesh and partition specification.
     pub fn new(mesh: LogicalMesh, partition_spec: PartitionSpec) -> Result<Self, ShardingError> {
-        Self::with_extra_axes(mesh, partition_spec, Vec::new(), Vec::new())
-    }
-
-    /// Creates a named sharding with explicit replicated and/or unreduced axes.
-    pub fn with_extra_axes(
-        mesh: LogicalMesh,
-        partition_spec: PartitionSpec,
-        replicated_axes: Vec<String>,
-        unreduced_axes: Vec<String>,
-    ) -> Result<Self, ShardingError> {
-        let partition_used = validate_partition_spec(&mesh, &partition_spec)?;
-
-        // Validate replicated/unreduced axes.
-        let mut extra_set = HashSet::new();
-        for axis_name in replicated_axes.iter().chain(unreduced_axes.iter()) {
-            if mesh.axis_index(axis_name).is_none() {
-                return Err(ShardingError::UnknownExtraAxis { name: axis_name.clone() });
-            }
-            if partition_used.contains(axis_name.as_str()) {
-                return Err(ShardingError::ExtraAxisConflictsWithPartition { name: axis_name.clone() });
-            }
-        }
-        for axis_name in &replicated_axes {
-            extra_set.insert(axis_name.clone());
-        }
-        for axis_name in &unreduced_axes {
-            if extra_set.contains(axis_name) {
-                return Err(ShardingError::AxisInBothReplicatedAndUnreduced { name: axis_name.clone() });
-            }
-        }
-
-        Ok(Self { mesh, partition_spec, replicated_axes, unreduced_axes })
+        validate_partition_spec(&mesh, &partition_spec)?;
+        Ok(Self { mesh, partition_spec })
     }
 
     /// Returns the logical mesh of this sharding.
@@ -1076,14 +1050,18 @@ impl NamedSharding {
         &self.partition_spec
     }
 
-    /// Returns explicitly replicated axes.
-    pub fn replicated_axes(&self) -> &[String] {
-        self.replicated_axes.as_slice()
-    }
-
-    /// Returns explicitly unreduced axes.
-    pub fn unreduced_axes(&self) -> &[String] {
-        self.unreduced_axes.as_slice()
+    /// Returns the visible mesh axes that are implicitly replicated by this sharding.
+    pub fn replicated_axes(&self) -> Vec<&str> {
+        let used_axes = used_axes_in_partition_spec(&self.partition_spec);
+        self.mesh
+            .axes()
+            .iter()
+            .filter_map(|axis| {
+                let axis_name = axis.name.as_str();
+                (self.mesh.is_axis_visible_in_traced_sharding(axis_name) && !used_axes.contains(axis_name))
+                    .then_some(axis_name)
+            })
+            .collect()
     }
 
     /// Projects this sharding into traced/type-level semantics by hiding `Auto` mesh axes.
@@ -1093,19 +1071,7 @@ impl NamedSharding {
     /// the traced sharding view carried by types.
     pub(crate) fn project_for_traced_sharding(&self) -> Self {
         let partition_spec = self.partition_spec.project_for_traced_sharding(&self.mesh);
-        let replicated_axes = self
-            .replicated_axes
-            .iter()
-            .filter(|axis_name| self.mesh.is_axis_visible_in_traced_sharding(axis_name))
-            .cloned()
-            .collect();
-        let unreduced_axes = self
-            .unreduced_axes
-            .iter()
-            .filter(|axis_name| self.mesh.is_axis_visible_in_traced_sharding(axis_name))
-            .cloned()
-            .collect();
-        Self { mesh: self.mesh.clone(), partition_spec, replicated_axes, unreduced_axes }
+        Self { mesh: self.mesh.clone(), partition_spec }
     }
 
     /// Renders this sharding as a Shardy tensor sharding attribute.
@@ -1127,9 +1093,10 @@ impl NamedSharding {
         let dim_shardings = self.partition_spec.to_shardy_dimension_shardings_literal(context);
         let mut result = format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}");
 
-        if !self.replicated_axes.is_empty() {
+        let replicated_axes = self.replicated_axes();
+        if !replicated_axes.is_empty() {
             result.push_str(", replicated={");
-            for (i, axis_name) in self.replicated_axes.iter().enumerate() {
+            for (i, axis_name) in replicated_axes.iter().enumerate() {
                 if i > 0 {
                     result.push_str(", ");
                 }
@@ -1140,9 +1107,9 @@ impl NamedSharding {
             result.push('}');
         }
 
-        if !self.unreduced_axes.is_empty() {
+        if !self.partition_spec.unreduced_axes.is_empty() {
             result.push_str(", unreduced={");
-            for (i, axis_name) in self.unreduced_axes.iter().enumerate() {
+            for (i, axis_name) in self.partition_spec.unreduced_axes.iter().enumerate() {
                 if i > 0 {
                     result.push_str(", ");
                 }
@@ -1166,11 +1133,12 @@ impl NamedSharding {
         let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
         let dim_shardings = self.partition_spec.to_shardy_dimension_shardings(context, sharding_context);
         let replicated_axes = self
-            .replicated_axes
+            .replicated_axes()
             .iter()
             .map(|axis_name| context.shardy_axis_ref(axis_name, None))
             .collect::<Vec<_>>();
         let unreduced_axes = self
+            .partition_spec
             .unreduced_axes
             .iter()
             .map(|axis_name| context.shardy_axis_ref(axis_name, None))
@@ -1333,12 +1301,27 @@ impl ShardingLayout {
                 let slice = match &partition_spec.dimensions()[dimension] {
                     PartitionDimension::Unsharded => 0..dimension_size,
                     PartitionDimension::Sharded(axis_names) => {
-                        let (partition_index, partition_count) = partition_index_for_axes(
-                            mesh.logical_mesh(),
-                            mesh_coordinate.as_slice(),
-                            axis_names.as_slice(),
-                        )?;
-                        partition_slice(dimension_size, partition_count, partition_index)?
+                        let mut partition_index = 0usize;
+                        let mut partition_count = 1usize;
+                        for axis_name in axis_names {
+                            let axis_index = mesh
+                                .logical_mesh()
+                                .axis_index(axis_name)
+                                .expect("partition spec mesh axes should be validated before building shard slices");
+                            let axis_size = mesh.logical_mesh().axes()[axis_index].size;
+                            let axis_coordinate = mesh_coordinate[axis_index];
+
+                            partition_index = partition_index * axis_size + axis_coordinate;
+                            partition_count *= axis_size;
+                        }
+
+                        let base_size = dimension_size / partition_count;
+                        let remainder = dimension_size % partition_count;
+                        let extra_before = partition_index.min(remainder);
+
+                        let start = partition_index * base_size + extra_before;
+                        let size = base_size + usize::from(partition_index < remainder);
+                        start..start + size
                     }
                     PartitionDimension::Unconstrained => 0..dimension_size,
                 };
@@ -1411,22 +1394,19 @@ fn escape_shardy_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Validates a partition spec against a logical mesh. Returns the set of axis names used.
-fn validate_partition_spec(
-    mesh: &LogicalMesh,
-    partition_spec: &PartitionSpec,
-) -> Result<HashSet<String>, ShardingError> {
+/// Validates a partition spec against a logical mesh.
+fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -> Result<(), ShardingError> {
     let mut used_axes = HashSet::new();
     for (dimension, partition_dimension) in partition_spec.dimensions().iter().enumerate() {
         if let PartitionDimension::Sharded(axis_names) = partition_dimension {
             if axis_names.is_empty() {
-                return Err(ShardingError::EmptyPartitionAxisList { dimension });
+                return Err(ShardingError::NoPartitionAxes { dimension });
             }
 
             let mut axes_in_dimension = HashSet::new();
             for axis_name in axis_names {
                 if mesh.axis_index(axis_name).is_none() {
-                    return Err(ShardingError::UnknownMeshAxis { name: axis_name.clone() });
+                    return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
                 }
                 if !axes_in_dimension.insert(axis_name.clone()) || !used_axes.insert(axis_name.clone()) {
                     return Err(ShardingError::DuplicatePartitionAxis { name: axis_name.clone() });
@@ -1434,7 +1414,32 @@ fn validate_partition_spec(
             }
         }
     }
-    Ok(used_axes)
+
+    for axis_name in partition_spec.unreduced_axes() {
+        if mesh.axis_index(axis_name).is_none() {
+            return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+        }
+        if used_axes.contains(axis_name) {
+            return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+        }
+        used_axes.insert(axis_name.clone());
+    }
+    Ok(())
+}
+
+fn used_axes_in_partition_spec(partition_spec: &PartitionSpec) -> HashSet<&str> {
+    let mut used_axes = HashSet::new();
+    for partition_dimension in partition_spec.dimensions() {
+        if let PartitionDimension::Sharded(axis_names) = partition_dimension {
+            for axis_name in axis_names {
+                used_axes.insert(axis_name.as_str());
+            }
+        }
+    }
+    for axis_name in partition_spec.unreduced_axes() {
+        used_axes.insert(axis_name.as_str());
+    }
+    used_axes
 }
 
 fn coordinate_for_linear_index(mut index: usize, axis_sizes: &[usize]) -> Vec<usize> {
@@ -1449,51 +1454,6 @@ fn coordinate_for_linear_index(mut index: usize, axis_sizes: &[usize]) -> Vec<us
         index /= axis_size;
     }
     coordinate
-}
-
-fn partition_index_for_axes(
-    mesh: &LogicalMesh,
-    mesh_coordinate: &[usize],
-    axis_names: &[String],
-) -> Result<(usize, usize), ShardingError> {
-    let mut partition_index = 0usize;
-    let mut partition_count = 1usize;
-
-    for axis_name in axis_names {
-        let axis_index = mesh
-            .axis_index(axis_name)
-            .ok_or_else(|| ShardingError::UnknownMeshAxis { name: axis_name.clone() })?;
-        let axis_size = mesh.axes()[axis_index].size;
-        let axis_coordinate = mesh_coordinate[axis_index];
-
-        partition_index = partition_index * axis_size + axis_coordinate;
-        partition_count *= axis_size;
-    }
-
-    Ok((partition_index, partition_count))
-}
-
-fn partition_slice(
-    dimension_size: usize,
-    partition_count: usize,
-    partition_index: usize,
-) -> Result<ShardSlice, ShardingError> {
-    if partition_count == 0 {
-        return Err(ShardingError::InvalidPartitionCount { count: partition_count });
-    }
-    if partition_index >= partition_count {
-        return Err(ShardingError::InvalidPartitionIndex { partition_index, partition_count });
-    }
-
-    let base_size = dimension_size / partition_count;
-    let remainder = dimension_size % partition_count;
-    let extra_before = partition_index.min(remainder);
-
-    let start = partition_index * base_size + extra_before;
-    let size = base_size + usize::from(partition_index < remainder);
-    let end = start + size;
-
-    Ok(start..end)
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,7 +1609,8 @@ mod tests {
             PartitionDimension::sharded_by(["data", "model", "batch"]),
             PartitionDimension::sharded("model"),
             PartitionDimension::unsharded(),
-        ]);
+        ])
+        .with_unreduced_axes(["model", "batch"]);
 
         assert_eq!(
             spec.project_for_traced_sharding(&mesh),
@@ -1658,6 +1619,7 @@ mod tests {
                 PartitionDimension::unsharded(),
                 PartitionDimension::unsharded(),
             ])
+            .with_unreduced_axes(["batch"])
         );
     }
 
@@ -1672,7 +1634,7 @@ mod tests {
         let unknown_axis_partition = PartitionSpec::new(vec![PartitionDimension::sharded("z")]);
         assert!(matches!(
             NamedSharding::new(mesh.clone(), unknown_axis_partition),
-            Err(ShardingError::UnknownMeshAxis { name }) if name == "z",
+            Err(ShardingError::UnknownMeshAxisName { name }) if name == "z",
         ));
 
         let duplicate_axis_partition =
@@ -1685,7 +1647,7 @@ mod tests {
         let empty_axis_partition = PartitionSpec::new(vec![PartitionDimension::Sharded(Vec::new())]);
         assert!(matches!(
             NamedSharding::new(mesh, empty_axis_partition),
-            Err(ShardingError::EmptyPartitionAxisList { dimension }) if dimension == 0,
+            Err(ShardingError::NoPartitionAxes { dimension }) if dimension == 0,
         ));
     }
 
@@ -1703,10 +1665,16 @@ mod tests {
 
     #[test]
     fn test_named_sharding_replicated_axes() {
-        let mesh = test_logical_mesh_2x2();
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
         let partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
-        let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], Vec::new()).unwrap();
+        let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
+
+        assert_eq!(sharding.replicated_axes(), vec!["y"]);
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], replicated={\"y\"}>"
@@ -1717,8 +1685,9 @@ mod tests {
     fn test_named_sharding_unreduced_axes() {
         let mesh = test_logical_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
-        let sharding = NamedSharding::with_extra_axes(mesh, partition_spec, Vec::new(), vec!["y".to_string()]).unwrap();
+            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()])
+                .with_unreduced_axes(["y"]);
+        let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>"
@@ -1728,14 +1697,15 @@ mod tests {
     #[test]
     fn test_named_sharding_replicated_and_unreduced_axes() {
         let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("z", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
-        let sharding =
-            NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], vec!["z".to_string()]).unwrap();
+        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]).with_unreduced_axes(["z"]);
+        let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
+
+        assert_eq!(sharding.replicated_axes(), vec!["y"]);
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
             "#sdy.sharding<@mesh, [{\"x\"}], replicated={\"y\"}, unreduced={\"z\"}>"
@@ -1751,41 +1721,31 @@ mod tests {
             MeshAxis::new("w", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
-        let sharding = NamedSharding::with_extra_axes(
+        let sharding = NamedSharding::new(
             mesh,
-            PartitionSpec::new(vec![PartitionDimension::sharded_by(["x", "y", "z"])]),
-            vec!["w".to_string()],
-            Vec::new(),
+            PartitionSpec::new(vec![PartitionDimension::sharded_by(["x", "y", "z"])]).with_unreduced_axes(["w"]),
         )
         .unwrap();
         let projected = sharding.project_for_traced_sharding();
 
         assert_eq!(projected.partition_spec(), &PartitionSpec::new(vec![PartitionDimension::sharded_by(["x", "z"])]));
         assert!(projected.replicated_axes().is_empty());
-        assert!(projected.unreduced_axes().is_empty());
+        assert!(projected.partition_spec().unreduced_axes().is_empty());
     }
 
     #[test]
-    fn test_named_sharding_extra_axis_validation() {
+    fn test_named_sharding_unreduced_axis_validation() {
         let mesh = test_logical_mesh_2x2();
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
 
-        // Unknown extra axis.
         assert!(matches!(
-            NamedSharding::with_extra_axes(mesh.clone(), partition_spec.clone(), vec!["z".to_string()], Vec::new()),
-            Err(ShardingError::UnknownExtraAxis { name }) if name == "z",
+            NamedSharding::new(mesh.clone(), partition_spec.clone().with_unreduced_axes(["z"])),
+            Err(ShardingError::UnknownMeshAxisName { name }) if name == "z",
         ));
 
-        // Conflicts with partition spec.
         assert!(matches!(
-            NamedSharding::with_extra_axes(mesh.clone(), partition_spec.clone(), vec!["x".to_string()], Vec::new()),
-            Err(ShardingError::ExtraAxisConflictsWithPartition { name }) if name == "x",
-        ));
-
-        // Same axis in both replicated and unreduced.
-        assert!(matches!(
-            NamedSharding::with_extra_axes(mesh, partition_spec, vec!["y".to_string()], vec!["y".to_string()]),
-            Err(ShardingError::AxisInBothReplicatedAndUnreduced { name }) if name == "y",
+            NamedSharding::new(mesh, partition_spec.with_unreduced_axes(["x"])),
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
         ));
     }
 
@@ -1802,11 +1762,6 @@ mod tests {
             ShardingLayout::new(vec![8usize], mesh, partition_spec),
             Err(ShardingError::PartitionRankMismatch { partition_rank: 2, array_rank: 1 }),
         ));
-    }
-
-    #[test]
-    fn test_partition_slice_rejects_zero_partition_count() {
-        assert!(matches!(partition_slice(8, 0, 0), Err(ShardingError::InvalidPartitionCount { count: 0 }),));
     }
 
     #[test]

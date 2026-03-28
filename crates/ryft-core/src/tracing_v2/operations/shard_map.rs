@@ -489,11 +489,9 @@ fn named_sharding_with_partition_spec(
     sharding: &crate::xla::sharding::NamedSharding,
     partition_spec: crate::xla::sharding::PartitionSpec,
 ) -> Option<crate::xla::sharding::NamedSharding> {
-    crate::xla::sharding::NamedSharding::with_extra_axes(
+    crate::xla::sharding::NamedSharding::new(
         sharding.mesh().clone(),
-        partition_spec,
-        sharding.replicated_axes().to_vec(),
-        sharding.unreduced_axes().to_vec(),
+        partition_spec.with_unreduced_axes(sharding.partition_spec().unreduced_axes().iter().cloned()),
     )
     .map(|sharding| sharding.project_for_traced_sharding())
     .ok()
@@ -508,34 +506,22 @@ fn is_replicated_sharding(sharding: &crate::xla::sharding::NamedSharding) -> boo
         .all(|dimension| matches!(dimension, crate::xla::sharding::PartitionDimension::Unsharded))
 }
 
-/// Merges replicated/unreduced axis sets from two shardings while preserving mesh validation.
+/// Merges unreduced-axis sets from two shardings while preserving mesh validation.
 fn merge_named_sharding_axes(
     left: &crate::xla::sharding::NamedSharding,
     right: &crate::xla::sharding::NamedSharding,
     partition_spec: crate::xla::sharding::PartitionSpec,
 ) -> Option<crate::xla::sharding::NamedSharding> {
-    let mut replicated_axes = left.replicated_axes().to_vec();
-    for axis_name in right.replicated_axes() {
-        if !replicated_axes.contains(axis_name) {
-            replicated_axes.push(axis_name.clone());
-        }
-    }
-
-    let mut unreduced_axes = left.unreduced_axes().to_vec();
-    for axis_name in right.unreduced_axes() {
+    let mut unreduced_axes = left.partition_spec().unreduced_axes().to_vec();
+    for axis_name in right.partition_spec().unreduced_axes() {
         if !unreduced_axes.contains(axis_name) {
             unreduced_axes.push(axis_name.clone());
         }
     }
 
-    crate::xla::sharding::NamedSharding::with_extra_axes(
-        left.mesh().clone(),
-        partition_spec,
-        replicated_axes,
-        unreduced_axes,
-    )
-    .map(|sharding| sharding.project_for_traced_sharding())
-    .ok()
+    crate::xla::sharding::NamedSharding::new(left.mesh().clone(), partition_spec.with_unreduced_axes(unreduced_axes))
+        .map(|sharding| sharding.project_for_traced_sharding())
+        .ok()
 }
 
 /// Infers the output sharding of one sharding-preserving unary op.
