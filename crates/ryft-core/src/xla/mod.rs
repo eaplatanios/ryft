@@ -9,6 +9,6 @@ pub use arrays::{AddressableShard, Array, ArrayError, ExecuteArguments};
 pub use shard_map::{ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, trace};
 
 pub use sharding::{
-    DeviceMesh, MeshDevice, NamedSharding, PartitionDimension, PartitionSpec, ShardDescriptor, ShardSlice,
-    ShardingContext, ShardingLayout,
+    DeviceMesh, NamedSharding, PartitionDimension, PartitionSpec, ShardDescriptor, ShardSlice, ShardingContext,
+    ShardingLayout,
 };

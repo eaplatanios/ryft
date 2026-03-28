@@ -165,3 +165,26 @@ impl LogicalMesh {
 /// Type alias used to represent [`MeshDevice`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
 /// and, on multi-host environments, are also unique across all devices and all hosts.
 pub type MeshDeviceId = usize;
+
+/// Type alias used to represent process indices in multi-process/multi-host environments.
+pub type MeshProcessIndex = usize;
+
+/// Device that belongs to a mesh topology. This type separates global device identity that is described by a
+/// [`MeshDeviceId`], from host/process ownership, that is described by a [`ProcessIndex`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MeshDevice {
+    /// Globally (i.e., across all hosts/processes) unique device ID.
+    pub id: MeshDeviceId,
+
+    /// Index of the process that owns this device. In single-host setups, this will always be set to `0`. In multi-host
+    /// setups it determines _addressability_. That is, a _shard_ of an array that is located on some device `d` is
+    /// _addressable_ from a process with index `p` if and only if `d.process_index == p`.
+    pub process_index: MeshProcessIndex,
+}
+
+impl MeshDevice {
+    /// Creates a new [`MeshDevice`].
+    pub fn new(id: MeshDeviceId, process_index: MeshProcessIndex) -> Self {
+        Self { id, process_index }
+    }
+}

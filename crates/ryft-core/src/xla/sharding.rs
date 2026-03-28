@@ -161,7 +161,9 @@ use ryft_mlir::Context as MlirContext;
 use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, TensorShardingAttributeRef};
 
 use crate::parameters::Parameter;
-use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, MeshDeviceId, SHARDY_MESH_SYMBOL_NAME, ShardingError};
+use crate::sharding::{
+    LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId, SHARDY_MESH_SYMBOL_NAME, ShardingError,
+};
 
 // ---------------------------------------------------------------------------
 // Sharding context
@@ -193,54 +195,6 @@ pub enum ShardingContext {
 // ---------------------------------------------------------------------------
 // Mesh-related types
 // ---------------------------------------------------------------------------
-
-/// Device entry in a logical mesh.
-///
-/// Separates global device identity ([`DeviceId`]) from host/process ownership
-/// (`process_index`), enabling the same sharding metadata to describe both local and remote
-/// shards. This mirrors [`jax.Device`][jax-device], where each device has:
-///
-/// - A globally unique `id` (from `device.id`).
-/// - A `process_index` indicating which host owns it (from `device.process_index`).
-///
-/// [jax-device]: https://docs.jax.dev/en/latest/jax.html#jax.Device
-///
-/// In a single-host setup all devices share `process_index = 0`. In multi-host setups,
-/// `process_index` determines addressability: a shard on a device is *addressable* from
-/// process `p` if and only if `device.process_index == p`. This is the same rule JAX uses
-/// to distinguish [`jax.local_devices()`][jax-local] from [`jax.devices()`][jax-all].
-///
-/// [jax-local]: https://docs.jax.dev/en/latest/jax.html#jax.local_devices
-/// [jax-all]: https://docs.jax.dev/en/latest/jax.html#jax.devices
-///
-/// # Shardy representation
-///
-/// In Shardy's `MeshAttr`, devices are represented by an optional `device_ids` list. When
-/// omitted, devices follow implicit iota ordering `[0, 1, 2, ...]`, which matches the
-/// row-major storage used by [`DeviceMesh`]. Explicit device IDs are only needed when the
-/// physical-to-logical mapping is non-trivial.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MeshDevice {
-    id: MeshDeviceId,
-    process_index: usize,
-}
-
-impl MeshDevice {
-    /// Creates a mesh-device entry.
-    pub fn new(id: MeshDeviceId, process_index: usize) -> Self {
-        Self { id, process_index }
-    }
-
-    /// Global PJRT device ID.
-    pub fn id(&self) -> MeshDeviceId {
-        self.id
-    }
-
-    /// Process index of the host owning this device.
-    pub fn process_index(&self) -> usize {
-        self.process_index
-    }
-}
 
 /// Logical mesh of devices used by sharding layouts.
 ///
@@ -1002,7 +956,7 @@ impl ShardingLayout {
                 slices.push(slice);
             }
 
-            shard_index_by_device.insert(mesh_device.id(), shard_index);
+            shard_index_by_device.insert(mesh_device.id, shard_index);
             shards.push(ShardDescriptor { shard_index, device: mesh_device, mesh_coordinate, slices, shape });
         }
 
@@ -1053,7 +1007,7 @@ impl ShardingLayout {
         self.shards
             .iter()
             .filter_map(|descriptor| {
-                (descriptor.device.process_index() == process_index).then_some(descriptor.shard_index())
+                (descriptor.device.process_index == process_index).then_some(descriptor.shard_index())
             })
             .collect()
     }

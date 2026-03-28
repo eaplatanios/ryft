@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added `Parameterized::broadcast_to_parameter_structure`.
 - Added the `Type` and `Broadcastable` traits.
 - Added the `DataType`, `Size`, `Shape`, `TileDimension`, `Tile`, `TiledLayout`, `StridedLayout`, `Layout`, `ArrayType`,
-  `MeshAxisType`, `MeshAxis`, `LogicalMesh`, and `DeviceId` types.
+  `MeshAxisType`, `MeshAxis`, `LogicalMesh`, `MeshDeviceId`, `MeshProcessIndex`, and `MeshDevice` types.
 - Introduced more fine-grained error types like `ParameterError`, `DataTypeError`, `LayoutError`, `BroadcastingError`,
   and `ShardingError`.
 

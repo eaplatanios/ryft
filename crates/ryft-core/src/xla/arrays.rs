@@ -181,10 +181,10 @@ impl<'o> Array<'o> {
                 .expect("layout shard index should exist for valid layout device-to-shard mapping");
 
             let process_index = device.process_index()?;
-            if process_index != shard.device().process_index() {
+            if process_index != shard.device().process_index {
                 return Err(ArrayError::BufferProcessIndexMismatch {
                     device_id,
-                    expected_process_index: shard.device().process_index(),
+                    expected_process_index: shard.device().process_index,
                     actual_process_index: process_index,
                 });
             }
@@ -444,9 +444,10 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+    use crate::sharding::MeshDevice;
     use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::{DeviceMesh, MeshDevice, PartitionDimension, PartitionSpec};
+    use crate::xla::sharding::{DeviceMesh, PartitionDimension, PartitionSpec};
 
     use super::*;
 

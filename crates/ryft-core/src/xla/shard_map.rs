@@ -1389,11 +1389,12 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use super::*;
+    use crate::sharding::MeshDevice;
     use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
     use crate::types::data_types::DataType;
     use crate::xla::arrays::Array;
-    use crate::xla::sharding::{DeviceMesh, MeshDevice, PartitionDimension, PartitionSpec, ShardingContext};
+    use crate::xla::sharding::{DeviceMesh, PartitionDimension, PartitionSpec, ShardingContext};
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
