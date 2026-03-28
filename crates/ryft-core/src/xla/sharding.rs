@@ -161,7 +161,7 @@ use ryft_mlir::Context as MlirContext;
 use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, TensorShardingAttributeRef};
 
 use crate::parameters::Parameter;
-use crate::sharding::{DeviceId, LogicalMesh, MeshAxis, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, ShardingError};
+use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, MeshDeviceId, SHARDY_MESH_SYMBOL_NAME, ShardingError};
 
 // ---------------------------------------------------------------------------
 // Sharding context
@@ -221,18 +221,18 @@ pub enum ShardingContext {
 /// physical-to-logical mapping is non-trivial.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MeshDevice {
-    id: DeviceId,
+    id: MeshDeviceId,
     process_index: usize,
 }
 
 impl MeshDevice {
     /// Creates a mesh-device entry.
-    pub fn new(id: DeviceId, process_index: usize) -> Self {
+    pub fn new(id: MeshDeviceId, process_index: usize) -> Self {
         Self { id, process_index }
     }
 
     /// Global PJRT device ID.
-    pub fn id(&self) -> DeviceId {
+    pub fn id(&self) -> MeshDeviceId {
         self.id
     }
 
@@ -943,7 +943,7 @@ pub struct ShardingLayout {
     mesh: DeviceMesh,
     partition_spec: PartitionSpec,
     shards: Vec<ShardDescriptor>,
-    shard_index_by_device: HashMap<DeviceId, usize>,
+    shard_index_by_device: HashMap<MeshDeviceId, usize>,
 }
 
 impl ShardingLayout {
@@ -1035,12 +1035,12 @@ impl ShardingLayout {
     }
 
     /// Returns the shard index for `device_id`, if the device is in the mesh.
-    pub fn shard_index_for_device(&self, device_id: DeviceId) -> Option<usize> {
+    pub fn shard_index_for_device(&self, device_id: MeshDeviceId) -> Option<usize> {
         self.shard_index_by_device.get(&device_id).copied()
     }
 
     /// Returns the shard descriptor for `device_id`, if the device is in the mesh.
-    pub fn shard_for_device(&self, device_id: DeviceId) -> Option<&ShardDescriptor> {
+    pub fn shard_for_device(&self, device_id: MeshDeviceId) -> Option<&ShardDescriptor> {
         self.shard_index_for_device(device_id).and_then(|index| self.shard(index))
     }
 

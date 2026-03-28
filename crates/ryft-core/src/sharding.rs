@@ -21,7 +21,7 @@ pub enum ShardingError {
     EmptyMeshAxis { name: String },
 
     #[error("mesh device ID '{id}' appears more than once")]
-    DuplicateMeshDeviceId { id: DeviceId },
+    DuplicateMeshDeviceId { id: MeshDeviceId },
 
     #[error("mesh has {actual_count} device(s), but its axis sizes imply {expected_count} device(s)")]
     MeshDeviceCountMismatch { expected_count: usize, actual_count: usize },
@@ -162,6 +162,6 @@ impl LogicalMesh {
     }
 }
 
-/// Type alias used to represent [`Device`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
+/// Type alias used to represent [`MeshDevice`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
 /// and, on multi-host environments, are also unique across all devices and all hosts.
-pub type DeviceId = usize;
+pub type MeshDeviceId = usize;
