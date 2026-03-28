@@ -1221,7 +1221,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
 ) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
     let manual_axis_names = mesh.manual_axes().into_iter().collect::<HashSet<_>>();
     let free_axis_names = mesh
-        .axes()
+        .axes
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
         .collect::<HashSet<_>>();
@@ -1287,7 +1287,7 @@ fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
 fn render_manual_computation_dimensions(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -> String {
     let manual_axis_names = mesh.manual_axes().into_iter().collect::<HashSet<_>>();
     let free_axis_names = mesh
-        .axes()
+        .axes
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
         .collect::<HashSet<_>>();

@@ -265,8 +265,11 @@ impl MeshDevice {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalMesh {
-    axes: Vec<MeshAxis>,
-    axis_index_by_name: HashMap<String, usize>,
+    /// Named axes that define this logical mesh topology.
+    pub axes: Vec<MeshAxis>,
+
+    /// Mapping from mesh axis names to their position in [`Self::axes`].
+    pub axis_indices: HashMap<String, usize>,
 }
 
 impl LogicalMesh {
@@ -276,11 +279,7 @@ impl LogicalMesh {
     ///
     /// Validates that all axis names are non-empty, all sizes are positive, and names are unique.
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
-        Self::build(axes)
-    }
-
-    fn build(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
-        let mut axis_index_by_name = HashMap::with_capacity(axes.len());
+        let mut axis_indices = HashMap::with_capacity(axes.len());
         for (axis_index, axis) in axes.iter().enumerate() {
             if axis.name.is_empty() {
                 return Err(ShardingError::EmptyMeshAxisName);
@@ -288,31 +287,11 @@ impl LogicalMesh {
             if axis.size == 0 {
                 return Err(ShardingError::EmptyMeshAxis { name: axis.name.clone() });
             }
-            if axis_index_by_name.insert(axis.name.clone(), axis_index).is_some() {
+            if axis_indices.insert(axis.name.clone(), axis_index).is_some() {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
             }
         }
-        Ok(Self { axes, axis_index_by_name })
-    }
-
-    /// Returns the axes of this mesh.
-    pub fn axes(&self) -> &[MeshAxis] {
-        self.axes.as_slice()
-    }
-
-    /// Returns the per-axis types.
-    pub fn axis_types(&self) -> Vec<MeshAxisType> {
-        self.axes.iter().map(|axis| axis.r#type).collect()
-    }
-
-    /// Returns axis names as a convenience accessor.
-    pub fn axis_names(&self) -> Vec<&str> {
-        self.axes.iter().map(|axis| axis.name.as_str()).collect()
-    }
-
-    /// Returns axis sizes as a convenience accessor.
-    pub fn axis_sizes(&self) -> Vec<usize> {
-        self.axes.iter().map(|axis| axis.size).collect()
+        Ok(Self { axes, axis_indices })
     }
 
     /// Returns the total number of devices implied by axis sizes.
@@ -320,55 +299,21 @@ impl LogicalMesh {
         self.axes.iter().fold(1usize, |count, axis| count * axis.size)
     }
 
-    /// Returns the index of `axis_name` in this mesh, if present.
-    pub fn axis_index<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.axis_index_by_name.get(axis_name.as_ref()).copied()
+    /// Returns the type of `axis_name` in this mesh, if present.
+    fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
+        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].r#type)
     }
 
     /// Returns the size of `axis_name` in this mesh, if present.
     pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.axis_index(axis_name).map(|axis_index| self.axes[axis_index].size)
-    }
-
-    /// Returns the type of `axis_name` in this mesh, if present.
-    fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
-        self.axis_index(axis_name).map(|axis_index| self.axes[axis_index].r#type)
-    }
-
-    /// Returns `true` if all axes have type [`MeshAxisType::Auto`].
-    pub fn are_all_axes_auto(&self) -> bool {
-        self.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto)
-    }
-
-    /// Returns `true` if all axes have type [`MeshAxisType::Explicit`].
-    pub fn are_all_axes_explicit(&self) -> bool {
-        self.axes.iter().all(|axis| axis.r#type == MeshAxisType::Explicit)
-    }
-
-    /// Returns `true` if all axes have type [`MeshAxisType::Manual`].
-    pub fn are_all_axes_manual(&self) -> bool {
-        self.axes.iter().all(|axis| axis.r#type == MeshAxisType::Manual)
-    }
-
-    /// Returns the names of axes with type [`MeshAxisType::Auto`].
-    pub fn auto_axes(&self) -> Vec<&str> {
-        self.axes_with_type(MeshAxisType::Auto)
-    }
-
-    /// Returns the names of axes with type [`MeshAxisType::Explicit`].
-    pub fn explicit_axes(&self) -> Vec<&str> {
-        self.axes_with_type(MeshAxisType::Explicit)
+        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].size)
     }
 
     /// Returns the names of axes with type [`MeshAxisType::Manual`].
     pub fn manual_axes(&self) -> Vec<&str> {
-        self.axes_with_type(MeshAxisType::Manual)
-    }
-
-    fn axes_with_type(&self, axis_type: MeshAxisType) -> Vec<&str> {
         self.axes
             .iter()
-            .filter_map(|axis| (axis.r#type == axis_type).then_some(axis.name.as_str()))
+            .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
             .collect()
     }
 
@@ -394,7 +339,7 @@ impl LogicalMesh {
                 MeshAxis::new(axis.name, axis.size, r#type).expect("logical meshes only contain validated mesh axes")
             })
             .collect();
-        Self { axes, axis_index_by_name: self.axis_index_by_name.clone() }
+        Self { axes, axis_indices: self.axis_indices.clone() }
     }
 
     /// Renders this mesh as the right-hand side of a Shardy `sdy.mesh` declaration.
@@ -461,7 +406,7 @@ impl LogicalMesh {
 /// | JAX                                 | Ryft                                             |
 /// | ----------------------------------- | ------------------------------------------------ |
 /// | `Mesh(np.array(devs).reshape(...))` | `DeviceMesh::new(vec![...], devs)`               |
-/// | `mesh.shape`                        | `mesh.logical_mesh().axes()`                     |
+/// | `mesh.shape`                        | `mesh.logical_mesh().axes`                       |
 /// | `mesh.devices` (ndarray)            | `mesh.devices()` (flat row-major slice)          |
 /// | `mesh.size`                         | `mesh.device_count()`                            |
 /// | `mesh.local_devices`                | `mesh.devices()` filtered by `process_index`     |
@@ -518,26 +463,6 @@ impl DeviceMesh {
         &self.logical_mesh
     }
 
-    /// Returns the axes of this mesh.
-    pub fn axes(&self) -> &[MeshAxis] {
-        self.logical_mesh.axes()
-    }
-
-    /// Returns the per-axis types.
-    pub fn axis_types(&self) -> Vec<MeshAxisType> {
-        self.logical_mesh.axis_types()
-    }
-
-    /// Returns axis names as a convenience accessor.
-    pub fn axis_names(&self) -> Vec<&str> {
-        self.logical_mesh.axis_names()
-    }
-
-    /// Returns axis sizes as a convenience accessor.
-    pub fn axis_sizes(&self) -> Vec<usize> {
-        self.logical_mesh.axis_sizes()
-    }
-
     /// Returns mesh devices in row-major order.
     pub fn devices(&self) -> &[MeshDevice] {
         self.devices.as_slice()
@@ -548,39 +473,9 @@ impl DeviceMesh {
         self.devices.len()
     }
 
-    /// Returns the index of `axis_name` in this mesh, if present.
-    pub fn axis_index<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.logical_mesh.axis_index(axis_name)
-    }
-
     /// Returns the size of `axis_name` in this mesh, if present.
     pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
         self.logical_mesh.axis_size(axis_name)
-    }
-
-    /// Returns `true` if all axes have type [`MeshAxisType::Auto`].
-    pub fn are_all_axes_auto(&self) -> bool {
-        self.logical_mesh.are_all_axes_auto()
-    }
-
-    /// Returns `true` if all axes have type [`MeshAxisType::Explicit`].
-    pub fn are_all_axes_explicit(&self) -> bool {
-        self.logical_mesh.are_all_axes_explicit()
-    }
-
-    /// Returns `true` if all axes have type [`MeshAxisType::Manual`].
-    pub fn are_all_axes_manual(&self) -> bool {
-        self.logical_mesh.are_all_axes_manual()
-    }
-
-    /// Returns the names of axes with type [`MeshAxisType::Auto`].
-    pub fn auto_axes(&self) -> Vec<&str> {
-        self.logical_mesh.auto_axes()
-    }
-
-    /// Returns the names of axes with type [`MeshAxisType::Explicit`].
-    pub fn explicit_axes(&self) -> Vec<&str> {
-        self.logical_mesh.explicit_axes()
     }
 
     /// Returns the names of axes with type [`MeshAxisType::Manual`].
@@ -1009,7 +904,7 @@ impl NamedSharding {
     pub fn replicated_axes(&self) -> Vec<&str> {
         let used_axes = used_axes_in_partition_spec(&self.partition_spec);
         self.mesh
-            .axes()
+            .axes
             .iter()
             .filter_map(|axis| {
                 let axis_name = axis.name.as_str();
@@ -1259,11 +1154,11 @@ impl ShardingLayout {
                         let mut partition_index = 0usize;
                         let mut partition_count = 1usize;
                         for axis_name in axis_names {
-                            let axis_index = mesh
-                                .logical_mesh()
-                                .axis_index(axis_name)
-                                .expect("partition spec mesh axes should be validated before building shard slices");
-                            let axis_size = mesh.logical_mesh().axes()[axis_index].size;
+                            let axis_index =
+                                mesh.logical_mesh().axis_indices.get(axis_name.as_str()).copied().expect(
+                                    "partition spec mesh axes should be validated before building shard slices",
+                                );
+                            let axis_size = mesh.logical_mesh().axes[axis_index].size;
                             let axis_coordinate = mesh_coordinate[axis_index];
 
                             partition_index = partition_index * axis_size + axis_coordinate;
@@ -1360,7 +1255,7 @@ fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -
 
             let mut axes_in_dimension = HashSet::new();
             for axis_name in axis_names {
-                if mesh.axis_index(axis_name).is_none() {
+                if !mesh.axis_indices.contains_key(axis_name) {
                     return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
                 }
                 if !axes_in_dimension.insert(axis_name.clone()) || !used_axes.insert(axis_name.clone()) {
@@ -1371,7 +1266,7 @@ fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -
     }
 
     for axis_name in partition_spec.unreduced_axes() {
-        if mesh.axis_index(axis_name).is_none() {
+        if !mesh.axis_indices.contains_key(axis_name) {
             return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
         }
         if used_axes.contains(axis_name) {
@@ -1443,10 +1338,10 @@ mod tests {
     #[test]
     fn test_logical_mesh_construction_and_lookups() {
         let mesh = test_logical_mesh_2x2();
-        assert_eq!(mesh.axes().len(), 2);
-        assert_eq!(mesh.axis_index("x"), Some(0));
-        assert_eq!(mesh.axis_index("y"), Some(1));
-        assert_eq!(mesh.axis_index("z"), None);
+        assert_eq!(mesh.axes.len(), 2);
+        assert_eq!(mesh.axis_indices.get("x"), Some(&0));
+        assert_eq!(mesh.axis_indices.get("y"), Some(&1));
+        assert_eq!(mesh.axis_indices.get("z"), None);
         assert_eq!(mesh.axis_size("x"), Some(2));
         assert_eq!(mesh.axis_size("y"), Some(2));
         assert_eq!(mesh.device_count(), 4);
@@ -1481,7 +1376,6 @@ mod tests {
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
         let mesh = DeviceMesh::from_logical(logical_mesh.clone(), devices).unwrap();
         assert_eq!(mesh.logical_mesh(), &logical_mesh);
-        assert_eq!(mesh.axes(), logical_mesh.axes());
         assert_eq!(mesh.device_count(), 4);
     }
 
@@ -1831,7 +1725,10 @@ mod tests {
     #[test]
     fn test_logical_mesh_default_axis_types() {
         let mesh = test_logical_mesh_2x2();
-        assert_eq!(mesh.axis_types(), vec![MeshAxisType::Auto, MeshAxisType::Auto]);
+        assert_eq!(
+            mesh.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
+            vec![MeshAxisType::Auto, MeshAxisType::Auto]
+        );
     }
 
     #[test]
@@ -1841,18 +1738,33 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ];
         let mesh = LogicalMesh::new(axes).unwrap();
-        assert_eq!(mesh.axis_types(), vec![MeshAxisType::Manual, MeshAxisType::Explicit]);
+        assert_eq!(
+            mesh.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
+            vec![MeshAxisType::Manual, MeshAxisType::Explicit]
+        );
     }
 
     #[test]
     fn test_logical_mesh_axis_type_queries() {
         // All auto.
         let mesh = test_logical_mesh_2x2();
-        assert!(mesh.are_all_axes_auto());
-        assert!(!mesh.are_all_axes_explicit());
-        assert!(!mesh.are_all_axes_manual());
-        assert_eq!(mesh.auto_axes(), vec!["x", "y"]);
-        assert!(mesh.explicit_axes().is_empty());
+        assert!(mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto));
+        assert!(mesh.axes.iter().all(|axis| axis.r#type != MeshAxisType::Explicit));
+        assert!(mesh.axes.iter().all(|axis| axis.r#type != MeshAxisType::Manual));
+        assert_eq!(
+            mesh.axes
+                .iter()
+                .filter_map(|axis| (axis.r#type == MeshAxisType::Auto).then_some(axis.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        assert!(
+            mesh.axes
+                .iter()
+                .filter_map(|axis| (axis.r#type == MeshAxisType::Explicit).then_some(axis.name.as_str()))
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         assert!(mesh.manual_axes().is_empty());
 
         // Mixed types.
@@ -1862,11 +1774,23 @@ mod tests {
             MeshAxis::new("c", 2, MeshAxisType::Manual).unwrap(),
         ];
         let mesh = LogicalMesh::new(axes).unwrap();
-        assert!(!mesh.are_all_axes_auto());
-        assert!(!mesh.are_all_axes_explicit());
-        assert!(!mesh.are_all_axes_manual());
-        assert_eq!(mesh.auto_axes(), vec!["a"]);
-        assert_eq!(mesh.explicit_axes(), vec!["b"]);
+        assert!(!mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto));
+        assert!(!mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Explicit));
+        assert!(!mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Manual));
+        assert_eq!(
+            mesh.axes
+                .iter()
+                .filter_map(|axis| (axis.r#type == MeshAxisType::Auto).then_some(axis.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(
+            mesh.axes
+                .iter()
+                .filter_map(|axis| (axis.r#type == MeshAxisType::Explicit).then_some(axis.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
         assert_eq!(mesh.manual_axes(), vec!["c"]);
     }
 
@@ -1875,19 +1799,25 @@ mod tests {
         let mesh = test_logical_mesh_2x2();
         let updates = HashMap::from([("y".to_string(), MeshAxisType::Manual)]);
         let updated = mesh.with_updated_axis_types(&updates);
-        assert_eq!(updated.axis_types(), vec![MeshAxisType::Auto, MeshAxisType::Manual]);
+        assert_eq!(
+            updated.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
+            vec![MeshAxisType::Auto, MeshAxisType::Manual]
+        );
 
         // Unknown names are silently ignored.
         let updates = HashMap::from([("z".to_string(), MeshAxisType::Explicit)]);
         let updated = mesh.with_updated_axis_types(&updates);
-        assert_eq!(updated.axis_types(), vec![MeshAxisType::Auto, MeshAxisType::Auto]);
+        assert_eq!(
+            updated.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
+            vec![MeshAxisType::Auto, MeshAxisType::Auto]
+        );
     }
 
     #[test]
     fn test_logical_mesh_axis_names_and_sizes() {
         let mesh = test_logical_mesh_2x2();
-        assert_eq!(mesh.axis_names(), vec!["x", "y"]);
-        assert_eq!(mesh.axis_sizes(), vec![2, 2]);
+        assert_eq!(mesh.axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
+        assert_eq!(mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 2]);
     }
 
     #[test]
@@ -1898,20 +1828,19 @@ mod tests {
         ];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 0), MeshDevice::new(3, 0)];
         let mesh = DeviceMesh::new(axes, devices).unwrap();
-        assert_eq!(mesh.axis_types(), vec![MeshAxisType::Explicit, MeshAxisType::Manual]);
+        assert_eq!(
+            mesh.logical_mesh().axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
+            vec![MeshAxisType::Explicit, MeshAxisType::Manual]
+        );
     }
 
     #[test]
-    fn test_device_mesh_axis_type_delegation() {
+    fn test_device_mesh_exposes_logical_mesh_axis_metadata() {
         let mesh = test_device_mesh_2x2();
-        assert!(mesh.are_all_axes_auto());
-        assert!(!mesh.are_all_axes_explicit());
-        assert!(!mesh.are_all_axes_manual());
-        assert_eq!(mesh.auto_axes(), vec!["x", "y"]);
-        assert!(mesh.explicit_axes().is_empty());
+        assert!(mesh.logical_mesh().axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto));
         assert!(mesh.manual_axes().is_empty());
-        assert_eq!(mesh.axis_names(), vec!["x", "y"]);
-        assert_eq!(mesh.axis_sizes(), vec![2, 2]);
+        assert_eq!(mesh.logical_mesh().axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
+        assert_eq!(mesh.logical_mesh().axes.iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 2]);
     }
 
     #[test]

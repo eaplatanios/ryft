@@ -11,7 +11,7 @@ use ryft_mlir::{
 };
 
 use crate::parameters::Parameterized;
-use crate::sharding::{MeshAxis, ShardingError};
+use crate::sharding::ShardingError;
 use crate::tracing_v2::{
     AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
     operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp},
@@ -600,8 +600,8 @@ fn collect_nested_linear_shard_map_mesh(
 }
 
 fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, LoweringError> {
-    let mut merged_axes = existing.axes().iter().cloned().collect::<Vec<MeshAxis>>();
-    for incoming_axis in incoming.axes() {
+    let mut merged_axes = existing.axes.clone();
+    for incoming_axis in &incoming.axes {
         match existing.axis_size(incoming_axis.name.as_str()) {
             Some(existing_size) if existing_size != incoming_axis.size => {
                 return Err(LoweringError::IncompatibleNestedMeshes);
