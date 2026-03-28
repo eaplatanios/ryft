@@ -20,7 +20,9 @@ use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, Exe
 use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardingError};
 use crate::types::data_types::{DataType, DataTypeError};
 
-use super::sharding::{DeviceMesh, PartitionSpec, ShardDescriptor, ShardingContext, ShardingLayout};
+use crate::sharding::DeviceMesh;
+
+use super::sharding::{PartitionSpec, ShardDescriptor, ShardingContext, ShardingLayout};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -300,7 +302,7 @@ impl<'o> Array<'o> {
         't: 'c,
         L: Location<'c, 't>,
     {
-        self.layout.mesh().logical_mesh().to_shardy_mesh(location)
+        self.layout.mesh().logical_mesh.to_shardy_mesh(location)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
@@ -445,9 +447,10 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use crate::sharding::MeshDevice;
+    use crate::sharding::{DeviceMesh, LogicalMesh};
     use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::{DeviceMesh, PartitionDimension, PartitionSpec};
+    use crate::xla::sharding::{PartitionDimension, PartitionSpec};
 
     use super::*;
 
@@ -504,7 +507,11 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let mesh = DeviceMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()], mesh_devices).unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()]).unwrap(),
+            mesh_devices,
+        )
+        .unwrap();
 
         let lhs_partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);

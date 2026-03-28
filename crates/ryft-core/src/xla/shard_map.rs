@@ -1389,12 +1389,13 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use super::*;
+    use crate::sharding::DeviceMesh;
     use crate::sharding::MeshDevice;
     use crate::sharding::{MeshAxis, MeshAxisType};
     use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
     use crate::types::data_types::DataType;
     use crate::xla::arrays::Array;
-    use crate::xla::sharding::{DeviceMesh, PartitionDimension, PartitionSpec, ShardingContext};
+    use crate::xla::sharding::{PartitionDimension, PartitionSpec, ShardingContext};
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
@@ -1869,15 +1870,18 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let device_mesh =
-            DeviceMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()], mesh_devices).unwrap();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            mesh_devices,
+        )
+        .unwrap();
 
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
             global_input_type,
-            device_mesh.logical_mesh().clone(),
+            device_mesh.logical_mesh.clone(),
             partition_spec.clone(),
             partition_spec.clone(),
         )
@@ -1949,8 +1953,11 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let device_mesh =
-            DeviceMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Manual).unwrap()], mesh_devices).unwrap();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Manual).unwrap()]).unwrap(),
+            mesh_devices,
+        )
+        .unwrap();
 
         let lhs_partition_spec =
             PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
@@ -1964,7 +1971,7 @@ mod tests {
         let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
             |(lhs, rhs)| lhs.matmul(rhs),
             global_input_types,
-            device_mesh.logical_mesh().clone(),
+            device_mesh.logical_mesh.clone(),
             (lhs_partition_spec.clone(), rhs_partition_spec.clone()),
             output_partition_spec.clone(),
         )
@@ -2076,8 +2083,11 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let device_mesh =
-            DeviceMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()], mesh_devices).unwrap();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            mesh_devices,
+        )
+        .unwrap();
 
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
@@ -2093,7 +2103,7 @@ mod tests {
                 lanes[0].clone() + lanes[1].clone()
             },
             global_input_type,
-            device_mesh.logical_mesh().clone(),
+            device_mesh.logical_mesh.clone(),
             partition_spec.clone(),
             partition_spec.clone(),
         )
@@ -2198,14 +2208,17 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let device_mesh =
-            DeviceMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()], mesh_devices).unwrap();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            mesh_devices,
+        )
+        .unwrap();
         let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
-                let mesh = device_mesh.logical_mesh().clone();
+                let mesh = device_mesh.logical_mesh.clone();
                 let partition_spec = partition_spec.clone();
                 move |x: ShardMapTracer| {
                     grad(
@@ -2325,16 +2338,16 @@ mod tests {
             .iter()
             .map(|device| MeshDevice::new(device.id().unwrap(), device.process_index().unwrap()))
             .collect::<Vec<_>>();
-        let device_mesh =
-            DeviceMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()], mesh_devices).unwrap();
-
-        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
-        let shard_map = ShardMap::new(
-            device_mesh.logical_mesh().clone(),
-            vec![partition_spec.clone()],
-            vec![partition_spec.clone()],
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            mesh_devices,
         )
         .unwrap();
+
+        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
+        let shard_map =
+            ShardMap::new(device_mesh.logical_mesh.clone(), vec![partition_spec.clone()], vec![partition_spec.clone()])
+                .unwrap();
         assert_eq!(shard_map.local_input_shape(0, &[8]).unwrap(), vec![2]);
         assert_eq!(shard_map.local_output_shape(0, &[8]).unwrap(), vec![2]);
 

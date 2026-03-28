@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -71,6 +71,7 @@ pub struct MeshAxis {
 
 impl MeshAxis {
     /// Creates a new [`MeshAxis`].
+    #[inline]
     pub fn new<N: Into<String>>(name: N, size: usize, r#type: MeshAxisType) -> Result<Self, ShardingError> {
         let name = name.into();
         if name.is_empty() {
@@ -98,6 +99,7 @@ pub struct LogicalMesh {
 
 impl LogicalMesh {
     /// Creates a new [`LogicalMesh`].
+    #[inline]
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
         let mut axis_indices = HashMap::with_capacity(axes.len());
         for (axis_index, axis) in axes.iter().enumerate() {
@@ -145,8 +147,9 @@ pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
 
 #[cfg(feature = "xla")]
 impl LogicalMesh {
-    /// Constructs a new [`shardy::DetachedMeshOperation`] that corresponds to this [`LogicalMesh`].
+    /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`LogicalMesh`].
     /// The mesh in the returned operation will be named `"mesh"`.
+    #[inline]
     pub fn to_shardy_mesh<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
         location: L,
@@ -184,7 +187,83 @@ pub struct MeshDevice {
 
 impl MeshDevice {
     /// Creates a new [`MeshDevice`].
+    #[inline]
     pub fn new(id: MeshDeviceId, process_index: MeshProcessIndex) -> Self {
         Self { id, process_index }
+    }
+}
+
+/// Mesh of devices used by sharding layouts. A [`DeviceMesh`] organizes a set of [`MeshDevice`]s into a
+/// [`LogicalMesh`]. Devices are stored in **row-major order** with respect to the [`MeshAxis`] list (e.g.,
+/// for a two-dimensional mesh with axes `("data"=4, "model"=2)`, the device at mesh coordinate `(i, j)` has
+/// linear index `i * 2 + j`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceMesh {
+    /// Logical mesh topology that defines the names, sizes, and types of the mesh axes.
+    pub logical_mesh: LogicalMesh,
+
+    /// Physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
+    pub devices: Vec<MeshDevice>,
+}
+
+impl DeviceMesh {
+    /// Creates a new [`DeviceMesh`].
+    #[inline]
+    pub fn new(logical_mesh: LogicalMesh, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
+        let expected_device_count = logical_mesh.device_count();
+        if devices.len() != expected_device_count {
+            return Err(ShardingError::MeshDeviceCountMismatch {
+                expected_count: expected_device_count,
+                actual_count: devices.len(),
+            });
+        }
+
+        let mut seen_device_ids = HashSet::with_capacity(devices.len());
+        for device in &devices {
+            if !seen_device_ids.insert(device.id) {
+                return Err(ShardingError::DuplicateMeshDeviceId { id: device.id });
+            }
+        }
+
+        Ok(Self { logical_mesh, devices })
+    }
+
+    /// Returns the rank (i.e., number of axes) of this [`DeviceMesh`].
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.logical_mesh.rank()
+    }
+
+    /// Returns the size of the [`MeshAxis`] in this [`DeviceMesh`] with the provided name, if such an axis exists.
+    #[inline]
+    pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
+        self.logical_mesh.axis_size(axis_name)
+    }
+
+    /// Returns the type of the [`MeshAxis`] in this [`DeviceMesh`] with the provided name, if such an axis exists.
+    #[inline]
+    pub fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
+        self.logical_mesh.axis_type(axis_name)
+    }
+
+    /// Returns the total number of devices that the topology defined by this [`DeviceMesh`] contains.
+    #[inline]
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Returns the mesh coordinates of the [`MeshDevice`] at the provided index, if valid.
+    #[inline]
+    pub fn device_coordinates(&self, device_index: usize) -> Option<Vec<usize>> {
+        (device_index < self.devices.len()).then(|| {
+            let axis_sizes = self.logical_mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>();
+            let mut coordinates = vec![0usize; axis_sizes.len()];
+            let mut index = device_index;
+            for (axis_index, axis_size) in axis_sizes.iter().enumerate().rev() {
+                coordinates[axis_index] = index % axis_size;
+                index /= axis_size;
+            }
+            coordinates
+        })
     }
 }
