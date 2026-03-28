@@ -359,7 +359,7 @@ mod tests {
         let module = context.module(context.unknown_location());
         assert_eq!(
             module.body().append_operation(mesh.to_shardy_mesh(context.unknown_location())).to_string(),
-            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"z\"=1]>")
+            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"y\"=3, \"z\"=1]>"),
         );
     }
 
@@ -402,5 +402,23 @@ mod tests {
             ),
             Err(ShardingError::DuplicateMeshDeviceId { id }) if id == 0,
         ));
+    }
+
+    #[cfg(feature = "xla")]
+    #[test]
+    fn test_device_mesh_to_shardy_mesh() {
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let context = MlirContext::new();
+        let module = context.module(context.unknown_location());
+        assert_eq!(
+            module.body().append_operation(mesh.to_shardy_mesh(context.unknown_location())).to_string(),
+            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"y\"=2]>"),
+        );
     }
 }
