@@ -306,6 +306,28 @@ pub(crate) fn escape_shardy_string(value: &str) -> String {
 /// validated when creating a [`NamedSharding`], not at `PartitionSpec` construction
 /// time, because validation requires knowing the mesh.
 ///
+/// # Ranked dimensions vs unreduced axes
+///
+/// `dimensions` is indexed by tensor rank, while `unreduced_axes` is not. The former says how
+/// each tensor dimension is partitioned; the latter records mesh axes that still carry
+/// partial-reduction state even though they do not correspond to any tensor dimension.
+///
+/// ```ignore
+/// let spec = PartitionSpec::new(vec![
+///     PartitionDimension::sharded(["data"]),
+///     PartitionDimension::unsharded(),
+/// ])
+/// .with_unreduced_axes(["model"]);
+///
+/// assert_eq!(spec.dimensions.len(), 2);
+/// assert_eq!(spec.unreduced_axes, vec!["model"]);
+/// ```
+///
+/// In this example, `"data"` partitions tensor dimension `0`, while `"model"` does not shard any
+/// ranked dimension and instead marks the value as still unreduced along the mesh axis `"model"`.
+/// Without `unreduced_axes`, that unused mesh axis would be indistinguishable from a truly
+/// replicated axis.
+///
 /// # Shardy representation
 ///
 /// Rendered as a bracket-enclosed list of dimension shardings via
