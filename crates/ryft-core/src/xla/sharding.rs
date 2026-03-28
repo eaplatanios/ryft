@@ -153,14 +153,12 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-#[cfg(test)]
-use ryft_mlir::Block;
 use ryft_mlir::Context as MlirContext;
 use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, TensorShardingAttributeRef};
 
 use crate::parameters::Parameter;
 use crate::sharding::{
-    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId, SHARDY_MESH_SYMBOL_NAME, ShardingError,
+    DeviceMesh, LogicalMesh, MeshAxisType, MeshDevice, MeshDeviceId, SHARDY_MESH_SYMBOL_NAME, ShardingError,
 };
 
 // ---------------------------------------------------------------------------
@@ -962,6 +960,8 @@ fn used_axes_in_partition_spec(partition_spec: &PartitionSpec) -> HashSet<&str> 
 
 #[cfg(test)]
 mod tests {
+    use crate::sharding::MeshAxis;
+
     use super::*;
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
@@ -980,97 +980,6 @@ mod tests {
         .unwrap();
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
         DeviceMesh::new(logical_mesh, devices).unwrap()
-    }
-
-    // -----------------------------------------------------------------------
-    // LogicalMesh tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_logical_mesh_construction_and_lookups() {
-        let mesh = test_logical_mesh_2x2();
-        assert_eq!(mesh.axes.len(), 2);
-        assert_eq!(mesh.axis_indices.get("x"), Some(&0));
-        assert_eq!(mesh.axis_indices.get("y"), Some(&1));
-        assert_eq!(mesh.axis_indices.get("z"), None);
-        assert_eq!(mesh.axis_size("x"), Some(2));
-        assert_eq!(mesh.axis_size("y"), Some(2));
-        assert_eq!(mesh.device_count(), 4);
-    }
-
-    #[test]
-    fn test_logical_mesh_validation() {
-        let axes = vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("x", 3, MeshAxisType::Auto).unwrap(),
-        ];
-        assert!(matches!(
-            LogicalMesh::new(axes),
-            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
-        ));
-    }
-
-    #[test]
-    fn test_logical_mesh_shardy_rendering() {
-        let mesh = test_logical_mesh_2x2();
-        let context = MlirContext::new();
-        let module = context.module(context.unknown_location());
-        assert_eq!(
-            module.body().append_operation(mesh.to_shardy_mesh(context.unknown_location())).to_string(),
-            "sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // DeviceMesh tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_device_mesh_construction_preserves_logical_mesh_data() {
-        let logical_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
-        let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
-        assert_eq!(mesh.logical_mesh.axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
-        assert_eq!(mesh.device_count(), 4);
-    }
-
-    #[test]
-    fn test_device_mesh_coordinate_mapping_by_index() {
-        let mesh = test_device_mesh_2x2();
-        assert_eq!(mesh.device_coordinates(0), Some(vec![0, 0]));
-        assert_eq!(mesh.device_coordinates(1), Some(vec![0, 1]));
-        assert_eq!(mesh.device_coordinates(2), Some(vec![1, 0]));
-        assert_eq!(mesh.device_coordinates(3), Some(vec![1, 1]));
-        assert_eq!(mesh.device_coordinates(99), None);
-    }
-
-    #[test]
-    fn test_device_mesh_validation() {
-        assert!(matches!(MeshAxis::new("", 4, MeshAxisType::Auto), Err(ShardingError::EmptyMeshAxisName)));
-        assert!(matches!(
-            MeshAxis::new("x", 0, MeshAxisType::Auto),
-            Err(ShardingError::EmptyMeshAxis { name }) if name == "x",
-        ));
-
-        let axes = vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-        ];
-        assert!(matches!(
-            LogicalMesh::new(axes),
-            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
-        ));
-
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(0, 0)];
-        assert!(matches!(
-            DeviceMesh::new(logical_mesh, devices),
-            Err(ShardingError::DuplicateMeshDeviceId { id }) if id == 0,
-        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1356,148 +1265,5 @@ mod tests {
 
         assert_eq!(layout.mesh(), &mesh);
         assert_eq!(layout.partition_spec(), &partition_spec);
-    }
-
-    // -----------------------------------------------------------------------
-    // MeshAxisType tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_mesh_axis_type_default() {
-        assert_eq!(MeshAxisType::default(), MeshAxisType::Auto);
-    }
-
-    #[test]
-    fn test_mesh_axis_default_type() {
-        let axis = MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap();
-        assert_eq!(axis.r#type, MeshAxisType::Auto);
-    }
-
-    #[test]
-    fn test_mesh_axis_with_explicit_type() {
-        let axis = MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap();
-        assert_eq!(axis.r#type, MeshAxisType::Manual);
-    }
-
-    #[test]
-    fn test_logical_mesh_default_axis_types() {
-        let mesh = test_logical_mesh_2x2();
-        assert_eq!(
-            mesh.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
-            vec![MeshAxisType::Auto, MeshAxisType::Auto]
-        );
-    }
-
-    #[test]
-    fn test_logical_mesh_preserves_axis_types_from_axes() {
-        let axes = vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ];
-        let mesh = LogicalMesh::new(axes).unwrap();
-        assert_eq!(
-            mesh.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
-            vec![MeshAxisType::Manual, MeshAxisType::Explicit]
-        );
-    }
-
-    #[test]
-    fn test_logical_mesh_axis_type_queries() {
-        // All auto.
-        let mesh = test_logical_mesh_2x2();
-        assert!(mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto));
-        assert!(mesh.axes.iter().all(|axis| axis.r#type != MeshAxisType::Explicit));
-        assert!(mesh.axes.iter().all(|axis| axis.r#type != MeshAxisType::Manual));
-        assert_eq!(
-            mesh.axes
-                .iter()
-                .filter_map(|axis| (axis.r#type == MeshAxisType::Auto).then_some(axis.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec!["x", "y"]
-        );
-        assert!(
-            mesh.axes
-                .iter()
-                .filter_map(|axis| (axis.r#type == MeshAxisType::Explicit).then_some(axis.name.as_str()))
-                .collect::<Vec<_>>()
-                .is_empty()
-        );
-        assert!(
-            mesh.axes
-                .iter()
-                .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
-                .collect::<Vec<_>>()
-                .is_empty()
-        );
-
-        // Mixed types.
-        let axes = vec![
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("b", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("c", 2, MeshAxisType::Manual).unwrap(),
-        ];
-        let mesh = LogicalMesh::new(axes).unwrap();
-        assert!(!mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto));
-        assert!(!mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Explicit));
-        assert!(!mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Manual));
-        assert_eq!(
-            mesh.axes
-                .iter()
-                .filter_map(|axis| (axis.r#type == MeshAxisType::Auto).then_some(axis.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec!["a"]
-        );
-        assert_eq!(
-            mesh.axes
-                .iter()
-                .filter_map(|axis| (axis.r#type == MeshAxisType::Explicit).then_some(axis.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec!["b"]
-        );
-        assert_eq!(
-            mesh.axes
-                .iter()
-                .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec!["c"]
-        );
-    }
-
-    #[test]
-    fn test_logical_mesh_axis_names_and_sizes() {
-        let mesh = test_logical_mesh_2x2();
-        assert_eq!(mesh.axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
-        assert_eq!(mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 2]);
-    }
-
-    #[test]
-    fn test_device_mesh_preserves_axis_types_from_axes() {
-        let logical_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 0), MeshDevice::new(3, 0)];
-        let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
-        assert_eq!(
-            mesh.logical_mesh.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
-            vec![MeshAxisType::Explicit, MeshAxisType::Manual]
-        );
-    }
-
-    #[test]
-    fn test_device_mesh_exposes_logical_mesh_axis_metadata() {
-        let mesh = test_device_mesh_2x2();
-        assert!(mesh.logical_mesh.axes.iter().all(|axis| axis.r#type == MeshAxisType::Auto));
-        assert!(
-            mesh.logical_mesh
-                .axes
-                .iter()
-                .filter(|axis| axis.r#type == MeshAxisType::Manual)
-                .collect::<Vec<_>>()
-                .is_empty()
-        );
-        assert_eq!(mesh.logical_mesh.axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
-        assert_eq!(mesh.logical_mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 2]);
     }
 }

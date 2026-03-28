@@ -6,9 +6,7 @@ use std::{
 };
 
 #[cfg(feature = "xla")]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(feature = "xla")]
-use ryft_mlir::{Block, Operation, Value, ValueRef};
+use ryft_mlir::ValueRef;
 
 use crate::tracing_v2::{
     FloatExt, TraceError, TransformLeaf, ZeroLike,

@@ -11,7 +11,7 @@ use ryft_mlir::{
 };
 
 use crate::parameters::Parameterized;
-use crate::sharding::{LogicalMesh, SHARDY_MESH_SYMBOL_NAME, ShardingError};
+use crate::sharding::{LogicalMesh, ShardingError};
 use crate::tracing_v2::{
     AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
     operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp},

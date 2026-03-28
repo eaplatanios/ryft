@@ -103,12 +103,6 @@ impl LogicalMesh {
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
         let mut axis_indices = HashMap::with_capacity(axes.len());
         for (axis_index, axis) in axes.iter().enumerate() {
-            if axis.name.is_empty() {
-                return Err(ShardingError::EmptyMeshAxisName);
-            }
-            if axis.size == 0 {
-                return Err(ShardingError::EmptyMeshAxis { name: axis.name.clone() });
-            }
             if axis_indices.insert(axis.name.clone(), axis_index).is_some() {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
             }
@@ -265,5 +259,148 @@ impl DeviceMesh {
             }
             coordinates
         })
+    }
+}
+
+#[cfg(feature = "xla")]
+impl DeviceMesh {
+    /// Creates a new [`shardy::DetachedMeshOperation`] that corresponds to this [`DeviceMesh`].
+    /// The mesh in the returned operation will be named `"mesh"`.
+    #[inline]
+    pub fn to_shardy_mesh<'c, 't: 'c, L: Location<'c, 't>>(
+        &self,
+        location: L,
+    ) -> shardy::DetachedMeshOperation<'c, 't> {
+        self.logical_mesh.to_shardy_mesh(location)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    #[cfg(feature = "xla")]
+    use ryft_mlir::{Block, Context as MlirContext};
+
+    use super::*;
+
+    #[test]
+    fn test_mesh_axis_type() {
+        assert_eq!(MeshAxisType::default(), MeshAxisType::Auto);
+    }
+
+    #[test]
+    fn test_mesh_axis() {
+        let axis = MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap();
+        assert_eq!(axis.name, "x");
+        assert_eq!(axis.size, 2);
+        assert_eq!(axis.r#type, MeshAxisType::Auto);
+
+        let axis = MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap();
+        assert_eq!(axis.name, "y");
+        assert_eq!(axis.size, 3);
+        assert_eq!(axis.r#type, MeshAxisType::Manual);
+
+        assert!(matches!(MeshAxis::new("", 4, MeshAxisType::Auto), Err(ShardingError::EmptyMeshAxisName)));
+        assert!(matches!(
+            MeshAxis::new("x", 0, MeshAxisType::Auto),
+            Err(ShardingError::EmptyMeshAxis { name }) if name == "x",
+        ));
+    }
+
+    #[test]
+    fn test_logical_mesh() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(mesh.axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y", "z"]);
+        assert_eq!(mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert_eq!(
+            mesh.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
+            vec![MeshAxisType::Auto, MeshAxisType::Manual, MeshAxisType::Explicit]
+        );
+        assert_eq!(mesh.axis_indices.get("x"), Some(&0));
+        assert_eq!(mesh.axis_indices.get("y"), Some(&1));
+        assert_eq!(mesh.axis_indices.get("z"), Some(&2));
+        assert_eq!(mesh.axis_indices.get("w"), None);
+        assert_eq!(mesh.rank(), 3);
+        assert_eq!(mesh.axis_size("x"), Some(2));
+        assert_eq!(mesh.axis_size("y"), Some(3));
+        assert_eq!(mesh.axis_size("z"), Some(1));
+        assert_eq!(mesh.axis_size("w"), None);
+        assert_eq!(mesh.axis_type("x"), Some(MeshAxisType::Auto));
+        assert_eq!(mesh.axis_type("y"), Some(MeshAxisType::Manual));
+        assert_eq!(mesh.axis_type("z"), Some(MeshAxisType::Explicit));
+        assert_eq!(mesh.axis_type("w"), None);
+        assert_eq!(mesh.device_count(), 6);
+
+        assert!(matches!(
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+                MeshAxis::new("x", 3, MeshAxisType::Auto).unwrap(),
+            ]),
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
+        ));
+    }
+
+    #[cfg(feature = "xla")]
+    #[test]
+    fn test_logical_mesh_to_shardy_mesh() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let context = MlirContext::new();
+        let module = context.module(context.unknown_location());
+        assert_eq!(
+            module.body().append_operation(mesh.to_shardy_mesh(context.unknown_location())).to_string(),
+            format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"z\"=1]>")
+        );
+    }
+
+    #[test]
+    fn test_device_mesh() {
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        assert_eq!(&mesh.logical_mesh, &logical_mesh);
+        assert_eq!(&mesh.devices, &devices);
+        assert_eq!(mesh.rank(), 2);
+        assert_eq!(mesh.axis_size("x"), Some(2));
+        assert_eq!(mesh.axis_size("y"), Some(2));
+        assert_eq!(mesh.axis_size("z"), None);
+        assert_eq!(mesh.axis_type("x"), Some(MeshAxisType::Auto));
+        assert_eq!(mesh.axis_type("y"), Some(MeshAxisType::Manual));
+        assert_eq!(mesh.axis_type("z"), None);
+        assert_eq!(mesh.device_count(), 4);
+        assert_eq!(mesh.device_coordinates(0), Some(vec![0, 0]));
+        assert_eq!(mesh.device_coordinates(1), Some(vec![0, 1]));
+        assert_eq!(mesh.device_coordinates(2), Some(vec![1, 0]));
+        assert_eq!(mesh.device_coordinates(3), Some(vec![1, 1]));
+        assert_eq!(mesh.device_coordinates(4), None);
+
+        assert!(matches!(
+            DeviceMesh::new(
+                logical_mesh.clone(),
+                vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1)],
+            ),
+            Err(ShardingError::MeshDeviceCountMismatch { expected_count: 4, actual_count: 3 }),
+        ));
+        assert!(matches!(
+            DeviceMesh::new(
+                logical_mesh.clone(),
+                vec![MeshDevice::new(0, 0), MeshDevice::new(0, 0), MeshDevice::new(1, 1), MeshDevice::new(2, 1)],
+            ),
+            Err(ShardingError::DuplicateMeshDeviceId { id }) if id == 0,
+        ));
     }
 }
