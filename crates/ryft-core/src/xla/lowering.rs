@@ -1774,12 +1774,13 @@ mod tests {
     #[test]
     fn test_to_mlir_module_renders_a_full_add_module() {
         let global_input_type = test_vector_type(8);
+        let mesh = test_manual_mesh("x", 4);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |x| x.clone() + x,
             global_input_type,
-            test_manual_mesh("x", 4),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
+            mesh.clone(),
+            ShardingSpecification::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
+            ShardingSpecification::new(mesh, vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
         )
         .unwrap();
 
@@ -1803,6 +1804,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_renders_constants_and_supported_ops() {
         let global_input_type = test_matrix_type(4, 4);
+        let mesh = test_manual_mesh("x", 2);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |x| {
                 let product = x.clone().transpose_matrix().matmul(x);
@@ -1810,15 +1812,19 @@ mod tests {
                 (waveform.clone() * waveform.one_like()) + waveform.zero_like()
             },
             global_input_type,
-            test_manual_mesh("x", 2),
+            mesh.clone(),
             ShardingSpecification::new(
+                mesh.clone(),
                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
                 vec![],
-            ),
+            )
+            .unwrap(),
             ShardingSpecification::new(
+                mesh,
                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
                 vec![],
-            ),
+            )
+            .unwrap(),
         )
         .unwrap();
 

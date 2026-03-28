@@ -8,4 +8,4 @@ pub mod sharding;
 pub use arrays::{AddressableShard, Array, ArrayError, ExecuteArguments};
 pub use shard_map::{ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, trace};
 
-pub use sharding::{NamedSharding, ShardDescriptor, ShardSlice, ShardingLayout, ShardingSpecification};
+pub use sharding::{ShardDescriptor, ShardSlice, ShardingLayout, ShardingSpecification};

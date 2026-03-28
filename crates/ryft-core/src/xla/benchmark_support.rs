@@ -57,18 +57,23 @@ fn nested_inner_mesh() -> LogicalMesh {
 }
 
 /// Returns a one-dimensional sharded sharding specification.
-fn sharded_1d_sharding_specification() -> ShardingSpecification {
-    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![])
+fn sharded_1d_sharding_specification(mesh: &LogicalMesh) -> ShardingSpecification {
+    ShardingSpecification::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap()
 }
 
 /// Returns a two-dimensional row-sharded sharding specification.
-fn row_sharded_sharding_specification() -> ShardingSpecification {
-    ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![])
+fn row_sharded_sharding_specification(mesh: &LogicalMesh) -> ShardingSpecification {
+    ShardingSpecification::new(
+        mesh.clone(),
+        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        vec![],
+    )
+    .unwrap()
 }
 
 /// Returns a two-dimensional replicated sharding specification.
-fn replicated_2d_sharding_specification() -> ShardingSpecification {
-    ShardingSpecification::replicated(2)
+fn replicated_2d_sharding_specification(mesh: &LogicalMesh) -> ShardingSpecification {
+    ShardingSpecification::replicated(mesh.clone(), 2)
 }
 
 /// Returns a rank-1 benchmark array type.
@@ -179,10 +184,11 @@ where
 
 /// Emits the basic traced `shard_map` benchmark.
 fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let sharding_specification = sharded_1d_sharding_specification();
+    let mesh = benchmark_mesh();
+    let sharding_specification = sharded_1d_sharding_specification(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
-            let mesh = benchmark_mesh();
+            let mesh = mesh.clone();
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| local_x.sin(),
@@ -201,12 +207,13 @@ fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 
 /// Emits the traced `shard_map` matrix-multiplication benchmark.
 fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let lhs_spec = row_sharded_sharding_specification();
-    let rhs_spec = replicated_2d_sharding_specification();
-    let out_spec = row_sharded_sharding_specification();
+    let mesh = benchmark_mesh();
+    let lhs_spec = row_sharded_sharding_specification(&mesh);
+    let rhs_spec = replicated_2d_sharding_specification(&mesh);
+    let out_spec = row_sharded_sharding_specification(&mesh);
     let traced: TracedXlaProgram<(ArrayType, ArrayType), ArrayType> = trace(
         {
-            let mesh = benchmark_mesh();
+            let mesh = mesh.clone();
             move |inputs: (ShardMapTracer, ShardMapTracer)| {
                 shard_map::<_, (ShardMapTracer, ShardMapTracer), ArrayType, ShardMapTracer>(
                     |(lhs, rhs)| lhs.matmul(rhs),
@@ -225,10 +232,11 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 
 /// Emits the traced reverse-mode-around-`shard_map` benchmark.
 fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let sharding_specification = sharded_1d_sharding_specification();
+    let mesh = benchmark_mesh();
+    let sharding_specification = sharded_1d_sharding_specification(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
-            let mesh = benchmark_mesh();
+            let mesh = mesh.clone();
             move |x: ShardMapTracer| {
                 grad(
                     {
@@ -261,10 +269,11 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
 
 /// Emits the traced reverse-mode-inside-`shard_map` benchmark.
 fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let sharding_specification = sharded_1d_sharding_specification();
+    let mesh = benchmark_mesh();
+    let sharding_specification = sharded_1d_sharding_specification(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
-            let mesh = benchmark_mesh();
+            let mesh = mesh.clone();
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
@@ -289,12 +298,15 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
 
 /// Emits the nested traced `shard_map` benchmark.
 fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let outer_sharding_specification = sharded_1d_sharding_specification();
-    let inner_sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["y"])], vec![]);
+    let outer_mesh = nested_outer_mesh();
+    let inner_mesh = nested_inner_mesh();
+    let outer_sharding_specification = sharded_1d_sharding_specification(&outer_mesh);
+    let inner_sharding_specification =
+        ShardingSpecification::new(inner_mesh.clone(), vec![ShardingDimension::sharded(["y"])], vec![]).unwrap();
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
-            let outer_mesh = nested_outer_mesh();
-            let inner_mesh = nested_inner_mesh();
+            let outer_mesh = outer_mesh.clone();
+            let inner_mesh = inner_mesh.clone();
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     {
@@ -330,10 +342,11 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 
 /// Emits the traced `shard_map` benchmark that composes reverse mode and batching inside the body.
 fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let sharding_specification = sharded_1d_sharding_specification();
+    let mesh = benchmark_mesh();
+    let sharding_specification = sharded_1d_sharding_specification(&mesh);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
-            let mesh = benchmark_mesh();
+            let mesh = mesh.clone();
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {

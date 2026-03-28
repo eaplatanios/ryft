@@ -21,8 +21,7 @@
 //!
 //! # Relationship to existing sharding types
 //!
-//! The public [`shard_map`] function accepts structured [`ShardingSpecification`] values and internally
-//! lowers them to [`NamedSharding`] values.
+//! The public [`shard_map`] function accepts structured mesh-bound [`ShardingSpecification`] values.
 //!
 //! The shard-map implementation derives its manual axes from the mesh itself: every axis whose type is
 //! [`Manual`](crate::sharding::MeshAxisType::Manual) is treated as manual for the
@@ -69,7 +68,7 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Shape, Size, Typed};
 
 use super::lowering::LoweringError;
-use super::sharding::{NamedSharding, ShardingSpecification};
+use super::sharding::ShardingSpecification;
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -525,17 +524,16 @@ where
 /// The manual axes are not stored separately; they are always derived from the mesh axes whose
 /// type is [`Manual`](crate::sharding::MeshAxisType::Manual).
 ///
-/// The public constructors accept [`ShardingSpecification`] values because that is the natural
-/// JAX-facing surface. Internally, those sharding specifications are converted to [`NamedSharding`]
-/// values and then projected into traced/type-level semantics, so `Auto` mesh axes remain
-/// hidden while `Manual` axes still drive the manual-computation body.
+/// The public constructors accept [`ShardingSpecification`] values and project them into
+/// traced/type-level semantics, so `Auto` mesh axes remain hidden while `Manual` axes still
+/// drive the manual-computation body.
 ///
 /// Reference: https://docs.jax.dev/en/latest/notebooks/shard_map.html.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShardMap {
     mesh: LogicalMesh,
-    in_shardings: Vec<NamedSharding>,
-    out_shardings: Vec<NamedSharding>,
+    in_shardings: Vec<ShardingSpecification>,
+    out_shardings: Vec<ShardingSpecification>,
 }
 
 impl ShardMap {
@@ -555,16 +553,16 @@ impl ShardMap {
         in_specs: Vec<ShardingSpecification>,
         out_specs: Vec<ShardingSpecification>,
     ) -> Result<Self, ShardMapError> {
-        let in_shardings = build_named_shardings(&mesh, in_specs, "input")?;
-        let out_shardings = build_named_shardings(&mesh, out_specs, "output")?;
+        let in_shardings = build_shardings(&mesh, in_specs, "input")?;
+        let out_shardings = build_shardings(&mesh, out_specs, "output")?;
         Ok(Self { mesh, in_shardings, out_shardings })
     }
 
     /// Builds a shard map directly from already-validated shardings.
     pub(crate) fn from_shardings(
         mesh: LogicalMesh,
-        in_shardings: Vec<NamedSharding>,
-        out_shardings: Vec<NamedSharding>,
+        in_shardings: Vec<ShardingSpecification>,
+        out_shardings: Vec<ShardingSpecification>,
     ) -> Self {
         Self { mesh, in_shardings, out_shardings }
     }
@@ -575,12 +573,12 @@ impl ShardMap {
     }
 
     /// Returns the validated per-input shardings.
-    pub(crate) fn in_shardings(&self) -> &[NamedSharding] {
+    pub(crate) fn in_shardings(&self) -> &[ShardingSpecification] {
         self.in_shardings.as_slice()
     }
 
     /// Returns the validated per-output shardings.
-    pub(crate) fn out_shardings(&self) -> &[NamedSharding] {
+    pub(crate) fn out_shardings(&self) -> &[ShardingSpecification] {
         self.out_shardings.as_slice()
     }
 
@@ -955,8 +953,7 @@ where
         .map(|(output_index, local_output_type)| {
             ensure_static_array_type(&local_output_type, "output", output_index)?;
             let global_shape = global_shape_for_sharding(
-                shard_map.out_shardings()[output_index].sharding_specification(),
-                shard_map.mesh(),
+                &shard_map.out_shardings()[output_index],
                 static_shape_values(&local_output_type, "output", output_index)?,
                 output_index,
             )?;
@@ -1004,7 +1001,6 @@ fn static_shape_values(
 
 fn global_shape_for_sharding(
     sharding_specification: &ShardingSpecification,
-    mesh: &LogicalMesh,
     local_shape: Vec<usize>,
     output_index: usize,
 ) -> Result<Vec<usize>, ShardMapTraceError> {
@@ -1017,7 +1013,8 @@ fn global_shape_for_sharding(
         });
     }
 
-    let manual_axis_names = mesh
+    let manual_axis_names = sharding_specification
+        .mesh()
         .axes
         .iter()
         .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
@@ -1033,7 +1030,7 @@ fn global_shape_for_sharding(
                     .iter()
                     .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                     .try_fold(1usize, |partition_count, axis_name| {
-                        let axis_size = mesh.axis_size(axis_name).ok_or_else(|| {
+                        let axis_size = sharding_specification.mesh().axis_size(axis_name).ok_or_else(|| {
                             ShardMapTraceError::ShardingError(ShardingError::UnknownMeshAxisName {
                                 name: axis_name.clone(),
                             })
@@ -1056,19 +1053,25 @@ fn global_shape_for_sharding(
         .collect()
 }
 
-fn build_named_shardings(
+fn build_shardings(
     mesh: &LogicalMesh,
     sharding_specifications: Vec<ShardingSpecification>,
     value_kind: &'static str,
-) -> Result<Vec<NamedSharding>, ShardMapError> {
+) -> Result<Vec<ShardingSpecification>, ShardMapError> {
     let manual_axes = manual_axes_from_mesh(mesh)?;
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     sharding_specifications
         .into_iter()
         .enumerate()
         .map(|(value_index, sharding_specification)| {
+            if sharding_specification.mesh() != mesh {
+                return Err(ShardMapError::ShardingError(ShardingError::MeshMismatch {
+                    expected: mesh.clone(),
+                    actual: sharding_specification.mesh().clone(),
+                }));
+            }
             validate_manual_axis_order(&sharding_specification, &manual_axis_names, value_kind, value_index)?;
-            Ok(NamedSharding::new(mesh.clone(), sharding_specification)?.project_for_traced_sharding())
+            Ok(sharding_specification.project_for_traced_sharding())
         })
         .collect()
 }
@@ -1130,17 +1133,16 @@ fn used_axes_in_sharding_specification(sharding_specification: &ShardingSpecific
 }
 
 fn local_shape_for_sharding(
-    sharding: &NamedSharding,
+    sharding: &ShardingSpecification,
     global_shape: &[usize],
     value_kind: &'static str,
     value_index: usize,
 ) -> Result<Vec<usize>, ShardMapError> {
-    let sharding_specification = sharding.sharding_specification();
-    if sharding_specification.rank() != global_shape.len() {
+    if sharding.rank() != global_shape.len() {
         return Err(ShardMapError::RankMismatch {
             value_kind,
             value_index,
-            partition_rank: sharding_specification.rank(),
+            partition_rank: sharding.rank(),
             shape_rank: global_shape.len(),
         });
     }
@@ -1153,7 +1155,7 @@ fn local_shape_for_sharding(
         .collect::<HashSet<_>>();
     let mut local_shape = Vec::with_capacity(global_shape.len());
     for (dimension, (partition_dimension, dimension_size)) in
-        sharding_specification.dimensions.iter().zip(global_shape.iter().copied()).enumerate()
+        sharding.dimensions.iter().zip(global_shape.iter().copied()).enumerate()
     {
         let manual_partition_count = match partition_dimension {
             ShardingDimension::Sharded(axis_names) => axis_names
@@ -1185,7 +1187,7 @@ fn local_shape_for_sharding(
 }
 
 #[cfg(test)]
-fn render_shardy_sharding_list(shardings: &[NamedSharding]) -> String {
+fn render_shardy_sharding_list(shardings: &[ShardingSpecification]) -> String {
     let mut result = String::from("[");
     for (sharding_index, sharding) in shardings.iter().enumerate() {
         if sharding_index > 0 {
@@ -1198,7 +1200,7 @@ fn render_shardy_sharding_list(shardings: &[NamedSharding]) -> String {
 }
 
 fn shardy_tensor_sharding_per_value<'c, 't>(
-    shardings: &[NamedSharding],
+    shardings: &[ShardingSpecification],
     context: &'c MlirContext<'t>,
 ) -> TensorShardingPerValueAttributeRef<'c, 't> {
     let shardings = shardings
@@ -1209,19 +1211,17 @@ fn shardy_tensor_sharding_per_value<'c, 't>(
 }
 
 fn manual_computation_tensor_sharding<'c, 't>(
-    sharding: &NamedSharding,
+    sharding: &ShardingSpecification,
     context: &'c MlirContext<'t>,
 ) -> TensorShardingAttributeRef<'c, 't> {
     let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
-    let dim_shardings =
-        manual_computation_dimension_shardings(sharding.mesh(), sharding.sharding_specification(), context);
+    let dim_shardings = manual_computation_dimension_shardings(sharding, context);
     let replicated_axis_names = sharding.replicated_axes();
     let replicated_axes = replicated_axis_names
         .iter()
         .map(|axis_name| context.shardy_axis_ref(axis_name, None))
         .collect::<Vec<_>>();
     let unreduced_axes = sharding
-        .sharding_specification()
         .unreduced_axes
         .iter()
         .map(|axis_name| context.shardy_axis_ref(axis_name, None))
@@ -1235,16 +1235,17 @@ fn manual_computation_tensor_sharding<'c, 't>(
 }
 
 fn manual_computation_dimension_shardings<'c, 't>(
-    mesh: &LogicalMesh,
     sharding_specification: &ShardingSpecification,
     context: &'c MlirContext<'t>,
 ) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
-    let manual_axis_names = mesh
+    let manual_axis_names = sharding_specification
+        .mesh()
         .axes
         .iter()
         .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
         .collect::<HashSet<_>>();
-    let free_axis_names = mesh
+    let free_axis_names = sharding_specification
+        .mesh()
         .axes
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
@@ -1270,13 +1271,11 @@ fn manual_computation_dimension_shardings<'c, 't>(
 }
 
 #[cfg(test)]
-fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
-    let mut result = format!(
-        "<@{SHARDY_MESH_SYMBOL_NAME}, {}",
-        render_manual_computation_dimensions(sharding.mesh(), sharding.sharding_specification())
-    );
+fn stripped_shardy_tensor_sharding(sharding: &ShardingSpecification) -> String {
+    let mut result = format!("<@{SHARDY_MESH_SYMBOL_NAME}, {}>", render_manual_computation_dimensions(sharding));
 
     let replicated_axes = sharding.replicated_axes();
+    result.pop();
     if !replicated_axes.is_empty() {
         result.push_str(", replicated={");
         for (axis_index, axis_name) in replicated_axes.iter().enumerate() {
@@ -1290,9 +1289,9 @@ fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
         result.push('}');
     }
 
-    if !sharding.sharding_specification().unreduced_axes.is_empty() {
+    if !sharding.unreduced_axes.is_empty() {
         result.push_str(", unreduced={");
-        for (axis_index, axis_name) in sharding.sharding_specification().unreduced_axes.iter().enumerate() {
+        for (axis_index, axis_name) in sharding.unreduced_axes.iter().enumerate() {
             if axis_index > 0 {
                 result.push_str(", ");
             }
@@ -1308,13 +1307,15 @@ fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
 }
 
 #[cfg(test)]
-fn render_manual_computation_dimensions(mesh: &LogicalMesh, sharding_specification: &ShardingSpecification) -> String {
-    let manual_axis_names = mesh
+fn render_manual_computation_dimensions(sharding_specification: &ShardingSpecification) -> String {
+    let manual_axis_names = sharding_specification
+        .mesh()
         .axes
         .iter()
         .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
         .collect::<HashSet<_>>();
-    let free_axis_names = mesh
+    let free_axis_names = sharding_specification
+        .mesh()
         .axes
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
@@ -1431,6 +1432,14 @@ mod tests {
         .unwrap()
     }
 
+    fn test_sharding(
+        mesh: &LogicalMesh,
+        dimensions: Vec<ShardingDimension>,
+        unreduced_axes: Vec<String>,
+    ) -> ShardingSpecification {
+        ShardingSpecification::new(mesh.clone(), dimensions, unreduced_axes).unwrap()
+    }
+
     fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
         CompilationOptions {
             argument_layouts: Vec::new(),
@@ -1485,10 +1494,11 @@ mod tests {
 
     #[test]
     fn test_shard_map_uses_manual_axes_from_mesh() {
+        let mesh = test_logical_mesh_2x2();
         let shard_map = ShardMap::new(
-            test_logical_mesh_2x2(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![])],
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
         )
         .unwrap();
 
@@ -1500,12 +1510,13 @@ mod tests {
     #[test]
     fn test_shard_map_function_rejects_mesh_without_manual_axes() {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let mesh = test_logical_mesh_without_manual_axes();
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
             |x| x.clone() + x,
             global_input_type,
-            test_logical_mesh_without_manual_axes(),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
+            mesh.clone(),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
         );
 
         assert!(matches!(result, Err(ShardMapTraceError::MeshHasNoManualAxes)));
@@ -1513,9 +1524,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_rejects_free_axis_before_manual_axis() {
+        let mesh = test_logical_mesh_data_model();
         let result = ShardMap::new(
-            test_logical_mesh_data_model(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["model", "data"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["model", "data"])], vec![])],
             Vec::new(),
         );
 
@@ -1533,9 +1545,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_local_input_shape_for_all_manual_axes() {
+        let mesh = test_logical_mesh_2x2();
         let shard_map = ShardMap::new(
-            test_logical_mesh_2x2(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["x", "y"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x", "y"])], vec![])],
             Vec::new(),
         )
         .unwrap();
@@ -1545,9 +1558,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_local_input_shape_for_mixed_manual_and_free_axes() {
+        let mesh = test_logical_mesh_data_model();
         let shard_map = ShardMap::new(
-            test_logical_mesh_data_model(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["data", "model"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![])],
             Vec::new(),
         )
         .unwrap();
@@ -1557,10 +1571,12 @@ mod tests {
 
     #[test]
     fn test_shard_map_local_output_shape() {
+        let mesh = test_logical_mesh_data_model();
         let shard_map = ShardMap::new(
-            test_logical_mesh_data_model(),
+            mesh.clone(),
             Vec::new(),
-            vec![ShardingSpecification::new(
+            vec![test_sharding(
+                &mesh,
                 vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
                 vec![],
             )],
@@ -1572,9 +1588,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_local_shape_rejects_padding_from_manual_axes() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Manual).unwrap()]).unwrap();
         let shard_map = ShardMap::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Manual).unwrap()]).unwrap(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             Vec::new(),
         )
         .unwrap();
@@ -1593,9 +1610,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_local_shape_rejects_rank_mismatch() {
+        let mesh = test_logical_mesh_2x2();
         let shard_map = ShardMap::new(
-            test_logical_mesh_2x2(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             Vec::new(),
         )
         .unwrap();
@@ -1608,9 +1626,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_renders_in_shardings_attribute() {
+        let mesh = test_logical_mesh_2x2();
         let shard_map = ShardMap::new(
-            test_logical_mesh_2x2(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             Vec::new(),
         )
         .unwrap();
@@ -1620,9 +1639,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_renders_free_axes_as_open_dimension_shardings() {
+        let mesh = test_logical_mesh_data_model();
         let shard_map = ShardMap::new(
-            test_logical_mesh_data_model(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["data", "model"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![])],
             Vec::new(),
         )
         .unwrap();
@@ -1632,9 +1652,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_renders_explicit_axes_in_traced_shardings() {
+        let mesh = test_logical_mesh_data_model_explicit();
         let shard_map = ShardMap::new(
-            test_logical_mesh_data_model_explicit(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["data", "model"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![])],
             Vec::new(),
         )
         .unwrap();
@@ -1644,14 +1665,15 @@ mod tests {
 
     #[test]
     fn test_shard_map_renders_out_shardings_attribute() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
         let shard_map = ShardMap::new(
-            LogicalMesh::new(vec![
-                MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-                MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-            ])
-            .unwrap(),
+            mesh.clone(),
             Vec::new(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::replicated()], vec![])],
+            vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
         )
         .unwrap();
 
@@ -1677,10 +1699,11 @@ mod tests {
 
     #[test]
     fn test_shard_map_renders_manual_computation_attributes() {
+        let mesh = test_logical_mesh_data_model();
         let shard_map = ShardMap::new(
-            test_logical_mesh_data_model(),
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["data"])], vec![])],
-            vec![ShardingSpecification::new(vec![ShardingDimension::sharded(["data"])], vec![])],
+            mesh.clone(),
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], vec![])],
+            vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], vec![])],
         )
         .unwrap();
 
@@ -1693,12 +1716,13 @@ mod tests {
     #[test]
     fn test_shard_map_trace_derives_types_and_renders_mlir() {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
             global_input_type.clone(),
-            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
+            mesh.clone(),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
         )
         .unwrap();
 
@@ -1729,12 +1753,13 @@ mod tests {
     #[test]
     fn test_shard_map_trace_hides_auto_axes_in_type_level_shardings() {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(16)]), None);
+        let mesh = test_logical_mesh_data_model();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
             global_input_type.clone(),
-            test_logical_mesh_data_model(),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["data", "model"])], vec![]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["data", "model"])], vec![]),
+            mesh.clone(),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]),
         )
         .unwrap();
 
@@ -1770,8 +1795,8 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let outer_sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]);
-        let inner_sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["y"])], vec![]);
+        let outer_sharding_specification = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let inner_sharding_specification = test_sharding(&inner_mesh, vec![ShardingDimension::sharded(["y"])], vec![]);
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             {
                 let inner_mesh = inner_mesh.clone();
@@ -1819,12 +1844,13 @@ mod tests {
     #[test]
     fn test_shard_map_trace_rejects_dynamic_input_types() {
         let dynamic_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(None)]), None);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
             |x| x.clone() + x,
             dynamic_input_type,
-            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
+            mesh.clone(),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
         );
 
         assert!(matches!(
@@ -1836,12 +1862,13 @@ mod tests {
     #[test]
     fn test_shard_map_infers_single_input_closure_argument_type() {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
             global_input_type,
-            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
-            ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]),
+            mesh.clone(),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
         )
         .unwrap();
 
@@ -1881,7 +1908,12 @@ mod tests {
         )
         .unwrap();
 
-        let sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]);
+        let sharding_specification = ShardingSpecification::new(
+            device_mesh.logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            vec![],
+        )
+        .unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
@@ -1965,14 +1997,18 @@ mod tests {
         .unwrap();
 
         let lhs_sharding_specification = ShardingSpecification::new(
+            device_mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             vec![],
-        );
-        let rhs_sharding_specification = ShardingSpecification::replicated(2);
+        )
+        .unwrap();
+        let rhs_sharding_specification = ShardingSpecification::replicated(device_mesh.logical_mesh.clone(), 2);
         let output_sharding_specification = ShardingSpecification::new(
+            device_mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             vec![],
-        );
+        )
+        .unwrap();
         let global_input_types = (
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None),
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None),
@@ -2099,7 +2135,12 @@ mod tests {
         )
         .unwrap();
 
-        let sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]);
+        let sharding_specification = ShardingSpecification::new(
+            device_mesh.logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            vec![],
+        )
+        .unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x: ShardMapTracer| {
@@ -2223,7 +2264,12 @@ mod tests {
             mesh_devices,
         )
         .unwrap();
-        let sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]);
+        let sharding_specification = ShardingSpecification::new(
+            device_mesh.logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            vec![],
+        )
+        .unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
@@ -2354,7 +2400,12 @@ mod tests {
         )
         .unwrap();
 
-        let sharding_specification = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"])], vec![]);
+        let sharding_specification = ShardingSpecification::new(
+            device_mesh.logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            vec![],
+        )
+        .unwrap();
         let shard_map = ShardMap::new(
             device_mesh.logical_mesh.clone(),
             vec![sharding_specification.clone()],

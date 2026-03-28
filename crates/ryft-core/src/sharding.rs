@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -26,14 +27,17 @@ pub enum ShardingError {
     #[error("mesh device ID '{id}' appears more than once")]
     DuplicateMeshDeviceId { id: MeshDeviceId },
 
-    #[error("mesh has {actual_count} device(s), but its axis sizes imply {expected_count} device(s)")]
-    MeshDeviceCountMismatch { expected_count: usize, actual_count: usize },
+    #[error("mesh has {actual} device(s), but its axis sizes imply {expected} device(s)")]
+    MeshDeviceCountMismatch { expected: usize, actual: usize },
 
-    #[error("partition specification dimension #{dimension} has no axes")]
-    EmptyPartitionSpecification { dimension: usize },
+    #[error("mesh mismatch; expected '{expected:?}' but got '{actual:?}'")]
+    MeshMismatch { expected: LogicalMesh, actual: LogicalMesh },
 
-    #[error("partition specification rank ({partition_rank}) does not match array rank ({array_rank})")]
-    PartitionSpecificationRankMismatch { partition_rank: usize, array_rank: usize },
+    #[error("sharding specification dimension #{dimension} has no axes")]
+    EmptyShardingSpecification { dimension: usize },
+
+    #[error("sharding specification rank ({sharding_rank}) does not match array rank ({array_rank})")]
+    ShardingSpecificationRankMismatch { sharding_rank: usize, array_rank: usize },
 }
 
 /// [`MeshAxis`] type which controls sharding constraint propagation. Each axis in a [`LogicalMesh`] can be tagged with
@@ -119,24 +123,6 @@ fn interned_logical_meshes() -> &'static Mutex<HashMap<LogicalMeshKey, Weak<Logi
 #[derive(Clone, PartialEq, Eq)]
 pub struct LogicalMesh(Arc<LogicalMeshData>);
 
-impl Debug for LogicalMesh {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("LogicalMesh")
-            .field("axes", &self.axes)
-            .field("axis_indices", &self.axis_indices)
-            .finish()
-    }
-}
-
-impl Deref for LogicalMesh {
-    type Target = LogicalMeshData;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
-    }
-}
-
 impl LogicalMesh {
     /// Creates a new [`LogicalMesh`].
     #[inline]
@@ -188,6 +174,30 @@ impl LogicalMesh {
     #[inline]
     pub fn device_count(&self) -> usize {
         self.axes.iter().fold(1usize, |count, axis| count * axis.size)
+    }
+}
+
+impl Debug for LogicalMesh {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LogicalMesh")
+            .field("axes", &self.axes)
+            .field("axis_indices", &self.axis_indices)
+            .finish()
+    }
+}
+
+impl Hash for LogicalMesh {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.axes.hash(state);
+    }
+}
+
+impl Deref for LogicalMesh {
+    type Target = LogicalMeshData;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
     }
 }
 
@@ -259,8 +269,8 @@ impl DeviceMesh {
         let expected_device_count = logical_mesh.device_count();
         if devices.len() != expected_device_count {
             return Err(ShardingError::MeshDeviceCountMismatch {
-                expected_count: expected_device_count,
-                actual_count: devices.len(),
+                expected: expected_device_count,
+                actual: devices.len(),
             });
         }
 
@@ -499,7 +509,7 @@ mod tests {
                 logical_mesh.clone(),
                 vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1)],
             ),
-            Err(ShardingError::MeshDeviceCountMismatch { expected_count: 4, actual_count: 3 }),
+            Err(ShardingError::MeshDeviceCountMismatch { expected: 4, actual: 3 }),
         ));
         assert!(matches!(
             DeviceMesh::new(

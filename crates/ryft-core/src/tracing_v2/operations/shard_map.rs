@@ -485,76 +485,71 @@ fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<b
     depends_on_cotangent
 }
 
-/// Clones one named sharding while replacing only its sharding specification.
-fn named_sharding_with_sharding_specification(
-    sharding: &crate::xla::sharding::NamedSharding,
-    sharding_specification: crate::xla::sharding::ShardingSpecification,
-) -> Option<crate::xla::sharding::NamedSharding> {
-    let sharding_specification = crate::xla::sharding::ShardingSpecification::new(
-        sharding_specification.dimensions,
-        sharding.sharding_specification().unreduced_axes.clone(),
-    );
-    crate::xla::sharding::NamedSharding::new(sharding.mesh().clone(), sharding_specification)
-        .map(|sharding| sharding.project_for_traced_sharding())
-        .ok()
+/// Clones one sharding while replacing only its ranked dimensions.
+fn sharding_with_dimensions(
+    sharding: &crate::xla::sharding::ShardingSpecification,
+    dimensions: Vec<ShardingDimension>,
+) -> Option<crate::xla::sharding::ShardingSpecification> {
+    crate::xla::sharding::ShardingSpecification::new(
+        sharding.mesh().clone(),
+        dimensions,
+        sharding.unreduced_axes.clone(),
+    )
+    .map(|sharding| sharding.project_for_traced_sharding())
+    .ok()
 }
 
-/// Returns whether one named sharding is fully replicated over its ranked dimensions.
-fn is_replicated_sharding(sharding: &crate::xla::sharding::NamedSharding) -> bool {
-    sharding
-        .sharding_specification()
-        .dimensions
-        .iter()
-        .all(|dimension| matches!(dimension, ShardingDimension::Replicated))
+/// Returns whether one sharding is fully replicated over its ranked dimensions.
+fn is_replicated_sharding(sharding: &crate::xla::sharding::ShardingSpecification) -> bool {
+    sharding.dimensions.iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
 }
 
 /// Merges unreduced-axis sets from two shardings while preserving mesh validation.
-fn merge_named_sharding_axes(
-    left: &crate::xla::sharding::NamedSharding,
-    right: &crate::xla::sharding::NamedSharding,
+fn merge_sharding_axes(
+    left: &crate::xla::sharding::ShardingSpecification,
+    right: &crate::xla::sharding::ShardingSpecification,
     sharding_specification: crate::xla::sharding::ShardingSpecification,
-) -> Option<crate::xla::sharding::NamedSharding> {
-    let mut unreduced_axes = left.sharding_specification().unreduced_axes.clone();
-    for axis_name in &right.sharding_specification().unreduced_axes {
+) -> Option<crate::xla::sharding::ShardingSpecification> {
+    let mut unreduced_axes = left.unreduced_axes.clone();
+    for axis_name in &right.unreduced_axes {
         if !unreduced_axes.contains(axis_name) {
             unreduced_axes.push(axis_name.clone());
         }
     }
 
-    let sharding_specification =
-        crate::xla::sharding::ShardingSpecification::new(sharding_specification.dimensions, unreduced_axes);
-    crate::xla::sharding::NamedSharding::new(left.mesh().clone(), sharding_specification)
-        .map(|sharding| sharding.project_for_traced_sharding())
-        .ok()
+    crate::xla::sharding::ShardingSpecification::new(
+        left.mesh().clone(),
+        sharding_specification.dimensions,
+        unreduced_axes,
+    )
+    .map(|sharding| sharding.project_for_traced_sharding())
+    .ok()
 }
 
 /// Infers the output sharding of one sharding-preserving unary op.
 fn infer_unary_output_sharding(
-    input: &crate::xla::sharding::NamedSharding,
-) -> Option<crate::xla::sharding::NamedSharding> {
-    named_sharding_with_sharding_specification(input, input.sharding_specification().clone())
+    input: &crate::xla::sharding::ShardingSpecification,
+) -> Option<crate::xla::sharding::ShardingSpecification> {
+    sharding_with_dimensions(input, input.dimensions.clone())
 }
 
 /// Infers the output sharding of one transpose op over a rank-2 tensor.
 fn infer_transpose_output_sharding(
-    input: &crate::xla::sharding::NamedSharding,
-) -> Option<crate::xla::sharding::NamedSharding> {
-    if input.sharding_specification().rank() != 2 {
+    input: &crate::xla::sharding::ShardingSpecification,
+) -> Option<crate::xla::sharding::ShardingSpecification> {
+    if input.rank() != 2 {
         return None;
     }
 
-    let dimensions = &input.sharding_specification().dimensions;
-    named_sharding_with_sharding_specification(
-        input,
-        crate::xla::sharding::ShardingSpecification::new(vec![dimensions[1].clone(), dimensions[0].clone()], vec![]),
-    )
+    let dimensions = &input.dimensions;
+    sharding_with_dimensions(input, vec![dimensions[1].clone(), dimensions[0].clone()])
 }
 
 /// Infers the output sharding of one binary elementwise op.
 fn infer_binary_elementwise_output_sharding(
-    left: &crate::xla::sharding::NamedSharding,
-    right: &crate::xla::sharding::NamedSharding,
-) -> Option<crate::xla::sharding::NamedSharding> {
+    left: &crate::xla::sharding::ShardingSpecification,
+    right: &crate::xla::sharding::ShardingSpecification,
+) -> Option<crate::xla::sharding::ShardingSpecification> {
     if left == right {
         return Some(left.clone());
     }
@@ -569,35 +564,37 @@ fn infer_binary_elementwise_output_sharding(
 
 /// Infers the output sharding of one rank-2 matrix multiplication.
 fn infer_matmul_output_sharding(
-    left: &crate::xla::sharding::NamedSharding,
-    right: &crate::xla::sharding::NamedSharding,
-) -> Option<crate::xla::sharding::NamedSharding> {
-    if left.sharding_specification().rank() != 2 || right.sharding_specification().rank() != 2 {
+    left: &crate::xla::sharding::ShardingSpecification,
+    right: &crate::xla::sharding::ShardingSpecification,
+) -> Option<crate::xla::sharding::ShardingSpecification> {
+    if left.rank() != 2 || right.rank() != 2 {
         return None;
     }
 
-    let left_dimensions = &left.sharding_specification().dimensions;
-    let right_dimensions = &right.sharding_specification().dimensions;
+    let left_dimensions = &left.dimensions;
+    let right_dimensions = &right.dimensions;
     if !matches!(left_dimensions[1], ShardingDimension::Replicated)
         || !matches!(right_dimensions[0], ShardingDimension::Replicated)
     {
         return None;
     }
 
-    merge_named_sharding_axes(
+    merge_sharding_axes(
         left,
         right,
         crate::xla::sharding::ShardingSpecification::new(
+            left.mesh().clone(),
             vec![left_dimensions[0].clone(), right_dimensions[1].clone()],
             vec![],
-        ),
+        )
+        .ok()?,
     )
 }
 
 /// Infers per-atom shardings for one simplified transpose body.
 fn infer_atom_shardings_for_transpose_body(
     body: &FlatTracedShardMap,
-) -> Vec<Option<crate::xla::sharding::NamedSharding>> {
+) -> Vec<Option<crate::xla::sharding::ShardingSpecification>> {
     let graph = body.compiled.graph();
     let equation_by_output = equation_by_output(graph);
     let mut atom_shardings = vec![None; graph.atom_count()];

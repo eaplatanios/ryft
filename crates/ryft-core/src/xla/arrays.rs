@@ -22,7 +22,7 @@ use crate::types::data_types::{DataType, DataTypeError};
 
 use crate::sharding::DeviceMesh;
 
-use super::sharding::{NamedSharding, ShardDescriptor, ShardingLayout, ShardingSpecification};
+use super::sharding::{ShardDescriptor, ShardingLayout, ShardingSpecification};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -146,7 +146,7 @@ impl std::fmt::Debug for AddressableShard<'_> {
 /// - each addressable buffer is mapped to its global shard index.
 ///
 /// In JAX terminology, this is the runtime pairing of:
-/// - sharding metadata (mesh + sharding specification), and
+/// - mesh-bound sharding metadata, and
 /// - addressable device buffers (the local portion of an IFRT array).
 pub struct Array<'o> {
     layout: ShardingLayout,
@@ -309,9 +309,7 @@ impl<'o> Array<'o> {
     ///
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
-        NamedSharding::new(self.layout.mesh().logical_mesh.clone(), self.layout.sharding_specification().clone())
-            .expect("array layouts should store validated sharding specifications")
-            .to_shardy_tensor_sharding_attribute()
+        self.layout.sharding_specification().to_shardy_tensor_sharding_attribute()
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].
@@ -507,10 +505,12 @@ mod tests {
         .unwrap();
 
         let lhs_sharding_specification = ShardingSpecification::new(
+            mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             vec![],
-        );
-        let rhs_sharding_specification = ShardingSpecification::replicated(2);
+        )
+        .unwrap();
+        let rhs_sharding_specification = ShardingSpecification::replicated(mesh.logical_mesh.clone(), 2);
 
         // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).
         // Row i is [i, i+1, i+2, i+3].
