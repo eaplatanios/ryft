@@ -6,6 +6,6 @@ pub(crate) mod shard_map;
 pub mod sharding;
 
 pub use arrays::{AddressableShard, Array, ArrayError, ExecuteArguments};
-pub use shard_map::{ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, trace};
+pub use shard_map::{ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, trace, with_sharding_constraint};
 
 pub use sharding::{ShardDescriptor, ShardSlice, Sharding, ShardingLayout};

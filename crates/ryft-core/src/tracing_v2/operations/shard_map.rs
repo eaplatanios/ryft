@@ -10,7 +10,7 @@ use crate::{
     sharding::{LogicalMesh, ShardingDimension},
     tracing_v2::{
         AtomId, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op, ProgramBuilder,
-        TraceError, TraceValue, ZeroLike,
+        TraceError, TraceValue, ZeroLike, operations::WithShardingConstraintOp,
     },
     types::{ArrayType, Typed},
     xla::{
@@ -608,6 +608,9 @@ fn infer_atom_shardings_for_transpose_body(body: &FlatTracedShardMap) -> Vec<Opt
                 .first()
                 .and_then(|input| atom_shardings[*input].clone())
                 .and_then(|input| infer_transpose_output_sharding(&input)),
+            "with_sharding_constraint" => {
+                equation.op.as_any().downcast_ref::<WithShardingConstraintOp>().map(|op| op.sharding().clone())
+            }
             "add" | "mul" => {
                 let left = equation.inputs.first().and_then(|input| atom_shardings[*input].clone());
                 let right = equation.inputs.get(1).and_then(|input| atom_shardings[*input].clone());

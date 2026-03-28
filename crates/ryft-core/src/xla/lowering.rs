@@ -14,7 +14,7 @@ use crate::parameters::Parameterized;
 use crate::sharding::{LogicalMesh, ShardingError};
 use crate::tracing_v2::{
     AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
-    operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp},
+    operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp, WithShardingConstraintOp},
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -339,7 +339,7 @@ where
     let location = context.unknown_location();
     let module = context.module(location);
 
-    if let Some(mesh) = collect_nested_shard_map_mesh(graph, None)? {
+    if let Some(mesh) = collect_nested_sharding_mesh(graph, None)? {
         let mesh_operation = mesh.to_shardy_mesh(location);
         module.body().append_operation(mesh_operation);
     }
@@ -551,7 +551,7 @@ where
     Ok(module.to_string())
 }
 
-fn collect_nested_shard_map_mesh<GraphInput, GraphOutput>(
+fn collect_nested_sharding_mesh<GraphInput, GraphOutput>(
     graph: &Graph<StagedOpRef<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, LoweringError>
@@ -569,8 +569,13 @@ where
                     Some(existing_mesh) => merge_logical_meshes(&existing_mesh, shard_map_op.body().shard_map.mesh())?,
                     None => shard_map_op.body().shard_map.mesh().clone(),
                 });
-                mesh = collect_nested_shard_map_mesh(shard_map_op.body().compiled.graph(), mesh)?;
+                mesh = collect_nested_sharding_mesh(shard_map_op.body().compiled.graph(), mesh)?;
             }
+        } else if let Some(sharding_constraint_op) = equation.op.as_any().downcast_ref::<WithShardingConstraintOp>() {
+            mesh = Some(match mesh.take() {
+                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding_constraint_op.sharding().mesh())?,
+                None => sharding_constraint_op.sharding().mesh().clone(),
+            });
         }
     }
     Ok(mesh)
@@ -587,11 +592,11 @@ fn collect_nested_linear_shard_map_mesh(
                 Some(existing_mesh) => merge_logical_meshes(&existing_mesh, body.shard_map.mesh())?,
                 None => body.shard_map.mesh().clone(),
             });
-            collect_nested_shard_map_mesh(body.compiled.graph(), mesh)
+            collect_nested_sharding_mesh(body.compiled.graph(), mesh)
         }
         LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
-            let mesh = collect_nested_shard_map_mesh(factorized.residual_body.compiled.graph(), existing)?;
-            collect_nested_shard_map_mesh(factorized.apply_body.compiled.graph(), mesh)
+            let mesh = collect_nested_sharding_mesh(factorized.residual_body.compiled.graph(), existing)?;
+            collect_nested_sharding_mesh(factorized.apply_body.compiled.graph(), mesh)
         }
     }
 }

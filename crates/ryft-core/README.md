@@ -16,6 +16,8 @@ to take a dependency on.
 ## Roadmap / TODOs
 
 - [ ] Link from the `MeshAxisType::Manual` documentation to the `shard_map` operation once we have it.
+- [ ] Add support for an operation like `jax.type_of`.
+- [ ] Add support for an operation like `jax.lax.with_sharding_constraint`.
 
 #### License
 

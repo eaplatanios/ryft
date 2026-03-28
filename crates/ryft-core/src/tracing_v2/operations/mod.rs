@@ -43,6 +43,10 @@ pub(crate) mod sin;
 pub(crate) mod vmap;
 
 #[cfg(feature = "xla")]
+/// Traced XLA sharding-constraint primitive.
+pub(crate) mod with_sharding_constraint;
+
+#[cfg(feature = "xla")]
 /// Traced `shard_map` operations.
 pub(crate) mod shard_map;
 
@@ -60,6 +64,8 @@ pub(crate) use scale::ScaleOp;
 pub(crate) use shard_map::{LinearShardMapEvalMode, ShardMapOp};
 pub(crate) use sin::SinOp;
 pub(crate) use vmap::{FlatTracedVMap, VMapOp};
+#[cfg(feature = "xla")]
+pub(crate) use with_sharding_constraint::WithShardingConstraintOp;
 
 /// Returns an input-count error when one staged op receives the wrong arity.
 pub(crate) fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {

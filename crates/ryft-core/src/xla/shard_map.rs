@@ -64,6 +64,7 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::sharding::{LogicalMesh, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, ShardingDimension, ShardingError};
 use crate::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
+    operations::WithShardingConstraintOp,
 };
 use crate::types::{ArrayType, Shape, Size, Typed};
 
@@ -440,6 +441,53 @@ where
 {
     let (global_output_types, compiled) = trace_xla_function(function, &global_input_types)?;
     Ok(TracedXlaProgram { global_input_types, global_output_types, compiled })
+}
+
+/// Applies a strict sharding constraint to one traced XLA value tree.
+///
+/// This mirrors [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
+/// it behaves like the identity at the value level while recording a concrete Shardy
+/// `sdy.sharding_constraint` on each traced leaf.
+///
+/// # Parameters
+///
+///   - `input`: Structured traced XLA value whose leaves will be constrained.
+///   - `shardings`: Structured shardings with the same leaf layout as `input`.
+#[allow(private_bounds, private_interfaces)]
+pub fn with_sharding_constraint<Input>(
+    input: Input,
+    shardings: Input::To<Sharding>,
+) -> Result<Input, ShardMapTraceError>
+where
+    Input: Parameterized<ShardMapTracer, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<Sharding>,
+{
+    fn constrain_leaf(input: ShardMapTracer, sharding: Sharding) -> Result<ShardMapTracer, ShardMapTraceError> {
+        let input_type = input.tpe();
+        if sharding.rank() != input_type.rank() {
+            return Err(ShardingError::ShardingRankMismatch {
+                sharding_rank: sharding.rank(),
+                array_rank: input_type.rank(),
+            }
+            .into());
+        }
+        Ok(JitTracer::apply_staged_op(
+            std::slice::from_ref(&input),
+            std::sync::Arc::new(WithShardingConstraintOp::new(sharding)),
+            vec![input.value.clone()],
+        )?
+        .into_iter()
+        .next()
+        .expect("with_sharding_constraint should produce one output per input leaf"))
+    }
+
+    let structure = input.parameter_structure();
+    let constrained = input
+        .into_parameters()
+        .zip(shardings.into_parameters())
+        .map(|(parameter, sharding)| constrain_leaf(parameter, sharding))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Input::from_parameters(structure, constrained)?)
 }
 
 /// Stages a traced shard-map body over the provided mesh and shardings.
@@ -2220,6 +2268,41 @@ mod tests {
                 *expected_values_by_device.get(&device_id).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn test_trace_with_sharding_constraint_renders_mlir() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    with_sharding_constraint(x.sin(), sharding.clone())
+                        .expect("with_sharding_constraint should stage on traced XLA values")
+                }
+            },
+            global_input_type.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(traced.global_input_types(), &global_input_type);
+        assert_eq!(traced.global_output_types(), &global_input_type);
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = stablehlo.sine %arg0 : tensor<8xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<8xf32>
+                    return %1 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
     }
 
     #[test]
