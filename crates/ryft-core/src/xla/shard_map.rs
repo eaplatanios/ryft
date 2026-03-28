@@ -1023,7 +1023,7 @@ fn global_shape_for_sharding(
         .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
         .collect::<HashSet<_>>();
     partition_spec
-        .dimensions()
+        .dimensions
         .iter()
         .zip(local_shape)
         .enumerate()
@@ -1091,7 +1091,7 @@ fn validate_manual_axis_order(
     value_kind: &'static str,
     value_index: usize,
 ) -> Result<(), ShardMapError> {
-    for (dimension, partition_dimension) in partition_spec.dimensions().iter().enumerate() {
+    for (dimension, partition_dimension) in partition_spec.dimensions.iter().enumerate() {
         if let PartitionDimension::Sharded(axis_names) = partition_dimension {
             let mut first_free_axis: Option<&str> = None;
             for axis_name in axis_names {
@@ -1116,14 +1116,14 @@ fn validate_manual_axis_order(
 
 fn used_axes_in_partition_spec(partition_spec: &PartitionSpec) -> HashSet<&str> {
     let mut used_axes = HashSet::new();
-    for partition_dimension in partition_spec.dimensions() {
+    for partition_dimension in &partition_spec.dimensions {
         if let PartitionDimension::Sharded(axis_names) = partition_dimension {
             for axis_name in axis_names {
                 used_axes.insert(axis_name.as_str());
             }
         }
     }
-    for axis_name in partition_spec.unreduced_axes() {
+    for axis_name in &partition_spec.unreduced_axes {
         used_axes.insert(axis_name.as_str());
     }
     used_axes
@@ -1153,7 +1153,7 @@ fn local_shape_for_sharding(
         .collect::<HashSet<_>>();
     let mut local_shape = Vec::with_capacity(global_shape.len());
     for (dimension, (partition_dimension, dimension_size)) in
-        partition_spec.dimensions().iter().zip(global_shape.iter().copied()).enumerate()
+        partition_spec.dimensions.iter().zip(global_shape.iter().copied()).enumerate()
     {
         let manual_partition_count = match partition_dimension {
             PartitionDimension::Sharded(axis_names) => axis_names
@@ -1221,7 +1221,7 @@ fn manual_computation_tensor_sharding<'c, 't>(
         .collect::<Vec<_>>();
     let unreduced_axes = sharding
         .partition_spec()
-        .unreduced_axes()
+        .unreduced_axes
         .iter()
         .map(|axis_name| context.shardy_axis_ref(axis_name, None))
         .collect::<Vec<_>>();
@@ -1252,7 +1252,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     partition_spec
-        .dimensions()
+        .dimensions
         .iter()
         .map(|partition_dimension| match partition_dimension {
             PartitionDimension::Unsharded => context.shardy_dimension_sharding(&[], !has_unused_free_axes, None),
@@ -1289,9 +1289,9 @@ fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
         result.push('}');
     }
 
-    if !sharding.partition_spec().unreduced_axes().is_empty() {
+    if !sharding.partition_spec().unreduced_axes.is_empty() {
         result.push_str(", unreduced={");
-        for (axis_index, axis_name) in sharding.partition_spec().unreduced_axes().iter().enumerate() {
+        for (axis_index, axis_name) in sharding.partition_spec().unreduced_axes.iter().enumerate() {
             if axis_index > 0 {
                 result.push_str(", ");
             }
@@ -1322,7 +1322,7 @@ fn render_manual_computation_dimensions(mesh: &LogicalMesh, partition_spec: &Par
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     let mut result = String::from("[");
-    for (dimension_index, partition_dimension) in partition_spec.dimensions().iter().enumerate() {
+    for (dimension_index, partition_dimension) in partition_spec.dimensions.iter().enumerate() {
         if dimension_index > 0 {
             result.push_str(", ");
         }

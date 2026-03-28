@@ -189,10 +189,6 @@ pub enum ShardingContext {
 }
 
 // ---------------------------------------------------------------------------
-// Mesh-related types
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Partition specification
 // ---------------------------------------------------------------------------
 
@@ -269,11 +265,7 @@ impl PartitionDimension {
     /// Equivalent to `'axis_name'` in JAX's `PartitionSpec` when exactly one axis name is
     /// provided, or to `('axis_a', 'axis_b')` when multiple axis names are provided. The
     /// dimension is split along the product of the referenced axis sizes.
-    pub fn sharded<I, N>(axis_names: I) -> Self
-    where
-        I: IntoIterator<Item = N>,
-        N: Into<String>,
-    {
+    pub fn sharded<N: Into<String>, I: IntoIterator<Item = N>>(axis_names: I) -> Self {
         Self::Sharded(axis_names.into_iter().map(Into::into).collect())
     }
 
@@ -328,8 +320,11 @@ pub(crate) fn escape_shardy_string(value: &str) -> String {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub struct PartitionSpec {
-    dimensions: Vec<PartitionDimension>,
-    unreduced_axes: Vec<String>,
+    /// Ranked per-dimension partition assignments.
+    pub dimensions: Vec<PartitionDimension>,
+
+    /// Unreduced mesh axes attached to this partition specification.
+    pub unreduced_axes: Vec<String>,
 }
 
 impl PartitionSpec {
@@ -360,16 +355,6 @@ impl PartitionSpec {
         self.unreduced_axes =
             axis_names.into_iter().map(Into::into).filter(|axis_name| seen.insert(axis_name.clone())).collect();
         self
-    }
-
-    /// Returns per-dimension partition assignments.
-    pub fn dimensions(&self) -> &[PartitionDimension] {
-        self.dimensions.as_slice()
-    }
-
-    /// Returns the unreduced mesh axes attached to this partition specification.
-    pub fn unreduced_axes(&self) -> &[String] {
-        self.unreduced_axes.as_slice()
     }
 
     /// Rank represented by this partition specification.
@@ -812,7 +797,7 @@ impl ShardingLayout {
             let mut slices = Vec::with_capacity(global_shape.len());
             let mut shape = Vec::with_capacity(global_shape.len());
             for (dimension, dimension_size) in global_shape.iter().copied().enumerate() {
-                let slice = match &partition_spec.dimensions()[dimension] {
+                let slice = match &partition_spec.dimensions[dimension] {
                     PartitionDimension::Unsharded => 0..dimension_size,
                     PartitionDimension::Sharded(axis_names) => {
                         let mut partition_index = 0usize;
@@ -903,7 +888,7 @@ impl ShardingLayout {
 /// Validates a partition spec against a logical mesh.
 fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -> Result<(), ShardingError> {
     let mut used_axes = HashSet::new();
-    for (dimension, partition_dimension) in partition_spec.dimensions().iter().enumerate() {
+    for (dimension, partition_dimension) in partition_spec.dimensions.iter().enumerate() {
         if let PartitionDimension::Sharded(axis_names) = partition_dimension {
             if axis_names.is_empty() {
                 return Err(ShardingError::EmptyPartitionSpecification { dimension });
@@ -921,7 +906,7 @@ fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -
         }
     }
 
-    for axis_name in partition_spec.unreduced_axes() {
+    for axis_name in &partition_spec.unreduced_axes {
         if !mesh.axis_indices.contains_key(axis_name) {
             return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
         }
@@ -935,14 +920,14 @@ fn validate_partition_spec(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -
 
 fn used_axes_in_partition_spec(partition_spec: &PartitionSpec) -> HashSet<&str> {
     let mut used_axes = HashSet::new();
-    for partition_dimension in partition_spec.dimensions() {
+    for partition_dimension in &partition_spec.dimensions {
         if let PartitionDimension::Sharded(axis_names) = partition_dimension {
             for axis_name in axis_names {
                 used_axes.insert(axis_name.as_str());
             }
         }
     }
-    for axis_name in partition_spec.unreduced_axes() {
+    for axis_name in &partition_spec.unreduced_axes {
         used_axes.insert(axis_name.as_str());
     }
     used_axes
@@ -1139,7 +1124,7 @@ mod tests {
 
         assert_eq!(projected.partition_spec(), &PartitionSpec::new(vec![PartitionDimension::sharded(["x", "z"])]));
         assert!(projected.replicated_axes().is_empty());
-        assert!(projected.partition_spec().unreduced_axes().is_empty());
+        assert!(projected.partition_spec().unreduced_axes.is_empty());
     }
 
     #[test]

@@ -492,7 +492,7 @@ fn named_sharding_with_partition_spec(
 ) -> Option<crate::xla::sharding::NamedSharding> {
     crate::xla::sharding::NamedSharding::new(
         sharding.mesh().clone(),
-        partition_spec.with_unreduced_axes(sharding.partition_spec().unreduced_axes().iter().cloned()),
+        partition_spec.with_unreduced_axes(sharding.partition_spec().unreduced_axes.iter().cloned()),
     )
     .map(|sharding| sharding.project_for_traced_sharding())
     .ok()
@@ -502,7 +502,7 @@ fn named_sharding_with_partition_spec(
 fn is_replicated_sharding(sharding: &crate::xla::sharding::NamedSharding) -> bool {
     sharding
         .partition_spec()
-        .dimensions()
+        .dimensions
         .iter()
         .all(|dimension| matches!(dimension, crate::xla::sharding::PartitionDimension::Unsharded))
 }
@@ -513,8 +513,8 @@ fn merge_named_sharding_axes(
     right: &crate::xla::sharding::NamedSharding,
     partition_spec: crate::xla::sharding::PartitionSpec,
 ) -> Option<crate::xla::sharding::NamedSharding> {
-    let mut unreduced_axes = left.partition_spec().unreduced_axes().to_vec();
-    for axis_name in right.partition_spec().unreduced_axes() {
+    let mut unreduced_axes = left.partition_spec().unreduced_axes.clone();
+    for axis_name in &right.partition_spec().unreduced_axes {
         if !unreduced_axes.contains(axis_name) {
             unreduced_axes.push(axis_name.clone());
         }
@@ -540,7 +540,7 @@ fn infer_transpose_output_sharding(
         return None;
     }
 
-    let dimensions = input.partition_spec().dimensions();
+    let dimensions = &input.partition_spec().dimensions;
     named_sharding_with_partition_spec(
         input,
         crate::xla::sharding::PartitionSpec::new(vec![dimensions[1].clone(), dimensions[0].clone()]),
@@ -573,8 +573,8 @@ fn infer_matmul_output_sharding(
         return None;
     }
 
-    let left_dimensions = left.partition_spec().dimensions();
-    let right_dimensions = right.partition_spec().dimensions();
+    let left_dimensions = &left.partition_spec().dimensions;
+    let right_dimensions = &right.partition_spec().dimensions;
     if !matches!(left_dimensions[1], crate::xla::sharding::PartitionDimension::Unsharded)
         || !matches!(right_dimensions[0], crate::xla::sharding::PartitionDimension::Unsharded)
     {
