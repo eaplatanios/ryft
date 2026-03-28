@@ -17,12 +17,12 @@ use ryft_mlir::Block;
 use ryft_mlir::{Location, dialects::shardy::DetachedMeshOperation};
 use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
-use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardingError};
+use crate::sharding::ShardingError;
 use crate::types::data_types::{DataType, DataTypeError};
 
 use crate::sharding::DeviceMesh;
 
-use super::sharding::{ShardDescriptor, ShardingLayout, ShardingSpecification};
+use super::sharding::{NamedSharding, ShardDescriptor, ShardingLayout, ShardingSpecification};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 // TODO(eaplatanios): Split [`ShardingLayout`] into [`Layout`] and a separate [`Sharding`].
@@ -309,8 +309,9 @@ impl<'o> Array<'o> {
     ///
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
-        let dim_shardings = self.layout.sharding_specification().to_shardy_dimension_shardings_literal();
-        format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}>")
+        NamedSharding::new(self.layout.mesh().logical_mesh.clone(), self.layout.sharding_specification().clone())
+            .expect("array layouts should store validated sharding specifications")
+            .to_shardy_tensor_sharding_attribute()
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].

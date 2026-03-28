@@ -250,12 +250,6 @@ impl ShardingDimension {
     }
 }
 
-/// Escapes a string for inclusion in quoted Shardy text syntax.
-#[cfg(feature = "xla")]
-pub(crate) fn escape_shardy_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 /// Sharding specification for all logical array dimensions.
 ///
 /// A sequence of per-dimension [`ShardingDimension`] entries describing how a tensor is
@@ -303,8 +297,7 @@ pub(crate) fn escape_shardy_string(value: &str) -> String {
 ///
 /// # Shardy representation
 ///
-/// Rendered as a bracket-enclosed list of dimension shardings via
-/// [`to_shardy_dimension_shardings_literal`][ShardingSpecification::to_shardy_dimension_shardings_literal]:
+/// Generic Shardy lowering represents this as a bracket-enclosed list of dimension shardings:
 ///
 /// ```text
 /// [{"data"}, {}]         <- P('data', None)
@@ -392,40 +385,6 @@ impl ShardingSpecification {
             .cloned()
             .collect();
         Self { dimensions, unreduced_axes }
-    }
-
-    /// Renders this sharding specification as a Shardy dimension list literal.
-    ///
-    /// The output is a bracket-enclosed, comma-separated list of dimension shardings suitable
-    /// for embedding in a `#sdy.sharding<...>` attribute.
-    ///
-    /// Unsharded dimensions render as closed (`{}`), while unconstrained dimensions render as
-    /// open (`{?}`).
-    pub fn to_shardy_dimension_shardings_literal(&self) -> String {
-        let mut literal = String::from("[");
-        for (dimension_index, dimension) in self.dimensions.iter().enumerate() {
-            if dimension_index > 0 {
-                literal.push_str(", ");
-            }
-            match dimension {
-                ShardingDimension::Unsharded => literal.push_str("{}"),
-                ShardingDimension::Sharded(axis_names) => {
-                    literal.push('{');
-                    for (axis_index, axis_name) in axis_names.iter().enumerate() {
-                        if axis_index > 0 {
-                            literal.push_str(", ");
-                        }
-                        literal.push('"');
-                        literal.push_str(escape_shardy_string(axis_name).as_str());
-                        literal.push('"');
-                    }
-                    literal.push('}');
-                }
-                ShardingDimension::Unconstrained => literal.push_str("{?}"),
-            }
-        }
-        literal.push(']');
-        literal
     }
 
     /// Builds this sharding specification as typed Shardy dimension shardings.
@@ -572,38 +531,8 @@ impl NamedSharding {
     ///
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
-        let dim_shardings = self.sharding_specification.to_shardy_dimension_shardings_literal();
-        let mut result = format!("#sdy.sharding<@{SHARDY_MESH_SYMBOL_NAME}, {dim_shardings}");
-
-        let replicated_axes = self.replicated_axes();
-        if !replicated_axes.is_empty() {
-            result.push_str(", replicated={");
-            for (i, axis_name) in replicated_axes.iter().enumerate() {
-                if i > 0 {
-                    result.push_str(", ");
-                }
-                result.push('"');
-                result.push_str(escape_shardy_string(axis_name).as_str());
-                result.push('"');
-            }
-            result.push('}');
-        }
-
-        if !self.sharding_specification.unreduced_axes.is_empty() {
-            result.push_str(", unreduced={");
-            for (i, axis_name) in self.sharding_specification.unreduced_axes.iter().enumerate() {
-                if i > 0 {
-                    result.push_str(", ");
-                }
-                result.push('"');
-                result.push_str(escape_shardy_string(axis_name).as_str());
-                result.push('"');
-            }
-            result.push('}');
-        }
-
-        result.push('>');
-        result
+        let context = MlirContext::new();
+        self.to_shardy_tensor_sharding(&context).to_string()
     }
 
     /// Builds this sharding as a typed Shardy tensor-sharding attribute.
@@ -923,6 +852,8 @@ fn used_axes_in_sharding_specification(sharding_specification: &ShardingSpecific
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use crate::sharding::MeshAxis;
 
     use super::*;
@@ -953,18 +884,6 @@ mod tests {
     fn test_partition_dimension_unconstrained() {
         let dim = ShardingDimension::unconstrained();
         assert!(matches!(dim, ShardingDimension::Unconstrained));
-    }
-
-    #[test]
-    fn test_sharding_specification_shardy_rendering() {
-        let spec = ShardingSpecification::new(vec![ShardingDimension::sharded(["x"]), ShardingDimension::unsharded()]);
-        assert_eq!(spec.to_shardy_dimension_shardings_literal(), "[{\"x\"}, {}]");
-    }
-
-    #[test]
-    fn test_sharding_specification_shardy_rendering_unconstrained() {
-        let spec = ShardingSpecification::new(vec![ShardingDimension::unconstrained()]);
-        assert_eq!(spec.to_shardy_dimension_shardings_literal(), "[{?}]");
     }
 
     #[test]
@@ -1077,6 +996,25 @@ mod tests {
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute(),
             "#sdy.sharding<@mesh, [{\"x\"}], replicated={\"y\"}, unreduced={\"z\"}>"
+        );
+    }
+
+    #[test]
+    fn test_named_sharding_shardy_rendering_escapes_axis_names() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x\"y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new(r"path\to", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z\"w", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding_specification =
+            ShardingSpecification::new(vec![ShardingDimension::sharded(["x\"y"])]).with_unreduced_axes(["z\"w"]);
+        let sharding = NamedSharding::new(mesh, sharding_specification).unwrap();
+
+        assert_eq!(sharding.replicated_axes(), vec![r"path\to"]);
+        assert_eq!(
+            sharding.to_shardy_tensor_sharding_attribute(),
+            r#"#sdy.sharding<@mesh, [{"x\22y"}], replicated={"path\\to"}, unreduced={"z\22w"}>"#
         );
     }
 
