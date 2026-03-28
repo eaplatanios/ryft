@@ -58,12 +58,12 @@ fn nested_inner_mesh() -> LogicalMesh {
 
 /// Returns a one-dimensional sharded partition spec.
 fn sharded_1d_partition_spec() -> PartitionSpec {
-    PartitionSpec::new(vec![PartitionDimension::sharded("x")])
+    PartitionSpec::new(vec![PartitionDimension::sharded(["x"])])
 }
 
 /// Returns a two-dimensional row-sharded partition spec.
 fn row_sharded_partition_spec() -> PartitionSpec {
-    PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()])
+    PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()])
 }
 
 /// Returns a two-dimensional replicated partition spec.
@@ -290,7 +290,7 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
 /// Emits the nested traced `shard_map` benchmark.
 fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let outer_partition_spec = sharded_1d_partition_spec();
-    let inner_partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("y")]);
+    let inner_partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded(["y"])]);
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let outer_mesh = nested_outer_mesh();

@@ -531,14 +531,14 @@ impl<'t> Context<'t> {
     ///
     ///   - `axes`: Mesh axes in declaration order.
     ///   - `device_ids`: Optional explicit device ordering for the mesh.
-    pub fn shardy_mesh<'c>(
+    pub fn shardy_mesh<'c, I: IntoIterator<Item = MeshAxisAttributeRef<'c, 't>>>(
         &'c self,
-        axes: &[MeshAxisAttributeRef<'c, 't>],
+        axes: I,
         device_ids: &[usize],
     ) -> MeshAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::shardy());
         unsafe {
-            let axes = axes.iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
+            let axes = axes.into_iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
             let device_ids = device_ids.iter().map(|value| *value as i64).collect::<Vec<_>>();
             MeshAttributeRef::from_c_api(
                 sdyMeshAttrGet(
@@ -1298,7 +1298,6 @@ mod tests {
     fn test_manual_axes_attribute() {
         let context = Context::new();
         let attribute = context.shardy_manual_axes(&["data", "model"]);
-
         assert_eq!(&context, attribute.context());
         assert_eq!(
             attribute.axes().iter().map(|axis| axis.as_str().unwrap()).collect::<Vec<_>>(),
@@ -1312,8 +1311,7 @@ mod tests {
         let context = Context::new();
         let axis_a = context.shardy_mesh_axis("a", 2);
         let axis_b = context.shardy_mesh_axis("b", 4);
-        let attribute = context.shardy_mesh(&[axis_a, axis_b], &[0, 2, 4, 6, 1, 3, 5, 7]);
-
+        let attribute = context.shardy_mesh([axis_a, axis_b], &[0, 2, 4, 6, 1, 3, 5, 7]);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.axes(), vec![axis_a, axis_b]);
         assert_eq!(attribute.device_ids(), vec![0, 2, 4, 6, 1, 3, 5, 7]);
@@ -1324,7 +1322,6 @@ mod tests {
     fn test_mesh_axis_attribute() {
         let context = Context::new();
         let attribute = context.shardy_mesh_axis("data", 8);
-
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.name().as_str().unwrap(), "data");
         assert_eq!(attribute.size(), 8);
@@ -1384,7 +1381,7 @@ mod tests {
     fn test_tensor_sharding_attribute() {
         let context = Context::new();
         let mesh_axis = context.shardy_mesh_axis("x", 2);
-        let mesh = context.shardy_mesh(&[mesh_axis], &[]);
+        let mesh = context.shardy_mesh([mesh_axis], &[]);
         let axis_ref = context.shardy_axis_ref("x", None);
         let dim_sharding = context.shardy_dimension_sharding(&[axis_ref], true, None);
         let attribute = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[axis_ref], &[]);
@@ -1400,7 +1397,7 @@ mod tests {
     fn test_tensor_sharding_per_value_attribute() {
         let context = Context::new();
         let mesh_axis = context.shardy_mesh_axis("x", 2);
-        let mesh = context.shardy_mesh(&[mesh_axis], &[]);
+        let mesh = context.shardy_mesh([mesh_axis], &[]);
         let axis_ref = context.shardy_axis_ref("x", None);
         let dim_sharding = context.shardy_dimension_sharding(&[axis_ref], true, None);
         let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]);

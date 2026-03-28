@@ -72,14 +72,14 @@
 //!    // Shard dim 0 along "data", replicate dim 1.
 //!    // JAX equivalent: PartitionSpec('data', None)
 //!    let spec = PartitionSpec::new(vec![
-//!        PartitionDimension::sharded("data"),
+//!        PartitionDimension::sharded(["data"]),
 //!        PartitionDimension::unsharded(),
 //!    ]);
 //!
 //!    // Shard dim 0 along both "data" and "model" axes.
 //!    // JAX equivalent: PartitionSpec(('data', 'model'),)
 //!    let spec = PartitionSpec::new(vec![
-//!        PartitionDimension::sharded_by(["data", "model"]),
+//!        PartitionDimension::sharded(["data", "model"]),
 //!    ]);
 //!
 //!    // Fully replicated across all devices.
@@ -208,8 +208,8 @@ pub enum ShardingContext {
 /// | JAX `PartitionSpec` element   | `PartitionDimension`                                   |
 /// | ----------------------------- | ------------------------------------------------------ |
 /// | `None`                        | [`Unsharded`][PartitionDimension::Unsharded]           |
-/// | `'axis_name'`                 | [`sharded("axis_name")`][PartitionDimension::sharded]  |
-/// | `('axis_a', 'axis_b')`        | [`sharded_by(["axis_a", "axis_b"])`][PartitionDimension::sharded_by] |
+/// | `'axis_name'`                 | [`sharded(["axis_name"])`][PartitionDimension::sharded] |
+/// | `('axis_a', 'axis_b')`        | [`sharded(["axis_a", "axis_b"])`][PartitionDimension::sharded] |
 /// | `PartitionSpec.UNCONSTRAINED` | [`Unconstrained`][PartitionDimension::Unconstrained]   |
 ///
 /// [jax-pspec]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec
@@ -264,18 +264,12 @@ impl PartitionDimension {
         Self::Unsharded
     }
 
-    /// Creates a partitioned dimension using exactly one mesh axis.
+    /// Creates a partitioned dimension using one or more mesh axes, from major to minor.
     ///
-    /// Equivalent to `'axis_name'` in JAX's `PartitionSpec`.
-    pub fn sharded<N: Into<String>>(axis_name: N) -> Self {
-        Self::Sharded(vec![axis_name.into()])
-    }
-
-    /// Creates a partitioned dimension using multiple mesh axes (major to minor).
-    ///
-    /// Equivalent to `('axis_a', 'axis_b')` in JAX's `PartitionSpec`. The dimension is split
-    /// along the product of the referenced axis sizes.
-    pub fn sharded_by<I, N>(axis_names: I) -> Self
+    /// Equivalent to `'axis_name'` in JAX's `PartitionSpec` when exactly one axis name is
+    /// provided, or to `('axis_a', 'axis_b')` when multiple axis names are provided. The
+    /// dimension is split along the product of the referenced axis sizes.
+    pub fn sharded<I, N>(axis_names: I) -> Self
     where
         I: IntoIterator<Item = N>,
         N: Into<String>,
@@ -308,9 +302,9 @@ pub(crate) fn escape_shardy_string(value: &str) -> String {
 ///
 /// | JAX                     | Ryft                                           |
 /// | ----------------------- | ---------------------------------------------- |
-/// | `P('data', None)`       | `new(vec![sharded("data"), unsharded()])`      |
-/// | `P('data', 'model')`    | `new(vec![sharded("data"), sharded("model")])` |
-/// | `P(('data', 'model'),)` | `new(vec![sharded_by(["data", "model"])])`     |
+/// | `P('data', None)`       | `new(vec![sharded(["data"]), unsharded()])`      |
+/// | `P('data', 'model')`    | `new(vec![sharded(["data"]), sharded(["model"])])` |
+/// | `P(('data', 'model'),)` | `new(vec![sharded(["data", "model"])])`          |
 /// | `P()` (replicated)      | `replicated(2)`                                |
 /// | `P(UNCONSTRAINED)`      | `new(vec![unconstrained()])`                   |
 ///
@@ -502,7 +496,7 @@ impl PartitionSpec {
 /// // JAX:   NamedSharding(mesh, PartitionSpec('data', None))
 /// // Ryft:
 /// let sharding = NamedSharding::new(logical_mesh, PartitionSpec::new(vec![
-///     PartitionDimension::sharded("data"),
+///     PartitionDimension::sharded(["data"]),
 ///     PartitionDimension::unsharded(),
 /// ]))?;
 /// ```
@@ -994,13 +988,13 @@ mod tests {
 
     #[test]
     fn test_partition_spec_shardy_rendering_explicit() {
-        let spec = PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+        let spec = PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]);
         assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ExplicitSharding), "[{\"x\"}, {}]");
     }
 
     #[test]
     fn test_partition_spec_shardy_rendering_constraint() {
-        let spec = PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+        let spec = PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]);
         assert_eq!(spec.to_shardy_dimension_shardings_literal(ShardingContext::ShardingConstraint), "[{\"x\"}, {?}]");
     }
 
@@ -1021,8 +1015,8 @@ mod tests {
         ])
         .unwrap();
         let spec = PartitionSpec::new(vec![
-            PartitionDimension::sharded_by(["data", "model", "batch"]),
-            PartitionDimension::sharded("model"),
+            PartitionDimension::sharded(["data", "model", "batch"]),
+            PartitionDimension::sharded(["model"]),
             PartitionDimension::unsharded(),
         ])
         .with_unreduced_axes(["model", "batch"]);
@@ -1030,7 +1024,7 @@ mod tests {
         assert_eq!(
             spec.project_for_traced_sharding(&mesh),
             PartitionSpec::new(vec![
-                PartitionDimension::sharded_by(["data", "batch"]),
+                PartitionDimension::sharded(["data", "batch"]),
                 PartitionDimension::unsharded(),
                 PartitionDimension::unsharded(),
             ])
@@ -1046,14 +1040,14 @@ mod tests {
     fn test_named_sharding_validation() {
         let mesh = test_logical_mesh_2x2();
 
-        let unknown_axis_partition = PartitionSpec::new(vec![PartitionDimension::sharded("z")]);
+        let unknown_axis_partition = PartitionSpec::new(vec![PartitionDimension::sharded(["z"])]);
         assert!(matches!(
             NamedSharding::new(mesh.clone(), unknown_axis_partition),
             Err(ShardingError::UnknownMeshAxisName { name }) if name == "z",
         ));
 
         let duplicate_axis_partition =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("x")]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::sharded(["x"])]);
         assert!(matches!(
             NamedSharding::new(mesh.clone(), duplicate_axis_partition),
             Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
@@ -1070,7 +1064,7 @@ mod tests {
     fn test_named_sharding_shardy_rendering() {
         let mesh = test_logical_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
         assert_eq!(
             sharding.to_shardy_tensor_sharding_attribute(ShardingContext::ExplicitSharding),
@@ -1086,7 +1080,7 @@ mod tests {
         ])
         .unwrap();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]);
         let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
 
         assert_eq!(sharding.replicated_axes(), vec!["y"]);
@@ -1100,7 +1094,7 @@ mod tests {
     fn test_named_sharding_unreduced_axes() {
         let mesh = test_logical_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()])
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()])
                 .with_unreduced_axes(["y"]);
         let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
         assert_eq!(
@@ -1117,7 +1111,7 @@ mod tests {
             MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]).with_unreduced_axes(["z"]);
+        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded(["x"])]).with_unreduced_axes(["z"]);
         let sharding = NamedSharding::new(mesh, partition_spec).unwrap();
 
         assert_eq!(sharding.replicated_axes(), vec!["y"]);
@@ -1138,12 +1132,12 @@ mod tests {
         .unwrap();
         let sharding = NamedSharding::new(
             mesh,
-            PartitionSpec::new(vec![PartitionDimension::sharded_by(["x", "y", "z"])]).with_unreduced_axes(["w"]),
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x", "y", "z"])]).with_unreduced_axes(["w"]),
         )
         .unwrap();
         let projected = sharding.project_for_traced_sharding();
 
-        assert_eq!(projected.partition_spec(), &PartitionSpec::new(vec![PartitionDimension::sharded_by(["x", "z"])]));
+        assert_eq!(projected.partition_spec(), &PartitionSpec::new(vec![PartitionDimension::sharded(["x", "z"])]));
         assert!(projected.replicated_axes().is_empty());
         assert!(projected.partition_spec().unreduced_axes().is_empty());
     }
@@ -1151,7 +1145,7 @@ mod tests {
     #[test]
     fn test_named_sharding_unreduced_axis_validation() {
         let mesh = test_logical_mesh_2x2();
-        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
+        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded(["x"])]);
 
         assert!(matches!(
             NamedSharding::new(mesh.clone(), partition_spec.clone().with_unreduced_axes(["z"])),
@@ -1172,7 +1166,7 @@ mod tests {
     fn test_sharding_layout_rank_mismatch() {
         let mesh = test_device_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("y")]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::sharded(["y"])]);
         assert!(matches!(
             ShardingLayout::new(vec![8usize], mesh, partition_spec),
             Err(ShardingError::PartitionSpecificationRankMismatch { partition_rank: 2, array_rank: 1 }),
@@ -1183,7 +1177,7 @@ mod tests {
     fn test_sharding_layout_unconstrained_is_ignored() {
         let mesh = test_device_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unconstrained()]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unconstrained()]);
         let layout = ShardingLayout::new(vec![8, 6], mesh, partition_spec).unwrap();
 
         let shard0 = layout.shard_for_device(0).unwrap();
@@ -1200,7 +1194,7 @@ mod tests {
     fn test_sharding_layout_even_2d_partitioning() {
         let mesh = test_device_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("y")]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::sharded(["y"])]);
         let layout = ShardingLayout::new(vec![8, 6], mesh, partition_spec).unwrap();
 
         let shard0 = layout.shard_for_device(0).unwrap();
@@ -1219,7 +1213,7 @@ mod tests {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
         let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
-        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded("x")]);
+        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded(["x"])]);
         let layout = ShardingLayout::new(vec![5], mesh, partition_spec).unwrap();
 
         let shard0 = layout.shard_for_device(0).unwrap();
@@ -1234,8 +1228,7 @@ mod tests {
     #[test]
     fn test_sharding_layout_multi_axis_single_dimension_partitioning() {
         let mesh = test_device_mesh_2x2();
-        let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded_by(["x".to_string(), "y".to_string()])]);
+        let partition_spec = PartitionSpec::new(vec![PartitionDimension::sharded(["x".to_string(), "y".to_string()])]);
         let layout = ShardingLayout::new(vec![10], mesh, partition_spec).unwrap();
 
         assert_eq!(layout.shard_for_device(0).unwrap().slices()[0], 0..3);
@@ -1248,7 +1241,7 @@ mod tests {
     fn test_sharding_layout_process_filtering() {
         let mesh = test_device_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::sharded("y")]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::sharded(["y"])]);
         let layout = ShardingLayout::new(vec![8, 6], mesh, partition_spec).unwrap();
 
         assert_eq!(layout.shard_indices_for_process(0), vec![0, 1]);
@@ -1260,7 +1253,7 @@ mod tests {
     fn test_sharding_layout_mesh_and_partition_spec_accessors() {
         let mesh = test_device_mesh_2x2();
         let partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]);
         let layout = ShardingLayout::new(vec![8, 6], mesh.clone(), partition_spec.clone()).unwrap();
 
         assert_eq!(layout.mesh(), &mesh);

@@ -514,7 +514,7 @@ mod tests {
         .unwrap();
 
         let lhs_partition_spec =
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]);
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]);
         let rhs_partition_spec = PartitionSpec::replicated(2);
 
         // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).

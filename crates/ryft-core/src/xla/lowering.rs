@@ -1780,8 +1780,8 @@ mod tests {
             |x| x.clone() + x,
             global_input_type,
             test_manual_mesh("x", 4),
-            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
-            PartitionSpec::new(vec![PartitionDimension::sharded("x")]),
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"])]),
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"])]),
         )
         .unwrap();
 
@@ -1813,8 +1813,8 @@ mod tests {
             },
             global_input_type,
             test_manual_mesh("x", 2),
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]),
-            PartitionSpec::new(vec![PartitionDimension::sharded("x"), PartitionDimension::unsharded()]),
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]),
+            PartitionSpec::new(vec![PartitionDimension::sharded(["x"]), PartitionDimension::unsharded()]),
         )
         .unwrap();
 

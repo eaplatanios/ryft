@@ -149,12 +149,8 @@ impl LogicalMesh {
         location: L,
     ) -> shardy::DetachedMeshOperation<'c, 't> {
         let context = location.context();
-        let axes = self
-            .axes
-            .iter()
-            .map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size))
-            .collect::<Vec<_>>();
-        let attribute = context.shardy_mesh(axes.as_slice(), &[]);
+        let attribute = context
+            .shardy_mesh(self.axes.iter().map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size)), &[]);
         shardy::mesh(SHARDY_MESH_SYMBOL_NAME, attribute, location)
     }
 }
