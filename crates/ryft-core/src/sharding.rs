@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::fmt::Debug;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use thiserror::Error;
 
@@ -84,17 +87,54 @@ impl MeshAxis {
     }
 }
 
-/// Logical mesh that represent a device topology that is to be used for sharding. A [`LogicalMesh`] captures the mesh
-/// axis names, sizes, and types of a device mesh without binding to physical devices. This is the compilation-time view
-/// of a mesh: it provides enough information to validate partition specifications and generate sharding-related code
-/// (e.g., [Shardy](https://openxla.org/shardy) MLIR attributes), but it does not carry any device-specific information.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogicalMesh {
+/// Key used to intern [`LogicalMesh`] instances.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LogicalMeshKey {
+    axes: Vec<MeshAxis>,
+}
+
+/// Interned immutable data for a [`LogicalMesh`].
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogicalMeshData {
     /// Named and sized axes that define this logical mesh topology.
     pub axes: Vec<MeshAxis>,
 
     /// Mapping from [`MeshAxis`] names to their indices/positions in [`Self::axes`].
     pub axis_indices: HashMap<String, usize>,
+}
+
+/// Returns all interned [`LogicalMesh`] instances.
+#[inline]
+fn interned_logical_meshes() -> &'static Mutex<HashMap<LogicalMeshKey, Weak<LogicalMeshData>>> {
+    static INTERNER: OnceLock<Mutex<HashMap<LogicalMeshKey, Weak<LogicalMeshData>>>> = OnceLock::new();
+    INTERNER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Logical mesh that represent a device topology that is to be used for sharding. A [`LogicalMesh`] captures the mesh
+/// axis names, sizes, and types of a device mesh without binding to physical devices. This is the compilation-time view
+/// of a mesh: it provides enough information to validate partition specifications and generate sharding-related code
+/// (e.g., [Shardy](https://openxla.org/shardy) MLIR attributes), but it does not carry any device-specific information.
+/// Note that equivalent meshes are interned within the process and so repeated constructions share immutable storage.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LogicalMesh(Arc<LogicalMeshData>);
+
+impl Debug for LogicalMesh {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LogicalMesh")
+            .field("axes", &self.axes)
+            .field("axis_indices", &self.axis_indices)
+            .finish()
+    }
+}
+
+impl Deref for LogicalMesh {
+    type Target = LogicalMeshData;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
 }
 
 impl LogicalMesh {
@@ -107,7 +147,23 @@ impl LogicalMesh {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
             }
         }
-        Ok(Self { axes, axis_indices })
+        let mut interner = interned_logical_meshes().lock().expect("poisoned logical mesh interner mutex");
+        match interner.entry(LogicalMeshKey { axes }) {
+            Entry::Occupied(mut occupied) => {
+                if let Some(mesh) = occupied.get().upgrade() {
+                    Ok(Self(mesh))
+                } else {
+                    let mesh = Arc::new(LogicalMeshData { axes: occupied.key().axes.clone(), axis_indices });
+                    occupied.insert(Arc::downgrade(&mesh));
+                    Ok(Self(mesh))
+                }
+            }
+            Entry::Vacant(vacant) => {
+                let mesh = Arc::new(LogicalMeshData { axes: vacant.key().axes.clone(), axis_indices });
+                vacant.insert(Arc::downgrade(&mesh));
+                Ok(Self(mesh))
+            }
+        }
     }
 
     /// Returns the rank (i.e., number of axes) of this [`LogicalMesh`].
@@ -340,6 +396,24 @@ mod tests {
             ]),
             Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
         ));
+
+        let mesh_0 = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let mesh_1 = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let mesh_2 = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        assert!(Arc::ptr_eq(&mesh_0.0, &mesh_1.0));
+        assert!(!Arc::ptr_eq(&mesh_0.0, &mesh_2.0));
     }
 
     #[cfg(feature = "xla")]

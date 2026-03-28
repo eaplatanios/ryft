@@ -493,7 +493,8 @@ impl PartitionSpec {
 /// This is the primary user-facing sharding type for compilation-time annotations,
 /// fully describing how a tensor is distributed across a mesh topology. It uses
 /// [`LogicalMesh`] rather than [`DeviceMesh`] because device identity is not needed for
-/// generating Shardy MLIR attributes.
+/// generating Shardy MLIR attributes. The stored mesh is the shared interned
+/// [`LogicalMesh`] handle, so many shardings can cheaply reference the same mesh.
 ///
 /// # JAX equivalent
 ///
