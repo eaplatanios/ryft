@@ -294,54 +294,24 @@ impl LogicalMesh {
         Ok(Self { axes, axis_indices })
     }
 
-    /// Returns the total number of devices implied by axis sizes.
-    pub fn device_count(&self) -> usize {
-        self.axes.iter().fold(1usize, |count, axis| count * axis.size)
-    }
-
-    /// Returns the type of `axis_name` in this mesh, if present.
-    fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
-        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].r#type)
-    }
-
     /// Returns the size of `axis_name` in this mesh, if present.
     pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
         self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].size)
     }
 
-    /// Returns the names of axes with type [`MeshAxisType::Manual`].
-    pub fn manual_axes(&self) -> Vec<&str> {
-        self.axes
-            .iter()
-            .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
-            .collect()
+    /// Returns the type of `axis_name` in this mesh, if present.
+    pub fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
+        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].r#type)
     }
 
-    /// Returns `true` if `axis_name` remains visible in traced/type-level sharding semantics.
-    ///
-    /// JAX hides `Auto` mesh axes from type-specified shardings while keeping `Explicit` axes
-    /// visible. `Manual` axes remain visible for traced `shard_map` semantics because the
-    /// manual-computation body still refers to them explicitly.
-    fn is_axis_visible_in_traced_sharding(&self, axis_name: &str) -> bool {
-        matches!(self.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
+    /// Returns the total number of devices implied by axis sizes.
+    pub fn device_count(&self) -> usize {
+        self.axes.iter().fold(1usize, |count, axis| count * axis.size)
     }
+}
 
-    /// Returns a new `LogicalMesh` with selected axes' types changed.
-    ///
-    /// Unknown names in `name_to_type` are silently ignored, matching JAX behavior.
-    pub fn with_updated_axis_types(&self, name_to_type: &HashMap<String, MeshAxisType>) -> Self {
-        let axes = self
-            .axes
-            .iter()
-            .cloned()
-            .map(|axis| {
-                let r#type = name_to_type.get(axis.name.as_str()).copied().unwrap_or(axis.r#type);
-                MeshAxis::new(axis.name, axis.size, r#type).expect("logical meshes only contain validated mesh axes")
-            })
-            .collect();
-        Self { axes, axis_indices: self.axis_indices.clone() }
-    }
-
+#[cfg(feature = "xla")]
+impl LogicalMesh {
     /// Renders this mesh as the right-hand side of a Shardy `sdy.mesh` declaration.
     ///
     /// Example output for axes `("x", 8)` and `("y", 2)`:
@@ -424,7 +394,6 @@ impl LogicalMesh {
 pub struct DeviceMesh {
     logical_mesh: LogicalMesh,
     devices: Vec<MeshDevice>,
-    device_index_by_id: HashMap<DeviceId, usize>,
 }
 
 impl DeviceMesh {
@@ -435,11 +404,6 @@ impl DeviceMesh {
     /// expected device count is `1`.
     pub fn new(axes: Vec<MeshAxis>, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
         let logical_mesh = LogicalMesh::new(axes)?;
-        Self::from_logical(logical_mesh, devices)
-    }
-
-    /// Creates a mesh from a pre-validated [`LogicalMesh`] and row-major devices.
-    pub fn from_logical(logical_mesh: LogicalMesh, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
         let expected_device_count = logical_mesh.device_count();
         if devices.len() != expected_device_count {
             return Err(ShardingError::MeshDeviceCountMismatch {
@@ -448,14 +412,14 @@ impl DeviceMesh {
             });
         }
 
-        let mut device_index_by_id = HashMap::with_capacity(devices.len());
-        for (device_index, device) in devices.iter().enumerate() {
-            if device_index_by_id.insert(device.id, device_index).is_some() {
+        let mut seen_device_ids = HashSet::with_capacity(devices.len());
+        for device in &devices {
+            if !seen_device_ids.insert(device.id) {
                 return Err(ShardingError::DuplicateMeshDeviceId { id: device.id });
             }
         }
 
-        Ok(Self { logical_mesh, devices, device_index_by_id })
+        Ok(Self { logical_mesh, devices })
     }
 
     /// Returns the logical mesh topology (axes only).
@@ -480,35 +444,11 @@ impl DeviceMesh {
 
     /// Returns the names of axes with type [`MeshAxisType::Manual`].
     pub fn manual_axes(&self) -> Vec<&str> {
-        self.logical_mesh.manual_axes()
-    }
-
-    /// Returns the row-major mesh index of `device_id`, if present.
-    pub fn device_index(&self, device_id: DeviceId) -> Option<usize> {
-        self.device_index_by_id.get(&device_id).copied()
-    }
-
-    /// Returns just the device IDs.
-    pub fn device_ids(&self) -> Vec<DeviceId> {
-        self.devices.iter().map(|d| d.id()).collect()
-    }
-
-    /// Returns `true` if any two devices belong to different processes.
-    pub fn is_multi_process(&self) -> bool {
-        let mut seen = None;
-        for device in &self.devices {
-            match seen {
-                None => seen = Some(device.process_index()),
-                Some(p) if p != device.process_index() => return true,
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Returns devices belonging to the given `process_index`.
-    pub fn local_devices(&self, process_index: usize) -> Vec<&MeshDevice> {
-        self.devices.iter().filter(|d| d.process_index() == process_index).collect()
+        self.logical_mesh
+            .axes
+            .iter()
+            .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+            .collect()
     }
 
     /// Returns the mesh coordinate of the device at `device_index`, if valid.
@@ -517,11 +457,6 @@ impl DeviceMesh {
             let axis_sizes = self.logical_mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>();
             coordinate_for_linear_index(device_index, axis_sizes.as_slice())
         })
-    }
-
-    /// Returns the mesh coordinate of `device_id`, if present.
-    pub fn coordinate_for_device(&self, device_id: DeviceId) -> Option<Vec<usize>> {
-        self.device_index(device_id).and_then(|device_index| self.coordinate_for_device_index(device_index))
     }
 }
 
@@ -621,14 +556,6 @@ impl PartitionDimension {
     /// Equivalent to `PartitionSpec.UNCONSTRAINED` in JAX.
     pub fn unconstrained() -> Self {
         Self::Unconstrained
-    }
-
-    /// Returns mesh axes used for partitioning this dimension, if it is sharded.
-    pub fn mesh_axes(&self) -> Option<&[String]> {
-        match self {
-            Self::Sharded(axis_names) => Some(axis_names.as_slice()),
-            _ => None,
-        }
     }
 }
 
@@ -732,7 +659,9 @@ impl PartitionSpec {
                 PartitionDimension::Sharded(axis_names) => {
                     let visible_axis_names = axis_names
                         .iter()
-                        .filter(|axis_name| mesh.is_axis_visible_in_traced_sharding(axis_name))
+                        .filter(|axis_name| {
+                            matches!(mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
+                        })
                         .cloned()
                         .collect::<Vec<_>>();
                     if visible_axis_names.is_empty() {
@@ -746,7 +675,9 @@ impl PartitionSpec {
         let unreduced_axes = self
             .unreduced_axes
             .iter()
-            .filter(|axis_name| mesh.is_axis_visible_in_traced_sharding(axis_name))
+            .filter(|axis_name| {
+                matches!(mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
+            })
             .cloned()
             .collect();
         Self { dimensions, unreduced_axes }
@@ -908,8 +839,9 @@ impl NamedSharding {
             .iter()
             .filter_map(|axis| {
                 let axis_name = axis.name.as_str();
-                (self.mesh.is_axis_visible_in_traced_sharding(axis_name) && !used_axes.contains(axis_name))
-                    .then_some(axis_name)
+                (matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
+                    && !used_axes.contains(axis_name))
+                .then_some(axis_name)
             })
             .collect()
     }
@@ -1371,22 +1303,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_device_mesh_from_logical() {
-        let logical_mesh = test_logical_mesh_2x2();
+    fn test_device_mesh_construction_preserves_logical_mesh_data() {
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ];
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
-        let mesh = DeviceMesh::from_logical(logical_mesh.clone(), devices).unwrap();
-        assert_eq!(mesh.logical_mesh(), &logical_mesh);
+        let mesh = DeviceMesh::new(axes, devices).unwrap();
+        assert_eq!(mesh.logical_mesh().axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
         assert_eq!(mesh.device_count(), 4);
     }
 
     #[test]
-    fn test_device_mesh_coordinate_mapping() {
+    fn test_device_mesh_coordinate_mapping_by_index() {
         let mesh = test_device_mesh_2x2();
-        assert_eq!(mesh.coordinate_for_device(0), Some(vec![0, 0]));
-        assert_eq!(mesh.coordinate_for_device(1), Some(vec![0, 1]));
-        assert_eq!(mesh.coordinate_for_device(2), Some(vec![1, 0]));
-        assert_eq!(mesh.coordinate_for_device(3), Some(vec![1, 1]));
-        assert_eq!(mesh.coordinate_for_device(99), None);
+        assert_eq!(mesh.coordinate_for_device_index(0), Some(vec![0, 0]));
+        assert_eq!(mesh.coordinate_for_device_index(1), Some(vec![0, 1]));
+        assert_eq!(mesh.coordinate_for_device_index(2), Some(vec![1, 0]));
+        assert_eq!(mesh.coordinate_for_device_index(3), Some(vec![1, 1]));
+        assert_eq!(mesh.coordinate_for_device_index(99), None);
     }
 
     #[test]
@@ -1423,7 +1358,6 @@ mod tests {
     fn test_partition_dimension_unconstrained() {
         let dim = PartitionDimension::unconstrained();
         assert!(matches!(dim, PartitionDimension::Unconstrained));
-        assert_eq!(dim.mesh_axes(), None);
     }
 
     #[test]
@@ -1765,7 +1699,13 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
-        assert!(mesh.manual_axes().is_empty());
+        assert!(
+            mesh.axes
+                .iter()
+                .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
 
         // Mixed types.
         let axes = vec![
@@ -1791,25 +1731,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b"]
         );
-        assert_eq!(mesh.manual_axes(), vec!["c"]);
-    }
-
-    #[test]
-    fn test_logical_mesh_with_updated_axis_types() {
-        let mesh = test_logical_mesh_2x2();
-        let updates = HashMap::from([("y".to_string(), MeshAxisType::Manual)]);
-        let updated = mesh.with_updated_axis_types(&updates);
         assert_eq!(
-            updated.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
-            vec![MeshAxisType::Auto, MeshAxisType::Manual]
-        );
-
-        // Unknown names are silently ignored.
-        let updates = HashMap::from([("z".to_string(), MeshAxisType::Explicit)]);
-        let updated = mesh.with_updated_axis_types(&updates);
-        assert_eq!(
-            updated.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
-            vec![MeshAxisType::Auto, MeshAxisType::Auto]
+            mesh.axes
+                .iter()
+                .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec!["c"]
         );
     }
 
@@ -1841,34 +1768,5 @@ mod tests {
         assert!(mesh.manual_axes().is_empty());
         assert_eq!(mesh.logical_mesh().axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y"]);
         assert_eq!(mesh.logical_mesh().axes.iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 2]);
-    }
-
-    #[test]
-    fn test_device_mesh_is_multi_process() {
-        // Single process.
-        let axes = vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()];
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
-        let mesh = DeviceMesh::new(axes, devices).unwrap();
-        assert!(!mesh.is_multi_process());
-
-        // Multi process.
-        let mesh = test_device_mesh_2x2(); // devices 0,1 on process 0; devices 2,3 on process 1.
-        assert!(mesh.is_multi_process());
-    }
-
-    #[test]
-    fn test_device_mesh_local_devices() {
-        let mesh = test_device_mesh_2x2();
-        let local_0: Vec<DeviceId> = mesh.local_devices(0).iter().map(|d| d.id()).collect();
-        assert_eq!(local_0, vec![0, 1]);
-        let local_1: Vec<DeviceId> = mesh.local_devices(1).iter().map(|d| d.id()).collect();
-        assert_eq!(local_1, vec![2, 3]);
-        assert!(mesh.local_devices(42).is_empty());
-    }
-
-    #[test]
-    fn test_device_mesh_device_ids() {
-        let mesh = test_device_mesh_2x2();
-        assert_eq!(mesh.device_ids(), vec![0, 1, 2, 3]);
     }
 }

@@ -60,7 +60,7 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::sharding::ShardingError;
+use crate::sharding::{MeshAxisType, ShardingError};
 use crate::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
 };
@@ -584,7 +584,11 @@ impl ShardMap {
 
     /// Returns the manual mesh axes in mesh order.
     fn manual_axes(&self) -> Vec<&str> {
-        self.mesh.manual_axes()
+        self.mesh
+            .axes
+            .iter()
+            .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+            .collect()
     }
 
     /// Returns the local body shape for input `input_index`.
@@ -1011,7 +1015,11 @@ fn global_shape_for_sharding(
         });
     }
 
-    let manual_axis_names = mesh.manual_axes().into_iter().collect::<HashSet<_>>();
+    let manual_axis_names = mesh
+        .axes
+        .iter()
+        .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+        .collect::<HashSet<_>>();
     partition_spec
         .dimensions()
         .iter()
@@ -1064,7 +1072,11 @@ fn build_named_shardings(
 }
 
 fn manual_axes_from_mesh(mesh: &LogicalMesh) -> Result<Vec<String>, ShardMapError> {
-    let manual_axes = mesh.manual_axes().into_iter().map(ToString::to_string).collect::<Vec<_>>();
+    let manual_axes = mesh
+        .axes
+        .iter()
+        .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.clone()))
+        .collect::<Vec<_>>();
     if manual_axes.is_empty() {
         return Err(ShardMapError::MeshHasNoManualAxes);
     }
@@ -1131,7 +1143,12 @@ fn local_shape_for_sharding(
         });
     }
 
-    let manual_axis_names = sharding.mesh().manual_axes().into_iter().collect::<HashSet<_>>();
+    let manual_axis_names = sharding
+        .mesh()
+        .axes
+        .iter()
+        .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+        .collect::<HashSet<_>>();
     let mut local_shape = Vec::with_capacity(global_shape.len());
     for (dimension, (partition_dimension, dimension_size)) in
         partition_spec.dimensions().iter().zip(global_shape.iter().copied()).enumerate()
@@ -1219,7 +1236,11 @@ fn manual_computation_dimension_shardings<'c, 't>(
     partition_spec: &PartitionSpec,
     context: &'c MlirContext<'t>,
 ) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
-    let manual_axis_names = mesh.manual_axes().into_iter().collect::<HashSet<_>>();
+    let manual_axis_names = mesh
+        .axes
+        .iter()
+        .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+        .collect::<HashSet<_>>();
     let free_axis_names = mesh
         .axes
         .iter()
@@ -1285,7 +1306,11 @@ fn stripped_shardy_tensor_sharding(sharding: &NamedSharding) -> String {
 
 #[cfg(test)]
 fn render_manual_computation_dimensions(mesh: &LogicalMesh, partition_spec: &PartitionSpec) -> String {
-    let manual_axis_names = mesh.manual_axes().into_iter().collect::<HashSet<_>>();
+    let manual_axis_names = mesh
+        .axes
+        .iter()
+        .filter_map(|axis| (axis.r#type == MeshAxisType::Manual).then_some(axis.name.as_str()))
+        .collect::<HashSet<_>>();
     let free_axis_names = mesh
         .axes
         .iter()
