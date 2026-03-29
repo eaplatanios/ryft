@@ -24,6 +24,9 @@ pub enum ShardingError {
     #[error("mesh axis '{name}' must have size > 0")]
     EmptyMeshAxis { name: String },
 
+    #[error("mesh axis '{name}' must have type manual")]
+    ExpectedManualMeshAxis { name: String },
+
     #[error("mesh device ID '{id}' appears more than once")]
     DuplicateMeshDeviceId { id: MeshDeviceId },
 
