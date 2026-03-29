@@ -679,30 +679,43 @@ fn make_visualization_styles(row_count: usize, column_count: usize) -> Vec<Visua
         return Vec::new();
     }
 
-    let color_order = make_visualization_color_order(cell_count);
-    color_order
+    assign_visualization_palette_indices(row_count, column_count)
         .into_iter()
-        .map(|color_index| {
-            let palette_index = if cell_count == 1 {
-                0
-            } else {
-                color_index * (VISUALIZATION_COLOR_PALETTE.len() - 1) / (cell_count - 1)
-            };
+        .map(|palette_index| {
             let background = VISUALIZATION_COLOR_PALETTE[palette_index];
             VisualizationStyle { foreground: contrasting_text_color(background), background }
         })
         .collect()
 }
 
-fn make_visualization_color_order(cell_count: usize) -> Vec<usize> {
-    let mut color_order = Vec::with_capacity(cell_count);
-    let mut index = 0usize;
-    let step = cell_count / 2 + usize::from(cell_count % 2 == 0);
-    for _ in 0..cell_count {
-        color_order.push(index);
-        index = (index + step) % cell_count;
+fn assign_visualization_palette_indices(row_count: usize, column_count: usize) -> Vec<usize> {
+    let cell_count = row_count * column_count;
+    let palette_count = VISUALIZATION_COLOR_PALETTE.len();
+    let unique_prefix_length = cell_count.min(palette_count);
+    let mut palette_indices = (0..unique_prefix_length).collect::<Vec<_>>();
+    let mut next_palette_index = 0usize;
+
+    for cell_index in unique_prefix_length..cell_count {
+        let row_index = cell_index / column_count;
+        let column_index = cell_index % column_count;
+        let left_neighbor = (column_index > 0).then_some(palette_indices[cell_index - 1]);
+        let upper_neighbor = (row_index > 0).then_some(palette_indices[cell_index - column_count]);
+
+        let mut assigned_palette_index = None;
+        for offset in 0..palette_count {
+            let candidate_palette_index = (next_palette_index + offset) % palette_count;
+            if Some(candidate_palette_index) != left_neighbor && Some(candidate_palette_index) != upper_neighbor {
+                assigned_palette_index = Some(candidate_palette_index);
+                next_palette_index = (candidate_palette_index + 1) % palette_count;
+                break;
+            }
+        }
+        palette_indices.push(
+            assigned_palette_index
+                .expect("the visualization palette should be large enough to avoid orthogonal collisions in a grid"),
+        );
     }
-    color_order
+    palette_indices
 }
 
 fn contrasting_text_color(background: (u8, u8, u8)) -> (u8, u8, u8) {
@@ -1132,6 +1145,8 @@ fn used_axes_in_sharding(sharding: &Sharding) -> HashSet<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1622,6 +1637,28 @@ mod tests {
         assert!(!colored.contains('│'));
         assert!(!colored.contains('└'));
         assert_eq!(strip_ansi_codes(colored.as_str()), " 0,1  2,3 ".to_string());
+    }
+
+    #[test]
+    fn test_visualization_palette_uses_unique_prefix_and_avoids_neighbor_collisions() {
+        let row_count = 5;
+        let column_count = 5;
+        let styles = make_visualization_styles(row_count, column_count);
+        let backgrounds = styles.iter().map(|style| style.background).collect::<Vec<_>>();
+        let unique_prefix = backgrounds.iter().take(VISUALIZATION_COLOR_PALETTE.len()).copied().collect::<HashSet<_>>();
+
+        assert_eq!(unique_prefix.len(), VISUALIZATION_COLOR_PALETTE.len());
+        for row_index in 0..row_count {
+            for column_index in 0..column_count {
+                let cell_index = row_index * column_count + column_index;
+                if column_index + 1 < column_count {
+                    assert_ne!(backgrounds[cell_index], backgrounds[cell_index + 1]);
+                }
+                if row_index + 1 < row_count {
+                    assert_ne!(backgrounds[cell_index], backgrounds[cell_index + column_count]);
+                }
+            }
+        }
     }
 
     #[test]
