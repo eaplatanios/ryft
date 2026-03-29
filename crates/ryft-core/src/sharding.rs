@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -181,7 +181,7 @@ impl LogicalMesh {
 }
 
 impl Debug for LogicalMesh {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LogicalMesh")
             .field("axes", &self.axes)
@@ -376,6 +376,25 @@ impl ShardingDimension {
     }
 }
 
+impl Display for ShardingDimension {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replicated => write!(formatter, "{{}}"),
+            Self::Unconstrained => write!(formatter, "{{?}}"),
+            Self::Sharded(axis_names) => {
+                write!(formatter, "{{")?;
+                if let Some((first_axis_name, remaining_axis_names)) = axis_names.split_first() {
+                    write!(formatter, "'{}'", first_axis_name.replace('\'', "\\'"))?;
+                    for axis_name in remaining_axis_names {
+                        write!(formatter, ", '{}'", axis_name.replace('\'', "\\'"))?;
+                    }
+                }
+                write!(formatter, "}}")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -539,5 +558,14 @@ mod tests {
             module.body().append_operation(mesh.to_shardy_mesh(context.unknown_location())).to_string(),
             format!("sdy.mesh @{SHARDY_MESH_SYMBOL_NAME} = <[\"x\"=2, \"y\"=2]>"),
         );
+    }
+
+    #[test]
+    fn test_sharding_dimension() {
+        assert_eq!(ShardingDimension::replicated().to_string(), "{}");
+        assert_eq!(ShardingDimension::unconstrained().to_string(), "{?}");
+        assert_eq!(ShardingDimension::sharded(["x"]).to_string(), "{'x'}");
+        assert_eq!(ShardingDimension::sharded(["x", "y"]).to_string(), "{'x', 'y'}");
+        assert_eq!(ShardingDimension::sharded([r"path\to", "x'y"]).to_string(), "{'path\\to', 'x\\'y'}");
     }
 }
