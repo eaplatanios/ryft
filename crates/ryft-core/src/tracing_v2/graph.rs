@@ -27,10 +27,7 @@ pub(crate) enum AtomSource {
 
 /// Staged atom carrying abstract metadata and provenance.
 #[derive(Clone, Debug)]
-pub(crate) struct Atom<V>
-where
-    V: TraceValue,
-{
+pub(crate) struct Atom<V: TraceValue> {
     /// Array type used for validation and shape propagation.
     pub abstract_value: ArrayType,
     /// Example value produced while staging this atom.
@@ -52,21 +49,13 @@ pub(crate) struct Equation<O> {
 
 /// Builder for staged graphs.
 #[derive(Clone, Debug)]
-pub(crate) struct GraphBuilder<O, V>
-where
-    O: Clone + Op<V>,
-    V: TraceValue,
-{
+pub(crate) struct GraphBuilder<O: Clone + Op<V>, V: TraceValue> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
 }
 
-impl<O, V> GraphBuilder<O, V>
-where
-    O: Clone + Op<V>,
-    V: TraceValue,
-{
+impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
     /// Creates an empty builder.
     #[inline]
     pub(crate) fn new() -> Self {
@@ -163,24 +152,14 @@ where
     }
 }
 
-impl<O, V> Default for GraphBuilder<O, V>
-where
-    O: Clone + Op<V>,
-    V: TraceValue,
-{
+impl<O: Clone + Op<V>, V: TraceValue> Default for GraphBuilder<O, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 /// Executable staged graph over an open operation set.
-pub(crate) struct Graph<O, V, Input, Output>
-where
-    O: Clone + Op<V>,
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+pub(crate) struct Graph<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
@@ -190,12 +169,12 @@ where
     marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<O, V, Input, Output> Clone for Graph<O, V, Input, Output>
-where
+impl<
     O: Clone + Op<V>,
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+> Clone for Graph<O, V, Input, Output>
 {
     fn clone(&self) -> Self {
         Self {
@@ -210,13 +189,7 @@ where
     }
 }
 
-impl<O, V, Input, Output> Graph<O, V, Input, Output>
-where
-    O: Clone + Op<V>,
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+impl<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Graph<O, V, Input, Output> {
     /// Returns the number of atoms in the graph.
     #[inline]
     pub(crate) fn atom_count(&self) -> usize {
@@ -336,18 +309,13 @@ where
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<O, V, Input, Output>(
+        fn mark_live<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>(
             graph: &Graph<O, V, Input, Output>,
             atom_id: usize,
             live_atoms: &mut [bool],
             live_equations: &mut [bool],
             equation_by_output: &[Option<usize>],
-        ) where
-            O: Clone + Op<V>,
-            V: TraceValue,
-            Input: Parameterized<V>,
-            Output: Parameterized<V>,
-        {
+        ) {
             if live_atoms[atom_id] {
                 return;
             }
@@ -467,12 +435,8 @@ where
     }
 }
 
-impl<O, V, Input, Output> Display for Graph<O, V, Input, Output>
-where
-    O: Clone + Display + Op<V>,
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
+impl<O: Clone + Display + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
+    for Graph<O, V, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");

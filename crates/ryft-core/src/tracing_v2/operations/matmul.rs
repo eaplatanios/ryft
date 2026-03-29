@@ -42,10 +42,7 @@ impl Display for MatMulOp {
     }
 }
 
-impl<V> Op<V> for MatMulOp
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> Op<V> for MatMulOp {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -139,10 +136,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for MatMulOp
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> BatchOp<V> for MatMulOp {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

@@ -43,10 +43,7 @@ impl Display for MulOp {
     }
 }
 
-impl<V> Op<V> for MulOp
-where
-    V: TraceValue + Mul<Output = V>,
-{
+impl<V: TraceValue + Mul<Output = V>> Op<V> for MulOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -126,10 +123,7 @@ where
     }
 }
 
-impl<V> JvpOp<V> for MulOp
-where
-    V: TraceValue + Mul<Output = V>,
-{
+impl<V: TraceValue + Mul<Output = V>> JvpOp<V> for MulOp {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,
@@ -147,10 +141,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for MulOp
-where
-    V: TraceValue + Mul<Output = V>,
-{
+impl<V: TraceValue + Mul<Output = V>> BatchOp<V> for MulOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

@@ -45,10 +45,7 @@ impl Display for AddOp {
     }
 }
 
-impl<V> Op<V> for AddOp
-where
-    V: TraceValue + Add<Output = V>,
-{
+impl<V: TraceValue + Add<Output = V>> Op<V> for AddOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -135,10 +132,7 @@ where
     }
 }
 
-impl<V> JvpOp<V> for AddOp
-where
-    V: TraceValue + Add<Output = V>,
-{
+impl<V: TraceValue + Add<Output = V>> JvpOp<V> for AddOp {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,
@@ -151,10 +145,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for AddOp
-where
-    V: TraceValue + Add<Output = V>,
-{
+impl<V: TraceValue + Add<Output = V>> BatchOp<V> for AddOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

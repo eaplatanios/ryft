@@ -123,13 +123,9 @@ fn summarize_nested_body(
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_xla_program<Input, Output>(
+fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
     program: &Program<ShardMapTensor, Input, Output>,
-) -> Result<IrBenchmarkSummary, BenchmarkError>
-where
-    Input: Parameterized<ShardMapTensor>,
-    Output: Parameterized<ShardMapTensor>,
-{
+) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
         eval_mode: &LinearShardMapEvalMode,
@@ -165,14 +161,15 @@ where
 ///
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `traced`: Traced XLA handle to render.
-fn traced_xla_records<Input, Output>(
+fn traced_xla_records<
+    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+>(
     case_id: &'static str,
     traced: &TracedXlaProgram<Input, Output>,
 ) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError>
 where
-    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<ShardMapTensor>,
-    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<ShardMapTensor>,
 {
     let program = traced.compiled().program().simplify()?;

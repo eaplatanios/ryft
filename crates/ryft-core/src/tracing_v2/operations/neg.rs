@@ -46,10 +46,7 @@ impl Display for NegOp {
     }
 }
 
-impl<V> Op<V> for NegOp
-where
-    V: TraceValue + Neg<Output = V>,
-{
+impl<V: TraceValue + Neg<Output = V>> Op<V> for NegOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -132,10 +129,7 @@ where
     }
 }
 
-impl<V> JvpOp<V> for NegOp
-where
-    V: TraceValue + Neg<Output = V>,
-{
+impl<V: TraceValue + Neg<Output = V>> JvpOp<V> for NegOp {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,
@@ -145,10 +139,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for NegOp
-where
-    V: TraceValue + Neg<Output = V>,
-{
+impl<V: TraceValue + Neg<Output = V>> BatchOp<V> for NegOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| -lane).collect())])

@@ -28,10 +28,7 @@ use crate::xla::lowering::{
 };
 
 /// Core primitive operation interface understood by staged graphs.
-pub(crate) trait Op<V>: Debug + Display
-where
-    V: TraceValue,
-{
+pub(crate) trait Op<V: TraceValue>: Debug + Display {
     /// Returns this operation as [`Any`] for downcasting.
     fn as_any(&self) -> &dyn Any;
 
@@ -123,10 +120,7 @@ where
 pub(crate) type StagedOpRef<V> = Arc<dyn Op<V>>;
 
 /// Primitive operation with a forward-mode differentiation rule.
-pub(crate) trait JvpOp<V>: Op<V>
-where
-    V: TraceValue,
-{
+pub(crate) trait JvpOp<V: TraceValue>: Op<V> {
     /// Applies the primitive's forward-mode rule to traced inputs.
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -134,19 +128,12 @@ where
 }
 
 /// Primitive operation with a batching rule used by `vmap`.
-pub(crate) trait BatchOp<V>: Op<V>
-where
-    V: TraceValue,
-{
+pub(crate) trait BatchOp<V: TraceValue>: Op<V> {
     /// Applies the primitive's batching rule to batched inputs.
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
 
-impl<T, V> Op<V> for Arc<T>
-where
-    T: Op<V> + ?Sized,
-    V: TraceValue,
-{
+impl<T: Op<V> + ?Sized, V: TraceValue> Op<V> for Arc<T> {
     #[inline]
     fn as_any(&self) -> &dyn Any {
         (**self).as_any()
@@ -233,11 +220,7 @@ where
     }
 }
 
-impl<T, V> JvpOp<V> for Arc<T>
-where
-    T: JvpOp<V> + ?Sized,
-    V: TraceValue,
-{
+impl<T: JvpOp<V> + ?Sized, V: TraceValue> JvpOp<V> for Arc<T> {
     #[inline]
     fn jvp<U>(&self, inputs: &[JvpTracer<V, U>]) -> Result<Vec<JvpTracer<V, U>>, TraceError>
     where
@@ -247,11 +230,7 @@ where
     }
 }
 
-impl<T, V> BatchOp<V> for Arc<T>
-where
-    T: BatchOp<V> + ?Sized,
-    V: TraceValue,
-{
+impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
     #[inline]
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         (**self).batch(inputs)

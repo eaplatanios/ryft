@@ -23,20 +23,14 @@ use crate::{
 
 /// Erased traced `vmap` body used by the staged higher-order op.
 #[derive(Clone)]
-pub(crate) struct FlatTracedVMap<V>
-where
-    V: TraceValue,
-{
+pub(crate) struct FlatTracedVMap<V: TraceValue> {
     lane_count: usize,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
     compiled: CompiledFunction<V, Vec<V>, Vec<V>>,
 }
 
-impl<V> FlatTracedVMap<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> FlatTracedVMap<V> {
     /// Builds one erased traced `vmap` body from explicit staged parts.
     #[inline]
     pub(crate) fn from_parts(
@@ -108,18 +102,12 @@ where
 
 /// Higher-order `vmap` op that carries one canonical program payload and, when linear, its transpose payload too.
 #[derive(Clone)]
-pub(crate) struct VMapOp<V>
-where
-    V: TraceValue,
-{
+pub(crate) struct VMapOp<V: TraceValue> {
     body: FlatTracedVMap<V>,
     transpose_body: Option<FlatTracedVMap<V>>,
 }
 
-impl<V> VMapOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> VMapOp<V> {
     /// Builds one ordinary traced `vmap` op.
     #[inline]
     pub(crate) fn new(body: FlatTracedVMap<V>) -> Self {
@@ -153,28 +141,19 @@ where
     }
 }
 
-impl<V> Debug for VMapOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Debug for VMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "VMap")
     }
 }
 
-impl<V> Display for VMapOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Display for VMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
 }
 
-impl<V> Op<V> for VMapOp<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> Op<V> for VMapOp<V> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -325,10 +304,7 @@ where
     }
 }
 
-impl<V> Op<JitTracer<V>> for VMapOp<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> Op<JitTracer<V>> for VMapOp<V> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

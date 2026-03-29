@@ -53,10 +53,7 @@ impl Display for WithShardingConstraintOp {
     }
 }
 
-impl<V> Op<V> for WithShardingConstraintOp
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -209,9 +206,14 @@ mod tests {
     fn test_with_sharding_constraint_abstract_eval_preserves_varying_axes() {
         let mesh = test_mesh();
         let target_sharding = test_sharding(&mesh);
-        let input_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], Vec::<&str>::new(), Vec::<&str>::new(), ["x"])
-                .unwrap();
+        let input_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated()],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+            ["x"],
+        )
+        .unwrap();
         let op = WithShardingConstraintOp::new(target_sharding);
 
         assert_eq!(
@@ -252,23 +254,16 @@ mod tests {
             MeshAxis::new("z", 4, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let target_sharding =
-            Sharding::new(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"])],
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-            )
-            .unwrap();
-        let input_sharding = Sharding::new(
+        let target_sharding = Sharding::new(
             mesh.clone(),
-            vec![ShardingDimension::replicated()],
-            ["y"],
-            ["z"],
-            ["x"],
+            vec![ShardingDimension::sharded(["x"])],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
         )
         .unwrap();
+        let input_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], ["y"], ["z"], ["x"]).unwrap();
         let op = WithShardingConstraintOp::new(target_sharding);
 
         assert_eq!(
@@ -281,8 +276,14 @@ mod tests {
                 Shape::new(vec![Size::Static(8)]),
                 None,
                 Some(
-                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], Vec::<&str>::new(), Vec::<&str>::new(), ["x"])
-                        .unwrap()
+                    Sharding::new(
+                        mesh,
+                        vec![ShardingDimension::sharded(["x"])],
+                        Vec::<&str>::new(),
+                        Vec::<&str>::new(),
+                        ["x"]
+                    )
+                    .unwrap()
                 ),
             )])
         );

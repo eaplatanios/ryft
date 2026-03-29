@@ -32,17 +32,11 @@ use super::{expect_input_count, lift_jit_constant, unary_abstract};
 
 /// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]
-pub(crate) struct ScaleOp<V>
-where
-    V: TraceValue,
-{
+pub(crate) struct ScaleOp<V: TraceValue> {
     factor: V,
 }
 
-impl<V> ScaleOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> ScaleOp<V> {
     /// Creates a new scale operation capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
@@ -56,28 +50,19 @@ where
     }
 }
 
-impl<V> Debug for ScaleOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Debug for ScaleOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Scale")
     }
 }
 
-impl<V> Display for ScaleOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Display for ScaleOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "scale")
     }
 }
 
-impl<V> Op<V> for ScaleOp<V>
-where
-    V: TraceValue + Mul<Output = V>,
-{
+impl<V: TraceValue + Mul<Output = V>> Op<V> for ScaleOp<V> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -160,10 +145,7 @@ where
     }
 }
 
-impl<V> JvpOp<V> for ScaleOp<V>
-where
-    V: TraceValue + Mul<Output = V>,
-{
+impl<V: TraceValue + Mul<Output = V>> JvpOp<V> for ScaleOp<V> {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,
@@ -177,10 +159,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for ScaleOp<V>
-where
-    V: TraceValue + Mul<Output = V>,
-{
+impl<V: TraceValue + Mul<Output = V>> BatchOp<V> for ScaleOp<V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| self.factor().clone() * lane).collect())])

@@ -28,18 +28,12 @@ use crate::{
 
 /// Tangent representation backed by atoms in a staged linear graph.
 #[derive(Clone, Debug, Parameter)]
-pub(crate) struct LinearTerm<V>
-where
-    V: TraceValue,
-{
+pub(crate) struct LinearTerm<V: TraceValue> {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<V>>>,
 }
 
-impl<V> LinearTerm<V>
-where
-    V: TraceValue + FloatExt,
-{
+impl<V: TraceValue + FloatExt> LinearTerm<V> {
     #[inline]
     pub(crate) fn atom(&self) -> AtomId {
         self.atom
@@ -111,10 +105,7 @@ where
     }
 }
 
-impl<V> TangentSpace<V> for LinearTerm<V>
-where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
-{
+impl<V: TraceValue + FloatExt + ZeroLike + MatrixOps> TangentSpace<V> for LinearTerm<V> {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
         lhs.add(rhs)
@@ -142,34 +133,24 @@ where
 pub(crate) type Linearized<V> = JvpTracer<V, LinearTerm<V>>;
 
 /// Staged linear map produced by `linearize`, `jvp_program`, or `vjp`.
-pub struct LinearProgram<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+pub struct LinearProgram<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     program: Program<V, Input, Output>,
     zero: V,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<V, Input, Output> Clone for LinearProgram<V, Input, Output>
-where
+impl<
     V: TraceValue + Clone,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+> Clone for LinearProgram<V, Input, Output>
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), zero: self.zero.clone(), marker: PhantomData }
     }
 }
 
-impl<V, Input, Output> LinearProgram<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearProgram<V, Input, Output> {
     #[inline]
     pub(crate) fn from_program(program: Program<V, Input, Output>, zero: V) -> Self {
         Self { program, zero, marker: PhantomData }
@@ -201,12 +182,7 @@ where
     }
 }
 
-impl<V, Input, Output> Display for LinearProgram<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for LinearProgram<V, Input, Output> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
     }
@@ -690,9 +666,8 @@ where
 
 /// Dispatch trait used by [`grad`] so it can operate both on concrete values and on already traced values.
 #[doc(hidden)]
-pub(crate) trait GradInvocationLeaf<Input>: Parameter + Sized
-where
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+pub(crate) trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>:
+    Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
     type Base: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps;
@@ -709,10 +684,9 @@ where
         F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>;
 }
 
-impl<V, Input> GradInvocationLeaf<Input> for V
+impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
+    for V
 where
-    V: TransformLeaf,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
 {
     type Base = V;
@@ -727,10 +701,9 @@ where
     }
 }
 
-impl<V, Input> GradInvocationLeaf<Input> for JitTracer<V>
+impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
+    for JitTracer<V>
 where
-    V: TransformLeaf,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V>,
 {
     type Base = V;
@@ -791,9 +764,8 @@ where
 
 /// Dispatch trait used by [`value_and_grad`] so it can operate both on concrete values and on already traced values.
 #[doc(hidden)]
-pub(crate) trait ValueAndGradInvocationLeaf<Input>: Parameter + Sized
-where
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+pub(crate) trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>:
+    Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
     type Base: TransformLeaf;
@@ -810,10 +782,9 @@ where
         F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>;
 }
 
-impl<V, Input> ValueAndGradInvocationLeaf<Input> for V
+impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>
+    ValueAndGradInvocationLeaf<Input> for V
 where
-    V: TransformLeaf,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
 {
     type Base = V;
@@ -830,10 +801,9 @@ where
     }
 }
 
-impl<V, Input> ValueAndGradInvocationLeaf<Input> for JitTracer<V>
+impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>
+    ValueAndGradInvocationLeaf<Input> for JitTracer<V>
 where
-    V: TransformLeaf,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V>,
     Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
 {
@@ -957,10 +927,7 @@ pub struct DenseJacobian<S, InputStructure, OutputStructure> {
     output_coordinate_counts: Vec<usize>,
 }
 
-impl<S, InputStructure, OutputStructure> DenseJacobian<S, InputStructure, OutputStructure>
-where
-    S: Clone,
-{
+impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure, OutputStructure> {
     fn from_rows(
         rows_data: Vec<Vec<S>>,
         input_structure: InputStructure,

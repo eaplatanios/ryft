@@ -42,10 +42,7 @@ impl Display for MatrixTransposeOp {
     }
 }
 
-impl<V> Op<V> for MatrixTransposeOp
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> Op<V> for MatrixTransposeOp {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -126,10 +123,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for MatrixTransposeOp
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> BatchOp<V> for MatrixTransposeOp {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])

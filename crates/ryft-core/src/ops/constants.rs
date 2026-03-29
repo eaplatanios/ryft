@@ -73,10 +73,7 @@ impl Constant<f32> for f32 {
     }
 }
 
-impl<V: Constant<f32>, T: Zero> Constant<f32> for JvpTracer<V, T>
-where
-    V: Differentiable<T> + Typed<T::T>,
-{
+impl<V: Constant<f32> + Differentiable<T> + Typed<T::T>, T: Zero> Constant<f32> for JvpTracer<V, T> {
     fn constant(value: f32) -> Self {
         V::constant(value).into()
     }

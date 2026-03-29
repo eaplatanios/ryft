@@ -20,10 +20,8 @@ fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTree
 fn merge_sharding_state(base: &Sharding, other: &Sharding) -> Sharding {
     let mut sharding = base.clone();
     sharding.unreduced_axes = merge_unique_axes(&base.unreduced_axes, &other.unreduced_axes);
-    sharding.reduced_manual_axes =
-        merge_unique_axes(&base.reduced_manual_axes, &other.reduced_manual_axes);
-    sharding.varying_manual_axes =
-        merge_unique_axes(&base.varying_manual_axes, &other.varying_manual_axes);
+    sharding.reduced_manual_axes = merge_unique_axes(&base.reduced_manual_axes, &other.reduced_manual_axes);
+    sharding.varying_manual_axes = merge_unique_axes(&base.varying_manual_axes, &other.varying_manual_axes);
     sharding
 }
 
@@ -120,10 +118,7 @@ pub(crate) fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> 
 }
 
 /// Lifts one concrete value into the staged graph owned by a JIT tracer.
-pub(crate) fn lift_jit_constant<V>(constant: &V, exemplar: &JitTracer<V>) -> JitTracer<V>
-where
-    V: TraceValue,
-{
+pub(crate) fn lift_jit_constant<V: TraceValue>(constant: &V, exemplar: &JitTracer<V>) -> JitTracer<V> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
     JitTracer::from_staged_parts(constant.clone(), atom, builder, exemplar.staging_error_handle())

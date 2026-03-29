@@ -18,33 +18,23 @@ pub(crate) type ProgramOpRef<V> = Arc<dyn Op<V>>;
 pub(crate) type ProgramBuilder<V> = GraphBuilder<ProgramOpRef<V>, V>;
 
 /// Canonical staged program used by `tracing_v2`.
-pub(crate) struct Program<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+pub(crate) struct Program<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     graph: Graph<ProgramOpRef<V>, V, Input, Output>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<V, Input, Output> Clone for Program<V, Input, Output>
-where
+impl<
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+> Clone for Program<V, Input, Output>
 {
     fn clone(&self) -> Self {
         Self { graph: self.graph.clone(), marker: PhantomData }
     }
 }
 
-impl<V, Input, Output> Program<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, Input, Output> {
     /// Creates a program from an existing staged graph.
     #[inline]
     pub(crate) fn from_graph(graph: Graph<ProgramOpRef<V>, V, Input, Output>) -> Self {
@@ -77,12 +67,7 @@ where
     }
 }
 
-impl<V, Input, Output> Display for Program<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for Program<V, Input, Output> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.graph, formatter)
     }

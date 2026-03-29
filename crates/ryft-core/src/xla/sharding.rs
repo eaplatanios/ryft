@@ -266,21 +266,20 @@ pub struct Sharding {
 
 impl Sharding {
     /// Creates a sharding from a mesh and per-dimension assignments.
-    pub fn new<U, UI, R, RI, V, VI>(
-        mesh: LogicalMesh,
-        dimensions: Vec<ShardingDimension>,
-        unreduced_axes: UI,
-        reduced_manual_axes: RI,
-        varying_manual_axes: VI,
-    ) -> Result<Self, ShardingError>
-    where
+    pub fn new<
         U: Into<String>,
         UI: IntoIterator<Item = U>,
         R: Into<String>,
         RI: IntoIterator<Item = R>,
         V: Into<String>,
         VI: IntoIterator<Item = V>,
-    {
+    >(
+        mesh: LogicalMesh,
+        dimensions: Vec<ShardingDimension>,
+        unreduced_axes: UI,
+        reduced_manual_axes: RI,
+        varying_manual_axes: VI,
+    ) -> Result<Self, ShardingError> {
         let unreduced_axes = unreduced_axes.into_iter().map(Into::into).collect();
         let reduced_manual_axes = reduced_manual_axes.into_iter().map(Into::into).collect();
         let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect();
@@ -1320,14 +1319,9 @@ mod tests {
             MeshAxis::new("z\"w", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::new(
-            mesh,
-            vec![ShardingDimension::sharded(["x\"y"])],
-            ["z\"w"],
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x\"y"])], ["z\"w"], empty_axes(), empty_axes())
+                .unwrap();
 
         assert_eq!(sharding.replicated_axes(), vec![r"path\to"]);
         assert_eq!(
@@ -1435,13 +1429,7 @@ mod tests {
         );
 
         assert_eq!(
-            Sharding::new(
-                mesh.clone(),
-                vec![ShardingDimension::replicated()],
-                empty_axes(),
-                empty_axes(),
-                ["x", "x"]
-            ),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["x", "x"]),
             Ok(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["x"])
                 .unwrap())
         );
@@ -1470,14 +1458,7 @@ mod tests {
 
         assert_eq!(
             sharding.project_for_traced_sharding(),
-            Sharding::new(
-                mesh,
-                vec![ShardingDimension::replicated()],
-                empty_axes(),
-                ["x", "z"],
-                ["y"],
-            )
-            .unwrap()
+            Sharding::new(mesh, vec![ShardingDimension::replicated()], empty_axes(), ["x", "z"], ["y"],).unwrap()
         );
     }
 
@@ -1821,9 +1802,14 @@ mod tests {
     fn test_sharding_layout_mesh_mismatch_reports_expected_and_actual_meshes() {
         let mesh = test_device_mesh_2x2();
         let actual = LogicalMesh::new(vec![MeshAxis::new("z", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let sharding =
-            Sharding::new(actual.clone(), vec![ShardingDimension::sharded(["z"])], empty_axes(), empty_axes(), empty_axes())
-                .unwrap();
+        let sharding = Sharding::new(
+            actual.clone(),
+            vec![ShardingDimension::sharded(["z"])],
+            empty_axes(),
+            empty_axes(),
+            empty_axes(),
+        )
+        .unwrap();
 
         assert_eq!(
             ShardingLayout::new(vec![8], mesh.clone(), sharding),

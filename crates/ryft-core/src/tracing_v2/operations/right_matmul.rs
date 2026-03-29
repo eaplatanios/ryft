@@ -29,17 +29,11 @@ use super::{
 
 /// Linear map `tangent -> tangent @ factor`.
 #[derive(Clone)]
-pub(crate) struct RightMatMulOp<V>
-where
-    V: MatrixValue,
-{
+pub(crate) struct RightMatMulOp<V: MatrixValue> {
     factor: V,
 }
 
-impl<V> RightMatMulOp<V>
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> RightMatMulOp<V> {
     /// Creates one right multiplication op capturing the provided factor.
     #[inline]
     pub(crate) fn new(factor: V) -> Self {
@@ -53,28 +47,19 @@ where
     }
 }
 
-impl<V> Debug for RightMatMulOp<V>
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> Debug for RightMatMulOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "RightMatMul")
     }
 }
 
-impl<V> Display for RightMatMulOp<V>
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> Display for RightMatMulOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "right_matmul")
     }
 }
 
-impl<V> Op<V> for RightMatMulOp<V>
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> Op<V> for RightMatMulOp<V> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -165,10 +150,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for RightMatMulOp<V>
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> BatchOp<V> for RightMatMulOp<V> {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(

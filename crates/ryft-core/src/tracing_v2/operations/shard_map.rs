@@ -59,10 +59,7 @@ pub(crate) enum LinearShardMapEvalMode {
 
 /// Linear execution state carried by one canonical traced shard-map op.
 #[derive(Clone)]
-struct LinearShardMapState<V>
-where
-    V: TraceValue,
-{
+struct LinearShardMapState<V: TraceValue> {
     captured_global_primals: Vec<V>,
     eval_mode: LinearShardMapEvalMode,
     transpose_mode: LinearShardMapEvalMode,
@@ -70,20 +67,14 @@ where
 
 /// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering.
 #[derive(Clone)]
-pub(crate) struct ShardMapOp<V>
-where
-    V: TraceValue,
-{
+pub(crate) struct ShardMapOp<V: TraceValue> {
     body: FlatTracedShardMap,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
     linear_state: Option<LinearShardMapState<V>>,
 }
 
-impl<V> ShardMapOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> ShardMapOp<V> {
     /// Creates one ordinary staged shard-map op from its erased body payload.
     #[inline]
     pub(crate) fn new(body: FlatTracedShardMap) -> Self {
@@ -154,19 +145,13 @@ where
     }
 }
 
-impl<V> Debug for ShardMapOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Debug for ShardMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.has_linear_state() { write!(formatter, "LinearShardMap") } else { write!(formatter, "ShardMap") }
     }
 }
 
-impl<V> Display for ShardMapOp<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Display for ShardMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.has_linear_state() { write!(formatter, "linear_shard_map") } else { write!(formatter, "shard_map") }
     }
@@ -868,16 +853,15 @@ fn make_replayed_linear_shard_map(
     }
 }
 
-fn try_linearize_traced_shard_map_body<F>(
+fn try_linearize_traced_shard_map_body<
+    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError>,
+>(
     function: F,
     primals: Vec<ShardMapTracer>,
 ) -> Result<
     (Vec<ShardMapTracer>, crate::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>),
     TraceError,
->
-where
-    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError>,
-{
+> {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_structure = vec![crate::parameters::Placeholder; primals.len()];
     let builder = std::rc::Rc::new(std::cell::RefCell::new(ProgramBuilder::new()));
@@ -908,16 +892,15 @@ where
     Ok((primal_outputs, crate::tracing_v2::LinearProgram::from_program(program, zero)))
 }
 
-fn try_transpose_traced_shard_map_body<F>(
+fn try_transpose_traced_shard_map_body<
+    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError>,
+>(
     function: F,
     primals: Vec<ShardMapTracer>,
 ) -> Result<
     (Vec<ShardMapTracer>, crate::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>),
     TraceError,
->
-where
-    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError>,
-{
+> {
     let (outputs, pushforward) = try_linearize_traced_shard_map_body(function, primals)?;
     Ok((outputs, pushforward.transpose()?))
 }
@@ -934,7 +917,11 @@ fn apply_flat_traced_shard_map(
     .map_err(ShardMapTraceError::from)
 }
 
-fn replay_traced_xla_graph<GraphInput, GraphOutput, V>(
+fn replay_traced_xla_graph<
+    GraphInput: crate::parameters::Parameterized<ShardMapTensor>,
+    GraphOutput: crate::parameters::Parameterized<ShardMapTensor>,
+    V: ReplayShardMapValue,
+>(
     graph: &crate::tracing_v2::Graph<
         crate::tracing_v2::StagedOpRef<ShardMapTensor>,
         ShardMapTensor,
@@ -942,12 +929,7 @@ fn replay_traced_xla_graph<GraphInput, GraphOutput, V>(
         GraphOutput,
     >,
     inputs: Vec<V>,
-) -> Result<Vec<V>, ShardMapTraceError>
-where
-    GraphInput: crate::parameters::Parameterized<ShardMapTensor>,
-    GraphOutput: crate::parameters::Parameterized<ShardMapTensor>,
-    V: ReplayShardMapValue,
-{
+) -> Result<Vec<V>, ShardMapTraceError> {
     let mut values = vec![None; graph.atom_count()];
     for (atom_id, value) in graph.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
         values[atom_id] = Some(value);
@@ -1025,10 +1007,10 @@ where
         .collect()
 }
 
-fn replay_flat_graph<V>(body: &FlatTracedShardMap, inputs: Vec<V>) -> Result<Vec<V>, ShardMapTraceError>
-where
-    V: ReplayShardMapValue,
-{
+fn replay_flat_graph<V: ReplayShardMapValue>(
+    body: &FlatTracedShardMap,
+    inputs: Vec<V>,
+) -> Result<Vec<V>, ShardMapTraceError> {
     replay_traced_xla_graph(body.compiled.graph(), inputs)
 }
 
@@ -1240,7 +1222,11 @@ impl ReplayShardMapValue for Linearized<ShardMapTracer> {
     }
 }
 
-fn trace_flat_shard_map<F, Input, Output>(
+fn trace_flat_shard_map<
+    F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
+    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
+    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+>(
     function: F,
     global_input_types: Input,
     mesh: LogicalMesh,
@@ -1250,13 +1236,10 @@ fn trace_flat_shard_map<F, Input, Output>(
     check_vma: bool,
 ) -> Result<FlatTracedShardMap, ShardMapTraceError>
 where
-    Input: Parameterized<ArrayType, ParameterStructure: Clone>,
     Input::Family:
         ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-    Output: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output::Family:
         ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
-    F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
 {
     let shard_map = ShardMap::new(
         mesh,
@@ -1268,14 +1251,11 @@ where
     Ok(FlatTracedShardMap::from_traced(&shard_map.trace::<F, Input, Output>(function, global_input_types)?))
 }
 
-fn apply_traced_shard_map<Output>(
+fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
-) -> Result<Output, ShardMapTraceError>
-where
-    Output: Parameterized<ShardMapTracer>,
-{
+) -> Result<Output, ShardMapTraceError> {
     let staged_outputs = JitTracer::apply_staged_op(
         traced_inputs.as_slice(),
         std::sync::Arc::new(ShardMapOp::new(traced.clone())),
@@ -1284,11 +1264,10 @@ where
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }
 
-fn global_input_types_from_traced_inputs<Input>(
+fn global_input_types_from_traced_inputs<Input: Parameterized<ShardMapTracer, ParameterStructure: Clone>>(
     traced_inputs: &Input,
 ) -> Result<Input::To<ArrayType>, ShardMapTraceError>
 where
-    Input: Parameterized<ShardMapTracer, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<ArrayType>,
 {
     Ok(Input::To::<ArrayType>::from_parameters(
@@ -1297,27 +1276,24 @@ where
     )?)
 }
 
-fn reparameterize_shardings<Source, Target>(
+fn reparameterize_shardings<Source: Parameterized<Sharding>, Target: Parameterized<Sharding>>(
     specs: Source,
     target_structure: Target::ParameterStructure,
-) -> Result<Target, ShardMapTraceError>
-where
-    Source: Parameterized<Sharding>,
-    Target: Parameterized<Sharding>,
-{
+) -> Result<Target, ShardMapTraceError> {
     Ok(Target::from_parameters(target_structure, specs.into_parameters().collect::<Vec<_>>())?)
 }
 
 impl ShardMapInvocationLeaf for ArrayType {
-    type Return<Input, Output>
+    type Return<
+        Input: Parameterized<Self, ParameterStructure: Clone>,
+        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    >
         = TracedShardMap<Input, Output>
     where
-        Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
@@ -1367,15 +1343,16 @@ impl ShardMapInvocationLeaf for ArrayType {
 }
 
 impl ShardMapInvocationLeaf for ShardMapTracer {
-    type Return<Input, Output>
+    type Return<
+        Input: Parameterized<Self, ParameterStructure: Clone>,
+        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    >
         = Output::To<ShardMapTracer>
     where
-        Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>
@@ -1424,15 +1401,16 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
 }
 
 impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
-    type Return<Input, Output>
+    type Return<
+        Input: Parameterized<Self, ParameterStructure: Clone>,
+        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
+    >
         = Output::To<Linearized<ShardMapTracer>>
     where
-        Input: Parameterized<Self, ParameterStructure: Clone>,
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
         Output::Family: ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>

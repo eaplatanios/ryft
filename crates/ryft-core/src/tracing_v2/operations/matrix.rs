@@ -38,7 +38,7 @@ pub trait MatrixOps: Sized {
 /// those array types to describe rank-2 matrices with static dimensions and floating-point element types.
 pub trait MatrixValue: TraceValue + MatrixOps {}
 
-impl<T> MatrixValue for T where T: TraceValue + MatrixOps {}
+impl<T: TraceValue + MatrixOps> MatrixValue for T {}
 
 impl MatrixOps for f32 {
     #[inline]
@@ -65,10 +65,7 @@ impl MatrixOps for f64 {
 }
 
 /// Tangent representation for matrix-valued primals.
-pub trait MatrixTangentSpace<V>: TangentSpace<V>
-where
-    V: MatrixValue,
-{
+pub trait MatrixTangentSpace<V: MatrixValue>: TangentSpace<V> {
     /// Applies the linear map `tangent -> factor @ tangent`.
     fn matmul_left(factor: V, tangent: Self) -> Self;
 
@@ -79,10 +76,7 @@ where
     fn transpose_matrix(value: Self) -> Self;
 }
 
-impl<V> MatrixTangentSpace<V> for V
-where
-    V: MatrixValue + FloatExt + ZeroLike,
-{
+impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for V {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
         factor.matmul(tangent)
@@ -188,19 +182,12 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
     matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
 }
 
-fn single_batch_output<V>(mut outputs: Vec<BatchedValue<V>>, op: &'static str) -> BatchedValue<V>
-where
-    V: MatrixValue,
-{
+fn single_batch_output<V: MatrixValue>(mut outputs: Vec<BatchedValue<V>>, op: &'static str) -> BatchedValue<V> {
     debug_assert_eq!(outputs.len(), 1, "{op} should produce a single batched output");
     outputs.pop().expect("single-output matrix primitive should return one batched output")
 }
 
-impl<V, T> MatrixOps for JvpTracer<V, T>
-where
-    V: MatrixValue,
-    T: MatrixTangentSpace<V>,
-{
+impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
         JvpTracer {
@@ -218,10 +205,7 @@ where
     }
 }
 
-impl<V> MatrixOps for JitTracer<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> MatrixOps for JitTracer<V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
         self.binary(rhs, Arc::new(MatMulOp), MatrixOps::matmul)
@@ -236,10 +220,7 @@ where
     }
 }
 
-impl<V> MatrixOps for BatchedValue<V>
-where
-    V: MatrixValue,
-{
+impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
         single_batch_output(MatMulOp.batch(&[self, rhs]).expect("batched matmul rule should succeed"), "matmul")
@@ -257,10 +238,7 @@ where
     }
 }
 
-impl<V> MatrixTangentSpace<V> for LinearTerm<V>
-where
-    V: MatrixValue + FloatExt + ZeroLike,
-{
+impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<V> {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
         tangent.apply_linear_op(Arc::new(LeftMatMulOp::new(factor)))

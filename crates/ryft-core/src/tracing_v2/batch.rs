@@ -64,10 +64,7 @@ fn single_output<V>(mut outputs: Vec<Batch<V>>, op: &'static str) -> Batch<V> {
     outputs.pop().expect("single-output primitive should return one batched output")
 }
 
-impl<V> Add for Batch<V>
-where
-    V: TraceValue + Add<Output = V>,
-{
+impl<V: TraceValue + Add<Output = V>> Add for Batch<V> {
     type Output = Self;
 
     #[inline]
@@ -76,10 +73,7 @@ where
     }
 }
 
-impl<V> Mul for Batch<V>
-where
-    V: TraceValue + Mul<Output = V>,
-{
+impl<V: TraceValue + Mul<Output = V>> Mul for Batch<V> {
     type Output = Self;
 
     #[inline]
@@ -88,10 +82,7 @@ where
     }
 }
 
-impl<V> Neg for Batch<V>
-where
-    V: TraceValue + Neg<Output = V>,
-{
+impl<V: TraceValue + Neg<Output = V>> Neg for Batch<V> {
     type Output = Self;
 
     #[inline]
@@ -100,10 +91,7 @@ where
     }
 }
 
-impl<V> FloatExt for Batch<V>
-where
-    V: TraceValue + FloatExt,
-{
+impl<V: TraceValue + FloatExt> FloatExt for Batch<V> {
     #[inline]
     fn sin(self) -> Self {
         single_output(SinOp.batch(&[self]).expect("sin batching rule should succeed"), "sin")
@@ -115,20 +103,14 @@ where
     }
 }
 
-impl<V> ZeroLike for Batch<V>
-where
-    V: ZeroLike,
-{
+impl<V: ZeroLike> ZeroLike for Batch<V> {
     #[inline]
     fn zero_like(&self) -> Self {
         Self::new(self.lanes.iter().map(ZeroLike::zero_like).collect())
     }
 }
 
-impl<V> OneLike for Batch<V>
-where
-    V: OneLike,
-{
+impl<V: OneLike> OneLike for Batch<V> {
     #[inline]
     fn one_like(&self) -> Self {
         Self::new(self.lanes.iter().map(OneLike::one_like).collect())
@@ -199,10 +181,10 @@ where
 
 /// Dispatch trait used by [`vmap`] so it can handle both concrete batches and already traced values.
 #[doc(hidden)]
-pub(crate) trait VMapInvocationLeaf<Input, Output>: Parameter + Sized
-where
+pub(crate) trait VMapInvocationLeaf<
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
+>: Parameter + Sized
 {
     /// Invokes [`vmap`] for one concrete leaf regime.
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
@@ -212,12 +194,13 @@ where
         F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>;
 }
 
-impl<V, Input, Output> VMapInvocationLeaf<Input, Output> for V
-where
+impl<
     V: TransformLeaf,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Batch<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+> VMapInvocationLeaf<Input, Output> for V
+where
+    Input::Family: ParameterizedFamily<Batch<V>>,
     Output::Family: ParameterizedFamily<Batch<V>>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
@@ -229,12 +212,13 @@ where
     }
 }
 
-impl<V, Input, Output> VMapInvocationLeaf<Input, Output> for JitTracer<V>
-where
+impl<
     V: TransformLeaf,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<V>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
+> VMapInvocationLeaf<Input, Output> for JitTracer<V>
+where
+    Input::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<Self> + ParameterizedFamily<V>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>

@@ -29,10 +29,7 @@ use crate::{
 
 /// Tracer used while staging JIT programs.
 #[derive(Clone, Debug, Parameter)]
-pub struct JitTracer<V>
-where
-    V: TraceValue,
-{
+pub struct JitTracer<V: TraceValue> {
     /// Concrete value obtained during eager execution of the staged computation.
     pub value: V,
     atom: AtomId,
@@ -40,10 +37,7 @@ where
     staging_error: Rc<RefCell<Option<TraceError>>>,
 }
 
-impl<V> JitTracer<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> JitTracer<V> {
     #[inline]
     pub(crate) fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
         self.builder.clone()
@@ -141,22 +135,16 @@ where
     }
 }
 
-impl<V> Typed<ArrayType> for JitTracer<V>
-where
-    V: TraceValue,
-{
+impl<V: TraceValue> Typed<ArrayType> for JitTracer<V> {
     #[inline]
     fn tpe(&self) -> ArrayType {
         <V as Typed<ArrayType>>::tpe(&self.value)
     }
 }
 
-impl<V> TraceValue for JitTracer<V> where V: TraceValue {}
+impl<V: TraceValue> TraceValue for JitTracer<V> {}
 
-impl<V> ZeroLike for JitTracer<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> ZeroLike for JitTracer<V> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.value.zero_like();
@@ -165,10 +153,7 @@ where
     }
 }
 
-impl<V> OneLike for JitTracer<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> OneLike for JitTracer<V> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.value.one_like();
@@ -177,10 +162,7 @@ where
     }
 }
 
-impl<V> Add for JitTracer<V>
-where
-    V: TransformLeaf + Add<Output = V>,
-{
+impl<V: TransformLeaf + Add<Output = V>> Add for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -189,10 +171,7 @@ where
     }
 }
 
-impl<V> Mul for JitTracer<V>
-where
-    V: TransformLeaf + Mul<Output = V>,
-{
+impl<V: TransformLeaf + Mul<Output = V>> Mul for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -201,10 +180,7 @@ where
     }
 }
 
-impl<V> Neg for JitTracer<V>
-where
-    V: TransformLeaf + Neg<Output = V>,
-{
+impl<V: TransformLeaf + Neg<Output = V>> Neg for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -213,10 +189,7 @@ where
     }
 }
 
-impl<V> FloatExt for JitTracer<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> FloatExt for JitTracer<V> {
     #[inline]
     fn sin(self) -> Self {
         self.unary(Arc::new(SinOp), FloatExt::sin)
@@ -233,33 +206,23 @@ where
 /// In the current prototype this type stores only the staged graph and replays it with the built-in interpreter.
 /// Later, once a concrete backend exists, it can grow additional fields that hold backend-specific compiled artifacts
 /// while keeping the same high-level API shape.
-pub struct CompiledFunction<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+pub struct CompiledFunction<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     program: Program<V, Input, Output>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<V, Input, Output> Clone for CompiledFunction<V, Input, Output>
-where
+impl<
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+> Clone for CompiledFunction<V, Input, Output>
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), marker: PhantomData }
     }
 }
 
-impl<V, Input, Output> CompiledFunction<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledFunction<V, Input, Output> {
     #[inline]
     pub(crate) fn from_graph(graph: crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output>) -> Self {
         Self::from_program(Program::from_graph(graph))
@@ -292,12 +255,7 @@ where
     }
 }
 
-impl<V, Input, Output> Display for CompiledFunction<V, Input, Output>
-where
-    V: TraceValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for CompiledFunction<V, Input, Output> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
     }

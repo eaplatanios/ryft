@@ -42,10 +42,7 @@ impl Display for SinOp {
     }
 }
 
-impl<V> Op<V> for SinOp
-where
-    V: TraceValue + FloatExt,
-{
+impl<V: TraceValue + FloatExt> Op<V> for SinOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -123,10 +120,7 @@ where
     }
 }
 
-impl<V> JvpOp<V> for SinOp
-where
-    V: TraceValue + FloatExt,
-{
+impl<V: TraceValue + FloatExt> JvpOp<V> for SinOp {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,
@@ -140,10 +134,7 @@ where
     }
 }
 
-impl<V> BatchOp<V> for SinOp
-where
-    V: TraceValue + FloatExt,
-{
+impl<V: TraceValue + FloatExt> BatchOp<V> for SinOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.sin()).collect())])

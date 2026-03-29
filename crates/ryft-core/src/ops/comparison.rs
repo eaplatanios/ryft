@@ -20,9 +20,7 @@ use crate::differentiation_v0::JvpTracer;
 // the following macro for generating those implementations.
 macro_rules! impl_partial_eq_with_jvp_tracer_rhs {
     ($($T:ty),* $(,)*) => {$(
-        impl<V, VT> PartialEq<$T> for JvpTracer<V, VT>
-        where
-            V: PartialEq<$T>,
+        impl<V: PartialEq<$T>, VT> PartialEq<$T> for JvpTracer<V, VT>
         {
             fn eq(&self, other: &$T) -> bool {
                 self.value.eq(&other)
@@ -57,9 +55,7 @@ impl_partial_eq_with_jvp_tracer_rhs!(bool, i8, i16, i32, i64, u8, u16, u32, u64,
 // to what we did for [PartialEq].
 macro_rules! impl_partial_ord_with_jvp_tracer_rhs {
     ($($T:ty),* $(,)*) => {$(
-        impl<V, VT> PartialOrd<$T> for JvpTracer<V, VT>
-        where
-            V: PartialOrd<$T>,
+        impl<V: PartialOrd<$T>, VT> PartialOrd<$T> for JvpTracer<V, VT>
         {
             fn partial_cmp(&self, other: &$T) -> Option<std::cmp::Ordering> {
                 self.value.partial_cmp(&other)
