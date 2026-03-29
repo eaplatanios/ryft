@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::{
-    sharding::ShardingDimension,
+    sharding::{Sharding, ShardingDimension},
     tracing_v2::{
         FloatExt, TraceError, TraceValue, TransformLeaf, ZeroLike,
         batch::Batch as BatchedValue,
@@ -18,7 +18,6 @@ use crate::{
         ops::BatchOp,
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
-    xla::sharding::Sharding,
 };
 
 use super::{LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, RightMatMulOp};

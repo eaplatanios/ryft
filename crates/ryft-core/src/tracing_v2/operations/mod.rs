@@ -2,9 +2,9 @@
 
 use std::collections::BTreeSet;
 
+use crate::sharding::Sharding;
 use crate::tracing_v2::{TraceError, TraceValue, batch::Batch, jit::JitTracer};
 use crate::types::ArrayType;
-use crate::xla::sharding::Sharding;
 
 fn is_replicated_sharding(sharding: &Sharding) -> bool {
     sharding
@@ -151,7 +151,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{DataType, Shape, Size};
 
     fn test_mesh() -> LogicalMesh {

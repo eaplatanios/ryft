@@ -17,12 +17,12 @@ use ryft_mlir::Block;
 use ryft_mlir::{Location, dialects::shardy::DetachedMeshOperation};
 use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
-use crate::sharding::ShardingError;
+use crate::sharding::{Sharding, ShardingError};
 use crate::types::data_types::{DataType, DataTypeError};
 
 use crate::sharding::DeviceMesh;
 
-use super::sharding::{ShardDescriptor, Sharding, ShardingLayout};
+use super::sharding::{ShardDescriptor, ShardingLayout};
 
 // TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
 
@@ -438,9 +438,8 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, ShardingDimension};
+    use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
     use crate::types::data_types::DataType;
-    use crate::xla::sharding::Sharding;
 
     use super::*;
 

@@ -4,7 +4,7 @@
 //! higher-order `shard_map` operation.
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
+use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing_v2::{
     FloatExt, MatrixOps, OneLike, Program,
     benchmarking::{
@@ -18,7 +18,6 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, DataType, Shape, Size};
 
 use super::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer};
-use super::sharding::Sharding;
 use super::{TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.

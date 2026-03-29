@@ -16,4 +16,5 @@ pub use shard_map::{
     with_sharding_constraint,
 };
 
-pub use sharding::{ShardDescriptor, ShardSlice, Sharding, ShardingLayout};
+pub use crate::sharding::Sharding;
+pub use sharding::{ShardDescriptor, ShardSlice, ShardingLayout};

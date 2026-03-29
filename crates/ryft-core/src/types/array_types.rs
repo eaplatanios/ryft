@@ -4,8 +4,8 @@ use ryft_macros::Parameter;
 
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
+use crate::sharding::Sharding;
 use crate::types::{DataType, Layout, Type};
-use crate::xla::sharding::Sharding;
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -266,10 +266,9 @@ impl Type for ArrayType {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout};
-    use crate::xla::sharding::Sharding;
 
     #[test]
     fn test_size_value() {

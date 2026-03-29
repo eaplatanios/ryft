@@ -1745,10 +1745,8 @@ mod tests {
     use crate::types::Shape;
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
-    use crate::sharding::{LogicalMesh, ShardingDimension};
-
-    use super::super::sharding::Sharding;
     use super::*;
+    use crate::sharding::{LogicalMesh, Sharding, ShardingDimension};
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
         LogicalMesh::new(vec![MeshAxis::new(axis_name, axis_size, MeshAxisType::Manual).unwrap()]).unwrap()

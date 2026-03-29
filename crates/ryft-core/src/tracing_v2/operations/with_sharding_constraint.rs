@@ -9,15 +9,13 @@ use std::{
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation, Value, ValueRef};
 
+use crate::sharding::Sharding;
 use crate::tracing_v2::{
     FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike, forward::JvpTracer, graph::AtomId,
     jit::JitTracer, linear::LinearTerm, ops::Op, program::ProgramBuilder,
 };
 use crate::types::ArrayType;
-use crate::xla::{
-    lowering::{LoweringError, MlirLowerableValue, ShardMapMlirLowerer},
-    sharding::Sharding,
-};
+use crate::xla::lowering::{LoweringError, MlirLowerableValue, ShardMapMlirLowerer};
 
 use super::{expect_input_count, unary_abstract};
 
@@ -164,11 +162,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tracing_v2::ProgramBuilder;
     use crate::types::{ArrayType, DataType, Shape, Size};
     use crate::xla::shard_map::ShardMapTensor;
-    use crate::xla::sharding::Sharding;
 
     use super::*;
 

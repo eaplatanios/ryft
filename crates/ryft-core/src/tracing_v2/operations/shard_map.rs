@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     parameters::{Parameterized, ParameterizedFamily},
-    sharding::LogicalMesh,
+    sharding::{LogicalMesh, Sharding},
     tracing_v2::{
         AtomId, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op, ProgramBuilder,
         TraceError, TraceValue, ZeroLike,
@@ -19,7 +19,6 @@ use crate::{
             FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
             ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap,
         },
-        sharding::Sharding,
     },
 };
 

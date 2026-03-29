@@ -66,7 +66,7 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::sharding::{LogicalMesh, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, ShardingDimension, ShardingError};
+use crate::sharding::{LogicalMesh, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, Sharding, ShardingDimension, ShardingError};
 use crate::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
     operations::WithShardingConstraintOp,
@@ -74,7 +74,6 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Shape, Size, Typed};
 
 use super::lowering::LoweringError;
-use super::sharding::Sharding;
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -1728,11 +1727,10 @@ mod tests {
     use crate::sharding::DeviceMesh;
     use crate::sharding::MeshDevice;
     use crate::sharding::ShardingDimension;
-    use crate::sharding::{MeshAxis, MeshAxisType};
+    use crate::sharding::{MeshAxis, MeshAxisType, Sharding};
     use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
     use crate::types::data_types::DataType;
     use crate::xla::arrays::Array;
-    use crate::xla::sharding::Sharding;
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
