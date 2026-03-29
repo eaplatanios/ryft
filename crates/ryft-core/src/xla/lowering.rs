@@ -651,7 +651,7 @@ fn packed_array_type(array_type: &ArrayType, lane_count: usize) -> ArrayType {
     let mut dimensions = Vec::with_capacity(array_type.shape.dimensions.len() + 1);
     dimensions.push(Size::Static(lane_count));
     dimensions.extend(array_type.shape.dimensions.iter().cloned());
-    ArrayType::new(array_type.data_type, Shape::new(dimensions), None)
+    ArrayType::new(array_type.data_type, Shape::new(dimensions), None, None)
 }
 
 /// Returns the tensor type obtained by prepending a leading axis of size one.
@@ -686,9 +686,10 @@ where
     B: Block<'b, 'c, 't>,
     L: Location<'c, 't> + Copy,
 {
-    let scalar_tensor_type =
-        context.tensor_type(lower_element_type(data_type, context)?, &[], None, location).ok_or_else(|| {
-            LoweringError::InvalidTensorType { array_type: ArrayType::new(data_type, Shape::new(Vec::new()), None) }
+    let scalar_tensor_type = context
+        .tensor_type(lower_element_type(data_type, context)?, &[], None, location)
+        .ok_or_else(|| LoweringError::InvalidTensorType {
+            array_type: ArrayType::new(data_type, Shape::new(Vec::new()), None, None),
         })?;
     let elements = lower_constant_elements_attribute(data_type, scalar_tensor_type, constant_kind, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location));
@@ -1374,7 +1375,7 @@ where
         let scalar_tensor_type = context
             .tensor_type(lower_element_type(value_type.data_type, context)?, &[], None, location)
             .ok_or_else(|| LoweringError::InvalidTensorType {
-                array_type: ArrayType::new(value_type.data_type, crate::types::Shape::new(Vec::new()), None),
+                array_type: ArrayType::new(value_type.data_type, crate::types::Shape::new(Vec::new()), None, None),
             })?;
         if let Some(scalar_elements) = value.to_scalar_dense_elements_attribute(scalar_tensor_type, context)? {
             let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location));
@@ -1413,7 +1414,7 @@ where
         let scalar_tensor_type = context
             .tensor_type(lower_element_type(value.r#type().data_type, context)?, &[], None, location)
             .ok_or_else(|| LoweringError::InvalidTensorType {
-                array_type: ArrayType::new(value.r#type().data_type, crate::types::Shape::new(Vec::new()), None),
+                array_type: ArrayType::new(value.r#type().data_type, crate::types::Shape::new(Vec::new()), None, None),
             })?;
         let scalar_elements =
             lower_constant_elements_attribute(value.r#type().data_type, scalar_tensor_type, constant_kind, context)?;
@@ -1754,11 +1755,11 @@ mod tests {
     }
 
     fn test_vector_type(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]), None)
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]), None, None)
     }
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None)
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
     }
 
     fn lower_traced_module(
@@ -1784,8 +1785,8 @@ mod tests {
             |x| x.clone() + x,
             global_input_type,
             mesh.clone(),
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], vec![]).unwrap(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![]).unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], vec![], vec![]).unwrap(),
         )
         .unwrap();
 
@@ -1822,10 +1823,16 @@ mod tests {
                 mesh.clone(),
                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
                 vec![],
+                vec![],
             )
             .unwrap(),
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![])
-                .unwrap(),
+            Sharding::new(
+                mesh,
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                vec![],
+                vec![],
+            )
+            .unwrap(),
         )
         .unwrap();
 

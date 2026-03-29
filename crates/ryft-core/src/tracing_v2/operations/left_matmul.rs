@@ -144,7 +144,9 @@ where
         {
             let output_abstract = &output_types[0];
             let transposed_output_abstract = match output_abstract.shape.dimensions.as_slice() {
-                [first, second] => ArrayType::new(output_abstract.data_type, Shape::new(vec![*second, *first]), None),
+                [first, second] => {
+                    ArrayType::new(output_abstract.data_type, Shape::new(vec![*second, *first]), None, None)
+                }
                 _ => return Err(LoweringError::UnsupportedOp { op: self.name().to_string() }),
             };
             let transposed_output_type = lowerer.lower_tensor_type(&transposed_output_abstract)?;

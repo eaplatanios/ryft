@@ -7,10 +7,10 @@ use std::{
 
 use crate::{
     parameters::{Parameterized, ParameterizedFamily},
-    sharding::{LogicalMesh, ShardingDimension},
+    sharding::LogicalMesh,
     tracing_v2::{
         AtomId, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op, ProgramBuilder,
-        TraceError, TraceValue, ZeroLike, operations::WithShardingConstraintOp,
+        TraceError, TraceValue, ZeroLike,
     },
     types::{ArrayType, Typed},
     xla::{
@@ -172,6 +172,11 @@ where
     }
 }
 
+/// Returns `true` when two shard-map boundary types agree apart from carried sharding metadata.
+fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
+    actual.data_type == expected.data_type && actual.shape == expected.shape && actual.layout == expected.layout
+}
+
 impl Op<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -185,7 +190,11 @@ impl Op<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
         if inputs.len() != self.input_types.len() {
             return Err(TraceError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
         }
-        if inputs != self.input_types.as_slice() {
+        if !inputs
+            .iter()
+            .zip(self.input_types.iter())
+            .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
+        {
             return Err(TraceError::IncompatibleAbstractValues { op: self.name() });
         }
         Ok(self.output_types.clone())
@@ -314,7 +323,11 @@ impl Op<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
         if inputs.len() != self.input_types.len() {
             return Err(TraceError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
         }
-        if inputs != self.input_types.as_slice() {
+        if !inputs
+            .iter()
+            .zip(self.input_types.iter())
+            .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
+        {
             return Err(TraceError::IncompatibleAbstractValues { op: self.name() });
         }
         Ok(self.output_types.clone())
@@ -483,157 +496,6 @@ fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<b
         }
     }
     depends_on_cotangent
-}
-
-/// Clones one sharding while replacing only its ranked dimensions.
-fn sharding_with_dimensions(
-    sharding: &crate::xla::sharding::Sharding,
-    dimensions: Vec<ShardingDimension>,
-) -> Option<crate::xla::sharding::Sharding> {
-    crate::xla::sharding::Sharding::new(sharding.mesh().clone(), dimensions, sharding.unreduced_axes.clone())
-        .map(|sharding| sharding.project_for_traced_sharding())
-        .ok()
-}
-
-/// Returns whether one sharding is fully replicated over its ranked dimensions.
-fn is_replicated_sharding(sharding: &crate::xla::sharding::Sharding) -> bool {
-    sharding.dimensions.iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
-}
-
-/// Merges unreduced-axis sets from two shardings while preserving mesh validation.
-fn merge_sharding_axes(
-    left: &crate::xla::sharding::Sharding,
-    right: &crate::xla::sharding::Sharding,
-    sharding: crate::xla::sharding::Sharding,
-) -> Option<crate::xla::sharding::Sharding> {
-    let mut unreduced_axes = left.unreduced_axes.clone();
-    for axis_name in &right.unreduced_axes {
-        if !unreduced_axes.contains(axis_name) {
-            unreduced_axes.push(axis_name.clone());
-        }
-    }
-
-    crate::xla::sharding::Sharding::new(left.mesh().clone(), sharding.dimensions, unreduced_axes)
-        .map(|sharding| sharding.project_for_traced_sharding())
-        .ok()
-}
-
-/// Infers the output sharding of one sharding-preserving unary op.
-fn infer_unary_output_sharding(input: &crate::xla::sharding::Sharding) -> Option<crate::xla::sharding::Sharding> {
-    sharding_with_dimensions(input, input.dimensions.clone())
-}
-
-/// Infers the output sharding of one transpose op over a rank-2 tensor.
-fn infer_transpose_output_sharding(input: &crate::xla::sharding::Sharding) -> Option<crate::xla::sharding::Sharding> {
-    if input.rank() != 2 {
-        return None;
-    }
-
-    let dimensions = &input.dimensions;
-    sharding_with_dimensions(input, vec![dimensions[1].clone(), dimensions[0].clone()])
-}
-
-/// Infers the output sharding of one binary elementwise op.
-fn infer_binary_elementwise_output_sharding(
-    left: &crate::xla::sharding::Sharding,
-    right: &crate::xla::sharding::Sharding,
-) -> Option<crate::xla::sharding::Sharding> {
-    if left == right {
-        return Some(left.clone());
-    }
-    if is_replicated_sharding(left) {
-        return Some(right.clone());
-    }
-    if is_replicated_sharding(right) {
-        return Some(left.clone());
-    }
-    None
-}
-
-/// Infers the output sharding of one rank-2 matrix multiplication.
-fn infer_matmul_output_sharding(
-    left: &crate::xla::sharding::Sharding,
-    right: &crate::xla::sharding::Sharding,
-) -> Option<crate::xla::sharding::Sharding> {
-    if left.rank() != 2 || right.rank() != 2 {
-        return None;
-    }
-
-    let left_dimensions = &left.dimensions;
-    let right_dimensions = &right.dimensions;
-    if !matches!(left_dimensions[1], ShardingDimension::Replicated)
-        || !matches!(right_dimensions[0], ShardingDimension::Replicated)
-    {
-        return None;
-    }
-
-    merge_sharding_axes(
-        left,
-        right,
-        crate::xla::sharding::Sharding::new(
-            left.mesh().clone(),
-            vec![left_dimensions[0].clone(), right_dimensions[1].clone()],
-            vec![],
-        )
-        .ok()?,
-    )
-}
-
-/// Infers per-atom shardings for one simplified transpose body.
-fn infer_atom_shardings_for_transpose_body(body: &FlatTracedShardMap) -> Vec<Option<crate::xla::sharding::Sharding>> {
-    let graph = body.compiled.graph();
-    let equation_by_output = equation_by_output(graph);
-    let mut atom_shardings = vec![None; graph.atom_count()];
-    for (atom_id, sharding) in graph.input_atoms().iter().copied().zip(body.shard_map.in_shardings().iter().cloned()) {
-        atom_shardings[atom_id] = Some(sharding);
-    }
-
-    for atom_id in 0..graph.atom_count() {
-        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
-        let crate::tracing_v2::AtomSource::Derived = atom.source else {
-            continue;
-        };
-        let Some(equation_index) = equation_by_output[atom_id] else {
-            continue;
-        };
-        let equation = &graph.equations()[equation_index];
-        let inferred = match equation.op.name() {
-            "neg" | "sin" | "cos" | "scale" => equation
-                .inputs
-                .first()
-                .and_then(|input| atom_shardings[*input].clone())
-                .and_then(|input| infer_unary_output_sharding(&input)),
-            "matrix_transpose" => equation
-                .inputs
-                .first()
-                .and_then(|input| atom_shardings[*input].clone())
-                .and_then(|input| infer_transpose_output_sharding(&input)),
-            "with_sharding_constraint" => {
-                equation.op.as_any().downcast_ref::<WithShardingConstraintOp>().map(|op| op.sharding().clone())
-            }
-            "add" | "mul" => {
-                let left = equation.inputs.first().and_then(|input| atom_shardings[*input].clone());
-                let right = equation.inputs.get(1).and_then(|input| atom_shardings[*input].clone());
-                match (left, right) {
-                    (Some(left), Some(right)) => infer_binary_elementwise_output_sharding(&left, &right),
-                    _ => None,
-                }
-            }
-            "matmul" => {
-                let left = equation.inputs.first().and_then(|input| atom_shardings[*input].clone());
-                let right = equation.inputs.get(1).and_then(|input| atom_shardings[*input].clone());
-                match (left, right) {
-                    (Some(left), Some(right)) => infer_matmul_output_sharding(&left, &right),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        for output in equation.outputs.iter().copied() {
-            atom_shardings[output] = inferred.clone();
-        }
-    }
-    atom_shardings
 }
 
 /// Rebuilds one projected flat shard-map graph over a subset of the original inputs and outputs.
@@ -857,9 +719,10 @@ fn factorize_transpose_shard_map_body(
         return Ok(None);
     }
 
-    let atom_shardings = infer_atom_shardings_for_transpose_body(&simplified_body);
-    let residual_out_shardings =
-        residual_atoms.iter().map(|atom_id| atom_shardings[*atom_id].clone()).collect::<Option<Vec<_>>>();
+    let residual_out_shardings = residual_atoms
+        .iter()
+        .map(|atom_id| graph.atom(*atom_id).expect("residual atoms should exist").abstract_value.sharding.clone())
+        .collect::<Option<Vec<_>>>();
     let Some(residual_out_shardings) = residual_out_shardings else {
         return Ok(None);
     };

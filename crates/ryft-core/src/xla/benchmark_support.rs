@@ -58,13 +58,18 @@ fn nested_inner_mesh() -> LogicalMesh {
 
 /// Returns a one-dimensional sharding.
 fn sharded_1d_sharding(mesh: &LogicalMesh) -> Sharding {
-    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap()
+    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![]).unwrap()
 }
 
 /// Returns a two-dimensional row-sharded sharding.
 fn row_sharded_sharding(mesh: &LogicalMesh) -> Sharding {
-    Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()], vec![])
-        .unwrap()
+    Sharding::new(
+        mesh.clone(),
+        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        vec![],
+        vec![],
+    )
+    .unwrap()
 }
 
 /// Returns a two-dimensional replicated sharding.
@@ -78,7 +83,7 @@ fn replicated_2d_sharding(mesh: &LogicalMesh) -> Sharding {
 ///
 ///   - `size`: Static vector length.
 fn vector_type(size: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]), None)
+    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]), None, None)
 }
 
 /// Returns a rank-2 benchmark array type.
@@ -88,7 +93,7 @@ fn vector_type(size: usize) -> ArrayType {
 ///   - `rows`: Matrix row count.
 ///   - `cols`: Matrix column count.
 fn matrix_type(rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None)
+    ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
 }
 
 /// Summarizes one erased nested shard-map body.
@@ -297,7 +302,8 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let outer_mesh = nested_outer_mesh();
     let inner_mesh = nested_inner_mesh();
     let outer_sharding = sharded_1d_sharding(&outer_mesh);
-    let inner_sharding = Sharding::new(inner_mesh.clone(), vec![ShardingDimension::sharded(["y"])], vec![]).unwrap();
+    let inner_sharding =
+        Sharding::new(inner_mesh.clone(), vec![ShardingDimension::sharded(["y"])], vec![], vec![]).unwrap();
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
         {
             let outer_mesh = outer_mesh.clone();

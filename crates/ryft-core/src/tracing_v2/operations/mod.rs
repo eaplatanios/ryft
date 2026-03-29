@@ -2,6 +2,25 @@
 
 use crate::tracing_v2::{TraceError, TraceValue, batch::Batch, jit::JitTracer};
 use crate::types::ArrayType;
+use crate::xla::sharding::Sharding;
+
+fn is_replicated_sharding(sharding: &Sharding) -> bool {
+    sharding
+        .dimensions
+        .iter()
+        .all(|dimension| matches!(dimension, crate::sharding::ShardingDimension::Replicated))
+}
+
+fn binary_output_sharding(inputs: &[ArrayType]) -> Option<Sharding> {
+    match (&inputs[0].sharding, &inputs[1].sharding) {
+        (Some(left), Some(right)) if left == right => Some(left.clone()),
+        (Some(left), Some(right)) if is_replicated_sharding(left) => Some(right.clone()),
+        (Some(left), Some(right)) if is_replicated_sharding(right) => Some(left.clone()),
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right.clone()),
+        _ => None,
+    }
+}
 
 /// Elementwise addition.
 pub(crate) mod add;
@@ -103,6 +122,7 @@ pub(crate) fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Re
             data_type: inputs[0].data_type,
             shape: inputs[0].shape.clone(),
             layout: if inputs[0].layout == inputs[1].layout { inputs[0].layout.clone() } else { None },
+            sharding: binary_output_sharding(inputs),
         })
     }
 }

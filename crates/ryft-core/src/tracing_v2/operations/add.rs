@@ -198,7 +198,7 @@ mod tests {
         let output = <AddOp as Op<f64>>::abstract_eval(
             &AddOp,
             &[
-                ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![])))),
+                ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None),
                 ArrayType::scalar(DataType::F32),
             ],
         )

@@ -78,17 +78,17 @@ pub enum BroadcastingError {
 /// assert_eq!(z.broadcast(&y)?, Shape::new(vec![4.into(), 3.into()]));
 /// assert!(w.broadcast(&x).is_err());
 ///
-/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None));
+/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None, None));
 /// let rhs = (
-///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None),
-///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None),
+///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None, None),
+///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None, None),
 /// );
 ///
 /// assert_eq!(
 ///     lhs.broadcast(&rhs)?,
 ///     (
-///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None),
-///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()]), None),
+///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None, None),
+///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()]), None, None),
 ///     ),
 /// );
 /// # Ok::<(), BroadcastingError>(())
@@ -224,7 +224,20 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
                     let broadcasted_data_type = lhs.data_type.broadcast(&rhs.data_type)?;
                     let broadcasted_shape = lhs.shape.broadcast(&rhs.shape)?;
                     let broadcasted_layout = (lhs.layout == rhs.layout).then(|| lhs.layout.clone()).flatten();
-                    Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape, broadcasted_layout))
+                    let broadcasted_sharding = match (&lhs.sharding, &rhs.sharding) {
+                        (Some(left), Some(right)) if left == right => Some(left.clone()),
+                        (Some(left), None) => Some(left.clone()),
+                        (None, Some(right)) => Some(right.clone()),
+                        // TODO(eaplatanios): This is not good. We should figure out how to broadcast sharding information.
+                        _ => None,
+                    }
+                    .filter(|sharding| sharding.rank() == broadcasted_shape.rank());
+                    Ok(ArrayType::new(
+                        broadcasted_data_type,
+                        broadcasted_shape,
+                        broadcasted_layout,
+                        broadcasted_sharding,
+                    ))
                 })
                 .collect::<Result<Vec<_>, BroadcastingError>>()?;
             Ok(Self::from_parameters(structure, broadcasted_array_types)?)
@@ -245,7 +258,12 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
             .map(|(lhs, rhs)| {
                 let broadcasted_data_type = lhs.data_type.broadcast_to(&rhs.data_type)?;
                 let broadcasted_shape = lhs.shape.broadcast_to(&rhs.shape)?;
-                Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape, rhs.layout.clone()))
+                Ok(ArrayType::new(
+                    broadcasted_data_type,
+                    broadcasted_shape,
+                    rhs.layout.clone(),
+                    rhs.sharding.clone().filter(|sharding| sharding.rank() == rhs.rank()),
+                ))
             })
             .collect::<Result<Vec<_>, BroadcastingError>>()?;
         Ok(Self::from_parameters(structure, broadcasted_array_types)?)
@@ -256,7 +274,9 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
             return false;
         };
         broadcasted_self.parameters().zip(other.parameters()).all(|(lhs, rhs)| {
-            lhs.data_type.is_broadcastable_to(&rhs.data_type) && lhs.shape.is_broadcastable_to(&rhs.shape)
+            lhs.data_type.is_broadcastable_to(&rhs.data_type)
+                && lhs.shape.is_broadcastable_to(&rhs.shape)
+                && (rhs.sharding.is_none() || lhs.sharding == rhs.sharding)
         })
     }
 }
@@ -318,21 +338,21 @@ mod tests {
         let l0 = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(4)])]));
         let l1 = Layout::Strided(StridedLayout::new(vec![16, 4]));
 
-        let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None);
-        let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None);
+        let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None, None);
+        let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None, None);
         let t2 = ArrayType::scalar(Boolean);
-        let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None);
-        let t4 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()));
-        let t5 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()));
-        let t6 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l1));
-        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), Some(l0.clone()));
+        let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None, None);
+        let t4 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()), None);
+        let t5 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l0.clone()), None);
+        let t6 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), Some(l1), None);
+        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), Some(l0.clone()), None);
 
         assert_eq!(t1.broadcast(&t2), Ok(t1.clone()));
         assert_eq!(t2.broadcast(&t1), Ok(t1.clone()));
         assert!(matches!(t0.broadcast(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
         assert_eq!(t4.broadcast(&t5), Ok(t4.clone()));
-        assert_eq!(t4.broadcast(&t6), Ok(ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None)));
-        assert_eq!(t7.broadcast(&t0), Ok(ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None)));
+        assert_eq!(t4.broadcast(&t6), Ok(ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None, None)));
+        assert_eq!(t7.broadcast(&t0), Ok(ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None, None)));
 
         assert_eq!(t2.broadcast_to(&t1), Ok(t1.clone()));
         assert_eq!(t2.broadcast_to(&t4), Ok(t4.clone()));
@@ -359,17 +379,17 @@ mod tests {
 
         let t0 = TestEnum::Pair {
             left: ArrayType::scalar(F32),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None, None),
         };
 
         let t1 = TestEnum::Pair {
-            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None),
-            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None),
+            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None, None),
+            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None, None),
         };
 
         let t2 = TestEnum::Pair {
-            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()]), None),
-            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None),
+            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()]), None, None),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()]), None, None),
         };
 
         let t3 = TestEnum::Wrapped { inner: ArrayType::scalar(F32) };
@@ -390,8 +410,8 @@ mod tests {
         assert_eq!(
             TestEnum::broadcasted(&[&t0, &t1]),
             Ok(TestEnum::Pair {
-                left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None),
-                right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None),
+                left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()]), None, None),
+                right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()]), None, None),
             }),
         );
         assert!(matches!(

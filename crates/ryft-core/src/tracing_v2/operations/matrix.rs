@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::{
+    sharding::ShardingDimension,
     tracing_v2::{
         FloatExt, TraceError, TraceValue, TransformLeaf, ZeroLike,
         batch::Batch as BatchedValue,
@@ -16,6 +17,7 @@ use crate::{
         ops::BatchOp,
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
+    xla::sharding::Sharding,
 };
 
 use super::{LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, RightMatMulOp};
@@ -96,8 +98,8 @@ where
     }
 }
 
-fn matrix_array_type(data_type: DataType, rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None)
+fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Option<Sharding>) -> ArrayType {
+    ArrayType::new(data_type, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, sharding)
 }
 
 fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TraceError> {
@@ -114,6 +116,59 @@ fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize
     Ok((r#type.data_type, rows, cols))
 }
 
+fn is_replicated_sharding(sharding: &Sharding) -> bool {
+    sharding.dimensions.iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
+}
+
+fn merge_unique_axes(left: &[String], right: &[String]) -> Vec<String> {
+    let mut merged = left.to_vec();
+    for axis_name in right {
+        if !merged.contains(axis_name) {
+            merged.push(axis_name.clone());
+        }
+    }
+    merged
+}
+
+fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
+    let sharding = input.sharding.clone()?;
+    if sharding.rank() != 2 {
+        return None;
+    }
+    Sharding::new(
+        sharding.mesh().clone(),
+        vec![sharding.dimensions[1].clone(), sharding.dimensions[0].clone()],
+        sharding.unreduced_axes.clone(),
+        sharding.varying_manual_axes.clone(),
+    )
+    .map(|sharding| sharding.project_for_traced_sharding())
+    .ok()
+}
+
+fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
+    let left = lhs.sharding.clone()?;
+    let right = rhs.sharding.clone()?;
+    if left == right && is_replicated_sharding(&left) {
+        return Some(left);
+    }
+    if left.rank() != 2 || right.rank() != 2 {
+        return None;
+    }
+    if !matches!(left.dimensions[1], ShardingDimension::Replicated)
+        || !matches!(right.dimensions[0], ShardingDimension::Replicated)
+    {
+        return None;
+    }
+    Sharding::new(
+        left.mesh().clone(),
+        vec![left.dimensions[0].clone(), right.dimensions[1].clone()],
+        merge_unique_axes(left.unreduced_axes.as_slice(), right.unreduced_axes.as_slice()),
+        merge_unique_axes(left.varying_manual_axes.as_slice(), right.varying_manual_axes.as_slice()),
+    )
+    .map(|sharding| sharding.project_for_traced_sharding())
+    .ok()
+}
+
 /// Computes the abstract output type of one matrix multiplication.
 pub(crate) fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
     let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
@@ -121,13 +176,13 @@ pub(crate) fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str
     if lhs_data_type != rhs_data_type || lhs_cols != rhs_rows {
         return Err(TraceError::IncompatibleAbstractValues { op });
     }
-    Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols))
+    Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, matmul_array_sharding(lhs, rhs)))
 }
 
 /// Computes the abstract output type of one matrix transpose.
 pub(crate) fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
     let (data_type, rows, cols) = matrix_parts(input, op)?;
-    Ok(matrix_array_type(data_type, cols, rows))
+    Ok(matrix_array_type(data_type, cols, rows, transpose_array_sharding(input)))
 }
 
 fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
@@ -264,7 +319,7 @@ mod ndarray_support {
     impl Typed<ArrayType> for Array2<f32> {
         #[inline]
         fn tpe(&self) -> ArrayType {
-            matrix_array_type(DataType::F32, self.nrows(), self.ncols())
+            matrix_array_type(DataType::F32, self.nrows(), self.ncols(), None)
         }
     }
 
@@ -273,7 +328,7 @@ mod ndarray_support {
     impl Typed<ArrayType> for Array2<f64> {
         #[inline]
         fn tpe(&self) -> ArrayType {
-            matrix_array_type(DataType::F64, self.nrows(), self.ncols())
+            matrix_array_type(DataType::F64, self.nrows(), self.ncols(), None)
         }
     }
 

@@ -8,6 +8,4 @@ pub mod sharding;
 pub mod tracing_v0;
 pub mod tracing_v2;
 pub mod types;
-
-#[cfg(feature = "xla")]
 pub mod xla;

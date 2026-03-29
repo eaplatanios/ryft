@@ -381,12 +381,12 @@ mod tests {
     #[test]
     fn test_jvp_tracer_broadcastable_broadcast() {
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]), None);
-        let t2 = ArrayType::new(F32, Shape::new(vec![1.into(), 5.into()]), None);
-        let t3 = ArrayType::new(F32, Shape::new(vec![10.into(), 1.into()]), None);
-        let t4 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]), None);
-        let t5 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None);
-        let t6 = ArrayType::new(F32, Shape::new(vec![4.into(), 2.into()]), None);
+        let t1 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]), None, None);
+        let t2 = ArrayType::new(F32, Shape::new(vec![1.into(), 5.into()]), None, None);
+        let t3 = ArrayType::new(F32, Shape::new(vec![10.into(), 1.into()]), None, None);
+        let t4 = ArrayType::new(F32, Shape::new(vec![10.into(), 5.into()]), None, None);
+        let t5 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None, None);
+        let t6 = ArrayType::new(F32, Shape::new(vec![4.into(), 2.into()]), None, None);
 
         let j0 = JvpTracer { value: t1.clone(), tangent: t2.clone() };
         let j1 = JvpTracer { value: t0.clone(), tangent: t3.clone() };
@@ -412,21 +412,22 @@ mod tests {
             JvpTracer<JvpTracer<ArrayType, ArrayType>, JvpTracer<ArrayType, JvpTracer<ArrayType, ArrayType>>>;
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]), None);
-        let t2 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]), None);
-        let t3 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]), None);
-        let t4 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]), None);
-        let t5 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]), None);
-        let t6 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into(), 2.into()]), None);
-        let t7 = ArrayType::new(BF16, Shape::new(vec![1.into(), 1.into()]), None);
-        let t8 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]), None);
-        let t9 = ArrayType::new(C64, Shape::new(vec![1.into(), 42.into(), 1.into()]), None);
-        let t11 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]), None);
-        let t12 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]), None);
-        let t13 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]), None);
-        let t14 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]), None);
-        let t15 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]), None);
-        let t17 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None);
+        let t1 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]), None, None);
+        let t2 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]), None, None);
+        let t3 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]), None, None);
+        let t4 = ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]), None, None);
+        let t5 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]), None, None);
+        let t6 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into(), 2.into()]), None, None);
+        let t7 = ArrayType::new(BF16, Shape::new(vec![1.into(), 1.into()]), None, None);
+        let t8 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]), None, None);
+        let t9 = ArrayType::new(C64, Shape::new(vec![1.into(), 42.into(), 1.into()]), None, None);
+        let t11 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into(), 2.into()]), None, None);
+        let t12 = ArrayType::new(BF16, Shape::new(vec![4.into(), 1.into()]), None, None);
+        let t13 = ArrayType::new(F16, Shape::new(vec![4.into(), Size::Dynamic(Some(1))]), None, None);
+        let t14 =
+            ArrayType::new(C64, Shape::new(vec![Size::Dynamic(None), 42.into(), Size::Dynamic(None)]), None, None);
+        let t15 = ArrayType::new(BF16, Shape::new(vec![42.into(), Size::Dynamic(None)]), None, None);
+        let t17 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]), None, None);
 
         let j0 = NestedJvpTracer {
             value: JvpTracer { value: t0.clone(), tangent: t1.clone() },

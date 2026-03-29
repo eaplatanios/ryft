@@ -66,10 +66,11 @@ where
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
-        let output = unary_abstract(inputs)?;
+        let mut output = unary_abstract(inputs)?;
         if output.rank() != self.sharding().rank() {
             return Err(TraceError::IncompatibleAbstractValues { op: "with_sharding_constraint" });
         }
+        output.sharding = Some(self.sharding().clone());
         Ok(vec![output])
     }
 
@@ -157,7 +158,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
@@ -174,7 +174,22 @@ mod tests {
     }
 
     fn test_sharding(mesh: &LogicalMesh) -> Sharding {
-        Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![]).unwrap()
+        Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![]).unwrap()
+    }
+
+    #[test]
+    fn test_with_sharding_constraint_abstract_eval_attaches_sharding() {
+        let mesh = test_mesh();
+        let sharding = test_sharding(&mesh);
+        let op = WithShardingConstraintOp::new(sharding.clone());
+
+        assert_eq!(
+            <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
+                &op,
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None)],
+            ),
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(sharding),)])
+        );
     }
 
     #[test]
@@ -185,7 +200,7 @@ mod tests {
         assert_eq!(
             <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
                 &op,
-                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None,)],
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)],
             ),
             Err(TraceError::IncompatibleAbstractValues { op: "with_sharding_constraint" })
         );
@@ -195,7 +210,7 @@ mod tests {
     fn test_with_sharding_constraint_transpose_preserves_the_constraint() {
         let mesh = test_mesh();
         let sharding = test_sharding(&mesh);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None);
 
         let mut forward_builder = ProgramBuilder::<ShardMapTensor>::new();
         let input = forward_builder.add_input(&ShardMapTensor::new(input_type.clone()));
@@ -205,7 +220,7 @@ mod tests {
 
         let mut transpose_builder = ProgramBuilder::<ShardMapTensor>::new();
         let output_cotangent = transpose_builder.add_input(&ShardMapTensor::new(input_type));
-        let contribution = WithShardingConstraintOp::new(sharding)
+        let contribution = WithShardingConstraintOp::new(sharding.clone())
             .transpose_program_op(&mut transpose_builder, &[input], &[output], &[output_cotangent])
             .unwrap()[0]
             .unwrap();
@@ -214,12 +229,8 @@ mod tests {
             transpose_builder.build::<ShardMapTensor, ShardMapTensor>(vec![contribution], Placeholder, Placeholder);
         assert_eq!(
             transpose_graph.to_string(),
-            indoc! {"
-                lambda %0:f32[8] .
-                let %1:f32[8] = with_sharding_constraint %0
-                in (%1)
-            "}
-            .trim_end(),
+            format!("lambda %0:f32[8] .\nlet %1:f32[8] sharding={sharding:?} = with_sharding_constraint %0\nin (%1)")
+                .trim_end(),
         );
     }
 }

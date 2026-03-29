@@ -5,6 +5,7 @@ use ryft_macros::Parameter;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
 use crate::types::{DataType, Layout, Type};
+use crate::xla::sharding::Sharding;
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -137,7 +138,8 @@ impl Display for Shape {
 /// Represents the [`Type`] of a potentially multi-dimensional array.
 ///
 /// Note that the [`Display`] implementation of [`ArrayType`] renders array types simply as their
-/// [`DataType`]s followed by their [`Shape`]s, optionally followed by their [`Layout`]s, if present.
+/// [`DataType`]s followed by their [`Shape`]s, optionally followed by their [`Layout`] and sharding metadata, if
+/// present.
 ///
 /// # Examples
 ///
@@ -147,25 +149,25 @@ impl Display for Shape {
 ///
 /// // Boolean scalar.
 /// assert_eq!(
-///   ArrayType::new(DataType::Boolean, Shape::scalar(), None).to_string(),
+///   ArrayType::new(DataType::Boolean, Shape::scalar(), None, None).to_string(),
 ///   "bool[]",
 /// );
 ///
 /// // 64-bit unsigned integer vector with 42 elements.
 /// assert_eq!(
-///   ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)]), None).to_string(),
+///   ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)]), None, None).to_string(),
 ///   "u64[42]",
 /// );
 ///
 /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
 /// assert_eq!(
-///   ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]), None).to_string(),
+///   ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]), None, None).to_string(),
 ///   "f32[42, <10]",
 /// );
 ///
 /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
 /// assert_eq!(
-///   ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)]), None).to_string(),
+///   ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)]), None, None).to_string(),
 ///   "c64[*, 42]",
 /// );
 /// ```
@@ -179,20 +181,24 @@ pub struct ArrayType {
 
     /// Optional physical memory/storage [`Layout`] of the array.
     pub layout: Option<Layout>,
+
+    /// Optional logical sharding metadata associated with the array.
+    pub sharding: Option<Sharding>,
 }
 
 impl ArrayType {
-    /// Constructs a new [`ArrayType`] with the provided [`DataType`], [`Shape`], and optional [`Layout`].
+    /// Constructs a new [`ArrayType`] with the provided [`DataType`], [`Shape`], optional [`Layout`], and optional
+    /// sharding metadata.
     #[inline]
-    pub fn new(data_type: DataType, shape: Shape, layout: Option<Layout>) -> Self {
-        Self { data_type, shape, layout }
+    pub fn new(data_type: DataType, shape: Shape, layout: Option<Layout>, sharding: Option<Sharding>) -> Self {
+        Self { data_type, shape, layout, sharding }
     }
 
     /// Constructs a new "scalar" [`ArrayType`] with the provided [`DataType`]. The resulting [`ArrayType::shape`]
     /// will be a scalar (i.e., have rank 0).
     #[inline]
     pub fn scalar(data_type: DataType) -> Self {
-        Self::new(data_type, Shape::scalar(), None)
+        Self::new(data_type, Shape::scalar(), None, None)
     }
 
     /// Returns the rank (i.e., the number of dimensions) of this [`ArrayType`].
@@ -204,20 +210,22 @@ impl ArrayType {
     /// # use ryft_core::types::{ArrayType, Shape, Size};
     ///
     /// // Boolean scalar.
-    /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar(), None).rank(), 0);
+    /// assert_eq!(ArrayType::new(DataType::Boolean, Shape::scalar(), None, None).rank(), 0);
     ///
     /// // 64-bit unsigned integer vector with 42 elements.
-    /// assert_eq!(ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)]), None).rank(), 1);
+    /// assert_eq!(ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(42)]), None, None).rank(), 1);
     ///
     /// // 32-bit floating-point number matrix with 42 rows and up to 10 columns.
     /// assert_eq!(
-    ///     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]), None).rank(),
+    ///     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(42), Size::Dynamic(Some(10))]), None, None)
+    ///         .rank(),
     ///     2,
     /// );
     ///
     /// // 64-bit complex number matrix with an unknown number of rows and 42 columns.
     /// assert_eq!(
-    ///     ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)]), None).rank(),
+    ///     ArrayType::new(DataType::C64, Shape::new(vec![Size::Dynamic(None), Size::Static(42)]), None, None)
+    ///         .rank(),
     ///     2,
     /// );
     /// ```
@@ -239,7 +247,11 @@ impl Display for ArrayType {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}{}", self.data_type, self.shape)?;
         if let Some(layout) = &self.layout {
-            write!(formatter, " layout={layout}")?;
+            write!(formatter, "[layout={layout}]")?;
+        }
+        if let Some(sharding) = &self.sharding {
+            // TODO(eaplatanios): `Sharding` should implement `Display`.
+            write!(formatter, "[sharding={sharding:?}]")?;
         }
         Ok(())
     }
@@ -255,8 +267,10 @@ impl Type for ArrayType {
 
 #[cfg(test)]
 mod tests {
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout};
+    use crate::xla::sharding::Sharding;
 
     #[test]
     fn test_size_value() {
@@ -326,8 +340,8 @@ mod tests {
         let s2 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, s1, None);
-        let t2 = ArrayType::new(F8E3M4, s2, None);
+        let t1 = ArrayType::new(F32, s1, None, None);
+        let t2 = ArrayType::new(F8E3M4, s2, None, None);
 
         assert_eq!(t0.rank(), 0);
         assert_eq!(t1.rank(), 3);
@@ -339,8 +353,8 @@ mod tests {
         let s0 = Shape::new(vec![Size::Static(42), Size::Static(4), Size::Static(2)]);
         let s1 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
-        let t0 = ArrayType::new(F32, s0, None);
-        let t1 = ArrayType::new(F8E3M4, s1, None);
+        let t0 = ArrayType::new(F32, s0, None, None);
+        let t1 = ArrayType::new(F8E3M4, s1, None, None);
 
         assert_eq!(t0.dimension(0), Size::Static(42));
         assert_eq!(t0.dimension(2), Size::Static(2));
@@ -359,20 +373,22 @@ mod tests {
         let s5 = Shape::new(vec![Size::Static(42), Size::Dynamic(None)]);
 
         let t0 = ArrayType::scalar(Boolean);
-        let t1 = ArrayType::new(F32, s1, None);
-        let t2 = ArrayType::new(BF16, s2, None);
-        let t3 = ArrayType::new(F16, s3, None);
-        let t4 = ArrayType::new(C64, s4, None);
-        let t5 = ArrayType::new(F8E4M3FN, s5, None);
+        let t1 = ArrayType::new(F32, s1, None, None);
+        let t2 = ArrayType::new(BF16, s2, None, None);
+        let t3 = ArrayType::new(F16, s3, None, None);
+        let t4 = ArrayType::new(C64, s4, None, None);
+        let t5 = ArrayType::new(F8E4M3FN, s5, None, None);
         let t6 = ArrayType::new(
             F32,
             Shape::new(vec![Size::Static(4), Size::Static(2)]),
             Some(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]))),
+            None,
         );
         let t7 = ArrayType::new(
             F32,
             Shape::new(vec![Size::Static(4), Size::Static(2)]),
             Some(Layout::Strided(StridedLayout::new(vec![8, 4]))),
+            None,
         );
 
         assert_eq!(format!("{t0}"), "bool[]");
@@ -381,7 +397,22 @@ mod tests {
         assert_eq!(format!("{t3}"), "f16[4, <1]");
         assert_eq!(format!("{t4}"), "c64[*, 42, *]");
         assert_eq!(format!("{t5}"), "f8e4m3fn[42, *]");
-        assert_eq!(format!("{t6}"), "f32[4, 2] layout=tiled{1,0:T(2)}");
-        assert_eq!(format!("{t7}"), "f32[4, 2] layout=strided{8,4}");
+        assert_eq!(format!("{t6}"), "f32[4, 2][layout=tiled{1,0:T(2)}]");
+        assert_eq!(format!("{t7}"), "f32[4, 2][layout=strided{8,4}]");
+    }
+
+    #[test]
+    fn test_array_type_preserves_sharding_metadata() {
+        let sharding = Sharding::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            vec![ShardingDimension::sharded(["x"])],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let array_type = ArrayType::new(F32, Shape::new(vec![Size::Static(8)]), None, Some(sharding.clone()));
+
+        assert_eq!(array_type.sharding, Some(sharding.clone()));
+        assert_eq!(format!("{array_type}"), format!("f32[8][sharding={sharding:?}]"));
     }
 }
