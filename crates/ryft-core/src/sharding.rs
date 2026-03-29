@@ -41,6 +41,9 @@ pub enum ShardingError {
 
     #[error("sharding rank ({sharding_rank}) does not match array rank ({array_rank})")]
     ShardingRankMismatch { sharding_rank: usize, array_rank: usize },
+
+    #[error("sharding visualization only supports rank-1 and rank-2 shapes, but got rank {rank}")]
+    UnsupportedVisualizationRank { rank: usize },
 }
 
 /// [`MeshAxis`] type which controls sharding constraint propagation. Each axis in a [`LogicalMesh`] can be tagged with

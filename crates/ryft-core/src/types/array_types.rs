@@ -137,9 +137,8 @@ impl Display for Shape {
 
 /// Represents the [`Type`] of a potentially multi-dimensional array.
 ///
-/// Note that the [`Display`] implementation of [`ArrayType`] renders array types simply as their
-/// [`DataType`]s followed by their [`Shape`]s, optionally followed by their [`Layout`] and sharding metadata, if
-/// present.
+/// Note that the [`Display`] implementation of [`ArrayType`] renders array types simply as their [`DataType`]s
+/// followed by their [`Shape`]s, optionally followed by their [`Layout`] and [`Sharding`], if present.
 ///
 /// # Examples
 ///
@@ -182,13 +181,12 @@ pub struct ArrayType {
     /// Optional physical memory/storage [`Layout`] of the array.
     pub layout: Option<Layout>,
 
-    /// Optional logical sharding metadata associated with the array.
+    /// Optional [`Sharding`] information about the array.
     pub sharding: Option<Sharding>,
 }
 
 impl ArrayType {
-    /// Constructs a new [`ArrayType`] with the provided [`DataType`], [`Shape`], optional [`Layout`], and optional
-    /// sharding metadata.
+    /// Constructs a new [`ArrayType`].
     #[inline]
     pub fn new(data_type: DataType, shape: Shape, layout: Option<Layout>, sharding: Option<Sharding>) -> Self {
         Self { data_type, shape, layout, sharding }
@@ -250,8 +248,7 @@ impl Display for ArrayType {
             write!(formatter, "[layout={layout}]")?;
         }
         if let Some(sharding) = &self.sharding {
-            // TODO(eaplatanios): `Sharding` should implement `Display`.
-            write!(formatter, "[sharding={sharding:?}]")?;
+            write!(formatter, "[sharding={sharding}]")?;
         }
         Ok(())
     }
@@ -267,6 +264,8 @@ impl Type for ArrayType {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout};
@@ -390,6 +389,21 @@ mod tests {
             Some(Layout::Strided(StridedLayout::new(vec![8, 4]))),
             None,
         );
+        let t8 = ArrayType::new(
+            F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::new(
+                    LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    vec![],
+                    vec![],
+                    vec!["x".into()],
+                )
+                .unwrap(),
+            ),
+        );
 
         assert_eq!(format!("{t0}"), "bool[]");
         assert_eq!(format!("{t1}"), "f32[42, 4, 2]");
@@ -399,20 +413,6 @@ mod tests {
         assert_eq!(format!("{t5}"), "f8e4m3fn[42, *]");
         assert_eq!(format!("{t6}"), "f32[4, 2][layout=tiled{1,0:T(2)}]");
         assert_eq!(format!("{t7}"), "f32[4, 2][layout=strided{8,4}]");
-    }
-
-    #[test]
-    fn test_array_type_preserves_sharding_metadata() {
-        let sharding = Sharding::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
-            vec![ShardingDimension::sharded(["x"])],
-            vec![],
-            vec![],
-        )
-        .unwrap();
-        let array_type = ArrayType::new(F32, Shape::new(vec![Size::Static(8)]), None, Some(sharding.clone()));
-
-        assert_eq!(array_type.sharding, Some(sharding.clone()));
-        assert_eq!(format!("{array_type}"), format!("f32[8][sharding={sharding:?}]"));
+        assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4]>, [{'x'}], varying={'x'}}]");
     }
 }
