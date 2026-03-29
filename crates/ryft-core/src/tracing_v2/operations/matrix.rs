@@ -139,7 +139,7 @@ fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
         sharding.mesh.clone(),
         vec![sharding.dimensions[1].clone(), sharding.dimensions[0].clone()],
         sharding.unreduced_axes.clone(),
-        sharding.reduced_axes.clone(),
+        sharding.reduced_manual_axes.clone(),
         sharding.varying_manual_axes.clone(),
     )
     .map(|sharding| sharding.project_for_traced_sharding())
@@ -164,7 +164,7 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
         left.mesh.clone(),
         vec![left.dimensions[0].clone(), right.dimensions[1].clone()],
         merge_unique_axes(left.unreduced_axes.as_slice(), right.unreduced_axes.as_slice()),
-        merge_unique_axes(left.reduced_axes.as_slice(), right.reduced_axes.as_slice()),
+        merge_unique_axes(left.reduced_manual_axes.as_slice(), right.reduced_manual_axes.as_slice()),
         merge_unique_axes(left.varying_manual_axes.as_slice(), right.varying_manual_axes.as_slice()),
     )
     .map(|sharding| sharding.project_for_traced_sharding())

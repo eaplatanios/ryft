@@ -1045,7 +1045,7 @@ fn sharding_with_varying_manual_axes(sharding: &Sharding, varying_axes: Vec<Stri
         sharding.mesh.clone(),
         sharding.dimensions.clone(),
         sharding.unreduced_axes.clone(),
-        sharding.reduced_axes.clone(),
+        sharding.reduced_manual_axes.clone(),
         varying_axes,
     )
     .expect("derived shard_map sharding should preserve valid manual-axis metadata")
@@ -1072,13 +1072,13 @@ fn validate_input_sharding_state(
             actual: actual.unreduced_axes.clone(),
         });
     }
-    if !axes_match(actual.reduced_axes.as_slice(), expected.reduced_axes.as_slice()) {
+    if !axes_match(actual.reduced_manual_axes.as_slice(), expected.reduced_manual_axes.as_slice()) {
         return Err(ShardMapTraceError::ShardingStateMismatch {
             value_kind: "input",
             value_index: input_index,
             state_kind: "reduced axes",
-            expected: expected.reduced_axes.clone(),
-            actual: actual.reduced_axes.clone(),
+            expected: expected.reduced_manual_axes.clone(),
+            actual: actual.reduced_manual_axes.clone(),
         });
     }
     Ok(())
@@ -1251,18 +1251,21 @@ where
                     });
                 }
 
-                let local_reduced_axes = local_output_type
+                let local_reduced_manual_axes = local_output_type
                     .sharding
                     .as_ref()
-                    .map(|sharding| sharding.reduced_axes.clone())
+                    .map(|sharding| sharding.reduced_manual_axes.clone())
                     .unwrap_or_default();
-                if !axes_match(local_reduced_axes.as_slice(), output_sharding.reduced_axes.as_slice()) {
+                if !axes_match(
+                    local_reduced_manual_axes.as_slice(),
+                    output_sharding.reduced_manual_axes.as_slice(),
+                ) {
                     return Err(ShardMapTraceError::ShardingStateMismatch {
                         value_kind: "output",
                         value_index: output_index,
                         state_kind: "reduced axes",
-                        expected: output_sharding.reduced_axes.clone(),
-                        actual: local_reduced_axes,
+                        expected: output_sharding.reduced_manual_axes.clone(),
+                        actual: local_reduced_manual_axes,
                     });
                 }
 
@@ -1465,24 +1468,6 @@ fn validate_manual_axis_order(
     Ok(())
 }
 
-fn used_axes_in_sharding(sharding: &Sharding) -> HashSet<&str> {
-    let mut used_axes = HashSet::new();
-    for partition_dimension in &sharding.dimensions {
-        if let ShardingDimension::Sharded(axis_names) = partition_dimension {
-            for axis_name in axis_names {
-                used_axes.insert(axis_name.as_str());
-            }
-        }
-    }
-    for axis_name in &sharding.unreduced_axes {
-        used_axes.insert(axis_name.as_str());
-    }
-    for axis_name in &sharding.reduced_axes {
-        used_axes.insert(axis_name.as_str());
-    }
-    used_axes
-}
-
 fn local_shape_for_sharding(
     sharding: &Sharding,
     manual_axis_names: HashSet<&str>,
@@ -1594,7 +1579,14 @@ fn manual_computation_dimension_shardings<'c, 't>(
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
         .collect::<HashSet<_>>();
-    let used_axes = used_axes_in_sharding(sharding);
+    let mut used_axes = HashSet::new();
+    for partition_dimension in &sharding.dimensions {
+        if let ShardingDimension::Sharded(axis_names) = partition_dimension {
+            used_axes.extend(axis_names.iter().map(String::as_str));
+        }
+    }
+    used_axes.extend(sharding.unreduced_axes.iter().map(String::as_str));
+    used_axes.extend(sharding.reduced_manual_axes.iter().map(String::as_str));
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     sharding
@@ -1660,7 +1652,14 @@ fn render_manual_computation_dimensions(sharding: &Sharding, manual_axes: &[Stri
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
         .collect::<HashSet<_>>();
-    let used_axes = used_axes_in_sharding(sharding);
+    let mut used_axes = HashSet::new();
+    for partition_dimension in &sharding.dimensions {
+        if let ShardingDimension::Sharded(axis_names) = partition_dimension {
+            used_axes.extend(axis_names.iter().map(String::as_str));
+        }
+    }
+    used_axes.extend(sharding.unreduced_axes.iter().map(String::as_str));
+    used_axes.extend(sharding.reduced_manual_axes.iter().map(String::as_str));
     let has_unused_free_axes = free_axis_names.iter().any(|axis_name| !used_axes.contains(axis_name));
 
     let mut result = String::from("[");
@@ -1780,10 +1779,10 @@ mod tests {
         mesh: &LogicalMesh,
         dimensions: Vec<ShardingDimension>,
         unreduced_axes: Vec<String>,
-        reduced_axes: Vec<String>,
+        reduced_manual_axes: Vec<String>,
         varying_manual_axes: Vec<String>,
     ) -> Sharding {
-        Sharding::new(mesh.clone(), dimensions, unreduced_axes, reduced_axes, varying_manual_axes).unwrap()
+        Sharding::new(mesh.clone(), dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes).unwrap()
     }
 
     fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
@@ -2215,7 +2214,7 @@ mod tests {
                 .sharding
                 .as_ref()
                 .expect("local shard_map input should keep sharding metadata")
-                .reduced_axes,
+                .reduced_manual_axes,
             vec!["z".to_string()]
         );
     }
@@ -2439,7 +2438,12 @@ mod tests {
             vec!["y".to_string()]
         );
         assert_eq!(
-            tensor.zero_like().tpe().sharding.expect("zero_like should keep sharding metadata").reduced_axes,
+            tensor
+                .zero_like()
+                .tpe()
+                .sharding
+                .expect("zero_like should keep sharding metadata")
+                .reduced_manual_axes,
             vec!["z".to_string()]
         );
         assert_eq!(
@@ -2456,7 +2460,12 @@ mod tests {
             vec!["y".to_string()]
         );
         assert_eq!(
-            tensor.one_like().tpe().sharding.expect("one_like should keep sharding metadata").reduced_axes,
+            tensor
+                .one_like()
+                .tpe()
+                .sharding
+                .expect("one_like should keep sharding metadata")
+                .reduced_manual_axes,
             vec!["z".to_string()]
         );
         assert_eq!(

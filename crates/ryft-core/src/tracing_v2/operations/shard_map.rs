@@ -181,12 +181,12 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
             (_, None) => true,
             (Some(actual), Some(expected)) => {
                 actual.unreduced_axes == expected.unreduced_axes
-                    && actual.reduced_axes == expected.reduced_axes
+                    && actual.reduced_manual_axes == expected.reduced_manual_axes
                     && actual.varying_manual_axes == expected.varying_manual_axes
             }
             (None, Some(expected)) => {
                 expected.unreduced_axes.is_empty()
-                    && expected.reduced_axes.is_empty()
+                    && expected.reduced_manual_axes.is_empty()
                     && expected.varying_manual_axes.is_empty()
             }
         }

@@ -208,9 +208,9 @@ use crate::sharding::{
 ///
 /// # Ranked dimensions and generic partition-spec state
 ///
-/// `dimensions` is indexed by tensor rank, while `unreduced_axes`, `reduced_axes`, and
+/// `dimensions` is indexed by tensor rank, while `unreduced_axes`, `reduced_manual_axes`, and
 /// `varying_manual_axes` are not. The former says how each tensor dimension is partitioned;
-/// `unreduced_axes` and `reduced_axes` record generic partition-spec state even when that state
+/// `unreduced_axes` and `reduced_manual_axes` record generic partition-spec state even when that state
 /// does not correspond to any tensor dimension, while `varying_manual_axes` carries traced
 /// `shard_map` metadata about which mesh axes a value is still known to vary along.
 ///
@@ -235,7 +235,7 @@ use crate::sharding::{
 /// Without `unreduced_axes`, that unused mesh axis would be indistinguishable from a truly
 /// replicated axis.
 ///
-/// `reduced_axes` is the dual partition-spec state used to record mesh axes that are known to have
+/// `reduced_manual_axes` is the dual partition-spec state used to record mesh axes that are known to have
 /// been reduced away. Unlike `unreduced_axes`, it is type-only metadata and is not rendered in
 /// generic Shardy tensor shardings because Shardy does not expose a matching tensor-sharding
 /// field.
@@ -262,24 +262,61 @@ use crate::sharding::{
 /// #sdy.sharding<@mesh, [{"data"}, {}], unreduced={"z"}>
 /// ```
 ///
-/// `reduced_axes` remains type-only metadata and is intentionally omitted from this rendering.
+/// `reduced_manual_axes` remains type-only metadata and is intentionally omitted from this rendering.
 ///
 /// [sdy-tensor]: https://openxla.org/shardy/sharding_representation
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Sharding {
-    /// Logical mesh that this sharding is defined against.
+    /// [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning to every
+    /// [`MeshAxis`] name stored in it. This is effectively the coordinate system for the rest of this struct. Every
+    /// axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_manual_axes`], and
+    /// [`Self::varying_manual_axes`] is resolved against this mesh.
     pub mesh: LogicalMesh,
 
-    /// Ranked per-dimension partition assignments.
+    /// Ranked per-array dimension [`Sharding`] partition assignments. This is the array-rank-indexed part of this
+    /// sharding: `dimensions[i]` describes how the logical array dimension `i` is partitioned across the mesh.
+    /// For example, on a mesh with axes `("data", "model")`, the [`dimensions`](Self::dimensions) assignment
+    /// `[ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]` means that the first array
+    /// dimension is split across `"data"` while the second array dimension is replicated on every device. This field
+    /// intentionally does not try to encode every mesh-related fact about the value. Mesh axes that matter semantically
+    /// but do not correspond to a ranked array dimension are stored separately in [`Self::unreduced_axes`],
+    /// [`Self::reduced_manual_axes`], and [`Self::varying_manual_axes`].
     pub dimensions: Vec<ShardingDimension>,
 
-    /// Unreduced mesh axes attached to this sharding.
+    /// Mesh axes along which values carry per-device partial results. This is the "a cross-device reduction still
+    /// needs to happen" marker. An axis can disappear from [`Self::dimensions`] after a local computation reduces over
+    /// the corresponding array dimension, but the value may still not be truly replicated; each shard can still hold a
+    /// different partial result that must later be combined across that mesh axis. Concretely, imagine a mesh with axes
+    /// `("data", "model")` and a value whose first tensor dimension is sharded by `"data"`. If a local computation then
+    /// sums over a `"model"`-partitioned feature dimension, the resulting value may have no ranked dimension left that
+    /// mentions `"model"`, yet each `"model"` shard still owns a different partial sum. Setting `unreduced_axes` to
+    /// `["model"]` preserves that fact. This is why this field is needed even though the mesh axis no longer appears in
+    /// [`Self::dimensions`]; without it, an axis that is absent from ranked dimensions would be indistinguishable from
+    /// ordinary replication.
     pub unreduced_axes: Vec<String>,
 
-    /// Manual mesh axes along which the value is known to already be reduced.
-    pub reduced_axes: Vec<String>,
+    /// [`MeshAxisType::Manual`] mesh axes across which values are known to have already been reduce. This is the dual
+    /// of [`Self::unreduced_axes`] though specific to manual axes because this property is implicit for other axis
+    /// types. It records that a manual mesh axis has already been consumed by a reduction, even though that fact no
+    /// longer has a direct ranked-dimension representation. A concrete `shard_map` example is an output that is
+    /// replicated in [`Self::dimensions`] but was produced by first summing across the active manual axis `"data"`
+    /// inside the mapped computation. In that case `reduced_manual_axes` being set to `["data"]` distinguishes "this
+    /// value is already reduced across `data`" from both "this value is still unreduced across `data`" and "this axis
+    /// was never relevant to the value". This field exists primarily for type-level `shard_map` reasoning and
+    /// validation.
+    pub reduced_manual_axes: Vec<String>,
 
-    /// Mesh axes along which the traced value is known to still vary for `shard_map`.
+    /// [`MeshAxisType::Manual`] mesh axes for which `shard_map` values are known to vary along. Unlike
+    /// [`Self::dimensions`], this is not a placement description. It answers a typing question used while tracing
+    /// `shard_map`: if we compared two otherwise identical devices that differ only along one of these axes, could this
+    /// local value still be different? A concrete nested-`shard_map` example is an outer map that is manual over `"y"`
+    /// and an inner map whose input sharding specifications additionally shard the value over manual axis `"x"`. Inside
+    /// the inner body, the local array can still have the same rank and local shape as before, but it now semantically
+    /// varies across both manual axes, and so the trace has `varying_manual_axes` set to `["y", "x"]`. This is needed
+    /// because neither ranked sharding nor reduction-state fields can say whether a local value is uniform across the
+    /// active manual shards. For example, constants created inside `shard_map` preserve [`Self::unreduced_axes`] and
+    /// [`Self::reduced_manual_axes`] but clear [`Self::varying_manual_axes`], because a constant does not vary from
+    /// shard to shard even when it is traced under manual axes.
     pub varying_manual_axes: Vec<String>,
 }
 
@@ -289,20 +326,22 @@ impl Sharding {
         mesh: LogicalMesh,
         dimensions: Vec<ShardingDimension>,
         unreduced_axes: Vec<String>,
-        reduced_axes: Vec<String>,
+        reduced_manual_axes: Vec<String>,
         varying_manual_axes: Vec<String>,
     ) -> Result<Self, ShardingError> {
         let mut seen = HashSet::new();
         let unreduced_axes = unreduced_axes.into_iter().filter(|axis_name| seen.insert(axis_name.clone())).collect();
-        let mut seen_reduced_axes = HashSet::new();
-        let reduced_axes =
-            reduced_axes.into_iter().filter(|axis_name| seen_reduced_axes.insert(axis_name.clone())).collect();
+        let mut seen_reduced_manual_axes = HashSet::new();
+        let reduced_manual_axes = reduced_manual_axes
+            .into_iter()
+            .filter(|axis_name| seen_reduced_manual_axes.insert(axis_name.clone()))
+            .collect();
         let mut seen_varying_axes = HashSet::new();
         let varying_manual_axes = varying_manual_axes
             .into_iter()
             .filter(|axis_name| seen_varying_axes.insert(axis_name.clone()))
             .collect();
-        let sharding = Self { mesh, dimensions, unreduced_axes, reduced_axes, varying_manual_axes };
+        let sharding = Self { mesh, dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes };
         validate_sharding(&sharding)?;
         Ok(sharding)
     }
@@ -317,7 +356,7 @@ impl Sharding {
             mesh,
             dimensions: vec![ShardingDimension::Replicated; rank],
             unreduced_axes: Vec::new(),
-            reduced_axes: Vec::new(),
+            reduced_manual_axes: Vec::new(),
             varying_manual_axes: Vec::new(),
         }
     }
@@ -420,7 +459,14 @@ impl Sharding {
 
     /// Returns the visible mesh axes that are implicitly replicated by this sharding.
     pub fn replicated_axes(&self) -> Vec<&str> {
-        let used_axes = used_axes_in_sharding(self);
+        let mut used_axes = HashSet::new();
+        for partition_dimension in &self.dimensions {
+            if let ShardingDimension::Sharded(axis_names) = partition_dimension {
+                used_axes.extend(axis_names.iter().map(String::as_str));
+            }
+        }
+        used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
+        used_axes.extend(self.reduced_manual_axes.iter().map(String::as_str));
         self.mesh
             .axes
             .iter()
@@ -472,8 +518,8 @@ impl Sharding {
             })
             .cloned()
             .collect();
-        let reduced_axes = self
-            .reduced_axes
+        let reduced_manual_axes = self
+            .reduced_manual_axes
             .iter()
             .filter(|axis_name| matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Manual)))
             .cloned()
@@ -482,7 +528,7 @@ impl Sharding {
             mesh: self.mesh.clone(),
             dimensions,
             unreduced_axes,
-            reduced_axes,
+            reduced_manual_axes,
             varying_manual_axes: self.varying_manual_axes.clone(),
         }
     }
@@ -595,9 +641,9 @@ impl Display for Sharding {
             write!(formatter, ", unreduced=")?;
             write_axis_set(formatter, self.unreduced_axes.as_slice())?;
         }
-        if !self.reduced_axes.is_empty() {
+        if !self.reduced_manual_axes.is_empty() {
             write!(formatter, ", reduced=")?;
-            write_axis_set(formatter, self.reduced_axes.as_slice())?;
+            write_axis_set(formatter, self.reduced_manual_axes.as_slice())?;
         }
         if !self.varying_manual_axes.is_empty() {
             write!(formatter, ", varying=")?;
@@ -1090,15 +1136,15 @@ fn validate_sharding(sharding: &Sharding) -> Result<(), ShardingError> {
         used_axes.insert(axis_name.clone());
     }
 
-    let mut seen_reduced_axes = HashSet::new();
-    for axis_name in &sharding.reduced_axes {
+    let mut seen_reduced_manual_axes = HashSet::new();
+    for axis_name in &sharding.reduced_manual_axes {
         if !sharding.mesh.axis_indices.contains_key(axis_name) {
             return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
         }
         if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
             return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
         }
-        if used_axes.contains(axis_name) || !seen_reduced_axes.insert(axis_name.clone()) {
+        if used_axes.contains(axis_name) || !seen_reduced_manual_axes.insert(axis_name.clone()) {
             return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
         }
         used_axes.insert(axis_name.clone());
@@ -1115,24 +1161,6 @@ fn validate_sharding(sharding: &Sharding) -> Result<(), ShardingError> {
     }
 
     Ok(())
-}
-
-fn used_axes_in_sharding(sharding: &Sharding) -> HashSet<&str> {
-    let mut used_axes = HashSet::new();
-    for partition_dimension in &sharding.dimensions {
-        if let ShardingDimension::Sharded(axis_names) = partition_dimension {
-            for axis_name in axis_names {
-                used_axes.insert(axis_name.as_str());
-            }
-        }
-    }
-    for axis_name in &sharding.unreduced_axes {
-        used_axes.insert(axis_name.as_str());
-    }
-    for axis_name in &sharding.reduced_axes {
-        used_axes.insert(axis_name.as_str());
-    }
-    used_axes
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,7 +1504,7 @@ mod tests {
             mesh: mesh.clone(),
             dimensions: vec![ShardingDimension::replicated()],
             unreduced_axes: vec![],
-            reduced_axes: vec!["x".into(), "y".into(), "z".into()],
+            reduced_manual_axes: vec!["x".into(), "y".into(), "z".into()],
             varying_manual_axes: vec!["y".into()],
         };
 

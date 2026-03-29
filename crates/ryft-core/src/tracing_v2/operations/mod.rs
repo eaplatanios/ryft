@@ -24,7 +24,8 @@ fn merge_unique_axes(left: &[String], right: &[String]) -> Vec<String> {
 fn merge_sharding_state(base: &Sharding, other: &Sharding) -> Sharding {
     let mut sharding = base.clone();
     sharding.unreduced_axes = merge_unique_axes(base.unreduced_axes.as_slice(), other.unreduced_axes.as_slice());
-    sharding.reduced_axes = merge_unique_axes(base.reduced_axes.as_slice(), other.reduced_axes.as_slice());
+    sharding.reduced_manual_axes =
+        merge_unique_axes(base.reduced_manual_axes.as_slice(), other.reduced_manual_axes.as_slice());
     sharding.varying_manual_axes =
         merge_unique_axes(base.varying_manual_axes.as_slice(), other.varying_manual_axes.as_slice());
     sharding
@@ -36,7 +37,7 @@ fn binary_output_sharding(inputs: &[ArrayType]) -> Option<Sharding> {
             if left.mesh == right.mesh
                 && left.dimensions == right.dimensions
                 && left.unreduced_axes == right.unreduced_axes
-                && left.reduced_axes == right.reduced_axes =>
+                && left.reduced_manual_axes == right.reduced_manual_axes =>
         {
             Some(merge_sharding_state(left, right))
         }
@@ -215,7 +216,7 @@ mod tests {
         );
 
         assert_eq!(
-            binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().reduced_axes),
+            binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().reduced_manual_axes),
             Ok(vec!["y".to_string()])
         );
     }
