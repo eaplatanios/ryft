@@ -397,9 +397,9 @@ mod tests {
                 Sharding::new(
                     LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
                     vec![ShardingDimension::sharded(["x"])],
-                    vec![],
-                    vec![],
-                    vec!["x".into()],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["x"],
                 )
                 .unwrap(),
             ),

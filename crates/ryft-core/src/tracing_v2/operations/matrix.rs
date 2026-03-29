@@ -4,6 +4,7 @@
 //! right linear actions for transposition, while reusing the same JVP, batching, and JIT infrastructure as scalar
 //! values.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::{
@@ -120,14 +121,8 @@ fn is_replicated_sharding(sharding: &Sharding) -> bool {
     sharding.dimensions.iter().all(|dimension| matches!(dimension, ShardingDimension::Replicated))
 }
 
-fn merge_unique_axes(left: &[String], right: &[String]) -> Vec<String> {
-    let mut merged = left.to_vec();
-    for axis_name in right {
-        if !merged.contains(axis_name) {
-            merged.push(axis_name.clone());
-        }
-    }
-    merged
+fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
+    left.union(right).cloned().collect()
 }
 
 fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
@@ -163,9 +158,9 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
     Sharding::new(
         left.mesh.clone(),
         vec![left.dimensions[0].clone(), right.dimensions[1].clone()],
-        merge_unique_axes(left.unreduced_axes.as_slice(), right.unreduced_axes.as_slice()),
-        merge_unique_axes(left.reduced_manual_axes.as_slice(), right.reduced_manual_axes.as_slice()),
-        merge_unique_axes(left.varying_manual_axes.as_slice(), right.varying_manual_axes.as_slice()),
+        merge_unique_axes(&left.unreduced_axes, &right.unreduced_axes),
+        merge_unique_axes(&left.reduced_manual_axes, &right.reduced_manual_axes),
+        merge_unique_axes(&left.varying_manual_axes, &right.varying_manual_axes),
     )
     .map(|sharding| sharding.project_for_traced_sharding())
     .ok()

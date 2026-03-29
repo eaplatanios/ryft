@@ -180,7 +180,14 @@ mod tests {
     }
 
     fn test_sharding(mesh: &LogicalMesh) -> Sharding {
-        Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec![]).unwrap()
+        Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -203,7 +210,7 @@ mod tests {
         let mesh = test_mesh();
         let target_sharding = test_sharding(&mesh);
         let input_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], vec![], vec![], vec!["x".into()])
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], Vec::<&str>::new(), Vec::<&str>::new(), ["x"])
                 .unwrap();
         let op = WithShardingConstraintOp::new(target_sharding);
 
@@ -227,9 +234,9 @@ mod tests {
                     Sharding::new(
                         input_sharding.mesh.clone(),
                         vec![ShardingDimension::sharded(["x"])],
-                        vec![],
-                        vec![],
-                        vec!["x".into()],
+                        Vec::<&str>::new(),
+                        Vec::<&str>::new(),
+                        ["x"],
                     )
                     .unwrap()
                 ),
@@ -246,13 +253,20 @@ mod tests {
         ])
         .unwrap();
         let target_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec![]).unwrap();
+            Sharding::new(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["x"])],
+                Vec::<&str>::new(),
+                Vec::<&str>::new(),
+                Vec::<&str>::new(),
+            )
+            .unwrap();
         let input_sharding = Sharding::new(
             mesh.clone(),
             vec![ShardingDimension::replicated()],
-            vec!["y".into()],
-            vec!["z".into()],
-            vec!["x".into()],
+            ["y"],
+            ["z"],
+            ["x"],
         )
         .unwrap();
         let op = WithShardingConstraintOp::new(target_sharding);
@@ -267,7 +281,7 @@ mod tests {
                 Shape::new(vec![Size::Static(8)]),
                 None,
                 Some(
-                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec!["x".into()])
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], Vec::<&str>::new(), Vec::<&str>::new(), ["x"])
                         .unwrap()
                 ),
             )])

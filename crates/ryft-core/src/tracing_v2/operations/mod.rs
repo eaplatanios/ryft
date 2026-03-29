@@ -1,5 +1,7 @@
 //! Concrete staged operations for [`crate::tracing_v2`].
 
+use std::collections::BTreeSet;
+
 use crate::tracing_v2::{TraceError, TraceValue, batch::Batch, jit::JitTracer};
 use crate::types::ArrayType;
 use crate::xla::sharding::Sharding;
@@ -11,23 +13,17 @@ fn is_replicated_sharding(sharding: &Sharding) -> bool {
         .all(|dimension| matches!(dimension, crate::sharding::ShardingDimension::Replicated))
 }
 
-fn merge_unique_axes(left: &[String], right: &[String]) -> Vec<String> {
-    let mut merged = left.to_vec();
-    for axis_name in right {
-        if !merged.contains(axis_name) {
-            merged.push(axis_name.clone());
-        }
-    }
-    merged
+fn merge_unique_axes(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<String> {
+    left.union(right).cloned().collect()
 }
 
 fn merge_sharding_state(base: &Sharding, other: &Sharding) -> Sharding {
     let mut sharding = base.clone();
-    sharding.unreduced_axes = merge_unique_axes(base.unreduced_axes.as_slice(), other.unreduced_axes.as_slice());
+    sharding.unreduced_axes = merge_unique_axes(&base.unreduced_axes, &other.unreduced_axes);
     sharding.reduced_manual_axes =
-        merge_unique_axes(base.reduced_manual_axes.as_slice(), other.reduced_manual_axes.as_slice());
+        merge_unique_axes(&base.reduced_manual_axes, &other.reduced_manual_axes);
     sharding.varying_manual_axes =
-        merge_unique_axes(base.varying_manual_axes.as_slice(), other.varying_manual_axes.as_slice());
+        merge_unique_axes(&base.varying_manual_axes, &other.varying_manual_axes);
     sharding
 }
 
@@ -179,8 +175,14 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec!["x".into()])
-                    .unwrap(),
+                Sharding::new(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["x"],
+                )
+                .unwrap(),
             ),
         );
         let right = ArrayType::new(
@@ -188,14 +190,20 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec!["y".into()])
-                    .unwrap(),
+                Sharding::new(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["y"],
+                )
+                .unwrap(),
             ),
         );
 
         assert_eq!(
             binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().varying_manual_axes),
-            Ok(vec!["x".to_string(), "y".to_string()])
+            Ok(BTreeSet::from(["x".to_string(), "y".to_string()]))
         );
     }
 
@@ -206,18 +214,36 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Size::Static(8)]),
             None,
-            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec![]).unwrap()),
+            Some(
+                Sharding::new(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                )
+                .unwrap(),
+            ),
         );
         let right = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Size::Static(8)]),
             None,
-            Some(Sharding::new(mesh, vec![ShardingDimension::replicated()], vec![], vec!["y".into()], vec![]).unwrap()),
+            Some(
+                Sharding::new(
+                    mesh,
+                    vec![ShardingDimension::replicated()],
+                    Vec::<&str>::new(),
+                    ["y"],
+                    Vec::<&str>::new(),
+                )
+                .unwrap(),
+            ),
         );
 
         assert_eq!(
             binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().reduced_manual_axes),
-            Ok(vec!["y".to_string()])
+            Ok(BTreeSet::from(["y".to_string()]))
         );
     }
 }
