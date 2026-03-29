@@ -265,7 +265,7 @@ pub struct Sharding {
 }
 
 impl Sharding {
-    /// Creates a sharding from a mesh and per-dimension assignments.
+    /// Creates a new [`Sharding`].
     pub fn new<
         U: Into<String>,
         UI: IntoIterator<Item = U>,
@@ -285,19 +285,21 @@ impl Sharding {
         let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect();
         let sharding = Self { mesh, dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes };
 
-        let mut used_axes = HashSet::new();
+        // Perform validation checks to ensure that the constructed [`Sharding`] is valid.
+        let mut used_axis_names = HashSet::new();
         for (dimension, partition_dimension) in sharding.dimensions.iter().enumerate() {
             if let ShardingDimension::Sharded(axis_names) = partition_dimension {
                 if axis_names.is_empty() {
                     return Err(ShardingError::EmptySharding { dimension });
                 }
 
-                let mut axes_in_dimension = HashSet::new();
+                let mut seen_axis_names = HashSet::new();
                 for axis_name in axis_names {
                     if !sharding.mesh.axis_indices.contains_key(axis_name) {
                         return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
                     }
-                    if !axes_in_dimension.insert(axis_name.clone()) || !used_axes.insert(axis_name.clone()) {
+
+                    if !seen_axis_names.insert(axis_name.clone()) || !used_axis_names.insert(axis_name.clone()) {
                         return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
                     }
                 }
@@ -308,23 +310,28 @@ impl Sharding {
             if !sharding.mesh.axis_indices.contains_key(axis_name) {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
-            if used_axes.contains(axis_name) {
+
+            if used_axis_names.contains(axis_name) {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
-            used_axes.insert(axis_name.clone());
+
+            used_axis_names.insert(axis_name.clone());
         }
 
         for axis_name in &sharding.reduced_manual_axes {
             if !sharding.mesh.axis_indices.contains_key(axis_name) {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
+
             if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
                 return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
             }
-            if used_axes.contains(axis_name) {
+
+            if used_axis_names.contains(axis_name) {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
-            used_axes.insert(axis_name.clone());
+
+            used_axis_names.insert(axis_name.clone());
         }
 
         for axis_name in &sharding.varying_manual_axes {
@@ -336,11 +343,10 @@ impl Sharding {
         Ok(sharding)
     }
 
-    /// Creates a fully replicated sharding for an array with rank `rank`.
-    ///
-    /// All dimensions are [`Replicated`][ShardingDimension::Replicated], meaning the full
-    /// tensor is present on every device. Equivalent to `NamedSharding(mesh, PartitionSpec())`
-    /// in JAX, padded to the tensor rank with `None`.
+    /// Creates a new _fully-replicated_ [`Sharding`] for an array with rank `rank`. All dimensions in the resulting
+    /// sharding are going to be [`ShardingDimension::Replicated`], meaning that a copy of the full array will be
+    /// present on every device.
+    #[inline]
     pub fn replicated(mesh: LogicalMesh, rank: usize) -> Self {
         Self {
             mesh,
@@ -351,7 +357,8 @@ impl Sharding {
         }
     }
 
-    /// Rank represented by this sharding.
+    /// Returns the rank (i.e., number of dimensions) of this [`Sharding`].
+    #[inline]
     pub fn rank(&self) -> usize {
         self.dimensions.len()
     }
