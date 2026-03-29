@@ -174,97 +174,41 @@ use crate::sharding::{
     DeviceMesh, LogicalMesh, MeshAxisType, MeshDevice, MeshDeviceId, ShardingDimension, ShardingError,
 };
 
-// ---------------------------------------------------------------------------
-// Sharding
-// ---------------------------------------------------------------------------
-
-/// Mesh-bound sharding for one logical array value.
+/// [`LogicalMesh`]-bound sharding for a logical array value. This is the primary user-facing sharding type for
+/// compilation-time annotations. It owns the [`LogicalMesh`] together with the per-dimension [`ShardingDimension`]
+/// assignments and any additional state needed to model partial reductions and [`MeshAxisType::Manual`] mesh axes.
 ///
-/// This is the primary user-facing sharding type for compilation-time annotations. It owns the
-/// [`LogicalMesh`] together with the per-dimension [`ShardingDimension`] assignments and any
-/// extra partition-spec state needed to model partial reductions.
+/// # Example
 ///
-/// # JAX equivalent
-///
-/// This corresponds to [`jax.sharding.NamedSharding(mesh, spec)`][jax-ns], while the
-/// [`dimensions`](Self::dimensions) field carries the semantics of the nested
-/// [`jax.sharding.PartitionSpec`][jax-pspec]:
+/// Consider the following [`Sharding`]:
 ///
 /// ```ignore
-/// let sharding = Sharding::new(
-///     logical_mesh,
-///     vec![
+/// Sharding {
+///     mesh,
+///     dimensions: vec![
 ///         ShardingDimension::sharded(["data"]),
 ///         ShardingDimension::replicated(),
 ///     ],
-///     vec![],
-///     vec![],
-///     vec![],
-/// )?;
+///     unreduced_axes: vec!["model".into()],
+///     reduced_manual_axes: vec![],
+///     varying_manual_axes: vec![],
+/// };
 /// ```
 ///
-/// [jax-ns]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.NamedSharding
-/// [jax-pspec]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec
+/// In this case, the `"data"` [`MeshAxis`] shards array dimension `0`, while `"model"` does not shard any ranked
+/// dimension and instead marks the value as still unreduced along the mesh axis `"model"`. Without `unreduced_axes`,
+/// that unused mesh axis would be indistinguishable from a truly replicated axis.
 ///
-/// # Ranked dimensions and generic partition-spec state
+/// # References
 ///
-/// `dimensions` is indexed by tensor rank, while `unreduced_axes`, `reduced_manual_axes`, and
-/// `varying_manual_axes` are not. The former says how each tensor dimension is partitioned;
-/// `unreduced_axes` and `reduced_manual_axes` record generic partition-spec state even when that state
-/// does not correspond to any tensor dimension, while `varying_manual_axes` carries traced
-/// `shard_map` metadata about which mesh axes a value is still known to vary along.
+/// For more information on the approach Ryft takes to sharding, you can refer to the relevant JAX documentation that
+/// inspired it. The following pages are particularly relevant:
 ///
-/// ```ignore
-/// let sharding = Sharding::new(
-///     logical_mesh,
-///     vec![
-///         ShardingDimension::sharded(["data"]),
-///         ShardingDimension::replicated(),
-///     ],
-///     vec!["model".into()],
-///     vec![],
-///     vec![],
-/// )?;
-///
-/// assert_eq!(sharding.dimensions.len(), 2);
-/// assert_eq!(sharding.unreduced_axes, vec!["model"]);
-/// ```
-///
-/// In this example, `"data"` partitions tensor dimension `0`, while `"model"` does not shard any
-/// ranked dimension and instead marks the value as still unreduced along the mesh axis `"model"`.
-/// Without `unreduced_axes`, that unused mesh axis would be indistinguishable from a truly
-/// replicated axis.
-///
-/// `reduced_manual_axes` is the dual partition-spec state used to record mesh axes that are known to have
-/// been reduced away. Unlike `unreduced_axes`, it is type-only metadata and is not rendered in
-/// generic Shardy tensor shardings because Shardy does not expose a matching tensor-sharding
-/// field.
-///
-/// # Validation
-///
-/// The constructor validates that:
-///
-/// - Every referenced mesh axis exists in the mesh.
-/// - No mesh axis is used more than once across all ranked dimensions.
-/// - Every unreduced axis exists in the mesh and is not already used by the ranked dimensions.
-/// - Every reduced axis exists in the mesh, is manual, and is not already used by ranked or
-///   unreduced dimensions.
-/// - Every varying-manual axis exists in the mesh.
-///
-/// # Shardy representation
-///
-/// Rendered as a [`TensorShardingAttr`][sdy-tensor] (`#sdy.sharding<...>`) via
-/// [`to_shardy_tensor_sharding_attribute`][Sharding::to_shardy_tensor_sharding_attribute]:
-///
-/// ```text
-/// #sdy.sharding<@mesh, [{"data"}, {}]>
-/// #sdy.sharding<@mesh, [{"data"}, {}], replicated={"y"}>
-/// #sdy.sharding<@mesh, [{"data"}, {}], unreduced={"z"}>
-/// ```
-///
-/// `reduced_manual_axes` remains type-only metadata and is intentionally omitted from this rendering.
-///
-/// [sdy-tensor]: https://openxla.org/shardy/sharding_representation
+/// - [Distributed Arrays and Automatic Parallelization](
+///   https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html)
+/// - [Explicit Sharding](https://docs.jax.dev/en/latest/notebooks/explicit-sharding.html)
+/// - [Manual Parallelism with `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html#so-let-s-see-a-shard-map).
+/// - [Memories and Host Offloading](https://docs.jax.dev/en/latest/notebooks/host-offloading.html)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Sharding {
     /// [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning to every
@@ -997,7 +941,6 @@ impl ShardingLayout {
                 actual: sharding.mesh.clone(),
             });
         }
-        validate_sharding(&sharding)?;
 
         let partition_rank = sharding.rank();
         let array_rank = global_shape.len();
