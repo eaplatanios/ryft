@@ -1042,7 +1042,7 @@ fn varying_axes(sharding: Option<&Sharding>) -> Vec<String> {
 
 fn sharding_with_varying_manual_axes(sharding: &Sharding, varying_axes: Vec<String>) -> Sharding {
     Sharding::new(
-        sharding.mesh().clone(),
+        sharding.mesh.clone(),
         sharding.dimensions.clone(),
         sharding.unreduced_axes.clone(),
         sharding.reduced_axes.clone(),
@@ -1356,7 +1356,7 @@ fn global_shape_for_sharding(
                     .iter()
                     .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                     .try_fold(1usize, |partition_count, axis_name| {
-                        let axis_size = sharding.mesh().axis_size(axis_name).ok_or_else(|| {
+                        let axis_size = sharding.mesh.axis_size(axis_name).ok_or_else(|| {
                             ShardMapTraceError::ShardingError(ShardingError::UnknownMeshAxisName {
                                 name: axis_name.clone(),
                             })
@@ -1390,10 +1390,10 @@ fn build_shardings(
         .into_iter()
         .enumerate()
         .map(|(value_index, sharding)| {
-            if sharding.mesh() != mesh {
+            if sharding.mesh != *mesh {
                 return Err(ShardMapError::ShardingError(ShardingError::MeshMismatch {
                     expected: mesh.clone(),
-                    actual: sharding.mesh().clone(),
+                    actual: sharding.mesh.clone(),
                 }));
             }
             validate_manual_axis_order(&sharding, &manual_axis_names, value_kind, value_index)?;
@@ -1509,7 +1509,7 @@ fn local_shape_for_sharding(
                 .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
                 .try_fold(1usize, |partition_count, axis_name| -> Result<usize, ShardMapError> {
                     let axis_size = sharding
-                        .mesh()
+                        .mesh
                         .axis_size(axis_name)
                         .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.clone() })?;
                     Ok(partition_count * axis_size)
@@ -1589,7 +1589,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
 ) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     let free_axis_names = sharding
-        .mesh()
+        .mesh
         .axes
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))
@@ -1655,7 +1655,7 @@ fn stripped_shardy_tensor_sharding(sharding: &Sharding, manual_axes: &[String]) 
 fn render_manual_computation_dimensions(sharding: &Sharding, manual_axes: &[String]) -> String {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     let free_axis_names = sharding
-        .mesh()
+        .mesh
         .axes
         .iter()
         .filter_map(|axis| (!manual_axis_names.contains(axis.name.as_str())).then_some(axis.name.as_str()))

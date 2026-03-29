@@ -267,7 +267,8 @@ use crate::sharding::{
 /// [sdy-tensor]: https://openxla.org/shardy/sharding_representation
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Sharding {
-    mesh: LogicalMesh,
+    /// Logical mesh that this sharding is defined against.
+    pub mesh: LogicalMesh,
 
     /// Ranked per-dimension partition assignments.
     pub dimensions: Vec<ShardingDimension>,
@@ -319,11 +320,6 @@ impl Sharding {
             reduced_axes: Vec::new(),
             varying_manual_axes: Vec::new(),
         }
-    }
-
-    /// Returns the logical mesh of this sharding.
-    pub fn mesh(&self) -> &LogicalMesh {
-        &self.mesh
     }
 
     /// Rank represented by this sharding.
@@ -949,10 +945,10 @@ pub struct ShardingLayout {
 impl ShardingLayout {
     /// Constructs shard metadata for all devices in the mesh.
     pub fn new(global_shape: Vec<usize>, mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ShardingError> {
-        if mesh.logical_mesh != sharding.mesh().clone() {
+        if mesh.logical_mesh != sharding.mesh.clone() {
             return Err(ShardingError::MeshMismatch {
                 expected: mesh.logical_mesh.clone(),
-                actual: sharding.mesh().clone(),
+                actual: sharding.mesh.clone(),
             });
         }
         validate_sharding(&sharding)?;

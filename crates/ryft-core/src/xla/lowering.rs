@@ -573,8 +573,8 @@ where
             }
         } else if let Some(sharding_constraint_op) = equation.op.as_any().downcast_ref::<WithShardingConstraintOp>() {
             mesh = Some(match mesh.take() {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding_constraint_op.sharding().mesh())?,
-                None => sharding_constraint_op.sharding().mesh().clone(),
+                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, &sharding_constraint_op.sharding().mesh)?,
+                None => sharding_constraint_op.sharding().mesh.clone(),
             });
         }
     }

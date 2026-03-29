@@ -33,7 +33,7 @@ fn merge_sharding_state(base: &Sharding, other: &Sharding) -> Sharding {
 fn binary_output_sharding(inputs: &[ArrayType]) -> Option<Sharding> {
     match (&inputs[0].sharding, &inputs[1].sharding) {
         (Some(left), Some(right))
-            if left.mesh() == right.mesh()
+            if left.mesh == right.mesh
                 && left.dimensions == right.dimensions
                 && left.unreduced_axes == right.unreduced_axes
                 && left.reduced_axes == right.reduced_axes =>

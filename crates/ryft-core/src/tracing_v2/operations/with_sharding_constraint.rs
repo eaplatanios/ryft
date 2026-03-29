@@ -225,7 +225,7 @@ mod tests {
                 None,
                 Some(
                     Sharding::new(
-                        input_sharding.mesh().clone(),
+                        input_sharding.mesh.clone(),
                         vec![ShardingDimension::sharded(["x"])],
                         vec![],
                         vec![],
