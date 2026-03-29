@@ -174,7 +174,22 @@ where
 
 /// Returns `true` when two shard-map boundary types agree apart from carried sharding metadata.
 fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
-    actual.data_type == expected.data_type && actual.shape == expected.shape && actual.layout == expected.layout
+    actual.data_type == expected.data_type
+        && actual.shape == expected.shape
+        && actual.layout == expected.layout
+        && match (&actual.sharding, &expected.sharding) {
+            (_, None) => true,
+            (Some(actual), Some(expected)) => {
+                actual.unreduced_axes == expected.unreduced_axes
+                    && actual.reduced_axes == expected.reduced_axes
+                    && actual.varying_manual_axes == expected.varying_manual_axes
+            }
+            (None, Some(expected)) => {
+                expected.unreduced_axes.is_empty()
+                    && expected.reduced_axes.is_empty()
+                    && expected.varying_manual_axes.is_empty()
+            }
+        }
 }
 
 impl Op<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
@@ -742,6 +757,8 @@ fn factorize_transpose_shard_map_body(
         simplified_body.shard_map.mesh().clone(),
         simplified_body.shard_map.in_shardings()[..primal_input_count].to_vec(),
         residual_out_shardings.clone(),
+        simplified_body.shard_map.manual_axes().to_vec(),
+        simplified_body.shard_map.check_vma(),
     );
     let residual_body = FlatTracedShardMap::from_parts(
         residual_shard_map.clone(),
@@ -775,6 +792,8 @@ fn factorize_transpose_shard_map_body(
             .chain(residual_out_shardings)
             .collect::<Vec<_>>(),
         simplified_body.shard_map.out_shardings().to_vec(),
+        simplified_body.shard_map.manual_axes().to_vec(),
+        simplified_body.shard_map.check_vma(),
     );
     let apply_body = FlatTracedShardMap::from_parts(
         apply_shard_map,
@@ -1057,6 +1076,8 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .chain(body.shard_map.in_shardings().iter().cloned())
             .collect::<Vec<_>>(),
         body.shard_map.out_shardings().to_vec(),
+        body.shard_map.manual_axes().to_vec(),
+        body.shard_map.check_vma(),
     );
 
     let pullback_local_input_types = body
@@ -1080,6 +1101,8 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .chain(body.shard_map.out_shardings().iter().cloned())
             .collect::<Vec<_>>(),
         body.shard_map.in_shardings().to_vec(),
+        body.shard_map.manual_axes().to_vec(),
+        body.shard_map.check_vma(),
     );
 
     let (_, pushforward_compiled): (
@@ -1223,6 +1246,8 @@ fn trace_flat_shard_map<F, Input, Output>(
     mesh: LogicalMesh,
     in_specs: Input::To<Sharding>,
     out_specs: Output::To<Sharding>,
+    manual_axes: Vec<String>,
+    check_vma: bool,
 ) -> Result<FlatTracedShardMap, ShardMapTraceError>
 where
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
@@ -1237,6 +1262,8 @@ where
         mesh,
         in_specs.into_parameters().collect::<Vec<_>>(),
         out_specs.into_parameters().collect::<Vec<_>>(),
+        manual_axes,
+        check_vma,
     )?;
     Ok(FlatTracedShardMap::from_traced(&shard_map.trace::<F, Input, Output>(function, global_input_types)?))
 }
@@ -1302,6 +1329,8 @@ impl ShardMapInvocationLeaf for ArrayType {
         mesh: LogicalMesh,
         in_specs: Input::To<Sharding>,
         out_specs: Output::To<Sharding>,
+        manual_axes: Vec<String>,
+        check_vma: bool,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
@@ -1320,6 +1349,8 @@ impl ShardMapInvocationLeaf for ArrayType {
             mesh,
             in_specs.into_parameters().collect::<Vec<_>>(),
             out_specs.into_parameters().collect::<Vec<_>>(),
+            manual_axes,
+            check_vma,
         )?;
         shard_map.trace(
             |local_inputs: ShardMapLocalTraceInput<Input>| {
@@ -1356,6 +1387,8 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
         mesh: LogicalMesh,
         in_specs: Input::To<Sharding>,
         out_specs: Output::To<Sharding>,
+        manual_axes: Vec<String>,
+        check_vma: bool,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
@@ -1383,6 +1416,8 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
             mesh,
             global_in_specs,
             out_specs,
+            manual_axes,
+            check_vma,
         )?;
         apply_traced_shard_map(traced, traced_inputs, output_structure)
     }
@@ -1409,6 +1444,8 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
         mesh: LogicalMesh,
         in_specs: Input::To<Sharding>,
         out_specs: Output::To<Sharding>,
+        manual_axes: Vec<String>,
+        check_vma: bool,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input: Parameterized<Self, ParameterStructure: Clone>,
@@ -1444,6 +1481,8 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
             mesh,
             global_in_specs,
             out_specs,
+            manual_axes,
+            check_vma,
         )?;
         let staged_outputs = apply_linearized_flat_shard_map(traced, traced_inputs)?;
         Ok(Output::To::<Linearized<ShardMapTracer>>::from_parameters(output_structure, staged_outputs)?)

@@ -70,7 +70,13 @@ where
         if output.rank() != self.sharding().rank() {
             return Err(TraceError::IncompatibleAbstractValues { op: "with_sharding_constraint" });
         }
-        output.sharding = Some(self.sharding().clone());
+        let mut sharding = self.sharding().clone();
+        sharding.varying_manual_axes = output
+            .sharding
+            .as_ref()
+            .map(|input_sharding| input_sharding.varying_manual_axes.clone())
+            .unwrap_or_default();
+        output.sharding = Some(sharding);
         Ok(vec![output])
     }
 
@@ -174,7 +180,7 @@ mod tests {
     }
 
     fn test_sharding(mesh: &LogicalMesh) -> Sharding {
-        Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![]).unwrap()
+        Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec![]).unwrap()
     }
 
     #[test]
@@ -189,6 +195,82 @@ mod tests {
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None)],
             ),
             Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(sharding),)])
+        );
+    }
+
+    #[test]
+    fn test_with_sharding_constraint_abstract_eval_preserves_varying_axes() {
+        let mesh = test_mesh();
+        let target_sharding = test_sharding(&mesh);
+        let input_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], vec![], vec![], vec!["x".into()])
+                .unwrap();
+        let op = WithShardingConstraintOp::new(target_sharding);
+
+        assert_eq!(
+            <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
+                &op,
+                &[
+                    ArrayType::new(
+                        DataType::F32,
+                        Shape::new(vec![Size::Static(8)]),
+                        None,
+                        Some(input_sharding.clone()),
+                    )
+                ],
+            ),
+            Ok(vec![ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Size::Static(8)]),
+                None,
+                Some(
+                    Sharding::new(
+                        input_sharding.mesh().clone(),
+                        vec![ShardingDimension::sharded(["x"])],
+                        vec![],
+                        vec![],
+                        vec!["x".into()],
+                    )
+                    .unwrap()
+                ),
+            )])
+        );
+    }
+
+    #[test]
+    fn test_with_sharding_constraint_abstract_eval_preserves_reduced_and_unreduced_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("z", 4, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let target_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec![]).unwrap();
+        let input_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated()],
+            vec!["y".into()],
+            vec!["z".into()],
+            vec!["x".into()],
+        )
+        .unwrap();
+        let op = WithShardingConstraintOp::new(target_sharding);
+
+        assert_eq!(
+            <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
+                &op,
+                &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(input_sharding),)],
+            ),
+            Ok(vec![ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Size::Static(8)]),
+                None,
+                Some(
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec!["x".into()])
+                        .unwrap()
+                ),
+            )])
         );
     }
 
@@ -229,7 +311,7 @@ mod tests {
             transpose_builder.build::<ShardMapTensor, ShardMapTensor>(vec![contribution], Placeholder, Placeholder);
         assert_eq!(
             transpose_graph.to_string(),
-            format!("lambda %0:f32[8] .\nlet %1:f32[8] sharding={sharding:?} = with_sharding_constraint %0\nin (%1)")
+            format!("lambda %0:f32[8] .\nlet %1:f32[8][sharding={sharding}] = with_sharding_constraint %0\nin (%1)")
                 .trim_end(),
         );
     }

@@ -508,6 +508,7 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             vec![],
             vec![],
+            vec![],
         )
         .unwrap();
         let rhs_sharding = Sharding::replicated(mesh.logical_mesh.clone(), 2);

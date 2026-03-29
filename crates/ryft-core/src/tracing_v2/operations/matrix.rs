@@ -139,6 +139,7 @@ fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
         sharding.mesh().clone(),
         vec![sharding.dimensions[1].clone(), sharding.dimensions[0].clone()],
         sharding.unreduced_axes.clone(),
+        sharding.reduced_axes.clone(),
         sharding.varying_manual_axes.clone(),
     )
     .map(|sharding| sharding.project_for_traced_sharding())
@@ -163,6 +164,7 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
         left.mesh().clone(),
         vec![left.dimensions[0].clone(), right.dimensions[1].clone()],
         merge_unique_axes(left.unreduced_axes.as_slice(), right.unreduced_axes.as_slice()),
+        merge_unique_axes(left.reduced_axes.as_slice(), right.reduced_axes.as_slice()),
         merge_unique_axes(left.varying_manual_axes.as_slice(), right.varying_manual_axes.as_slice()),
     )
     .map(|sharding| sharding.project_for_traced_sharding())
@@ -176,13 +178,15 @@ pub(crate) fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str
     if lhs_data_type != rhs_data_type || lhs_cols != rhs_rows {
         return Err(TraceError::IncompatibleAbstractValues { op });
     }
-    Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, matmul_array_sharding(lhs, rhs)))
+    let sharding = matmul_array_sharding(lhs, rhs);
+    Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, sharding))
 }
 
 /// Computes the abstract output type of one matrix transpose.
 pub(crate) fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
     let (data_type, rows, cols) = matrix_parts(input, op)?;
-    Ok(matrix_array_type(data_type, cols, rows, transpose_array_sharding(input)))
+    let sharding = transpose_array_sharding(input);
+    Ok(matrix_array_type(data_type, cols, rows, sharding))
 }
 
 fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {

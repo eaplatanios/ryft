@@ -11,11 +11,37 @@ fn is_replicated_sharding(sharding: &Sharding) -> bool {
         .all(|dimension| matches!(dimension, crate::sharding::ShardingDimension::Replicated))
 }
 
+fn merge_unique_axes(left: &[String], right: &[String]) -> Vec<String> {
+    let mut merged = left.to_vec();
+    for axis_name in right {
+        if !merged.contains(axis_name) {
+            merged.push(axis_name.clone());
+        }
+    }
+    merged
+}
+
+fn merge_sharding_state(base: &Sharding, other: &Sharding) -> Sharding {
+    let mut sharding = base.clone();
+    sharding.unreduced_axes = merge_unique_axes(base.unreduced_axes.as_slice(), other.unreduced_axes.as_slice());
+    sharding.reduced_axes = merge_unique_axes(base.reduced_axes.as_slice(), other.reduced_axes.as_slice());
+    sharding.varying_manual_axes =
+        merge_unique_axes(base.varying_manual_axes.as_slice(), other.varying_manual_axes.as_slice());
+    sharding
+}
+
 fn binary_output_sharding(inputs: &[ArrayType]) -> Option<Sharding> {
     match (&inputs[0].sharding, &inputs[1].sharding) {
-        (Some(left), Some(right)) if left == right => Some(left.clone()),
-        (Some(left), Some(right)) if is_replicated_sharding(left) => Some(right.clone()),
-        (Some(left), Some(right)) if is_replicated_sharding(right) => Some(left.clone()),
+        (Some(left), Some(right))
+            if left.mesh() == right.mesh()
+                && left.dimensions == right.dimensions
+                && left.unreduced_axes == right.unreduced_axes
+                && left.reduced_axes == right.reduced_axes =>
+        {
+            Some(merge_sharding_state(left, right))
+        }
+        (Some(left), Some(right)) if is_replicated_sharding(left) => Some(merge_sharding_state(right, left)),
+        (Some(left), Some(right)) if is_replicated_sharding(right) => Some(merge_sharding_state(left, right)),
         (Some(left), None) => Some(left.clone()),
         (None, Some(right)) => Some(right.clone()),
         _ => None,
@@ -118,11 +144,79 @@ pub(crate) fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Re
     if inputs[0].data_type != inputs[1].data_type || inputs[0].shape != inputs[1].shape {
         Err(TraceError::IncompatibleAbstractValues { op })
     } else {
-        Ok(ArrayType {
-            data_type: inputs[0].data_type,
-            shape: inputs[0].shape.clone(),
-            layout: if inputs[0].layout == inputs[1].layout { inputs[0].layout.clone() } else { None },
-            sharding: binary_output_sharding(inputs),
-        })
+        let sharding = binary_output_sharding(inputs);
+        Ok(ArrayType::new(
+            inputs[0].data_type,
+            inputs[0].shape.clone(),
+            if inputs[0].layout == inputs[1].layout { inputs[0].layout.clone() } else { None },
+            sharding.clone(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
+    use crate::types::{DataType, Shape, Size};
+
+    fn test_mesh() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn test_binary_same_abstract_unions_varying_axes() {
+        let mesh = test_mesh();
+        let left = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec!["x".into()])
+                    .unwrap(),
+            ),
+        );
+        let right = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec!["y".into()])
+                    .unwrap(),
+            ),
+        );
+
+        assert_eq!(
+            binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().varying_manual_axes),
+            Ok(vec!["x".to_string(), "y".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_binary_same_abstract_preserves_reduced_axes_from_replicated_input() {
+        let mesh = test_mesh();
+        let left = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], vec![], vec![], vec![]).unwrap()),
+        );
+        let right = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(Sharding::new(mesh, vec![ShardingDimension::replicated()], vec![], vec!["y".into()], vec![]).unwrap()),
+        );
+
+        assert_eq!(
+            binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().reduced_axes),
+            Ok(vec!["y".to_string()])
+        );
     }
 }
