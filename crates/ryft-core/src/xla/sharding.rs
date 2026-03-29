@@ -286,7 +286,60 @@ impl Sharding {
             .filter(|axis_name| seen_varying_axes.insert(axis_name.clone()))
             .collect();
         let sharding = Self { mesh, dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes };
-        validate_sharding(&sharding)?;
+
+        let mut used_axes = HashSet::new();
+        for (dimension, partition_dimension) in sharding.dimensions.iter().enumerate() {
+            if let ShardingDimension::Sharded(axis_names) = partition_dimension {
+                if axis_names.is_empty() {
+                    return Err(ShardingError::EmptySharding { dimension });
+                }
+
+                let mut axes_in_dimension = HashSet::new();
+                for axis_name in axis_names {
+                    if !sharding.mesh.axis_indices.contains_key(axis_name) {
+                        return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+                    }
+                    if !axes_in_dimension.insert(axis_name.clone()) || !used_axes.insert(axis_name.clone()) {
+                        return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+                    }
+                }
+            }
+        }
+
+        for axis_name in &sharding.unreduced_axes {
+            if !sharding.mesh.axis_indices.contains_key(axis_name) {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if used_axes.contains(axis_name) {
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+            }
+            used_axes.insert(axis_name.clone());
+        }
+
+        let mut seen_reduced_manual_axes = HashSet::new();
+        for axis_name in &sharding.reduced_manual_axes {
+            if !sharding.mesh.axis_indices.contains_key(axis_name) {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+                return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
+            }
+            if used_axes.contains(axis_name) || !seen_reduced_manual_axes.insert(axis_name.clone()) {
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+            }
+            used_axes.insert(axis_name.clone());
+        }
+
+        let mut seen_varying_axes = HashSet::new();
+        for axis_name in &sharding.varying_manual_axes {
+            if !sharding.mesh.axis_indices.contains_key(axis_name) {
+                return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
+            }
+            if !seen_varying_axes.insert(axis_name.clone()) {
+                return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
+            }
+        }
+
         Ok(sharding)
     }
 
@@ -1046,64 +1099,6 @@ impl ShardingLayout {
             })
             .collect()
     }
-}
-
-/// Validates a sharding against its logical mesh.
-fn validate_sharding(sharding: &Sharding) -> Result<(), ShardingError> {
-    let mut used_axes = HashSet::new();
-    for (dimension, partition_dimension) in sharding.dimensions.iter().enumerate() {
-        if let ShardingDimension::Sharded(axis_names) = partition_dimension {
-            if axis_names.is_empty() {
-                return Err(ShardingError::EmptySharding { dimension });
-            }
-
-            let mut axes_in_dimension = HashSet::new();
-            for axis_name in axis_names {
-                if !sharding.mesh.axis_indices.contains_key(axis_name) {
-                    return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-                }
-                if !axes_in_dimension.insert(axis_name.clone()) || !used_axes.insert(axis_name.clone()) {
-                    return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
-                }
-            }
-        }
-    }
-
-    for axis_name in &sharding.unreduced_axes {
-        if !sharding.mesh.axis_indices.contains_key(axis_name) {
-            return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-        }
-        if used_axes.contains(axis_name) {
-            return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
-        }
-        used_axes.insert(axis_name.clone());
-    }
-
-    let mut seen_reduced_manual_axes = HashSet::new();
-    for axis_name in &sharding.reduced_manual_axes {
-        if !sharding.mesh.axis_indices.contains_key(axis_name) {
-            return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-        }
-        if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-            return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
-        }
-        if used_axes.contains(axis_name) || !seen_reduced_manual_axes.insert(axis_name.clone()) {
-            return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
-        }
-        used_axes.insert(axis_name.clone());
-    }
-
-    let mut seen_varying_axes = HashSet::new();
-    for axis_name in &sharding.varying_manual_axes {
-        if !sharding.mesh.axis_indices.contains_key(axis_name) {
-            return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-        }
-        if !seen_varying_axes.insert(axis_name.clone()) {
-            return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
-        }
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
