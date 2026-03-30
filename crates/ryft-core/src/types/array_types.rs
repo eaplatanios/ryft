@@ -189,6 +189,7 @@ impl ArrayType {
     /// Constructs a new [`ArrayType`].
     #[inline]
     pub fn new(data_type: DataType, shape: Shape, layout: Option<Layout>, sharding: Option<Sharding>) -> Self {
+        // TODO(eaplatanios): Verify that the rank of the sharding matches that of the shape, if provided.
         Self { data_type, shape, layout, sharding }
     }
 

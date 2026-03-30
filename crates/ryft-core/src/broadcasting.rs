@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
+
 use thiserror::Error;
 
 use crate::{
     parameters::{ParameterError, Parameterized},
-    types::data_types::DataTypeError,
-    types::{ArrayType, DataType, Shape, Size},
+    sharding::{Sharding, ShardingDimension, ShardingError},
+    types::{ArrayType, DataType, Shape, Size, data_types::DataTypeError},
 };
 
 /// Represents broadcasting-related errors.
@@ -18,8 +20,14 @@ pub enum BroadcastingError {
     #[error("failed to broadcast shape `{lhs}` to shape `{rhs}`")]
     IncompatibleShapes { lhs: Shape, rhs: Shape },
 
+    #[error("failed to broadcast due to incompatible shardings; lhs={lhs:?}, rhs={rhs:?}")]
+    IncompatibleShardings { lhs: Option<Sharding>, rhs: Option<Sharding> },
+
     #[error("failed to reconstruct the parameterized structure after broadcasting; {0}")]
     ParameterError(#[from] ParameterError),
+
+    #[error("failed to broadcast sharding information; {0}")]
+    ShardingError(#[from] ShardingError),
 }
 
 /// Represents [`Type`](crate::types::Type)s or values that can be broadcast together.
@@ -224,14 +232,13 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
                     let broadcasted_data_type = lhs.data_type.broadcast(&rhs.data_type)?;
                     let broadcasted_shape = lhs.shape.broadcast(&rhs.shape)?;
                     let broadcasted_layout = (lhs.layout == rhs.layout).then(|| lhs.layout.clone()).flatten();
-                    let broadcasted_sharding = match (&lhs.sharding, &rhs.sharding) {
-                        (Some(left), Some(right)) if left == right => Some(left.clone()),
-                        (Some(left), None) => Some(left.clone()),
-                        (None, Some(right)) => Some(right.clone()),
-                        // TODO(eaplatanios): This is not good. We should figure out how to broadcast sharding information.
-                        _ => None,
-                    }
-                    .filter(|sharding| sharding.rank() == broadcasted_shape.rank());
+                    let broadcasted_sharding = broadcast_sharding(
+                        &lhs.shape,
+                        lhs.sharding.as_ref(),
+                        &rhs.shape,
+                        rhs.sharding.as_ref(),
+                        &broadcasted_shape,
+                    )?;
                     Ok(ArrayType::new(
                         broadcasted_data_type,
                         broadcasted_shape,
@@ -258,12 +265,14 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
             .map(|(lhs, rhs)| {
                 let broadcasted_data_type = lhs.data_type.broadcast_to(&rhs.data_type)?;
                 let broadcasted_shape = lhs.shape.broadcast_to(&rhs.shape)?;
-                Ok(ArrayType::new(
-                    broadcasted_data_type,
-                    broadcasted_shape,
-                    rhs.layout.clone(),
-                    rhs.sharding.clone().filter(|sharding| sharding.rank() == rhs.rank()),
-                ))
+                let broadcasted_sharding = broadcast_sharding(
+                    &lhs.shape,
+                    lhs.sharding.as_ref(),
+                    &rhs.shape,
+                    rhs.sharding.as_ref(),
+                    &broadcasted_shape,
+                )?;
+                Ok(ArrayType::new(broadcasted_data_type, broadcasted_shape, rhs.layout.clone(), broadcasted_sharding))
             })
             .collect::<Result<Vec<_>, BroadcastingError>>()?;
         Ok(Self::from_parameters(structure, broadcasted_array_types)?)
@@ -276,16 +285,150 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
         broadcasted_self.parameters().zip(other.parameters()).all(|(lhs, rhs)| {
             lhs.data_type.is_broadcastable_to(&rhs.data_type)
                 && lhs.shape.is_broadcastable_to(&rhs.shape)
-                && (rhs.sharding.is_none() || lhs.sharding == rhs.sharding)
+                // TODO(eaplatanios): Is it worth adding a more efficient implementation for this?
+                && broadcast_sharding(&lhs.shape, lhs.sharding.as_ref(), &rhs.shape, rhs.sharding.as_ref(), &rhs.shape)
+                    .is_ok()
         })
     }
 }
 
+// TODO(eaplatanios): Review this function.
+/// Computes the sharding metadata for broadcasting two array leaves.
+///
+/// This routine applies Ryft's sharding broadcast rules axis by axis after the result shape has already been inferred.
+/// The rules are:
+///
+///   - If neither operand carries sharding metadata, the broadcasted result is also unsharded.
+///   - Any provided [`Sharding`] must already have the same rank as its source [`Shape`]. Mismatched metadata is
+///     rejected before any broadcast-specific logic runs.
+///   - When the operands have different ranks, the lower-rank sharding is left-padded with replicated dimensions so
+///     that sharding alignment follows the same leading-rank promotion as shape broadcasting.
+///   - On an aligned axis, an operand with extent `1` is treated as replicated for that axis. The non-singleton
+///     operand therefore determines the result sharding for standard singleton expansion.
+///   - If neither aligned axis is singleton, identical sharding dimensions remain unchanged. A replicated dimension is
+///     neutral and yields to the other operand's sharding.
+///   - If both aligned non-singleton axes carry different non-replicated shardings, the operands are incompatible and
+///     broadcasting fails.
+///   - Rank-promotion and outer-product style broadcasts preserve the contributing operand's sharding on axes that only
+///     one operand meaningfully contributes to.
+///   - Both operands must use the same mesh when they are both sharded. After the per-axis dimensions are combined,
+///     reusing the same mesh axis across multiple result dimensions is treated as an incompatible broadcast.
+///   - The `unreduced_axes`, `reduced_manual_axes`, and `varying_manual_axes` sets are unioned across both inputs once
+///     the per-axis sharding dimensions have been proven compatible.
+///
+/// # Parameters
+///
+///   - `lhs_shape`: Shape of the left-hand operand before broadcasting.
+///   - `lhs_sharding`: Optional sharding metadata for the left-hand operand.
+///   - `rhs_shape`: Shape of the right-hand operand before broadcasting.
+///   - `rhs_sharding`: Optional sharding metadata for the right-hand operand.
+///   - `broadcasted_shape`: The already-computed broadcast result shape used to align operand axes.
+fn broadcast_sharding(
+    lhs_shape: &Shape,
+    lhs_sharding: Option<&Sharding>,
+    rhs_shape: &Shape,
+    rhs_sharding: Option<&Sharding>,
+    broadcasted_shape: &Shape,
+) -> Result<Option<Sharding>, BroadcastingError> {
+    let mesh = match (lhs_sharding, rhs_sharding) {
+        (None, None) => {
+            return Ok(None);
+        }
+        (Some(left), None) => left.mesh.clone(),
+        (None, Some(right)) => right.mesh.clone(),
+        (Some(left), Some(right)) if left.mesh == right.mesh => left.mesh.clone(),
+        (Some(left), Some(right)) => {
+            return Err(BroadcastingError::IncompatibleShardings { lhs: Some(left.clone()), rhs: Some(right.clone()) });
+        }
+    };
+
+    let result_rank = broadcasted_shape.rank();
+    let lhs_offset = result_rank - lhs_shape.rank();
+    let rhs_offset = result_rank - rhs_shape.rank();
+    let lhs_dimensions = lhs_sharding.map(|sharding| {
+        let mut dimensions = vec![ShardingDimension::replicated(); lhs_offset];
+        dimensions.extend(sharding.dimensions.iter().cloned());
+        dimensions
+    });
+    let rhs_dimensions = rhs_sharding.map(|sharding| {
+        let mut dimensions = vec![ShardingDimension::replicated(); rhs_offset];
+        dimensions.extend(sharding.dimensions.iter().cloned());
+        dimensions
+    });
+    let mut broadcasted_dimensions = Vec::with_capacity(result_rank);
+    for i in 0..result_rank {
+        let lhs_size = if i < lhs_offset { Size::Static(1) } else { lhs_shape.dimensions[i - lhs_offset] };
+        let rhs_size = if i < rhs_offset { Size::Static(1) } else { rhs_shape.dimensions[i - rhs_offset] };
+        let lhs_dimension = lhs_dimensions
+            .as_ref()
+            .map(|dimensions| dimensions[i].clone())
+            .unwrap_or_else(ShardingDimension::replicated);
+        let rhs_dimension = rhs_dimensions
+            .as_ref()
+            .map(|dimensions| dimensions[i].clone())
+            .unwrap_or_else(ShardingDimension::replicated);
+        let lhs_dimension =
+            if matches!(lhs_size, Size::Static(1)) { ShardingDimension::replicated() } else { lhs_dimension };
+        let rhs_dimension =
+            if matches!(rhs_size, Size::Static(1)) { ShardingDimension::replicated() } else { rhs_dimension };
+        let dimension = match (&lhs_size, &rhs_size) {
+            (Size::Static(1), _) if rhs_size != Size::Static(1) => Some(rhs_dimension),
+            (_, Size::Static(1)) if lhs_size != Size::Static(1) => Some(lhs_dimension),
+            _ if lhs_dimension == rhs_dimension => Some(lhs_dimension),
+            _ if matches!(lhs_dimension, ShardingDimension::Replicated) => Some(rhs_dimension),
+            _ if matches!(rhs_dimension, ShardingDimension::Replicated) => Some(lhs_dimension),
+            _ => None,
+        }
+        .ok_or_else(|| BroadcastingError::IncompatibleShardings {
+            lhs: lhs_sharding.cloned(),
+            rhs: rhs_sharding.cloned(),
+        })?;
+        broadcasted_dimensions.push(dimension);
+    }
+
+    let mut used_axis_names = BTreeSet::new();
+    for dimension in &broadcasted_dimensions {
+        if let ShardingDimension::Sharded(axis_names) = dimension {
+            for axis_name in axis_names {
+                if !used_axis_names.insert(axis_name.clone()) {
+                    return Err(BroadcastingError::IncompatibleShardings {
+                        lhs: lhs_sharding.cloned(),
+                        rhs: rhs_sharding.cloned(),
+                    });
+                }
+            }
+        }
+    }
+
+    let unreduced_axes = match (lhs_sharding, rhs_sharding) {
+        (Some(left), Some(right)) => left.unreduced_axes.union(&right.unreduced_axes).cloned().collect(),
+        (Some(left), None) => left.unreduced_axes.clone(),
+        (None, Some(right)) => right.unreduced_axes.clone(),
+        (None, None) => BTreeSet::new(),
+    };
+    let reduced_manual_axes = match (lhs_sharding, rhs_sharding) {
+        (Some(left), Some(right)) => left.reduced_manual_axes.union(&right.reduced_manual_axes).cloned().collect(),
+        (Some(left), None) => left.reduced_manual_axes.clone(),
+        (None, Some(right)) => right.reduced_manual_axes.clone(),
+        (None, None) => BTreeSet::new(),
+    };
+    let varying_manual_axes = match (lhs_sharding, rhs_sharding) {
+        (Some(left), Some(right)) => left.varying_manual_axes.union(&right.varying_manual_axes).cloned().collect(),
+        (Some(left), None) => left.varying_manual_axes.clone(),
+        (None, Some(right)) => right.varying_manual_axes.clone(),
+        (None, None) => BTreeSet::new(),
+    };
+
+    Ok(Some(Sharding::new(mesh, broadcasted_dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes)?))
+}
+
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use ryft_macros::Parameterized;
 
     use crate::parameters::{Parameter, ParameterError};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::data_types::DataType::*;
     use crate::types::{Layout, Shape, StridedLayout, Tile, TileDimension, TiledLayout};
 
@@ -367,6 +510,234 @@ mod tests {
         assert!(t2.is_broadcastable_to(&t1));
         assert!(!t0.is_broadcastable_to(&t3));
     }
+
+    // TODO(eaplatanios): Review the commented out tests.
+    // #[test]
+    // fn test_array_type_broadcast_unions_varying_axes() {
+    //     let mesh = LogicalMesh::new(vec![
+    //         MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+    //         MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+    //     ])
+    //     .unwrap();
+    //     let left = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh.clone(),
+    //                 vec![ShardingDimension::sharded(["x"])],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 ["x"],
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+    //     let right = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh.clone(),
+    //                 vec![ShardingDimension::sharded(["x"])],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 ["y"],
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+
+    //     assert_eq!(
+    //         left.broadcast(&right).map(|output| output.sharding.unwrap().varying_manual_axes),
+    //         Ok(BTreeSet::from(["x".to_string(), "y".to_string()]))
+    //     );
+    // }
+
+    // #[test]
+    // fn test_array_type_broadcast_to_preserves_reduced_axes_from_source() {
+    //     let mesh = LogicalMesh::new(vec![
+    //         MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+    //         MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+    //     ])
+    //     .unwrap();
+    //     let source = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![1.into(), 8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh.clone(),
+    //                 vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+    //                 Vec::<&str>::new(),
+    //                 ["y"],
+    //                 Vec::<&str>::new(),
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+    //     let target = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![2.into(), 8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh,
+    //                 vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+
+    //     assert_eq!(
+    //         source.broadcast_to(&target).map(|output| output.sharding.unwrap().reduced_manual_axes),
+    //         Ok(BTreeSet::from(["y".to_string()]))
+    //     );
+    // }
+
+    // #[test]
+    // fn test_array_type_broadcast_promotes_lower_rank_sharding() {
+    //     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+    //     let source = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh.clone(),
+    //                 vec![ShardingDimension::sharded(["x"])],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+    //     let target = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]), None, None);
+
+    //     assert_eq!(
+    //         source.broadcast(&target).map(|output| output.sharding.unwrap().dimensions),
+    //         Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+    //     );
+    //     assert_eq!(
+    //         source.broadcast_to(&target).map(|output| output.sharding.unwrap().dimensions),
+    //         Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+    //     );
+    // }
+
+    // #[test]
+    // fn test_array_type_broadcast_composes_outer_product_shardings() {
+    //     let mesh = LogicalMesh::new(vec![
+    //         MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+    //         MeshAxis::new("y", 4, MeshAxisType::Explicit).unwrap(),
+    //     ])
+    //     .unwrap();
+    //     let left = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![4.into(), 1.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh.clone(),
+    //                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+    //     let right = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![1.into(), 8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh,
+    //                 vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+
+    //     assert_eq!(
+    //         left.broadcast(&right).map(|output| output.sharding.unwrap().dimensions),
+    //         Ok(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+    //     );
+    // }
+
+    // #[test]
+    // fn test_array_type_broadcast_rejects_duplicate_mesh_axis_use() {
+    //     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+    //     let left = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![4.into(), 1.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh.clone(),
+    //                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+    //     let right = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![1.into(), 8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh,
+    //                 vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+
+    //     assert!(matches!(left.broadcast(&right), Err(BroadcastingError::IncompatibleShardings { .. }),));
+    //     assert!(!left.is_broadcastable_to(&right));
+    // }
+
+    // #[test]
+    // fn test_array_type_is_broadcastable_to_allows_unsharded_source_for_sharded_target() {
+    //     let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+    //     let source = ArrayType::scalar(F32);
+    //     let target = ArrayType::new(
+    //         F32,
+    //         Shape::new(vec![8.into()]),
+    //         None,
+    //         Some(
+    //             Sharding::new(
+    //                 mesh,
+    //                 vec![ShardingDimension::sharded(["x"])],
+    //                 Vec::<&str>::new(),
+    //                 Vec::<&str>::new(),
+    //                 ["x"],
+    //             )
+    //             .unwrap(),
+    //         ),
+    //     );
+
+    //     assert!(source.is_broadcastable_to(&target));
+    //     assert_eq!(
+    //         source.broadcast_to(&target).map(|output| output.sharding.unwrap().dimensions),
+    //         Ok(vec![ShardingDimension::sharded(["x"])])
+    //     );
+    // }
 
     #[test]
     fn test_parameterized_array_type_broadcastable() {

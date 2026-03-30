@@ -178,6 +178,28 @@ impl Sharding {
         self.dimensions.len()
     }
 
+    /// Returns the names of the mesh axes that are implicitly or explicitly replicated by this [`Sharding`].
+    pub fn replicated_axes(&self) -> Vec<&str> {
+        let mut used_axes = HashSet::new();
+        for partition_dimension in &self.dimensions {
+            if let ShardingDimension::Sharded(axis_names) = partition_dimension {
+                used_axes.extend(axis_names.iter().map(String::as_str));
+            }
+        }
+        used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
+        used_axes.extend(self.reduced_manual_axes.iter().map(String::as_str));
+        self.mesh
+            .axes
+            .iter()
+            .filter_map(|axis| {
+                let axis_name = axis.name.as_str();
+                (matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
+                    && !used_axes.contains(axis_name))
+                .then_some(axis_name)
+            })
+            .collect()
+    }
+
     /// Renders a visualization of this sharding over a concrete device mesh.
     ///
     /// This ports the core behavior of JAX's
@@ -267,28 +289,6 @@ impl Sharding {
         let cell_height =
             if global_shape.len() == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
         Ok(render_visualization(cells.as_slice(), cell_width, cell_height, colored))
-    }
-
-    /// Returns the visible mesh axes that are implicitly replicated by this sharding.
-    pub fn replicated_axes(&self) -> Vec<&str> {
-        let mut used_axes = HashSet::new();
-        for partition_dimension in &self.dimensions {
-            if let ShardingDimension::Sharded(axis_names) = partition_dimension {
-                used_axes.extend(axis_names.iter().map(String::as_str));
-            }
-        }
-        used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
-        used_axes.extend(self.reduced_manual_axes.iter().map(String::as_str));
-        self.mesh
-            .axes
-            .iter()
-            .filter_map(|axis| {
-                let axis_name = axis.name.as_str();
-                (matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
-                    && !used_axes.contains(axis_name))
-                .then_some(axis_name)
-            })
-            .collect()
     }
 
     /// Projects this sharding into traced/type-level semantics by hiding `Auto` mesh axes.
