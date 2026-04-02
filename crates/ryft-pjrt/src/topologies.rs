@@ -132,6 +132,15 @@ impl Topology<'_> {
             .map_err(|error| error.clone())
     }
 
+    /// Returns a stable fingerprint for this [`Topology`]. Topologies with identical structure and device metadata
+    /// should return the same fingerprint.
+    pub fn fingerprint(&self) -> Result<u64, Error> {
+        use ffi::PJRT_TopologyDescription_Fingerprint_Args;
+        invoke_pjrt_api_error_fn!(self.api(), PJRT_TopologyDescription_Fingerprint, { topology = self.to_c_api() }, {
+            fingerprint
+        })
+    }
+
     /// Serializes this [`Topology`] to a Protobuf message.
     pub fn proto(&self) -> Result<TopologyProto, Error> {
         // It would be nice to be able to get this directly without having to go through [`Topology::serialize`] first,
@@ -500,6 +509,23 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_TopologyDescription_Attributes_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_TopologyDescription_Fingerprint_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub topology: *const PJRT_TopologyDescription,
+        pub fingerprint: u64,
+    }
+
+    impl PJRT_TopologyDescription_Fingerprint_Args {
+        pub fn new(topology: *mut PJRT_TopologyDescription) -> Self {
+            Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), topology, fingerprint: 0 }
+        }
+    }
+
+    pub type PJRT_TopologyDescription_Fingerprint =
+        unsafe extern "C" fn(args: *mut PJRT_TopologyDescription_Fingerprint_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_TopologyDescription_Destroy_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -597,6 +623,7 @@ mod tests {
                 assert!(topology.attributes().is_ok());
                 let platform_name = topology.platform_name().unwrap();
                 let attributes = topology.attributes().unwrap();
+                let fingerprint = topology.fingerprint();
                 let serialized_topology = topology.serialize().unwrap();
                 assert!(!serialized_topology.data().is_empty());
                 assert!(serialized_topology.proto().is_ok());
@@ -608,30 +635,37 @@ mod tests {
                     TestPlatform::Cpu => {
                         assert_eq!(platform_name, "cpu");
                         assert!(attributes.is_empty());
+                        assert!(matches!(fingerprint, Err(Error::Unimplemented { .. })));
                     }
                     TestPlatform::Cuda12 => {
                         assert_eq!(platform_name, "cuda");
                         assert!(!attributes.is_empty());
+                        assert!(fingerprint.is_ok());
                     }
                     TestPlatform::Cuda13 => {
                         assert_eq!(platform_name, "cuda");
                         assert!(!attributes.is_empty());
+                        assert!(fingerprint.is_ok());
                     }
                     TestPlatform::Rocm7 => {
                         assert_eq!(platform_name, "rocm");
                         assert!(!attributes.is_empty());
+                        assert!(fingerprint.is_ok());
                     }
                     TestPlatform::Tpu => {
                         assert_eq!(platform_name, "tpu");
                         assert!(!attributes.is_empty());
+                        assert!(fingerprint.is_ok());
                     }
                     TestPlatform::Neuron => {
                         assert_eq!(platform_name, "neuron");
                         assert!(!attributes.is_empty());
+                        assert!(fingerprint.is_ok());
                     }
                     TestPlatform::Metal => {
                         assert_eq!(platform_name, "METAL");
                         assert!(!attributes.is_empty());
+                        assert!(fingerprint.is_ok());
                     }
                 }
             }

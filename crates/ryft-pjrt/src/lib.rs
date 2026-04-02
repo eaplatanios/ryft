@@ -357,6 +357,9 @@ pub(crate) mod ffi {
         pub PJRT_LoadedExecutable_AddressableDeviceLogicalIds:
             Option<PJRT_LoadedExecutable_AddressableDeviceLogicalIds>,
         pub PJRT_Buffer_Bitcast: Option<PJRT_Buffer_Bitcast>,
+        pub PJRT_Error_ForEachPayload: Option<PJRT_Error_ForEachPayload>,
+        pub PJRT_TopologyDescription_Fingerprint: Option<PJRT_TopologyDescription_Fingerprint>,
+        pub PJRT_Executable_ParameterMemoryKinds: Option<PJRT_Executable_ParameterMemoryKinds>,
     }
 }
 
