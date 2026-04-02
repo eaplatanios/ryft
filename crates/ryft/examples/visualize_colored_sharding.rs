@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])?,
         (0..12).map(|device_id| MeshDevice::new(device_id, usize::from(device_id >= 6))).collect(),
     )?;
-    let sharding = Sharding::new(
+    let sharding = Sharding::new::<String, _, String, _, String, _>(
         mesh.logical_mesh.clone(),
         vec![ShardingDimension::sharded(["data"]), ShardingDimension::sharded(["model"])],
         vec![],
