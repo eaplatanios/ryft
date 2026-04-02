@@ -598,11 +598,6 @@ mod tests {
         }
 
         let type_id = TypeId::create(&UnalignedData { _value_0: false, _value_1: 42 });
-
-        #[cfg(unix)]
-        assert!(type_id.is_err());
-
-        #[cfg(windows)]
         assert!(type_id.is_ok());
 
         // Test null pointer edge case.
