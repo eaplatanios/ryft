@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 use prost::Message;
 
 use crate::{
-    Api, Client, Error, HasDefaultMemory, Memory, MemoryStatistics, Plugin, ProcessIndex, Value, hash_map_from_c_api,
-    invoke_pjrt_api_error_fn, slice_from_c_api, str_from_c_api,
+    Api, Client, Error, HasDefaultMemory, Memory, MemoryStatistics, NamedValue, Plugin, ProcessIndex, Value,
+    hash_map_from_c_api, invoke_pjrt_api_error_fn, slice_from_c_api, str_from_c_api,
 };
 
 /// Type alias used to represent [`Device`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
@@ -259,8 +259,25 @@ impl Device<'_> {
     /// [`Client::error_buffer`] for more information on buffer _poisoning_). Returns `true` if the execution was
     /// poisoned successfully and `false` if it had already finished executing.
     pub fn poison_execution(&self, launch_id: i32, error: Error) -> Result<bool, Error> {
+        self.poison_execution_with_payload(launch_id, error, &[] as &[NamedValue])
+    }
+
+    /// _Poisons_ the earliest execution on this [`Device`] with the provided launch ID if it is not finished
+    /// yet (i.e., sets the resulting [`Buffer`](crate::Buffer) to an error buffer; refer to the documentation of
+    /// [`Client::error_buffer`] for more information on buffer _poisoning_), passing the provided payload entries
+    /// through to the PJRT runtime together with the error.
+    pub fn poison_execution_with_payload<P: AsRef<[NamedValue]>>(
+        &self,
+        launch_id: i32,
+        error: Error,
+        payload: P,
+    ) -> Result<bool, Error> {
         use ffi::PJRT_Device_PoisonExecution_Args;
         let error_message = error.message();
+        let payload = payload.as_ref();
+        let payload = payload.iter().map(|payload| unsafe { payload.to_c_api() }).collect::<Vec<_>>();
+        let (payload, payload_size) =
+            if payload.is_empty() { (std::ptr::null(), 0) } else { (payload.as_ptr(), payload.len()) };
         invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Device_PoisonExecution,
@@ -270,6 +287,8 @@ impl Device<'_> {
                 error_code = error.code(),
                 error_message = error_message.as_ptr(),
                 error_message_size = error_message.count_bytes(),
+                payload = payload,
+                payload_size = payload_size,
             },
             { poisoned },
         )
@@ -966,6 +985,8 @@ pub(crate) mod ffi {
         pub error_message: *const std::ffi::c_char,
         pub error_message_size: usize,
         pub poisoned: bool,
+        pub payload: *const PJRT_NamedValue,
+        pub payload_size: usize,
     }
 
     impl PJRT_Device_PoisonExecution_Args {
@@ -975,6 +996,8 @@ pub(crate) mod ffi {
             error_code: PJRT_Error_Code,
             error_message: *const std::ffi::c_char,
             error_message_size: usize,
+            payload: *const PJRT_NamedValue,
+            payload_size: usize,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -985,6 +1008,8 @@ pub(crate) mod ffi {
                 error_message,
                 error_message_size,
                 poisoned: false,
+                payload,
+                payload_size,
             }
         }
     }
@@ -1153,7 +1178,8 @@ mod tests {
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{TestPlatform, test_cpu_client, test_for_each_platform};
     use crate::{
-        BufferType, Device, DeviceAssignment, DeviceDescription, Error, ExecutionDeviceInputs, ExecutionInput, Program,
+        BufferType, Device, DeviceAssignment, DeviceDescription, Error, ExecutionDeviceInputs, ExecutionInput,
+        NamedValue, Program,
     };
 
     #[test]
@@ -1307,7 +1333,11 @@ mod tests {
         let output = outputs.remove(0);
 
         // Finally, poison the program execution.
-        assert_eq!(device.poison_execution(launch_id as i32, Error::aborted("test poison error")), Ok(true));
+        let payload = [NamedValue::new("launch_id", launch_id as i64), NamedValue::new("reason", "unit-test")];
+        assert_eq!(
+            device.poison_execution_with_payload(launch_id as i32, Error::aborted("test poison error"), &payload),
+            Ok(true),
+        );
         assert!(matches!(
             output.done.r#await(),
             Err(Error::Aborted { message, .. }) if message == "test poison error",
