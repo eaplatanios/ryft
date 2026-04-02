@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `88dfac847f3087ac1c08463f52c60ec2f19b27c7`.
+- Upgraded the OpenXLA dependency pin to commit `6e9c133d38ff253a4627ad62fbed0af677a067f3`.
+- Synchronized the mirrored protobuf definitions with the upstream PJRT and StreamExecutor schema changes.
 
 ## [0.0.2] - 2026-03-02
 
