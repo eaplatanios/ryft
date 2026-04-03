@@ -6,7 +6,9 @@ use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::str::Chars;
 
-use crate::{Api, Client, Device, Error, Event, HasDefaultMemory, Memory, invoke_pjrt_api_error_fn, slice_from_c_api};
+use crate::{
+    Api, Client, Device, Error, Event, HasDefaultMemory, Memory, NamedValue, invoke_pjrt_api_error_fn, slice_from_c_api,
+};
 
 /// Type of the data stored in a [`Buffer`]. Specifically, this represents
 /// the type of individual values that are stored in [`Buffer`]s.
@@ -2339,9 +2341,35 @@ impl<'s> Client<'s> {
         specification: BufferSpecification<D>,
         memory: M,
     ) -> Result<Buffer<'_>, Error> {
+        self.error_buffer_with_payload(error, specification, memory, std::iter::empty::<(&str, &str)>())
+    }
+
+    /// Creates a new _poisoned_ [`Buffer`] that represents an error state, similar to [`Self::error_buffer`],
+    /// but with the resulting buffer carrying payload metadata. The provided payload is an iterator of string
+    /// `(name, value)` pairs that is forwarded to the PJRT runtime together with the poisoned buffer so that
+    /// backends can attach structured error information to the failure.
+    pub fn error_buffer_with_payload<D: AsRef<[u64]>, M: HasDefaultMemory, P, K, V>(
+        &'_ self,
+        error: Error,
+        specification: BufferSpecification<D>,
+        memory: M,
+        payload: P,
+    ) -> Result<Buffer<'_>, Error>
+    where
+        P: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
         use ffi::PJRT_Client_CreateErrorBuffer_Args;
         let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
         let error_message = error.message();
+        let payload = payload
+            .into_iter()
+            .map(|(name, value)| NamedValue::new(name.as_ref(), value.as_ref()))
+            .collect::<Vec<_>>();
+        let payload = payload.iter().map(|payload| unsafe { payload.to_c_api() }).collect::<Vec<_>>();
+        let (payload, payload_size) =
+            if payload.is_empty() { (std::ptr::null(), 0) } else { (payload.as_ptr(), payload.len()) };
         invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Client_CreateErrorBuffer,
@@ -2355,6 +2383,8 @@ impl<'s> Client<'s> {
                 shape_element_type = specification.element_type.to_c_api(),
                 shape_layout = layout.map(|layout| &layout as *const _ as *mut _).unwrap_or(std::ptr::null_mut()),
                 memory = memory.default_memory().to_c_api(),
+                payload = payload,
+                payload_size = payload_size,
             },
             { buffer },
         )
@@ -2525,6 +2555,7 @@ pub(crate) mod ffi {
     use crate::events::ffi::PJRT_Event;
     use crate::ffi::PJRT_Extension_Base;
     use crate::memories::ffi::PJRT_Memory;
+    use crate::values::ffi::PJRT_NamedValue;
 
     // We represent opaque C types as structs with a particular structure that is following the convention
     // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
@@ -3394,6 +3425,8 @@ pub(crate) mod ffi {
         pub shape_layout: *mut PJRT_Buffer_MemoryLayout,
         pub memory: *mut PJRT_Memory,
         pub buffer: *mut PJRT_Buffer,
+        pub payload: *const PJRT_NamedValue,
+        pub payload_size: usize,
     }
 
     impl PJRT_Client_CreateErrorBuffer_Args {
@@ -3408,6 +3441,8 @@ pub(crate) mod ffi {
             shape_element_type: PJRT_Buffer_Type,
             shape_layout: *mut PJRT_Buffer_MemoryLayout,
             memory: *mut PJRT_Memory,
+            payload: *const PJRT_NamedValue,
+            payload_size: usize,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -3422,6 +3457,8 @@ pub(crate) mod ffi {
                 shape_layout,
                 memory,
                 buffer: std::ptr::null_mut(),
+                payload,
+                payload_size,
             }
         }
     }
@@ -3552,6 +3589,7 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     use crate::tests::{TestPlatform, test_cpu_client, test_for_each_platform};
@@ -4198,11 +4236,24 @@ mod tests {
         let device = client.addressable_devices().unwrap()[0].clone();
         let error = Error::aborted("test error");
         let specification = BufferSpecification { element_type: BufferType::U8, dimensions: [4u64], layout: None };
-        let buffer = client.error_buffer(error.clone(), specification, device).unwrap();
+
+        let buffer = client.error_buffer(error.clone(), specification.clone(), device.clone()).unwrap();
         assert!(matches!(
             buffer.ready().unwrap().r#await(),
             Err(Error::Aborted { message, .. }) if message.contains("test error"),
         ));
+
+        let payload = HashMap::from([("launch_id", "17"), ("reason", "unit-test")]);
+        let buffer = client.error_buffer_with_payload(error, specification, device, &payload).unwrap();
+        let error = buffer.ready().unwrap().r#await().unwrap_err();
+        assert!(matches!(&error, Error::Aborted { message, .. } if message.contains("test error")));
+        assert_eq!(error.payload("launch_id"), Some("17"));
+        assert_eq!(error.payload("reason"), Some("unit-test"));
+        assert_eq!(error.payload("missing"), None);
+        assert_eq!(
+            error.payloads().iter().map(|(name, value)| (name.as_str(), value.as_str())).collect::<HashMap<_, _>>(),
+            HashMap::from([("launch_id", "17"), ("reason", "unit-test")]),
+        );
     }
 
     #[test]

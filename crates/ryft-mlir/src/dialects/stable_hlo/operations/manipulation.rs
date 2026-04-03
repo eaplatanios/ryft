@@ -1808,7 +1808,7 @@ pub const SELECT_AND_SCATTER_WINDOW_STRIDES_ATTRIBUTE: &str = "window_strides";
 ///   window_strides = array<i64: 2, 1>
 /// }> ({
 ///   ^bb0(%arg0: tensor<i64>, %arg1: tensor<i64>):
-///     %0 = stablehlo.compare  GE, %arg0, %arg1 : (tensor<i64>, tensor<i64>) -> tensor<i1>
+///     %0 = stablehlo.compare GE, %arg0, %arg1 : (tensor<i64>, tensor<i64>) -> tensor<i1>
 ///     stablehlo.return %0 : tensor<i1>
 /// }, {
 ///   ^bb0(%arg0: tensor<i64>, %arg1: tensor<i64>):
@@ -3035,7 +3035,7 @@ mod tests {
                       window_strides = array<i64: 2, 3>\
                     }> ({
                     ^bb0(%arg3: tensor<i32>, %arg4: tensor<i32>):
-                      %1 = stablehlo.compare  GE, %arg3, %arg4,  SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                      %1 = stablehlo.compare GE, %arg3, %arg4, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
                       stablehlo.return %1 : tensor<i1>
                     }, {
                     ^bb0(%arg3: tensor<i32>, %arg4: tensor<i32>):

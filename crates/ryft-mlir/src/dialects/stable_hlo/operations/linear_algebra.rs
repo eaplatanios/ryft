@@ -1796,7 +1796,7 @@ pub const FFT_LENGTH_ATTRIBUTE: &str = "fft_length";
 ///
 /// ```mlir
 /// // %operand: [(1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
-/// %result = stablehlo.fft %operand, type =  FFT, length = [4] : (tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>>
+/// %result = stablehlo.fft %operand, type = FFT, length = [4] : (tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>>
 /// // %result: [(1.0, 0.0), (1.0, 0.0), (1.0, 0.0), (1.0, 0.0)]
 /// ```
 ///
@@ -2725,10 +2725,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @fft_test(%arg0: tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>> {
-                    %0 = stablehlo.fft %arg0, \
-                      type =  FFT, \
-                      length = [4] \
-                    : (tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>>
+                    %0 = stablehlo.fft %arg0, type = FFT, length = [4] \
+                      : (tensor<4xcomplex<f32>>) -> tensor<4xcomplex<f32>>
                     return %0 : tensor<4xcomplex<f32>>
                   }
                 }

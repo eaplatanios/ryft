@@ -4208,8 +4208,8 @@ unsafe extern "C" {
     pub fn mlirSymbolRefAttrGetTypeID() -> MlirTypeID;
 }
 unsafe extern "C" {
-    #[doc = " Creates a DisctinctAttr with the referenced attribute."]
-    pub fn mlirDisctinctAttrCreate(referencedAttr: MlirAttribute) -> MlirAttribute;
+    #[doc = " Creates a DistinctAttr with the referenced attribute."]
+    pub fn mlirDistinctAttrCreate(referencedAttr: MlirAttribute) -> MlirAttribute;
 }
 unsafe extern "C" {
     #[doc = " Checks whether the given attribute is a flat symbol reference attribute."]

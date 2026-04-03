@@ -61,7 +61,7 @@ pub const RNG_DISTRIBUTION_ATTRIBUTE: &str = "rng_distribution";
 /// // %a = 0
 /// // %b = 2
 /// // %shape = [3, 3]
-/// %result = stablehlo.rng %a, %b, %shape, distribution =  UNIFORM
+/// %result = stablehlo.rng %a, %b, %shape, distribution = UNIFORM
 ///   : (tensor<i32>, tensor<i32>, tensor<2xi64>) -> tensor<3x3xi32>
 /// // %result: [[1, 0, 1], [1, 1, 1], [0, 0, 0]]
 /// ```
@@ -149,7 +149,7 @@ pub const RNG_ALGORITHM_ATTRIBUTE: &str = "rng_algorithm";
 /// [`Display`](std::fmt::Display) rendering:
 ///
 /// ```mlir
-/// %output_state, %output = stablehlo.rng_bit_generator %initial_state, algorithm =  THREE_FRY
+/// %output_state, %output = stablehlo.rng_bit_generator %initial_state, algorithm = THREE_FRY
 ///   : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xui32>)
 /// ```
 ///
@@ -335,7 +335,7 @@ mod tests {
                     %arg1: tensor<f32>, \
                     %arg2: tensor<2xi64>\
                   ) -> tensor<?x?xf32> {
-                    %0 = stablehlo.rng %arg0, %arg1, %arg2, distribution =  UNIFORM \
+                    %0 = stablehlo.rng %arg0, %arg1, %arg2, distribution = UNIFORM \
                       : (tensor<f32>, tensor<f32>, tensor<2xi64>) -> tensor<?x?xf32>
                     return %0 : tensor<?x?xf32>
                   }
@@ -382,7 +382,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @rng_bit_generator_test(%arg0: tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xui32>) {
-                    %output_state, %output = stablehlo.rng_bit_generator %arg0, algorithm =  THREE_FRY \
+                    %output_state, %output = stablehlo.rng_bit_generator %arg0, algorithm = THREE_FRY \
                       : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xui32>)
                     return %output_state, %output : tensor<2xui64>, tensor<2x3xui32>
                   }

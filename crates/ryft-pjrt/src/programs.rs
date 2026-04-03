@@ -124,6 +124,25 @@ impl Executable {
         })
     }
 
+    /// Returns the [`Memory`](crate::Memory) kind of each input/parameter of this [`Executable`].
+    pub fn input_memory_kinds(&self) -> Result<Vec<Cow<'_, str>>, Error> {
+        use ffi::PJRT_Executable_ParameterMemoryKinds_Args;
+        invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_Executable_ParameterMemoryKinds,
+            { executable = self.to_c_api() },
+            { num_parameters, memory_kinds, memory_kind_sizes },
+        )
+        .map(|(parameter_count, memory_kinds, memory_kind_sizes)| unsafe {
+            let memory_kind_sizes = slice_from_c_api(memory_kind_sizes, parameter_count);
+            let mut input_memory_kinds = Vec::with_capacity(parameter_count);
+            for (index, memory_kind_size) in memory_kind_sizes.iter().enumerate() {
+                input_memory_kinds.push(str_from_c_api(*(memory_kinds.add(index)), *memory_kind_size));
+            }
+            input_memory_kinds
+        })
+    }
+
     /// Returns the number of outputs of this [`Executable`] per [`Device`].
     pub fn output_count(&self) -> Result<usize, Error> {
         use ffi::PJRT_Executable_NumOutputs_Args;
@@ -1565,6 +1584,32 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_Executable_NumPartitions_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_Executable_ParameterMemoryKinds_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub executable: *mut PJRT_Executable,
+        pub num_parameters: usize,
+        pub memory_kinds: *const *const std::ffi::c_char,
+        pub memory_kind_sizes: *const usize,
+    }
+
+    impl PJRT_Executable_ParameterMemoryKinds_Args {
+        pub fn new(executable: *mut PJRT_Executable) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                executable,
+                num_parameters: 0,
+                memory_kinds: std::ptr::null(),
+                memory_kind_sizes: std::ptr::null(),
+            }
+        }
+    }
+
+    pub type PJRT_Executable_ParameterMemoryKinds =
+        unsafe extern "C" fn(args: *mut PJRT_Executable_ParameterMemoryKinds_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_Executable_NumOutputs_Args {
         pub struct_size: usize,
         pub extension_start: *mut PJRT_Extension_Base,
@@ -2523,15 +2568,19 @@ mod tests {
             assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
             assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
 
-            // The CPU plugin does not implement `output_memory_kinds` and `generated_code_size_in_bytes`.
+            // The CPU plugin does not implement `input_memory_kinds`, `output_memory_kinds`,
+            // and `generated_code_size_in_bytes`.
+            let input_memory_kinds = executable.input_memory_kinds();
             let output_memory_kinds = executable.output_memory_kinds();
             match platform {
                 TestPlatform::Cpu => {
-                    assert!(matches!(executable.output_memory_kinds(), Err(Error::Unimplemented { .. })));
+                    assert!(matches!(input_memory_kinds, Err(Error::Unimplemented { .. })));
+                    assert!(matches!(output_memory_kinds, Err(Error::Unimplemented { .. })));
                     assert!(matches!(executable.generated_code_size_in_bytes(), Err(Error::Unavailable { .. })));
                     assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
                 }
                 _ => {
+                    assert_eq!(input_memory_kinds.unwrap(), vec!["device"]);
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
                     assert!(executable.generated_code_size_in_bytes().is_ok());
                     assert!(executable.cost_analysis().is_ok());

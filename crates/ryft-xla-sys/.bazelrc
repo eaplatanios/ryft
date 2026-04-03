@@ -45,6 +45,7 @@ build:linux --define=tensorflow_mkldnn_contraction_kernel=1
 # MacOS Configuration
 build:macos --config=posix
 build:macos --apple_platform_type=macos
+build:macos --macos_minimum_os=11.0
 # build:macos --macos_sdk_version=15.5
 # build:macos --xcode_version=16.4
 build:macos --apple_crosstool_top=@local_config_apple_cc//:toolchain
@@ -116,13 +117,14 @@ build:rocm --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
 build:rocm --dynamic_mode=off
 build:rocm --repo_env="OS=ubuntu_22.04"
 build:rocm --action_env TF_ROCM_AMDGPU_TARGETS="gfx900,gfx906,gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1200,gfx1201"
-build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain
+build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain-local
 # build:rocm --define=using_rocm=true
 build:rocm --define=using_rocm_hipcc=true
 build:rocm --define=tensorflow_mkldnn_contraction_kernel=0
 # build:rocm --define=xnn_enable_avxvnniint8=false
 # build:rocm --define=xnn_enable_avx512fp16=false
 build:rocm --repo_env=TF_NEED_ROCM=1
+build:rocm --action_env=HIPCC_COMPILE_FLAGS_APPEND="--offload-compress"
 build:rocm --action_env=CLANG_COMPILER_PATH="/usr/lib/llvm-18/bin/clang"
 build:rocm --action_env=TF_ROCM_CLANG="1"
 # build:rocm --action_env=TF_HIPCC_CLANG="1"

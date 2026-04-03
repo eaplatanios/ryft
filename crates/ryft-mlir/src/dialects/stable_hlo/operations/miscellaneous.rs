@@ -241,7 +241,7 @@ pub const SORT_IS_STABLE_ATTRIBUTE: &str = "is_stable";
 /// // %input1 = [[3, 2, 1], [1, 2, 3]]
 /// %result0, %result1 = "stablehlo.sort"(%input0, %input1) <{dimension = 0 : i64, is_stable = true}> ({
 /// ^bb0(%input2: tensor<i64>, %input3: tensor<i64>, %input4: tensor<i64>, %input5: tensor<i64>):
-///   %1 = stablehlo.compare  GT, %input2, %input3,  SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+///   %1 = stablehlo.compare GT, %input2, %input3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
 ///   stablehlo.return %1 : tensor<i1>
 /// }) : (tensor<2x3xi64>, tensor<2x3xi64>) -> (tensor<2x3xi64>, tensor<2x3xi64>)
 /// // %result0 = [[3, 2, 3], [1, 2, 1]]
@@ -1280,7 +1280,7 @@ mod tests {
                   func.func @sort_test(%arg0: tensor<2x2xi64>, %arg1: tensor<2x2xi64>) -> (tensor<2x2xi64>, tensor<2x2xi64>) {
                     %0:2 = \"stablehlo.sort\"(%arg0, %arg1) <{dimension = 1 : i64, is_stable = true}> ({
                     ^bb0(%arg2: tensor<i64>, %arg3: tensor<i64>, %arg4: tensor<i64>, %arg5: tensor<i64>):
-                      %1 = stablehlo.compare  GT, %arg2, %arg3,  SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %1 = stablehlo.compare GT, %arg2, %arg3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
                       stablehlo.return %1 : tensor<i1>
                     }) : (tensor<2x2xi64>, tensor<2x2xi64>) -> (tensor<2x2xi64>, tensor<2x2xi64>)
                     return %0#0, %0#1 : tensor<2x2xi64>, tensor<2x2xi64>
