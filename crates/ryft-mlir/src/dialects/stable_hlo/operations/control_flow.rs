@@ -163,7 +163,7 @@ pub fn r#if<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 /// %result_i, %result_sum = stablehlo.while(%arg0 = %initial_i, %arg1 = %initial_sum) : tensor<i64>, tensor<i64>
 /// cond {
 ///   %c = stablehlo.constant dense<10> : tensor<i64>
-///   %1 = stablehlo.compare  LT, %arg0, %c,  SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+///   %1 = stablehlo.compare LT, %arg0, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
 ///   stablehlo.return %1 : tensor<i1>
 /// } do {
 ///   %c = stablehlo.constant dense<1> : tensor<i64>
@@ -531,7 +531,7 @@ mod tests {
                     %0:2 = stablehlo.while(%iterArg = %arg0, %iterArg_0 = %arg1) : tensor<i64>, tensor<i64>
                     cond {
                       %c = stablehlo.constant dense<10> : tensor<i64>
-                      %1 = stablehlo.compare  LT, %iterArg, %c,  SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      %1 = stablehlo.compare LT, %iterArg, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
                       stablehlo.return %1 : tensor<i1>
                     } do {
                       %c = stablehlo.constant dense<1> : tensor<i64>

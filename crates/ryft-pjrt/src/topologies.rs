@@ -635,7 +635,7 @@ mod tests {
                     TestPlatform::Cpu => {
                         assert_eq!(platform_name, "cpu");
                         assert!(attributes.is_empty());
-                        assert!(matches!(fingerprint, Err(Error::Unimplemented { .. })));
+                        assert!(fingerprint.is_ok());
                     }
                     TestPlatform::Cuda12 => {
                         assert_eq!(platform_name, "cuda");

@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Upgraded the OpenXLA dependency pin to commit `6e9c133d38ff253a4627ad62fbed0af677a067f3`.
 - Synchronized the mirrored protobuf definitions with the upstream PJRT and StreamExecutor schema changes.
+- Pinned macOS Bazel artifacts to a macOS `11.0` deployment target so the published static library remains linkable
+  from Rust consumers that target the workspace baseline.
 
 ## [0.0.2] - 2026-03-02
 
