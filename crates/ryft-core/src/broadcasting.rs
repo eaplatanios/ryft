@@ -286,9 +286,7 @@ impl<T: Parameterized<ArrayType, ParameterStructure: Clone>> Broadcastable for T
         broadcasted_self.parameters().zip(other.parameters()).all(|(lhs, rhs)| {
             lhs.data_type.is_broadcastable_to(&rhs.data_type)
                 && lhs.shape.is_broadcastable_to(&rhs.shape)
-                // TODO(eaplatanios): Is it worth adding a more efficient implementation for this?
-                && broadcast_sharding(&lhs.shape, lhs.sharding.as_ref(), &rhs.shape, rhs.sharding.as_ref(), &rhs.shape)
-                    .is_ok()
+                && is_sharding_broadcastable_to(&lhs.shape, lhs.sharding.as_ref(), &rhs.shape, rhs.sharding.as_ref())
         })
     }
 }
@@ -346,47 +344,20 @@ fn broadcast_sharding(
     let result_rank = broadcasted_shape.rank();
     let lhs_offset = result_rank - lhs_shape.rank();
     let rhs_offset = result_rank - rhs_shape.rank();
-    let lhs_dimensions = lhs_sharding.map(|sharding| {
-        let mut dimensions = vec![ShardingDimension::replicated(); lhs_offset];
-        dimensions.extend(sharding.dimensions.iter().cloned());
-        dimensions
-    });
-    let rhs_dimensions = rhs_sharding.map(|sharding| {
-        let mut dimensions = vec![ShardingDimension::replicated(); rhs_offset];
-        dimensions.extend(sharding.dimensions.iter().cloned());
-        dimensions
-    });
-
-    let mut broadcasted_dimensions = Vec::with_capacity(result_rank);
-    for i in 0..result_rank {
-        let lhs_size = if i < lhs_offset { Size::Static(1) } else { lhs_shape.dimensions[i - lhs_offset] };
-        let rhs_size = if i < rhs_offset { Size::Static(1) } else { rhs_shape.dimensions[i - rhs_offset] };
-        let lhs_dimension = lhs_dimensions
-            .as_ref()
-            .map(|dimensions| dimensions[i].clone())
-            .unwrap_or_else(ShardingDimension::replicated);
-        let rhs_dimension = rhs_dimensions
-            .as_ref()
-            .map(|dimensions| dimensions[i].clone())
-            .unwrap_or_else(ShardingDimension::replicated);
-        let dimension = match (lhs_dimension, rhs_dimension) {
-            (lhs_dimension, rhs_dimension) if lhs_dimension == rhs_dimension => lhs_dimension,
-            (ShardingDimension::Replicated, rhs_dimension) if matches!(lhs_size, Size::Static(1)) => rhs_dimension,
-            (lhs_dimension, ShardingDimension::Replicated) if matches!(rhs_size, Size::Static(1)) => lhs_dimension,
-            (ShardingDimension::Replicated, rhs_dimension) => rhs_dimension,
-            (lhs_dimension, ShardingDimension::Replicated) => lhs_dimension,
-            _ => {
-                return Err(BroadcastingError::IncompatibleShardings {
-                    lhs: lhs_sharding.cloned(),
-                    rhs: rhs_sharding.cloned(),
-                });
-            }
-        };
-        broadcasted_dimensions.push(dimension);
-    }
 
     let mut used_axes = BTreeSet::new();
-    for dimension in &broadcasted_dimensions {
+    let mut broadcasted_dimensions = Vec::with_capacity(result_rank);
+    for index in 0..result_rank {
+        let lhs_size = if index < lhs_offset { Size::Static(1) } else { lhs_shape.dimensions[index - lhs_offset] };
+        let rhs_size = if index < rhs_offset { Size::Static(1) } else { rhs_shape.dimensions[index - rhs_offset] };
+        let lhs_dimension = padded_sharding_dimension(lhs_sharding, lhs_offset, index);
+        let rhs_dimension = padded_sharding_dimension(rhs_sharding, rhs_offset, index);
+        let Some(dimension) = broadcast_sharding_dimension(lhs_size, lhs_dimension, rhs_size, rhs_dimension) else {
+            return Err(BroadcastingError::IncompatibleShardings {
+                lhs: lhs_sharding.cloned(),
+                rhs: rhs_sharding.cloned(),
+            });
+        };
         if let ShardingDimension::Sharded(axis_names) = dimension {
             for axis_name in axis_names {
                 if !used_axes.insert(axis_name.clone()) {
@@ -397,6 +368,7 @@ fn broadcast_sharding(
                 }
             }
         }
+        broadcasted_dimensions.push(dimension.clone());
     }
 
     let unreduced_axes = match (lhs_sharding, rhs_sharding) {
@@ -443,6 +415,78 @@ fn broadcast_sharding(
     };
 
     Ok(Some(Sharding::new(mesh, broadcasted_dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes)?))
+}
+
+/// Returns `true` if the provided [`Sharding`]s are broadcastable, according to the rules of [`broadcast_sharding`].
+fn is_sharding_broadcastable_to(
+    lhs_shape: &Shape,
+    lhs_sharding: Option<&Sharding>,
+    rhs_shape: &Shape,
+    rhs_sharding: Option<&Sharding>,
+) -> bool {
+    match (lhs_sharding, rhs_sharding) {
+        (None, None) => return true,
+        (Some(left), Some(right)) if left.mesh != right.mesh => return false,
+        _ => {}
+    }
+
+    let result_rank = rhs_shape.rank();
+    let lhs_offset = result_rank - lhs_shape.rank();
+    let rhs_offset = result_rank - rhs_shape.rank();
+    let mut used_axes = BTreeSet::new();
+    for index in 0..result_rank {
+        let lhs_size = if index < lhs_offset { Size::Static(1) } else { lhs_shape.dimensions[index - lhs_offset] };
+        let rhs_size = if index < rhs_offset { Size::Static(1) } else { rhs_shape.dimensions[index - rhs_offset] };
+        let lhs_dimension = padded_sharding_dimension(lhs_sharding, lhs_offset, index);
+        let rhs_dimension = padded_sharding_dimension(rhs_sharding, rhs_offset, index);
+        let Some(dimension) = broadcast_sharding_dimension(lhs_size, lhs_dimension, rhs_size, rhs_dimension) else {
+            return false;
+        };
+        if let ShardingDimension::Sharded(axis_names) = dimension {
+            for axis_name in axis_names {
+                if !used_axes.insert(axis_name.as_str()) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    match (lhs_sharding, rhs_sharding) {
+        (Some(left), Some(right)) => {
+            left.unreduced_axes == right.unreduced_axes
+                && left.reduced_manual_axes == right.reduced_manual_axes
+                && left.varying_manual_axes == right.varying_manual_axes
+        }
+        _ => true,
+    }
+}
+
+/// Returns the [`ShardingDimension`] visible at `index` after left-padding lower-rank shardings
+/// with [`ShardingDimension::Replicated`] axes.
+#[inline]
+fn padded_sharding_dimension(sharding: Option<&Sharding>, offset: usize, index: usize) -> &ShardingDimension {
+    (index < offset)
+        .then_some(&ShardingDimension::Replicated)
+        .or_else(|| sharding.map(|sharding| &sharding.dimensions[index - offset]))
+        .unwrap_or(&ShardingDimension::Replicated)
+}
+
+/// Combines two aligned [`ShardingDimension`]s using the rules described in [`broadcast_sharding`].
+#[inline]
+fn broadcast_sharding_dimension<'d>(
+    lhs_size: Size,
+    lhs_dimension: &'d ShardingDimension,
+    rhs_size: Size,
+    rhs_dimension: &'d ShardingDimension,
+) -> Option<&'d ShardingDimension> {
+    match (lhs_dimension, rhs_dimension) {
+        (lhs_dimension, rhs_dimension) if lhs_dimension == rhs_dimension => Some(lhs_dimension),
+        (ShardingDimension::Replicated, rhs_dimension) if matches!(lhs_size, Size::Static(1)) => Some(rhs_dimension),
+        (lhs_dimension, ShardingDimension::Replicated) if matches!(rhs_size, Size::Static(1)) => Some(lhs_dimension),
+        (ShardingDimension::Replicated, rhs_dimension) => Some(rhs_dimension),
+        (lhs_dimension, ShardingDimension::Replicated) => Some(lhs_dimension),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -701,10 +745,13 @@ mod tests {
         assert!(t2.is_broadcastable_to(&t1));
         assert!(!t0.is_broadcastable_to(&t3));
         assert!(t2.is_broadcastable_to(&t14));
+        assert!(t11.is_broadcastable_to(&t12));
+        assert!(t15.is_broadcastable_to(&t16));
+        assert!(t21.is_broadcastable_to(&t23));
         assert!(!t8.is_broadcastable_to(&t10));
         assert!(!t11.is_broadcastable_to(&t13));
         assert!(!t17.is_broadcastable_to(&t18));
-        
+
         // Test `broadcast_sharding` with mismatched ranks.
         let source_shape = Shape::new(vec![4.into(), 8.into()]);
         let target_shape = Shape::new(vec![4.into(), 8.into()]);
