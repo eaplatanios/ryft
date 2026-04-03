@@ -72,6 +72,8 @@ update this file so that they do not need to remind you again in the future.
   explicitly asks for them. Default to updating all in-repo use sites to the new canonical path.
 - For enums with straightforward tuple or unit variants, prefer using the variants directly instead of adding
   redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
+- For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
+  call site instead of extracting a helper that adds indirection without meaningful reuse.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
@@ -157,6 +159,8 @@ update this file so that they do not need to remind you again in the future.
 - Whenever possible, use existing helper macros instead of duplicating FFI boilerplate like:
   - `ryft-mlir`: `mlir_subtype_trait_impls!`, `mlir_op!`, `mlir_op_trait!`, `mlir_*_op!`, `mlir_pass!`, etc.
   - `ryft-pjrt`: `invoke_pjrt_api_void_fn!`, `invoke_pjrt_api_error_fn!`, `invoke_distributed_api_error_fn!`, etc.
+- When upgrading PJRT or XLA FFI structs, update both the raw `ffi` argument structs and every corresponding safe
+  Rust wrapper, convenience method, and test in the same change; do not stop at the FFI layer after adding new fields.
 
 ## Documentation Style
 
@@ -292,6 +296,12 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - Keep the Rust and C++ distributed-runtime bridge structs and signatures synchronized.
 - Keep the Rust proto message types in `crates/ryft-xla-sys/src/protos.rs` synchronized with the corresponding `.proto`
   files in the OpenXLA repository, whenever upgrading our XLA dependency.
+- After publishing or rebuilding `ryft-xla-sys` artifacts, always validate at least one downstream consumer link on
+  each affected platform against the published binary so deployment-target mismatches and stale exported-symbol names
+  are caught before handoff.
+- For OpenXLA / PJRT / MLIR upgrade work, do not stop at smoke tests once core crate code has changed; run the full
+  affected crate `--lib` unit suites so runtime-attribute drift, printer-format churn, and environment-sensitive test
+  assumptions are caught before handoff.
 
 ## Convention References / Examples
 

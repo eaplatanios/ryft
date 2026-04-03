@@ -990,6 +990,9 @@ pub enum CommandBufferSchedulingMode {
 
     /// Use the latency-hiding scheduler strategy to overlap independent operations.
     LatencyHidingScheduler = 2,
+
+    /// Allow concurrent execution within latency-bound command-buffer regions.
+    ConcurrentRegions = 3,
 }
 
 /// Controls how runtime verification checks behave when issues are detected. This enum is used by various detection
@@ -1409,6 +1412,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "240")]
     pub xla_gpu_collect_cost_model_stats: Option<bool>,
 
+    /// Maximum number of instructions that collective combiner passes may merge into one collective.
+    #[prost(int64, optional, tag = "461")]
+    pub xla_gpu_collective_combine_threshold_count: Option<i64>,
+
     /// Factor by which to inflate collective operation costs by running each collective multiple times.
     #[prost(int32, optional, tag = "205")]
     pub xla_gpu_collective_inflation_factor: Option<i32>,
@@ -1519,6 +1526,10 @@ pub struct DebugOptions {
     #[prost(enumeration = "CommandBufferCommandType", repeated, tag = "258")]
     pub xla_gpu_enable_command_buffer: Vec<i32>,
 
+    /// If `true`, command buffer thunks will use fixed virtual addresses across executions.
+    #[prost(bool, optional, tag = "464")]
+    pub xla_gpu_enable_command_buffer_va_remapping: Option<bool>,
+
     /// If `true`, radix sort using CUB will be enabled.
     #[prost(bool, optional, tag = "259")]
     pub xla_gpu_enable_cub_radix_sort: Option<bool>,
@@ -1573,6 +1584,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "267")]
     pub xla_gpu_enable_nccl_user_buffers: Option<bool>,
 
+    /// If `true`, programmatic dependent launch (PDL) will be enabled on supported GPUs.
+    #[prost(bool, optional, tag = "460")]
+    pub xla_gpu_enable_pdl: Option<bool>,
+
     /// If `true`, pipelined all-gather operations will be enabled.
     #[prost(bool, optional, tag = "227")]
     pub xla_gpu_enable_pipelined_all_gather: Option<bool>,
@@ -1601,10 +1616,6 @@ pub struct DebugOptions {
     /// regardless of dimension.
     #[prost(bool, optional, tag = "257")]
     pub xla_gpu_enable_reduce_scatter_combine_by_dim: Option<bool>,
-
-    /// If `true`, reduction epilogue fusion will be enabled in fusion passes.
-    #[prost(bool, optional, tag = "243")]
-    pub xla_gpu_enable_reduction_epilogue_fusion: Option<bool>,
 
     /// If `true`, the scatter determinism expander will rewrite scatter operations to be deterministic.
     #[prost(bool, optional, tag = "345")]
@@ -1659,10 +1670,6 @@ pub struct DebugOptions {
     /// If `true`, an exhaustive tiling search will be performed.
     #[prost(bool, optional, tag = "219")]
     pub xla_gpu_exhaustive_tiling_search: Option<bool>,
-
-    /// If `true`, an unroll factor of 8 will be allowed on Blackwell architectures (guarded by heuristics).
-    #[prost(bool, optional, tag = "430")]
-    pub xla_gpu_experimental_allow_unroll_factor_eight: Option<bool>,
 
     /// If `true`, Ahead-of-Time (AOT) compilation flow will be enabled with generated thunks
     /// included in the compiled binary.
@@ -1739,6 +1746,10 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "388")]
     pub xla_gpu_experimental_enable_nvshmem: Option<bool>,
 
+    /// If `true`, OneHot patterns will be rewritten into Gather operations during GPU lowering.
+    #[prost(bool, optional, tag = "458")]
+    pub xla_gpu_experimental_enable_onehot_rewriter: Option<bool>,
+
     /// If `true`, GEMMs that underutilize the GPU will be split along the K dimension.
     #[prost(bool, optional, tag = "386")]
     pub xla_gpu_experimental_enable_split_k_rewrite: Option<bool>,
@@ -1755,9 +1766,17 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "421")]
     pub xla_gpu_experimental_enable_triton_warp_specialization: Option<bool>,
 
+    /// Maximum unroll factor to allow on Blackwell architectures.
+    #[prost(int32, optional, tag = "459")]
+    pub xla_gpu_experimental_max_unroll_factor: Option<i32>,
+
     /// If `true`, sub-byte dot operands will be laid out along the contracting (K) dimension.
     #[prost(bool, optional, tag = "362")]
     pub xla_gpu_experimental_pack_dot_operands_along_k_dimension: Option<bool>,
+
+    /// Maximum amount of async-compute overlap that the GPU runtime should try to exploit.
+    #[prost(int32, optional, tag = "465")]
+    pub xla_gpu_experimental_parallel_async_compute_limit: Option<i32>,
 
     /// Maximum number of in-flight collectives the latency hiding scheduler can schedule.
     #[prost(int32, optional, tag = "336")]
@@ -1778,6 +1797,10 @@ pub struct DebugOptions {
     /// If `true`, the ragged dot fusion emitter will be used rather than expanding to a regular dot.
     #[prost(bool, optional, tag = "401")]
     pub xla_gpu_experimental_use_ragged_dot_fusion: Option<bool>,
+
+    /// If `true`, grouped GEMM lowering for ragged dot will be enabled when available.
+    #[prost(bool, optional, tag = "501")]
+    pub xla_gpu_experimental_use_ragged_dot_grouped_gemm: Option<bool>,
 
     /// If `true`, PTX compilation will fail if a kernel spills registers.
     #[prost(bool, optional, tag = "353")]
@@ -2240,6 +2263,10 @@ pub struct DebugOptions {
     #[prost(int64, optional, tag = "293")]
     pub xla_reduce_window_rewrite_base_length: Option<i64>,
 
+    /// Reduction recognition optimization level.
+    #[prost(int32, optional, tag = "463")]
+    pub xla_recognize_reduction_optimization_level: Option<i32>,
+
     /// Size of the command buffer trace cache.
     #[prost(int64, optional, tag = "311")]
     pub xla_cmd_buffer_trace_cache_size: Option<i64>,
@@ -2251,10 +2278,6 @@ pub struct DebugOptions {
     /// If `true`, command buffers will be allowed to launch during profiling.
     #[prost(bool, optional, tag = "317")]
     pub xla_enable_command_buffers_during_profiling: Option<bool>,
-
-    /// If `true`, channel IDs will be ignored in collective operations.
-    #[prost(bool, optional, tag = "330")]
-    pub xla_ignore_channel_id: Option<bool>,
 
     /// If `true`, PJRT will be allowed to use automatic layout in HLO.
     #[prost(bool, optional, tag = "344")]
@@ -2275,6 +2298,10 @@ pub struct DebugOptions {
     /// If `true`, the `IsTritonSupportedInstruction` check for scaled dot operations will be ignored.
     #[prost(bool, optional, tag = "410")]
     pub xla_gpu_experimental_scaled_dot_with_triton: Option<bool>,
+
+    /// If `true`, one-shot RaggedAllToAll thunks will use a barrier + NCCL synchronization kernel.
+    #[prost(bool, optional, tag = "462")]
+    pub xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl: Option<bool>,
 
     /// If `true`, the RAFT library will be used for TopK operations on GPU.
     #[prost(bool, optional, tag = "413")]
@@ -3007,12 +3034,50 @@ pub enum GpuComputeCapability {
     RocmComputeCapability(RocmComputeCapability),
 }
 
+/// Additional connectivity metadata describing how a GPU is wired to its peers.
+///
+/// This type corresponds to `stream_executor.DeviceInterconnectInfoProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Eq, Hash, Message)]
+pub struct DeviceInterconnectInformation {
+    /// Number of active links that connect this GPU to its interconnect clique.
+    #[prost(int32, tag = "1")]
+    pub active_links: i32,
+
+    /// UUID that identifies the cluster to which the interconnect clique belongs.
+    #[prost(string, tag = "2")]
+    pub cluster_uuid: String,
+
+    /// Identifier of the interconnect clique for this GPU.
+    #[prost(string, tag = "3")]
+    pub clique_id: String,
+}
+
 /// Information about a GPU's hardware characteristics. XLA uses this information to make optimization decisions
 /// during compilation, such as choosing tile sizes for kernels or determining memory allocation strategies.
 ///
 /// This type corresponds to `stream_executor.GpuDeviceInfoProto` in [XLA](https://github.com/openxla/xla).
 #[derive(Clone, PartialEq, Message)]
 pub struct GpuDeviceInformation {
+    /// Device vendor string as reported by the platform runtime.
+    #[prost(string, tag = "30")]
+    pub device_vendor: String,
+
+    /// Platform-specific runtime version string associated with this device.
+    #[prost(string, tag = "31")]
+    pub platform_version: String,
+
+    /// PCI bus identifier for this GPU, when applicable.
+    #[prost(string, tag = "32")]
+    pub pci_bus_id: String,
+
+    /// Human-readable device name.
+    #[prost(string, tag = "34")]
+    pub name: String,
+
+    /// Human-readable model string for this GPU.
+    #[prost(string, tag = "35")]
+    pub model: String,
+
     /// Maximum number of threads that can be launched in a single block.
     #[prost(int32, tag = "1")]
     pub threads_per_block_limit: i32,
@@ -3042,16 +3107,16 @@ pub struct GpuDeviceInformation {
     pub fpus_per_core: i64,
 
     /// Maximum block dimension in the `X` (i.e., first) dimension.
-    #[prost(int32, tag = "8")]
-    pub block_dimension_limit_x: i32,
+    #[prost(int64, tag = "8")]
+    pub block_dimension_limit_x: i64,
 
     /// Maximum block dimension in the `Y` (i.e., second) dimension.
-    #[prost(int32, tag = "9")]
-    pub block_dimension_limit_y: i32,
+    #[prost(int64, tag = "9")]
+    pub block_dimension_limit_y: i64,
 
     /// Maximum block dimension in the `Z` (i.e., third) dimension.
-    #[prost(int32, tag = "10")]
-    pub block_dimension_limit_z: i32,
+    #[prost(int64, tag = "10")]
+    pub block_dimension_limit_z: i64,
 
     /// Memory bandwidth in bytes per second.
     #[prost(int64, tag = "11")]
@@ -3092,6 +3157,62 @@ pub struct GpuDeviceInformation {
     /// commonly used in deep learning workloads.
     #[prost(message, optional, tag = "21")]
     pub matrix_unit_description: Option<GpuExecutionUnitDescription>,
+
+    /// Driver version string reported for this GPU.
+    #[prost(string, tag = "23")]
+    pub driver_version: String,
+
+    /// Kernel-mode driver version string reported for this GPU.
+    #[prost(string, tag = "24")]
+    pub kernel_mode_driver_version: String,
+
+    /// Runtime version string reported for this GPU.
+    #[prost(string, tag = "25")]
+    pub runtime_version: String,
+
+    /// Toolkit version that was used at compile time for this GPU target.
+    #[prost(string, tag = "26")]
+    pub compile_time_toolkit_version: String,
+
+    /// Version string for the DNN library associated with this GPU.
+    #[prost(string, tag = "27")]
+    pub dnn_version: String,
+
+    /// Version string for the bundled CUB library.
+    #[prost(string, tag = "28")]
+    pub cub_version: String,
+
+    /// Interconnect topology metadata for this GPU.
+    #[prost(message, optional, tag = "29")]
+    pub device_interconnect_information: Option<DeviceInterconnectInformation>,
+
+    /// NUMA node to which this GPU is local, when available.
+    #[prost(int32, tag = "36")]
+    pub numa_node: i32,
+
+    /// Maximum thread dimension in the `X` (i.e., first) dimension.
+    #[prost(int64, tag = "37")]
+    pub thread_dimension_limit_x: i64,
+
+    /// Maximum thread dimension in the `Y` (i.e., second) dimension.
+    #[prost(int64, tag = "38")]
+    pub thread_dimension_limit_y: i64,
+
+    /// Maximum thread dimension in the `Z` (i.e., third) dimension.
+    #[prost(int64, tag = "39")]
+    pub thread_dimension_limit_z: i64,
+
+    /// Number of usable device address bits.
+    #[prost(int64, tag = "40")]
+    pub device_address_bits: i64,
+
+    /// PCIe bandwidth in bytes per second, when available.
+    #[prost(int64, tag = "41")]
+    pub pcie_bandwidth_in_bytes_per_second: i64,
+
+    /// If `true`, error-correcting code (ECC) is enabled on this GPU.
+    #[prost(bool, tag = "42")]
+    pub ecc_enabled: bool,
 
     /// Compute capability of the device specifying the GPU architecture and its supported features.
     #[prost(oneof = "GpuComputeCapability", tags = "16, 17")]

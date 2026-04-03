@@ -11,10 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added support for the new `PJRT_Buffer_Bitcast` C API function.
+- Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust
+  wrappers for error buffers and execution poisoning.
+- Added support for querying executable parameter memory kinds and topology fingerprints.
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.98`.
+- Updated our PJRT C API bindings for version `0.103`.
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 
 ## [0.0.2] - 2026-03-02

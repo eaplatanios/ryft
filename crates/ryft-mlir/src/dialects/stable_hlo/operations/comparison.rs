@@ -89,7 +89,7 @@ pub const COMPARISON_TYPE_ATTRIBUTE: &str = "compare_type";
 /// ```mlir
 /// // %lhs: [1.0, 3.0]
 /// // %rhs: [1.1, 2.9]
-/// %result = stablehlo.compare  GE, %arg0, %arg1,  TOTALORDER : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xi1>
+/// %result = stablehlo.compare GE, %arg0, %arg1, TOTALORDER : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xi1>
 /// // %result: [false, true]
 /// ```
 ///
@@ -497,7 +497,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @compare_test(%arg0: tensor<3xf32>, %arg1: tensor<3xf32>) -> tensor<3xi1> {
-                    %0 = stablehlo.compare  GE, %arg0, %arg1,  TOTALORDER : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
+                    %0 = stablehlo.compare GE, %arg0, %arg1, TOTALORDER : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
                     return %0 : tensor<3xi1>
                   }
                 }

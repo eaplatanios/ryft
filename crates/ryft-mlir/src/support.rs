@@ -590,20 +590,10 @@ mod tests {
         map.insert(type_id_1, "third");
         assert_eq!(map.len(), 2);
 
-        // Test with bad data.
-        #[repr(packed)]
-        struct UnalignedData {
-            _value_0: bool,
-            _value_1: u8,
-        }
-
-        let type_id = TypeId::create(&UnalignedData { _value_0: false, _value_1: 42 });
-
-        #[cfg(unix)]
-        assert!(type_id.is_err());
-
-        #[cfg(windows)]
-        assert!(type_id.is_ok());
+        // Test with misaligned data.
+        let bytes = [0_u8; 16];
+        let type_id = TypeId::create(&bytes[1]);
+        assert!(matches!(type_id, Err(TypeIdError::AlignmentError { .. })));
 
         // Test null pointer edge case.
         let bad_handle = MlirTypeID { ptr: std::ptr::null_mut() };

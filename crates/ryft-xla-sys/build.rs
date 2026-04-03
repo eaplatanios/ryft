@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::{env, fs};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -33,6 +34,15 @@ static PJRT_PLUGIN_NEURON_LIB: &str = "PJRT_PLUGIN_NEURON_LIB";
 
 /// Name of the environment variable that contains the path to a precompiled PJRT Metal plugin.
 static PJRT_PLUGIN_METAL_LIB: &str = "PJRT_PLUGIN_METAL_LIB";
+
+/// OpenXLA commit currently pinned in [`WORKSPACE`].
+static XLA_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
+    include_str!("WORKSPACE")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("XLA_COMMIT = \""))
+        .and_then(|line| line.strip_suffix('"'))
+        .expect("failed to parse `XLA_COMMIT` from `WORKSPACE`")
+});
 
 /// URL paired with an expected SHA-256 checksum for verifying downloads.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -460,14 +470,7 @@ impl BuildConfiguration {
         // We include the XLA commit in the extracted archive name to ensure that we do not use stale extracted files.
         let artifact_name = self.precompiled_artifact_name(artifact);
         let artifact_name = artifact_name.trim_end_matches(".tar.gz").trim_end_matches(".whl");
-        let archive_name = format!(
-            "{artifact_name}-{}",
-            include_str!("WORKSPACE")
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("XLA_COMMIT = \""))
-                .and_then(|line| line.strip_suffix('"'))
-                .expect("failed to parse `XLA_COMMIT` from `WORKSPACE`"),
-        );
+        let archive_name = format!("{artifact_name}-{}", *XLA_COMMIT);
 
         let extracted_path = dirs::cache_dir()
             .map(|cache_dir| cache_dir.join("ryft").join("xla"))
@@ -775,18 +778,21 @@ impl BuildConfiguration {
 
     /// Returns the URL prefix to use for downloading the pre-compiled archive that corresponds to the provided
     /// [`Artifact`] and this [`BuildConfiguration`].
-    fn precompiled_artifact_url_prefix(&self, artifact: Artifact) -> &'static str {
+    fn precompiled_artifact_url_prefix(&self, artifact: Artifact) -> String {
         match (artifact, self.device) {
             (Artifact::PjrtPlugin, Device::Tpu) => {
                 "https://files.pythonhosted.org/packages/17/b9/76527052aa583529fe0b816e6bbe9010676a87e8c50da3a9751d5f404c66"
+                    .to_string()
             }
-            (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla",
+            (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla".to_string(),
             (Artifact::PjrtPlugin, Device::Metal) => {
                 "https://files.pythonhosted.org/packages/09/dc/6d8fbfc29d902251cf333414cf7dcfaf4b252a9920c881354584ed36270d"
+                    .to_string()
             }
-            _ => {
-                "https://github.com/eaplatanios/ryft/releases/download/ryft-xla-sys-88dfac847f3087ac1c08463f52c60ec2f19b27c7"
-            }
+            _ => format!(
+                "https://github.com/eaplatanios/ryft/releases/download/ryft-xla-sys-{}",
+                *XLA_COMMIT,
+            ),
         }
     }
 
@@ -795,22 +801,22 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("1dcc53eac1f42772f49564eeff978147e73289286286c0515951167fd30f9a1f")
+                Some("af59336ef70cb676cfbae23a20d7a474cbd67a122e477a29a8daa1e411777bce")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("56b26843772232a46996bfdc6180ae86b92409565202af2e9a153a7fd547a336")
+                Some("c73be003b6111bd7838e5b3bdf3c55cdecbb3bc412102c6702d4ff29e5072657")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("7382b269db0621df17b3d373004e1c06646b45dfd8c9b11c32c33f3cb104442c")
+                Some("5d77f9b5802ef3846671d241e0bc167e169bb33c59e4f31747c6621279aaedd1")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("6ae761c14aa1cc75977f991671e98e61aceb72f6f4c9d773abdc2aa85451527a")
+                Some("923fb684f2aa43222676a79c8584099f62b642432b47f763845b8e886befeb8d")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("d0b3c4ef1a363cbc03dba79dd0a5c25355badbf03d58401c65ca307d296470d8")
+                Some("f1fba4ec1a094cb324ed982fc7c996a6ab4a218569d58fdbcb0fb4c2f770be56")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("65d3ae590af9893e0eea77c46380e8bed9054468ea6804d90c069b10ba8acec1")
+                Some("964330c744e9144d4d4af03a87f6c3819977beaabe46a2820c50474aeb1754ad")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")

@@ -6,9 +6,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # XLA
 # ----------------------------------------------------
 
-XLA_COMMIT = "88dfac847f3087ac1c08463f52c60ec2f19b27c7"
+XLA_COMMIT = "6e9c133d38ff253a4627ad62fbed0af677a067f3"
 
-XLA_SHA256 = "563687f3a04ee1efb5f6ff6cf96be5aa30c9839a16af3f6488f45f1bc01df02f"
+XLA_SHA256 = "60380ae52ef2038835ef29596c8598548a6b167cd720942f43d00eec29fb0ebc"
 
 JAX_COMMIT = "d40b4c951a9b53207974330c620130f664a0383e"
 
@@ -36,10 +36,10 @@ http_archive(
 
 http_archive(
     name = "rules_ml_toolchain",
-    sha256 = "2887d9b49e18ef5df6f87438a4d99759408d21a1f463c61f4be6ab31d892dc88",
-    strip_prefix = "rules_ml_toolchain-de6fc6c38ea0368a198daa3f8c7cb829cc8db185",
+    sha256 = "f2c924e85a22ba2eaa0c08657e5f5467fedbc3d0506f9cc0c69dd97ed9fbaf28",
+    strip_prefix = "rules_ml_toolchain-99c43dfe995a0e81c767d5b6d686191992672fe6",
     urls = [
-        "https://github.com/google-ml-infra/rules_ml_toolchain/archive/de6fc6c38ea0368a198daa3f8c7cb829cc8db185.tar.gz",
+        "https://github.com/google-ml-infra/rules_ml_toolchain/archive/99c43dfe995a0e81c767d5b6d686191992672fe6.tar.gz",
     ],
 )
 
