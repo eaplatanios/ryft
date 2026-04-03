@@ -30,6 +30,12 @@ pub enum ShardingError {
     #[error("mesh axis '{name}' must have type manual")]
     ExpectedManualMeshAxis { name: String },
 
+    #[error("manual axis '{name}' cannot be both varying and unreduced")]
+    ConflictingVaryingAndUnreducedMeshAxis { name: String },
+
+    #[error("manual axis '{name}' cannot be both varying and reduced")]
+    ConflictingVaryingAndReducedMeshAxis { name: String },
+
     #[error("mesh device ID '{id}' appears more than once")]
     DuplicateMeshDeviceId { id: MeshDeviceId },
 
@@ -562,6 +568,14 @@ impl Sharding {
             if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
                 return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
             }
+
+            if sharding.unreduced_axes.contains(axis_name) {
+                return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
+            }
+
+            if sharding.reduced_manual_axes.contains(axis_name) {
+                return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
+            }
         }
 
         Ok(sharding)
@@ -932,20 +946,17 @@ mod tests {
             vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
             Vec::<&str>::new(),
             ["manual"],
-            ["manual"],
+            Vec::<&str>::new(),
         )
         .unwrap();
         assert_eq!(sharding.mesh, mesh.clone());
         assert_eq!(sharding.dimensions, vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]);
         assert_eq!(sharding.unreduced_axes, BTreeSet::new());
         assert_eq!(sharding.reduced_manual_axes, BTreeSet::from(["manual".to_string()]));
-        assert_eq!(sharding.varying_manual_axes, BTreeSet::from(["manual".to_string()]));
+        assert_eq!(sharding.varying_manual_axes, BTreeSet::new());
         assert_eq!(sharding.rank(), 2);
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
-        assert_eq!(
-            sharding.to_string(),
-            "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced_manual={'manual'}, varying_manual={'manual'}}",
-        );
+        assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced_manual={'manual'}}",);
 
         let replicated = Sharding::replicated(mesh.clone(), 3);
         assert_eq!(replicated.mesh, mesh);
@@ -959,6 +970,27 @@ mod tests {
         assert_eq!(replicated.rank(), 3);
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
         assert_eq!(replicated.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{}, {}, {}]}");
+        
+        assert!(matches!(
+            Sharding::new(
+                mesh.clone(),
+                vec![ShardingDimension::replicated()],
+                ["manual"],
+                Vec::<&str>::new(),
+                ["manual"],
+            ),
+            Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name }) if name == "manual",
+        ));
+        assert!(matches!(
+            Sharding::new(
+                mesh,
+                vec![ShardingDimension::replicated()],
+                Vec::<&str>::new(),
+                ["manual"],
+                ["manual"],
+            ),
+            Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name }) if name == "manual",
+        ));
     }
 
     #[test]
@@ -1040,13 +1072,13 @@ mod tests {
             mesh.clone(),
             vec![ShardingDimension::replicated()],
             Vec::<&str>::new(),
-            BTreeSet::from(["x".to_string(), "z".to_string()]),
+            BTreeSet::from(["z".to_string()]),
             BTreeSet::from(["x".to_string()]),
         )
         .unwrap();
         assert_eq!(
             sharding.without_auto_axes(),
-            Sharding::new(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["x", "z"], ["x"],).unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["z"], ["x"],).unwrap(),
         );
     }
 
