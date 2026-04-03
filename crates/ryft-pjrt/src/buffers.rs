@@ -4245,10 +4245,15 @@ mod tests {
 
         let payload = HashMap::from([("launch_id", "17"), ("reason", "unit-test")]);
         let buffer = client.error_buffer_with_payload(error, specification, device, &payload).unwrap();
-        assert!(matches!(
-            buffer.ready().unwrap().r#await(),
-            Err(Error::Aborted { message, .. }) if message.contains("test error"),
-        ));
+        let error = buffer.ready().unwrap().r#await().unwrap_err();
+        assert!(matches!(&error, Error::Aborted { message, .. } if message.contains("test error")));
+        assert_eq!(error.payload("launch_id"), Some("17"));
+        assert_eq!(error.payload("reason"), Some("unit-test"));
+        assert_eq!(error.payload("missing"), None);
+        assert_eq!(
+            error.payloads().iter().map(|(name, value)| (name.as_str(), value.as_str())).collect::<HashMap<_, _>>(),
+            HashMap::from([("launch_id", "17"), ("reason", "unit-test")]),
+        );
     }
 
     #[test]

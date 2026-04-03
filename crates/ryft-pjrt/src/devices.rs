@@ -1348,10 +1348,15 @@ mod tests {
             device.poison_execution_with_payload(launch_id as i32, Error::aborted("test poison error"), &payload),
             Ok(true),
         );
-        assert!(matches!(
-            output.done.r#await(),
-            Err(Error::Aborted { message, .. }) if message == "test poison error",
-        ));
+        let error = output.done.r#await().unwrap_err();
+        assert!(matches!(&error, Error::Aborted { message, .. } if message == "test poison error"));
+        assert_eq!(error.payload("launch_id"), Some("17"));
+        assert_eq!(error.payload("reason"), Some("unit-test"));
+        assert_eq!(error.payload("missing"), None);
+        assert_eq!(
+            error.payloads().iter().map(|(name, value)| (name.as_str(), value.as_str())).collect::<HashMap<_, _>>(),
+            HashMap::from([("launch_id", "17"), ("reason", "unit-test")]),
+        );
     }
 
     #[test]

@@ -7,9 +7,10 @@ use crate::{Api, invoke_pjrt_api_error_fn, invoke_pjrt_api_void_fn, str_from_c_a
 /// Represents errors that can occur when interacting with the PJRT C API. The error types are based on the
 /// [Abseil status codes](https://abseil.io/docs/cpp/guides/status-codes) which PJRT uses internally.
 ///
-/// Each variant includes a `backtrace` field that captures the call stack at the point where the error was created,
-/// which is useful for debugging. Note that it is represented as a [`String`] and not as a [`Backtrace`] because using
-/// the latter is only currently supported in unstable Rust.
+/// PJRT-originated errors can carry payload metadata which can be accessed using [`Error::payloads`]. Each variant also
+/// includes a `backtrace` field that captures the call stack at the point where the error was created, which is useful
+/// for debugging. Note that it is represented as a [`String`] and not as a [`Backtrace`] because using the latter is
+/// only currently supported in unstable Rust.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     #[error("error while loading a PJRT plugin from '{path}': {error}")]
@@ -19,52 +20,52 @@ pub enum Error {
     PluginVersionMismatch { message: String, backtrace: String },
 
     #[error("{message}")]
-    Cancelled { message: String, backtrace: String },
+    Cancelled { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    Unknown { message: String, backtrace: String },
+    Unknown { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    InvalidArgument { message: String, backtrace: String },
+    InvalidArgument { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    DeadlineExceeded { message: String, backtrace: String },
+    DeadlineExceeded { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    NotFound { message: String, backtrace: String },
+    NotFound { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    AlreadyExists { message: String, backtrace: String },
+    AlreadyExists { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    PermissionDenied { message: String, backtrace: String },
+    PermissionDenied { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    ResourceExhausted { message: String, backtrace: String },
+    ResourceExhausted { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    FailedPrecondition { message: String, backtrace: String },
+    FailedPrecondition { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    Aborted { message: String, backtrace: String },
+    Aborted { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    OutOfRange { message: String, backtrace: String },
+    OutOfRange { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    Unimplemented { message: String, backtrace: String },
+    Unimplemented { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    Internal { message: String, backtrace: String },
+    Internal { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    Unavailable { message: String, backtrace: String },
+    Unavailable { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    DataLoss { message: String, backtrace: String },
+    DataLoss { message: String, payload: Vec<(String, String)>, backtrace: String },
 
     #[error("{message}")]
-    Unauthenticated { message: String, backtrace: String },
+    Unauthenticated { message: String, payload: Vec<(String, String)>, backtrace: String },
 }
 
 impl Error {
@@ -85,28 +86,92 @@ impl Error {
         let (message, message_size) = message.inspect_err(|_: &Self| drop::<Result<(), Self>>(destroy_error()))?;
         let message = str_from_c_api(message, message_size).into_owned();
         let code = invoke_pjrt_api_error_fn!(api, PJRT_Error_GetCode, { error = handle }, { code });
+
+        // Extract the error payload metadata if there is any.
+        let payload = {
+            unsafe extern "C" fn collect_payload(
+                key: *const std::ffi::c_char,
+                key_size: usize,
+                value: *const std::ffi::c_char,
+                value_size: usize,
+                user_arg: *mut std::ffi::c_void,
+            ) {
+                unsafe { &mut *(user_arg as *mut Vec<(String, String)>) }
+                    .push((str_from_c_api(key, key_size).into_owned(), str_from_c_api(value, value_size).into_owned()));
+            }
+
+            let mut payload = Vec::new();
+            match invoke_pjrt_api_error_fn!(
+                api,
+                PJRT_Error_ForEachPayload,
+                {
+                    error = handle,
+                    visitor = Some(collect_payload),
+                    user_arg = (&mut payload as *mut Vec<(String, String)>).cast(),
+                }
+            ) {
+                Ok(()) => {
+                    payload.sort_unstable();
+                    payload
+                }
+                Err(Error::Unimplemented { .. }) => Vec::new(),
+                Err(error) => {
+                    drop(destroy_error());
+                    return Err(error);
+                }
+            }
+        };
+
         let error = Some(match code.inspect_err(|_| drop(destroy_error()))? {
             PJRT_Error_Code_OK => {
                 destroy_error()?;
                 return Ok(None);
             }
-            PJRT_Error_Code_CANCELLED => Self::cancelled(message),
-            PJRT_Error_Code_UNKNOWN => Self::unknown(message),
-            PJRT_Error_Code_INVALID_ARGUMENT => Self::invalid_argument(message),
-            PJRT_Error_Code_DEADLINE_EXCEEDED => Self::deadline_exceeded(message),
-            PJRT_Error_Code_NOT_FOUND => Self::not_found(message),
-            PJRT_Error_Code_ALREADY_EXISTS => Self::already_exists(message),
-            PJRT_Error_Code_PERMISSION_DENIED => Self::permission_denied(message),
-            PJRT_Error_Code_RESOURCE_EXHAUSTED => Self::resource_exhausted(message),
-            PJRT_Error_Code_FAILED_PRECONDITION => Self::failed_precondition(message),
-            PJRT_Error_Code_ABORTED => Self::aborted(message),
-            PJRT_Error_Code_OUT_OF_RANGE => Self::out_of_range(message),
-            PJRT_Error_Code_UNIMPLEMENTED => Self::unimplemented(message),
-            PJRT_Error_Code_INTERNAL => Self::internal(message),
-            PJRT_Error_Code_UNAVAILABLE => Self::unavailable(message),
-            PJRT_Error_Code_DATA_LOSS => Self::data_loss(message),
-            PJRT_Error_Code_UNAUTHENTICATED => Self::unauthenticated(message),
-            _ => Self::plugin_version_mismatch(message),
+            PJRT_Error_Code_CANCELLED => {
+                Self::Cancelled { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_UNKNOWN => Self::Unknown { message, payload, backtrace: Backtrace::capture().to_string() },
+            PJRT_Error_Code_INVALID_ARGUMENT => {
+                Self::InvalidArgument { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_DEADLINE_EXCEEDED => {
+                Self::DeadlineExceeded { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_NOT_FOUND => {
+                Self::NotFound { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_ALREADY_EXISTS => {
+                Self::AlreadyExists { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_PERMISSION_DENIED => {
+                Self::PermissionDenied { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_RESOURCE_EXHAUSTED => {
+                Self::ResourceExhausted { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_FAILED_PRECONDITION => {
+                Self::FailedPrecondition { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_ABORTED => Self::Aborted { message, payload, backtrace: Backtrace::capture().to_string() },
+            PJRT_Error_Code_OUT_OF_RANGE => {
+                Self::OutOfRange { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_UNIMPLEMENTED => {
+                Self::Unimplemented { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_INTERNAL => {
+                Self::Internal { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_UNAVAILABLE => {
+                Self::Unavailable { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_DATA_LOSS => {
+                Self::DataLoss { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            PJRT_Error_Code_UNAUTHENTICATED => {
+                Self::Unauthenticated { message, payload, backtrace: Backtrace::capture().to_string() }
+            }
+            _ => Self::Unknown { message, payload, backtrace: Backtrace::capture().to_string() },
         });
         destroy_error()?;
         Ok(error)
@@ -138,82 +203,146 @@ impl Error {
 
     /// Creates a new [`Error::Cancelled`].
     pub fn cancelled<M: Into<String>>(message: M) -> Self {
-        Self::Cancelled { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::Cancelled { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::Unknown`].
     pub fn unknown<M: Into<String>>(message: M) -> Self {
-        Self::Unknown { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::Unknown { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::InvalidArgument`].
     pub fn invalid_argument<M: Into<String>>(message: M) -> Self {
-        Self::InvalidArgument { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::InvalidArgument {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
     }
 
     /// Creates a new [`Error::DeadlineExceeded`].
     pub fn deadline_exceeded<M: Into<String>>(message: M) -> Self {
-        Self::DeadlineExceeded { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::DeadlineExceeded {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
     }
 
     /// Creates a new [`Error::NotFound`].
     pub fn not_found<M: Into<String>>(message: M) -> Self {
-        Self::NotFound { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::NotFound { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::AlreadyExists`].
     pub fn already_exists<M: Into<String>>(message: M) -> Self {
-        Self::AlreadyExists { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::AlreadyExists {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
     }
 
     /// Creates a new [`Error::PermissionDenied`].
     pub fn permission_denied<M: Into<String>>(message: M) -> Self {
-        Self::PermissionDenied { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::PermissionDenied {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
     }
 
     /// Creates a new [`Error::ResourceExhausted`].
     pub fn resource_exhausted<M: Into<String>>(message: M) -> Self {
-        Self::ResourceExhausted { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::ResourceExhausted {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
     }
 
     /// Creates a new [`Error::FailedPrecondition`].
     pub fn failed_precondition<M: Into<String>>(message: M) -> Self {
-        Self::FailedPrecondition { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::FailedPrecondition {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
     }
 
     /// Creates a new [`Error::Aborted`].
     pub fn aborted<M: Into<String>>(message: M) -> Self {
-        Self::Aborted { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::Aborted { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::OutOfRange`].
     pub fn out_of_range<M: Into<String>>(message: M) -> Self {
-        Self::OutOfRange { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::OutOfRange { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::Unimplemented`].
     pub fn unimplemented<M: Into<String>>(message: M) -> Self {
-        Self::Unimplemented { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::Unimplemented {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
     }
 
     /// Creates a new [`Error::Internal`].
     pub fn internal<M: Into<String>>(message: M) -> Self {
-        Self::Internal { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::Internal { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::Unavailable`].
     pub fn unavailable<M: Into<String>>(message: M) -> Self {
-        Self::Unavailable { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::Unavailable { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::DataLoss`].
     pub fn data_loss<M: Into<String>>(message: M) -> Self {
-        Self::DataLoss { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::DataLoss { message: message.into(), payload: Vec::new(), backtrace: Backtrace::capture().to_string() }
     }
 
     /// Creates a new [`Error::Unauthenticated`].
     pub fn unauthenticated<M: Into<String>>(message: M) -> Self {
-        Self::Unauthenticated { message: message.into(), backtrace: Backtrace::capture().to_string() }
+        Self::Unauthenticated {
+            message: message.into(),
+            payload: Vec::new(),
+            backtrace: Backtrace::capture().to_string(),
+        }
+    }
+
+    /// Returns the payload metadata attached to this [`Error`].
+    pub fn payloads(&self) -> &[(String, String)] {
+        match self {
+            Self::Cancelled { payload, .. }
+            | Self::Unknown { payload, .. }
+            | Self::InvalidArgument { payload, .. }
+            | Self::DeadlineExceeded { payload, .. }
+            | Self::NotFound { payload, .. }
+            | Self::AlreadyExists { payload, .. }
+            | Self::PermissionDenied { payload, .. }
+            | Self::ResourceExhausted { payload, .. }
+            | Self::FailedPrecondition { payload, .. }
+            | Self::Aborted { payload, .. }
+            | Self::OutOfRange { payload, .. }
+            | Self::Unimplemented { payload, .. }
+            | Self::Internal { payload, .. }
+            | Self::Unavailable { payload, .. }
+            | Self::DataLoss { payload, .. }
+            | Self::Unauthenticated { payload, .. } => payload,
+            Self::PluginLoadingError { .. } | Self::PluginVersionMismatch { .. } => &[],
+        }
+    }
+
+    /// Returns the payload metadata value that is associated with the provided `name`,
+    /// if this [`Error`] carries such a payload entry.
+    pub fn payload<N: AsRef<str>>(&self, name: N) -> Option<&str> {
+        let name = name.as_ref();
+        self.payloads()
+            .iter()
+            .find_map(|(payload_name, payload_value)| (payload_name == name).then_some(payload_value.as_str()))
     }
 
     /// Returns the [`PJRT_Error_Code`](ffi::PJRT_Error_Code) that corresponds to this [`Error`].
@@ -343,6 +472,36 @@ pub(crate) mod ffi {
 
     pub type PJRT_Error_GetCode = unsafe extern "C" fn(args: *mut PJRT_Error_GetCode_Args) -> *mut PJRT_Error;
 
+    pub type PJRT_Error_PayloadVisitor = unsafe extern "C" fn(
+        key: *const std::ffi::c_char,
+        key_size: usize,
+        value: *const std::ffi::c_char,
+        value_size: usize,
+        user_arg: *mut std::ffi::c_void,
+    );
+
+    #[repr(C)]
+    pub struct PJRT_Error_ForEachPayload_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut PJRT_Extension_Base,
+        pub error: *const PJRT_Error,
+        pub visitor: Option<PJRT_Error_PayloadVisitor>,
+        pub user_arg: *mut std::ffi::c_void,
+    }
+
+    impl PJRT_Error_ForEachPayload_Args {
+        pub fn new(
+            error: *const PJRT_Error,
+            visitor: Option<PJRT_Error_PayloadVisitor>,
+            user_arg: *mut std::ffi::c_void,
+        ) -> Self {
+            Self { struct_size: size_of::<Self>(), extension_start: std::ptr::null_mut(), error, visitor, user_arg }
+        }
+    }
+
+    pub type PJRT_Error_ForEachPayload =
+        unsafe extern "C" fn(args: *mut PJRT_Error_ForEachPayload_Args) -> *mut PJRT_Error;
+
     #[repr(C)]
     pub struct PJRT_Error_Destroy_Args {
         pub struct_size: usize,
@@ -439,6 +598,10 @@ mod tests {
         assert_eq!(errors[14].message().to_str().unwrap(), "unavailable");
         assert_eq!(errors[15].message().to_str().unwrap(), "data loss");
         assert_eq!(errors[16].message().to_str().unwrap(), "unauthenticated");
+        assert_eq!(errors[0].payload("missing"), None);
+        assert_eq!(errors[0].payloads().len(), 0);
+        assert_eq!(errors[3].payload("missing"), None);
+        assert_eq!(errors[3].payloads().len(), 0);
     }
 
     #[test]
@@ -446,7 +609,7 @@ mod tests {
         let error = Error::invalid_argument("bad input");
         assert_eq!(format!("{error}"), "bad input");
         let debug = format!("{error:?}");
-        assert!(debug.starts_with("InvalidArgument { message: \"bad input\", backtrace: \""));
+        assert!(debug.starts_with("InvalidArgument { message: \"bad input\", payload: [], backtrace: \""));
 
         let error = Error::plugin_loading_error("/path", "err");
         assert_eq!(format!("{error}"), "error while loading a PJRT plugin from '/path': err");
