@@ -2341,23 +2341,32 @@ impl<'s> Client<'s> {
         specification: BufferSpecification<D>,
         memory: M,
     ) -> Result<Buffer<'_>, Error> {
-        self.error_buffer_with_payload(error, specification, memory, &[] as &[NamedValue])
+        self.error_buffer_with_payload(error, specification, memory, std::iter::empty::<(&str, &str)>())
     }
 
     /// Creates a new _poisoned_ [`Buffer`] that represents an error state, similar to [`Self::error_buffer`],
-    /// but with the resulting buffer carrying payload metadata. The provided payload is forwarded to the PJRT runtime
-    /// together with the poisoned buffer so that backends can attach structured error information to the failure.
-    pub fn error_buffer_with_payload<D: AsRef<[u64]>, M: HasDefaultMemory, P: AsRef<[NamedValue]>>(
+    /// but with the resulting buffer carrying payload metadata. The provided payload is an iterator of string
+    /// `(name, value)` pairs that is forwarded to the PJRT runtime together with the poisoned buffer so that
+    /// backends can attach structured error information to the failure.
+    pub fn error_buffer_with_payload<D: AsRef<[u64]>, M: HasDefaultMemory, P, K, V>(
         &'_ self,
         error: Error,
         specification: BufferSpecification<D>,
         memory: M,
         payload: P,
-    ) -> Result<Buffer<'_>, Error> {
+    ) -> Result<Buffer<'_>, Error>
+    where
+        P: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
         use ffi::PJRT_Client_CreateErrorBuffer_Args;
         let layout = specification.layout.map(|layout| unsafe { layout.to_c_api() });
         let error_message = error.message();
-        let payload = payload.as_ref();
+        let payload = payload
+            .into_iter()
+            .map(|(name, value)| NamedValue::new(name.as_ref(), value.as_ref()))
+            .collect::<Vec<_>>();
         let payload = payload.iter().map(|payload| unsafe { payload.to_c_api() }).collect::<Vec<_>>();
         let (payload, payload_size) =
             if payload.is_empty() { (std::ptr::null(), 0) } else { (payload.as_ptr(), payload.len()) };
@@ -3580,12 +3589,13 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     use crate::tests::{TestPlatform, test_cpu_client, test_for_each_platform};
     use crate::{
         Buffer, BufferSpecification, BufferType, Error, HostBuffer, HostBufferData, HostBufferSemantics, Layout,
-        NamedValue, StridedLayout, Tile, TileDimension, TiledLayout,
+        StridedLayout, Tile, TileDimension, TiledLayout,
     };
 
     use super::ffi;
@@ -4233,7 +4243,7 @@ mod tests {
             Err(Error::Aborted { message, .. }) if message.contains("test error"),
         ));
 
-        let payload = [NamedValue::new("launch_id", "17"), NamedValue::new("reason", "unit-test")];
+        let payload = HashMap::from([("launch_id", "17"), ("reason", "unit-test")]);
         let buffer = client.error_buffer_with_payload(error, specification, device, &payload).unwrap();
         assert!(matches!(
             buffer.ready().unwrap().r#await(),

@@ -259,22 +259,30 @@ impl Device<'_> {
     /// [`Client::error_buffer`] for more information on buffer _poisoning_). Returns `true` if the execution was
     /// poisoned successfully and `false` if it had already finished executing.
     pub fn poison_execution(&self, launch_id: i32, error: Error) -> Result<bool, Error> {
-        self.poison_execution_with_payload(launch_id, error, &[] as &[NamedValue])
+        self.poison_execution_with_payload(launch_id, error, std::iter::empty::<(&str, &str)>())
     }
 
     /// _Poisons_ the earliest execution on this [`Device`] with the provided launch ID if it is not finished
     /// yet (i.e., sets the resulting [`Buffer`](crate::Buffer) to an error buffer; refer to the documentation of
-    /// [`Client::error_buffer`] for more information on buffer _poisoning_), passing the provided payload entries
-    /// through to the PJRT runtime together with the error.
-    pub fn poison_execution_with_payload<P: AsRef<[NamedValue]>>(
+    /// [`Client::error_buffer`] for more information on buffer _poisoning_), passing the provided payload string
+    /// `(name, value)` pairs through to the PJRT runtime together with the error.
+    pub fn poison_execution_with_payload<P, K, V>(
         &self,
         launch_id: i32,
         error: Error,
         payload: P,
-    ) -> Result<bool, Error> {
+    ) -> Result<bool, Error>
+    where
+        P: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
         use ffi::PJRT_Device_PoisonExecution_Args;
         let error_message = error.message();
-        let payload = payload.as_ref();
+        let payload = payload
+            .into_iter()
+            .map(|(name, value)| NamedValue::new(name.as_ref(), value.as_ref()))
+            .collect::<Vec<_>>();
         let payload = payload.iter().map(|payload| unsafe { payload.to_c_api() }).collect::<Vec<_>>();
         let (payload, payload_size) =
             if payload.is_empty() { (std::ptr::null(), 0) } else { (payload.as_ptr(), payload.len()) };
@@ -1178,8 +1186,7 @@ mod tests {
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use crate::tests::{TestPlatform, test_cpu_client, test_for_each_platform};
     use crate::{
-        BufferType, Device, DeviceAssignment, DeviceDescription, Error, ExecutionDeviceInputs, ExecutionInput,
-        NamedValue, Program,
+        BufferType, Device, DeviceAssignment, DeviceDescription, Error, ExecutionDeviceInputs, ExecutionInput, Program,
     };
 
     #[test]
@@ -1210,7 +1217,7 @@ mod tests {
                         assert!(device.default_memory().is_ok());
                         assert!(device.memory_statistics().is_err());
                         assert_eq!(format!("{device}"), format!("CpuDevice(id={})", index));
-                        assert_eq!(format!("{device:?}"), format!("Device[TFRT_CPU_{}]", index));
+                        assert_eq!(format!("{device:?}"), format!("Device[cpu:{}]", index));
                     }
                     TestPlatform::Metal => {
                         assert!(device.default_memory().is_err());
@@ -1333,7 +1340,10 @@ mod tests {
         let output = outputs.remove(0);
 
         // Finally, poison the program execution.
-        let payload = [NamedValue::new("launch_id", launch_id as i64), NamedValue::new("reason", "unit-test")];
+        let payload = HashMap::from([
+            ("launch_id".to_string(), launch_id.to_string()),
+            ("reason".to_string(), "unit-test".to_string()),
+        ]);
         assert_eq!(
             device.poison_execution_with_payload(launch_id as i32, Error::aborted("test poison error"), &payload),
             Ok(true),
@@ -1361,7 +1371,7 @@ mod tests {
         assert_ne!(descriptions[0], descriptions[1]);
         assert_ne!(descriptions[1], descriptions[0]);
         assert_eq!(format!("{description}"), "CpuDevice(id=1)");
-        assert_eq!(format!("{description:?}"), "DeviceDescription[TFRT_CPU_1]");
+        assert_eq!(format!("{description:?}"), "DeviceDescription[cpu:1]");
 
         // Test creating a [`DeviceDescription`] from a null pointer.
         assert!(matches!(
