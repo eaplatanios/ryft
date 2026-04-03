@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{
     parameters::{ParameterError, Parameterized},
     sharding::{Sharding, ShardingDimension, ShardingError},
-    types::{ArrayType, DataType, Shape, Size, data_types::DataTypeError},
+    types::{data_types::DataTypeError, ArrayType, DataType, Shape, Size},
 };
 
 /// Represents broadcasting-related errors.
@@ -428,7 +428,6 @@ mod tests {
     use ryft_macros::Parameterized;
 
     use crate::parameters::{Parameter, ParameterError};
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::data_types::DataType::*;
     use crate::types::{Layout, Shape, StridedLayout, Tile, TileDimension, TiledLayout};
 

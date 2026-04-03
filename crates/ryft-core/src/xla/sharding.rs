@@ -155,7 +155,7 @@
 //! This mirrors JAX's `array.addressable_shards` (local) vs `array.global_shards` (all),
 //! where accessing `.data` on a non-addressable shard raises an error.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
 
@@ -172,34 +172,6 @@ use crate::sharding::{DeviceMesh, MeshAxisType, MeshDevice, MeshDeviceId, Shardi
 use crate::sharding::LogicalMesh;
 
 impl Sharding {
-    /// Returns the rank (i.e., number of dimensions) of this [`Sharding`].
-    #[inline]
-    pub fn rank(&self) -> usize {
-        self.dimensions.len()
-    }
-
-    /// Returns the names of the mesh axes that are implicitly or explicitly replicated by this [`Sharding`].
-    pub fn replicated_axes(&self) -> Vec<&str> {
-        let mut used_axes = HashSet::new();
-        for partition_dimension in &self.dimensions {
-            if let ShardingDimension::Sharded(axis_names) = partition_dimension {
-                used_axes.extend(axis_names.iter().map(String::as_str));
-            }
-        }
-        used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
-        used_axes.extend(self.reduced_manual_axes.iter().map(String::as_str));
-        self.mesh
-            .axes
-            .iter()
-            .filter_map(|axis| {
-                let axis_name = axis.name.as_str();
-                (matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
-                    && !used_axes.contains(axis_name))
-                .then_some(axis_name)
-            })
-            .collect()
-    }
-
     /// Renders a visualization of this sharding over a concrete device mesh.
     ///
     /// This ports the core behavior of JAX's

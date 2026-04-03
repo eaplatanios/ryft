@@ -582,6 +582,34 @@ impl Sharding {
             varying_manual_axes: BTreeSet::new(),
         }
     }
+    
+    /// Returns the rank (i.e., number of dimensions) of this [`Sharding`].
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.dimensions.len()
+    }
+
+    /// Returns the names of the mesh axes that are implicitly or explicitly replicated by this [`Sharding`].
+    pub fn replicated_axes(&self) -> Vec<&str> {
+        let mut used_axes = HashSet::new();
+        for dimension in &self.dimensions {
+            if let ShardingDimension::Sharded(axis_names) = dimension {
+                used_axes.extend(axis_names.iter().map(String::as_str));
+            }
+        }
+        used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
+        used_axes.extend(self.reduced_manual_axes.iter().map(String::as_str));
+        self.mesh
+            .axes
+            .iter()
+            .filter_map(|axis| {
+                let axis_name = axis.name.as_str();
+                (matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
+                    && !used_axes.contains(axis_name))
+                .then_some(axis_name)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -780,6 +808,7 @@ mod tests {
         assert_eq!(sharding.reduced_manual_axes, BTreeSet::from(["manual".to_string()]));
         assert_eq!(sharding.varying_manual_axes, BTreeSet::from(["manual".to_string()]));
         assert_eq!(sharding.rank(), 2);
+        assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
 
         let replicated = Sharding::replicated(mesh.clone(), 3);
         assert_eq!(replicated.mesh, mesh);
@@ -791,5 +820,6 @@ mod tests {
         assert_eq!(replicated.reduced_manual_axes, BTreeSet::new());
         assert_eq!(replicated.varying_manual_axes, BTreeSet::new());
         assert_eq!(replicated.rank(), 3);
+        assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
     }
 }
