@@ -970,7 +970,7 @@ mod tests {
         assert_eq!(replicated.rank(), 3);
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
         assert_eq!(replicated.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{}, {}, {}]}");
-        
+
         assert!(matches!(
             Sharding::new(
                 mesh.clone(),
