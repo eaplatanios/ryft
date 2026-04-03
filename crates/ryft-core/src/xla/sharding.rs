@@ -129,11 +129,11 @@
 //!    // Generates: sdy.mesh @mesh = <["data"=4, "model"=2]>
 //!    let context = MlirContext::new();
 //!    let mesh_module = context.module(context.unknown_location());
-//!    let mesh_op = mesh.logical_mesh.to_shardy_mesh(context.unknown_location());
+//!    let mesh_op = mesh.logical_mesh.to_shardy(context.unknown_location());
 //!    let mesh_op = mesh_module.body().append_operation(mesh_op);
 //!
 //!    // Generates: #sdy.sharding<@mesh, [{"data"}, {}]>
-//!    let attr = sharding.to_shardy_tensor_sharding_attribute();
+//!    let attr = sharding.to_shardy(context.unknown_location());
 //!    ```
 //!
 //! # Multi-host and addressability
@@ -159,14 +159,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
 
-#[cfg(feature = "xla")]
-use ryft_mlir::Context as MlirContext;
-#[cfg(feature = "xla")]
-use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, TensorShardingAttributeRef};
-
-#[cfg(feature = "xla")]
-use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 use crate::sharding::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDimension, ShardingError};
+#[cfg(test)]
+use ryft_mlir::Context as MlirContext;
 
 #[cfg(test)]
 use crate::sharding::{LogicalMesh, MeshAxisType};
@@ -261,69 +256,6 @@ impl Sharding {
         let cell_height =
             if global_shape.len() == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
         Ok(render_visualization(cells.as_slice(), cell_width, cell_height, colored))
-    }
-
-    /// Renders this sharding as a Shardy tensor sharding attribute.
-    ///
-    /// The output is a valid Shardy `#sdy.sharding<...>` attribute that can be attached to
-    /// tensor types in a StableHLO program. For example:
-    ///
-    /// ```text
-    /// #sdy.sharding<@mesh, [{"x"}, {}]>
-    /// #sdy.sharding<@mesh, [{"x"}, {}], replicated={"y"}>
-    /// ```
-    ///
-    /// Uses the canonical `@mesh` symbol name.
-    #[cfg(feature = "xla")]
-    pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
-        let context = MlirContext::new();
-        self.to_shardy_tensor_sharding(&context).to_string()
-    }
-
-    /// Builds this sharding as typed Shardy dimension shardings.
-    #[cfg(feature = "xla")]
-    pub(crate) fn to_shardy_dimension_shardings<'c, 't>(
-        &self,
-        context: &'c MlirContext<'t>,
-    ) -> Vec<DimensionShardingAttributeRef<'c, 't>> {
-        self.dimensions
-            .iter()
-            .map(|dimension| match dimension {
-                ShardingDimension::Replicated => context.shardy_dimension_sharding(&[], true, None),
-                ShardingDimension::Sharded(axis_names) => {
-                    let axes =
-                        axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)).collect::<Vec<_>>();
-                    context.shardy_dimension_sharding(axes.as_slice(), true, None)
-                }
-                ShardingDimension::Unconstrained => context.shardy_dimension_sharding(&[], false, None),
-            })
-            .collect()
-    }
-
-    /// Builds this sharding as a typed Shardy tensor-sharding attribute.
-    #[cfg(feature = "xla")]
-    pub(crate) fn to_shardy_tensor_sharding<'c, 't>(
-        &self,
-        context: &'c MlirContext<'t>,
-    ) -> TensorShardingAttributeRef<'c, 't> {
-        let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
-        let dim_shardings = self.to_shardy_dimension_shardings(context);
-        let replicated_axes = self
-            .replicated_axes()
-            .iter()
-            .map(|axis_name| context.shardy_axis_ref(axis_name, None))
-            .collect::<Vec<_>>();
-        let unreduced_axes = self
-            .unreduced_axes
-            .iter()
-            .map(|axis_name| context.shardy_axis_ref(axis_name, None))
-            .collect::<Vec<_>>();
-        context.shardy_tensor_sharding(
-            mesh_symbol_ref,
-            dim_shardings.as_slice(),
-            replicated_axes.as_slice(),
-            unreduced_axes.as_slice(),
-        )
     }
 }
 
@@ -896,6 +828,12 @@ mod tests {
         Vec::new()
     }
 
+    #[cfg(feature = "xla")]
+    fn to_shardy_string(sharding: &Sharding) -> String {
+        let context = MlirContext::new();
+        sharding.to_shardy(context.unknown_location()).to_string()
+    }
+
     // -----------------------------------------------------------------------
     // Sharding tests
     // -----------------------------------------------------------------------
@@ -949,7 +887,7 @@ mod tests {
             empty_axes(),
         )
         .unwrap();
-        assert_eq!(sharding.to_shardy_tensor_sharding_attribute(), "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
+        assert_eq!(to_shardy_string(&sharding), "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
     }
 
     #[test]
@@ -969,10 +907,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(sharding.replicated_axes(), vec!["y"]);
-        assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(),
-            "#sdy.sharding<@mesh, [{\"x\"}, {}], replicated={\"y\"}>"
-        );
+        assert_eq!(to_shardy_string(&sharding), "#sdy.sharding<@mesh, [{\"x\"}, {}], replicated={\"y\"}>");
     }
 
     #[test]
@@ -986,10 +921,7 @@ mod tests {
             empty_axes(),
         )
         .unwrap();
-        assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(),
-            "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>"
-        );
+        assert_eq!(to_shardy_string(&sharding), "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>");
     }
 
     #[test]
@@ -1005,7 +937,7 @@ mod tests {
 
         assert_eq!(sharding.replicated_axes(), vec!["y"]);
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(),
+            to_shardy_string(&sharding),
             "#sdy.sharding<@mesh, [{\"x\"}], replicated={\"y\"}, unreduced={\"z\"}>"
         );
     }
@@ -1024,7 +956,7 @@ mod tests {
 
         assert_eq!(sharding.replicated_axes(), vec![r"path\to"]);
         assert_eq!(
-            sharding.to_shardy_tensor_sharding_attribute(),
+            to_shardy_string(&sharding),
             r#"#sdy.sharding<@mesh, [{"x\22y"}], replicated={"path\\to"}, unreduced={"z\22w"}>"#
         );
     }

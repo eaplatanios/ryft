@@ -301,14 +301,15 @@ impl<'o> Array<'o> {
         't: 'c,
         L: Location<'c, 't>,
     {
-        self.layout.mesh().logical_mesh.to_shardy_mesh(location)
+        self.layout.mesh().logical_mesh.to_shardy(location)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
     ///
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
-        self.layout.sharding().to_shardy_tensor_sharding_attribute()
+        let context = ryft_mlir::Context::new();
+        self.layout.sharding().to_shardy(context.unknown_location()).to_string()
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].

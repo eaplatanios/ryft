@@ -1587,15 +1587,15 @@ fn manual_computation_dimension_shardings<'c, 't>(
         .dimensions
         .iter()
         .map(|partition_dimension| match partition_dimension {
-            ShardingDimension::Replicated => context.shardy_dimension_sharding(&[], !has_unused_free_axes, None),
+            ShardingDimension::Replicated => context.shardy_dimension_sharding([], !has_unused_free_axes, None),
             ShardingDimension::Sharded(axis_names) => {
                 let axes =
                     axis_names.iter().map(|axis_name| context.shardy_axis_ref(axis_name, None)).collect::<Vec<_>>();
                 let contains_free_axis =
                     axis_names.iter().any(|axis_name| free_axis_names.contains(axis_name.as_str()));
-                context.shardy_dimension_sharding(axes.as_slice(), !(contains_free_axis || has_unused_free_axes), None)
+                context.shardy_dimension_sharding(axes, !(contains_free_axis || has_unused_free_axes), None)
             }
-            ShardingDimension::Unconstrained => context.shardy_dimension_sharding(&[], false, None),
+            ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
         })
         .collect()
 }
@@ -3246,14 +3246,14 @@ mod tests {
         assert_eq!(shard_map.local_input_shape(0, &[8]).unwrap(), vec![2]);
         assert_eq!(shard_map.local_output_shape(0, &[8]).unwrap(), vec![2]);
 
-        let input_sharding = shard_map.in_shardings()[0].to_shardy_tensor_sharding_attribute();
-        let output_sharding = shard_map.out_shardings()[0].to_shardy_tensor_sharding_attribute();
-        let manual_computation_attributes = shard_map.to_shardy_manual_computation_attributes();
         let context = MlirContext::new();
+        let input_sharding = shard_map.in_shardings()[0].to_shardy(context.unknown_location()).to_string();
+        let output_sharding = shard_map.out_shardings()[0].to_shardy(context.unknown_location()).to_string();
+        let manual_computation_attributes = shard_map.to_shardy_manual_computation_attributes();
         let mesh_module = context.module(context.unknown_location());
         let mesh_operation = mesh_module
             .body()
-            .append_operation(shard_map.mesh().to_shardy_mesh(context.unknown_location()))
+            .append_operation(shard_map.mesh().to_shardy(context.unknown_location()))
             .to_string();
 
         let mlir_program = format!(

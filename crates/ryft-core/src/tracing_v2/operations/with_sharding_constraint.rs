@@ -150,7 +150,7 @@ impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
     {
         let operation = lowerer.block.append_operation(shardy::sharding_constraint(
             input_values[0],
-            self.sharding().to_shardy_tensor_sharding(lowerer.context),
+            self.sharding().to_shardy(lowerer.location),
             lowerer.location,
         ));
         Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])

@@ -335,15 +335,15 @@ impl<'t> Context<'t> {
     ///   - `axes`: Axis refs used to shard one tensor dimension.
     ///   - `is_closed`: Whether the dimension is closed to additional sharding.
     ///   - `priority`: Optional user-defined priority.
-    pub fn shardy_dimension_sharding<'c>(
+    pub fn shardy_dimension_sharding<'c, I: IntoIterator<Item = AxisRefAttributeRef<'c, 't>>>(
         &'c self,
-        axes: &[AxisRefAttributeRef<'c, 't>],
+        axes: I,
         is_closed: bool,
         priority: Option<usize>,
     ) -> DimensionShardingAttributeRef<'c, 't> {
         self.load_dialect(DialectHandle::shardy());
         unsafe {
-            let axes = axes.iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
+            let axes = axes.into_iter().map(|axis| axis.to_c_api()).collect::<Vec<_>>();
             DimensionShardingAttributeRef::from_c_api(
                 sdyDimensionShardingAttrGet(
                     *self.handle.borrow(),
@@ -1273,7 +1273,7 @@ mod tests {
     fn test_dimension_sharding_attribute() {
         let context = Context::new();
         let axis_ref = context.shardy_axis_ref("data", None);
-        let attribute = context.shardy_dimension_sharding(&[axis_ref], true, Some(2));
+        let attribute = context.shardy_dimension_sharding([axis_ref], true, Some(2));
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.axes(), vec![axis_ref]);
         assert!(attribute.is_closed());
@@ -1383,7 +1383,7 @@ mod tests {
         let mesh_axis = context.shardy_mesh_axis("x", 2);
         let mesh = context.shardy_mesh([mesh_axis], &[]);
         let axis_ref = context.shardy_axis_ref("x", None);
-        let dim_sharding = context.shardy_dimension_sharding(&[axis_ref], true, None);
+        let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None);
         let attribute = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[axis_ref], &[]);
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.mesh_or_ref(), mesh.as_ref());
@@ -1399,7 +1399,7 @@ mod tests {
         let mesh_axis = context.shardy_mesh_axis("x", 2);
         let mesh = context.shardy_mesh([mesh_axis], &[]);
         let axis_ref = context.shardy_axis_ref("x", None);
-        let dim_sharding = context.shardy_dimension_sharding(&[axis_ref], true, None);
+        let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None);
         let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]);
         let attribute = context.shardy_tensor_sharding_per_value(&[tensor_sharding]);
         assert_eq!(&context, attribute.context());

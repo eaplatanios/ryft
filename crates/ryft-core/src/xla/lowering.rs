@@ -252,14 +252,14 @@ where
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
-    let mesh_operation = shard_map.mesh().to_shardy_mesh(location);
+    let mesh_operation = shard_map.mesh().to_shardy(location);
     module.body().append_operation(mesh_operation);
 
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(shard_map.in_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy_tensor_sharding(&context);
+            let sharding = sharding.to_shardy(location);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -270,7 +270,7 @@ where
         .iter()
         .zip(shard_map.out_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy_tensor_sharding(&context);
+            let sharding = sharding.to_shardy(location);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -340,7 +340,7 @@ where
     let module = context.module(location);
 
     if let Some(mesh) = collect_nested_sharding_mesh(graph, None)? {
-        let mesh_operation = mesh.to_shardy_mesh(location);
+        let mesh_operation = mesh.to_shardy(location);
         module.body().append_operation(mesh_operation);
     }
 

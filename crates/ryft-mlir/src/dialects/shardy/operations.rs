@@ -745,7 +745,7 @@ mod tests {
         let mesh_axis = context.shardy_mesh_axis("a", 2);
         let mesh = context.shardy_mesh([mesh_axis], &[]);
         let axis_ref = context.shardy_axis_ref("a", None);
-        let dim_sharding = context.shardy_dimension_sharding(&[axis_ref], true, None);
+        let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None);
         let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]);
         let tensor_sharding_per_value = context.shardy_tensor_sharding_per_value(&[tensor_sharding]);
         let manual_axes = context.shardy_manual_axes(&["a"]);
@@ -845,7 +845,7 @@ mod tests {
         let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(8)], None, location).unwrap();
         let mesh_axis = context.shardy_mesh_axis("a", 2);
         let mesh = context.shardy_mesh([mesh_axis], &[]);
-        let empty_dimension_sharding = context.shardy_dimension_sharding(&[], true, None);
+        let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None);
         let out_sharding = context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[]);
         let reduction_axes = test_operation_attribute(
             &context,
@@ -972,8 +972,8 @@ mod tests {
         let mesh_axis = context.shardy_mesh_axis("a", 2);
         let mesh = context.shardy_mesh([mesh_axis], &[]);
         let axis_ref = context.shardy_axis_ref("a", None);
-        let dimension_sharding = context.shardy_dimension_sharding(&[axis_ref], true, None);
-        let empty_dimension_sharding = context.shardy_dimension_sharding(&[], true, None);
+        let dimension_sharding = context.shardy_dimension_sharding([axis_ref], true, None);
+        let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None);
         let input_sharding =
             context.shardy_tensor_sharding(mesh, &[dimension_sharding, empty_dimension_sharding], &[], &[]);
         let output_sharding =
@@ -1241,7 +1241,7 @@ mod tests {
         let mesh_axis = context.shardy_mesh_axis("a", 2);
         let mesh = context.shardy_mesh([mesh_axis], &[]);
         let axis_ref = context.shardy_axis_ref("a", None);
-        let empty_dimension_sharding = context.shardy_dimension_sharding(&[], true, None);
+        let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None);
         let input_sharding = context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[axis_ref], &[]);
         let output_sharding = context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[axis_ref]);
         let axes = test_operation_attribute(
