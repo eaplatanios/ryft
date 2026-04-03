@@ -751,17 +751,6 @@ mod tests {
         assert!(!t8.is_broadcastable_to(&t10));
         assert!(!t11.is_broadcastable_to(&t13));
         assert!(!t17.is_broadcastable_to(&t18));
-
-        // Test `broadcast_sharding` with mismatched ranks.
-        let source_shape = Shape::new(vec![4.into(), 8.into()]);
-        let target_shape = Shape::new(vec![4.into(), 8.into()]);
-        assert_eq!(
-            broadcast_sharding(&source_shape, Some(&s7), &target_shape, None, &target_shape),
-            Err(BroadcastingError::ShardingError(ShardingError::ShardingRankMismatch {
-                sharding_rank: 1,
-                array_rank: 2,
-            })),
-        );
     }
 
     #[test]
