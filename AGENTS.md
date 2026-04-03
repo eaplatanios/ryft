@@ -37,7 +37,9 @@ When asked to implement a change or add a new feature, you must always follow th
 4. **Verification:** Never consider a task as completed without first proving that it is. Look at the diff between the
    code before and after your changes to determine what changed and needs testing. Then, ask yourself "Would a staff
    engineer approve this? Also, what tests would they want me to run or even add to do so?". Run tests, check the logs,
-   demonstrate correctness, and iterate if you are not there yet.
+   demonstrate correctness, and iterate if you are not there yet. When running potentially expensive verification
+   commands locally, start with an explicit timeout of 300 seconds per command unless the user asks for a longer run.
+   Do not let test or benchmark commands sit for many minutes by default.
 5. **Elegance:** For non-trivial changes pause and ask yourself "Is there a more elegant way to do this?". If a change
    feels hacky, implement an elegent solution knowing everything that you know by this point. For non-trivial changes,
    always challenge your work before presenting it.
@@ -72,6 +74,11 @@ update this file so that they do not need to remind you again in the future.
   redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
 - For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
   call site instead of extracting a helper that adds indirection without meaningful reuse.
+- When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
+  parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
+  abstraction and keep one source of truth.
+- Prefer putting type bounds directly in the generic type declarations over using `where` bounds later on in the same
+  signature.
 
 #### Formatting & Naming
 
@@ -159,7 +166,9 @@ update this file so that they do not need to remind you again in the future.
 
 - Every struct, enum, trait, module, and function should have a documentation string. Enum variants should have 
   documentation unless their name is self-explanatory. If an enum variant requires a documentation string, then you must
-  add documentation for all variants in that enum and separate them with an empty line.
+  add documentation for all variants in that enum.
+- When enum variants have documentation strings, keep an empty line between adjacent documented variants even for short
+  unit variants or small enums.
 - Prefer descriptive documentation that explains semantics and edge cases and includes examples where appropriate.
 - When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code
   "matches" another system such as JAX unless the external comparison is itself the point of the documentation.

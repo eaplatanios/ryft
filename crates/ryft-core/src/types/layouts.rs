@@ -8,7 +8,7 @@ use ryft_pjrt::{
     TiledLayout as PjrtTiledLayout,
 };
 
-/// Errors produced when handling [`Layout`]s.
+/// Represents [`Layout`]-related errors.
 #[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum LayoutError {
     #[error("invalid layout: {message}")]

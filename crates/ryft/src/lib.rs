@@ -9,6 +9,10 @@ pub use ryft_core::parameters::{
     Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
     PathPrefixedParameterIterator, Placeholder,
 };
+pub use ryft_core::sharding::{
+    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId, MeshProcessIndex, Sharding,
+    ShardingDimension, ShardingError,
+};
 pub use ryft_core::types::Type;
 pub use ryft_core::types::array_types::{ArrayType, Shape, Size};
 pub use ryft_core::types::data_types::{DataType, DataTypeError};
