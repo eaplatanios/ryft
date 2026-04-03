@@ -1047,6 +1047,10 @@ fn varying_axes(sharding: Option<&Sharding>) -> BTreeSet<String> {
 }
 
 fn sharding_with_varying_manual_axes(sharding: &Sharding, varying_axes: BTreeSet<String>) -> Sharding {
+    let varying_axes = varying_axes
+        .into_iter()
+        .filter(|axis_name| sharding.mesh.axis_type(axis_name) == Some(MeshAxisType::Manual))
+        .collect::<BTreeSet<_>>();
     Sharding::new(
         sharding.mesh.clone(),
         sharding.dimensions.clone(),

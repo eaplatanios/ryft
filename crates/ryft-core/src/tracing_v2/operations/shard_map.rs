@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     parameters::{Parameterized, ParameterizedFamily},
-    sharding::{LogicalMesh, Sharding},
+    sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
         AtomId, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op, ProgramBuilder,
         TraceError, TraceValue, ZeroLike,
@@ -158,6 +158,14 @@ impl<V: TraceValue> Display for ShardMapOp<V> {
 
 /// Returns `true` when two shard-map boundary types agree apart from carried sharding metadata.
 fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
+    fn varying_manual_axes_match(actual: &Sharding, expected: &Sharding) -> bool {
+        actual
+            .varying_manual_axes
+            .iter()
+            .filter(|axis_name| expected.mesh.axis_type(axis_name.as_str()) == Some(MeshAxisType::Manual))
+            .eq(expected.varying_manual_axes.iter())
+    }
+
     actual.data_type == expected.data_type
         && actual.shape == expected.shape
         && actual.layout == expected.layout
@@ -166,7 +174,7 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
             (Some(actual), Some(expected)) => {
                 actual.unreduced_axes == expected.unreduced_axes
                     && actual.reduced_manual_axes == expected.reduced_manual_axes
-                    && actual.varying_manual_axes == expected.varying_manual_axes
+                    && varying_manual_axes_match(actual, expected)
             }
             (None, Some(expected)) => {
                 expected.unreduced_axes.is_empty()
