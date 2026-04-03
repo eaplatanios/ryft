@@ -155,8 +155,7 @@
 //! This mirrors JAX's `array.addressable_shards` (local) vs `array.global_shards` (all),
 //! where accessing `.data` on a non-addressable shard raises an error.
 
-use std::collections::{BTreeSet, HashMap};
-use std::fmt::{Display, Formatter};
+use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::sharding::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDimension, ShardingError};
@@ -256,62 +255,6 @@ impl Sharding {
         let cell_height =
             if global_shape.len() == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
         Ok(render_visualization(cells.as_slice(), cell_width, cell_height, colored))
-    }
-}
-
-impl Display for Sharding {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        fn write_axis_set(formatter: &mut Formatter<'_>, axis_names: &BTreeSet<String>) -> std::fmt::Result {
-            write!(formatter, "{{")?;
-            for (axis_index, axis_name) in axis_names.iter().enumerate() {
-                if axis_index > 0 {
-                    write!(formatter, ", ")?;
-                }
-                write!(formatter, "'{}'", axis_name.replace('\'', "\\'"))?;
-            }
-            write!(formatter, "}}")
-        }
-
-        write!(formatter, "{{mesh<[")?;
-        for (axis_index, axis) in self.mesh.axes.iter().enumerate() {
-            if axis_index > 0 {
-                write!(formatter, ", ")?;
-            }
-            write!(formatter, "'{}'", axis.name.replace('\'', "\\'"))?;
-            write!(formatter, "={}", axis.size)?;
-        }
-        write!(formatter, "]>, [")?;
-        for (dimension_index, dimension) in self.dimensions.iter().enumerate() {
-            if dimension_index > 0 {
-                write!(formatter, ", ")?;
-            }
-            write!(formatter, "{dimension}")?;
-        }
-        write!(formatter, "]")?;
-        let replicated_axes = self.replicated_axes();
-        if !replicated_axes.is_empty() {
-            write!(formatter, ", replicated={{")?;
-            for (axis_index, axis_name) in replicated_axes.iter().enumerate() {
-                if axis_index > 0 {
-                    write!(formatter, ", ")?;
-                }
-                write!(formatter, "'{}'", axis_name.replace('\'', "\\'"))?;
-            }
-            write!(formatter, "}}")?;
-        }
-        if !self.unreduced_axes.is_empty() {
-            write!(formatter, ", unreduced=")?;
-            write_axis_set(formatter, &self.unreduced_axes)?;
-        }
-        if !self.reduced_manual_axes.is_empty() {
-            write!(formatter, ", reduced=")?;
-            write_axis_set(formatter, &self.reduced_manual_axes)?;
-        }
-        if !self.varying_manual_axes.is_empty() {
-            write!(formatter, ", varying=")?;
-            write_axis_set(formatter, &self.varying_manual_axes)?;
-        }
-        write!(formatter, "}}")
     }
 }
 
@@ -772,7 +715,7 @@ impl ShardingLayout {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::HashSet;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -1017,49 +960,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_varying_manual_axes_validation() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["z"]),
-            Ok(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["z"])
-                .unwrap())
-        );
-
-        assert_eq!(
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["x", "x"]),
-            Ok(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["x"])
-                .unwrap())
-        );
-
-        assert!(matches!(
-            Sharding::new(mesh, vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["unknown"]),
-            Err(ShardingError::UnknownMeshAxisName { name }) if name == "unknown",
-        ));
-    }
-
-    #[test]
-    fn test_sharding_preserves_varying_manual_axes() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["x"])
-                .map(|sharding| sharding.varying_manual_axes),
-            Ok(BTreeSet::from(["x".to_string()]))
-        );
-    }
-
-    #[test]
     fn test_sharding_display() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
@@ -1082,8 +982,8 @@ mod tests {
 
         assert_eq!(
             sharding.to_string(),
-            "{mesh<['data'=4, 'manual'=2, 'carry'=8]>, [{'data'}, {}, {?}], unreduced={'carry'}, reduced={'manual'}, \
-             varying={'manual'}}"
+            "{mesh<['data'=4, 'manual'=2, 'carry'=8]>, [{'data'}, {}, {?}], unreduced={'carry'}, \
+            reduced_manual={'manual'}, varying_manual={'manual'}}",
         );
     }
 

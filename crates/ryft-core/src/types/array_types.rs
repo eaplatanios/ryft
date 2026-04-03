@@ -413,6 +413,6 @@ mod tests {
         assert_eq!(format!("{t5}"), "f8e4m3fn[42, *]");
         assert_eq!(format!("{t6}"), "f32[4, 2][layout=tiled{1,0:T(2)}]");
         assert_eq!(format!("{t7}"), "f32[4, 2][layout=strided{8,4}]");
-        assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4]>, [{'x'}], varying={'x'}}]");
+        assert_eq!(format!("{t8}"), "f32[8][sharding={mesh<['x'=4]>, [{'x'}], varying_manual={'x'}}]");
     }
 }

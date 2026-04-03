@@ -647,6 +647,62 @@ impl Sharding {
     }
 }
 
+impl Display for Sharding {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        fn write_names<I, S>(formatter: &mut Formatter<'_>, names: I) -> std::fmt::Result
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<str>,
+        {
+            write!(formatter, "{{")?;
+            write!(
+                formatter,
+                "{}",
+                names
+                    .into_iter()
+                    .map(|name| format!("'{}'", name.as_ref().replace('\'', "\\'")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+            write!(formatter, "}}")
+        }
+
+        write!(formatter, "{{mesh<[")?;
+        write!(
+            formatter,
+            "{}",
+            self.mesh
+                .axes
+                .iter()
+                .map(|axis| format!("'{}'={}", axis.name.replace('\'', "\\'"), axis.size))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+        write!(formatter, "]>")?;
+
+        write!(formatter, ", [")?;
+        write!(formatter, "{}", self.dimensions.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))?;
+        write!(formatter, "]")?;
+
+        if !self.unreduced_axes.is_empty() {
+            write!(formatter, ", unreduced=")?;
+            write_names(formatter, self.unreduced_axes.iter())?;
+        }
+
+        if !self.reduced_manual_axes.is_empty() {
+            write!(formatter, ", reduced_manual=")?;
+            write_names(formatter, self.reduced_manual_axes.iter())?;
+        }
+
+        if !self.varying_manual_axes.is_empty() {
+            write!(formatter, ", varying_manual=")?;
+            write_names(formatter, self.varying_manual_axes.iter())?;
+        }
+
+        write!(formatter, "}}")
+    }
+}
+
 #[cfg(feature = "xla")]
 impl Sharding {
     /// Creates a new [`shardy::TensorShardingAttributeRef`] that corresponds to this [`Sharding`].
@@ -886,6 +942,10 @@ mod tests {
         assert_eq!(sharding.varying_manual_axes, BTreeSet::from(["manual".to_string()]));
         assert_eq!(sharding.rank(), 2);
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
+        assert_eq!(
+            sharding.to_string(),
+            "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced_manual={'manual'}, varying_manual={'manual'}}",
+        );
 
         let replicated = Sharding::replicated(mesh.clone(), 3);
         assert_eq!(replicated.mesh, mesh);
@@ -898,6 +958,7 @@ mod tests {
         assert_eq!(replicated.varying_manual_axes, BTreeSet::new());
         assert_eq!(replicated.rank(), 3);
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
+        assert_eq!(replicated.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{}, {}, {}]}");
     }
 
     #[test]
