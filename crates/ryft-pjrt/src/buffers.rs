@@ -2317,7 +2317,7 @@ impl<'s> Client<'s> {
         )
         .and_then(|handle| unsafe { Buffer::from_c_api(handle, self.api(), self.to_c_api()) })
     }
-    
+
     /// Creates a new _poisoned_ [`Buffer`] that represents an error state. Instead of a standard buffer containing
     /// valid data, this function creates a [`Buffer`] that carries a specific [`Error`]. This is particularly useful
     /// for asynchronous execution and error propagation across the PJRT interface.
@@ -4233,7 +4233,7 @@ mod tests {
             Err(Error::Aborted { message, .. }) if message.contains("test error"),
         ));
 
-        let payload = [NamedValue::new("launch_id", 17i64), NamedValue::new("reason", "unit-test")];
+        let payload = [NamedValue::new("launch_id", "17"), NamedValue::new("reason", "unit-test")];
         let buffer = client.error_buffer_with_payload(error, specification, device, &payload).unwrap();
         assert!(matches!(
             buffer.ready().unwrap().r#await(),
