@@ -166,10 +166,10 @@ use ryft_mlir::dialects::shardy::{DimensionShardingAttributeRef, TensorShardingA
 
 #[cfg(feature = "xla")]
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
-use crate::sharding::{DeviceMesh, MeshAxisType, MeshDevice, MeshDeviceId, Sharding, ShardingDimension, ShardingError};
+use crate::sharding::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDimension, ShardingError};
 
 #[cfg(test)]
-use crate::sharding::LogicalMesh;
+use crate::sharding::{LogicalMesh, MeshAxisType};
 
 impl Sharding {
     /// Renders a visualization of this sharding over a concrete device mesh.
@@ -261,60 +261,6 @@ impl Sharding {
         let cell_height =
             if global_shape.len() == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
         Ok(render_visualization(cells.as_slice(), cell_width, cell_height, colored))
-    }
-
-    /// Projects this sharding into traced/type-level semantics by hiding `Auto` mesh axes.
-    ///
-    /// This mirrors JAX's distinction between concrete shardings and type-specified shardings:
-    /// auto axes may exist in the concrete mesh and runtime placement, but they are omitted from
-    /// the traced sharding view carried by types.
-    pub(crate) fn project_for_traced_sharding(&self) -> Self {
-        let dimensions = self
-            .dimensions
-            .iter()
-            .map(|dimension| match dimension {
-                ShardingDimension::Replicated => ShardingDimension::Replicated,
-                ShardingDimension::Unconstrained => ShardingDimension::Unconstrained,
-                ShardingDimension::Sharded(axis_names) => {
-                    let visible_axis_names = axis_names
-                        .iter()
-                        .filter(|axis_name| {
-                            matches!(
-                                self.mesh.axis_type(axis_name),
-                                Some(MeshAxisType::Explicit | MeshAxisType::Manual)
-                            )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if visible_axis_names.is_empty() {
-                        ShardingDimension::Replicated
-                    } else {
-                        ShardingDimension::Sharded(visible_axis_names)
-                    }
-                }
-            })
-            .collect();
-        let unreduced_axes = self
-            .unreduced_axes
-            .iter()
-            .filter(|axis_name| {
-                matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Explicit | MeshAxisType::Manual))
-            })
-            .cloned()
-            .collect();
-        let reduced_manual_axes = self
-            .reduced_manual_axes
-            .iter()
-            .filter(|axis_name| matches!(self.mesh.axis_type(axis_name), Some(MeshAxisType::Manual)))
-            .cloned()
-            .collect();
-        Self {
-            mesh: self.mesh.clone(),
-            dimensions,
-            unreduced_axes,
-            reduced_manual_axes,
-            varying_manual_axes: self.varying_manual_axes.clone(),
-        }
     }
 
     /// Renders this sharding as a Shardy tensor sharding attribute.
@@ -955,47 +901,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_sharding_project_for_traced_sharding_hides_auto_axes() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("data", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("model", 4, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("batch", 8, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("hidden", 16, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("reduction", 16, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("carry", 32, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let sharding = Sharding::new(
-            mesh.clone(),
-            vec![
-                ShardingDimension::sharded(["data", "model", "batch"]),
-                ShardingDimension::sharded(["hidden"]),
-                ShardingDimension::replicated(),
-            ],
-            ["reduction", "carry"],
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            sharding.project_for_traced_sharding(),
-            Sharding::new(
-                mesh,
-                vec![
-                    ShardingDimension::sharded(["data", "batch"]),
-                    ShardingDimension::replicated(),
-                    ShardingDimension::replicated(),
-                ],
-                ["carry"],
-                empty_axes(),
-                empty_axes(),
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
     fn test_sharding_validation() {
         let mesh = test_logical_mesh_2x2();
 
@@ -1125,34 +1030,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_project_for_traced_sharding_filters_auto_axes() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("w", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let sharding = Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x", "y", "z"])],
-            ["w"],
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
-        let projected = sharding.project_for_traced_sharding();
-
-        assert_eq!(
-            projected,
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["x", "z"])], empty_axes(), empty_axes(), empty_axes())
-                .unwrap()
-        );
-        assert!(projected.replicated_axes().is_empty());
-        assert!(projected.unreduced_axes.is_empty());
-    }
-
-    #[test]
     fn test_sharding_unreduced_axis_validation() {
         let mesh = test_logical_mesh_2x2();
         let sharding = Sharding::new(
@@ -1232,28 +1109,6 @@ mod tests {
             Sharding::new(mesh, vec![ShardingDimension::replicated()], empty_axes(), empty_axes(), ["unknown"]),
             Err(ShardingError::UnknownMeshAxisName { name }) if name == "unknown",
         ));
-    }
-
-    #[test]
-    fn test_sharding_project_for_traced_sharding_filters_reduced_axes() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let sharding = Sharding {
-            mesh: mesh.clone(),
-            dimensions: vec![ShardingDimension::replicated()],
-            unreduced_axes: BTreeSet::new(),
-            reduced_manual_axes: BTreeSet::from(["x".to_string(), "y".to_string(), "z".to_string()]),
-            varying_manual_axes: BTreeSet::from(["y".to_string()]),
-        };
-
-        assert_eq!(
-            sharding.project_for_traced_sharding(),
-            Sharding::new(mesh, vec![ShardingDimension::replicated()], empty_axes(), ["x", "z"], ["y"],).unwrap()
-        );
     }
 
     #[test]

@@ -1394,7 +1394,7 @@ fn build_shardings(
                 }));
             }
             validate_manual_axis_order(&sharding, &manual_axis_names, value_kind, value_index)?;
-            Ok(sharding.project_for_traced_sharding())
+            Ok(sharding.without_auto_axes())
         })
         .collect()
 }
@@ -2525,7 +2525,7 @@ mod tests {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(16)]), None, None);
         let mesh = test_logical_mesh_data_model();
         let input_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![]);
-        let projected_sharding = input_sharding.project_for_traced_sharding();
+        let projected_sharding = input_sharding.without_auto_axes();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
             global_input_type.clone(),

@@ -5,7 +5,8 @@ use thiserror::Error;
 use crate::{
     parameters::{ParameterError, Parameterized},
     sharding::{Sharding, ShardingDimension, ShardingError},
-    types::{data_types::DataTypeError, ArrayType, DataType, Shape, Size},
+    types::data_types::DataTypeError,
+    types::{ArrayType, DataType, Shape, Size},
 };
 
 /// Represents broadcasting-related errors.

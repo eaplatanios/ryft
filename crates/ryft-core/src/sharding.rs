@@ -564,6 +564,10 @@ impl Sharding {
             if !sharding.mesh.axis_indices.contains_key(axis_name) {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
+
+            if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
+                return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
+            }
         }
 
         Ok(sharding)
@@ -582,7 +586,7 @@ impl Sharding {
             varying_manual_axes: BTreeSet::new(),
         }
     }
-    
+
     /// Returns the rank (i.e., number of dimensions) of this [`Sharding`].
     #[inline]
     pub fn rank(&self) -> usize {
@@ -609,6 +613,43 @@ impl Sharding {
                 .then_some(axis_name)
             })
             .collect()
+    }
+
+    /// Returns a copy of this [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.
+    pub(crate) fn without_auto_axes(&self) -> Self {
+        let dimensions = self
+            .dimensions
+            .iter()
+            .map(|dimension| match dimension {
+                ShardingDimension::Replicated => ShardingDimension::Replicated,
+                ShardingDimension::Unconstrained => ShardingDimension::Unconstrained,
+                ShardingDimension::Sharded(axis_names) => {
+                    let axis_names = axis_names
+                        .iter()
+                        .filter(|axis_name| match self.mesh.axis_type(axis_name) {
+                            Some(MeshAxisType::Explicit | MeshAxisType::Manual) => true,
+                            _ => false,
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if axis_names.is_empty() {
+                        ShardingDimension::Replicated
+                    } else {
+                        ShardingDimension::Sharded(axis_names)
+                    }
+                }
+            })
+            .collect();
+        let unreduced_axes = self
+            .unreduced_axes
+            .iter()
+            .filter(|axis_name| match self.mesh.axis_type(axis_name) {
+                Some(MeshAxisType::Explicit | MeshAxisType::Manual) => true,
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        Self { dimensions, unreduced_axes, ..self.clone() }
     }
 }
 
@@ -821,5 +862,94 @@ mod tests {
         assert_eq!(replicated.varying_manual_axes, BTreeSet::new());
         assert_eq!(replicated.rank(), 3);
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
+    }
+
+    #[test]
+    fn test_sharding_without_auto_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("model", 4, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("batch", 8, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("hidden", 16, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("reduction", 16, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("carry", 32, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![
+                ShardingDimension::sharded(["data", "model", "batch"]),
+                ShardingDimension::sharded(["hidden"]),
+                ShardingDimension::replicated(),
+            ],
+            ["reduction", "carry"],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            sharding.without_auto_axes(),
+            Sharding::new(
+                mesh,
+                vec![
+                    ShardingDimension::sharded(["data", "batch"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::replicated(),
+                ],
+                ["carry"],
+                Vec::<&str>::new(),
+                Vec::<&str>::new(),
+            )
+            .unwrap(),
+        );
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("w", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x", "y", "z"])],
+            ["w"],
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+        )
+        .unwrap()
+        .without_auto_axes();
+        assert_eq!(
+            sharding,
+            Sharding::new(
+                mesh,
+                vec![ShardingDimension::sharded(["x", "z"])],
+                Vec::<&str>::new(),
+                Vec::<&str>::new(),
+                Vec::<&str>::new(),
+            )
+            .unwrap(),
+        );
+        assert!(sharding.replicated_axes().is_empty());
+        assert!(sharding.unreduced_axes.is_empty());
+
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated()],
+            Vec::<&str>::new(),
+            BTreeSet::from(["x".to_string(), "z".to_string()]),
+            BTreeSet::from(["x".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            sharding.without_auto_axes(),
+            Sharding::new(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["x", "z"], ["x"],).unwrap(),
+        );
     }
 }

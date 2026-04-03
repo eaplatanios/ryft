@@ -130,7 +130,7 @@ fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
         sharding.reduced_manual_axes.clone(),
         sharding.varying_manual_axes.clone(),
     )
-    .map(|sharding| sharding.project_for_traced_sharding())
+    .map(|sharding| sharding.without_auto_axes())
     .ok()
 }
 
@@ -155,7 +155,7 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
         merge_unique_axes(&left.reduced_manual_axes, &right.reduced_manual_axes),
         merge_unique_axes(&left.varying_manual_axes, &right.varying_manual_axes),
     )
-    .map(|sharding| sharding.project_for_traced_sharding())
+    .map(|sharding| sharding.without_auto_axes())
     .ok()
 }
 
