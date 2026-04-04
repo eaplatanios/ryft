@@ -40,6 +40,7 @@ pub use linear::{
 };
 pub(crate) use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
+pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub(crate) use ops::{Op, StagedOpRef};
 pub(crate) use program::{Program, ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};

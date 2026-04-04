@@ -70,6 +70,9 @@ pub(crate) mod mul;
 /// Elementwise negation.
 pub(crate) mod neg;
 
+/// Reshaping primitive.
+pub(crate) mod reshape;
+
 /// Linear right matrix multiplication.
 pub(crate) mod right_matmul;
 
