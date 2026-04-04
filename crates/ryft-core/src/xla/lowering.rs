@@ -652,6 +652,7 @@ fn packed_array_type(array_type: &ArrayType, lane_count: usize) -> ArrayType {
     dimensions.push(Size::Static(lane_count));
     dimensions.extend(array_type.shape.dimensions.iter().cloned());
     ArrayType::new(array_type.data_type, Shape::new(dimensions), None, None)
+        .expect("packed array types are constructed without sharding")
 }
 
 /// Returns the tensor type obtained by prepending a leading axis of size one.
@@ -688,9 +689,7 @@ where
 {
     let scalar_tensor_type = context
         .tensor_type(lower_element_type(data_type, context)?, &[], None, location)
-        .ok_or_else(|| LoweringError::InvalidTensorType {
-            array_type: ArrayType::new(data_type, Shape::new(Vec::new()), None, None),
-        })?;
+        .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(data_type) })?;
     let elements = lower_constant_elements_attribute(data_type, scalar_tensor_type, constant_kind, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location));
     Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
@@ -1374,9 +1373,7 @@ where
     if !value_type.shape.dimensions.is_empty() {
         let scalar_tensor_type = context
             .tensor_type(lower_element_type(value_type.data_type, context)?, &[], None, location)
-            .ok_or_else(|| LoweringError::InvalidTensorType {
-                array_type: ArrayType::new(value_type.data_type, crate::types::Shape::new(Vec::new()), None, None),
-            })?;
+            .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(value_type.data_type) })?;
         if let Some(scalar_elements) = value.to_scalar_dense_elements_attribute(scalar_tensor_type, context)? {
             let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location));
             let tensor_type = lower_tensor_type(&value_type, context, location)?;
@@ -1414,7 +1411,7 @@ where
         let scalar_tensor_type = context
             .tensor_type(lower_element_type(value.r#type().data_type, context)?, &[], None, location)
             .ok_or_else(|| LoweringError::InvalidTensorType {
-                array_type: ArrayType::new(value.r#type().data_type, crate::types::Shape::new(Vec::new()), None, None),
+                array_type: ArrayType::scalar(value.r#type().data_type),
             })?;
         let scalar_elements =
             lower_constant_elements_attribute(value.r#type().data_type, scalar_tensor_type, constant_kind, context)?;
@@ -1753,11 +1750,11 @@ mod tests {
     }
 
     fn test_vector_type(length: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]), None, None)
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(length)]), None, None).unwrap()
     }
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
-        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
+        ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None).unwrap()
     }
 
     fn lower_traced_module(

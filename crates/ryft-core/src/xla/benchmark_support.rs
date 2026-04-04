@@ -91,6 +91,7 @@ fn replicated_2d_sharding(mesh: &LogicalMesh) -> Sharding {
 ///   - `size`: Static vector length.
 fn vector_type(size: usize) -> ArrayType {
     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(size)]), None, None)
+        .expect("benchmark vector types are constructed without sharding")
 }
 
 /// Returns a rank-2 benchmark array type.
@@ -101,6 +102,7 @@ fn vector_type(size: usize) -> ArrayType {
 ///   - `cols`: Matrix column count.
 fn matrix_type(rows: usize, cols: usize) -> ArrayType {
     ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None)
+        .expect("benchmark matrix types are constructed without sharding")
 }
 
 /// Summarizes one erased nested shard-map body.

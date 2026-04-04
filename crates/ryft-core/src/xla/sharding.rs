@@ -964,6 +964,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("varying", 8, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("carry", 8, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
@@ -976,14 +977,14 @@ mod tests {
             ],
             ["carry"],
             ["manual"],
-            ["manual"],
+            ["varying"],
         )
         .unwrap();
 
         assert_eq!(
             sharding.to_string(),
-            "{mesh<['data'=4, 'manual'=2, 'carry'=8]>, [{'data'}, {}, {?}], unreduced={'carry'}, \
-            reduced_manual={'manual'}, varying_manual={'manual'}}",
+            "{mesh<['data'=4, 'manual'=2, 'varying'=8, 'carry'=8]>, [{'data'}, {}, {?}], unreduced={'carry'}, \
+            reduced_manual={'manual'}, varying_manual={'varying'}}",
         );
     }
 

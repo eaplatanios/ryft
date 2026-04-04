@@ -137,12 +137,13 @@ pub(crate) fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Re
         Err(TraceError::IncompatibleAbstractValues { op })
     } else {
         let sharding = binary_output_sharding(inputs);
-        Ok(ArrayType::new(
+        ArrayType::new(
             inputs[0].data_type,
             inputs[0].shape.clone(),
             if inputs[0].layout == inputs[1].layout { inputs[0].layout.clone() } else { None },
-            sharding.clone(),
-        ))
+            sharding,
+        )
+        .map_err(|_| TraceError::InternalInvariantViolation("binary output sharding should match operand rank"))
     }
 }
 
@@ -179,7 +180,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-        );
+        )
+        .unwrap();
         let right = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Size::Static(8)]),
@@ -194,7 +196,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().varying_manual_axes),
@@ -219,7 +222,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-        );
+        )
+        .unwrap();
         let right = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Size::Static(8)]),
@@ -234,7 +238,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             binary_same_abstract("add", &[left, right]).map(|output| output.sharding.unwrap().reduced_manual_axes),

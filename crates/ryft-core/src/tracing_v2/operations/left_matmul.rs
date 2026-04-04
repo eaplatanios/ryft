@@ -131,6 +131,7 @@ impl<V: MatrixValue> Op<V> for LeftMatMulOp<V> {
             let transposed_output_abstract = match output_abstract.shape.dimensions.as_slice() {
                 [first, second] => {
                     ArrayType::new(output_abstract.data_type, Shape::new(vec![*second, *first]), None, None)
+                        .expect("transposed matrix output without sharding should always be valid")
                 }
                 _ => return Err(LoweringError::UnsupportedOp { op: self.name().to_string() }),
             };
