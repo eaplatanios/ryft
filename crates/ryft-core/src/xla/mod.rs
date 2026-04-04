@@ -9,7 +9,10 @@ pub(crate) mod shard_map;
 pub mod sharding;
 
 #[cfg(feature = "xla")]
-pub use arrays::{Array, ArrayError, ArrayShard, ExecuteArguments};
+pub use arrays::{
+    Array, ArrayError, ArrayShard, DevicePutLeaf, DevicePutOptions, DevicePutPlacement, DevicePutSharding,
+    ExecuteArguments, device_put, device_put_bytes,
+};
 #[cfg(feature = "xla")]
 pub use shard_map::{
     ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, shard_map_with_options, trace,

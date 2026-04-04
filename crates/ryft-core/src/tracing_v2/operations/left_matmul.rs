@@ -6,7 +6,9 @@ use std::{
 };
 
 #[cfg(feature = "xla")]
-use ryft_mlir::ValueRef;
+use ryft_mlir::dialects::stable_hlo;
+#[cfg(feature = "xla")]
+use ryft_mlir::{Block, Operation, Value, ValueRef};
 
 use crate::tracing_v2::{
     FloatExt, TraceError, TransformLeaf, ZeroLike,
@@ -18,7 +20,7 @@ use crate::tracing_v2::{
     ops::{BatchOp, Op},
     program::ProgramBuilder,
 };
-use crate::types::{ArrayType, Typed};
+use crate::types::{ArrayType, Shape, Typed};
 #[cfg(feature = "xla")]
 use crate::xla::lowering::{LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode};
 
