@@ -7,7 +7,7 @@
 //! - [`device_put`] is the higher-level `ryft` analogue of JAX's
 //!   [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) over
 //!   supported host leaves, [`Array`] leaves, and `Parameterized` trees of those leaves.
-//! - [`device_put_bytes`] is the lower-level raw dense-host-bytes uploader used by
+//! - [`Array::from_host_buffer`] is the lower-level dense-host-buffer constructor used by
 //!   [`device_put`] and by tests that need explicit byte-level control.
 //! - [`Array`] corresponds to `jax.Array` / IFRT `Array`: global type and shard-placement
 //!   metadata plus local addressable device buffers.
@@ -315,7 +315,7 @@ fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ArrayError> {
 
 /// Returns the dense host-storage size in bytes for one `element_type` value.
 ///
-/// [`device_put_bytes`] currently accepts raw dense host bytes rather than a typed host container. It
+/// [`Array::from_host_buffer`] accepts raw dense host bytes rather than a typed host container. It
 /// therefore supports only element types whose host representation is byte-addressable and whose
 /// packing is unambiguous.
 fn device_put_element_size_in_bytes(element_type: DataType) -> Result<usize, ArrayError> {
@@ -949,74 +949,6 @@ fn merge_dense_byte_segment(
     Ok(())
 }
 
-/// Uploads dense row-major host data to the local shards implied by `mesh` and `sharding`.
-///
-/// This is the low-level raw-bytes helper used by the higher-level [`device_put`] surface. The
-/// function derives the per-device shard slices from the provided [`Sharding`], uploads only the
-/// shards addressable by `client`, and returns an [`Array`] whose global shard metadata covers the
-/// full mesh.
-///
-/// # Parameters
-///
-///   - `client`: PJRT client used to upload the local addressable shard buffers.
-///   - `data`: Dense row-major host bytes for the full logical array.
-///   - `global_shape`: Global logical array shape.
-///   - `element_type`: Element type stored in `data`.
-///   - `mesh`: Concrete device mesh describing the global device topology.
-///   - `sharding`: Sharding to apply to the global logical array over `mesh`.
-pub fn device_put_bytes<'c, B: AsRef<[u8]>, D: AsRef<[usize]>>(
-    client: &'c Client<'_>,
-    data: B,
-    global_shape: D,
-    element_type: DataType,
-    mesh: DeviceMesh,
-    sharding: Sharding,
-) -> Result<Array<'c>, ArrayError> {
-    let data = data.as_ref();
-    let global_shape = global_shape.as_ref();
-    let expected_byte_count = checked_byte_count(global_shape, element_type)?;
-    if data.len() != expected_byte_count {
-        return Err(ArrayError::HostDataLengthMismatch { expected_byte_count, actual_byte_count: data.len() });
-    }
-
-    let client_process_index = client.process_index()?;
-    let addressable_devices = client.addressable_devices()?;
-    let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
-    for device in addressable_devices {
-        addressable_device_by_id.insert(device.id()?, device);
-    }
-
-    let (shards, _) = compute_shard_descriptors(global_shape, &mesh, &sharding)?;
-    let mut addressable_buffers = Vec::new();
-    for shard in &shards {
-        let mesh_device = shard.device();
-        if mesh_device.process_index != client_process_index {
-            continue;
-        }
-
-        let device =
-            addressable_device_by_id
-                .get(&mesh_device.id)
-                .ok_or(ArrayError::MissingClientDeviceForLocalMeshDevice {
-                    device_id: mesh_device.id,
-                    process_index: client_process_index,
-                })?;
-        let shard_bytes = extract_dense_shard_bytes(data, global_shape, shard.slices(), element_type)?;
-        let shard_dimensions = shard.shape().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-        let buffer = client.buffer(
-            shard_bytes.as_slice(),
-            element_type.to_pjrt_buffer_type(),
-            shard_dimensions.as_slice(),
-            None,
-            device.clone(),
-            None,
-        )?;
-        addressable_buffers.push(buffer);
-    }
-
-    Array::from_sharding(global_shape.to_vec(), element_type, mesh, sharding, addressable_buffers)
-}
-
 /// One global shard of an [`Array`].
 ///
 /// This corresponds to one entry in JAX's `array.global_shards`. When [`Self::buffer`] returns
@@ -1205,6 +1137,74 @@ impl<'o> Array<'o> {
         Ok(Self { array_type, shards, shard_index_by_device, addressable_shard_indices })
     }
 
+    /// Creates an [`Array`] by uploading one dense row-major host buffer to the local shards
+    /// implied by `mesh` and `sharding`.
+    ///
+    /// This is the low-level host-buffer constructor used by the higher-level [`device_put`]
+    /// surface. The constructor derives the per-device shard slices from the provided
+    /// [`Sharding`], uploads only the shards addressable by `client`, and returns an [`Array`]
+    /// whose global shard metadata covers the full mesh.
+    ///
+    /// # Parameters
+    ///
+    ///   - `client`: PJRT client used to upload the local addressable shard buffers.
+    ///   - `buffer`: Dense row-major host bytes for the full logical array.
+    ///   - `global_shape`: Global logical array shape.
+    ///   - `element_type`: Element type stored in `buffer`.
+    ///   - `mesh`: Concrete device mesh describing the global device topology.
+    ///   - `sharding`: Sharding to apply to the global logical array over `mesh`.
+    pub fn from_host_buffer<B: AsRef<[u8]>, D: AsRef<[usize]>>(
+        client: &'o Client<'_>,
+        buffer: B,
+        global_shape: D,
+        element_type: DataType,
+        mesh: DeviceMesh,
+        sharding: Sharding,
+    ) -> Result<Self, ArrayError> {
+        let buffer = buffer.as_ref();
+        let global_shape = global_shape.as_ref();
+        let expected_byte_count = checked_byte_count(global_shape, element_type)?;
+        if buffer.len() != expected_byte_count {
+            return Err(ArrayError::HostDataLengthMismatch { expected_byte_count, actual_byte_count: buffer.len() });
+        }
+
+        let client_process_index = client.process_index()?;
+        let addressable_devices = client.addressable_devices()?;
+        let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
+        for device in addressable_devices {
+            addressable_device_by_id.insert(device.id()?, device);
+        }
+
+        let (shards, _) = compute_shard_descriptors(global_shape, &mesh, &sharding)?;
+        let mut addressable_buffers = Vec::new();
+        for shard in &shards {
+            let mesh_device = shard.device();
+            if mesh_device.process_index != client_process_index {
+                continue;
+            }
+
+            let device = addressable_device_by_id.get(&mesh_device.id).ok_or(
+                ArrayError::MissingClientDeviceForLocalMeshDevice {
+                    device_id: mesh_device.id,
+                    process_index: client_process_index,
+                },
+            )?;
+            let shard_bytes = extract_dense_shard_bytes(buffer, global_shape, shard.slices(), element_type)?;
+            let shard_dimensions = shard.shape().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+            let addressable_buffer = client.buffer(
+                shard_bytes.as_slice(),
+                element_type.to_pjrt_buffer_type(),
+                shard_dimensions.as_slice(),
+                None,
+                device.clone(),
+                None,
+            )?;
+            addressable_buffers.push(addressable_buffer);
+        }
+
+        Self::from_sharding(global_shape.to_vec(), element_type, mesh, sharding, addressable_buffers)
+    }
+
     /// Creates an [`Array`] from shape/type/sharding metadata and local addressable buffers.
     pub fn from_sharding(
         global_shape: Vec<usize>,
@@ -1227,7 +1227,8 @@ impl<'o> Array<'o> {
     /// cross-host transfers extension when it is available. When the destination requires
     /// repartitioning, concatenating shards, or exact remote moves without the extension, the
     /// method falls back to materializing the full logical array as dense row-major host bytes on
-    /// the current process and then reuses [`device_put_bytes`] to upload the destination shards. That
+    /// the current process and then reuses [`Array::from_host_buffer`] to upload the destination
+    /// shards. That
     /// fallback requires every global shard of `self` to be addressable from the current process.
     ///
     /// # Parameters
@@ -1248,7 +1249,14 @@ impl<'o> Array<'o> {
         }
 
         let host_bytes = materialize_dense_array_bytes(self)?;
-        device_put_bytes(client, host_bytes.as_slice(), global_shape.as_slice(), self.element_type(), mesh, sharding)
+        Self::from_host_buffer(
+            client,
+            host_bytes.as_slice(),
+            global_shape.as_slice(),
+            self.element_type(),
+            mesh,
+            sharding,
+        )
     }
 
     /// Moves or copies this array to the provided placement, consuming `self`.
@@ -1528,7 +1536,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
             Some(device) => resolve_device_put_placement(device, shape.len())?,
             None => default_device_put_placement(client, shape.len())?,
         };
-        device_put_bytes(
+        Array::from_host_buffer(
             client,
             bytes.as_slice(),
             shape.as_slice(),
@@ -1873,7 +1881,7 @@ mod tests {
         .unwrap();
         let values = [0.0f32, 1.0, 2.0, 3.0, 4.0];
 
-        let array = device_put_bytes(
+        let array = Array::from_host_buffer(
             &client,
             f32_values_to_bytes(values.as_slice()).as_slice(),
             [5usize],
@@ -1925,7 +1933,7 @@ mod tests {
         .unwrap();
         let values = (0..48).map(|value| value as f32).collect::<Vec<_>>();
 
-        let array = device_put_bytes(
+        let array = Array::from_host_buffer(
             &client,
             f32_values_to_bytes(values.as_slice()).as_slice(),
             [8usize, 6usize],
@@ -1967,7 +1975,7 @@ mod tests {
         .unwrap();
         let source_sharding = Sharding::replicated(source_mesh.logical_mesh.clone(), 1);
         let source_values = [0.0f32, 1.0, 2.0, 3.0, 4.0];
-        let source_array = device_put_bytes(
+        let source_array = Array::from_host_buffer(
             &client,
             f32_values_to_bytes(source_values.as_slice()).as_slice(),
             [5usize],
@@ -2207,7 +2215,7 @@ mod tests {
         )
         .unwrap();
         let source_sharding = Sharding::replicated(source_mesh.logical_mesh.clone(), 1);
-        let first_source_array = device_put_bytes(
+        let first_source_array = Array::from_host_buffer(
             &client,
             f32_values_to_bytes(&[0.0, 1.0, 2.0, 3.0, 4.0]).as_slice(),
             [5usize],
@@ -2216,7 +2224,7 @@ mod tests {
             source_sharding.clone(),
         )
         .unwrap();
-        let second_source_array = device_put_bytes(
+        let second_source_array = Array::from_host_buffer(
             &client,
             f32_values_to_bytes(&[10.0, 11.0, 12.0, 13.0, 14.0]).as_slice(),
             [5usize],
@@ -2445,7 +2453,7 @@ mod tests {
         )
         .unwrap();
         let source_sharding = Sharding::replicated(source_mesh.logical_mesh.clone(), 1);
-        let source_array = device_put_bytes(
+        let source_array = Array::from_host_buffer(
             &client,
             f32_values_to_bytes(&[0.0, 1.0]).as_slice(),
             [2usize],

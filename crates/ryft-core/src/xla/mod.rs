@@ -11,7 +11,7 @@ pub mod sharding;
 #[cfg(feature = "xla")]
 pub use arrays::{
     Array, ArrayError, ArrayShard, DevicePutLeaf, DevicePutOptions, DevicePutPlacement, DevicePutSharding,
-    ExecuteArguments, device_put, device_put_bytes,
+    ExecuteArguments, device_put,
 };
 #[cfg(feature = "xla")]
 pub use shard_map::{
