@@ -9,7 +9,7 @@ pub(crate) mod shard_map;
 pub mod sharding;
 
 #[cfg(feature = "xla")]
-pub use arrays::{AddressableShard, Array, ArrayError, ExecuteArguments};
+pub use arrays::{Array, ArrayError, ArrayShard, ExecuteArguments};
 #[cfg(feature = "xla")]
 pub use shard_map::{
     ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, shard_map_with_options, trace,
@@ -17,4 +17,4 @@ pub use shard_map::{
 };
 
 pub use crate::sharding::Sharding;
-pub use sharding::{ShardDescriptor, ShardSlice, ShardingLayout};
+pub use sharding::{Shard, ShardSlice};

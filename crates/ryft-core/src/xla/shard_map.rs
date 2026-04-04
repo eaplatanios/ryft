@@ -1773,6 +1773,16 @@ mod tests {
         Vec::new()
     }
 
+    fn static_sharded_array_type(data_type: DataType, global_shape: &[usize], sharding: Sharding) -> ArrayType {
+        ArrayType::new(
+            data_type,
+            Shape::new(global_shape.iter().copied().map(Size::Static).collect()),
+            None,
+            Some(sharding),
+        )
+        .unwrap()
+    }
+
     fn test_sharding(mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>, unreduced_axes: Vec<String>) -> Sharding {
         Sharding::new(mesh.clone(), dimensions, unreduced_axes, empty_axes(), empty_axes()).unwrap()
     }
@@ -2755,7 +2765,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let input_array = Array::from_sharding(vec![8], DataType::F32, device_mesh, sharding, input_buffers).unwrap();
+        let input_array =
+            Array::new(static_sharded_array_type(DataType::F32, &[8], sharding), device_mesh, input_buffers).unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
         let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
 
@@ -2888,11 +2899,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lhs_array =
-            Array::from_sharding(vec![8, 4], DataType::F32, device_mesh.clone(), lhs_sharding.clone(), lhs_buffers)
-                .unwrap();
+        let lhs_array = Array::new(
+            static_sharded_array_type(DataType::F32, &[8, 4], lhs_sharding.clone()),
+            device_mesh.clone(),
+            lhs_buffers,
+        )
+        .unwrap();
         let rhs_array =
-            Array::from_sharding(vec![4, 2], DataType::F32, device_mesh, rhs_sharding, rhs_buffers).unwrap();
+            Array::new(static_sharded_array_type(DataType::F32, &[4, 2], rhs_sharding), device_mesh, rhs_buffers)
+                .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
         let executable = client.compile(&program, &test_spmd_compilation_options(8)).unwrap();
 
@@ -3021,7 +3036,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let input_array = Array::from_sharding(vec![8], DataType::F32, device_mesh, sharding, input_buffers).unwrap();
+        let input_array =
+            Array::new(static_sharded_array_type(DataType::F32, &[8], sharding), device_mesh, input_buffers).unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
         let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
 
@@ -3191,7 +3207,8 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let input_array = Array::from_sharding(vec![8], DataType::F32, device_mesh, sharding, input_buffers).unwrap();
+        let input_array =
+            Array::new(static_sharded_array_type(DataType::F32, &[8], sharding), device_mesh, input_buffers).unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
         let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
 
@@ -3312,7 +3329,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let input_array = Array::from_sharding(vec![8], DataType::F32, device_mesh, sharding, input_buffers).unwrap();
+        let input_array =
+            Array::new(static_sharded_array_type(DataType::F32, &[8], sharding), device_mesh, input_buffers).unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
         let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
 

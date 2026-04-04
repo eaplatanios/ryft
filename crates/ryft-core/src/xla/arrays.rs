@@ -1,11 +1,13 @@
 //! Runtime sharded-array data structures for XLA execution.
 //!
 //! This module builds on the sharding metadata from [`super::sharding`] to provide runtime
-//! array types that pair global sharding metadata with local PJRT buffers:
+//! array types that pair global [`crate::types::ArrayType`] metadata, global shard placement
+//! metadata, and local PJRT buffers:
 //!
-//! - [`Array`] corresponds to `jax.Array` / IFRT `Array`: global array metadata plus local
-//!   addressable device buffers.
-//! - [`AddressableShard`] corresponds to one entry in JAX's `array.addressable_shards`.
+//! - [`Array`] corresponds to `jax.Array` / IFRT `Array`: global type and shard-placement
+//!   metadata plus local addressable device buffers.
+//! - [`ArrayShard`] corresponds to one entry in JAX's `array.global_shards`, with
+//!   [`ArrayShard::buffer`] identifying the addressable local subset.
 //! - [`ExecuteArguments`] marshals distributed arrays into per-device execution inputs for PJRT.
 
 use std::collections::{HashMap, HashSet};
@@ -17,14 +19,11 @@ use ryft_mlir::Block;
 use ryft_mlir::{Location, dialects::shardy::DetachedMeshOperation};
 use ryft_pjrt::{Buffer, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
-use crate::sharding::{Sharding, ShardingError};
+use crate::sharding::{DeviceMesh, MeshDevice, Sharding, ShardingError};
 use crate::types::data_types::{DataType, DataTypeError};
+use crate::types::{ArrayType, Shape, Size};
 
-use crate::sharding::DeviceMesh;
-
-use super::sharding::{ShardDescriptor, ShardingLayout};
-
-// TODO(eaplatanios): Pull a [`Shape`] outside of the [`ShardingLayout`] structure.
+use super::sharding::{Shard, ShardSlice, compute_shard_descriptors};
 
 /// Error type for [`Array`] construction and execution-input preparation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -33,13 +32,21 @@ pub enum ArrayError {
     #[error("{0}")]
     PjrtError(#[from] PjrtError),
 
-    /// Underlying sharding/layout error.
+    /// Underlying sharding error.
     #[error("{0}")]
     ShardingError(#[from] ShardingError),
 
     /// Underlying data-type conversion error.
     #[error("{0}")]
     DataTypeError(#[from] DataTypeError),
+
+    /// Error returned when the array type is missing sharding metadata.
+    #[error("array type is missing sharding metadata")]
+    MissingArraySharding,
+
+    /// Error returned when the array type shape is not fully static.
+    #[error("array type dimension #{dimension} must be static, but got {size}")]
+    DynamicArrayShape { dimension: usize, size: Size },
 
     /// Error returned when an addressable buffer is placed on a device not present in the array mesh.
     #[error("addressable buffer is placed on device {device_id}, but that device is not in the mesh")]
@@ -91,81 +98,132 @@ pub enum ArrayError {
     UnexpectedArrayShardDevice { array_index: usize, device_id: DeviceId },
 }
 
-/// Addressable shard on the current host.
-///
-/// Each entry ties one local [`Buffer`] to one global shard index.
-/// This corresponds to one entry in JAX's `array.addressable_shards`.
-pub struct AddressableShard<'o> {
-    // TODO(eaplatanios): Is this needed?
-    shard_index: usize,
-    device_id: DeviceId,
-    // TODO(eaplatanios): Is this needed?
-    process_index: usize,
-    buffer: Buffer<'o>,
+/// Returns the concrete shape encoded by `array_type`.
+fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ArrayError> {
+    array_type
+        .shape
+        .dimensions
+        .iter()
+        .enumerate()
+        .map(|(dimension, size)| match size {
+            Size::Static(value) => Ok(*value),
+            _ => Err(ArrayError::DynamicArrayShape { dimension, size: *size }),
+        })
+        .collect()
 }
 
-impl<'o> AddressableShard<'o> {
-    /// Global shard index for this buffer.
+/// One global shard of an [`Array`].
+///
+/// This corresponds to one entry in JAX's `array.global_shards`. When [`Self::buffer`] returns
+/// `Some(_)`, the shard is addressable from the current process and corresponds to one entry in
+/// `array.addressable_shards`.
+pub struct ArrayShard<'o> {
+    descriptor: Shard,
+    buffer: Option<Buffer<'o>>,
+}
+
+impl<'o> ArrayShard<'o> {
+    /// Global shard descriptor.
+    pub fn descriptor(&self) -> &Shard {
+        &self.descriptor
+    }
+
+    /// Global shard index in row-major mesh order.
     pub fn shard_index(&self) -> usize {
-        self.shard_index
+        self.descriptor.shard_index()
+    }
+
+    /// Device that owns this shard.
+    pub fn device(&self) -> MeshDevice {
+        self.descriptor.device()
     }
 
     /// Device ID on which this buffer is placed.
     pub fn device_id(&self) -> DeviceId {
-        self.device_id
+        self.device().id
     }
 
-    /// Process index owning the device on which this buffer is placed.
+    /// Process index owning this shard's device.
     pub fn process_index(&self) -> usize {
-        self.process_index
+        self.device().process_index
     }
 
-    /// Addressable shard buffer.
-    pub fn buffer(&self) -> &Buffer<'o> {
-        &self.buffer
+    /// Row-major mesh coordinate of this shard.
+    pub fn mesh_coordinate(&self) -> &[usize] {
+        self.descriptor.mesh_coordinate()
+    }
+
+    /// Per-dimension logical slices for this shard.
+    pub fn slices(&self) -> &[ShardSlice] {
+        self.descriptor.slices()
+    }
+
+    /// Logical shape of this shard.
+    pub fn shape(&self) -> &[usize] {
+        self.descriptor.shape()
+    }
+
+    /// Whether this shard is backed by a local PJRT buffer on the current process.
+    pub fn is_addressable(&self) -> bool {
+        self.buffer.is_some()
+    }
+
+    /// Local PJRT buffer for this shard, if the shard is addressable from the current process.
+    pub fn buffer(&self) -> Option<&Buffer<'o>> {
+        self.buffer.as_ref()
+    }
+
+    fn into_addressable_buffer(self) -> Option<(DeviceId, Buffer<'o>)> {
+        let device_id = self.device_id();
+        self.buffer.map(|buffer| (device_id, buffer))
     }
 }
 
-impl std::fmt::Debug for AddressableShard<'_> {
+impl std::fmt::Debug for ArrayShard<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AddressableShard")
-            .field("shard_index", &self.shard_index)
-            .field("device_id", &self.device_id)
-            .field("process_index", &self.process_index)
+            .debug_struct("ArrayShard")
+            .field("shard_index", &self.shard_index())
+            .field("device_id", &self.device_id())
+            .field("process_index", &self.process_index())
+            .field("is_addressable", &self.is_addressable())
             .finish()
     }
 }
 
-/// Distributed array backed by local addressable PJRT buffers and global sharding metadata.
+/// Distributed array backed by local addressable PJRT buffers together with global array metadata.
 ///
 /// This is conceptually aligned with JAX/IFRT arrays:
-/// - `layout` describes all global shards across the full mesh.
-/// - `addressable_shards` contains only shards local to the current host process.
-/// - each addressable buffer is mapped to its global shard index.
+/// - `array_type` stores element type, abstract shape metadata, and sharding.
+/// - `shards` describes all global shards across the full mesh together with concrete device ownership.
+/// - addressable shards are the subset of [`Self::shards`] whose [`ArrayShard::buffer`] is present.
 ///
 /// In JAX terminology, this is the runtime pairing of:
-/// - mesh-bound sharding metadata, and
+/// - mesh-bound global array metadata, and
 /// - addressable device buffers (the local portion of an IFRT array).
 pub struct Array<'o> {
-    layout: ShardingLayout,
-    element_type: DataType,
-    addressable_shards: Vec<AddressableShard<'o>>,
-    addressable_shard_index_by_device: HashMap<DeviceId, usize>,
+    array_type: ArrayType,
+    shards: Vec<ArrayShard<'o>>,
+    shard_index_by_device: HashMap<DeviceId, usize>,
+    addressable_shard_indices: Vec<usize>,
 }
 
 impl<'o> Array<'o> {
-    /// Creates an [`Array`] from precomputed sharding metadata and local addressable buffers.
+    /// Creates an [`Array`] from global array metadata, a concrete mesh, and local addressable buffers.
     ///
-    /// Each buffer is mapped to a shard using its device ID. Buffer shape and element type are validated against
-    /// shard metadata.
+    /// `array_type.shape` must be fully static. Each buffer is mapped to a shard using its device ID, and its shape
+    /// and element type are validated against the computed shard metadata.
     pub fn new(
-        layout: ShardingLayout,
-        element_type: DataType,
+        array_type: ArrayType,
+        mesh: DeviceMesh,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
+        let shape = static_shape(&array_type)?;
+        let sharding = array_type.sharding.as_ref().ok_or(ArrayError::MissingArraySharding)?;
+        let (descriptors, shard_index_by_device) = compute_shard_descriptors(shape.as_slice(), &mesh, sharding)?;
+
         let mut seen_devices = HashSet::with_capacity(addressable_buffers.len());
-        let mut addressable_shards = Vec::with_capacity(addressable_buffers.len());
+        let mut buffers_by_device = HashMap::with_capacity(addressable_buffers.len());
 
         for buffer in addressable_buffers {
             let device = buffer.device()?;
@@ -174,27 +232,28 @@ impl<'o> Array<'o> {
                 return Err(ArrayError::DuplicateAddressableBufferDevice { device_id });
             }
 
-            let shard_index = layout
-                .shard_index_for_device(device_id)
+            let shard_index = shard_index_by_device
+                .get(&device_id)
+                .copied()
                 .ok_or(ArrayError::AddressableBufferDeviceNotInMesh { device_id })?;
-            let shard = layout
-                .shard(shard_index)
-                .expect("layout shard index should exist for valid layout device-to-shard mapping");
+            let descriptor = descriptors
+                .get(shard_index)
+                .expect("shard index should exist for valid mesh device-to-shard mapping");
 
             let process_index = device.process_index()?;
-            if process_index != shard.device().process_index {
+            if process_index != descriptor.device().process_index {
                 return Err(ArrayError::BufferProcessIndexMismatch {
                     device_id,
-                    expected_process_index: shard.device().process_index,
+                    expected_process_index: descriptor.device().process_index,
                     actual_process_index: process_index,
                 });
             }
 
             let actual_element_type = DataType::from_pjrt_buffer_type(buffer.element_type()?)?;
-            if actual_element_type != element_type {
+            if actual_element_type != array_type.data_type {
                 return Err(ArrayError::BufferElementTypeMismatch {
                     device_id,
-                    expected: element_type,
+                    expected: array_type.data_type,
                     actual: actual_element_type,
                 });
             }
@@ -211,26 +270,32 @@ impl<'o> Array<'o> {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if actual_shape != shard.shape() {
+            if actual_shape != descriptor.shape() {
                 return Err(ArrayError::BufferShapeMismatch {
                     device_id,
                     shard_index,
-                    expected_shape: shard.shape().to_vec(),
+                    expected_shape: descriptor.shape().to_vec(),
                     actual_shape,
                 });
             }
 
-            addressable_shards.push(AddressableShard { shard_index, device_id, process_index, buffer });
+            buffers_by_device.insert(device_id, buffer);
         }
 
-        addressable_shards.sort_by_key(AddressableShard::shard_index);
-        let addressable_shard_index_by_device = addressable_shards
-            .iter()
-            .enumerate()
-            .map(|(addressable_shard_index, shard)| (shard.device_id(), addressable_shard_index))
-            .collect::<HashMap<_, _>>();
+        let mut addressable_shard_indices = Vec::with_capacity(buffers_by_device.len());
+        let shards = descriptors
+            .into_iter()
+            .map(|descriptor| {
+                let shard_index = descriptor.shard_index();
+                let buffer = buffers_by_device.remove(&descriptor.device().id);
+                if buffer.is_some() {
+                    addressable_shard_indices.push(shard_index);
+                }
+                ArrayShard { descriptor, buffer }
+            })
+            .collect::<Vec<_>>();
 
-        Ok(Self { layout, element_type, addressable_shards, addressable_shard_index_by_device })
+        Ok(Self { array_type, shards, shard_index_by_device, addressable_shard_indices })
     }
 
     /// Creates an [`Array`] from shape/type/sharding metadata and local addressable buffers.
@@ -241,52 +306,60 @@ impl<'o> Array<'o> {
         sharding: Sharding,
         addressable_buffers: Vec<Buffer<'o>>,
     ) -> Result<Self, ArrayError> {
-        let layout = ShardingLayout::new(global_shape, mesh, sharding)?;
-        Self::new(layout, element_type, addressable_buffers)
+        let shape = Shape::new(global_shape.iter().copied().map(Size::Static).collect());
+        let array_type = ArrayType::new(element_type, shape, None, Some(sharding))?;
+        Self::new(array_type, mesh, addressable_buffers)
     }
 
-    /// Returns global sharding layout metadata.
-    pub fn layout(&self) -> &ShardingLayout {
-        &self.layout
+    /// Returns the global array type metadata.
+    pub fn array_type(&self) -> &ArrayType {
+        &self.array_type
     }
 
-    /// Returns the global array shape.
-    pub fn global_shape(&self) -> &[usize] {
-        self.layout.global_shape()
+    /// Returns the concrete global array shape.
+    pub fn shape(&self) -> Vec<usize> {
+        static_shape(&self.array_type)
+            .expect("runtime arrays should only be constructed from array types with static shapes")
     }
 
     /// Returns the global array element type.
     pub fn element_type(&self) -> DataType {
-        self.element_type
+        self.array_type.data_type
+    }
+
+    /// Returns the global array sharding.
+    pub fn sharding(&self) -> &Sharding {
+        self.array_type
+            .sharding
+            .as_ref()
+            .expect("runtime arrays should only be constructed from array types with sharding")
     }
 
     /// Returns metadata for all global shards.
-    pub fn shards(&self) -> &[ShardDescriptor] {
-        self.layout.shards()
+    pub fn shards(&self) -> &[ArrayShard<'o>] {
+        self.shards.as_slice()
     }
 
-    /// Returns addressable local shards.
-    pub fn addressable_shards(&self) -> &[AddressableShard<'o>] {
-        self.addressable_shards.as_slice()
+    /// Returns an iterator over the addressable local shards.
+    pub fn addressable_shards(&self) -> impl ExactSizeIterator<Item = &ArrayShard<'o>> {
+        self.addressable_shard_indices.iter().map(|index| &self.shards[*index])
     }
 
     /// Returns the addressable shard for `device_id`, if local.
-    pub fn addressable_shard_for_device(&self, device_id: DeviceId) -> Option<&AddressableShard<'o>> {
-        self.addressable_shard_index_by_device
-            .get(&device_id)
-            .and_then(|index| self.addressable_shards.get(*index))
+    pub fn addressable_shard_for_device(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+        self.shard_for_device(device_id).filter(|shard| shard.is_addressable())
     }
 
     /// Returns global shard metadata for `device_id`, if it exists in the mesh.
-    pub fn shard_for_device(&self, device_id: DeviceId) -> Option<&ShardDescriptor> {
-        self.layout.shard_for_device(device_id)
+    pub fn shard_for_device(&self, device_id: DeviceId) -> Option<&ArrayShard<'o>> {
+        self.shard_index_by_device.get(&device_id).and_then(|index| self.shards.get(*index))
     }
 
     /// Returns global shard metadata for a local addressable shard index.
-    pub fn shard_for_addressable_index(&self, addressable_shard_index: usize) -> Option<&ShardDescriptor> {
-        self.addressable_shards
+    pub fn shard_for_addressable_index(&self, addressable_shard_index: usize) -> Option<&ArrayShard<'o>> {
+        self.addressable_shard_indices
             .get(addressable_shard_index)
-            .and_then(|addressable_shard| self.layout.shard(addressable_shard.shard_index()))
+            .and_then(|index| self.shards.get(*index))
     }
 
     /// Builds the detached Shardy mesh declaration (`sdy.mesh`) implied by this array's sharding.
@@ -301,7 +374,7 @@ impl<'o> Array<'o> {
         't: 'c,
         L: Location<'c, 't>,
     {
-        self.layout.mesh().logical_mesh.to_shardy(location)
+        self.sharding().mesh.to_shardy(location)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
@@ -309,7 +382,7 @@ impl<'o> Array<'o> {
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
         let context = ryft_mlir::Context::new();
-        self.layout.sharding().to_shardy(context.unknown_location()).to_string()
+        self.sharding().to_shardy(context.unknown_location()).to_string()
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].
@@ -334,10 +407,7 @@ impl<'o> Array<'o> {
     }
 
     fn into_addressable_buffers_by_device(self) -> HashMap<DeviceId, Buffer<'o>> {
-        self.addressable_shards
-            .into_iter()
-            .map(|addressable_shard| (addressable_shard.device_id(), addressable_shard.buffer))
-            .collect()
+        self.shards.into_iter().filter_map(ArrayShard::into_addressable_buffer).collect()
     }
 }
 
@@ -345,10 +415,11 @@ impl std::fmt::Debug for Array<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Array")
-            .field("global_shape", &self.global_shape())
+            .field("array_type", &self.array_type)
+            .field("shape", &self.shape())
             .field("element_type", &self.element_type())
             .field("global_shard_count", &self.shards().len())
-            .field("addressable_shard_count", &self.addressable_shards.len())
+            .field("addressable_shard_count", &self.addressable_shard_indices.len())
             .finish()
     }
 }
@@ -441,6 +512,7 @@ mod tests {
 
     use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
     use crate::types::data_types::DataType;
+    use crate::types::{ArrayType, Shape, Size};
 
     use super::*;
 
@@ -479,6 +551,56 @@ mod tests {
         let first = f32::from_ne_bytes(bytes[..size_of::<f32>()].try_into().unwrap());
         let second = f32::from_ne_bytes(bytes[size_of::<f32>()..].try_into().unwrap());
         [first, second]
+    }
+
+    #[test]
+    fn test_array_new_requires_sharding() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![MeshDevice::new(0, 1)],
+        )
+        .unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
+
+        assert!(matches!(Array::new(array_type, mesh, Vec::new()), Err(ArrayError::MissingArraySharding),));
+    }
+
+    #[test]
+    fn test_array_shape_returns_static_shape() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![MeshDevice::new(0, 1)],
+        )
+        .unwrap();
+        let sharding = Sharding::replicated(mesh.logical_mesh.clone(), 1);
+        let array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(7)]), None, Some(sharding)).unwrap();
+
+        let array = Array::new(array_type.clone(), mesh.clone(), Vec::new()).unwrap();
+
+        assert_eq!(array.array_type(), &array_type);
+        assert_eq!(array.shape(), vec![7]);
+        assert_eq!(array.shards().len(), 1);
+        assert_eq!(array.addressable_shards().count(), 0);
+        assert_eq!(array.shards()[0].shape(), &[7]);
+        assert!(!array.shards()[0].is_addressable());
+    }
+
+    #[test]
+    fn test_array_new_rejects_dynamic_shape() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![MeshDevice::new(0, 1)],
+        )
+        .unwrap();
+        let sharding = Sharding::replicated(mesh.logical_mesh.clone(), 1);
+        let array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Dynamic(Some(10))]), None, Some(sharding)).unwrap();
+
+        assert!(matches!(
+            Array::new(array_type, mesh, Vec::new()),
+            Err(ArrayError::DynamicArrayShape { dimension: 0, size: Size::Dynamic(Some(10)) }),
+        ));
     }
 
     #[test]
@@ -552,13 +674,23 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let lhs_array =
-            Array::from_sharding(vec![8, 4], DataType::F32, mesh.clone(), lhs_sharding.clone(), lhs_buffers).unwrap();
-        let rhs_array =
-            Array::from_sharding(vec![4, 2], DataType::F32, mesh.clone(), rhs_sharding, rhs_buffers).unwrap();
+        let lhs_array_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8), Size::Static(4)]),
+            None,
+            Some(lhs_sharding.clone()),
+        )
+        .unwrap();
+        let rhs_array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None, Some(rhs_sharding))
+                .unwrap();
+        let lhs_array = Array::new(lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
+        let rhs_array = Array::new(rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
 
         assert_eq!(lhs_array.element_type(), DataType::F32);
         assert_eq!(rhs_array.element_type(), DataType::F32);
+        assert_eq!(lhs_array.addressable_shards().count(), 8);
+        assert!(lhs_array.shards().iter().all(|shard| shard.is_addressable()));
 
         // Derive Shardy attributes from runtime arrays (JIT-style).
         let context = ryft_mlir::Context::new();
