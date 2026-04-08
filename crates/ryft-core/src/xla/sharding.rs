@@ -269,11 +269,59 @@ impl ShardingVisualization {
     /// approximate JAX's colorized `rich` table. When `false` the output is stable plain text
     /// with box-drawing borders and no escape sequences.
     pub fn render(&self, colored: bool) -> String {
+        let row_count = self.cells.len();
+        let column_count = self.cells.first().map_or(0, Vec::len);
+        let label_line = self.cell_height / 2;
+        let mut lines = Vec::new();
+
         if colored {
-            render_colored_visualization(&self.cells, self.cell_width, self.cell_height)
+            let background_colors = assign_visualization_background_colors(row_count, column_count);
+            for (row_index, row_cells) in self.cells.iter().enumerate() {
+                for line_index in 0..self.cell_height {
+                    let mut line = String::new();
+                    for (column_index, label) in row_cells.iter().enumerate() {
+                        let contents = if line_index == label_line {
+                            center_text(label.as_str(), self.cell_width)
+                        } else {
+                            " ".repeat(self.cell_width)
+                        };
+                        let background = background_colors[row_index * column_count + column_index];
+                        line.push_str(
+                            Color::colored_text(contents.as_str(), background.foreground_color(), background).as_str(),
+                        );
+                    }
+                    lines.push(line);
+                }
+            }
         } else {
-            render_plain_visualization(&self.cells, self.cell_width, self.cell_height)
+            let top_border = render_horizontal_border('┌', '┬', '┐', column_count, self.cell_width);
+            let middle_border = render_horizontal_border('├', '┼', '┤', column_count, self.cell_width);
+            let bottom_border = render_horizontal_border('└', '┴', '┘', column_count, self.cell_width);
+            lines.push(top_border);
+
+            for (row_index, row_cells) in self.cells.iter().enumerate() {
+                for line_index in 0..self.cell_height {
+                    let mut line = String::from("│");
+                    for label in row_cells {
+                        let contents = if line_index == label_line {
+                            center_text(label.as_str(), self.cell_width)
+                        } else {
+                            " ".repeat(self.cell_width)
+                        };
+                        line.push_str(contents.as_str());
+                        line.push('│');
+                    }
+                    lines.push(line);
+                }
+                if row_index + 1 == row_count {
+                    lines.push(bottom_border.clone());
+                } else {
+                    lines.push(middle_border.clone());
+                }
+            }
         }
+
+        lines.join("\n")
     }
 }
 
@@ -313,57 +361,6 @@ const VISUALIZATION_COLOR_PALETTE: &[Color] = &[
     Color::new(206, 109, 189),
     Color::new(222, 158, 214),
 ];
-
-fn render_plain_visualization(cells: &[Vec<String>], cell_width: usize, cell_height: usize) -> String {
-    let top_border = render_horizontal_border('┌', '┬', '┐', cells[0].len(), cell_width);
-    let middle_border = render_horizontal_border('├', '┼', '┤', cells[0].len(), cell_width);
-    let bottom_border = render_horizontal_border('└', '┴', '┘', cells[0].len(), cell_width);
-    let mut lines = Vec::new();
-    lines.push(top_border);
-
-    for (row_index, row_cells) in cells.iter().enumerate() {
-        let label_line = cell_height / 2;
-        for line_index in 0..cell_height {
-            let mut line = String::from("│");
-            for label in row_cells {
-                let contents =
-                    if line_index == label_line { center_text(label.as_str(), cell_width) } else { " ".repeat(cell_width) };
-                line.push_str(contents.as_str());
-                line.push('│');
-            }
-            lines.push(line);
-        }
-        if row_index + 1 == cells.len() {
-            lines.push(bottom_border.clone());
-        } else {
-            lines.push(middle_border.clone());
-        }
-    }
-
-    lines.join("\n")
-}
-
-fn render_colored_visualization(cells: &[Vec<String>], cell_width: usize, cell_height: usize) -> String {
-    let row_count = cells.len();
-    let column_count = cells.first().map_or(0, Vec::len);
-    let background_colors = assign_visualization_background_colors(row_count, column_count);
-    let label_line = cell_height / 2;
-    let mut lines = Vec::new();
-    for (row_index, row_cells) in cells.iter().enumerate() {
-        for line_index in 0..cell_height {
-            let mut line = String::new();
-            for (column_index, label) in row_cells.iter().enumerate() {
-                let contents =
-                    if line_index == label_line { center_text(label.as_str(), cell_width) } else { " ".repeat(cell_width) };
-                let background = background_colors[row_index * column_count + column_index];
-                line.push_str(Color::colored_text(contents.as_str(), background.foreground_color(), background).as_str());
-            }
-            lines.push(line);
-        }
-    }
-
-    lines.join("\n")
-}
 
 /// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that
 /// avoids giving the same color to horizontally or vertically adjacent cells.
