@@ -169,18 +169,15 @@ impl Sharding {
             return Err(ShardingError::UnsupportedVisualizationRank { rank });
         }
 
-        let axis_sizes = self.mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>();
-        let device_count = self.mesh.device_count();
-
         // Compute per-device partition coordinates and group devices into grid cells.
         let mut devices_by_cell = HashMap::<(usize, usize), Vec<usize>>::new();
-        for device_index in 0..device_count {
+        for device_index in 0..self.mesh.device_count() {
             // Decompose the linear device index into row-major mesh coordinates.
             let mut remaining = device_index;
-            let mut mesh_coordinate = vec![0usize; axis_sizes.len()];
-            for (axis_index, axis_size) in axis_sizes.iter().enumerate().rev() {
-                mesh_coordinate[axis_index] = remaining % axis_size;
-                remaining /= axis_size;
+            let mut mesh_coordinate = vec![0usize; self.mesh.axes.len()];
+            for (axis_index, axis) in self.mesh.axes.iter().enumerate().rev() {
+                mesh_coordinate[axis_index] = remaining % axis.size;
+                remaining /= axis.size;
             }
             let cell = self.visualization_cell(&mesh_coordinate);
             devices_by_cell.entry(cell).or_default().push(device_index);
