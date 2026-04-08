@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![],
         vec![],
     )?;
-    let visualization = sharding.visualize(true)?;
+    let visualization = sharding.visualize()?.render(true);
 
     println!("Colored sharding visualization example");
     println!("mesh axes: data=2, replica=2, model=3");

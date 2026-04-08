@@ -153,24 +153,17 @@ use crate::utilities::colors::Color;
 use crate::sharding::{LogicalMesh, MeshAxisType};
 
 impl Sharding {
-    /// Renders a visualization of this sharding over the [`LogicalMesh`] stored in [`Self::mesh`].
+    /// Builds a visualization of this sharding over the [`LogicalMesh`] stored in [`Self::mesh`].
     ///
     /// This ports the core behavior of JAX's
     /// [`jax.debug.visualize_array_sharding`](https://github.com/jax-ml/jax/blob/main/jax/_src/debugging.py):
-    /// it groups devices that own the same logical partition and renders the resulting chunks as
-    /// uniform cells in a rank-1 (single row) or rank-2 (row x column) grid. Devices are labeled
-    /// with sequential indices `0..device_count` based on their row-major position in the logical
-    /// mesh.
+    /// it groups devices that own the same logical partition and arranges them into a rank-1
+    /// (single row) or rank-2 (row x column) grid. Devices are labeled with sequential indices
+    /// `0..device_count` based on their row-major position in the logical mesh.
     ///
-    /// Unlike JAX's implementation, this method returns a string instead of printing directly,
-    /// making it suitable for logs, tests, and snapshots. When `colored` is `true`, the returned
-    /// string contains ANSI color escape sequences that approximate JAX's colorized `rich` table.
-    ///
-    /// # Parameters
-    ///
-    ///   - `colored`: Whether to return ANSI colorized cell backgrounds in a rich-table-like
-    ///     rendering. When `false`, the output is stable plain text without escape sequences.
-    pub fn visualize(&self, colored: bool) -> Result<String, ShardingError> {
+    /// The returned [`ShardingVisualization`] can be rendered to a string via
+    /// [`ShardingVisualization::render`].
+    pub fn visualize(&self) -> Result<ShardingVisualization, ShardingError> {
         let rank = self.rank();
         if !matches!(rank, 1 | 2) {
             return Err(ShardingError::UnsupportedVisualizationRank { rank });
@@ -198,10 +191,8 @@ impl Sharding {
         let column_count = devices_by_cell.keys().map(|(_, column)| *column).max().map_or(0, |max| max + 1);
 
         // Build the visualization cell grid.
-        let mut cells = vec![vec![VisualizationCell { label: String::new(), style: None }; column_count]; row_count];
+        let mut cells = vec![vec![String::new(); column_count]; row_count];
         let mut cell_width = VISUALIZATION_MIN_CELL_WIDTH;
-        let mut cell_styles =
-            if colored { Some(make_visualization_styles(row_count, column_count).into_iter()) } else { None };
         for row_index in 0..row_count {
             for column_index in 0..column_count {
                 let label = devices_by_cell
@@ -212,16 +203,11 @@ impl Sharding {
                     })
                     .unwrap_or_default();
                 cell_width = cell_width.max(label.chars().count() + 2);
-                cells[row_index][column_index] =
-                    VisualizationCell { label, style: cell_styles.as_mut().and_then(Iterator::next) };
+                cells[row_index][column_index] = label;
             }
         }
         let cell_height = if rank == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
-        if colored {
-            Ok(render_colored_visualization(cells.as_slice(), cell_width, cell_height))
-        } else {
-            Ok(render_plain_visualization(cells.as_slice(), cell_width, cell_height))
-        }
+        Ok(ShardingVisualization { cells, cell_width, cell_height })
     }
 
     /// Returns the `(row, column)` grid cell for a device at the given mesh coordinate.
@@ -256,6 +242,37 @@ impl Sharding {
                 }
                 partition_index
             }
+        }
+    }
+}
+
+/// Grid-based visualization of a [`Sharding`] produced by [`Sharding::visualize`].
+///
+/// Each cell in the grid holds a label listing the device indices that share the corresponding
+/// partition. Call [`Self::render`] to produce a displayable string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardingVisualization {
+    /// Row-major grid of device-index labels (e.g., `"0,1"`).
+    cells: Vec<Vec<String>>,
+
+    /// Character width of every cell in the rendered output.
+    cell_width: usize,
+
+    /// Line height of every cell in the rendered output.
+    cell_height: usize,
+}
+
+impl ShardingVisualization {
+    /// Renders this visualization to a string.
+    ///
+    /// When `colored` is `true` the output contains ANSI 24-bit color escape sequences that
+    /// approximate JAX's colorized `rich` table. When `false` the output is stable plain text
+    /// with box-drawing borders and no escape sequences.
+    pub fn render(&self, colored: bool) -> String {
+        if colored {
+            render_colored_visualization(&self.cells, self.cell_width, self.cell_height)
+        } else {
+            render_plain_visualization(&self.cells, self.cell_width, self.cell_height)
         }
     }
 }
@@ -297,42 +314,65 @@ const VISUALIZATION_COLOR_PALETTE: &[Color] = &[
     Color::new(222, 158, 214),
 ];
 
-/// Single cell in the visualization grid produced by [`Sharding::visualize`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct VisualizationCell {
-    /// Comma-separated device indices that share this partition (e.g., `"0,1"`).
-    label: String,
+fn render_plain_visualization(cells: &[Vec<String>], cell_width: usize, cell_height: usize) -> String {
+    let top_border = render_horizontal_border('┌', '┬', '┐', cells[0].len(), cell_width);
+    let middle_border = render_horizontal_border('├', '┼', '┤', cells[0].len(), cell_width);
+    let bottom_border = render_horizontal_border('└', '┴', '┘', cells[0].len(), cell_width);
+    let mut lines = Vec::new();
+    lines.push(top_border);
 
-    /// ANSI color style applied when colored output is requested. [`None`] for plain-text mode.
-    style: Option<VisualizationStyle>,
-}
-
-/// ANSI true-color foreground/background pair for a single [`VisualizationCell`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct VisualizationStyle {
-    /// Foreground (text) color, chosen to contrast with [`Self::background`].
-    foreground: Color,
-
-    /// Background color drawn from [`VISUALIZATION_COLOR_PALETTE`].
-    background: Color,
-}
-
-impl VisualizationStyle {
-    /// Wraps `text` in ANSI 24-bit color escape sequences using this style's colors.
-    fn render(&self, text: &str) -> String {
-        Color::colored_text(text, self.foreground, self.background)
+    for (row_index, row_cells) in cells.iter().enumerate() {
+        let label_line = cell_height / 2;
+        for line_index in 0..cell_height {
+            let mut line = String::from("│");
+            for label in row_cells {
+                let contents =
+                    if line_index == label_line { center_text(label.as_str(), cell_width) } else { " ".repeat(cell_width) };
+                line.push_str(contents.as_str());
+                line.push('│');
+            }
+            lines.push(line);
+        }
+        if row_index + 1 == cells.len() {
+            lines.push(bottom_border.clone());
+        } else {
+            lines.push(middle_border.clone());
+        }
     }
+
+    lines.join("\n")
 }
 
-fn make_visualization_styles(row_count: usize, column_count: usize) -> Vec<VisualizationStyle> {
+fn render_colored_visualization(cells: &[Vec<String>], cell_width: usize, cell_height: usize) -> String {
+    let row_count = cells.len();
+    let column_count = cells.first().map_or(0, Vec::len);
+    let background_colors = assign_visualization_background_colors(row_count, column_count);
+    let label_line = cell_height / 2;
+    let mut lines = Vec::new();
+    for (row_index, row_cells) in cells.iter().enumerate() {
+        for line_index in 0..cell_height {
+            let mut line = String::new();
+            for (column_index, label) in row_cells.iter().enumerate() {
+                let contents =
+                    if line_index == label_line { center_text(label.as_str(), cell_width) } else { " ".repeat(cell_width) };
+                let background = background_colors[row_index * column_count + column_index];
+                line.push_str(Color::colored_text(contents.as_str(), background.foreground_color(), background).as_str());
+            }
+            lines.push(line);
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that
+/// avoids giving the same color to horizontally or vertically adjacent cells.
+fn assign_visualization_background_colors(row_count: usize, column_count: usize) -> Vec<Color> {
     let cell_count = row_count * column_count;
     if cell_count == 0 {
         return Vec::new();
     }
 
-    // Assign palette indices using a greedy graph-coloring approach: the first N cells (up to the
-    // palette size) get unique sequential indices, and remaining cells cycle through the palette
-    // while avoiding the same color as their left and upper neighbors.
     let palette_count = VISUALIZATION_COLOR_PALETTE.len();
     let unique_prefix_length = cell_count.min(palette_count);
     let mut palette_indices = (0..unique_prefix_length).collect::<Vec<_>>();
@@ -359,70 +399,7 @@ fn make_visualization_styles(row_count: usize, column_count: usize) -> Vec<Visua
         );
     }
 
-    palette_indices
-        .into_iter()
-        .map(|palette_index| {
-            let background = VISUALIZATION_COLOR_PALETTE[palette_index];
-            VisualizationStyle { foreground: background.foreground_color(), background }
-        })
-        .collect()
-}
-
-fn render_plain_visualization(cells: &[Vec<VisualizationCell>], cell_width: usize, cell_height: usize) -> String {
-    let top_border = render_horizontal_border('┌', '┬', '┐', cells[0].len(), cell_width);
-    let middle_border = render_horizontal_border('├', '┼', '┤', cells[0].len(), cell_width);
-    let bottom_border = render_horizontal_border('└', '┴', '┘', cells[0].len(), cell_width);
-    let mut lines = Vec::new();
-    lines.push(top_border);
-
-    for (row_index, row_cells) in cells.iter().enumerate() {
-        let label_line = cell_height / 2;
-        for line_index in 0..cell_height {
-            let mut line = String::from("│");
-            for cell in row_cells {
-                let contents = if line_index == label_line {
-                    center_text(cell.label.as_str(), cell_width)
-                } else {
-                    " ".repeat(cell_width)
-                };
-                line.push_str(contents.as_str());
-                line.push('│');
-            }
-            lines.push(line);
-        }
-        if row_index + 1 == cells.len() {
-            lines.push(bottom_border.clone());
-        } else {
-            lines.push(middle_border.clone());
-        }
-    }
-
-    lines.join("\n")
-}
-
-fn render_colored_visualization(cells: &[Vec<VisualizationCell>], cell_width: usize, cell_height: usize) -> String {
-    let label_line = cell_height / 2;
-    let mut lines = Vec::new();
-    for row_cells in cells {
-        for line_index in 0..cell_height {
-            let mut line = String::new();
-            for cell in row_cells {
-                let contents = if line_index == label_line {
-                    center_text(cell.label.as_str(), cell_width)
-                } else {
-                    " ".repeat(cell_width)
-                };
-                if let Some(style) = cell.style {
-                    line.push_str(style.render(contents.as_str()).as_str());
-                } else {
-                    line.push_str(contents.as_str());
-                }
-            }
-            lines.push(line);
-        }
-    }
-
-    lines.join("\n")
+    palette_indices.into_iter().map(|index| VISUALIZATION_COLOR_PALETTE[index]).collect()
 }
 
 fn render_horizontal_border(
@@ -900,14 +877,14 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            sharding.visualize(false),
-            Ok(indoc! {"
+            sharding.visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │ 0,1 │ 2,3 │
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
     }
 
@@ -919,14 +896,14 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            sharding.visualize(false),
-            Ok(indoc! {"
+            sharding.visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
     }
 
@@ -943,8 +920,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            sharding.visualize(false),
-            Ok(indoc! {"
+            sharding.visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │     │     │
                 │  0  │  1  │
@@ -956,7 +933,7 @@ mod tests {
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
     }
 
@@ -967,7 +944,7 @@ mod tests {
             Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], empty_axes(), empty_axes(), empty_axes())
                 .unwrap();
 
-        let colored = sharding.visualize(true).unwrap();
+        let colored = sharding.visualize().unwrap().render(true);
 
         assert!(colored.contains("\u{1b}[38;2;"));
         assert!(colored.contains("\u{1b}[48;2;"));
@@ -1004,7 +981,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 3);
 
-        assert_eq!(sharding.visualize(false), Err(ShardingError::UnsupportedVisualizationRank { rank: 3 }));
+        assert_eq!(sharding.visualize(), Err(ShardingError::UnsupportedVisualizationRank { rank: 3 }));
     }
 
     fn shard_for_device<'a>(

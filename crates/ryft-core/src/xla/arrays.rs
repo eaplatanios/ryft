@@ -1894,14 +1894,14 @@ mod tests {
         assert_eq!(array.addressable_shards().count(), 2);
         assert!(array.shards().iter().all(|shard| shard.is_addressable()));
         assert_eq!(
-            array.sharding().visualize(false),
-            Ok(indoc! {"
+            array.sharding().visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
     }
 
@@ -1946,8 +1946,8 @@ mod tests {
         assert_eq!(array.addressable_shards().count(), 4);
         assert!(array.shards().iter().all(|shard| shard.is_addressable()));
         assert_eq!(
-            array.sharding().visualize(false),
-            Ok(indoc! {"
+            array.sharding().visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │     │     │
                 │  0  │  1  │
@@ -1959,7 +1959,7 @@ mod tests {
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
     }
 
@@ -2007,14 +2007,14 @@ mod tests {
 
         assert_eq!(moved_array.addressable_shards().count(), 2);
         assert_eq!(
-            moved_array.sharding().visualize(false),
-            Ok(indoc! {"
+            moved_array.sharding().visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
         let first_shard_bytes = moved_array.shard_for_device(client_devices[0].id().unwrap()).unwrap();
         let second_shard_bytes = moved_array.shard_for_device(client_devices[1].id().unwrap()).unwrap();
@@ -2073,8 +2073,8 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(
-            copied_array.sharding().visualize(false),
-            Ok(expected_visualization)
+            copied_array.sharding().visualize().unwrap().render(false),
+            expected_visualization
         );
         assert_eq!(
             f32_values_from_bytes(
@@ -2262,24 +2262,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            moved_arrays.0.sharding().visualize(false),
-            Ok(indoc! {"
+            moved_arrays.0.sharding().visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
         assert_eq!(
-            moved_arrays.1.sharding().visualize(false),
-            Ok(indoc! {"
+            moved_arrays.1.sharding().visualize().unwrap().render(false),
+            indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string())
+            .to_string()
         );
         assert_eq!(
             f32_values_from_bytes(
@@ -2356,8 +2356,8 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(
-            copied_array.sharding().visualize(false),
-            Ok(expected_visualization)
+            copied_array.sharding().visualize().unwrap().render(false),
+            expected_visualization
         );
         assert_eq!(
             f32_values_from_bytes(
@@ -2420,8 +2420,8 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(
-            copied_array.sharding().visualize(false),
-            Ok(expected_visualization)
+            copied_array.sharding().visualize().unwrap().render(false),
+            expected_visualization
         );
         assert_eq!(
             f32_values_from_bytes(
