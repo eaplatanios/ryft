@@ -8,6 +8,7 @@ pub mod sharding;
 pub mod tracing_v0;
 pub mod tracing_v2;
 pub mod types;
+pub mod utilities;
 pub mod xla;
 
 // TODO(eaplatanios): Export names.
