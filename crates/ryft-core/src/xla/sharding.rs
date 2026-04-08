@@ -180,7 +180,13 @@ impl Sharding {
         // Compute per-device partition coordinates and group devices into grid cells.
         let mut devices_by_cell = HashMap::<(usize, usize), Vec<usize>>::new();
         for device_index in 0..device_count {
-            let mesh_coordinate = decompose_row_major_index(device_index, &axis_sizes);
+            // Decompose the linear device index into row-major mesh coordinates.
+            let mut remaining = device_index;
+            let mut mesh_coordinate = vec![0usize; axis_sizes.len()];
+            for (axis_index, axis_size) in axis_sizes.iter().enumerate().rev() {
+                mesh_coordinate[axis_index] = remaining % axis_size;
+                remaining /= axis_size;
+            }
             let cell = self.visualization_cell(&mesh_coordinate);
             devices_by_cell.entry(cell).or_default().push(device_index);
         }
@@ -248,9 +254,20 @@ impl Sharding {
     }
 }
 
+/// Minimum width in characters for each cell in the rendered visualization grid. Cells expand
+/// beyond this minimum when device labels (e.g., `"0,1,2"`) plus padding exceed it.
 const VISUALIZATION_MIN_CELL_WIDTH: usize = 5;
+
+/// Height in lines of each cell when visualizing a rank-1 sharding (single-row grid).
 const VISUALIZATION_1D_CELL_HEIGHT: usize = 1;
+
+/// Height in lines of each cell when visualizing a rank-2 sharding (row x column grid). The extra
+/// height gives the label a blank line above and below for readability.
 const VISUALIZATION_2D_CELL_HEIGHT: usize = 3;
+
+/// RGB color palette used for ANSI-colored visualization output. Colors are assigned to grid cells
+/// via a greedy graph-coloring scheme that avoids giving the same color to horizontally or
+/// vertically adjacent cells. The palette is adapted from the Tableau 20 categorical color scheme.
 const VISUALIZATION_COLOR_PALETTE: &[(u8, u8, u8)] = &[
     (57, 59, 121),
     (82, 84, 163),
@@ -274,19 +291,28 @@ const VISUALIZATION_COLOR_PALETTE: &[(u8, u8, u8)] = &[
     (222, 158, 214),
 ];
 
+/// Single cell in the visualization grid produced by [`Sharding::visualize`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VisualizationCell {
+    /// Comma-separated device indices that share this partition (e.g., `"0,1"`).
     label: String,
+
+    /// ANSI color style applied when colored output is requested. [`None`] for plain-text mode.
     style: Option<VisualizationStyle>,
 }
 
+/// ANSI true-color foreground/background pair for a single [`VisualizationCell`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct VisualizationStyle {
+    /// RGB foreground (text) color, chosen to contrast with [`Self::background`].
     foreground: (u8, u8, u8),
+
+    /// RGB background color drawn from [`VISUALIZATION_COLOR_PALETTE`].
     background: (u8, u8, u8),
 }
 
 impl VisualizationStyle {
+    /// Wraps `text` in ANSI 24-bit color escape sequences using this style's colors.
     fn render(&self, text: &str) -> String {
         let (foreground_red, foreground_green, foreground_blue) = self.foreground;
         let (background_red, background_green, background_blue) = self.background;
@@ -297,33 +323,15 @@ impl VisualizationStyle {
     }
 }
 
-/// Decomposes a linear row-major index into per-axis coordinates for the given axis sizes.
-fn decompose_row_major_index(mut index: usize, axis_sizes: &[usize]) -> Vec<usize> {
-    let mut coordinates = vec![0usize; axis_sizes.len()];
-    for (axis_index, axis_size) in axis_sizes.iter().enumerate().rev() {
-        coordinates[axis_index] = index % axis_size;
-        index /= axis_size;
-    }
-    coordinates
-}
-
 fn make_visualization_styles(row_count: usize, column_count: usize) -> Vec<VisualizationStyle> {
     let cell_count = row_count * column_count;
     if cell_count == 0 {
         return Vec::new();
     }
 
-    assign_visualization_palette_indices(row_count, column_count)
-        .into_iter()
-        .map(|palette_index| {
-            let background = VISUALIZATION_COLOR_PALETTE[palette_index];
-            VisualizationStyle { foreground: contrasting_text_color(background), background }
-        })
-        .collect()
-}
-
-fn assign_visualization_palette_indices(row_count: usize, column_count: usize) -> Vec<usize> {
-    let cell_count = row_count * column_count;
+    // Assign palette indices using a greedy graph-coloring approach: the first N cells (up to the
+    // palette size) get unique sequential indices, and remaining cells cycle through the palette
+    // while avoiding the same color as their left and upper neighbors.
     let palette_count = VISUALIZATION_COLOR_PALETTE.len();
     let unique_prefix_length = cell_count.min(palette_count);
     let mut palette_indices = (0..unique_prefix_length).collect::<Vec<_>>();
@@ -349,7 +357,14 @@ fn assign_visualization_palette_indices(row_count: usize, column_count: usize) -
                 .expect("the visualization palette should be large enough to avoid orthogonal collisions in a grid"),
         );
     }
+
     palette_indices
+        .into_iter()
+        .map(|palette_index| {
+            let background = VISUALIZATION_COLOR_PALETTE[palette_index];
+            VisualizationStyle { foreground: contrasting_text_color(background), background }
+        })
+        .collect()
 }
 
 fn contrasting_text_color(background: (u8, u8, u8)) -> (u8, u8, u8) {
