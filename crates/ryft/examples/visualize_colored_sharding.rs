@@ -14,11 +14,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![],
         vec![],
     )?;
-    let global_shape = [48, 96];
-    let visualization = sharding.visualize(&global_shape, true)?;
+    let visualization = sharding.visualize(true)?;
 
     println!("Colored sharding visualization example");
-    println!("global shape: {global_shape:?}");
     println!("mesh axes: data=2, replica=2, model=3");
     println!("sharding: {sharding}");
     println!("note: the `replica` mesh axis is left replicated, so each rendered shard groups two devices");

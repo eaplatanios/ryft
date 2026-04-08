@@ -155,10 +155,10 @@ impl Sharding {
     ///
     /// This ports the core behavior of JAX's
     /// [`jax.debug.visualize_array_sharding`](https://github.com/jax-ml/jax/blob/main/jax/_src/debugging.py):
-    /// it materializes the per-device shard layout for a rank-1 or rank-2 array, groups devices
-    /// that own the same logical slice, and renders the resulting chunks as uniform cells. Devices
-    /// are labeled with sequential indices `0..device_count` based on their row-major position in
-    /// the logical mesh.
+    /// it groups devices that own the same logical partition and renders the resulting chunks as
+    /// uniform cells in a rank-1 (single row) or rank-2 (row x column) grid. Devices are labeled
+    /// with sequential indices `0..device_count` based on their row-major position in the logical
+    /// mesh.
     ///
     /// Unlike JAX's implementation, this method returns a string instead of printing directly,
     /// making it suitable for logs, tests, and snapshots. When `colored` is `true`, the returned
@@ -166,37 +166,30 @@ impl Sharding {
     ///
     /// # Parameters
     ///
-    ///   - `global_shape`: Global logical array shape to visualize. Only rank-1 and rank-2
-    ///     shapes are supported.
     ///   - `colored`: Whether to return ANSI colorized cell backgrounds in a rich-table-like
     ///     rendering. When `false`, the output is stable plain text without escape sequences.
-    pub fn visualize(&self, global_shape: &[usize], colored: bool) -> Result<String, ShardingError> {
-        let rank = global_shape.len();
+    pub fn visualize(&self, colored: bool) -> Result<String, ShardingError> {
+        let rank = self.rank();
         if !matches!(rank, 1 | 2) {
             return Err(ShardingError::UnsupportedVisualizationRank { rank });
-        }
-        if self.rank() != rank {
-            return Err(ShardingError::ShardingRankMismatch { sharding_rank: self.rank(), array_rank: rank });
         }
 
         let axis_sizes = self.mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>();
         let device_count = self.mesh.device_count();
 
-        // Compute per-device slice bounds and group devices into grid cells.
-        let mut devices_by_cell = HashMap::<(VisualizationBounds, VisualizationBounds), Vec<usize>>::new();
+        // Compute per-device partition coordinates and group devices into grid cells.
+        let mut devices_by_cell = HashMap::<(usize, usize), Vec<usize>>::new();
         for device_index in 0..device_count {
             let mesh_coordinate = decompose_row_major_index(device_index, &axis_sizes);
-            let (row_bounds, column_bounds) = self.visualization_bounds(global_shape, &mesh_coordinate);
-            devices_by_cell.entry((row_bounds, column_bounds)).or_default().push(device_index);
+            let cell = self.visualization_cell(&mesh_coordinate);
+            devices_by_cell.entry(cell).or_default().push(device_index);
         }
 
-        // Collect and deduplicate distinct row and column segments.
-        let row_segments = collect_visualization_segments(devices_by_cell.keys().map(|(row, _)| *row));
-        let column_segments = collect_visualization_segments(devices_by_cell.keys().map(|(_, column)| *column));
+        // Collect the distinct row and column partition indices.
+        let row_count = devices_by_cell.keys().map(|(row, _)| *row).max().map_or(0, |max| max + 1);
+        let column_count = devices_by_cell.keys().map(|(_, column)| *column).max().map_or(0, |max| max + 1);
 
         // Build the visualization cell grid.
-        let row_count = row_segments.len();
-        let column_count = column_segments.len();
         let mut cells = vec![vec![VisualizationCell { label: String::new(), style: None }; column_count]; row_count];
         let mut cell_width = VISUALIZATION_MIN_CELL_WIDTH;
         let mut cell_styles =
@@ -204,7 +197,7 @@ impl Sharding {
         for row_index in 0..row_count {
             for column_index in 0..column_count {
                 let label = devices_by_cell
-                    .get_mut(&(row_segments[row_index], column_segments[column_index]))
+                    .get_mut(&(row_index, column_index))
                     .map(|device_indices| {
                         device_indices.sort_unstable();
                         device_indices.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
@@ -219,39 +212,26 @@ impl Sharding {
         Ok(render_visualization(cells.as_slice(), cell_width, cell_height, colored))
     }
 
-    /// Returns the `(row_bounds, column_bounds)` for a device at the given mesh coordinate.
+    /// Returns the `(row, column)` grid cell for a device at the given mesh coordinate.
     ///
-    /// For rank-1 arrays the row is a single fixed band `(0, 1)` and the column covers the
-    /// device's slice. For rank-2 arrays row and column map to the first and second array
-    /// dimensions respectively.
-    fn visualization_bounds(
-        &self,
-        global_shape: &[usize],
-        mesh_coordinate: &[usize],
-    ) -> (VisualizationBounds, VisualizationBounds) {
-        if global_shape.len() == 1 {
-            let column_bounds = self.dimension_slice_bounds(0, global_shape[0], mesh_coordinate);
-            ((0, 1), column_bounds)
+    /// For rank-1 shardings the row is always `0` and the column is the partition index for
+    /// dimension 0. For rank-2 shardings row and column map to the partition indices of the
+    /// first and second dimensions respectively.
+    fn visualization_cell(&self, mesh_coordinate: &[usize]) -> (usize, usize) {
+        if self.dimensions.len() == 1 {
+            (0, self.dimension_partition_index(0, mesh_coordinate))
         } else {
-            let row_bounds = self.dimension_slice_bounds(0, global_shape[0], mesh_coordinate);
-            let column_bounds = self.dimension_slice_bounds(1, global_shape[1], mesh_coordinate);
-            (row_bounds, column_bounds)
+            (self.dimension_partition_index(0, mesh_coordinate), self.dimension_partition_index(1, mesh_coordinate))
         }
     }
 
-    /// Returns the `(start, end)` bounds of a single array dimension's shard slice for a device
-    /// at the given mesh coordinate.
-    fn dimension_slice_bounds(
-        &self,
-        dimension: usize,
-        dimension_size: usize,
-        mesh_coordinate: &[usize],
-    ) -> VisualizationBounds {
+    /// Returns the partition index of a single sharding dimension for a device at the given mesh
+    /// coordinate. Replicated and unconstrained dimensions always return `0` (single partition).
+    fn dimension_partition_index(&self, dimension: usize, mesh_coordinate: &[usize]) -> usize {
         match &self.dimensions[dimension] {
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => (0, dimension_size),
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
             ShardingDimension::Sharded(axis_names) => {
                 let mut partition_index = 0usize;
-                let mut partition_count = 1usize;
                 for axis_name in axis_names {
                     let axis_index = self
                         .mesh
@@ -261,14 +241,8 @@ impl Sharding {
                         .expect("sharding mesh axes should be validated at construction");
                     let axis_size = self.mesh.axes[axis_index].size;
                     partition_index = partition_index * axis_size + mesh_coordinate[axis_index];
-                    partition_count *= axis_size;
                 }
-                let base_size = dimension_size / partition_count;
-                let remainder = dimension_size % partition_count;
-                let extra_before = partition_index.min(remainder);
-                let start = partition_index * base_size + extra_before;
-                let size = base_size + usize::from(partition_index < remainder);
-                (start, start + size)
+                partition_index
             }
         }
     }
@@ -299,8 +273,6 @@ const VISUALIZATION_COLOR_PALETTE: &[(u8, u8, u8)] = &[
     (206, 109, 189),
     (222, 158, 214),
 ];
-
-type VisualizationBounds = (usize, usize);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VisualizationCell {
@@ -333,13 +305,6 @@ fn decompose_row_major_index(mut index: usize, axis_sizes: &[usize]) -> Vec<usiz
         index /= axis_size;
     }
     coordinates
-}
-
-fn collect_visualization_segments<I: IntoIterator<Item = VisualizationBounds>>(bounds: I) -> Vec<VisualizationBounds> {
-    let mut segments = bounds.into_iter().collect::<Vec<_>>();
-    segments.sort_unstable();
-    segments.dedup();
-    segments
 }
 
 fn make_visualization_styles(row_count: usize, column_count: usize) -> Vec<VisualizationStyle> {
@@ -938,7 +903,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            sharding.visualize(&[8], false),
+            sharding.visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │ 0,1 │ 2,3 │
@@ -957,7 +922,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            sharding.visualize(&[5], false),
+            sharding.visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
@@ -981,7 +946,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            sharding.visualize(&[8, 6], false),
+            sharding.visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │     │     │
@@ -1005,7 +970,7 @@ mod tests {
             Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], empty_axes(), empty_axes(), empty_axes())
                 .unwrap();
 
-        let colored = sharding.visualize(&[8], true).unwrap();
+        let colored = sharding.visualize(true).unwrap();
 
         assert!(colored.contains("\u{1b}[38;2;"));
         assert!(colored.contains("\u{1b}[48;2;"));
@@ -1042,7 +1007,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 3);
 
-        assert_eq!(sharding.visualize(&[2, 3, 4], false), Err(ShardingError::UnsupportedVisualizationRank { rank: 3 }));
+        assert_eq!(sharding.visualize(false), Err(ShardingError::UnsupportedVisualizationRank { rank: 3 }));
     }
 
     fn shard_for_device<'a>(

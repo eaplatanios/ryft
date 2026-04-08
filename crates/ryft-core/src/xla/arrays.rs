@@ -1894,7 +1894,7 @@ mod tests {
         assert_eq!(array.addressable_shards().count(), 2);
         assert!(array.shards().iter().all(|shard| shard.is_addressable()));
         assert_eq!(
-            array.sharding().visualize(array.shape().as_slice(), false),
+            array.sharding().visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
@@ -1946,7 +1946,7 @@ mod tests {
         assert_eq!(array.addressable_shards().count(), 4);
         assert!(array.shards().iter().all(|shard| shard.is_addressable()));
         assert_eq!(
-            array.sharding().visualize(array.shape().as_slice(), false),
+            array.sharding().visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │     │     │
@@ -2007,7 +2007,7 @@ mod tests {
 
         assert_eq!(moved_array.addressable_shards().count(), 2);
         assert_eq!(
-            moved_array.sharding().visualize(moved_array.shape().as_slice(), false),
+            moved_array.sharding().visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
@@ -2073,7 +2073,7 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(
-            copied_array.sharding().visualize(copied_array.shape().as_slice(), false),
+            copied_array.sharding().visualize(false),
             Ok(expected_visualization)
         );
         assert_eq!(
@@ -2262,7 +2262,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            moved_arrays.0.sharding().visualize(moved_arrays.0.shape().as_slice(), false),
+            moved_arrays.0.sharding().visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
@@ -2272,7 +2272,7 @@ mod tests {
             .to_string())
         );
         assert_eq!(
-            moved_arrays.1.sharding().visualize(moved_arrays.1.shape().as_slice(), false),
+            moved_arrays.1.sharding().visualize(false),
             Ok(indoc! {"
                 ┌─────┬─────┐
                 │  0  │  1  │
@@ -2356,7 +2356,7 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(
-            copied_array.sharding().visualize(copied_array.shape().as_slice(), false),
+            copied_array.sharding().visualize(false),
             Ok(expected_visualization)
         );
         assert_eq!(
@@ -2420,7 +2420,7 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(
-            copied_array.sharding().visualize(copied_array.shape().as_slice(), false),
+            copied_array.sharding().visualize(false),
             Ok(expected_visualization)
         );
         assert_eq!(
