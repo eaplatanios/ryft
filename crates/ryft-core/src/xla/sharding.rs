@@ -143,9 +143,11 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::sharding::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDimension, ShardingError};
 #[cfg(test)]
 use ryft_mlir::Context as MlirContext;
+
+use crate::sharding::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDimension, ShardingError};
+use crate::utilities::colors::Color;
 
 #[cfg(test)]
 use crate::sharding::{LogicalMesh, MeshAxisType};
@@ -215,7 +217,11 @@ impl Sharding {
             }
         }
         let cell_height = if rank == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
-        Ok(render_visualization(cells.as_slice(), cell_width, cell_height, colored))
+        if colored {
+            Ok(render_colored_visualization(cells.as_slice(), cell_width, cell_height))
+        } else {
+            Ok(render_plain_visualization(cells.as_slice(), cell_width, cell_height))
+        }
     }
 
     /// Returns the `(row, column)` grid cell for a device at the given mesh coordinate.
@@ -268,27 +274,27 @@ const VISUALIZATION_2D_CELL_HEIGHT: usize = 3;
 /// RGB color palette used for ANSI-colored visualization output. Colors are assigned to grid cells
 /// via a greedy graph-coloring scheme that avoids giving the same color to horizontally or
 /// vertically adjacent cells. The palette is adapted from the Tableau 20 categorical color scheme.
-const VISUALIZATION_COLOR_PALETTE: &[(u8, u8, u8)] = &[
-    (57, 59, 121),
-    (82, 84, 163),
-    (107, 110, 207),
-    (156, 158, 222),
-    (99, 121, 57),
-    (140, 162, 82),
-    (181, 207, 107),
-    (206, 219, 156),
-    (140, 109, 49),
-    (189, 158, 57),
-    (231, 186, 82),
-    (231, 203, 148),
-    (132, 60, 57),
-    (173, 73, 74),
-    (214, 97, 107),
-    (231, 150, 156),
-    (123, 65, 115),
-    (165, 81, 148),
-    (206, 109, 189),
-    (222, 158, 214),
+const VISUALIZATION_COLOR_PALETTE: &[Color] = &[
+    Color::new(57, 59, 121),
+    Color::new(82, 84, 163),
+    Color::new(107, 110, 207),
+    Color::new(156, 158, 222),
+    Color::new(99, 121, 57),
+    Color::new(140, 162, 82),
+    Color::new(181, 207, 107),
+    Color::new(206, 219, 156),
+    Color::new(140, 109, 49),
+    Color::new(189, 158, 57),
+    Color::new(231, 186, 82),
+    Color::new(231, 203, 148),
+    Color::new(132, 60, 57),
+    Color::new(173, 73, 74),
+    Color::new(214, 97, 107),
+    Color::new(231, 150, 156),
+    Color::new(123, 65, 115),
+    Color::new(165, 81, 148),
+    Color::new(206, 109, 189),
+    Color::new(222, 158, 214),
 ];
 
 /// Single cell in the visualization grid produced by [`Sharding::visualize`].
@@ -304,22 +310,17 @@ struct VisualizationCell {
 /// ANSI true-color foreground/background pair for a single [`VisualizationCell`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct VisualizationStyle {
-    /// RGB foreground (text) color, chosen to contrast with [`Self::background`].
-    foreground: (u8, u8, u8),
+    /// Foreground (text) color, chosen to contrast with [`Self::background`].
+    foreground: Color,
 
-    /// RGB background color drawn from [`VISUALIZATION_COLOR_PALETTE`].
-    background: (u8, u8, u8),
+    /// Background color drawn from [`VISUALIZATION_COLOR_PALETTE`].
+    background: Color,
 }
 
 impl VisualizationStyle {
     /// Wraps `text` in ANSI 24-bit color escape sequences using this style's colors.
     fn render(&self, text: &str) -> String {
-        let (foreground_red, foreground_green, foreground_blue) = self.foreground;
-        let (background_red, background_green, background_blue) = self.background;
-        format!(
-            "\u{1b}[38;2;{foreground_red};{foreground_green};{foreground_blue}m\
-\u{1b}[48;2;{background_red};{background_green};{background_blue}m{text}\u{1b}[0m"
-        )
+        Color::colored_text(text, self.foreground, self.background)
     }
 }
 
@@ -362,28 +363,9 @@ fn make_visualization_styles(row_count: usize, column_count: usize) -> Vec<Visua
         .into_iter()
         .map(|palette_index| {
             let background = VISUALIZATION_COLOR_PALETTE[palette_index];
-            VisualizationStyle { foreground: contrasting_text_color(background), background }
+            VisualizationStyle { foreground: background.foreground_color(), background }
         })
         .collect()
-}
-
-fn contrasting_text_color(background: (u8, u8, u8)) -> (u8, u8, u8) {
-    let (red, green, blue) = background;
-    let luminance = f32::from(red) * 0.299 + f32::from(green) * 0.587 + f32::from(blue) * 0.114;
-    if luminance > 186.0 { (0, 0, 0) } else { (255, 255, 255) }
-}
-
-fn render_visualization(
-    cells: &[Vec<VisualizationCell>],
-    cell_width: usize,
-    cell_height: usize,
-    colored: bool,
-) -> String {
-    if colored {
-        return render_colored_visualization(cells, cell_width, cell_height);
-    }
-
-    render_plain_visualization(cells, cell_width, cell_height)
 }
 
 fn render_plain_visualization(cells: &[Vec<VisualizationCell>], cell_width: usize, cell_height: usize) -> String {
