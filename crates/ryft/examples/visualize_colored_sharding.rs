@@ -1,24 +1,21 @@
-use ryft::core::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, ShardingDimension};
+use ryft::core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
 use ryft::core::xla::Sharding;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mesh = DeviceMesh::new(
-        LogicalMesh::new(vec![
-            MeshAxis::new("data", 2, MeshAxisType::Auto)?,
-            MeshAxis::new("replica", 2, MeshAxisType::Auto)?,
-            MeshAxis::new("model", 3, MeshAxisType::Auto)?,
-        ])?,
-        (0..12).map(|device_id| MeshDevice::new(device_id, usize::from(device_id >= 6))).collect(),
-    )?;
+    let mesh = LogicalMesh::new(vec![
+        MeshAxis::new("data", 2, MeshAxisType::Auto)?,
+        MeshAxis::new("replica", 2, MeshAxisType::Auto)?,
+        MeshAxis::new("model", 3, MeshAxisType::Auto)?,
+    ])?;
     let sharding = Sharding::new::<String, _, String, _, String, _>(
-        mesh.logical_mesh.clone(),
+        mesh,
         vec![ShardingDimension::sharded(["data"]), ShardingDimension::sharded(["model"])],
         vec![],
         vec![],
         vec![],
     )?;
     let global_shape = [48, 96];
-    let visualization = sharding.visualize(&global_shape, &mesh, true)?;
+    let visualization = sharding.visualize(&global_shape, true)?;
 
     println!("Colored sharding visualization example");
     println!("global shape: {global_shape:?}");
