@@ -180,7 +180,7 @@ impl ShardingVisualization {
                     let mut line = String::new();
                     for (cell, &background_color) in row_cells.iter().zip(row_colors.iter()) {
                         let contents = if line_index == label_line {
-                            Self::center_text(cell.as_str(), cell_width)
+                            format!("{cell:^cell_width$}")
                         } else {
                             " ".repeat(cell_width)
                         };
@@ -206,7 +206,7 @@ impl ShardingVisualization {
                     let mut line = String::from("│");
                     for label in row_cells {
                         let contents = if line_index == label_line {
-                            Self::center_text(label.as_str(), cell_width)
+                            format!("{label:^cell_width$}")
                         } else {
                             " ".repeat(cell_width)
                         };
@@ -253,19 +253,6 @@ impl ShardingVisualization {
             .chunks(column_count)
             .map(|row| row.iter().map(|&index| VISUALIZATION_COLOR_PALETTE[index]).collect())
             .collect()
-    }
-
-    /// Centers `text` within a field of the given `width` by padding with spaces on both sides. If
-    /// `text` is already as wide as or wider than `width`, it is truncated to fit.
-    fn center_text(text: &str, width: usize) -> String {
-        let text_width = text.chars().count();
-        if text_width >= width {
-            return text.chars().take(width).collect();
-        }
-
-        let left_padding = (width - text_width) / 2;
-        let right_padding = width - text_width - left_padding;
-        format!("{}{}{}", " ".repeat(left_padding), text, " ".repeat(right_padding))
     }
 
     /// Builds a single horizontal border line for the plain-text visualization grid using box-drawing
