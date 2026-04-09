@@ -152,10 +152,8 @@ impl Sharding {
     }
 }
 
-/// Grid-based visualization of a [`Sharding`] produced by [`Sharding::visualize`].
-///
-/// Each cell in the grid holds a label listing the device indices that share the corresponding
-/// partition. Call [`Self::render`] to produce a displayable string.
+/// Grid-based visualization of a [`Sharding`] produced by [`Sharding::visualize`]. Each cell in the grid holds a label
+/// listing the device indices that share the corresponding partition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardingVisualization {
     /// Row-major grid of device-index labels (e.g., `"0,1"`).
@@ -169,48 +167,47 @@ pub struct ShardingVisualization {
 }
 
 impl ShardingVisualization {
-    /// Renders this visualization to a string.
-    ///
-    /// When `colored` is `true` the output contains ANSI 24-bit color escape sequences that
-    /// approximate JAX's colorized `rich` table. When `false` the output is stable plain text
-    /// with box-drawing borders and no escape sequences.
+    /// Renders this [`ShardingVisualization`] to a string. When `colored` is `true` the output contains ANSI 24-bit
+    /// color escape sequences. When `false` the output is stable plain text with ASCII borders and no escape sequences.
     pub fn render(&self, colored: bool) -> String {
         let row_count = self.cells.len();
         let column_count = self.cells.first().map_or(0, Vec::len);
         let label_line = self.cell_height / 2;
         let mut lines = Vec::new();
-
         if colored {
-            let background_colors = assign_visualization_background_colors(row_count, column_count);
-            for (row_index, row_cells) in self.cells.iter().enumerate() {
+            let background_colors = Self::assign_background_colors(row_count, column_count);
+            for (row_cells, row_colors) in self.cells.iter().zip(background_colors.iter()) {
                 for line_index in 0..self.cell_height {
                     let mut line = String::new();
-                    for (column_index, label) in row_cells.iter().enumerate() {
+                    for (cell, &background_color) in row_cells.iter().zip(row_colors.iter()) {
                         let contents = if line_index == label_line {
-                            center_text(label.as_str(), self.cell_width)
+                            Self::center_text(cell.as_str(), self.cell_width)
                         } else {
                             " ".repeat(self.cell_width)
                         };
-                        let background = background_colors[row_index * column_count + column_index];
                         line.push_str(
-                            Color::colored_text(contents.as_str(), background.foreground_color(), background).as_str(),
+                            Color::colored_text(
+                                contents.as_str(),
+                                background_color.foreground_color(),
+                                background_color,
+                            )
+                            .as_str(),
                         );
                     }
                     lines.push(line);
                 }
             }
         } else {
-            let top_border = render_horizontal_border('┌', '┬', '┐', column_count, self.cell_width);
-            let middle_border = render_horizontal_border('├', '┼', '┤', column_count, self.cell_width);
-            let bottom_border = render_horizontal_border('└', '┴', '┘', column_count, self.cell_width);
+            let top_border = Self::render_horizontal_border('┌', '┬', '┐', column_count, self.cell_width);
+            let middle_border = Self::render_horizontal_border('├', '┼', '┤', column_count, self.cell_width);
+            let bottom_border = Self::render_horizontal_border('└', '┴', '┘', column_count, self.cell_width);
             lines.push(top_border);
-
             for (row_index, row_cells) in self.cells.iter().enumerate() {
                 for line_index in 0..self.cell_height {
                     let mut line = String::from("│");
                     for label in row_cells {
                         let contents = if line_index == label_line {
-                            center_text(label.as_str(), self.cell_width)
+                            Self::center_text(label.as_str(), self.cell_width)
                         } else {
                             " ".repeat(self.cell_width)
                         };
@@ -226,82 +223,84 @@ impl ShardingVisualization {
                 }
             }
         }
-
         lines.join("\n")
     }
-}
 
-/// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that
-/// avoids giving the same color to horizontally or vertically adjacent cells.
-fn assign_visualization_background_colors(row_count: usize, column_count: usize) -> Vec<Color> {
-    let cell_count = row_count * column_count;
-    if cell_count == 0 {
-        return Vec::new();
+    /// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that
+    /// avoids giving the same color to horizontally or vertically adjacent cells.
+    fn assign_background_colors(row_count: usize, column_count: usize) -> Vec<Vec<Color>> {
+        let cell_count = row_count * column_count;
+        if cell_count == 0 {
+            return Vec::new();
+        }
+
+        let palette_count = VISUALIZATION_COLOR_PALETTE.len();
+        let unique_prefix_length = cell_count.min(palette_count);
+        let mut palette_indices = (0..unique_prefix_length).collect::<Vec<_>>();
+        let mut next_palette_index = 0usize;
+
+        for cell_index in unique_prefix_length..cell_count {
+            let column_index = cell_index % column_count;
+            let left_neighbor = (column_index > 0).then_some(palette_indices[cell_index - 1]);
+            let upper_neighbor = (cell_index >= column_count).then_some(palette_indices[cell_index - column_count]);
+
+            let mut assigned_palette_index = None;
+            for offset in 0..palette_count {
+                let candidate_palette_index = (next_palette_index + offset) % palette_count;
+                if Some(candidate_palette_index) != left_neighbor && Some(candidate_palette_index) != upper_neighbor {
+                    assigned_palette_index = Some(candidate_palette_index);
+                    next_palette_index = (candidate_palette_index + 1) % palette_count;
+                    break;
+                }
+            }
+            palette_indices.push(
+                assigned_palette_index.expect(
+                    "the visualization palette should be large enough to avoid orthogonal collisions in a grid",
+                ),
+            );
+        }
+
+        palette_indices
+            .chunks(column_count)
+            .map(|row| row.iter().map(|&index| VISUALIZATION_COLOR_PALETTE[index]).collect())
+            .collect()
     }
 
-    let palette_count = VISUALIZATION_COLOR_PALETTE.len();
-    let unique_prefix_length = cell_count.min(palette_count);
-    let mut palette_indices = (0..unique_prefix_length).collect::<Vec<_>>();
-    let mut next_palette_index = 0usize;
-
-    for cell_index in unique_prefix_length..cell_count {
-        let row_index = cell_index / column_count;
-        let column_index = cell_index % column_count;
-        let left_neighbor = (column_index > 0).then_some(palette_indices[cell_index - 1]);
-        let upper_neighbor = (row_index > 0).then_some(palette_indices[cell_index - column_count]);
-
-        let mut assigned_palette_index = None;
-        for offset in 0..palette_count {
-            let candidate_palette_index = (next_palette_index + offset) % palette_count;
-            if Some(candidate_palette_index) != left_neighbor && Some(candidate_palette_index) != upper_neighbor {
-                assigned_palette_index = Some(candidate_palette_index);
-                next_palette_index = (candidate_palette_index + 1) % palette_count;
-                break;
+    /// Builds a single horizontal border line for the plain-text visualization grid using box-drawing
+    /// characters. For example, `render_horizontal_border('┌', '┬', '┐', 3, 5)` produces the string
+    /// `"┌─────┬─────┬─────┐"`.
+    fn render_horizontal_border(
+        left_corner: char,
+        intersection: char,
+        right_corner: char,
+        column_count: usize,
+        cell_width: usize,
+    ) -> String {
+        let mut line = String::new();
+        line.push(left_corner);
+        if column_count > 0 {
+            line.push_str("─".repeat(cell_width).as_str());
+            for _ in 1..column_count {
+                line.push(intersection);
+                line.push_str("─".repeat(cell_width).as_str());
             }
         }
-        palette_indices.push(
-            assigned_palette_index
-                .expect("the visualization palette should be large enough to avoid orthogonal collisions in a grid"),
-        );
+        line.push(right_corner);
+        line
     }
 
-    palette_indices.into_iter().map(|index| VISUALIZATION_COLOR_PALETTE[index]).collect()
-}
-
-/// Builds a single horizontal border line for the plain-text visualization grid using box-drawing
-/// characters. For example, `render_horizontal_border('┌', '┬', '┐', 3, 5)` produces the string
-/// `"┌─────┬─────┬─────┐"`.
-fn render_horizontal_border(
-    left_corner: char,
-    intersection: char,
-    right_corner: char,
-    column_count: usize,
-    cell_width: usize,
-) -> String {
-    let mut line = String::new();
-    line.push(left_corner);
-    if column_count > 0 {
-        line.push_str("─".repeat(cell_width).as_str());
-        for _ in 1..column_count {
-            line.push(intersection);
-            line.push_str("─".repeat(cell_width).as_str());
+    /// Centers `text` within a field of the given `width` by padding with spaces on both sides. If
+    /// `text` is already as wide as or wider than `width`, it is truncated to fit.
+    fn center_text(text: &str, width: usize) -> String {
+        let text_width = text.chars().count();
+        if text_width >= width {
+            return text.chars().take(width).collect();
         }
-    }
-    line.push(right_corner);
-    line
-}
 
-/// Centers `text` within a field of the given `width` by padding with spaces on both sides. If
-/// `text` is already as wide as or wider than `width`, it is truncated to fit.
-fn center_text(text: &str, width: usize) -> String {
-    let text_width = text.chars().count();
-    if text_width >= width {
-        return text.chars().take(width).collect();
+        let left_padding = (width - text_width) / 2;
+        let right_padding = width - text_width - left_padding;
+        format!("{}{}{}", " ".repeat(left_padding), text, " ".repeat(right_padding))
     }
-
-    let left_padding = (width - text_width) / 2;
-    let right_padding = width - text_width - left_padding;
-    format!("{}{}{}", " ".repeat(left_padding), text, " ".repeat(right_padding))
 }
 
 #[cfg(test)]
@@ -419,18 +418,18 @@ mod tests {
     fn test_visualization_palette_uses_unique_prefix_and_avoids_neighbor_collisions() {
         let row_count = 5;
         let column_count = 5;
-        let backgrounds = assign_visualization_background_colors(row_count, column_count);
-        let unique_prefix = backgrounds.iter().take(VISUALIZATION_COLOR_PALETTE.len()).copied().collect::<HashSet<_>>();
+        let backgrounds = ShardingVisualization::assign_background_colors(row_count, column_count);
+        let flat: Vec<Color> = backgrounds.iter().flatten().copied().collect();
+        let unique_prefix = flat.iter().take(VISUALIZATION_COLOR_PALETTE.len()).copied().collect::<HashSet<_>>();
 
         assert_eq!(unique_prefix.len(), VISUALIZATION_COLOR_PALETTE.len());
         for row_index in 0..row_count {
             for column_index in 0..column_count {
-                let cell_index = row_index * column_count + column_index;
                 if column_index + 1 < column_count {
-                    assert_ne!(backgrounds[cell_index], backgrounds[cell_index + 1]);
+                    assert_ne!(backgrounds[row_index][column_index], backgrounds[row_index][column_index + 1]);
                 }
                 if row_index + 1 < row_count {
-                    assert_ne!(backgrounds[cell_index], backgrounds[cell_index + column_count]);
+                    assert_ne!(backgrounds[row_index][column_index], backgrounds[row_index + 1][column_index]);
                 }
             }
         }
