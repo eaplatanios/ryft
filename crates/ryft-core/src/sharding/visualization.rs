@@ -113,39 +113,6 @@ impl Sharding {
         let cell_height = if rank == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
         Ok(ShardingVisualization { cells, cell_width, cell_height })
     }
-
-    /// Returns the partition index for the provided array dimension that is owned by the device at the provided
-    /// mesh coordinates. Each dimension of a sharded array is partitioned independently; a device's full shard is the
-    /// intersection of its per-dimension partitions. For example, with sharding `[Sharded(["x"]), Sharded(["y"])]` on
-    /// a `2×2` mesh, the device at `(x=1, y=0)` owns partition `1` of dimension `0` (i.e., the second row-band) and
-    /// partition `0` of dimension `1` (i.e., the first column-band). Together these identify the rectangular tile that
-    /// device holds.
-    ///
-    /// The returned index is computed as follows:
-    ///   - [`ShardingDimension::Replicated`] and [`ShardingDimension::Unconstrained`] always have partition index `0`,
-    ///     since every device holds the full extent of that dimension.
-    ///   - [`ShardingDimension::Sharded`] results in the row-major linearization of the device's mesh coordinates along
-    ///     the sharding axes. For example, given `Sharded(["data", "model"])` where `data` has size `4` and `model` has
-    ///     size `2`, a device at mesh coordinates `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
-    fn partition_index(&self, dimension: usize, device_mesh_coordinates: &[usize]) -> usize {
-        match &self.dimensions[dimension] {
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
-            ShardingDimension::Sharded(axis_names) => {
-                let mut partition_index = 0usize;
-                for axis_name in axis_names {
-                    let axis_index = self
-                        .mesh
-                        .axis_indices
-                        .get(axis_name.as_str())
-                        .copied()
-                        .expect("sharding mesh axes should be validated at construction");
-                    let axis_size = self.mesh.axes[axis_index].size;
-                    partition_index = partition_index * axis_size + device_mesh_coordinates[axis_index];
-                }
-                partition_index
-            }
-        }
-    }
 }
 
 /// Grid-based visualization of a [`Sharding`] produced by [`Sharding::visualize`].

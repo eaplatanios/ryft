@@ -646,6 +646,34 @@ impl Sharding {
             .collect()
     }
 
+    /// Returns the partition index for the provided array dimension that is owned by the device at the provided
+    /// mesh coordinates. Each dimension of a sharded array is partitioned independently; a device's full shard is the
+    /// intersection of its per-dimension partitions. For example, with sharding `[Sharded(["x"]), Sharded(["y"])]` on
+    /// a `2×2` mesh, the device at `(x=1, y=0)` owns partition `1` of dimension `0` (i.e., the second row-band) and
+    /// partition `0` of dimension `1` (i.e., the first column-band). Together these identify the rectangular tile that
+    /// device holds.
+    ///
+    /// The returned index is computed as follows:
+    ///   - [`ShardingDimension::Replicated`] and [`ShardingDimension::Unconstrained`] always have partition index `0`,
+    ///     since every device holds the full extent of that dimension.
+    ///   - [`ShardingDimension::Sharded`] results in the row-major linearization of the device's mesh coordinates along
+    ///     the sharding axes. For example, given `Sharded(["data", "model"])` where `data` has size `4` and `model` has
+    ///     size `2`, a device at mesh coordinates `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
+    pub fn partition_index(&self, dimension: usize, device_mesh_coordinates: &[usize]) -> usize {
+        match &self.dimensions[dimension] {
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
+            ShardingDimension::Sharded(axis_names) => axis_names.iter().fold(0usize, |index, axis_name| {
+                let axis_index = self
+                    .mesh
+                    .axis_indices
+                    .get(axis_name.as_str())
+                    .copied()
+                    .expect("sharding mesh axes should be validated at construction");
+                index * self.mesh.axes[axis_index].size + device_mesh_coordinates[axis_index]
+            }),
+        }
+    }
+
     /// Returns a copy of this [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.
     pub(crate) fn without_auto_axes(&self) -> Self {
         let dimensions = self
@@ -978,6 +1006,11 @@ mod tests {
         assert_eq!(sharding.reduced_manual_axes, BTreeSet::from(["manual".to_string()]));
         assert_eq!(sharding.varying_manual_axes, BTreeSet::new());
         assert_eq!(sharding.rank(), 2);
+        assert_eq!(sharding.partition_index(0, &[0, 0]), 0);
+        assert_eq!(sharding.partition_index(0, &[2, 1]), 2);
+        assert_eq!(sharding.partition_index(0, &[3, 0]), 3);
+        assert_eq!(sharding.partition_index(1, &[0, 0]), 0);
+        assert_eq!(sharding.partition_index(1, &[3, 1]), 0);
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
         assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced_manual={'manual'}}",);
 
@@ -991,6 +1024,9 @@ mod tests {
         assert_eq!(replicated.reduced_manual_axes, BTreeSet::new());
         assert_eq!(replicated.varying_manual_axes, BTreeSet::new());
         assert_eq!(replicated.rank(), 3);
+        assert_eq!(replicated.partition_index(0, &[0, 0]), 0);
+        assert_eq!(replicated.partition_index(1, &[3, 1]), 0);
+        assert_eq!(replicated.partition_index(2, &[2, 0]), 0);
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
         assert_eq!(replicated.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{}, {}, {}]}");
 
