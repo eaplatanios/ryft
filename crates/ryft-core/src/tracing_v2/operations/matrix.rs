@@ -124,7 +124,7 @@ fn transpose_array_sharding(input: &ArrayType) -> Option<Sharding> {
     if sharding.rank() != 2 {
         return None;
     }
-    Sharding::new(
+    Sharding::with_manual_axes(
         sharding.mesh.clone(),
         vec![sharding.dimensions[1].clone(), sharding.dimensions[0].clone()],
         sharding.unreduced_axes.clone(),
@@ -149,7 +149,7 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
     {
         return None;
     }
-    Sharding::new(
+    Sharding::with_manual_axes(
         left.mesh.clone(),
         vec![left.dimensions[0].clone(), right.dimensions[1].clone()],
         merge_unique_axes(&left.unreduced_axes, &right.unreduced_axes),

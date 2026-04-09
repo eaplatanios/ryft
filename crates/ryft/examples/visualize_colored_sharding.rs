@@ -7,12 +7,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MeshAxis::new("replica", 2, MeshAxisType::Auto)?,
         MeshAxis::new("model", 3, MeshAxisType::Auto)?,
     ])?;
-    let sharding = Sharding::new::<String, _, String, _, String, _>(
+    let sharding = Sharding::new(
         mesh,
         vec![ShardingDimension::sharded(["data"]), ShardingDimension::sharded(["model"])],
-        vec![],
-        vec![],
-        vec![],
     )?;
     let visualization = sharding.visualize()?.render(true);
 

@@ -28,13 +28,7 @@ impl Sharding {
     ///     MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
     ///     MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
     /// ]).unwrap();
-    /// let sharding = Sharding::new(
-    ///     mesh,
-    ///     vec![ShardingDimension::sharded(["x"])],
-    ///     Vec::<&str>::new(),
-    ///     Vec::<&str>::new(),
-    ///     Vec::<&str>::new(),
-    /// ).unwrap();
+    /// let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
     /// assert_eq!(
     ///     sharding.visualize().unwrap().render(false),
     ///     indoc! {"
@@ -50,9 +44,6 @@ impl Sharding {
     /// let sharding = Sharding::new(
     ///     mesh,
     ///     vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
-    ///     Vec::<&str>::new(),
-    ///     Vec::<&str>::new(),
-    ///     Vec::<&str>::new(),
     /// ).unwrap();
     /// assert_eq!(
     ///     sharding.visualize().unwrap().render(false),
@@ -381,16 +372,10 @@ mod tests {
         stripped
     }
 
-    fn empty_axes() -> Vec<&'static str> {
-        Vec::new()
-    }
-
     #[test]
     fn test_sharding_visualize_groups_replicated_devices() {
         let mesh = test_logical_mesh_2x2();
-        let sharding =
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], empty_axes(), empty_axes(), empty_axes())
-                .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         assert_eq!(
             sharding.visualize().unwrap().render(false),
@@ -407,9 +392,7 @@ mod tests {
     #[test]
     fn test_sharding_visualize_uneven_1d_partitioning() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let sharding =
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], empty_axes(), empty_axes(), empty_axes())
-                .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         assert_eq!(
             sharding.visualize().unwrap().render(false),
@@ -426,14 +409,8 @@ mod tests {
     #[test]
     fn test_sharding_visualize_2d_partitioning() {
         let mesh = test_logical_mesh_2x2();
-        let sharding = Sharding::new(
-            mesh,
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
-            empty_axes(),
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]).unwrap();
 
         assert_eq!(
             sharding.visualize().unwrap().render(false),
@@ -456,9 +433,7 @@ mod tests {
     #[test]
     fn test_sharding_visualize_colorizes_cells() {
         let mesh = test_logical_mesh_2x2();
-        let sharding =
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])], empty_axes(), empty_axes(), empty_axes())
-                .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let colored = sharding.visualize().unwrap().render(true);
 

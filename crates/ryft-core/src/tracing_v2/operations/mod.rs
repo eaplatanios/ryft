@@ -174,7 +174,7 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(
+                Sharding::with_manual_axes(
                     mesh.clone(),
                     vec![ShardingDimension::sharded(["x"])],
                     Vec::<&str>::new(),
@@ -190,7 +190,7 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(
+                Sharding::with_manual_axes(
                     mesh.clone(),
                     vec![ShardingDimension::sharded(["x"])],
                     Vec::<&str>::new(),
@@ -219,9 +219,6 @@ mod tests {
                 Sharding::new(
                     mesh.clone(),
                     vec![ShardingDimension::sharded(["x"])],
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
-                    Vec::<&str>::new(),
                 )
                 .unwrap(),
             ),
@@ -232,7 +229,7 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(
+                Sharding::with_manual_axes(
                     mesh,
                     vec![ShardingDimension::replicated()],
                     Vec::<&str>::new(),

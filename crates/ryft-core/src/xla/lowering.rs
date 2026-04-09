@@ -1780,22 +1780,8 @@ mod tests {
             |x| x.clone() + x,
             global_input_type,
             mesh.clone(),
-            Sharding::new(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"])],
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-            )
-            .unwrap(),
-            Sharding::new(
-                mesh,
-                vec![ShardingDimension::sharded(["x"])],
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-            )
-            .unwrap(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
         )
         .unwrap();
 
@@ -1828,22 +1814,9 @@ mod tests {
             },
             global_input_type,
             mesh.clone(),
-            Sharding::new(
-                mesh.clone(),
-                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-            )
-            .unwrap(),
-            Sharding::new(
-                mesh,
-                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-            )
-            .unwrap(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
         )
         .unwrap();
 

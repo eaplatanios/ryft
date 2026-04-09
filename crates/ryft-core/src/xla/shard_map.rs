@@ -1052,7 +1052,7 @@ fn sharding_with_varying_manual_axes(sharding: &Sharding, varying_axes: BTreeSet
         .into_iter()
         .filter(|axis_name| sharding.mesh.axis_type(axis_name) == Some(MeshAxisType::Manual))
         .collect::<BTreeSet<_>>();
-    Sharding::new(
+    Sharding::with_manual_axes(
         sharding.mesh.clone(),
         sharding.dimensions.clone(),
         sharding.unreduced_axes.clone(),
@@ -1784,7 +1784,7 @@ mod tests {
     }
 
     fn test_sharding(mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>, unreduced_axes: Vec<String>) -> Sharding {
-        Sharding::new(mesh.clone(), dimensions, unreduced_axes, empty_axes(), empty_axes()).unwrap()
+        Sharding::with_unreduced_axes(mesh.clone(), dimensions, unreduced_axes).unwrap()
     }
 
     fn test_sharding_with_varying(
@@ -1794,7 +1794,8 @@ mod tests {
         reduced_manual_axes: Vec<String>,
         varying_manual_axes: Vec<String>,
     ) -> Sharding {
-        Sharding::new(mesh.clone(), dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes).unwrap()
+        Sharding::with_manual_axes(mesh.clone(), dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes)
+            .unwrap()
     }
 
     fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
@@ -2159,9 +2160,14 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let input_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), ["x"], empty_axes())
-                .unwrap();
+        let input_sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::replicated()],
+            empty_axes(),
+            ["x"],
+            empty_axes(),
+        )
+        .unwrap();
         let shard_map =
             ShardMap::new(mesh.clone(), vec![input_sharding], Vec::new(), vec!["x".into(), "y".into()], true).unwrap();
         let global_input_type = ArrayType::new(
@@ -2169,7 +2175,14 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()], empty_axes(), ["y"], empty_axes()).unwrap(),
+                Sharding::with_manual_axes(
+                    mesh,
+                    vec![ShardingDimension::replicated()],
+                    empty_axes(),
+                    ["y"],
+                    empty_axes(),
+                )
+                .unwrap(),
             ),
         )
         .unwrap();
@@ -2194,8 +2207,14 @@ mod tests {
             MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let input_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], ["y"], ["z"], empty_axes()).unwrap();
+        let input_sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"])],
+            ["y"],
+            ["z"],
+            empty_axes(),
+        )
+        .unwrap();
         let shard_map = ShardMap::new(
             mesh.clone(),
             vec![input_sharding.clone()],
@@ -2276,8 +2295,7 @@ mod tests {
         ])
         .unwrap();
         let output_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], ["y"], empty_axes(), empty_axes())
-                .unwrap();
+            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::sharded(["x"])], ["y"]).unwrap();
         let shard_map =
             ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding.clone()], vec!["x".into(), "y".into()], true)
                 .unwrap();
@@ -2304,16 +2322,7 @@ mod tests {
         let shard_map = ShardMap::new(
             mesh.clone(),
             Vec::new(),
-            vec![
-                Sharding::new(
-                    mesh.clone(),
-                    vec![ShardingDimension::replicated()],
-                    empty_axes(),
-                    empty_axes(),
-                    empty_axes(),
-                )
-                .unwrap(),
-            ],
+            vec![Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap()],
             vec!["x".into(), "y".into()],
             true,
         )
@@ -2322,9 +2331,7 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Size::Static(4)]),
             None,
-            Some(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()], ["y"], empty_axes(), empty_axes()).unwrap(),
-            ),
+            Some(Sharding::with_unreduced_axes(mesh, vec![ShardingDimension::replicated()], ["y"]).unwrap()),
         )
         .unwrap();
 
@@ -2347,9 +2354,14 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let output_sharding =
-            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], empty_axes(), ["x"], empty_axes())
-                .unwrap();
+        let output_sharding = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::replicated()],
+            empty_axes(),
+            ["x"],
+            empty_axes(),
+        )
+        .unwrap();
         let shard_map =
             ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding], vec!["x".into(), "y".into()], true).unwrap();
         let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]), None, None).unwrap();
@@ -2449,7 +2461,16 @@ mod tests {
                 DataType::F32,
                 Shape::new(vec![Size::Static(4)]),
                 None,
-                Some(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()], ["y"], ["z"], ["x"]).unwrap()),
+                Some(
+                    Sharding::with_manual_axes(
+                        mesh.clone(),
+                        vec![ShardingDimension::replicated()],
+                        ["y"],
+                        ["z"],
+                        ["x"],
+                    )
+                    .unwrap(),
+                ),
             )
             .unwrap(),
         );
@@ -2521,8 +2542,14 @@ mod tests {
             Shape::new(vec![Size::Static(2)]),
             None,
             Some(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])], empty_axes(), empty_axes(), ["x"])
-                    .unwrap(),
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    empty_axes(),
+                    empty_axes(),
+                    ["x"],
+                )
+                .unwrap(),
             ),
         )
         .unwrap();
@@ -2570,7 +2597,7 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(
+                Sharding::with_manual_axes(
                     mesh.clone(),
                     vec![ShardingDimension::sharded(["data"])],
                     empty_axes(),
@@ -2728,14 +2755,8 @@ mod tests {
         )
         .unwrap();
 
-        let sharding = Sharding::new(
-            device_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            empty_axes(),
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x| x.clone() + x,
@@ -2821,18 +2842,12 @@ mod tests {
         let lhs_sharding = Sharding::new(
             device_mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            empty_axes(),
-            empty_axes(),
-            empty_axes(),
         )
         .unwrap();
         let rhs_sharding = Sharding::replicated(device_mesh.logical_mesh.clone(), 2);
         let output_sharding = Sharding::new(
             device_mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            empty_axes(),
-            empty_axes(),
-            empty_axes(),
         )
         .unwrap();
         let global_input_types = (
@@ -2959,14 +2974,8 @@ mod tests {
         )
         .unwrap();
 
-        let sharding = Sharding::new(
-            device_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            empty_axes(),
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x: ShardMapTracer| {
@@ -3127,14 +3136,8 @@ mod tests {
             mesh_devices,
         )
         .unwrap();
-        let sharding = Sharding::new(
-            device_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            empty_axes(),
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
@@ -3265,14 +3268,8 @@ mod tests {
         )
         .unwrap();
 
-        let sharding = Sharding::new(
-            device_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            empty_axes(),
-            empty_axes(),
-            empty_axes(),
-        )
-        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let shard_map = ShardMap::new(
             device_mesh.logical_mesh.clone(),
             vec![sharding.clone()],

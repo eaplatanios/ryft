@@ -1871,14 +1871,7 @@ mod tests {
             mesh_devices,
         )
         .unwrap();
-        let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let values = [0.0f32, 1.0, 2.0, 3.0, 4.0];
 
         let array = Array::from_host_buffer(
@@ -1926,9 +1919,6 @@ mod tests {
         let sharding = Sharding::new(
             mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
         )
         .unwrap();
         let values = (0..48).map(|value| value as f32).collect::<Vec<_>>();
@@ -1994,14 +1984,8 @@ mod tests {
             target_mesh_devices,
         )
         .unwrap();
-        let target_sharding = Sharding::new(
-            target_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let target_sharding =
+            Sharding::new(target_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let moved_array = source_array.put(&client, target_mesh.clone(), target_sharding).unwrap();
 
@@ -2047,14 +2031,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let local_source_buffer = client
             .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
@@ -2072,10 +2049,7 @@ mod tests {
             format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
-        assert_eq!(
-            copied_array.sharding().visualize().unwrap().render(false),
-            expected_visualization
-        );
+        assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
         assert_eq!(
             f32_values_from_bytes(
                 copied_array
@@ -2109,14 +2083,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let source_sharding = Sharding::new(
-            source_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let source_sharding =
+            Sharding::new(source_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let local_source_buffer = client
             .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
@@ -2131,14 +2099,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let target_sharding = Sharding::new(
-            target_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let target_sharding =
+            Sharding::new(target_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let plan = plan_exact_shard_put(
             &source_array,
@@ -2181,14 +2143,8 @@ mod tests {
             vec![MeshDevice::new(0, 0), MeshDevice::new(1, 1)],
         )
         .unwrap();
-        let source_sharding = Sharding::new(
-            source_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let source_sharding =
+            Sharding::new(source_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let source_array =
             Array::from_sharding(vec![4usize], DataType::F32, source_mesh, source_sharding, Vec::new()).unwrap();
         let target_mesh = DeviceMesh::new(
@@ -2242,14 +2198,8 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let target_sharding = Sharding::new(
-            target_mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let target_sharding =
+            Sharding::new(target_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
         let moved_arrays = device_put(
             &client,
@@ -2330,14 +2280,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let local_source_buffer = client
             .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
@@ -2355,10 +2298,7 @@ mod tests {
             format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
-        assert_eq!(
-            copied_array.sharding().visualize().unwrap().render(false),
-            expected_visualization
-        );
+        assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
         assert_eq!(
             f32_values_from_bytes(
                 copied_array
@@ -2392,14 +2332,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let local_source_buffer = client
             .buffer(f32_values_to_bytes(&[0.0, 1.0]).as_slice(), BufferType::F32, [2u64], None, local_device, None)
             .unwrap();
@@ -2419,10 +2352,7 @@ mod tests {
             format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
-        assert_eq!(
-            copied_array.sharding().visualize().unwrap().render(false),
-            expected_visualization
-        );
+        assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
         assert_eq!(
             f32_values_from_bytes(
                 copied_array
@@ -2507,9 +2437,6 @@ mod tests {
         let lhs_sharding = Sharding::new(
             mesh.logical_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
         )
         .unwrap();
         let rhs_sharding = Sharding::replicated(mesh.logical_mesh.clone(), 2);

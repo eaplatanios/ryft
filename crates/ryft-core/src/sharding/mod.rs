@@ -497,8 +497,26 @@ pub struct Sharding {
 }
 
 impl Sharding {
-    /// Creates a new [`Sharding`].
-    pub fn new<
+    /// Creates a new [`Sharding`] from a [`LogicalMesh`] and a per-dimension list of [`ShardingDimension`]s.
+    /// Use [`Self::with_unreduced_axes`] or [`Self::with_manual_axes`] when you also need to specify unreduced,
+    /// reduced, or varying manual axes.
+    pub fn new(mesh: LogicalMesh, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
+        Self::with_manual_axes::<&str, _, &str, _, &str, _>(mesh, dimensions, [], [], [])
+    }
+
+    /// Creates a new [`Sharding`] with explicit unreduced axes. Use this when the sharding carries partial results
+    /// along certain mesh axes that still need cross-device reduction.
+    pub fn with_unreduced_axes<U: Into<String>, UI: IntoIterator<Item = U>>(
+        mesh: LogicalMesh,
+        dimensions: Vec<ShardingDimension>,
+        unreduced_axes: UI,
+    ) -> Result<Self, ShardingError> {
+        Self::with_manual_axes::<_, _, &str, _, &str, _>(mesh, dimensions, unreduced_axes, [], [])
+    }
+
+    /// Creates a new [`Sharding`] with full control over unreduced, reduced manual, and varying manual axes.
+    /// Prefer [`Self::new`] or [`Self::with_unreduced_axes`] when the manual-axis fields are not needed.
+    pub fn with_manual_axes<
         U: Into<String>,
         UI: IntoIterator<Item = U>,
         R: Into<String>,
@@ -946,7 +964,7 @@ mod tests {
         ])
         .unwrap();
 
-        let sharding = Sharding::new(
+        let sharding = Sharding::with_manual_axes(
             mesh.clone(),
             vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],
             Vec::<&str>::new(),
@@ -977,7 +995,7 @@ mod tests {
         assert_eq!(replicated.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{}, {}, {}]}");
 
         assert!(matches!(
-            Sharding::new(
+            Sharding::with_manual_axes(
                 mesh.clone(),
                 vec![ShardingDimension::replicated()],
                 ["manual"],
@@ -987,7 +1005,7 @@ mod tests {
             Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name }) if name == "manual",
         ));
         assert!(matches!(
-            Sharding::new(
+            Sharding::with_manual_axes(
                 mesh,
                 vec![ShardingDimension::replicated()],
                 Vec::<&str>::new(),
@@ -1009,7 +1027,7 @@ mod tests {
             MeshAxis::new("carry", 32, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::new(
+        let sharding = Sharding::with_unreduced_axes(
             mesh.clone(),
             vec![
                 ShardingDimension::sharded(["data", "model", "batch"]),
@@ -1017,13 +1035,11 @@ mod tests {
                 ShardingDimension::replicated(),
             ],
             ["reduction", "carry"],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
         )
         .unwrap();
         assert_eq!(
             sharding.without_auto_axes(),
-            Sharding::new(
+            Sharding::with_unreduced_axes(
                 mesh,
                 vec![
                     ShardingDimension::sharded(["data", "batch"]),
@@ -1031,8 +1047,6 @@ mod tests {
                     ShardingDimension::replicated(),
                 ],
                 ["carry"],
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
             )
             .unwrap(),
         );
@@ -1044,26 +1058,11 @@ mod tests {
             MeshAxis::new("w", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x", "y", "z"])],
-            ["w"],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap()
-        .without_auto_axes();
-        assert_eq!(
-            sharding,
-            Sharding::new(
-                mesh,
-                vec![ShardingDimension::sharded(["x", "z"])],
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-                Vec::<&str>::new(),
-            )
-            .unwrap(),
-        );
+        let sharding =
+            Sharding::with_unreduced_axes(mesh.clone(), vec![ShardingDimension::sharded(["x", "y", "z"])], ["w"])
+                .unwrap()
+                .without_auto_axes();
+        assert_eq!(sharding, Sharding::new(mesh, vec![ShardingDimension::sharded(["x", "z"])]).unwrap(),);
         assert!(sharding.replicated_axes().is_empty());
         assert!(sharding.unreduced_axes.is_empty());
 
@@ -1073,7 +1072,7 @@ mod tests {
             MeshAxis::new("z", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::new(
+        let sharding = Sharding::with_manual_axes(
             mesh.clone(),
             vec![ShardingDimension::replicated()],
             Vec::<&str>::new(),
@@ -1083,7 +1082,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             sharding.without_auto_axes(),
-            Sharding::new(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["z"], ["x"],).unwrap(),
+            Sharding::with_manual_axes(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["z"], ["x"])
+                .unwrap(),
         );
     }
 
@@ -1095,12 +1095,10 @@ mod tests {
             MeshAxis::new("y", 6, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let sharding = Sharding::new(
+        let sharding = Sharding::with_unreduced_axes(
             mesh,
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             ["y"],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
         )
         .unwrap();
         let context = MlirContext::new();

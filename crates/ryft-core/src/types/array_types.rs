@@ -414,7 +414,7 @@ mod tests {
             Shape::new(vec![Size::Static(8)]),
             None,
             Some(
-                Sharding::new(
+                Sharding::with_manual_axes(
                     LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
                     vec![ShardingDimension::sharded(["x"])],
                     Vec::<&str>::new(),
@@ -440,14 +440,7 @@ mod tests {
     #[test]
     fn test_array_type_with_mismatched_sharding_rank() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::new(
-            mesh,
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         assert_eq!(
             ArrayType::new(F32, Shape::new(vec![Size::Static(4), Size::Static(2)]), None, Some(sharding)),
             Err(ShardingError::ShardingRankMismatch { sharding_rank: 1, array_rank: 2 }),
