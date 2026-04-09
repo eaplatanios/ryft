@@ -807,7 +807,7 @@ impl BuildConfiguration {
                 Some("c73be003b6111bd7838e5b3bdf3c55cdecbb3bc412102c6702d4ff29e5072657")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("5d77f9b5802ef3846671d241e0bc167e169bb33c59e4f31747c6621279aaedd1")
+                Some("5d814d3e99206261f72d57fb6756ae5a507681ecc9c20c9d962aacf41513d4cf")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
                 Some("923fb684f2aa43222676a79c8584099f62b642432b47f763845b8e886befeb8d")

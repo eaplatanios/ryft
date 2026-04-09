@@ -952,8 +952,7 @@ mod tests {
     fn test_visualization_palette_uses_unique_prefix_and_avoids_neighbor_collisions() {
         let row_count = 5;
         let column_count = 5;
-        let styles = make_visualization_styles(row_count, column_count);
-        let backgrounds = styles.iter().map(|style| style.background).collect::<Vec<_>>();
+        let backgrounds = assign_visualization_background_colors(row_count, column_count);
         let unique_prefix = backgrounds.iter().take(VISUALIZATION_COLOR_PALETTE.len()).copied().collect::<HashSet<_>>();
 
         assert_eq!(unique_prefix.len(), VISUALIZATION_COLOR_PALETTE.len());

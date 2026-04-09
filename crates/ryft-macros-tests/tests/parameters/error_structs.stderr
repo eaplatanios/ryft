@@ -34,12 +34,12 @@ error[E0283]: type annotations needed
    = help: the following types implement trait `ryft::Parameter`:
              ArrayType
              Batch<V>
+             DevicePutPlacement
+             DevicePutSharding
              JitTracer<V>
              Option<P>
              Placeholder
              Tracer<T, V, O>
-             bool
-             f32
            and $N others
 note: required by a bound in `StructWithUnusedParameterType`
   --> tests/parameters/error_structs.rs:10:41
