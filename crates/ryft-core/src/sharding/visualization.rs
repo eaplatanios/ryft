@@ -12,6 +12,64 @@ impl Sharding {
     ///
     /// This function is heavily inspired by [JAX's `jax.debug.visualize_array_sharding`](
     /// https://docs.jax.dev/en/latest/_autosummary/jax.debug.visualize_array_sharding.html).
+    ///
+    /// # Examples
+    ///
+    /// Below are some example [`Sharding`]s along with their visualizations:
+    ///
+    /// ```
+    /// # use indoc::indoc;
+    /// # use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    ///
+    /// // A rank-1 sharding over a `2×2` mesh with dimension `0` sharded along axis `"x"` produces a single-row
+    /// // grid where devices sharing the same partition are grouped together (devices `0` and `1` share one `"x"`
+    /// // coordinate, and devices `2` and `3` share the other):
+    /// let mesh = LogicalMesh::new(vec![
+    ///     MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+    ///     MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+    /// ]).unwrap();
+    /// let sharding = Sharding::new(
+    ///     mesh,
+    ///     vec![ShardingDimension::sharded(["x"])],
+    ///     Vec::<&str>::new(),
+    ///     Vec::<&str>::new(),
+    ///     Vec::<&str>::new(),
+    /// ).unwrap();
+    /// assert_eq!(
+    ///     sharding.visualize().unwrap().render(false),
+    ///     indoc! {"
+    ///         ┌─────┬─────┐
+    ///         │ 0,1 │ 2,3 │
+    ///         └─────┴─────┘
+    ///     "}
+    ///     .trim_end()
+    /// );
+    ///
+    /// // A rank-2 sharding over the same mesh with each dimension sharded along a different axis produces
+    /// // a two-dimensional grid:
+    /// let sharding = Sharding::new(
+    ///     mesh,
+    ///     vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
+    ///     Vec::<&str>::new(),
+    ///     Vec::<&str>::new(),
+    ///     Vec::<&str>::new(),
+    /// ).unwrap();
+    /// assert_eq!(
+    ///     sharding.visualize().unwrap().render(false),
+    ///     indoc! {"
+    ///         ┌─────┬─────┐
+    ///         │     │     │
+    ///         │  0  │  1  │
+    ///         │     │     │
+    ///         ├─────┼─────┤
+    ///         │     │     │
+    ///         │  2  │  3  │
+    ///         │     │     │
+    ///         └─────┴─────┘
+    ///     "}
+    ///     .trim_end()
+    /// );
+    /// ```
     pub fn visualize(&self) -> Result<ShardingVisualization, ShardingError> {
         let rank = self.rank();
         if !matches!(rank, 1 | 2) {
