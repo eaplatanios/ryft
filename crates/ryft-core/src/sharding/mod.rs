@@ -1,5 +1,7 @@
 pub mod visualization;
 
+pub use visualization::ShardingVisualization;
+
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
