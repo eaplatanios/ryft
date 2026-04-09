@@ -20,7 +20,7 @@ use ryft_mlir::{Block, Operation, Value, ValueRef};
 #[cfg(feature = "xla")]
 use crate::xla::{
     lowering::{LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer},
-    shard_map::{ShardMapTensor, trace},
+    shard_map::ShardMapTensor,
 };
 use crate::{
     sharding::{Sharding, ShardingDimension},
@@ -527,8 +527,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[cfg(feature = "xla")]
-    use crate::xla::shard_map::{
-        ShardMapTracer, TracedShardMap, TracedXlaProgram, shard_map, with_sharding_constraint,
+    use crate::xla::{
+        shard_map::{ShardMapTracer, TracedShardMap, TracedXlaProgram, shard_map, with_sharding_constraint},
+        trace,
     };
     use crate::{
         parameters::Placeholder,
@@ -555,7 +556,14 @@ mod tests {
         dimensions: Vec<ShardingDimension>,
         varying_manual_axes: Vec<&str>,
     ) -> Sharding {
-        Sharding::with_manual_axes(mesh.clone(), dimensions, Vec::<&str>::new(), Vec::<&str>::new(), varying_manual_axes).unwrap()
+        Sharding::with_manual_axes(
+            mesh.clone(),
+            dimensions,
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+            varying_manual_axes,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -565,13 +573,7 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Size::Static(8)]),
             None,
-            Some(
-                Sharding::new(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"])],
-                )
-                .unwrap(),
-            ),
+            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
         )
         .unwrap();
 
@@ -629,11 +631,8 @@ mod tests {
                 Shape::new(vec![Size::Static(8), Size::Static(6)]),
                 None,
                 Some(
-                    Sharding::new(
-                        mesh,
-                        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                    )
-                    .unwrap(),
+                    Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],)
+                        .unwrap(),
                 ),
             )
             .unwrap())
@@ -648,11 +647,8 @@ mod tests {
             Shape::new(vec![Size::Static(8), Size::Static(6)]),
             None,
             Some(
-                Sharding::new(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-                )
-                .unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
             ),
         )
         .unwrap();
@@ -701,13 +697,7 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Size::Static(8)]),
             None,
-            Some(
-                Sharding::new(
-                    mesh,
-                    vec![ShardingDimension::sharded(["x"])],
-                )
-                .unwrap(),
-            ),
+            Some(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap()),
         )
         .unwrap();
 
@@ -725,11 +715,7 @@ mod tests {
             Shape::new(vec![Size::Static(2), Size::Static(4)]),
             None,
             Some(
-                Sharding::new(
-                    mesh,
-                    vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-                )
-                .unwrap(),
+                Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap(),
             ),
         )
         .unwrap();

@@ -174,7 +174,7 @@ impl ShardingVisualization {
         let label_line = cell_height / 2;
         let mut lines = Vec::new();
         if colored {
-            let background_colors = Self::assign_background_colors(row_count, column_count);
+            let background_colors = Self::background_colors(row_count, column_count);
             for (row_cells, row_colors) in self.cells.iter().zip(background_colors.iter()) {
                 for line_index in 0..cell_height {
                     let mut line = String::new();
@@ -224,9 +224,9 @@ impl ShardingVisualization {
         lines.join("\n")
     }
 
-    /// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that avoids giving the
-    /// same color to horizontally or vertically adjacent cells.
-    fn assign_background_colors(row_count: usize, column_count: usize) -> Vec<Vec<Color>> {
+    /// Returns one background [`Color`] per grid cell that is assigned using a greedy graph-coloring approach which
+    /// avoids giving the same color to horizontally or vertically adjacent cells.
+    fn background_colors(row_count: usize, column_count: usize) -> Vec<Vec<Color>> {
         let cell_count = row_count * column_count;
         if cell_count == 0 {
             return Vec::new();
@@ -270,73 +270,41 @@ mod tests {
 
     use super::*;
 
-    fn test_logical_mesh_2x2() -> LogicalMesh {
-        LogicalMesh::new(vec![
+    #[test]
+    fn test_sharding_visualization() {
+        let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
         ])
-        .unwrap()
-    }
+        .unwrap();
 
-    fn strip_ansi_codes(value: &str) -> String {
-        let mut stripped = String::new();
-        let mut characters = value.chars();
-        while let Some(character) = characters.next() {
-            if character == '\u{1b}' {
-                if characters.next() == Some('[') {
-                    for character in characters.by_ref() {
-                        if character == 'm' {
-                            break;
-                        }
-                    }
-                }
-            } else {
-                stripped.push(character);
-            }
-        }
-        stripped
-    }
-
-    #[test]
-    fn test_sharding_visualize_groups_replicated_devices() {
-        let mesh = test_logical_mesh_2x2();
-        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-
+        // Test using a one-dimensional sharding where dimension `0` is sharded along the "x" axis. Devices `0` and
+        // `1` share one "x" coordinate and devices `2` and `3` share the other, producing a single-row grid with two
+        // grouped cells.
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let visualization = sharding.visualize().unwrap();
         assert_eq!(
-            sharding.visualize().unwrap().render(false),
+            visualization.render(false),
             indoc! {"
                 ┌─────┬─────┐
                 │ 0,1 │ 2,3 │
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string()
         );
-    }
 
-    #[test]
-    fn test_sharding_visualize_uneven_1d_partitioning() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-
+        // Colored renderings use ANSI 24-bit escape sequences with palette colors as background colors and contrasting
+        // foreground colors for the device index labels, without any ASCII box-drawing characters.
         assert_eq!(
-            sharding.visualize().unwrap().render(false),
-            indoc! {"
-                ┌─────┬─────┐
-                │  0  │  1  │
-                └─────┴─────┘
-            "}
-            .trim_end()
-            .to_string()
+            visualization.render(true),
+            "\u{1b}[38;2;255;255;255m\u{1b}[48;2;57;59;121m 0,1 \u{1b}[0m\
+             \u{1b}[38;2;255;255;255m\u{1b}[48;2;82;84;163m 2,3 \u{1b}[0m"
         );
-    }
 
-    #[test]
-    fn test_sharding_visualize_2d_partitioning() {
-        let mesh = test_logical_mesh_2x2();
+        // Test using a two-dimensional sharding where each dimension sharded along a different axis.
         let sharding =
-            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]).unwrap();
-
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+                .unwrap();
         assert_eq!(
             sharding.visualize().unwrap().render(false),
             indoc! {"
@@ -351,51 +319,40 @@ mod tests {
                 └─────┴─────┘
             "}
             .trim_end()
-            .to_string()
         );
+
+        // Three-dimensional shardings are not supported and should result in an error.
+        let sharding = Sharding::replicated(mesh, 3);
+        assert_eq!(sharding.visualize(), Err(ShardingError::UnsupportedVisualizationRank { rank: 3 }));
     }
 
     #[test]
-    fn test_sharding_visualize_colorizes_cells() {
-        let mesh = test_logical_mesh_2x2();
-        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        let colored = sharding.visualize().unwrap().render(true);
-
-        assert!(colored.contains("\u{1b}[38;2;"));
-        assert!(colored.contains("\u{1b}[48;2;"));
-        assert!(!colored.contains('┌'));
-        assert!(!colored.contains('│'));
-        assert!(!colored.contains('└'));
-        assert_eq!(strip_ansi_codes(colored.as_str()), " 0,1  2,3 ".to_string());
-    }
-
-    #[test]
-    fn test_visualization_palette_uses_unique_prefix_and_avoids_neighbor_collisions() {
+    fn test_sharding_visualization_background_colors() {
         let row_count = 5;
         let column_count = 5;
-        let backgrounds = ShardingVisualization::assign_background_colors(row_count, column_count);
-        let flat: Vec<Color> = backgrounds.iter().flatten().copied().collect();
-        let unique_prefix = flat.iter().take(VISUALIZATION_COLOR_PALETTE.len()).copied().collect::<HashSet<_>>();
+        let background_colors = ShardingVisualization::background_colors(row_count, column_count);
 
-        assert_eq!(unique_prefix.len(), VISUALIZATION_COLOR_PALETTE.len());
+        // The first [`VISUALIZATION_COLOR_PALETTE.len()`] colors should all be unique.
+        let colors = background_colors.iter().flatten().copied().collect::<Vec<_>>();
+        let unique_colors = colors.iter().take(VISUALIZATION_COLOR_PALETTE.len()).copied().collect::<HashSet<_>>();
+        assert_eq!(unique_colors.len(), VISUALIZATION_COLOR_PALETTE.len());
+
+        // No two horizontally or vertically adjacent cells should share a color.
         for row_index in 0..row_count {
             for column_index in 0..column_count {
                 if column_index + 1 < column_count {
-                    assert_ne!(backgrounds[row_index][column_index], backgrounds[row_index][column_index + 1]);
+                    assert_ne!(
+                        background_colors[row_index][column_index],
+                        background_colors[row_index][column_index + 1],
+                    );
                 }
                 if row_index + 1 < row_count {
-                    assert_ne!(backgrounds[row_index][column_index], backgrounds[row_index + 1][column_index]);
+                    assert_ne!(
+                        background_colors[row_index][column_index],
+                        background_colors[row_index + 1][column_index],
+                    );
                 }
             }
         }
-    }
-
-    #[test]
-    fn test_sharding_visualize_rejects_unsupported_rank() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh, 3);
-
-        assert_eq!(sharding.visualize(), Err(ShardingError::UnsupportedVisualizationRank { rank: 3 }));
     }
 }
