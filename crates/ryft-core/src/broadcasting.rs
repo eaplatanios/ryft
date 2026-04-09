@@ -414,7 +414,13 @@ fn broadcast_sharding(
         }
     };
 
-    Ok(Some(Sharding::new(mesh, broadcasted_dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes)?))
+    Ok(Some(Sharding::with_manual_axes(
+        mesh,
+        broadcasted_dimensions,
+        unreduced_axes,
+        reduced_manual_axes,
+        varying_manual_axes,
+    )?))
 }
 
 /// Returns `true` if the provided [`Sharding`]s are broadcastable, according to the rules of [`broadcast_sharding`].
@@ -560,7 +566,7 @@ mod tests {
         ])
         .unwrap();
 
-        let s0 = Sharding::new(
+        let s0 = Sharding::with_manual_axes(
             m0.clone(),
             vec![ShardingDimension::sharded(["x"])],
             Vec::<&str>::new(),
@@ -568,7 +574,7 @@ mod tests {
             ["x"],
         )
         .unwrap();
-        let s1 = Sharding::new(
+        let s1 = Sharding::with_manual_axes(
             m0.clone(),
             vec![ShardingDimension::sharded(["x"])],
             Vec::<&str>::new(),
@@ -576,7 +582,7 @@ mod tests {
             ["x"],
         )
         .unwrap();
-        let s2 = Sharding::new(
+        let s2 = Sharding::with_manual_axes(
             m0.clone(),
             vec![ShardingDimension::sharded(["x"])],
             Vec::<&str>::new(),
@@ -584,7 +590,7 @@ mod tests {
             ["y"],
         )
         .unwrap();
-        let s3 = Sharding::new(
+        let s3 = Sharding::with_manual_axes(
             m0.clone(),
             vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
             Vec::<&str>::new(),
@@ -592,7 +598,7 @@ mod tests {
             Vec::<&str>::new(),
         )
         .unwrap();
-        let s4 = Sharding::new(
+        let s4 = Sharding::with_manual_axes(
             m0.clone(),
             vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
             Vec::<&str>::new(),
@@ -600,73 +606,26 @@ mod tests {
             Vec::<&str>::new(),
         )
         .unwrap();
-        let s5 = Sharding::new(
-            m0.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
-        let s6 =
-            Sharding::new(m0, vec![ShardingDimension::sharded(["x"])], Vec::<&str>::new(), Vec::<&str>::new(), ["x"])
-                .unwrap();
-        let s7 = Sharding::new(
-            m1.clone(),
+        let s5 = Sharding::new(m0.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+            .unwrap();
+        let s6 = Sharding::with_manual_axes(
+            m0,
             vec![ShardingDimension::sharded(["x"])],
             Vec::<&str>::new(),
             Vec::<&str>::new(),
-            Vec::<&str>::new(),
+            ["x"],
         )
         .unwrap();
-        let s8 = Sharding::new(
-            m1.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
-        let s9 = Sharding::new(
-            m1,
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
-        let s10 = Sharding::new(
-            m2.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
-        let s11 = Sharding::new(
-            m2.clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
-        let s12 = Sharding::new(
-            m2.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
-        let s13 = Sharding::new(
-            m2,
-            vec![ShardingDimension::sharded(["y"])],
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-        )
-        .unwrap();
+        let s7 = Sharding::new(m1.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let s8 = Sharding::new(m1.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+            .unwrap();
+        let s9 = Sharding::new(m1, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
+        let s10 = Sharding::new(m2.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+            .unwrap();
+        let s11 = Sharding::new(m2.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
+            .unwrap();
+        let s12 = Sharding::new(m2.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let s13 = Sharding::new(m2, vec![ShardingDimension::sharded(["y"])]).unwrap();
 
         let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]), None, None).unwrap();
         let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]), None, None).unwrap();

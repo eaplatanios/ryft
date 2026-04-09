@@ -11,7 +11,7 @@ pub use ryft_core::parameters::{
 };
 pub use ryft_core::sharding::{
     DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId, MeshProcessIndex, Sharding,
-    ShardingDimension, ShardingError,
+    ShardingDimension, ShardingError, ShardingVisualization,
 };
 pub use ryft_core::types::Type;
 pub use ryft_core::types::array_types::{ArrayType, Shape, Size};
