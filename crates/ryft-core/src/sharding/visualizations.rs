@@ -197,10 +197,9 @@ impl ShardingVisualization {
                 }
             }
         } else {
-            let top_border = Self::render_horizontal_border('┌', '┬', '┐', column_count, cell_width);
-            let middle_border = Self::render_horizontal_border('├', '┼', '┤', column_count, cell_width);
-            let bottom_border = Self::render_horizontal_border('└', '┴', '┘', column_count, cell_width);
-            lines.push(top_border);
+            let border_segment = "─".repeat(cell_width);
+            let border_line = vec![border_segment.as_str(); column_count];
+            lines.push(format!("┌{}┐", border_line.join("┬")));
             for (row_index, row_cells) in self.cells.iter().enumerate() {
                 for line_index in 0..cell_height {
                     let mut line = String::from("│");
@@ -215,7 +214,11 @@ impl ShardingVisualization {
                     }
                     lines.push(line);
                 }
-                lines.push(if row_index + 1 == row_count { bottom_border.clone() } else { middle_border.clone() });
+                lines.push(if row_index + 1 == row_count {
+                    format!("└{}┘", border_line.join("┴"))
+                } else {
+                    format!("├{}┤", border_line.join("┼"))
+                });
             }
         }
         lines.join("\n")
@@ -253,29 +256,6 @@ impl ShardingVisualization {
             .chunks(column_count)
             .map(|row| row.iter().map(|&index| VISUALIZATION_COLOR_PALETTE[index]).collect())
             .collect()
-    }
-
-    /// Builds a single horizontal border line for the plain-text visualization grid using box-drawing
-    /// characters. For example, `render_horizontal_border('┌', '┬', '┐', 3, 5)` produces the string
-    /// `"┌─────┬─────┬─────┐"`.
-    fn render_horizontal_border(
-        left_corner: char,
-        intersection: char,
-        right_corner: char,
-        column_count: usize,
-        cell_width: usize,
-    ) -> String {
-        let mut line = String::new();
-        line.push(left_corner);
-        if column_count > 0 {
-            line.push_str("─".repeat(cell_width).as_str());
-            for _ in 1..column_count {
-                line.push(intersection);
-                line.push_str("─".repeat(cell_width).as_str());
-            }
-        }
-        line.push(right_corner);
-        line
     }
 }
 
