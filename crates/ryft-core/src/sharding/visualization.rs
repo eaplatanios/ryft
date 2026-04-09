@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use super::{Sharding, ShardingDimension, ShardingError};
 use crate::utilities::colors::Color;
+
+use super::{MeshDeviceId, Sharding, ShardingDimension, ShardingError};
 
 impl Sharding {
     /// Builds a [`ShardingVisualization`] of this sharding that can later be rendered to text using
@@ -68,24 +69,25 @@ impl Sharding {
         }
 
         // Compute per-device partition coordinates and group devices into grid cells.
-        let mut devices_by_cell = HashMap::<(usize, usize), Vec<usize>>::new();
+        let mut devices_by_cell = HashMap::<(usize, usize), Vec<MeshDeviceId>>::new();
         for device_index in 0..self.mesh.device_count() {
             // Decompose the linear device index into row-major mesh coordinates.
             let mut remaining = device_index;
-            let mut mesh_coordinate = vec![0usize; self.mesh.axes.len()];
+            let mut mesh_coordinates = vec![0usize; self.mesh.axes.len()];
             for (axis_index, axis) in self.mesh.axes.iter().enumerate().rev() {
-                mesh_coordinate[axis_index] = remaining % axis.size;
+                mesh_coordinates[axis_index] = remaining % axis.size;
                 remaining /= axis.size;
             }
-            // Map the mesh coordinate to a (row, column) grid cell. For rank-1 shardings the
-            // row is always 0; for rank-2 shardings row and column correspond to the partition
-            // indices of the first and second dimensions respectively.
+
+            // Map the mesh coordinates to a `(row, column)` grid cell. For rank-1 shardings the row is always `0`
+            // and for rank-2 shardings the row and column correspond to the partition indices of the first and second
+            // dimensions, respectively.
             let cell = if rank == 1 {
-                (0, self.dimension_partition_index(0, &mesh_coordinate))
+                (0, self.dimension_partition_index(0, &mesh_coordinates))
             } else {
                 (
-                    self.dimension_partition_index(0, &mesh_coordinate),
-                    self.dimension_partition_index(1, &mesh_coordinate),
+                    self.dimension_partition_index(0, &mesh_coordinates),
+                    self.dimension_partition_index(1, &mesh_coordinates),
                 )
             };
             devices_by_cell.entry(cell).or_default().push(device_index);
@@ -115,16 +117,14 @@ impl Sharding {
         Ok(ShardingVisualization { cells, cell_width, cell_height })
     }
 
-    /// Returns the partition index of a single sharding dimension for a device at the given mesh
-    /// coordinate.
+    /// Returns the partition index of a single [`ShardingDimension`] for a device at the given mesh coordinate.
     ///
-    /// [`ShardingDimension::Replicated`] and [`ShardingDimension::Unconstrained`] dimensions map
-    /// every device to the same partition (`0`), since all devices hold the full extent of that
-    /// dimension. For [`ShardingDimension::Sharded`] dimensions, the partition index is the
-    /// row-major linearization of the device's coordinates along the sharding axes. For example,
-    /// given `Sharded(["data", "model"])` where `data` has size 4 and `model` has size 2, a device
-    /// at mesh coordinate `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
-    fn dimension_partition_index(&self, dimension: usize, mesh_coordinate: &[usize]) -> usize {
+    /// [`ShardingDimension::Replicated`] and [`ShardingDimension::Unconstrained`] map every device to the same
+    /// partition (`0`), since all devices hold the full extent of that dimension. For [`ShardingDimension::Sharded`]
+    /// dimensions, the partition index is the row-major linearization of the device's coordinates along the sharding
+    /// axes. For example, given `Sharded(["data", "model"])` where `data` has size `4` and `model` has size `2`, a
+    /// device at mesh coordinates `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
+    fn dimension_partition_index(&self, dimension: usize, device_mesh_coordinates: &[usize]) -> usize {
         match &self.dimensions[dimension] {
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
             ShardingDimension::Sharded(axis_names) => {
@@ -137,7 +137,7 @@ impl Sharding {
                         .copied()
                         .expect("sharding mesh axes should be validated at construction");
                     let axis_size = self.mesh.axes[axis_index].size;
-                    partition_index = partition_index * axis_size + mesh_coordinate[axis_index];
+                    partition_index = partition_index * axis_size + device_mesh_coordinates[axis_index];
                 }
                 partition_index
             }
