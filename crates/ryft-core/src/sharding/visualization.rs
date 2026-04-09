@@ -2,7 +2,44 @@ use std::collections::HashMap;
 
 use crate::utilities::colors::Color;
 
-use super::{MeshDeviceId, Sharding, ShardingDimension, ShardingError};
+use super::{MeshDeviceId, Sharding, ShardingError};
+
+/// Minimum width in characters for each cell in a rendered [`Sharding`] visualization grid. Cells expand beyond this
+/// minimum when device labels (e.g., `"0,1,2"`) plus padding exceed it.
+const VISUALIZATION_MIN_CELL_WIDTH: usize = 5;
+
+/// Height in lines of each cell when visualizing a rank-1 [`Sharding`].
+const VISUALIZATION_1D_CELL_HEIGHT: usize = 1;
+
+/// Height in lines of each cell when visualizing a rank-2 [`Sharding`].
+/// The extra height gives the label a blank line above and below for readability.
+const VISUALIZATION_2D_CELL_HEIGHT: usize = 3;
+
+/// [`Color`] palette used for ANSI-colored [`Sharding`] visualization renderings. Colors are assigned to grid cells
+/// via a greedy graph-coloring scheme that avoids giving the same color to horizontally or vertically adjacent cells.
+/// The palette is adapted from the Tableau 20 categorical color scheme.
+const VISUALIZATION_COLOR_PALETTE: &[Color] = &[
+    Color::new(57, 59, 121),
+    Color::new(82, 84, 163),
+    Color::new(107, 110, 207),
+    Color::new(156, 158, 222),
+    Color::new(99, 121, 57),
+    Color::new(140, 162, 82),
+    Color::new(181, 207, 107),
+    Color::new(206, 219, 156),
+    Color::new(140, 109, 49),
+    Color::new(189, 158, 57),
+    Color::new(231, 186, 82),
+    Color::new(231, 203, 148),
+    Color::new(132, 60, 57),
+    Color::new(173, 73, 74),
+    Color::new(214, 97, 107),
+    Color::new(231, 150, 156),
+    Color::new(123, 65, 115),
+    Color::new(165, 81, 148),
+    Color::new(206, 109, 189),
+    Color::new(222, 158, 214),
+];
 
 impl Sharding {
     /// Builds a [`ShardingVisualization`] of this sharding that can later be rendered to text using
@@ -82,12 +119,9 @@ impl Sharding {
             // Map the mesh coordinates to a `(row, column)` grid cell. For rank-1 shardings the row is always `0`
             // and for rank-2 shardings the row and column correspond to the partition indices of the first and second
             // dimensions, respectively.
-            let cell = if rank == 1 {
-                (0, self.partition_index(0, &mesh_coordinates)?)
-            } else {
-                (self.partition_index(0, &mesh_coordinates)?, self.partition_index(1, &mesh_coordinates)?)
-            };
-            devices_by_cell.entry(cell).or_default().push(device_index);
+            let row = if rank == 1 { 0 } else { self.partition_index(0, &mesh_coordinates)? };
+            let column = self.partition_index(if rank == 1 { 0 } else { 1 }, &mesh_coordinates)?;
+            devices_by_cell.entry((row, column)).or_default().push(device_index);
         }
 
         // Collect the distinct row and column partition indices.
@@ -95,8 +129,8 @@ impl Sharding {
         let column_count = devices_by_cell.keys().map(|(_, column)| *column).max().map_or(0, |max| max + 1);
 
         // Build the visualization cell grid.
-        let mut cells = vec![vec![String::new(); column_count]; row_count];
         let mut cell_width = VISUALIZATION_MIN_CELL_WIDTH;
+        let mut cells = vec![vec![String::new(); column_count]; row_count];
         for row_index in 0..row_count {
             for column_index in 0..column_count {
                 let label = devices_by_cell
@@ -193,43 +227,6 @@ impl ShardingVisualization {
         lines.join("\n")
     }
 }
-
-/// Minimum width in characters for each cell in the rendered visualization grid. Cells expand
-/// beyond this minimum when device labels (e.g., `"0,1,2"`) plus padding exceed it.
-const VISUALIZATION_MIN_CELL_WIDTH: usize = 5;
-
-/// Height in lines of each cell when visualizing a rank-1 sharding (single-row grid).
-const VISUALIZATION_1D_CELL_HEIGHT: usize = 1;
-
-/// Height in lines of each cell when visualizing a rank-2 sharding (row x column grid). The extra
-/// height gives the label a blank line above and below for readability.
-const VISUALIZATION_2D_CELL_HEIGHT: usize = 3;
-
-/// RGB color palette used for ANSI-colored visualization output. Colors are assigned to grid cells
-/// via a greedy graph-coloring scheme that avoids giving the same color to horizontally or
-/// vertically adjacent cells. The palette is adapted from the Tableau 20 categorical color scheme.
-const VISUALIZATION_COLOR_PALETTE: &[Color] = &[
-    Color::new(57, 59, 121),
-    Color::new(82, 84, 163),
-    Color::new(107, 110, 207),
-    Color::new(156, 158, 222),
-    Color::new(99, 121, 57),
-    Color::new(140, 162, 82),
-    Color::new(181, 207, 107),
-    Color::new(206, 219, 156),
-    Color::new(140, 109, 49),
-    Color::new(189, 158, 57),
-    Color::new(231, 186, 82),
-    Color::new(231, 203, 148),
-    Color::new(132, 60, 57),
-    Color::new(173, 73, 74),
-    Color::new(214, 97, 107),
-    Color::new(231, 150, 156),
-    Color::new(123, 65, 115),
-    Color::new(165, 81, 148),
-    Color::new(206, 109, 189),
-    Color::new(222, 158, 214),
-];
 
 /// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that
 /// avoids giving the same color to horizontally or vertically adjacent cells.
