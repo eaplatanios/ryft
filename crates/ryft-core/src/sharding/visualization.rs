@@ -130,8 +130,6 @@ impl Sharding {
         let column_count = devices_by_cell.keys().map(|(_, column)| *column).max().map_or(0, |max| max + 1);
 
         // Build the visualization cell grid.
-        let cell_height = if rank == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
-        let mut cell_width = VISUALIZATION_MIN_CELL_WIDTH;
         let mut cells = vec![vec![String::new(); column_count]; row_count];
         for row_index in 0..row_count {
             for column_index in 0..column_count {
@@ -142,13 +140,11 @@ impl Sharding {
                         device_indices.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
                     })
                     .unwrap_or_default();
-                cell_width = cell_width.max(label.chars().count() + 2);
                 cells[row_index][column_index] = label;
             }
         }
 
-        // Finally, construct the [`ShardingVisualization`].
-        Ok(ShardingVisualization { cells, cell_width, cell_height })
+        Ok(ShardingVisualization { cells })
     }
 }
 
@@ -158,12 +154,6 @@ impl Sharding {
 pub struct ShardingVisualization {
     /// Row-major grid of device-index labels (e.g., `"0,1"`).
     cells: Vec<Vec<String>>,
-
-    /// Character width of every cell in the rendered output.
-    cell_width: usize,
-
-    /// Line height of every cell in the rendered output.
-    cell_height: usize,
 }
 
 impl ShardingVisualization {
@@ -172,18 +162,27 @@ impl ShardingVisualization {
     pub fn render(&self, colored: bool) -> String {
         let row_count = self.cells.len();
         let column_count = self.cells.first().map_or(0, Vec::len);
-        let label_line = self.cell_height / 2;
+        let cell_height = if row_count <= 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
+        let cell_width = self
+            .cells
+            .iter()
+            .flatten()
+            .map(|label| label.chars().count() + 2)
+            .max()
+            .unwrap_or(0)
+            .max(VISUALIZATION_MIN_CELL_WIDTH);
+        let label_line = cell_height / 2;
         let mut lines = Vec::new();
         if colored {
             let background_colors = Self::assign_background_colors(row_count, column_count);
             for (row_cells, row_colors) in self.cells.iter().zip(background_colors.iter()) {
-                for line_index in 0..self.cell_height {
+                for line_index in 0..cell_height {
                     let mut line = String::new();
                     for (cell, &background_color) in row_cells.iter().zip(row_colors.iter()) {
                         let contents = if line_index == label_line {
-                            Self::center_text(cell.as_str(), self.cell_width)
+                            Self::center_text(cell.as_str(), cell_width)
                         } else {
-                            " ".repeat(self.cell_width)
+                            " ".repeat(cell_width)
                         };
                         line.push_str(
                             Color::colored_text(
@@ -198,29 +197,25 @@ impl ShardingVisualization {
                 }
             }
         } else {
-            let top_border = Self::render_horizontal_border('┌', '┬', '┐', column_count, self.cell_width);
-            let middle_border = Self::render_horizontal_border('├', '┼', '┤', column_count, self.cell_width);
-            let bottom_border = Self::render_horizontal_border('└', '┴', '┘', column_count, self.cell_width);
+            let top_border = Self::render_horizontal_border('┌', '┬', '┐', column_count, cell_width);
+            let middle_border = Self::render_horizontal_border('├', '┼', '┤', column_count, cell_width);
+            let bottom_border = Self::render_horizontal_border('└', '┴', '┘', column_count, cell_width);
             lines.push(top_border);
             for (row_index, row_cells) in self.cells.iter().enumerate() {
-                for line_index in 0..self.cell_height {
+                for line_index in 0..cell_height {
                     let mut line = String::from("│");
                     for label in row_cells {
                         let contents = if line_index == label_line {
-                            Self::center_text(label.as_str(), self.cell_width)
+                            Self::center_text(label.as_str(), cell_width)
                         } else {
-                            " ".repeat(self.cell_width)
+                            " ".repeat(cell_width)
                         };
                         line.push_str(contents.as_str());
                         line.push('│');
                     }
                     lines.push(line);
                 }
-                if row_index + 1 == row_count {
-                    lines.push(bottom_border.clone());
-                } else {
-                    lines.push(middle_border.clone());
-                }
+                lines.push(if row_index + 1 == row_count { bottom_border.clone() } else { middle_border.clone() });
             }
         }
         lines.join("\n")
