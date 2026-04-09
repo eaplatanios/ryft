@@ -17,7 +17,8 @@ const VISUALIZATION_2D_CELL_HEIGHT: usize = 3;
 
 /// [`Color`] palette used for ANSI-colored [`Sharding`] visualization renderings. Colors are assigned to grid cells
 /// via a greedy graph-coloring scheme that avoids giving the same color to horizontally or vertically adjacent cells.
-/// The palette is adapted from the Tableau 20 categorical color scheme.
+/// The palette matches Matplotlib's [`tab20b`](https://matplotlib.org/stable/gallery/color/colormap_reference.html)
+/// qualitative colormap, which is the same palette that JAX uses for its sharding visualizations.
 const VISUALIZATION_COLOR_PALETTE: &[Color] = &[
     Color::new(57, 59, 121),
     Color::new(82, 84, 163),
@@ -129,6 +130,7 @@ impl Sharding {
         let column_count = devices_by_cell.keys().map(|(_, column)| *column).max().map_or(0, |max| max + 1);
 
         // Build the visualization cell grid.
+        let cell_height = if rank == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
         let mut cell_width = VISUALIZATION_MIN_CELL_WIDTH;
         let mut cells = vec![vec![String::new(); column_count]; row_count];
         for row_index in 0..row_count {
@@ -144,7 +146,8 @@ impl Sharding {
                 cells[row_index][column_index] = label;
             }
         }
-        let cell_height = if rank == 1 { VISUALIZATION_1D_CELL_HEIGHT } else { VISUALIZATION_2D_CELL_HEIGHT };
+
+        // Finally, construct the [`ShardingVisualization`].
         Ok(ShardingVisualization { cells, cell_width, cell_height })
     }
 }
