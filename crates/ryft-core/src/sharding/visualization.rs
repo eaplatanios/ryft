@@ -221,44 +221,51 @@ impl ShardingVisualization {
         lines.join("\n")
     }
 
-    /// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that
-    /// avoids giving the same color to horizontally or vertically adjacent cells.
+    /// Assigns one background [`Color`] per grid cell using a greedy graph-coloring approach that avoids giving the
+    /// same color to horizontally or vertically adjacent cells.
     fn assign_background_colors(row_count: usize, column_count: usize) -> Vec<Vec<Color>> {
         let cell_count = row_count * column_count;
         if cell_count == 0 {
             return Vec::new();
         }
 
-        let palette_count = VISUALIZATION_COLOR_PALETTE.len();
-        let unique_prefix_length = cell_count.min(palette_count);
-        let mut palette_indices = (0..unique_prefix_length).collect::<Vec<_>>();
-        let mut next_palette_index = 0usize;
-
+        let color_count = VISUALIZATION_COLOR_PALETTE.len();
+        let unique_prefix_length = cell_count.min(color_count);
+        let mut color_indices = (0..unique_prefix_length).collect::<Vec<_>>();
+        let mut next_color_index = 0usize;
         for cell_index in unique_prefix_length..cell_count {
             let column_index = cell_index % column_count;
-            let left_neighbor = (column_index > 0).then_some(palette_indices[cell_index - 1]);
-            let upper_neighbor = (cell_index >= column_count).then_some(palette_indices[cell_index - column_count]);
-
-            let mut assigned_palette_index = None;
-            for offset in 0..palette_count {
-                let candidate_palette_index = (next_palette_index + offset) % palette_count;
-                if Some(candidate_palette_index) != left_neighbor && Some(candidate_palette_index) != upper_neighbor {
-                    assigned_palette_index = Some(candidate_palette_index);
-                    next_palette_index = (candidate_palette_index + 1) % palette_count;
+            let left_neighbor = (column_index > 0).then_some(color_indices[cell_index - 1]);
+            let top_neighbor = (cell_index >= column_count).then_some(color_indices[cell_index - column_count]);
+            let mut color_index = None;
+            for offset in 0..color_count {
+                let candidate_color_index = (next_color_index + offset) % color_count;
+                if Some(candidate_color_index) != left_neighbor && Some(candidate_color_index) != top_neighbor {
+                    color_index = Some(candidate_color_index);
+                    next_color_index = (candidate_color_index + 1) % color_count;
                     break;
                 }
             }
-            palette_indices.push(
-                assigned_palette_index.expect(
-                    "the visualization palette should be large enough to avoid orthogonal collisions in a grid",
-                ),
-            );
+            color_indices.push(color_index.unwrap());
         }
 
-        palette_indices
+        color_indices
             .chunks(column_count)
             .map(|row| row.iter().map(|&index| VISUALIZATION_COLOR_PALETTE[index]).collect())
             .collect()
+    }
+
+    /// Centers `text` within a field of the given `width` by padding with spaces on both sides. If
+    /// `text` is already as wide as or wider than `width`, it is truncated to fit.
+    fn center_text(text: &str, width: usize) -> String {
+        let text_width = text.chars().count();
+        if text_width >= width {
+            return text.chars().take(width).collect();
+        }
+
+        let left_padding = (width - text_width) / 2;
+        let right_padding = width - text_width - left_padding;
+        format!("{}{}{}", " ".repeat(left_padding), text, " ".repeat(right_padding))
     }
 
     /// Builds a single horizontal border line for the plain-text visualization grid using box-drawing
@@ -282,19 +289,6 @@ impl ShardingVisualization {
         }
         line.push(right_corner);
         line
-    }
-
-    /// Centers `text` within a field of the given `width` by padding with spaces on both sides. If
-    /// `text` is already as wide as or wider than `width`, it is truncated to fit.
-    fn center_text(text: &str, width: usize) -> String {
-        let text_width = text.chars().count();
-        if text_width >= width {
-            return text.chars().take(width).collect();
-        }
-
-        let left_padding = (width - text_width) / 2;
-        let right_padding = width - text_width - left_padding;
-        format!("{}{}{}", " ".repeat(left_padding), text, " ".repeat(right_padding))
     }
 }
 
