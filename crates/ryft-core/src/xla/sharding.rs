@@ -179,7 +179,17 @@ impl Sharding {
                 mesh_coordinate[axis_index] = remaining % axis.size;
                 remaining /= axis.size;
             }
-            let cell = self.visualization_cell(&mesh_coordinate);
+            // Map the mesh coordinate to a (row, column) grid cell. For rank-1 shardings the
+            // row is always 0; for rank-2 shardings row and column correspond to the partition
+            // indices of the first and second dimensions respectively.
+            let cell = if rank == 1 {
+                (0, self.dimension_partition_index(0, &mesh_coordinate))
+            } else {
+                (
+                    self.dimension_partition_index(0, &mesh_coordinate),
+                    self.dimension_partition_index(1, &mesh_coordinate),
+                )
+            };
             devices_by_cell.entry(cell).or_default().push(device_index);
         }
 
@@ -207,21 +217,15 @@ impl Sharding {
         Ok(ShardingVisualization { cells, cell_width, cell_height })
     }
 
-    /// Returns the `(row, column)` grid cell for a device at the given mesh coordinate.
-    ///
-    /// For rank-1 shardings the row is always `0` and the column is the partition index for
-    /// dimension 0. For rank-2 shardings row and column map to the partition indices of the
-    /// first and second dimensions respectively.
-    fn visualization_cell(&self, mesh_coordinate: &[usize]) -> (usize, usize) {
-        if self.dimensions.len() == 1 {
-            (0, self.dimension_partition_index(0, mesh_coordinate))
-        } else {
-            (self.dimension_partition_index(0, mesh_coordinate), self.dimension_partition_index(1, mesh_coordinate))
-        }
-    }
-
     /// Returns the partition index of a single sharding dimension for a device at the given mesh
-    /// coordinate. Replicated and unconstrained dimensions always return `0` (single partition).
+    /// coordinate.
+    ///
+    /// [`ShardingDimension::Replicated`] and [`ShardingDimension::Unconstrained`] dimensions map
+    /// every device to the same partition (`0`), since all devices hold the full extent of that
+    /// dimension. For [`ShardingDimension::Sharded`] dimensions, the partition index is the
+    /// row-major linearization of the device's coordinates along the sharding axes. For example,
+    /// given `Sharded(["data", "model"])` where `data` has size 4 and `model` has size 2, a device
+    /// at mesh coordinate `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
     fn dimension_partition_index(&self, dimension: usize, mesh_coordinate: &[usize]) -> usize {
         match &self.dimensions[dimension] {
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
@@ -396,6 +400,9 @@ fn assign_visualization_background_colors(row_count: usize, column_count: usize)
     palette_indices.into_iter().map(|index| VISUALIZATION_COLOR_PALETTE[index]).collect()
 }
 
+/// Builds a single horizontal border line for the plain-text visualization grid using box-drawing
+/// characters. For example, `render_horizontal_border('┌', '┬', '┐', 3, 5)` produces the string
+/// `"┌─────┬─────┬─────┐"`.
 fn render_horizontal_border(
     left_corner: char,
     intersection: char,
@@ -416,6 +423,8 @@ fn render_horizontal_border(
     line
 }
 
+/// Centers `text` within a field of the given `width` by padding with spaces on both sides. If
+/// `text` is already as wide as or wider than `width`, it is truncated to fit.
 fn center_text(text: &str, width: usize) -> String {
     let text_width = text.chars().count();
     if text_width >= width {
@@ -595,19 +604,8 @@ mod tests {
     }
 
     fn test_device_mesh_2x2() -> DeviceMesh {
-        let logical_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
         let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
-        DeviceMesh::new(logical_mesh, devices).unwrap()
-    }
-
-    fn test_device_mesh_1x2() -> DeviceMesh {
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0)];
-        DeviceMesh::new(logical_mesh, devices).unwrap()
+        DeviceMesh::new(test_logical_mesh_2x2(), devices).unwrap()
     }
 
     fn strip_ansi_codes(value: &str) -> String {
@@ -1002,9 +1000,10 @@ mod tests {
 
     #[test]
     fn test_shard_metadata_rank_mismatch() {
+        let logical_mesh = test_logical_mesh_2x2();
         let mesh = test_device_mesh_2x2();
         let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
+            logical_mesh,
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
             empty_axes(),
             empty_axes(),
@@ -1019,9 +1018,10 @@ mod tests {
 
     #[test]
     fn test_shard_metadata_unconstrained_is_ignored() {
+        let logical_mesh = test_logical_mesh_2x2();
         let mesh = test_device_mesh_2x2();
         let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
+            logical_mesh,
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::unconstrained()],
             empty_axes(),
             empty_axes(),
@@ -1042,9 +1042,10 @@ mod tests {
 
     #[test]
     fn test_shard_metadata_even_2d_partitioning() {
+        let logical_mesh = test_logical_mesh_2x2();
         let mesh = test_device_mesh_2x2();
         let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
+            logical_mesh,
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
             empty_axes(),
             empty_axes(),
@@ -1090,9 +1091,10 @@ mod tests {
 
     #[test]
     fn test_shard_metadata_multi_axis_single_dimension_partitioning() {
+        let logical_mesh = test_logical_mesh_2x2();
         let mesh = test_device_mesh_2x2();
         let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
+            logical_mesh,
             vec![ShardingDimension::sharded(["x".to_string(), "y".to_string()])],
             empty_axes(),
             empty_axes(),
@@ -1109,9 +1111,10 @@ mod tests {
 
     #[test]
     fn test_shard_metadata_process_filtering() {
+        let logical_mesh = test_logical_mesh_2x2();
         let mesh = test_device_mesh_2x2();
         let sharding = Sharding::new(
-            mesh.logical_mesh.clone(),
+            logical_mesh,
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
             empty_axes(),
             empty_axes(),
@@ -1127,6 +1130,7 @@ mod tests {
 
     #[test]
     fn test_shard_metadata_mesh_mismatch_reports_expected_and_actual_meshes() {
+        let logical_mesh = test_logical_mesh_2x2();
         let mesh = test_device_mesh_2x2();
         let actual = LogicalMesh::new(vec![MeshAxis::new("z", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharding = Sharding::new(
@@ -1140,7 +1144,7 @@ mod tests {
 
         assert_eq!(
             compute_shard_descriptors(&[8], &mesh, &sharding),
-            Err(ShardingError::MeshMismatch { expected: mesh.logical_mesh, actual })
+            Err(ShardingError::MeshMismatch { expected: logical_mesh, actual })
         );
     }
 }
