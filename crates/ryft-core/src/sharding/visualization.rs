@@ -83,9 +83,9 @@ impl Sharding {
             // and for rank-2 shardings the row and column correspond to the partition indices of the first and second
             // dimensions, respectively.
             let cell = if rank == 1 {
-                (0, self.partition_index(0, &mesh_coordinates))
+                (0, self.partition_index(0, &mesh_coordinates)?)
             } else {
-                (self.partition_index(0, &mesh_coordinates), self.partition_index(1, &mesh_coordinates))
+                (self.partition_index(0, &mesh_coordinates)?, self.partition_index(1, &mesh_coordinates)?)
             };
             devices_by_cell.entry(cell).or_default().push(device_index);
         }

@@ -56,6 +56,9 @@ pub enum ShardingError {
     #[error("sharding rank ({sharding_rank}) does not match array rank ({array_rank})")]
     ShardingRankMismatch { sharding_rank: usize, array_rank: usize },
 
+    #[error("dimension index {dimension} is out of bounds for a sharding of rank {rank}")]
+    DimensionOutOfBounds { dimension: usize, rank: usize },
+
     #[error("sharding visualization only supports rank-1 and rank-2 shapes, but got rank {rank}")]
     UnsupportedVisualizationRank { rank: usize },
 }
@@ -659,17 +662,21 @@ impl Sharding {
     ///   - [`ShardingDimension::Sharded`] results in the row-major linearization of the device's mesh coordinates along
     ///     the sharding axes. For example, given `Sharded(["data", "model"])` where `data` has size `4` and `model` has
     ///     size `2`, a device at mesh coordinates `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
-    pub fn partition_index(&self, dimension: usize, device_mesh_coordinates: &[usize]) -> usize {
-        match &self.dimensions[dimension] {
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
-            ShardingDimension::Sharded(axis_names) => axis_names.iter().fold(0usize, |index, axis_name| {
+    pub fn partition_index(&self, dimension: usize, device_mesh_coordinates: &[usize]) -> Result<usize, ShardingError> {
+        let sharding_dimension = self
+            .dimensions
+            .get(dimension)
+            .ok_or(ShardingError::DimensionOutOfBounds { dimension, rank: self.rank() })?;
+        match sharding_dimension {
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => Ok(0),
+            ShardingDimension::Sharded(axis_names) => axis_names.iter().try_fold(0usize, |index, axis_name| {
                 let axis_index = self
                     .mesh
                     .axis_indices
                     .get(axis_name.as_str())
                     .copied()
-                    .expect("sharding mesh axes should be validated at construction");
-                index * self.mesh.axes[axis_index].size + device_mesh_coordinates[axis_index]
+                    .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.clone() })?;
+                Ok(index * self.mesh.axes[axis_index].size + device_mesh_coordinates[axis_index])
             }),
         }
     }
@@ -1006,11 +1013,15 @@ mod tests {
         assert_eq!(sharding.reduced_manual_axes, BTreeSet::from(["manual".to_string()]));
         assert_eq!(sharding.varying_manual_axes, BTreeSet::new());
         assert_eq!(sharding.rank(), 2);
-        assert_eq!(sharding.partition_index(0, &[0, 0]), 0);
-        assert_eq!(sharding.partition_index(0, &[2, 1]), 2);
-        assert_eq!(sharding.partition_index(0, &[3, 0]), 3);
-        assert_eq!(sharding.partition_index(1, &[0, 0]), 0);
-        assert_eq!(sharding.partition_index(1, &[3, 1]), 0);
+        assert_eq!(sharding.partition_index(0, &[0, 0]), Ok(0));
+        assert_eq!(sharding.partition_index(0, &[2, 1]), Ok(2));
+        assert_eq!(sharding.partition_index(0, &[3, 0]), Ok(3));
+        assert_eq!(sharding.partition_index(1, &[0, 0]), Ok(0));
+        assert_eq!(sharding.partition_index(1, &[3, 1]), Ok(0));
+        assert_eq!(
+            sharding.partition_index(2, &[0, 0]),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 })
+        );
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
         assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced_manual={'manual'}}",);
 
@@ -1024,9 +1035,13 @@ mod tests {
         assert_eq!(replicated.reduced_manual_axes, BTreeSet::new());
         assert_eq!(replicated.varying_manual_axes, BTreeSet::new());
         assert_eq!(replicated.rank(), 3);
-        assert_eq!(replicated.partition_index(0, &[0, 0]), 0);
-        assert_eq!(replicated.partition_index(1, &[3, 1]), 0);
-        assert_eq!(replicated.partition_index(2, &[2, 0]), 0);
+        assert_eq!(replicated.partition_index(0, &[0, 0]), Ok(0));
+        assert_eq!(replicated.partition_index(1, &[3, 1]), Ok(0));
+        assert_eq!(replicated.partition_index(2, &[2, 0]), Ok(0));
+        assert_eq!(
+            replicated.partition_index(3, &[0, 0]),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 3, rank: 3 })
+        );
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
         assert_eq!(replicated.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{}, {}, {}]}");
 
