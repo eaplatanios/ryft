@@ -83,12 +83,9 @@ impl Sharding {
             // and for rank-2 shardings the row and column correspond to the partition indices of the first and second
             // dimensions, respectively.
             let cell = if rank == 1 {
-                (0, self.dimension_partition_index(0, &mesh_coordinates))
+                (0, self.partition_index(0, &mesh_coordinates))
             } else {
-                (
-                    self.dimension_partition_index(0, &mesh_coordinates),
-                    self.dimension_partition_index(1, &mesh_coordinates),
-                )
+                (self.partition_index(0, &mesh_coordinates), self.partition_index(1, &mesh_coordinates))
             };
             devices_by_cell.entry(cell).or_default().push(device_index);
         }
@@ -117,14 +114,20 @@ impl Sharding {
         Ok(ShardingVisualization { cells, cell_width, cell_height })
     }
 
-    /// Returns the partition index of a single [`ShardingDimension`] for a device at the given mesh coordinate.
+    /// Returns the partition index for the provided array dimension that is owned by the device at the provided
+    /// mesh coordinates. Each dimension of a sharded array is partitioned independently; a device's full shard is the
+    /// intersection of its per-dimension partitions. For example, with sharding `[Sharded(["x"]), Sharded(["y"])]` on
+    /// a `2×2` mesh, the device at `(x=1, y=0)` owns partition `1` of dimension `0` (i.e., the second row-band) and
+    /// partition `0` of dimension `1` (i.e., the first column-band). Together these identify the rectangular tile that
+    /// device holds.
     ///
-    /// [`ShardingDimension::Replicated`] and [`ShardingDimension::Unconstrained`] map every device to the same
-    /// partition (`0`), since all devices hold the full extent of that dimension. For [`ShardingDimension::Sharded`]
-    /// dimensions, the partition index is the row-major linearization of the device's coordinates along the sharding
-    /// axes. For example, given `Sharded(["data", "model"])` where `data` has size `4` and `model` has size `2`, a
-    /// device at mesh coordinates `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
-    fn dimension_partition_index(&self, dimension: usize, device_mesh_coordinates: &[usize]) -> usize {
+    /// The returned index is computed as follows:
+    ///   - [`ShardingDimension::Replicated`] and [`ShardingDimension::Unconstrained`] always have partition index `0`,
+    ///     since every device holds the full extent of that dimension.
+    ///   - [`ShardingDimension::Sharded`] results in the row-major linearization of the device's mesh coordinates along
+    ///     the sharding axes. For example, given `Sharded(["data", "model"])` where `data` has size `4` and `model` has
+    ///     size `2`, a device at mesh coordinates `(data=2, model=1)` maps to partition index `2 * 2 + 1 = 5`.
+    fn partition_index(&self, dimension: usize, device_mesh_coordinates: &[usize]) -> usize {
         match &self.dimensions[dimension] {
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
             ShardingDimension::Sharded(axis_names) => {
