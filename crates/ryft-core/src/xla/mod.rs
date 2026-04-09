@@ -20,4 +20,5 @@ pub use shard_map::{
 };
 
 pub use crate::sharding::Sharding;
-pub use sharding::{Shard, ShardSlice, ShardingVisualization};
+pub use crate::sharding::visualization::ShardingVisualization;
+pub use sharding::{Shard, ShardSlice};

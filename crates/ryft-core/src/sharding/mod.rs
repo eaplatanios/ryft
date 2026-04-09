@@ -1,3 +1,5 @@
+pub mod visualization;
+
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -7,6 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use thiserror::Error;
 
 use ryft_macros::Parameter;
+
 #[cfg(feature = "xla")]
 use ryft_mlir::{Location, dialects::shardy};
 
