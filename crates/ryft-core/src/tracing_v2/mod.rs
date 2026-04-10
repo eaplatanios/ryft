@@ -41,7 +41,7 @@ pub use linear::{
 pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
-pub use ops::{Op, StagedOpRef};
+pub use ops::{DifferentiableOp, Op, PrimitiveOp, StagedOpRef};
 pub use program::Program;
 pub use program::{ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};
@@ -50,7 +50,10 @@ pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};
 ///
 /// This trait is intentionally not implemented for [`JitTracer`]. Higher-order transform composition should go
 /// through staged replay rather than recursively instantiating `JitTracer<JitTracer<...>>`.
-pub trait TransformLeaf: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps {}
+pub trait TransformLeaf:
+    TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps
+{
+}
 
 impl TransformLeaf for f32 {}
 

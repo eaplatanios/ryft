@@ -6,15 +6,16 @@
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, Program,
+    FloatExt, MatrixOps, OneLike, PrimitiveOp, Program,
     benchmarking::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
         record, summarize_graph,
     },
     grad,
-    operations::{LinearShardMapEvalMode, ShardMapOp},
     vmap,
 };
+
+use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_graph;
@@ -127,15 +128,18 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
     }
 
     summarize_graph(program.graph(), |op| {
-        if let Some(shard_map_op) = op.as_any().downcast_ref::<ShardMapOp<ShardMapTensor>>() {
-            let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
-            if let Some(eval_mode) = shard_map_op.eval_mode() {
-                nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);
+        if let PrimitiveOp::Custom(custom_op) = op {
+            if let Some(shard_map_op) = custom_op.as_any().downcast_ref::<ShardMapOp<ShardMapTensor>>() {
+                let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
+                if let Some(eval_mode) = shard_map_op.eval_mode() {
+                    nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);
+                }
+                if let Some(transpose_mode) = shard_map_op.transpose_mode() {
+                    nested_regions
+                        .extend(summarize_linear_eval_mode("linear_shard_map.transpose_body", transpose_mode)?);
+                }
+                return Ok(nested_regions);
             }
-            if let Some(transpose_mode) = shard_map_op.transpose_mode() {
-                nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.transpose_body", transpose_mode)?);
-            }
-            return Ok(nested_regions);
         }
 
         Ok(Vec::new())
@@ -170,7 +174,8 @@ where
             traced.global_input_types(),
             traced.global_output_types(),
             "main",
-        )?,
+        )
+        .map_err(|error| BenchmarkError::External(Box::new(error)))?,
         summary,
     )])
 }
@@ -194,7 +199,8 @@ fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             }
         },
         vector_type(8),
-    )?;
+    )
+    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     traced_xla_records("shard_map_basic", &traced)
 }
 
@@ -219,7 +225,8 @@ fn emit_shard_map_matmul() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             }
         },
         (matrix_type(8, 4), matrix_type(4, 2)),
-    )?;
+    )
+    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     traced_xla_records("shard_map_matmul", &traced)
 }
 
@@ -256,7 +263,8 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             }
         },
         vector_type(8),
-    )?;
+    )
+    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     traced_xla_records("grad_around_shard_map", &traced)
 }
 
@@ -285,7 +293,8 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             }
         },
         vector_type(8),
-    )?;
+    )
+    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     traced_xla_records("shard_map_grad_inside", &traced)
 }
 
@@ -328,7 +337,8 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             }
         },
         vector_type(8),
-    )?;
+    )
+    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     traced_xla_records("nested_shard_map", &traced)
 }
 
@@ -363,7 +373,8 @@ fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, Benc
             }
         },
         vector_type(8),
-    )?;
+    )
+    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
     traced_xla_records("shard_map_grad_vmap_composition", &traced)
 }
 

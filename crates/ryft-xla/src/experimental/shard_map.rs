@@ -530,10 +530,14 @@ where
         output_type.sharding =
             Some(sharding_with_varying_manual_axes(&sharding, varying_axes(output_type.sharding.as_ref())));
         let output_value = input.value.with_type(output_type);
-        Ok(JitTracer::apply_staged_op(std::slice::from_ref(&input), std::sync::Arc::new(op), vec![output_value])?
-            .into_iter()
-            .next()
-            .expect("with_sharding_constraint should produce one output per input leaf"))
+        Ok(JitTracer::apply_staged_op(
+            std::slice::from_ref(&input),
+            ryft_core::tracing_v2::PrimitiveOp::Custom(std::sync::Arc::new(op)),
+            vec![output_value],
+        )?
+        .into_iter()
+        .next()
+        .expect("with_sharding_constraint should produce one output per input leaf"))
     }
 
     let structure = input.parameter_structure();

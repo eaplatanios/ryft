@@ -37,7 +37,7 @@ pretty_assertions.workspace = true
 
 [features]
 default = []
-benchmarking = []
+benchmarking = ["ryft-core/benchmarking"]
 ndarray = ["dep:ndarray", "ryft-core/ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]

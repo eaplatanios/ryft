@@ -4,20 +4,19 @@ use std::{
     any::Any,
     fmt::{Debug, Display},
     ops::Mul,
-    sync::Arc,
 };
 
 #[cfg(test)]
 use indoc::indoc;
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, JvpOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -73,7 +72,9 @@ impl<V: TraceValue + Mul<Output = V>> Op<V> for ScaleOp<V> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
+}
 
+impl<V: TraceValue + Mul<Output = V>> DifferentiableOp<V> for ScaleOp<V> {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -94,7 +95,7 @@ impl<V: TraceValue + Mul<Output = V>> Op<V> for ScaleOp<V> {
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         self.jvp(inputs)
     }
@@ -107,13 +108,19 @@ impl<V: TraceValue + Mul<Output = V>> Op<V> for ScaleOp<V> {
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let contribution =
-            builder.add_equation(Arc::new(ScaleOp::new(self.factor().clone())), vec![output_cotangents[0]])?[0];
+        let abstract_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").abstract_value.clone();
+        let example_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").example_value.clone();
+        let contribution = builder.add_equation_prevalidated(
+            PrimitiveOp::Scale { factor: self.factor().clone() },
+            vec![output_cotangents[0]],
+            vec![abstract_value],
+            vec![example_value],
+        )[0];
         Ok(vec![Some(contribution)])
     }
 }
@@ -156,7 +163,7 @@ mod tests {
     fn test_scale_transpose_scales_output_cotangents() {
         let mut forward_builder = ProgramBuilder::<f64>::new();
         let input = forward_builder.add_input(&1.0f64);
-        let output = forward_builder.add_equation(Arc::new(ScaleOp::new(3.0f64)), vec![input]).unwrap()[0];
+        let output = forward_builder.add_equation(PrimitiveOp::Scale { factor: 3.0f64 }, vec![input]).unwrap()[0];
 
         let mut transpose_builder = ProgramBuilder::<f64>::new();
         let output_cotangent = transpose_builder.add_input(&1.0f64);

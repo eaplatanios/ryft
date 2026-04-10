@@ -2,10 +2,9 @@ use std::ops::{Add, Mul, Neg};
 
 use indoc::indoc;
 
-use crate::tracing_v2::operations::AddOp;
 use crate::{
     parameters::Placeholder,
-    tracing_v2::{self, *},
+    tracing_v2::{*, ops::PrimitiveOp},
 };
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
@@ -23,10 +22,10 @@ pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
 }
 
 pub(crate) fn assert_reference_graph_rendering() {
-    let mut builder = GraphBuilder::<std::sync::Arc<dyn tracing_v2::Op<f64>>, f64>::new();
+    let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
     let x = builder.add_input(&1.0f64);
     let three = builder.add_constant(3.0f64);
-    let sum = builder.add_equation(std::sync::Arc::new(AddOp), vec![x, three]).unwrap()[0];
+    let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
     let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
     assert_eq!(

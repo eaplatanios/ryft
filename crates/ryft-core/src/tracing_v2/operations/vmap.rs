@@ -1,14 +1,13 @@
 //! Higher-order `vmap` operations for [`crate::tracing_v2`].
 
-use std::{
-    fmt::{Debug, Display},
-    sync::Arc,
-};
+use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, Op, TraceError, TraceValue, TransformLeaf,
-        ZeroLike,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Op, TraceError, TraceValue,
+        TransformLeaf, ZeroLike,
+        operations::reshape::ReshapeOps,
+        ops::{DifferentiableOp, PrimitiveOp},
         linear::{linearize_program, transpose_linear_program},
     },
     types::{ArrayType, Typed},
@@ -71,15 +70,18 @@ impl<V: TraceValue> FlatTracedVMap<V> {
         self.lane_count * self.output_types.len()
     }
 
-    fn repeated_input_types(&self) -> Vec<ArrayType> {
+    pub(crate) fn repeated_input_types(&self) -> Vec<ArrayType> {
         (0..self.lane_count).flat_map(|_| self.input_types.iter().cloned()).collect::<Vec<_>>()
     }
 
-    fn repeated_output_types(&self) -> Vec<ArrayType> {
+    pub(crate) fn repeated_output_types(&self) -> Vec<ArrayType> {
         (0..self.lane_count).flat_map(|_| self.output_types.iter().cloned()).collect::<Vec<_>>()
     }
 
-    fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
+    where
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    {
         if inputs.len() != self.total_input_count() {
             return Err(TraceError::InvalidInputCount { expected: self.total_input_count(), got: inputs.len() });
         }
@@ -171,7 +173,9 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
         let _ = <Self as Op<V>>::abstract_eval(self, abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }
+}
 
+impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -189,7 +193,7 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
         let primal_output_values =
             self.eval(primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice())?;
         let primal_outputs =
-            JitTracer::apply_staged_op(primal_inputs.as_slice(), Arc::new(self.clone()), primal_output_values)?;
+            JitTracer::apply_staged_op(primal_inputs.as_slice(), PrimitiveOp::VMap(Box::new(self.clone())), primal_output_values)?;
         let lane_input_count = self.body().input_types().len();
         let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
@@ -211,7 +215,7 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         if self.has_transpose_body() {
             return Err(TraceError::HigherOrderOpFailure {
@@ -224,7 +228,7 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
         let primal_outputs = self.eval(primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            Arc::new(make_linear_vmap(&self.body)?),
+            PrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
             self.body.total_output_count(),
         )?;
         Ok(primal_outputs
@@ -242,7 +246,7 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
         output_cotangents: &[crate::tracing_v2::AtomId],
     ) -> Result<Vec<Option<crate::tracing_v2::AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         if !self.has_transpose_body() {
             return Err(TraceError::HigherOrderOpFailure {
@@ -265,7 +269,17 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
                 got: output_cotangents.len(),
             });
         }
-        let contributions = builder.add_equation(Arc::new(self.transpose_op()?), output_cotangents.to_vec())?;
+        let transpose = self.transpose_op()?;
+        let output_abstracts = transpose.body().repeated_output_types();
+        let output_examples = transpose.body().eval_lanes(
+            &output_cotangents.iter().map(|id| builder.atom(*id).expect("cotangent atom should exist").example_value.clone()).collect::<Vec<_>>(),
+        )?;
+        let contributions = builder.add_equation_prevalidated(
+            PrimitiveOp::VMap(Box::new(transpose)),
+            output_cotangents.to_vec(),
+            output_abstracts,
+            output_examples,
+        );
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }
@@ -286,7 +300,7 @@ impl<V: TransformLeaf> Op<JitTracer<V>> for VMapOp<V> {
     fn eval(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let output_values = <Self as Op<V>>::eval(self, concrete_inputs.as_slice())?;
-        JitTracer::apply_staged_op(inputs, Arc::new(self.clone()), output_values)
+        JitTracer::apply_staged_op(inputs, PrimitiveOp::VMap(Box::new(self.clone())), output_values)
     }
 }
 

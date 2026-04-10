@@ -356,23 +356,21 @@ mod tests {
     /// Verifies that exact case filtering emits only the requested case.
     #[test]
     fn test_collect_ir_benchmark_records_filters_by_case_id() {
-        let records = collect_ir_benchmark_records(&["scalar_bilinear_sin_jit".to_string()]).unwrap();
+        let records = collect_ir_benchmark_records(&[], &["scalar_bilinear_sin_jit".to_string()]).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].case_id, "scalar_bilinear_sin_jit");
         assert_eq!(records[0].surface, "jit");
         assert_eq!(
             records[0].raw_ir.trim_end(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>) -> tensor<f64> {
-                    %0 = stablehlo.multiply %arg0, %arg1 : tensor<f64>
-                    %1 = stablehlo.sine %arg0 : tensor<f64>
-                    %2 = stablehlo.add %0, %1 : tensor<f64>
-                    return %2 : tensor<f64>
-                  }
-                }
-            "#}
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %1
+                    %3:f64[] = sin %0
+                    %4:f64[] = add %2 %3
+                in (%4)
+            "}
             .trim_end(),
         );
     }
+
 }

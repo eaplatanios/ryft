@@ -8,7 +8,6 @@ use std::{
     fmt::{Debug, Display},
     marker::PhantomData,
     rc::Rc,
-    sync::Arc,
 };
 
 use ryft_macros::Parameter;
@@ -20,8 +19,8 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, Graph},
         jit::{JitTracer, try_trace_program},
-        operations::{AddOp, NegOp, ScaleOp},
-        ops::Op,
+        operations::reshape::ReshapeOps,
+        ops::{DifferentiableOp, Op, PrimitiveOp},
         program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };
@@ -53,7 +52,10 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
         inputs: &[Self],
         op: ProgramOpRef<V>,
         output_count: usize,
-    ) -> Result<Vec<Self>, TraceError> {
+    ) -> Result<Vec<Self>, TraceError>
+    where
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
         }
@@ -66,42 +68,66 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
         }
 
         let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
-        let output_atoms = builder.borrow_mut().add_equation(op, input_atoms)?;
+        let mut borrow = builder.borrow_mut();
+        let output_abstracts = op.abstract_eval(
+            &input_atoms
+                .iter()
+                .map(|id| borrow.atom(*id).expect("staged input should exist").abstract_value.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let output_examples = op.eval(
+            &input_atoms
+                .iter()
+                .map(|id| borrow.atom(*id).expect("staged input should exist").example_value.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let output_atoms = borrow.add_equation_prevalidated(op, input_atoms, output_abstracts, output_examples);
+        drop(borrow);
         if output_atoms.len() != output_count {
             return Err(TraceError::InvalidOutputCount { expected: output_count, got: output_atoms.len() });
         }
         Ok(output_atoms.into_iter().map(|atom| Self { atom, builder: builder.clone() }).collect())
     }
 
+    /// Stages a unary linear op in the program builder, bypassing `Op::eval` validation.
+    ///
+    /// The output atom reuses the abstract type of the input atom (valid for shape-preserving linear ops).
     #[inline]
     pub fn apply_linear_op(self, op: ProgramOpRef<V>) -> Self {
-        let atom = self
-            .builder
-            .borrow_mut()
-            .add_equation(op, vec![self.atom])
-            .expect("staging a linear op should succeed")[0];
+        let mut borrow = self.builder.borrow_mut();
+        let input_atom = borrow.atom(self.atom).expect("staged input should exist");
+        let abstract_value = input_atom.abstract_value.clone();
+        let example_value = input_atom.example_value.clone();
+        let atom = borrow.add_equation_prevalidated(op, vec![self.atom], vec![abstract_value], vec![example_value])[0];
+        drop(borrow);
         Self { atom, builder: self.builder }
     }
 
     #[inline]
     pub fn add(self, rhs: Self) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
-        let atom = self
-            .builder
-            .borrow_mut()
-            .add_equation(Arc::new(AddOp), vec![self.atom, rhs.atom])
-            .expect("staging linear addition should succeed")[0];
+        let mut borrow = self.builder.borrow_mut();
+        let input_atom = borrow.atom(self.atom).expect("staged input should exist");
+        let abstract_value = input_atom.abstract_value.clone();
+        let example_value = input_atom.example_value.clone();
+        let atom = borrow.add_equation_prevalidated(
+            PrimitiveOp::Add,
+            vec![self.atom, rhs.atom],
+            vec![abstract_value],
+            vec![example_value],
+        )[0];
+        drop(borrow);
         Self { atom, builder: self.builder }
     }
 
     #[inline]
     pub fn neg(self) -> Self {
-        self.apply_linear_op(Arc::new(NegOp))
+        self.apply_linear_op(PrimitiveOp::Neg)
     }
 
     #[inline]
     pub fn scale(self, factor: V) -> Self {
-        self.apply_linear_op(Arc::new(ScaleOp::new(factor)))
+        self.apply_linear_op(PrimitiveOp::Scale { factor })
     }
 }
 
@@ -165,6 +191,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
     /// Applies the linear program to a concrete input tangent or cotangent.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -174,7 +201,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
     /// Transposes the linear program, turning a pushforward into a pullback.
     pub fn transpose(&self) -> Result<LinearProgram<V, Output, Input>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -182,31 +209,36 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for LinearProgram<V, Input, Output> {
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+> Display for LinearProgram<V, Input, Output>
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
     }
 }
 
 fn apply_program_jvp_rule<V>(
-    op: &dyn Op<V>,
+    op: &PrimitiveOp<V>,
     inputs: &[JvpTracer<V, LinearTerm<V>>],
 ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
 {
     op.apply_program_jvp_rule(inputs)
 }
 
 fn transpose_program_op<V>(
-    op: &dyn Op<V>,
+    op: &PrimitiveOp<V>,
     builder: &mut ProgramBuilder<V>,
     inputs: &[AtomId],
     outputs: &[AtomId],
     output_cotangents: &[AtomId],
 ) -> Result<Vec<Option<AtomId>>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
 {
     op.transpose_program_op(builder, inputs, outputs, output_cotangents)
 }
@@ -215,7 +247,7 @@ pub fn linearize_program<V, Input, Output>(
     program: &Program<V, Input, Output>,
 ) -> Result<LinearProgram<V, Input, Output>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    V: TransformLeaf,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
@@ -270,7 +302,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TraceError>>()?;
-        let output_duals = apply_program_jvp_rule(equation.op.as_ref(), input_duals.as_slice())?;
+        let output_duals = apply_program_jvp_rule(&equation.op, input_duals.as_slice())?;
         if output_duals.len() != equation.outputs.len() {
             return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
         }
@@ -310,7 +342,7 @@ pub fn transpose_linear_program<V, Input, Output>(
     program: &LinearProgram<V, Input, Output>,
 ) -> Result<LinearProgram<V, Output, Input>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
@@ -324,7 +356,16 @@ where
         V: TraceValue + FloatExt,
     {
         adjoints[atom] = Some(match adjoints[atom] {
-            Some(existing) => builder.add_equation(Arc::new(AddOp), vec![existing, contribution])?[0],
+            Some(existing) => {
+                let abstract_value = builder.atom(existing).expect("adjoint atom should exist").abstract_value.clone();
+                let example_value = builder.atom(existing).expect("adjoint atom should exist").example_value.clone();
+                builder.add_equation_prevalidated(
+                    PrimitiveOp::Add,
+                    vec![existing, contribution],
+                    vec![abstract_value],
+                    vec![example_value],
+                )[0]
+            }
             None => contribution,
         });
         Ok(())
@@ -352,7 +393,7 @@ where
             continue;
         };
         let input_cotangents = transpose_program_op(
-            equation.op.as_ref(),
+            &equation.op,
             &mut builder,
             equation.inputs.as_slice(),
             equation.outputs.as_slice(),
@@ -419,7 +460,7 @@ where
     V: TraceValue,
     R: Clone,
     LiftConstant: Fn(&V, &[R]) -> Result<R, TraceError>,
-    ApplyOp: Fn(&dyn Op<V>, Vec<R>) -> Result<Vec<R>, TraceError>,
+    ApplyOp: Fn(&PrimitiveOp<V>, Vec<R>) -> Result<Vec<R>, TraceError>,
 {
     let mut values = vec![None; graph.atom_count()];
     for (atom_id, value) in graph.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
@@ -454,7 +495,7 @@ where
                     .iter()
                     .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
-                let outputs = apply_op(equation.op.as_ref(), input_values)?;
+                let outputs = apply_op(&equation.op, input_values)?;
                 for (output_atom, output_value) in equation.outputs.iter().copied().zip(outputs) {
                     values[output_atom] = Some(output_value);
                 }
@@ -524,7 +565,7 @@ pub fn try_jvp_program<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    V: TransformLeaf,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -625,7 +666,7 @@ pub fn try_vjp<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + MatrixOps,
+    V: TransformLeaf,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,

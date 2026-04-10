@@ -10,7 +10,6 @@ use std::{
     marker::PhantomData,
     ops::{Add, Mul, Neg},
     rc::Rc,
-    sync::Arc,
 };
 
 use ryft_macros::Parameter;
@@ -18,11 +17,11 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
         graph::AtomId,
-        operations::{AddOp, CosOp, MulOp, NegOp, SinOp},
-        ops::StagedOpRef,
-        program::{Program, ProgramBuilder},
+        operations::reshape::ReshapeOps,
+        ops::PrimitiveOp,
+        program::{Program, ProgramBuilder, ProgramOpRef},
     },
     types::{ArrayType, Typed},
 };
@@ -60,9 +59,12 @@ impl<V: TraceValue> JitTracer<V> {
 
     pub fn apply_staged_op(
         inputs: &[Self],
-        op: StagedOpRef<V>,
+        op: PrimitiveOp<V>,
         output_values: Vec<V>,
-    ) -> Result<Vec<Self>, TraceError> {
+    ) -> Result<Vec<Self>, TraceError>
+    where
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
         }
@@ -100,7 +102,10 @@ impl<V: TraceValue> JitTracer<V> {
             .collect())
     }
 
-    pub fn unary(self, op: StagedOpRef<V>, apply: impl FnOnce(V) -> V) -> Self {
+    pub fn unary(self, op: PrimitiveOp<V>, apply: impl FnOnce(V) -> V) -> Self
+    where
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    {
         let value = apply(self.value);
         let atom = if self.staging_error.borrow().is_some() {
             self.atom
@@ -116,7 +121,10 @@ impl<V: TraceValue> JitTracer<V> {
         Self { value, atom, builder: self.builder, staging_error: self.staging_error }
     }
 
-    pub fn binary(self, rhs: Self, op: StagedOpRef<V>, apply: impl FnOnce(V, V) -> V) -> Self {
+    pub fn binary(self, rhs: Self, op: PrimitiveOp<V>, apply: impl FnOnce(V, V) -> V) -> Self
+    where
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         debug_assert!(Rc::ptr_eq(&self.staging_error, &rhs.staging_error));
         let value = apply(self.value, rhs.value);
@@ -167,7 +175,7 @@ impl<V: TransformLeaf + Add<Output = V>> Add for JitTracer<V> {
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, Arc::new(AddOp), |left, right| left + right)
+        self.binary(rhs, PrimitiveOp::Add, |left, right| left + right)
     }
 }
 
@@ -176,7 +184,7 @@ impl<V: TransformLeaf + Mul<Output = V>> Mul for JitTracer<V> {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, Arc::new(MulOp), |left, right| left * right)
+        self.binary(rhs, PrimitiveOp::Mul, |left, right| left * right)
     }
 }
 
@@ -185,19 +193,19 @@ impl<V: TransformLeaf + Neg<Output = V>> Neg for JitTracer<V> {
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(Arc::new(NegOp), |value| -value)
+        self.unary(PrimitiveOp::Neg, |value| -value)
     }
 }
 
 impl<V: TransformLeaf> FloatExt for JitTracer<V> {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(Arc::new(SinOp), FloatExt::sin)
+        self.unary(PrimitiveOp::Sin, FloatExt::sin)
     }
 
     #[inline]
     fn cos(self) -> Self {
-        self.unary(Arc::new(CosOp), FloatExt::cos)
+        self.unary(PrimitiveOp::Cos, FloatExt::cos)
     }
 }
 
@@ -224,7 +232,7 @@ impl<
 
 impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledFunction<V, Input, Output> {
     #[inline]
-    pub fn from_graph(graph: crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output>) -> Self {
+    pub fn from_graph(graph: crate::tracing_v2::Graph<ProgramOpRef<V>, V, Input, Output>) -> Self {
         Self::from_program(Program::from_graph(graph))
     }
 
@@ -235,7 +243,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledF
 
     /// Returns the staged graph backing this compiled function.
     #[inline]
-    pub fn graph(&self) -> &crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output> {
+    pub fn graph(&self) -> &crate::tracing_v2::Graph<ProgramOpRef<V>, V, Input, Output> {
         self.program.graph()
     }
 
@@ -248,6 +256,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledF
     /// Replays the staged graph on concrete input values.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -255,7 +264,12 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledF
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for CompiledFunction<V, Input, Output> {
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+> Display for CompiledFunction<V, Input, Output>
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
     }
@@ -267,7 +281,7 @@ fn try_trace_program_with_options<F, Input, Output, V>(
     simplify_program: bool,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -314,7 +328,7 @@ pub fn try_trace_program<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -329,7 +343,7 @@ pub fn try_jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -349,7 +363,7 @@ pub fn jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: TraceValue,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -426,7 +440,7 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing_v2::{FloatExt, MatrixOps, OneLike, TransformLeaf, ZeroLike},
+            tracing_v2::{FloatExt, MatrixOps, OneLike, TransformLeaf, ZeroLike, operations::reshape::ReshapeOps},
             types::{ArrayType, DataType, Typed},
         };
 
@@ -496,6 +510,12 @@ mod tests {
 
             fn transpose_matrix(self) -> Self {
                 self
+            }
+        }
+
+        impl ReshapeOps for TestAbstractValue {
+            fn reshape(self, _target_shape: crate::types::Shape) -> Result<Self, TraceError> {
+                Ok(self)
             }
         }
 

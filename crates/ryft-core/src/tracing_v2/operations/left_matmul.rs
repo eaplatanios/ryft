@@ -1,18 +1,15 @@
 //! Left matrix-multiplication primitive for [`crate::tracing_v2`].
 
-use std::{
-    fmt::{Debug, Display},
-    sync::Arc,
-};
+use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, TransformLeaf, ZeroLike,
+    FloatExt, OneLike, TraceError, TransformLeaf, ZeroLike,
     batch::Batch as BatchedValue,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, Op},
+    ops::{BatchOp, DifferentiableOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::{ArrayType, Typed};
@@ -72,7 +69,9 @@ impl<V: MatrixValue> Op<V> for LeftMatMulOp<V> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor.clone().matmul(inputs[0].clone())])
     }
+}
 
+impl<V: MatrixValue> DifferentiableOp<V> for LeftMatMulOp<V> {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -94,13 +93,13 @@ impl<V: MatrixValue> Op<V> for LeftMatMulOp<V> {
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = builder.add_equation(
-            Arc::new(LeftMatMulOp::new(self.factor.clone().transpose_matrix())),
+            PrimitiveOp::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
             vec![output_cotangents[0]],
         )?[0];
         Ok(vec![Some(contribution)])

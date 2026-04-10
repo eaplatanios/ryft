@@ -7,7 +7,6 @@
 use std::{
     any::Any,
     fmt::{Debug, Display},
-    sync::Arc,
 };
 
 #[cfg(test)]
@@ -16,13 +15,13 @@ use indoc::indoc;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
         batch::Batch,
         forward::{JvpTracer, TangentSpace},
         graph::AtomId,
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{BatchOp, Op},
+        ops::{BatchOp, DifferentiableOp, Op, PrimitiveOp},
         program::ProgramBuilder,
     },
     types::{ArrayType, Shape, Size, Typed},
@@ -211,14 +210,14 @@ impl<V: ReshapeValue + FloatExt + ZeroLike> ReshapeTangentSpace<V> for V {
     }
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike + MatrixOps> ReshapeTangentSpace<V> for LinearTerm<V> {
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> ReshapeTangentSpace<V> for LinearTerm<V> {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         if input_type == output_type {
             return Ok(tangent);
         }
         Ok(LinearTerm::apply_staged_op(
             std::slice::from_ref(&tangent),
-            Arc::new(ReshapeOp::new(input_type.clone(), output_type.clone())),
+            PrimitiveOp::Reshape { input_type: input_type.clone(), output_type: output_type.clone() },
             1,
         )?
         .into_iter()
@@ -249,7 +248,7 @@ impl<V: TransformLeaf + ReshapeValue> ReshapeOps for JitTracer<V> {
         let output_value = self.value.clone().reshape(target_shape)?;
         Ok(JitTracer::apply_staged_op(
             std::slice::from_ref(&self),
-            Arc::new(ReshapeOp::new(input_type, output_type)),
+            PrimitiveOp::Reshape { input_type, output_type },
             vec![output_value],
         )?
         .into_iter()
@@ -388,7 +387,9 @@ impl<V: ReshapeValue> Op<V> for ReshapeOp {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
+}
 
+impl<V: ReshapeValue> DifferentiableOp<V> for ReshapeOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -411,7 +412,7 @@ impl<V: ReshapeValue> Op<V> for ReshapeOp {
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
@@ -425,7 +426,7 @@ impl<V: ReshapeValue> Op<V> for ReshapeOp {
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
@@ -433,10 +434,14 @@ impl<V: ReshapeValue> Op<V> for ReshapeOp {
         if self.input_type() == self.output_type() {
             return Ok(vec![Some(output_cotangents[0])]);
         }
-        let contribution = builder.add_equation(
-            Arc::new(Self::new(self.output_type().clone(), self.input_type().clone())),
+        let abstract_value = self.input_type().clone();
+        let example_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").example_value.clone();
+        let contribution = builder.add_equation_prevalidated(
+            PrimitiveOp::Reshape { input_type: self.output_type().clone(), output_type: self.input_type().clone() },
             vec![output_cotangents[0]],
-        )?[0];
+            vec![abstract_value],
+            vec![example_value],
+        )[0];
         Ok(vec![Some(contribution)])
     }
 }
@@ -710,7 +715,10 @@ mod tests {
         let mut forward_builder = ProgramBuilder::<ndarray::Array2<f64>>::new();
         let input = forward_builder.add_input_abstract(input_type.clone(), arr2(&[[1.0f64, 2.0], [3.0, 4.0]]));
         let output = forward_builder
-            .add_equation(Arc::new(ReshapeOp::new(input_type.clone(), output_type.clone())), vec![input])
+            .add_equation(
+                PrimitiveOp::Reshape { input_type: input_type.clone(), output_type: output_type.clone() },
+                vec![input],
+            )
             .unwrap()[0];
 
         let mut transpose_builder = ProgramBuilder::<ndarray::Array2<f64>>::new();

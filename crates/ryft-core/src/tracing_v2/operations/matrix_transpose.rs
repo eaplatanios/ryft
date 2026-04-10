@@ -3,12 +3,12 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, TransformLeaf, ZeroLike,
+    FloatExt, OneLike, TraceError, TransformLeaf, ZeroLike,
     batch::Batch as BatchedValue,
     forward::JvpTracer,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, Op},
+    ops::{BatchOp, DifferentiableOp, Op},
 };
 use crate::types::ArrayType;
 
@@ -51,7 +51,9 @@ impl<V: MatrixValue> Op<V> for MatrixTransposeOp {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
+}
 
+impl<V: MatrixValue> DifferentiableOp<V> for MatrixTransposeOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -68,7 +70,7 @@ impl<V: MatrixValue> Op<V> for MatrixTransposeOp {
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])

@@ -49,13 +49,13 @@ pub struct Equation<O> {
 
 /// Builder for staged graphs.
 #[derive(Clone, Debug)]
-pub struct GraphBuilder<O: Clone + Op<V>, V: TraceValue> {
+pub struct GraphBuilder<O: Clone, V: TraceValue> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
 }
 
-impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
+impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     /// Creates an empty builder.
     #[inline]
     pub fn new() -> Self {
@@ -96,8 +96,44 @@ impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
         id
     }
 
+    /// Adds a staged equation without running abstract or concrete evaluation.
+    ///
+    /// This is intended for linear program construction where the output types are already known.
+    pub(crate) fn add_equation_prevalidated(
+        &mut self,
+        op: O,
+        inputs: Vec<AtomId>,
+        output_abstracts: Vec<ArrayType>,
+        output_examples: Vec<V>,
+    ) -> Vec<AtomId> {
+        let outputs = output_abstracts
+            .into_iter()
+            .zip(output_examples)
+            .map(|(abstract_value, example_value)| {
+                let id = self.atoms.len();
+                self.atoms.push(Atom { abstract_value, example_value, source: AtomSource::Derived });
+                id
+            })
+            .collect::<Vec<_>>();
+        self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
+        outputs
+    }
+
+    /// Returns the number of equations added so far.
+    #[inline]
+    pub fn equation_count(&self) -> usize {
+        self.equations.len()
+    }
+
     /// Adds a staged equation, validating its inputs through abstract evaluation first.
-    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError> {
+    ///
+    /// When every input atom has [`AtomSource::Constant`] as its source, the operation is folded at
+    /// graph-construction time: `abstract_eval` and `eval` are still executed for validation, but the
+    /// output atoms are recorded as constants and no equation is added to the graph.
+    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
+    where
+        O: Op<V>,
+    {
         let input_abstracts = inputs
             .iter()
             .map(|input| {
@@ -115,17 +151,26 @@ impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_examples = op.eval(input_examples.as_slice())?;
-        let outputs = op
-            .abstract_eval(input_abstracts.as_slice())?
+        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
+
+        let all_constant = inputs
+            .iter()
+            .all(|input| self.atom(*input).map_or(false, |atom| matches!(atom.source, AtomSource::Constant)));
+
+        let source = if all_constant { AtomSource::Constant } else { AtomSource::Derived };
+        let outputs = output_abstracts
             .into_iter()
             .zip(output_examples)
             .map(|(abstract_value, example_value)| {
                 let id = self.atoms.len();
-                self.atoms.push(Atom { abstract_value, example_value, source: AtomSource::Derived });
+                self.atoms.push(Atom { abstract_value, example_value, source: source.clone() });
                 id
             })
             .collect::<Vec<_>>();
-        self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
+
+        if !all_constant {
+            self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
+        }
         Ok(outputs)
     }
 
@@ -152,14 +197,14 @@ impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
     }
 }
 
-impl<O: Clone + Op<V>, V: TraceValue> Default for GraphBuilder<O, V> {
+impl<O: Clone, V: TraceValue> Default for GraphBuilder<O, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 /// Executable staged graph over an open operation set.
-pub struct Graph<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
+pub struct Graph<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
@@ -170,7 +215,7 @@ pub struct Graph<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Outpu
 }
 
 impl<
-    O: Clone + Op<V>,
+    O: Clone,
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -189,7 +234,7 @@ impl<
     }
 }
 
-impl<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Graph<O, V, Input, Output> {
+impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Graph<O, V, Input, Output> {
     /// Returns the number of atoms in the graph.
     #[inline]
     pub fn atom_count(&self) -> usize {
@@ -256,6 +301,7 @@ impl<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameter
     /// Interprets the staged graph on concrete input values.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
+        O: Op<V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -306,10 +352,11 @@ impl<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameter
     /// Eliminates dead constants and equations that do not contribute to the graph outputs.
     pub fn simplify(&self) -> Result<Self, TraceError>
     where
+        O: Op<V>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>(
+        fn mark_live<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>(
             graph: &Graph<O, V, Input, Output>,
             atom_id: usize,
             live_atoms: &mut [bool],
@@ -491,22 +538,22 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{self, test_support},
+        tracing_v2::{test_support, ops::PrimitiveOp},
     };
 
     use super::*;
 
     #[test]
     fn graph_builder_tracks_atom_sources_and_executes() {
-        let mut builder = GraphBuilder::<std::sync::Arc<dyn crate::tracing_v2::ops::Op<f64>>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
         let scaled_x = builder
-            .add_equation(std::sync::Arc::new(tracing_v2::operations::ScaleOp::new(2.0)), vec![x])
+            .add_equation(PrimitiveOp::Scale { factor: 2.0 }, vec![x])
             .unwrap()[0];
         let sum =
-            builder.add_equation(std::sync::Arc::new(tracing_v2::operations::AddOp), vec![scaled_x, y]).unwrap()[0];
+            builder.add_equation(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
         let graph = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(graph.atom(x).unwrap().source, AtomSource::Input));
@@ -527,10 +574,10 @@ mod tests {
 
     #[test]
     fn graph_display_uses_typed_jaxpr_like_rendering() {
-        let mut builder = GraphBuilder::<std::sync::Arc<dyn crate::tracing_v2::ops::Op<f64>>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_equation(std::sync::Arc::new(tracing_v2::operations::AddOp), vec![x, three]).unwrap()[0];
+        let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
         let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
         assert_eq!(
@@ -547,9 +594,62 @@ mod tests {
 
     #[test]
     fn graph_builder_rejects_unbound_inputs() {
-        let mut builder = GraphBuilder::<std::sync::Arc<tracing_v2::operations::AddOp>, f64>::new();
-        let result = builder.add_equation(std::sync::Arc::new(tracing_v2::operations::AddOp), vec![42, 99]);
+        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let result = builder.add_equation(PrimitiveOp::Add, vec![42, 99]);
         assert!(matches!(result, Err(TraceError::UnboundAtomId { id: 42 })));
         test_support::assert_reference_graph_rendering();
+    }
+
+    #[test]
+    fn test_constant_folding_eliminates_equations() {
+        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let a = builder.add_constant(2.0f64);
+        let b = builder.add_constant(3.0f64);
+
+        // Adding two constants should fold: no equation, output is constant.
+        let folded = builder.add_equation(PrimitiveOp::Add, vec![a, b]).unwrap();
+        assert_eq!(folded.len(), 1);
+        assert!(matches!(builder.atom(folded[0]).unwrap().source, AtomSource::Constant));
+        assert_eq!(builder.equation_count(), 0);
+
+        // Introduce a non-constant input and combine with the folded constant.
+        let x = builder.add_input(&10.0f64);
+        let result = builder.add_equation(PrimitiveOp::Mul, vec![folded[0], x]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(matches!(builder.atom(result[0]).unwrap().source, AtomSource::Derived));
+        assert_eq!(builder.equation_count(), 1);
+
+        // Build the graph and verify only the non-folded equation survived.
+        let graph = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
+        assert_eq!(graph.equations().len(), 1);
+        assert_eq!(
+            graph.to_string(),
+            indoc! {"
+                lambda %3:f64[] .
+                let %0:f64[] = const
+                    %1:f64[] = const
+                    %2:f64[] = const
+                    %4:f64[] = mul %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_constant_folding_graph_call_produces_correct_results() {
+        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let a = builder.add_constant(2.0f64);
+        let b = builder.add_constant(3.0f64);
+        let folded_sum = builder.add_equation(PrimitiveOp::Add, vec![a, b]).unwrap()[0];
+
+        let x = builder.add_input(&10.0f64);
+        let product = builder.add_equation(PrimitiveOp::Mul, vec![folded_sum, x]).unwrap()[0];
+        let graph = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
+
+        // folded_sum = 2.0 + 3.0 = 5.0, product = 5.0 * input
+        assert_eq!(graph.call(10.0).unwrap(), 50.0);
+        assert_eq!(graph.call(0.5).unwrap(), 2.5);
+        assert_eq!(graph.call(0.0).unwrap(), 0.0);
     }
 }

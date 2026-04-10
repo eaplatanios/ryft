@@ -7,13 +7,13 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, JvpOp, Op},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -53,7 +53,9 @@ impl<V: TraceValue + Add<Output = V>> Op<V> for AddOp {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
+}
 
+impl<V: TraceValue + Add<Output = V>> DifferentiableOp<V> for AddOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -73,7 +75,7 @@ impl<V: TraceValue + Add<Output = V>> Op<V> for AddOp {
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         self.jvp(inputs)
     }
@@ -86,7 +88,7 @@ impl<V: TraceValue + Add<Output = V>> Op<V> for AddOp {
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         expect_input_count(inputs.len(), 2)?;
         expect_input_count(outputs.len(), 1)?;

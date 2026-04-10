@@ -5,17 +5,14 @@
 //! public batching surface unchanged while giving lowering enough structure to emit packed StableHLO that is much
 //! closer to JAX's current Shardy output.
 
-use std::{
-    ops::{Add, Mul, Neg},
-    sync::Arc,
-};
+use std::ops::{Add, Mul, Neg};
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, OneLike, Program, TraceError, TraceValue, TransformLeaf, ZeroLike,
         operations::{AddOp, CosOp, FlatTracedVMap, MulOp, NegOp, SinOp, VMapOp},
-        ops::BatchOp,
+        ops::{BatchOp, PrimitiveOp},
     },
     types::Typed,
 };
@@ -302,7 +299,7 @@ where
             .collect::<Vec<_>>();
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
         let staged_outputs =
-            JitTracer::apply_staged_op(staged_inputs.as_slice(), Arc::new(VMapOp::new(body)), output_values)?;
+            JitTracer::apply_staged_op(staged_inputs.as_slice(), PrimitiveOp::VMap(Box::new(VMapOp::new(body))), output_values)?;
         (0..lane_count)
             .map(|lane_index| {
                 let start = lane_index * output_leaf_count;

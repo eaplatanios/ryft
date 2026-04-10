@@ -4,15 +4,18 @@
 //! common operation universe for staged tracing. It is the canonical internal IR that later
 //! transforms can replay or rewrite without retracing the original Rust closure.
 
-use std::{fmt::Display, marker::PhantomData, sync::Arc};
+use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{Graph, GraphBuilder, Op, TraceError, TraceValue},
+    tracing_v2::{
+        FloatExt, Graph, GraphBuilder, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
+        operations::reshape::ReshapeOps, ops::PrimitiveOp,
+    },
 };
 
-/// Shared operation reference used by the canonical staged program IR.
-pub type ProgramOpRef<V> = Arc<dyn Op<V>>;
+/// Canonical operation type used by the staged program IR.
+pub type ProgramOpRef<V> = PrimitiveOp<V>;
 
 /// Shared builder used by the canonical staged program IR.
 pub type ProgramBuilder<V> = GraphBuilder<ProgramOpRef<V>, V>;
@@ -51,6 +54,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     #[inline]
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
+        ProgramOpRef<V>: crate::tracing_v2::Op<V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -60,6 +64,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     /// Eliminates dead constants and equations that do not contribute to the program outputs.
     pub fn simplify(&self) -> Result<Self, TraceError>
     where
+        ProgramOpRef<V>: crate::tracing_v2::Op<V>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -67,7 +72,12 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for Program<V, Input, Output> {
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+> Display for Program<V, Input, Output>
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.graph, formatter)
     }

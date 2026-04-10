@@ -5,7 +5,6 @@
 //! values.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use crate::{
     sharding::{Sharding, ShardingDimension},
@@ -15,12 +14,12 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::BatchOp,
+        ops::{BatchOp, PrimitiveOp},
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
 };
 
-use super::{LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, RightMatMulOp};
+use super::{MatMulOp, MatrixTransposeOp};
 
 /// Matrix operations required by the tracing prototype.
 pub trait MatrixOps: Sized {
@@ -208,7 +207,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
 impl<V: TransformLeaf> MatrixOps for JitTracer<V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, Arc::new(MatMulOp), MatrixOps::matmul)
+        self.binary(rhs, PrimitiveOp::MatMul, MatrixOps::matmul)
     }
 
     #[inline]
@@ -216,7 +215,7 @@ impl<V: TransformLeaf> MatrixOps for JitTracer<V> {
         if matrix_transpose_is_identity_type(&self.tpe()) {
             return self;
         }
-        self.unary(Arc::new(MatrixTransposeOp), MatrixOps::transpose_matrix)
+        self.unary(PrimitiveOp::MatrixTranspose, MatrixOps::transpose_matrix)
     }
 }
 
@@ -241,17 +240,17 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
 impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<V> {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
-        tangent.apply_linear_op(Arc::new(LeftMatMulOp::new(factor)))
+        tangent.apply_linear_op(PrimitiveOp::LeftMatMul { factor })
     }
 
     #[inline]
     fn matmul_right(tangent: Self, factor: V) -> Self {
-        tangent.apply_linear_op(Arc::new(RightMatMulOp::new(factor)))
+        tangent.apply_linear_op(PrimitiveOp::RightMatMul { factor })
     }
 
     #[inline]
     fn transpose_matrix(value: Self) -> Self {
-        value.apply_linear_op(Arc::new(LinearMatrixTransposeOp))
+        value.apply_linear_op(PrimitiveOp::LinearMatrixTranspose)
     }
 }
 

@@ -8,9 +8,9 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike, forward::JvpTracer, graph::AtomId,
-    jit::JitTracer, linear::LinearTerm, ops::Op, program::ProgramBuilder,
-    operations::{expect_input_count, unary_abstract},
+    FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    forward::JvpTracer, graph::AtomId, jit::JitTracer, linear::LinearTerm, ops::{DifferentiableOp, Op},
+    program::ProgramBuilder, operations::{expect_input_count, unary_abstract},
 };
 use ryft_core::types::ArrayType;
 
@@ -74,7 +74,11 @@ impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
+}
 
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V>
+    for WithShardingConstraintOp
+{
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -86,16 +90,20 @@ impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
         let input = inputs.into_iter().next().expect("validated single input should exist");
         let primal = JitTracer::apply_staged_op(
             std::slice::from_ref(&input.primal),
-            Arc::new(self.clone()),
+            PrimitiveOp::Custom(Arc::new(self.clone())),
             vec![input.primal.value.clone()],
         )?
         .into_iter()
         .next()
         .expect("sharding constraint should produce one primal output");
-        let tangent = LinearTerm::apply_staged_op(std::slice::from_ref(&input.tangent), Arc::new(self.clone()), 1)?
-            .into_iter()
-            .next()
-            .expect("sharding constraint should produce one tangent output");
+        let tangent = LinearTerm::apply_staged_op(
+            std::slice::from_ref(&input.tangent),
+            PrimitiveOp::Custom(Arc::new(self.clone())),
+            1,
+        )?
+        .into_iter()
+        .next()
+        .expect("sharding constraint should produce one tangent output");
         Ok(vec![JvpTracer { primal, tangent }])
     }
 
@@ -107,10 +115,14 @@ impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
         V: FloatExt + ZeroLike + MatrixOps,
     {
         expect_input_count(inputs.len(), 1)?;
-        let tangent = LinearTerm::apply_staged_op(std::slice::from_ref(&inputs[0].tangent), Arc::new(self.clone()), 1)?
-            .into_iter()
-            .next()
-            .expect("sharding constraint should produce one tangent output");
+        let tangent = LinearTerm::apply_staged_op(
+            std::slice::from_ref(&inputs[0].tangent),
+            PrimitiveOp::Custom(Arc::new(self.clone())),
+            1,
+        )?
+        .into_iter()
+        .next()
+        .expect("sharding constraint should produce one tangent output");
         Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent }])
     }
 
@@ -128,12 +140,11 @@ impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = builder.add_equation(
-            Arc::new(WithShardingConstraintOp::new(self.sharding().clone())),
+            PrimitiveOp::Custom(Arc::new(WithShardingConstraintOp::new(self.sharding().clone()))),
             vec![output_cotangents[0]],
         )?[0];
         Ok(vec![Some(contribution)])
     }
-
 }
 
 #[cfg(test)]
@@ -292,7 +303,10 @@ mod tests {
         let mut forward_builder = ProgramBuilder::<ShardMapTensor>::new();
         let input = forward_builder.add_input(&ShardMapTensor::new(input_type.clone()));
         let output = forward_builder
-            .add_equation(Arc::new(WithShardingConstraintOp::new(sharding.clone())), vec![input])
+            .add_equation(
+                PrimitiveOp::Custom(Arc::new(WithShardingConstraintOp::new(sharding.clone()))),
+                vec![input],
+            )
             .unwrap()[0];
 
         let mut transpose_builder = ProgramBuilder::<ShardMapTensor>::new();

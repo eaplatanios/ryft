@@ -6,12 +6,12 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, JvpOp, Op},
 };
 use crate::types::ArrayType;
 
@@ -50,7 +50,9 @@ impl<V: TraceValue + FloatExt> Op<V> for CosOp {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().cos()])
     }
+}
 
+impl<V: TraceValue + FloatExt> DifferentiableOp<V> for CosOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -71,7 +73,7 @@ impl<V: TraceValue + FloatExt> Op<V> for CosOp {
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + MatrixOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
     {
         self.jvp(inputs)
     }
