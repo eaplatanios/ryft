@@ -16,6 +16,7 @@
 //! - [`ExecuteArguments`] marshals distributed arrays into per-device execution inputs for PJRT.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use half::{bf16, f16};
 use thiserror::Error;
@@ -31,7 +32,7 @@ use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevic
 use crate::types::data_types::{DataType, DataTypeError};
 use crate::types::{ArrayType, Shape, Size};
 
-use super::sharding::{Shard, ShardSlice, compute_shard_descriptors};
+use super::sharding::{Shard, compute_shard_descriptors};
 
 /// Concrete mesh/sharding target used by the higher-level [`device_put`] API.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -407,7 +408,7 @@ fn row_major_element_strides(global_shape: &[usize], element_type: DataType) -> 
 fn extract_dense_shard_bytes(
     host_data: &[u8],
     global_shape: &[usize],
-    shard_slices: &[ShardSlice],
+    shard_slices: &[Range<usize>],
     element_type: DataType,
 ) -> Result<Vec<u8>, ArrayError> {
     if shard_slices.is_empty() {
@@ -434,7 +435,7 @@ fn extract_dense_shard_bytes(
 /// Appends the row-major bytes for the shard slice at `dimension` to `shard_bytes`.
 fn append_dense_shard_bytes(
     host_data: &[u8],
-    shard_slices: &[ShardSlice],
+    shard_slices: &[Range<usize>],
     strides: &[usize],
     dimension: usize,
     base_element_offset: usize,
@@ -585,15 +586,14 @@ fn preferred_exact_source_shard<'a, 'o>(
     source_shards: &[&'a ArrayShard<'o>],
     destination_shard: &Shard,
 ) -> &'a ArrayShard<'o> {
-    let destination_device = destination_shard.device();
     source_shards
         .iter()
         .min_by_key(|source_shard| {
             (
-                source_shard.process_index() != destination_device.process_index,
-                source_shard.device_id() != destination_device.id,
+                source_shard.process_index() != destination_shard.device.process_index,
+                source_shard.device_id() != destination_shard.device.id,
                 source_shard.device_id(),
-                source_shard.shard_index(),
+                source_shard.descriptor().index,
             )
         })
         .copied()
@@ -611,9 +611,9 @@ fn plan_exact_shard_put<'o>(
     mesh: &DeviceMesh,
     sharding: &Sharding,
 ) -> Result<Option<ExactShardPutPlan>, ArrayError> {
-    let mut source_shards_by_slices = HashMap::<Vec<ShardSlice>, Vec<&ArrayShard<'o>>>::new();
+    let mut source_shards_by_slices = HashMap::<Vec<Range<usize>>, Vec<&ArrayShard<'o>>>::new();
     for shard in array.shards() {
-        source_shards_by_slices.entry(shard.slices().to_vec()).or_default().push(shard);
+        source_shards_by_slices.entry(shard.descriptor().slice.clone()).or_default().push(shard);
     }
 
     let (destination_shards, _) = compute_shard_descriptors(global_shape, mesh, sharding)?;
@@ -621,13 +621,13 @@ fn plan_exact_shard_put<'o>(
     let mut plan =
         ExactShardPutPlan { local_copies: Vec::new(), cross_host_sends: Vec::new(), cross_host_receives: Vec::new() };
     for destination_shard in &destination_shards {
-        let source_shards = match source_shards_by_slices.get(destination_shard.slices()) {
+        let source_shards = match source_shards_by_slices.get(&destination_shard.slice) {
             Some(source_shards) => source_shards,
             None => return Ok(None),
         };
         let source_shard = preferred_exact_source_shard(source_shards.as_slice(), destination_shard);
         let source_process_index = source_shard.process_index();
-        let destination_process_index = destination_shard.device().process_index;
+        let destination_process_index = destination_shard.device.process_index;
 
         if destination_process_index == client_process_index {
             if source_process_index == client_process_index {
@@ -635,21 +635,21 @@ fn plan_exact_shard_put<'o>(
                     return Ok(None);
                 }
                 plan.local_copies.push(LocalShardCopyPlan {
-                    source_shard_index: source_shard.shard_index(),
+                    source_shard_index: source_shard.descriptor().index,
                     source_device_id: source_shard.device_id(),
-                    destination_shard_index: destination_shard.shard_index(),
-                    destination_device_id: destination_shard.device().id,
+                    destination_shard_index: destination_shard.index,
+                    destination_device_id: destination_shard.device.id,
                 });
             } else {
                 plan.cross_host_receives.push(CrossHostShardReceivePlan {
-                    source_shard_index: source_shard.shard_index(),
+                    source_shard_index: source_shard.descriptor().index,
                     source_device_id: source_shard.device_id(),
-                    destination_shard_index: destination_shard.shard_index(),
-                    destination_device_id: destination_shard.device().id,
-                    destination_shape: destination_shard.shape().to_vec(),
+                    destination_shard_index: destination_shard.index,
+                    destination_device_id: destination_shard.device.id,
+                    destination_shape: destination_shard.shape(),
                     transfer_key: exact_shard_transfer_key(
-                        source_shard.shard_index(),
-                        destination_shard.shard_index(),
+                        source_shard.descriptor().index,
+                        destination_shard.index,
                         destination_shard_count,
                     )?,
                 });
@@ -659,13 +659,13 @@ fn plan_exact_shard_put<'o>(
                 return Ok(None);
             }
             plan.cross_host_sends.push(CrossHostShardSendPlan {
-                source_shard_index: source_shard.shard_index(),
+                source_shard_index: source_shard.descriptor().index,
                 source_device_id: source_shard.device_id(),
-                destination_shard_index: destination_shard.shard_index(),
-                destination_device_id: destination_shard.device().id,
+                destination_shard_index: destination_shard.index,
+                destination_device_id: destination_shard.device.id,
                 transfer_key: exact_shard_transfer_key(
-                    source_shard.shard_index(),
-                    destination_shard.shard_index(),
+                    source_shard.descriptor().index,
+                    destination_shard.index,
                     destination_shard_count,
                 )?,
             });
@@ -811,15 +811,17 @@ fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayErro
     let mut written = vec![false; total_byte_count];
 
     for shard in array.shards() {
+        let descriptor = shard.descriptor();
         let buffer = shard.buffer().ok_or(ArrayError::MissingAddressableShardForMove {
-            shard_index: shard.shard_index(),
+            shard_index: descriptor.index,
             device_id: shard.device_id(),
         })?;
         let shard_bytes = buffer.copy_to_host(None)?.r#await()?;
-        let expected_byte_count = checked_byte_count(shard.shape(), element_type)?;
+        let shard_shape = descriptor.shape();
+        let expected_byte_count = checked_byte_count(&shard_shape, element_type)?;
         if shard_bytes.len() != expected_byte_count {
             return Err(ArrayError::CopiedShardByteCountMismatch {
-                shard_index: shard.shard_index(),
+                shard_index: descriptor.index,
                 device_id: shard.device_id(),
                 expected_byte_count,
                 actual_byte_count: shard_bytes.len(),
@@ -828,9 +830,9 @@ fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayErro
         merge_dense_shard_bytes(
             shard_bytes.as_slice(),
             global_shape.as_slice(),
-            shard.slices(),
+            &descriptor.slice,
             element_type,
-            shard.shard_index(),
+            descriptor.index,
             &mut global_bytes,
             &mut written,
         )?;
@@ -843,7 +845,7 @@ fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayErro
 fn merge_dense_shard_bytes(
     shard_bytes: &[u8],
     global_shape: &[usize],
-    shard_slices: &[ShardSlice],
+    shard_slices: &[Range<usize>],
     element_type: DataType,
     shard_index: usize,
     global_bytes: &mut [u8],
@@ -875,7 +877,7 @@ fn merge_dense_shard_bytes(
 /// Recursively merges one shard's bytes into `global_bytes`.
 fn merge_dense_shard_bytes_recursive(
     shard_bytes: &[u8],
-    shard_slices: &[ShardSlice],
+    shard_slices: &[Range<usize>],
     global_strides: &[usize],
     shard_strides: &[usize],
     dimension: usize,
@@ -965,38 +967,18 @@ impl<'o> ArrayShard<'o> {
         &self.descriptor
     }
 
-    /// Global shard index in row-major mesh order.
-    pub fn shard_index(&self) -> usize {
-        self.descriptor.shard_index()
-    }
-
-    /// Device that owns this shard.
-    pub fn device(&self) -> MeshDevice {
-        self.descriptor.device()
-    }
-
     /// Device ID on which this buffer is placed.
     pub fn device_id(&self) -> DeviceId {
-        self.device().id
+        self.descriptor.device.id
     }
 
     /// Process index owning this shard's device.
     pub fn process_index(&self) -> usize {
-        self.device().process_index
-    }
-
-    /// Row-major mesh coordinate of this shard.
-    pub fn mesh_coordinate(&self) -> &[usize] {
-        self.descriptor.mesh_coordinate()
-    }
-
-    /// Per-dimension logical slices for this shard.
-    pub fn slices(&self) -> &[ShardSlice] {
-        self.descriptor.slices()
+        self.descriptor.device.process_index
     }
 
     /// Logical shape of this shard.
-    pub fn shape(&self) -> &[usize] {
+    pub fn shape(&self) -> Vec<usize> {
         self.descriptor.shape()
     }
 
@@ -1020,7 +1002,7 @@ impl std::fmt::Debug for ArrayShard<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ArrayShard")
-            .field("shard_index", &self.shard_index())
+            .field("index", &self.descriptor.index)
             .field("device_id", &self.device_id())
             .field("process_index", &self.process_index())
             .field("is_addressable", &self.is_addressable())
@@ -1080,10 +1062,10 @@ impl<'o> Array<'o> {
                 .expect("shard index should exist for valid mesh device-to-shard mapping");
 
             let process_index = device.process_index()?;
-            if process_index != descriptor.device().process_index {
+            if process_index != descriptor.device.process_index {
                 return Err(ArrayError::BufferProcessIndexMismatch {
                     device_id,
-                    expected_process_index: descriptor.device().process_index,
+                    expected_process_index: descriptor.device.process_index,
                     actual_process_index: process_index,
                 });
             }
@@ -1109,13 +1091,9 @@ impl<'o> Array<'o> {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if actual_shape != descriptor.shape() {
-                return Err(ArrayError::BufferShapeMismatch {
-                    device_id,
-                    shard_index,
-                    expected_shape: descriptor.shape().to_vec(),
-                    actual_shape,
-                });
+            let expected_shape = descriptor.shape();
+            if actual_shape != expected_shape {
+                return Err(ArrayError::BufferShapeMismatch { device_id, shard_index, expected_shape, actual_shape });
             }
 
             buffers_by_device.insert(device_id, buffer);
@@ -1125,10 +1103,9 @@ impl<'o> Array<'o> {
         let shards = descriptors
             .into_iter()
             .map(|descriptor| {
-                let shard_index = descriptor.shard_index();
-                let buffer = buffers_by_device.remove(&descriptor.device().id);
+                let buffer = buffers_by_device.remove(&descriptor.device.id);
                 if buffer.is_some() {
-                    addressable_shard_indices.push(shard_index);
+                    addressable_shard_indices.push(descriptor.index);
                 }
                 ArrayShard { descriptor, buffer }
             })
@@ -1178,18 +1155,17 @@ impl<'o> Array<'o> {
         let (shards, _) = compute_shard_descriptors(global_shape, &mesh, &sharding)?;
         let mut addressable_buffers = Vec::new();
         for shard in &shards {
-            let mesh_device = shard.device();
-            if mesh_device.process_index != client_process_index {
+            if shard.device.process_index != client_process_index {
                 continue;
             }
 
-            let device = addressable_device_by_id.get(&mesh_device.id).ok_or(
+            let device = addressable_device_by_id.get(&shard.device.id).ok_or(
                 ArrayError::MissingClientDeviceForLocalMeshDevice {
-                    device_id: mesh_device.id,
+                    device_id: shard.device.id,
                     process_index: client_process_index,
                 },
             )?;
-            let shard_bytes = extract_dense_shard_bytes(buffer, global_shape, shard.slices(), element_type)?;
+            let shard_bytes = extract_dense_shard_bytes(buffer, global_shape, &shard.slice, element_type)?;
             let shard_dimensions = shard.shape().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let addressable_buffer = client.buffer(
                 shard_bytes.as_slice(),
@@ -1306,7 +1282,7 @@ impl<'o> Array<'o> {
 
     /// Returns the concrete mesh implied by this array's global shard placement metadata.
     pub fn mesh(&self) -> DeviceMesh {
-        DeviceMesh::new(self.sharding().mesh.clone(), self.shards.iter().map(ArrayShard::device).collect())
+        DeviceMesh::new(self.sharding().mesh.clone(), self.shards.iter().map(|s| s.descriptor.device).collect())
             .expect("runtime arrays should always contain one shard descriptor per mesh device")
     }
 
@@ -2537,7 +2513,7 @@ mod tests {
         let row_start_by_device = execution_device_ids
             .iter()
             .map(|device_id| {
-                let row_start = lhs_array.shard_for_device(*device_id).unwrap().slices()[0].start;
+                let row_start = lhs_array.shard_for_device(*device_id).unwrap().descriptor().slice[0].start;
                 (*device_id, row_start)
             })
             .collect::<HashMap<_, _>>();

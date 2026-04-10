@@ -17,7 +17,7 @@
 //! | [`MeshDevice`]         | One element in `Mesh.devices`          | Device ID in `MeshAttr.device_ids`         |
 //! | [`Sharding`] | [`jax.sharding.NamedSharding`][jax-ns] | `#sdy.sharding<@mesh, [dim_shardings...]>` |
 //! | [`ShardingDimension`]     | One element of a `PartitionSpec`-like payload | `DimensionShardingAttr`                    |
-//! | [`Shard`]              | `jax.Shard` from `array.global_shards` | runtime metadata only                      |
+//! | [`Shard`]   | `jax.Shard` from `array.global_shards` | runtime metadata only                      |
 //!
 //! [jax-mesh]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.Mesh
 //! [jax-ns]: https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.NamedSharding
@@ -143,19 +143,8 @@ use crate::sharding::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDi
 use crate::sharding::{LogicalMesh, MeshAxisType};
 
 // ---------------------------------------------------------------------------
-// Shard metadata
+// Sharding metadata
 // ---------------------------------------------------------------------------
-
-/// Half-open slice `[start, end)` for one logical array dimension in a shard.
-///
-/// Describes which contiguous range of elements along a single dimension a particular shard
-/// holds. This is analogous to one element of the index tuple in JAX's `Shard.index`, which
-/// uses Python `slice` objects (e.g., `slice(0, 4)`).
-///
-/// For a replicated dimension, the slice spans the full extent `[0, dim_size)`. For a sharded
-/// dimension, the slice covers the partition assigned to a specific device based on its mesh
-/// coordinate.
-pub type ShardSlice = Range<usize>;
 
 /// Metadata for one global shard of a distributed array.
 ///
@@ -167,13 +156,14 @@ pub type ShardSlice = Range<usize>;
 /// Analogous to one entry in JAX's [`array.global_shards`][jax-global-shards], which returns
 /// a list of `Shard` objects:
 ///
-/// | JAX `Shard` field           | `Shard` method                        |
-/// | --------------------------- | ------------------------------------- |
-/// | `shard.device`              | [`device()`][Shard::device]           |
-/// | `shard.index` (slice tuple) | [`slices()`][Shard::slices]           |
-/// | `shard.data.shape`          | [`shape()`][Shard::shape]             |
-/// | `shard.replica_id`          | derivable from mesh coordinate        |
+/// | JAX `Shard` field           | `Shard` field                               |
+/// | --------------------------- | ------------------------------------------------------ |
+/// | `shard.device`              | [`device`][Shard::device]                   |
+/// | `shard.index` (slice tuple) | [`slices`][Shard::slices]                   |
+/// | `shard.data.shape`          | [`shape()`][Shard::shape]                   |
+/// | `shard.replica_id`          | derivable from [`device_coordinates`]                  |
 ///
+/// [`device_coordinates`]: Shard::device_coordinates
 /// [jax-global-shards]: https://docs.jax.dev/en/latest/jax.html#jax.Array.global_shards
 ///
 /// Unlike JAX's `Shard.data`, which provides access to the actual tensor data (only on
@@ -182,42 +172,32 @@ pub type ShardSlice = Range<usize>;
 /// by PJRT buffers, and remains inaccessible for remote shards.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Shard {
-    shard_index: usize,
-    device: MeshDevice,
-    mesh_coordinate: Vec<usize>,
-    slices: Vec<ShardSlice>,
-    shape: Vec<usize>,
+    /// Global (ordinal) index of this [`Shard`] in a row-major device mesh ordering.
+    pub index: usize,
+
+    /// [`MeshDevice`] that owns this [`Shard`].
+    pub device: MeshDevice,
+
+    /// Row-major device mesh coordinates of the device that owns this [`Shard`].
+    pub device_coordinates: Vec<usize>,
+
+    /// Per-dimension ranges describing the portion of the corresponding global array that this [`Shard`] corresponds
+    /// to. Each range describes which contiguous range of elements along a single array dimension this [`Shard`] owns.
+    /// For a replicated dimension, the slice spans the full extent of that dimension, `[0, dimension_size)`. For a
+    /// sharded dimension, the slice covers the partition assigned to a specific device based on its mesh coordinates.
+    pub slice: Vec<Range<usize>>,
 }
 
 impl Shard {
-    /// Global shard index in row-major mesh order.
-    pub fn shard_index(&self) -> usize {
-        self.shard_index
-    }
-
-    /// Device that owns this shard.
-    pub fn device(&self) -> MeshDevice {
-        self.device
-    }
-
-    /// Row-major mesh coordinate of this shard.
-    pub fn mesh_coordinate(&self) -> &[usize] {
-        self.mesh_coordinate.as_slice()
-    }
-
-    /// Per-dimension logical slices for this shard.
-    pub fn slices(&self) -> &[ShardSlice] {
-        self.slices.as_slice()
-    }
-
-    /// Logical shape of this shard.
-    pub fn shape(&self) -> &[usize] {
-        self.shape.as_slice()
+    /// Logical shape of this shard, derived from the per-dimension [`slices`](Self::slices).
+    #[inline]
+    pub fn shape(&self) -> Vec<usize> {
+        self.slice.iter().map(|slice| slice.len()).collect()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Shard-metadata helpers
+// Sharding-metadata helpers
 // ---------------------------------------------------------------------------
 
 /// Computes one [`Shard`] per mesh device for the provided global shape and [`Sharding`].
@@ -238,13 +218,11 @@ pub(crate) fn compute_shard_descriptors(
 
     let mut shards = Vec::with_capacity(mesh.device_count());
     let mut shard_index_by_device = HashMap::with_capacity(mesh.device_count());
-    for (shard_index, mesh_device) in mesh.devices.iter().copied().enumerate() {
-        let mesh_coordinate = mesh
-            .device_coordinates(shard_index)
-            .expect("mesh coordinate should exist for valid mesh device index");
+    for (index, mesh_device) in mesh.devices.iter().copied().enumerate() {
+        let device_coordinates =
+            mesh.device_coordinates(index).expect("mesh coordinate should exist for valid mesh device index");
 
         let mut slices = Vec::with_capacity(global_shape.len());
-        let mut shape = Vec::with_capacity(global_shape.len());
         for (dimension, dimension_size) in global_shape.iter().copied().enumerate() {
             let slice = match &sharding.dimensions[dimension] {
                 ShardingDimension::Replicated => 0..dimension_size,
@@ -259,7 +237,7 @@ pub(crate) fn compute_shard_descriptors(
                             .copied()
                             .expect("sharding mesh axes should be validated before building shard slices");
                         let axis_size = mesh.logical_mesh.axes[axis_index].size;
-                        let axis_coordinate = mesh_coordinate[axis_index];
+                        let axis_coordinate = device_coordinates[axis_index];
 
                         partition_index = partition_index * axis_size + axis_coordinate;
                         partition_count *= axis_size;
@@ -275,12 +253,11 @@ pub(crate) fn compute_shard_descriptors(
                 }
                 ShardingDimension::Unconstrained => 0..dimension_size,
             };
-            shape.push(slice.len());
             slices.push(slice);
         }
 
-        shard_index_by_device.insert(mesh_device.id, shard_index);
-        shards.push(Shard { shard_index, device: mesh_device, mesh_coordinate, slices, shape });
+        shard_index_by_device.insert(mesh_device.id, index);
+        shards.push(Shard { index, device: mesh_device, device_coordinates, slice: slices });
     }
 
     Ok((shards, shard_index_by_device))
@@ -524,14 +501,12 @@ mod tests {
     fn shard_indices_for_process(shards: &[Shard], process_index: usize) -> Vec<usize> {
         shards
             .iter()
-            .filter_map(|descriptor| {
-                (descriptor.device().process_index == process_index).then_some(descriptor.shard_index())
-            })
+            .filter_map(|descriptor| (descriptor.device.process_index == process_index).then_some(descriptor.index))
             .collect()
     }
 
     // -----------------------------------------------------------------------
-    // Shard metadata tests
+    // Sharding metadata tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -558,10 +533,10 @@ mod tests {
 
         let shard0 = shard_for_device(&shards, &shard_index_by_device, 0);
         let shard3 = shard_for_device(&shards, &shard_index_by_device, 3);
-        assert_eq!(shard0.slices()[0], 0..4);
-        assert_eq!(shard0.slices()[1], 0..6);
-        assert_eq!(shard3.slices()[0], 4..8);
-        assert_eq!(shard3.slices()[1], 0..6);
+        assert_eq!(shard0.slice[0], 0..4);
+        assert_eq!(shard0.slice[1], 0..6);
+        assert_eq!(shard3.slice[0], 4..8);
+        assert_eq!(shard3.slice[1], 0..6);
         assert_eq!(shard0.shape(), &[4, 6]);
         assert_eq!(shard3.shape(), &[4, 6]);
     }
@@ -577,13 +552,13 @@ mod tests {
 
         let shard0 = shard_for_device(&shards, &shard_index_by_device, 0);
         assert_eq!(shard0.shape(), &[4, 3]);
-        assert_eq!(shard0.slices()[0], 0..4);
-        assert_eq!(shard0.slices()[1], 0..3);
+        assert_eq!(shard0.slice[0], 0..4);
+        assert_eq!(shard0.slice[1], 0..3);
 
         let shard3 = shard_for_device(&shards, &shard_index_by_device, 3);
         assert_eq!(shard3.shape(), &[4, 3]);
-        assert_eq!(shard3.slices()[0], 4..8);
-        assert_eq!(shard3.slices()[1], 3..6);
+        assert_eq!(shard3.slice[0], 4..8);
+        assert_eq!(shard3.slice[1], 3..6);
     }
 
     #[test]
@@ -596,11 +571,11 @@ mod tests {
 
         let shard0 = shard_for_device(&shards, &shard_index_by_device, 0);
         assert_eq!(shard0.shape(), &[3]);
-        assert_eq!(shard0.slices()[0], 0..3);
+        assert_eq!(shard0.slice[0], 0..3);
 
         let shard1 = shard_for_device(&shards, &shard_index_by_device, 1);
         assert_eq!(shard1.shape(), &[2]);
-        assert_eq!(shard1.slices()[0], 3..5);
+        assert_eq!(shard1.slice[0], 3..5);
     }
 
     #[test]
@@ -611,10 +586,10 @@ mod tests {
             Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x".to_string(), "y".to_string()])]).unwrap();
         let (shards, shard_index_by_device) = compute_shard_descriptors(&[10], &mesh, &sharding).unwrap();
 
-        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 0).slices()[0], 0..3);
-        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 1).slices()[0], 3..6);
-        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 2).slices()[0], 6..8);
-        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 3).slices()[0], 8..10);
+        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 0).slice[0], 0..3);
+        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 1).slice[0], 3..6);
+        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 2).slice[0], 6..8);
+        assert_eq!(shard_for_device(&shards, &shard_index_by_device, 3).slice[0], 8..10);
     }
 
     #[test]
