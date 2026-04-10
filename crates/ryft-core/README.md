@@ -15,6 +15,7 @@ to take a dependency on.
 
 ## Roadmap / TODOs
 
+- [ ] Move all `"xla"`-feature-gated code under the `ryft_core::xla` module. I'm wondering if it should be `ryft_xla`.
 - [ ] Link from the `MeshAxisType::Manual` documentation to the `shard_map` operation once we have it.
 - [ ] Add support for an operation like `jax.type_of`.
 - [ ] Add support for an operation like `jax.lax.with_sharding_constraint`.

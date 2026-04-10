@@ -66,12 +66,13 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::sharding::{LogicalMesh, MeshAxisType, SHARDY_MESH_SYMBOL_NAME, Sharding, ShardingDimension, ShardingError};
+use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use crate::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
     operations::WithShardingConstraintOp,
 };
 use crate::types::{ArrayType, Shape, Size, Typed};
+use crate::xla::sharding::SHARDY_MESH_SYMBOL_NAME;
 
 use super::lowering::LoweringError;
 
@@ -2932,7 +2933,7 @@ mod tests {
         let row_start_by_device = execution_device_ids
             .iter()
             .map(|device_id| {
-                let row_start = lhs_array.shard_for_device(*device_id).unwrap().descriptor().slice[0].start;
+                let row_start = lhs_array.shard_for_device(*device_id).unwrap().slice[0].start;
                 (*device_id, row_start)
             })
             .collect::<HashMap<_, _>>();
