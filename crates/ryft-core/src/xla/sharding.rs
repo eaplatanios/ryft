@@ -142,34 +142,9 @@ use crate::sharding::{DeviceMesh, MeshDevice, MeshDeviceId, Sharding, ShardingDi
 #[cfg(test)]
 use crate::sharding::{LogicalMesh, MeshAxisType};
 
-// ---------------------------------------------------------------------------
-// Sharding metadata
-// ---------------------------------------------------------------------------
-
-/// Metadata for one global shard of a distributed array.
-///
-/// Each shard corresponds to one device in the mesh and describes the portion of the global
-/// array that device holds. This is pure metadata - it does not contain actual buffer data.
-///
-/// # JAX equivalent
-///
-/// Analogous to one entry in JAX's [`array.global_shards`][jax-global-shards], which returns
-/// a list of `Shard` objects:
-///
-/// | JAX `Shard` field           | `Shard` field                               |
-/// | --------------------------- | ------------------------------------------------------ |
-/// | `shard.device`              | [`device`][Shard::device]                   |
-/// | `shard.index` (slice tuple) | [`slices`][Shard::slices]                   |
-/// | `shard.data.shape`          | [`shape()`][Shard::shape]                   |
-/// | `shard.replica_id`          | derivable from [`device_coordinates`]                  |
-///
-/// [`device_coordinates`]: Shard::device_coordinates
-/// [jax-global-shards]: https://docs.jax.dev/en/latest/jax.html#jax.Array.global_shards
-///
-/// Unlike JAX's `Shard.data`, which provides access to the actual tensor data (only on
-/// addressable shards), a `Shard` never holds buffer data. Buffer data is stored
-/// alongside descriptors in [`ArrayShard`][super::arrays::ArrayShard] for local shards backed
-/// by PJRT buffers, and remains inaccessible for remote shards.
+/// Information about a single shard of a distributed (i.e., sharded) array. Each shard corresponds to one device in a
+/// [`DeviceMesh`] and describes the portion of the global array that that device holds. This is pure metadata; it does
+/// not contain any actual array data.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Shard {
     /// Global (ordinal) index of this [`Shard`] in a row-major device mesh ordering.
