@@ -1,10 +1,9 @@
+use ryft_core::types::data_types::{DataType, DataTypeError};
+use ryft_core::types::layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 use ryft_pjrt::{
     BufferType, Layout as PjrtLayout, StridedLayout as PjrtStridedLayout, Tile as PjrtTile,
     TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
 };
-
-use ryft_core::types::data_types::{DataType, DataTypeError};
-use ryft_core::types::layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 
 use crate::pjrt::{FromPjrt, ToPjrt};
 
