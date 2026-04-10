@@ -3,9 +3,11 @@
 use std::env;
 
 use ryft_core::tracing_v2::benchmarking::{benchmark_case_ids, collect_ir_benchmark_records};
+use ryft_xla::experimental::benchmark_support;
 
 /// Runs the Rust-side IR benchmark emitter.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let xla_cases = benchmark_support::cases();
     let mut case_ids = Vec::new();
     let mut list_cases = false;
 
@@ -24,11 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if list_cases {
-        println!("{}", serde_json::to_string_pretty(&benchmark_case_ids())?);
+        println!("{}", serde_json::to_string_pretty(&benchmark_case_ids(&xla_cases))?);
         return Ok(());
     }
 
-    let records = collect_ir_benchmark_records(case_ids.as_slice())?;
+    let records = collect_ir_benchmark_records(&xla_cases, case_ids.as_slice())?;
     println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }

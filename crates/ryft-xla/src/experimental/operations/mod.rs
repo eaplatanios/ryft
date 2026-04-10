@@ -1,3 +1,4 @@
+pub mod reshape;
 pub mod shard_map;
 pub mod with_sharding_constraint;
 

@@ -20,6 +20,10 @@ pub enum BenchmarkError {
     #[error("{0}")]
     Trace(#[from] TraceError),
 
+    /// Wrapper around a boxed error returned by an external benchmark case provider.
+    #[error("{0}")]
+    External(#[from] Box<dyn std::error::Error>),
+
     /// Error returned when the requested case ID is unknown.
     #[error("unknown IR benchmark case '{case_id}'")]
     UnknownCase {
@@ -103,9 +107,9 @@ pub struct IrBenchmarkRecord {
     pub summary: IrBenchmarkSummary,
 }
 
-/// Internal descriptor for one benchmark case.
+/// Descriptor for one benchmark case.
 #[derive(Clone, Copy)]
-pub(crate) struct BenchmarkCase {
+pub struct BenchmarkCase {
     /// Stable case identifier.
     pub case_id: &'static str,
 
@@ -114,8 +118,14 @@ pub(crate) struct BenchmarkCase {
 }
 
 /// Returns the stable set of benchmark case IDs supported by the Rust-side emitter.
-pub fn benchmark_case_ids() -> Vec<&'static str> {
-    tracing_v2_cases().into_iter().map(|case| case.case_id).collect()
+///
+/// # Parameters
+///
+///   - `extra_cases`: Additional benchmark cases to include (e.g., from `ryft-xla`).
+pub fn benchmark_case_ids(extra_cases: &[BenchmarkCase]) -> Vec<&'static str> {
+    let mut cases = tracing_v2_cases();
+    cases.extend_from_slice(extra_cases);
+    cases.into_iter().map(|case| case.case_id).collect()
 }
 
 /// Emits the requested benchmark records.
@@ -124,9 +134,14 @@ pub fn benchmark_case_ids() -> Vec<&'static str> {
 ///
 /// # Parameters
 ///
+///   - `extra_cases`: Additional benchmark cases to include (e.g., from `ryft-xla`).
 ///   - `case_ids`: Optional exact case IDs to emit.
-pub fn collect_ir_benchmark_records(case_ids: &[String]) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let all_cases = tracing_v2_cases();
+pub fn collect_ir_benchmark_records(
+    extra_cases: &[BenchmarkCase],
+    case_ids: &[String],
+) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
+    let mut all_cases = tracing_v2_cases();
+    all_cases.extend_from_slice(extra_cases);
 
     let selected_cases = if case_ids.is_empty() {
         all_cases
@@ -160,7 +175,7 @@ pub fn collect_ir_benchmark_records(case_ids: &[String]) -> Result<Vec<IrBenchma
 ///   - `surface`: Artifact surface for the emitted record.
 ///   - `raw_ir`: Full raw textual IR artifact.
 ///   - `summary`: Normalized structural summary for the artifact.
-pub(crate) fn record(
+pub fn record(
     case_id: &'static str,
     category: &'static str,
     surface: &'static str,
@@ -204,7 +219,7 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
 ///   - `graph`: Graph to summarize.
 ///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
 ///     staged op.
-pub(crate) fn summarize_graph<V, Input, Output, F>(
+pub fn summarize_graph<V, Input, Output, F>(
     graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
@@ -262,7 +277,7 @@ where
 ///
 ///   - `label`: Stable nested-region label.
 ///   - `summary`: Child graph summary.
-pub(crate) fn nested_region(label: &'static str, summary: IrBenchmarkSummary) -> IrNestedRegionSummary {
+pub fn nested_region(label: &'static str, summary: IrBenchmarkSummary) -> IrNestedRegionSummary {
     IrNestedRegionSummary {
         label: label.to_string(),
         input_leaf_count: summary.input_leaf_count,
@@ -320,7 +335,7 @@ mod tests {
     /// Verifies the stable benchmark case registry.
     #[test]
     fn test_benchmark_case_registry_contains_expected_ids() {
-        let case_ids = benchmark_case_ids();
+        let case_ids = benchmark_case_ids(&[]);
         assert!(case_ids.contains(&"scalar_bilinear_sin_jit"));
         assert!(case_ids.contains(&"scalar_bilinear_sin_jvp"));
         assert!(case_ids.contains(&"scalar_bilinear_sin_vjp_pullback"));

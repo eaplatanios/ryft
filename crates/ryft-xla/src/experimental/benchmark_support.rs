@@ -21,7 +21,7 @@ use crate::experimental::lowering::to_mlir_module_for_graph;
 use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
-pub(crate) fn cases() -> Vec<BenchmarkCase> {
+pub fn cases() -> Vec<BenchmarkCase> {
     vec![
         BenchmarkCase { case_id: "shard_map_basic", emit: emit_shard_map_basic },
         BenchmarkCase { case_id: "shard_map_matmul", emit: emit_shard_map_matmul },
