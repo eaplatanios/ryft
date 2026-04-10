@@ -7,6 +7,7 @@ members = [
     "crates/ryft-macros-tests",
     "crates/ryft-mlir",
     "crates/ryft-pjrt",
+    "crates/ryft-xla",
     "crates/ryft-xla-sys",
 ]
 
@@ -30,6 +31,7 @@ ryft-core = { path = "crates/ryft-core", version = "0.0.3", default-features = f
 ryft-macros = { path = "crates/ryft-macros", version = "0.0.3", default-features = false }
 ryft-mlir = { path = "crates/ryft-mlir", version = "0.0.3", default-features = false }
 ryft-pjrt = { path = "crates/ryft-pjrt", version = "0.0.3", default-features = false }
+ryft-xla = { path = "crates/ryft-xla", version = "0.0.3", default-features = false }
 ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.3", default-features = false }
 anyhow = "1.0.102"
 aquamarine = "0.6.0"

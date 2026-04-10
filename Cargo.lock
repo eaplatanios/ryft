@@ -1836,6 +1836,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryft-xla"
+version = "0.0.3"
+dependencies = [
+ "half",
+ "indoc",
+ "paste",
+ "pretty_assertions",
+ "ryft-core",
+ "ryft-mlir",
+ "ryft-pjrt",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ryft-xla-sys"
 version = "0.0.3"
 dependencies = [

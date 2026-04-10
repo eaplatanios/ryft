@@ -1,0 +1,44 @@
+[package]
+name = "ryft-xla"
+version = "0.0.3"
+readme = "README.md"
+description = "XLA backend for the Ryft library."
+keywords = ["ryft", "xla", "pjrt", "gpu", "tpu"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "README.md",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+ryft-core.workspace = true
+ryft-mlir.workspace = true
+ryft-pjrt.workspace = true
+half.workspace = true
+paste.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+pretty_assertions.workspace = true
+
+[features]
+default = []
+benchmarking = []
+ndarray = ["ryft-core/ndarray"]
+cuda-12 = ["ryft-pjrt/cuda-12"]
+cuda-13 = ["ryft-pjrt/cuda-13"]
+rocm-7 = ["ryft-pjrt/rocm-7"]
+tpu = ["ryft-pjrt/tpu"]
+neuron = ["ryft-pjrt/neuron"]
+metal = ["ryft-pjrt/metal"]
