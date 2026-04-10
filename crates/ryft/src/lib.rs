@@ -3,6 +3,9 @@ pub use ryft_macros as macros;
 pub use ryft_mlir as mlir;
 pub use ryft_pjrt as pjrt;
 
+#[cfg(feature = "xla")]
+pub use ryft_xla as xla;
+
 pub use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
 pub use ryft_core::errors::Error;
 pub use ryft_core::parameters::{

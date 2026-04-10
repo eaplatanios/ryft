@@ -1766,6 +1766,7 @@ dependencies = [
  "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",
+ "ryft-xla",
 ]
 
 [[package]]
