@@ -22,10 +22,13 @@ license.workspace = true
 
 [dependencies]
 ryft-core.workspace = true
+ryft-macros.workspace = true
 ryft-mlir.workspace = true
 ryft-pjrt.workspace = true
 half.workspace = true
+ndarray = { workspace = true, optional = true }
 paste.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -35,10 +38,15 @@ pretty_assertions.workspace = true
 [features]
 default = []
 benchmarking = []
-ndarray = ["ryft-core/ndarray"]
+ndarray = ["dep:ndarray", "ryft-core/ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]
 rocm-7 = ["ryft-pjrt/rocm-7"]
 tpu = ["ryft-pjrt/tpu"]
 neuron = ["ryft-pjrt/neuron"]
 metal = ["ryft-pjrt/metal"]
+
+[[bin]]
+name = "ir_benchmark"
+path = "src/bin/ir_benchmark.rs"
+required-features = ["benchmarking", "ndarray"]

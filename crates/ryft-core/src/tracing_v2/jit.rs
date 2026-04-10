@@ -39,17 +39,17 @@ pub struct JitTracer<V: TraceValue> {
 
 impl<V: TraceValue> JitTracer<V> {
     #[inline]
-    pub(crate) fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
         self.builder.clone()
     }
 
     #[inline]
-    pub(crate) fn staging_error_handle(&self) -> Rc<RefCell<Option<TraceError>>> {
+    pub fn staging_error_handle(&self) -> Rc<RefCell<Option<TraceError>>> {
         self.staging_error.clone()
     }
 
     #[inline]
-    pub(crate) fn from_staged_parts(
+    pub fn from_staged_parts(
         value: V,
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<V>>>,
@@ -58,7 +58,7 @@ impl<V: TraceValue> JitTracer<V> {
         Self { value, atom, builder, staging_error }
     }
 
-    pub(crate) fn apply_staged_op(
+    pub fn apply_staged_op(
         inputs: &[Self],
         op: StagedOpRef<V>,
         output_values: Vec<V>,
@@ -100,7 +100,7 @@ impl<V: TraceValue> JitTracer<V> {
             .collect())
     }
 
-    pub(crate) fn unary(self, op: StagedOpRef<V>, apply: impl FnOnce(V) -> V) -> Self {
+    pub fn unary(self, op: StagedOpRef<V>, apply: impl FnOnce(V) -> V) -> Self {
         let value = apply(self.value);
         let atom = if self.staging_error.borrow().is_some() {
             self.atom
@@ -116,7 +116,7 @@ impl<V: TraceValue> JitTracer<V> {
         Self { value, atom, builder: self.builder, staging_error: self.staging_error }
     }
 
-    pub(crate) fn binary(self, rhs: Self, op: StagedOpRef<V>, apply: impl FnOnce(V, V) -> V) -> Self {
+    pub fn binary(self, rhs: Self, op: StagedOpRef<V>, apply: impl FnOnce(V, V) -> V) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         debug_assert!(Rc::ptr_eq(&self.staging_error, &rhs.staging_error));
         let value = apply(self.value, rhs.value);
@@ -224,24 +224,24 @@ impl<
 
 impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledFunction<V, Input, Output> {
     #[inline]
-    pub(crate) fn from_graph(graph: crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output>) -> Self {
+    pub fn from_graph(graph: crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output>) -> Self {
         Self::from_program(Program::from_graph(graph))
     }
 
     #[inline]
-    pub(crate) fn from_program(program: Program<V, Input, Output>) -> Self {
+    pub fn from_program(program: Program<V, Input, Output>) -> Self {
         Self { program, marker: PhantomData }
     }
 
     /// Returns the staged graph backing this compiled function.
     #[inline]
-    pub(crate) fn graph(&self) -> &crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output> {
+    pub fn graph(&self) -> &crate::tracing_v2::Graph<StagedOpRef<V>, V, Input, Output> {
         self.program.graph()
     }
 
     /// Returns the staged program backing this compiled function.
     #[inline]
-    pub(crate) fn program(&self) -> &Program<V, Input, Output> {
+    pub fn program(&self) -> &Program<V, Input, Output> {
         &self.program
     }
 
@@ -309,7 +309,7 @@ where
     Ok((output_value, program))
 }
 
-pub(crate) fn try_trace_program<F, Input, Output, V>(
+pub fn try_trace_program<F, Input, Output, V>(
     function: F,
     input: Input,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
@@ -324,7 +324,7 @@ where
     try_trace_program_with_options(function, input, true)
 }
 
-pub(crate) fn try_jit<F, Input, Output, V>(
+pub fn try_jit<F, Input, Output, V>(
     function: F,
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>

@@ -6,11 +6,6 @@ use std::{
     ops::Mul,
 };
 
-#[cfg(feature = "xla")]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(feature = "xla")]
-use ryft_mlir::{Block, Operation, Value, ValueRef};
-
 use crate::tracing_v2::{
     FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
@@ -20,16 +15,12 @@ use crate::tracing_v2::{
     ops::{BatchOp, JvpOp, Op},
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{
-    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
-};
 
 use super::{binary_same_abstract, expect_batch_sizes_match, expect_input_count};
 
 /// Elementwise multiplication primitive.
 #[derive(Clone, Default)]
-pub(crate) struct MulOp;
+pub struct MulOp;
 
 impl Debug for MulOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -88,38 +79,6 @@ impl<V: TraceValue + Mul<Output = V>> Op<V> for MulOp {
         V: FloatExt + ZeroLike + MatrixOps,
     {
         self.jvp(inputs)
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let operation =
-            lowerer
-                .block
-                .append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.multiply should return one result").as_ref()])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let operation =
-            lowerer
-                .block
-                .append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.multiply should return one result").as_ref()])
     }
 }
 

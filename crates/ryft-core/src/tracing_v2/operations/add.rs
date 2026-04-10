@@ -6,11 +6,6 @@ use std::{
     ops::Add,
 };
 
-#[cfg(feature = "xla")]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(feature = "xla")]
-use ryft_mlir::{Block, Operation, Value, ValueRef};
-
 use crate::tracing_v2::{
     FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
@@ -22,16 +17,12 @@ use crate::tracing_v2::{
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{
-    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
-};
 
 use super::{binary_same_abstract, expect_batch_sizes_match, expect_input_count};
 
 /// Elementwise addition primitive.
 #[derive(Clone, Default)]
-pub(crate) struct AddOp;
+pub struct AddOp;
 
 impl Debug for AddOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,34 +92,6 @@ impl<V: TraceValue + Add<Output = V>> Op<V> for AddOp {
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0]), Some(output_cotangents[0])])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let operation =
-            lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.add should return one result").as_ref()])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let operation =
-            lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.add should return one result").as_ref()])
     }
 }
 

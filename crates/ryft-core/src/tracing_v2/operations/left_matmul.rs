@@ -5,13 +5,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(feature = "xla")]
-use ryft_mlir::ValueRef;
-#[cfg(all(feature = "xla", feature = "ndarray"))]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(all(feature = "xla", feature = "ndarray"))]
-use ryft_mlir::{Block, Operation, Value};
-
 use crate::tracing_v2::{
     FloatExt, TraceError, TransformLeaf, ZeroLike,
     batch::Batch as BatchedValue,
@@ -22,11 +15,7 @@ use crate::tracing_v2::{
     ops::{BatchOp, Op},
     program::ProgramBuilder,
 };
-#[cfg(all(feature = "xla", feature = "ndarray"))]
-use crate::types::Shape;
 use crate::types::{ArrayType, Typed};
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode};
 
 use super::{
     expect_input_count, lift_jit_constant,
@@ -35,20 +24,20 @@ use super::{
 
 /// Linear map `tangent -> factor @ tangent`.
 #[derive(Clone)]
-pub(crate) struct LeftMatMulOp<V: MatrixValue> {
+pub struct LeftMatMulOp<V: MatrixValue> {
     factor: V,
 }
 
 impl<V: MatrixValue> LeftMatMulOp<V> {
     /// Creates one left multiplication op capturing the provided factor.
     #[inline]
-    pub(crate) fn new(factor: V) -> Self {
+    pub fn new(factor: V) -> Self {
         Self { factor }
     }
 
     /// Returns the captured matrix factor.
     #[inline]
-    pub(crate) fn factor(&self) -> &V {
+    pub fn factor(&self) -> &V {
         &self.factor
     }
 }
@@ -115,57 +104,6 @@ impl<V: MatrixValue> Op<V> for LeftMatMulOp<V> {
             vec![output_cotangents[0]],
         )?[0];
         Ok(vec![Some(contribution)])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        if !matches!(mode, PlainMlirLoweringMode::Unpacked) {
-            return Err(LoweringError::UnsupportedOp { op: self.name().to_string() });
-        }
-        #[cfg(feature = "ndarray")]
-        {
-            let output_abstract = &output_types[0];
-            let transposed_output_abstract = match output_abstract.shape.dimensions.as_slice() {
-                [first, second] => {
-                    ArrayType::new(output_abstract.data_type, Shape::new(vec![*second, *first]), None, None)
-                        .expect("transposed matrix output without sharding should always be valid")
-                }
-                _ => return Err(LoweringError::UnsupportedOp { op: self.name().to_string() }),
-            };
-            let transposed_output_type = lowerer.lower_tensor_type(&transposed_output_abstract)?;
-            let factor = lowerer.lower_literal_value(&self.factor.clone().transpose_matrix())?;
-            let dot = lowerer.block.append_operation(stable_hlo::dot_general(
-                input_values[0],
-                factor,
-                lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[0], &[0]),
-                Some((stable_hlo::Precision::Default, stable_hlo::Precision::Default)),
-                None,
-                transposed_output_type,
-                lowerer.location,
-            ));
-            let operation = lowerer.block.append_operation(stable_hlo::transpose(
-                dot.result(0).expect("stablehlo.dot_general should return one result").as_ref(),
-                &[1, 0],
-                lowerer.location,
-            ));
-            Ok(vec![operation.result(0).expect("stablehlo.transpose should return one result").as_ref()])
-        }
-        #[cfg(not(feature = "ndarray"))]
-        {
-            let _ = output_types;
-            let _ = input_values;
-            let _ = lowerer;
-            Err(LoweringError::UnsupportedOp { op: self.name().to_string() })
-        }
     }
 }
 

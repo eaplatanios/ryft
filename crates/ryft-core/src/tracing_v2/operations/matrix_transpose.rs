@@ -2,11 +2,6 @@
 
 use std::fmt::{Debug, Display};
 
-#[cfg(feature = "xla")]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(feature = "xla")]
-use ryft_mlir::{Block, Operation, Value, ValueRef};
-
 use crate::tracing_v2::{
     FloatExt, TraceError, TransformLeaf, ZeroLike,
     batch::Batch as BatchedValue,
@@ -16,10 +11,6 @@ use crate::tracing_v2::{
     ops::{BatchOp, Op},
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{
-    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
-};
 
 use super::{
     expect_input_count,
@@ -28,7 +19,7 @@ use super::{
 
 /// Primitive representing matrix transposition.
 #[derive(Clone, Default)]
-pub(crate) struct MatrixTransposeOp;
+pub struct MatrixTransposeOp;
 
 impl Debug for MatrixTransposeOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,45 +72,6 @@ impl<V: MatrixValue> Op<V> for MatrixTransposeOp {
     {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let permutation = match mode {
-            PlainMlirLoweringMode::Unpacked => vec![1, 0],
-            PlainMlirLoweringMode::Packed { .. } => match output_types[0].shape.dimensions.len() {
-                2 => vec![1, 0],
-                3 => vec![0, 2, 1],
-                _ => return Err(LoweringError::UnsupportedOp { op: <Self as Op<V>>::name(self).to_string() }),
-            },
-        };
-        let operation = lowerer.block.append_operation(stable_hlo::transpose(
-            input_values[0],
-            permutation.as_slice(),
-            lowerer.location,
-        ));
-        Ok(vec![operation.result(0).expect("stablehlo.transpose should return one result").as_ref()])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let operation =
-            lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.transpose should return one result").as_ref()])
     }
 }
 

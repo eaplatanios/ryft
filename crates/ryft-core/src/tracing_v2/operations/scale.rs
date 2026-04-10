@@ -9,10 +9,6 @@ use std::{
 
 #[cfg(test)]
 use indoc::indoc;
-#[cfg(feature = "xla")]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(feature = "xla")]
-use ryft_mlir::{Block, Operation, Value, ValueRef};
 
 use crate::tracing_v2::{
     FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
@@ -25,14 +21,12 @@ use crate::tracing_v2::{
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode};
 
 use super::{expect_input_count, lift_jit_constant, unary_abstract};
 
 /// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]
-pub(crate) struct ScaleOp<V: TraceValue> {
+pub struct ScaleOp<V: TraceValue> {
     factor: V,
 }
 
@@ -45,7 +39,7 @@ impl<V: TraceValue> ScaleOp<V> {
 
     /// Returns the captured scale factor.
     #[inline]
-    pub(crate) fn factor(&self) -> &V {
+    pub fn factor(&self) -> &V {
         &self.factor
     }
 }
@@ -121,27 +115,6 @@ impl<V: TraceValue + Mul<Output = V>> Op<V> for ScaleOp<V> {
         let contribution =
             builder.add_equation(Arc::new(ScaleOp::new(self.factor().clone())), vec![output_cotangents[0]])?[0];
         Ok(vec![Some(contribution)])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let factor = match mode {
-            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(self.factor())?,
-            PlainMlirLoweringMode::Packed { .. } => {
-                lowerer.lower_packed_literal_value(self.factor(), &output_types[0])?
-            }
-        };
-        let operation = lowerer.block.append_operation(stable_hlo::multiply(factor, input_values[0], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.multiply should return one result").as_ref()])
     }
 }
 

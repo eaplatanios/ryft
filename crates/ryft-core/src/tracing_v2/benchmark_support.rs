@@ -15,8 +15,6 @@ use crate::tracing_v2::{
 };
 #[cfg(feature = "ndarray")]
 use crate::tracing_v2::{MatrixOps, ZeroLike};
-#[cfg(feature = "xla")]
-use crate::xla::lowering::to_mlir_module_for_plain_graph;
 
 /// Returns the tracing-only IR benchmark cases.
 pub(crate) fn cases() -> Vec<BenchmarkCase> {
@@ -82,27 +80,6 @@ where
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `surface`: Artifact surface to record.
 ///   - `program`: Program to render and summarize.
-#[cfg(feature = "xla")]
-fn tracing_record<V, Input, Output>(
-    case_id: &'static str,
-    surface: &'static str,
-    program: &Program<V, Input, Output>,
-) -> Result<IrBenchmarkRecord, BenchmarkError>
-where
-    V: crate::xla::lowering::MlirLowerableValue,
-    Input: crate::parameters::Parameterized<V>,
-    Output: crate::parameters::Parameterized<V>,
-{
-    Ok(record(
-        case_id,
-        tracing_category(case_id),
-        surface,
-        to_mlir_module_for_plain_graph(program.graph(), "main")?,
-        summarize_program(program)?,
-    ))
-}
-
-#[cfg(not(feature = "xla"))]
 fn tracing_record<V, Input, Output>(
     case_id: &'static str,
     surface: &'static str,

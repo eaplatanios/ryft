@@ -28,28 +28,28 @@ use crate::{
 
 /// Tangent representation backed by atoms in a staged linear graph.
 #[derive(Clone, Debug, Parameter)]
-pub(crate) struct LinearTerm<V: TraceValue> {
+pub struct LinearTerm<V: TraceValue> {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<V>>>,
 }
 
 impl<V: TraceValue + FloatExt> LinearTerm<V> {
     #[inline]
-    pub(crate) fn atom(&self) -> AtomId {
+    pub fn atom(&self) -> AtomId {
         self.atom
     }
 
     #[inline]
-    pub(crate) fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
         self.builder.clone()
     }
 
     #[inline]
-    pub(crate) fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<V>>>) -> Self {
+    pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<V>>>) -> Self {
         Self { atom, builder }
     }
 
-    pub(crate) fn apply_staged_op(
+    pub fn apply_staged_op(
         inputs: &[Self],
         op: ProgramOpRef<V>,
         output_count: usize,
@@ -74,7 +74,7 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
     }
 
     #[inline]
-    pub(crate) fn apply_linear_op(self, op: ProgramOpRef<V>) -> Self {
+    pub fn apply_linear_op(self, op: ProgramOpRef<V>) -> Self {
         let atom = self
             .builder
             .borrow_mut()
@@ -84,7 +84,7 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
     }
 
     #[inline]
-    pub(crate) fn add(self, rhs: Self) -> Self {
+    pub fn add(self, rhs: Self) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         let atom = self
             .builder
@@ -95,12 +95,12 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
     }
 
     #[inline]
-    pub(crate) fn neg(self) -> Self {
+    pub fn neg(self) -> Self {
         self.apply_linear_op(Arc::new(NegOp))
     }
 
     #[inline]
-    pub(crate) fn scale(self, factor: V) -> Self {
+    pub fn scale(self, factor: V) -> Self {
         self.apply_linear_op(Arc::new(ScaleOp::new(factor)))
     }
 }
@@ -130,7 +130,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + MatrixOps> TangentSpace<V> for Linear
 }
 
 /// Standard traced value used while building linear programs.
-pub(crate) type Linearized<V> = JvpTracer<V, LinearTerm<V>>;
+pub type Linearized<V> = JvpTracer<V, LinearTerm<V>>;
 
 /// Staged linear map produced by `linearize`, `jvp_program`, or `vjp`.
 pub struct LinearProgram<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
@@ -152,13 +152,13 @@ impl<
 
 impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearProgram<V, Input, Output> {
     #[inline]
-    pub(crate) fn from_program(program: Program<V, Input, Output>, zero: V) -> Self {
+    pub fn from_program(program: Program<V, Input, Output>, zero: V) -> Self {
         Self { program, zero, marker: PhantomData }
     }
 
     /// Returns the staged graph backing this linear program.
     #[inline]
-    pub(crate) fn program(&self) -> &Program<V, Input, Output> {
+    pub fn program(&self) -> &Program<V, Input, Output> {
         &self.program
     }
 
@@ -211,7 +211,7 @@ where
     op.transpose_program_op(builder, inputs, outputs, output_cotangents)
 }
 
-pub(crate) fn linearize_program<V, Input, Output>(
+pub fn linearize_program<V, Input, Output>(
     program: &Program<V, Input, Output>,
 ) -> Result<LinearProgram<V, Input, Output>, TraceError>
 where
@@ -306,7 +306,7 @@ where
     })
 }
 
-pub(crate) fn transpose_linear_program<V, Input, Output>(
+pub fn transpose_linear_program<V, Input, Output>(
     program: &LinearProgram<V, Input, Output>,
 ) -> Result<LinearProgram<V, Output, Input>, TraceError>
 where
@@ -469,7 +469,7 @@ where
         .collect()
 }
 
-pub(crate) fn replay_program_graph_linearized_jit<GraphInput, GraphOutput, V>(
+pub fn replay_program_graph_linearized_jit<GraphInput, GraphOutput, V>(
     graph: &Graph<ProgramOpRef<V>, V, GraphInput, GraphOutput>,
     inputs: Vec<Linearized<JitTracer<V>>>,
 ) -> Result<Vec<Linearized<JitTracer<V>>>, TraceError>
@@ -519,7 +519,7 @@ where
     Ok((primal_outputs, LinearProgram::from_program(program, zero)))
 }
 
-pub(crate) fn try_jvp_program<F, Input, Output, V>(
+pub fn try_jvp_program<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
@@ -537,7 +537,7 @@ where
 
 /// Runs JVP for already traced inputs by staging the inner function once over base values and
 /// replaying the resulting pushforward in the surrounding trace.
-pub(crate) fn try_jvp_traced<F, Input, Output, V>(
+pub fn try_jvp_traced<F, Input, Output, V>(
     function: F,
     primals: Input,
     tangents: Input,
@@ -620,7 +620,7 @@ where
     jvp_program(function, primals)
 }
 
-pub(crate) fn try_vjp<F, Input, Output, V>(
+pub fn try_vjp<F, Input, Output, V>(
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
@@ -666,7 +666,7 @@ where
 
 /// Dispatch trait used by [`grad`] so it can operate both on concrete values and on already traced values.
 #[doc(hidden)]
-pub(crate) trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>:
+pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>:
     Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
@@ -764,7 +764,7 @@ where
 
 /// Dispatch trait used by [`value_and_grad`] so it can operate both on concrete values and on already traced values.
 #[doc(hidden)]
-pub(crate) trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>:
+pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>:
     Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.

@@ -1,7 +1,7 @@
 //! Runtime sharded-array data structures for XLA execution.
 //!
-//! This module builds on the sharding metadata from [`super::sharding`] to provide runtime
-//! array types that pair global [`crate::types::ArrayType`] metadata, global shard placement
+//! This module builds on the sharding metadata from [`ryft_core::sharding`] to provide runtime
+//! array types that pair global [`ryft_core::types::ArrayType`] metadata, global shard placement
 //! metadata, and local PJRT buffers:
 //!
 //! - [`device_put`] is the higher-level `ryft` analogue of JAX's
@@ -27,12 +27,16 @@ use ryft_mlir::{Location, dialects::shardy::DetachedMeshOperation};
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput};
 
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
-use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingError};
-use crate::types::data_types::{DataType, DataTypeError};
-use crate::types::{ArrayType, Shape, Size};
+use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
+use ryft_core::sharding::{
+    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId, Sharding, ShardingDimension,
+    ShardingError,
+};
+use ryft_core::types::data_types::{DataType, DataTypeError};
+use ryft_core::types::{ArrayType, Shape, Size};
 
-use crate::sharding::{MeshDeviceId, ShardingDimension};
+use crate::mlir::ToMlir;
+use crate::pjrt::{FromPjrt, ToPjrt};
 
 /// Concrete mesh/sharding target used by the higher-level [`device_put`] API.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -721,7 +725,8 @@ fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
                     shard_index: send_plan.source_shard_index,
                     device_id: send_plan.source_device_id,
                 })?
-                .buffer.as_ref()
+                .buffer
+                .as_ref()
                 .expect("addressable shard lookups should always return a local buffer");
             send_buffers.push(source_buffer);
             destination_devices.push(cross_host_global_device_id(send_plan.destination_device_id)?);
@@ -742,7 +747,8 @@ fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
                 shard_index: local_copy_plan.source_shard_index,
                 device_id: local_copy_plan.source_device_id,
             })?
-            .buffer.as_ref()
+            .buffer
+            .as_ref()
             .expect("addressable shard lookups should always return a local buffer");
         let destination_device = addressable_device_by_id.get(&local_copy_plan.destination_device_id).ok_or(
             ArrayError::MissingClientDeviceForLocalMeshDevice {
@@ -777,8 +783,7 @@ fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
                 process_index: client_process_index,
             },
         )?;
-        let element_types =
-            receive_plans.iter().map(|_| array.element_type().to_pjrt_buffer_type()).collect::<Vec<_>>();
+        let element_types = receive_plans.iter().map(|_| array.element_type().to_pjrt()).collect::<Vec<_>>();
         let dimensions = receive_plans
             .iter()
             .map(|receive_plan| cross_host_shape(receive_plan))
@@ -1127,7 +1132,7 @@ impl<'o> Array<'o> {
                 });
             }
 
-            let actual_element_type = DataType::from_pjrt_buffer_type(buffer.element_type()?)?;
+            let actual_element_type = DataType::from_pjrt(buffer.element_type()?)?;
             if actual_element_type != array_type.data_type {
                 return Err(ArrayError::BufferElementTypeMismatch {
                     device_id,
@@ -1226,7 +1231,7 @@ impl<'o> Array<'o> {
             let shard_dimensions = shard.shape().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let addressable_buffer = client.buffer(
                 shard_bytes.as_slice(),
-                element_type.to_pjrt_buffer_type(),
+                element_type.to_pjrt(),
                 shard_dimensions.as_slice(),
                 None,
                 device.clone(),
@@ -1382,7 +1387,7 @@ impl<'o> Array<'o> {
         't: 'c,
         L: Location<'c, 't>,
     {
-        self.sharding().mesh.to_shardy(location)
+        self.sharding().mesh.to_mlir(location)
     }
 
     /// Renders the Shardy tensor sharding attribute (`#sdy.sharding<...>`) implied by this array.
@@ -1390,7 +1395,7 @@ impl<'o> Array<'o> {
     /// Uses the canonical `@mesh` symbol name.
     pub fn to_shardy_tensor_sharding_attribute(&self) -> String {
         let context = ryft_mlir::Context::new();
-        self.sharding().to_shardy(context.unknown_location()).to_string()
+        self.sharding().to_mlir(context.unknown_location()).to_string()
     }
 
     /// Converts distributed arrays to per-device execution arguments for [`ryft_pjrt::LoadedExecutable::execute`].
@@ -1792,9 +1797,11 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::sharding::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use crate::types::data_types::DataType;
-    use crate::types::{ArrayType, Shape, Size};
+    use ryft_core::sharding::{
+        DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension,
+    };
+    use ryft_core::types::data_types::DataType;
+    use ryft_core::types::{ArrayType, Shape, Size};
 
     use super::*;
 
@@ -2046,7 +2053,15 @@ mod tests {
         );
         assert_eq!(
             f32_values_from_bytes(
-                second_shard_bytes.buffer.as_ref().unwrap().copy_to_host(None).unwrap().r#await().unwrap().as_slice()
+                second_shard_bytes
+                    .buffer
+                    .as_ref()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap()
+                    .as_slice()
             ),
             vec![3.0, 4.0]
         );
@@ -2091,7 +2106,8 @@ mod tests {
                 copied_array
                     .shard_for_device(local_device_id)
                     .unwrap()
-                    .buffer.as_ref()
+                    .buffer
+                    .as_ref()
                     .unwrap()
                     .copy_to_host(None)
                     .unwrap()
@@ -2273,7 +2289,8 @@ mod tests {
                     .0
                     .shard_for_device(client_devices[1].id().unwrap())
                     .unwrap()
-                    .buffer.as_ref()
+                    .buffer
+                    .as_ref()
                     .unwrap()
                     .copy_to_host(None)
                     .unwrap()
@@ -2289,7 +2306,8 @@ mod tests {
                     .1
                     .shard_for_device(client_devices[0].id().unwrap())
                     .unwrap()
-                    .buffer.as_ref()
+                    .buffer
+                    .as_ref()
                     .unwrap()
                     .copy_to_host(None)
                     .unwrap()
@@ -2340,7 +2358,8 @@ mod tests {
                 copied_array
                     .shard_for_device(local_device_id)
                     .unwrap()
-                    .buffer.as_ref()
+                    .buffer
+                    .as_ref()
                     .unwrap()
                     .copy_to_host(None)
                     .unwrap()
@@ -2394,7 +2413,8 @@ mod tests {
                 copied_array
                     .shard_for_device(local_device_id)
                     .unwrap()
-                    .buffer.as_ref()
+                    .buffer
+                    .as_ref()
                     .unwrap()
                     .copy_to_host(None)
                     .unwrap()
@@ -2601,7 +2621,7 @@ mod tests {
     // Shard-descriptor computation tests
     // -----------------------------------------------------------------------
 
-    use crate::sharding::{MeshDeviceId, ShardingError};
+    use ryft_core::sharding::{MeshDeviceId, ShardingError};
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![

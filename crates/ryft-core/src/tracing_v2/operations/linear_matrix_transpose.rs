@@ -16,17 +16,15 @@ use crate::tracing_v2::{
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode};
 
 use super::{
-    MatrixTransposeOp, expect_input_count,
+    expect_input_count,
     matrix::{MatrixOps, MatrixValue, transpose_abstract},
 };
 
 /// Linear transpose primitive used inside matrix-valued pushforwards and pullbacks.
 #[derive(Clone, Default)]
-pub(crate) struct LinearMatrixTransposeOp;
+pub struct LinearMatrixTransposeOp;
 
 impl Debug for LinearMatrixTransposeOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,20 +83,6 @@ impl<V: MatrixValue> Op<V> for LinearMatrixTransposeOp {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = builder.add_equation(Arc::new(LinearMatrixTransposeOp), vec![output_cotangents[0]])?[0];
         Ok(vec![Some(contribution)])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ryft_mlir::ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ryft_mlir::ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        <MatrixTransposeOp as Op<V>>::lower_plain_mlir(&MatrixTransposeOp, input_values, output_types, mode, lowerer)
     }
 }
 

@@ -2,11 +2,6 @@
 
 use std::fmt::{Debug, Display};
 
-#[cfg(feature = "xla")]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(feature = "xla")]
-use ryft_mlir::{Block, Operation, Value, ValueRef};
-
 use crate::tracing_v2::{
     FloatExt, TraceError, TransformLeaf, ZeroLike,
     batch::Batch as BatchedValue,
@@ -16,10 +11,6 @@ use crate::tracing_v2::{
     ops::{BatchOp, Op},
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{
-    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
-};
 
 use super::{
     expect_batch_sizes_match, expect_input_count,
@@ -28,7 +19,7 @@ use super::{
 
 /// Primitive representing matrix multiplication.
 #[derive(Clone, Default)]
-pub(crate) struct MatMulOp;
+pub struct MatMulOp;
 
 impl Debug for MatMulOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,58 +72,6 @@ impl<V: MatrixValue> Op<V> for MatMulOp {
     {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let output_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dot_dimensions = match mode {
-            PlainMlirLoweringMode::Unpacked => lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]),
-            PlainMlirLoweringMode::Packed { .. } => match output_types[0].shape.dimensions.len() {
-                2 => lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]),
-                3 => lowerer.context.stable_hlo_dot_dimensions(&[0], &[0], &[2], &[1]),
-                _ => return Err(LoweringError::UnsupportedOp { op: <Self as Op<V>>::name(self).to_string() }),
-            },
-        };
-        let operation = lowerer.block.append_operation(stable_hlo::dot_general(
-            input_values[0],
-            input_values[1],
-            dot_dimensions,
-            Some((stable_hlo::Precision::Default, stable_hlo::Precision::Default)),
-            None,
-            output_type,
-            lowerer.location,
-        ));
-        Ok(vec![operation.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let output_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let operation = lowerer.block.append_operation(stable_hlo::dot_general(
-            input_values[0],
-            input_values[1],
-            lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]),
-            Some((stable_hlo::Precision::Default, stable_hlo::Precision::Default)),
-            None,
-            output_type,
-            lowerer.location,
-        ));
-        Ok(vec![operation.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
     }
 }
 

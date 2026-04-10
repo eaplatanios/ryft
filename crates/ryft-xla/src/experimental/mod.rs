@@ -2,8 +2,8 @@ pub mod arrays;
 #[cfg(all(feature = "benchmarking"))]
 pub mod benchmark_support;
 pub mod lowering;
+pub mod operations;
 pub mod shard_map;
-pub mod sharding;
 
 pub use arrays::{
     Array, ArrayError, ArrayShard, DevicePutLeaf, DevicePutOptions, DevicePutPlacement, DevicePutSharding,

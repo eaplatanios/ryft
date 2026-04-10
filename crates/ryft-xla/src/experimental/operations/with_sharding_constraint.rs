@@ -6,35 +6,30 @@ use std::{
     sync::Arc,
 };
 
-use ryft_mlir::dialects::shardy;
-use ryft_mlir::{Block, Operation, Value, ValueRef};
-
-use crate::sharding::Sharding;
-use crate::tracing_v2::{
+use ryft_core::sharding::Sharding;
+use ryft_core::tracing_v2::{
     FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike, forward::JvpTracer, graph::AtomId,
     jit::JitTracer, linear::LinearTerm, ops::Op, program::ProgramBuilder,
+    operations::{expect_input_count, unary_abstract},
 };
-use crate::types::ArrayType;
-use crate::xla::lowering::{LoweringError, MlirLowerableValue, ShardMapMlirLowerer};
-
-use super::{expect_input_count, unary_abstract};
+use ryft_core::types::ArrayType;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
 #[derive(Clone)]
-pub(crate) struct WithShardingConstraintOp {
+pub struct WithShardingConstraintOp {
     sharding: Sharding,
 }
 
 impl WithShardingConstraintOp {
     /// Creates one sharding-constraint op with the provided target sharding.
     #[inline]
-    pub(crate) fn new(sharding: Sharding) -> Self {
+    pub fn new(sharding: Sharding) -> Self {
         Self { sharding }
     }
 
     /// Returns the target sharding carried by this op.
     #[inline]
-    pub(crate) fn sharding(&self) -> &Sharding {
+    pub fn sharding(&self) -> &Sharding {
         &self.sharding
     }
 }
@@ -139,33 +134,18 @@ impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
         Ok(vec![Some(contribution)])
     }
 
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let operation = lowerer.block.append_operation(shardy::sharding_constraint(
-            input_values[0],
-            self.sharding().to_shardy(lowerer.location),
-            lowerer.location,
-        ));
-        Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::parameters::Placeholder;
-    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tracing_v2::ProgramBuilder;
-    use crate::types::{ArrayType, DataType, Shape, Size};
-    use crate::xla::shard_map::ShardMapTensor;
+    use ryft_core::parameters::Placeholder;
+    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use ryft_core::tracing_v2::ProgramBuilder;
+    use ryft_core::types::{ArrayType, DataType, Shape, Size};
+
+        use crate::experimental::shard_map::ShardMapTensor;
 
     use super::*;
 

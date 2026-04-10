@@ -12,11 +12,11 @@ use crate::{
 };
 
 /// Identifier for an atom within a staged graph.
-pub(crate) type AtomId = usize;
+pub type AtomId = usize;
 
 /// Origin of a staged atom.
 #[derive(Clone, Debug)]
-pub(crate) enum AtomSource {
+pub enum AtomSource {
     /// Atom introduced as a graph input.
     Input,
     /// Atom introduced as a literal constant.
@@ -27,7 +27,7 @@ pub(crate) enum AtomSource {
 
 /// Staged atom carrying abstract metadata and provenance.
 #[derive(Clone, Debug)]
-pub(crate) struct Atom<V: TraceValue> {
+pub struct Atom<V: TraceValue> {
     /// Array type used for validation and shape propagation.
     pub abstract_value: ArrayType,
     /// Example value produced while staging this atom.
@@ -38,7 +38,7 @@ pub(crate) struct Atom<V: TraceValue> {
 
 /// Single equation in a staged graph.
 #[derive(Clone, Debug)]
-pub(crate) struct Equation<O> {
+pub struct Equation<O> {
     /// Operation applied by this equation.
     pub op: O,
     /// Input atoms consumed by the equation.
@@ -49,7 +49,7 @@ pub(crate) struct Equation<O> {
 
 /// Builder for staged graphs.
 #[derive(Clone, Debug)]
-pub(crate) struct GraphBuilder<O: Clone + Op<V>, V: TraceValue> {
+pub struct GraphBuilder<O: Clone + Op<V>, V: TraceValue> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
@@ -58,20 +58,20 @@ pub(crate) struct GraphBuilder<O: Clone + Op<V>, V: TraceValue> {
 impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
     /// Creates an empty builder.
     #[inline]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { atoms: Vec::new(), input_atoms: Vec::new(), equations: Vec::new() }
     }
 
     /// Returns the number of atoms allocated so far.
     /// Returns the atom with the provided identifier.
     #[inline]
-    pub(crate) fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
+    pub fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
         self.atoms.get(id)
     }
 
     /// Adds a new input atom with the supplied abstract value.
     #[inline]
-    pub(crate) fn add_input_abstract(&mut self, abstract_value: ArrayType, example_value: V) -> AtomId {
+    pub fn add_input_abstract(&mut self, abstract_value: ArrayType, example_value: V) -> AtomId {
         let id = self.atoms.len();
         self.atoms.push(Atom { abstract_value, example_value, source: AtomSource::Input });
         self.input_atoms.push(id);
@@ -80,13 +80,13 @@ impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
 
     /// Adds a new input atom using the abstract value of `example`.
     #[inline]
-    pub(crate) fn add_input(&mut self, example: &V) -> AtomId {
+    pub fn add_input(&mut self, example: &V) -> AtomId {
         self.add_input_abstract(<V as Typed<ArrayType>>::tpe(example), example.clone())
     }
 
     /// Adds a constant atom to the graph.
     #[inline]
-    pub(crate) fn add_constant(&mut self, value: V) -> AtomId {
+    pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = self.atoms.len();
         self.atoms.push(Atom {
             abstract_value: <V as Typed<ArrayType>>::tpe(&value),
@@ -97,7 +97,7 @@ impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
     }
 
     /// Adds a staged equation, validating its inputs through abstract evaluation first.
-    pub(crate) fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError> {
+    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError> {
         let input_abstracts = inputs
             .iter()
             .map(|input| {
@@ -130,7 +130,7 @@ impl<O: Clone + Op<V>, V: TraceValue> GraphBuilder<O, V> {
     }
 
     /// Finalizes the builder into a graph with the given input/output structures.
-    pub(crate) fn build<Input, Output>(
+    pub fn build<Input, Output>(
         self,
         outputs: Vec<AtomId>,
         input_structure: Input::ParameterStructure,
@@ -159,7 +159,7 @@ impl<O: Clone + Op<V>, V: TraceValue> Default for GraphBuilder<O, V> {
 }
 
 /// Executable staged graph over an open operation set.
-pub(crate) struct Graph<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
+pub struct Graph<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
@@ -192,48 +192,48 @@ impl<
 impl<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Graph<O, V, Input, Output> {
     /// Returns the number of atoms in the graph.
     #[inline]
-    pub(crate) fn atom_count(&self) -> usize {
+    pub fn atom_count(&self) -> usize {
         self.atoms.len()
     }
 
     /// Returns the atom with the provided identifier.
     #[inline]
-    pub(crate) fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
+    pub fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
         self.atoms.get(id)
     }
 
     /// Returns the graph input atoms in parameter order.
     #[inline]
-    pub(crate) fn input_atoms(&self) -> &[AtomId] {
+    pub fn input_atoms(&self) -> &[AtomId] {
         self.input_atoms.as_slice()
     }
 
     /// Returns the equations in execution order.
     #[inline]
-    pub(crate) fn equations(&self) -> &[Equation<O>] {
+    pub fn equations(&self) -> &[Equation<O>] {
         self.equations.as_slice()
     }
 
     /// Returns the output atoms in parameter order.
     #[inline]
-    pub(crate) fn outputs(&self) -> &[AtomId] {
+    pub fn outputs(&self) -> &[AtomId] {
         self.outputs.as_slice()
     }
 
     /// Returns the expected input parameter structure.
     #[inline]
-    pub(crate) fn input_structure(&self) -> &Input::ParameterStructure {
+    pub fn input_structure(&self) -> &Input::ParameterStructure {
         &self.input_structure
     }
 
     /// Returns the output parameter structure.
     #[inline]
-    pub(crate) fn output_structure(&self) -> &Output::ParameterStructure {
+    pub fn output_structure(&self) -> &Output::ParameterStructure {
         &self.output_structure
     }
 
     /// Clones this graph while replacing only the typed input/output structures.
-    pub(crate) fn clone_with_structures<NewInput, NewOutput>(
+    pub fn clone_with_structures<NewInput, NewOutput>(
         &self,
         input_structure: NewInput::ParameterStructure,
         output_structure: NewOutput::ParameterStructure,
@@ -254,7 +254,7 @@ impl<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameter
     }
 
     /// Interprets the staged graph on concrete input values.
-    pub(crate) fn call(&self, input: Input) -> Result<Output, TraceError>
+    pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
@@ -304,7 +304,7 @@ impl<O: Clone + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameter
     }
 
     /// Eliminates dead constants and equations that do not contribute to the graph outputs.
-    pub(crate) fn simplify(&self) -> Result<Self, TraceError>
+    pub fn simplify(&self) -> Result<Self, TraceError>
     where
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,

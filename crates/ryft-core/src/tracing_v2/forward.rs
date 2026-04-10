@@ -97,7 +97,7 @@ pub type Dual<V> = JvpTracer<V, V>;
 
 /// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
 #[doc(hidden)]
-pub(crate) trait JvpInvocationLeaf<
+pub trait JvpInvocationLeaf<
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 >: Parameter + Sized

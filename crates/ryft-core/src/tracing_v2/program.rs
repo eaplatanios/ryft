@@ -12,13 +12,13 @@ use crate::{
 };
 
 /// Shared operation reference used by the canonical staged program IR.
-pub(crate) type ProgramOpRef<V> = Arc<dyn Op<V>>;
+pub type ProgramOpRef<V> = Arc<dyn Op<V>>;
 
 /// Shared builder used by the canonical staged program IR.
-pub(crate) type ProgramBuilder<V> = GraphBuilder<ProgramOpRef<V>, V>;
+pub type ProgramBuilder<V> = GraphBuilder<ProgramOpRef<V>, V>;
 
 /// Canonical staged program used by `tracing_v2`.
-pub(crate) struct Program<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
+pub struct Program<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     graph: Graph<ProgramOpRef<V>, V, Input, Output>,
     marker: PhantomData<fn(Input) -> Output>,
 }
@@ -37,19 +37,19 @@ impl<
 impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, Input, Output> {
     /// Creates a program from an existing staged graph.
     #[inline]
-    pub(crate) fn from_graph(graph: Graph<ProgramOpRef<V>, V, Input, Output>) -> Self {
+    pub fn from_graph(graph: Graph<ProgramOpRef<V>, V, Input, Output>) -> Self {
         Self { graph, marker: PhantomData }
     }
 
     /// Returns the underlying staged graph.
     #[inline]
-    pub(crate) fn graph(&self) -> &Graph<ProgramOpRef<V>, V, Input, Output> {
+    pub fn graph(&self) -> &Graph<ProgramOpRef<V>, V, Input, Output> {
         &self.graph
     }
 
     /// Replays the staged program on concrete input values.
     #[inline]
-    pub(crate) fn call(&self, input: Input) -> Result<Output, TraceError>
+    pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
@@ -58,7 +58,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     }
 
     /// Eliminates dead constants and equations that do not contribute to the program outputs.
-    pub(crate) fn simplify(&self) -> Result<Self, TraceError>
+    pub fn simplify(&self) -> Result<Self, TraceError>
     where
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,

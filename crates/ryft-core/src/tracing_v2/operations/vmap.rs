@@ -5,13 +5,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(feature = "xla")]
-use ryft_mlir::ValueRef;
-
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{
-    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
-};
 use crate::{
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, Op, TraceError, TraceValue, TransformLeaf,
@@ -23,7 +16,7 @@ use crate::{
 
 /// Erased traced `vmap` body used by the staged higher-order op.
 #[derive(Clone)]
-pub(crate) struct FlatTracedVMap<V: TraceValue> {
+pub struct FlatTracedVMap<V: TraceValue> {
     lane_count: usize,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
@@ -33,7 +26,7 @@ pub(crate) struct FlatTracedVMap<V: TraceValue> {
 impl<V: TraceValue> FlatTracedVMap<V> {
     /// Builds one erased traced `vmap` body from explicit staged parts.
     #[inline]
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         lane_count: usize,
         input_types: Vec<ArrayType>,
         output_types: Vec<ArrayType>,
@@ -44,37 +37,37 @@ impl<V: TraceValue> FlatTracedVMap<V> {
 
     /// Returns the body lane count.
     #[inline]
-    pub(crate) fn lane_count(&self) -> usize {
+    pub fn lane_count(&self) -> usize {
         self.lane_count
     }
 
     /// Returns the canonical per-lane input types.
     #[inline]
-    pub(crate) fn input_types(&self) -> &[ArrayType] {
+    pub fn input_types(&self) -> &[ArrayType] {
         self.input_types.as_slice()
     }
 
     /// Returns the canonical per-lane output types.
     #[inline]
-    pub(crate) fn output_types(&self) -> &[ArrayType] {
+    pub fn output_types(&self) -> &[ArrayType] {
         self.output_types.as_slice()
     }
 
     /// Returns the compiled flat body.
     #[inline]
-    pub(crate) fn compiled(&self) -> &CompiledFunction<V, Vec<V>, Vec<V>> {
+    pub fn compiled(&self) -> &CompiledFunction<V, Vec<V>, Vec<V>> {
         &self.compiled
     }
 
     /// Returns the flattened input count across all lanes.
     #[inline]
-    pub(crate) fn total_input_count(&self) -> usize {
+    pub fn total_input_count(&self) -> usize {
         self.lane_count * self.input_types.len()
     }
 
     /// Returns the flattened output count across all lanes.
     #[inline]
-    pub(crate) fn total_output_count(&self) -> usize {
+    pub fn total_output_count(&self) -> usize {
         self.lane_count * self.output_types.len()
     }
 
@@ -102,7 +95,7 @@ impl<V: TraceValue> FlatTracedVMap<V> {
 
 /// Higher-order `vmap` op that carries one canonical program payload and, when linear, its transpose payload too.
 #[derive(Clone)]
-pub(crate) struct VMapOp<V: TraceValue> {
+pub struct VMapOp<V: TraceValue> {
     body: FlatTracedVMap<V>,
     transpose_body: Option<FlatTracedVMap<V>>,
 }
@@ -110,25 +103,25 @@ pub(crate) struct VMapOp<V: TraceValue> {
 impl<V: TraceValue> VMapOp<V> {
     /// Builds one ordinary traced `vmap` op.
     #[inline]
-    pub(crate) fn new(body: FlatTracedVMap<V>) -> Self {
+    pub fn new(body: FlatTracedVMap<V>) -> Self {
         Self { body, transpose_body: None }
     }
 
     /// Builds one linear traced `vmap` op with an explicit transpose body.
     #[inline]
-    pub(crate) fn new_linear(body: FlatTracedVMap<V>, transpose_body: FlatTracedVMap<V>) -> Self {
+    pub fn new_linear(body: FlatTracedVMap<V>, transpose_body: FlatTracedVMap<V>) -> Self {
         Self { body, transpose_body: Some(transpose_body) }
     }
 
     /// Returns the canonical traced body.
     #[inline]
-    pub(crate) fn body(&self) -> &FlatTracedVMap<V> {
+    pub fn body(&self) -> &FlatTracedVMap<V> {
         &self.body
     }
 
     /// Returns whether the op carries a transpose body.
     #[inline]
-    pub(crate) fn has_transpose_body(&self) -> bool {
+    pub fn has_transpose_body(&self) -> bool {
         self.transpose_body.is_some()
     }
 
@@ -275,33 +268,6 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
         let contributions = builder.add_equation(Arc::new(self.transpose_op()?), output_cotangents.to_vec())?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        lowerer.lower_vmap(self, input_values)
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        lowerer.lower_vmap(self, input_values)
-    }
 }
 
 impl<V: TransformLeaf> Op<JitTracer<V>> for VMapOp<V> {
@@ -325,7 +291,7 @@ impl<V: TransformLeaf> Op<JitTracer<V>> for VMapOp<V> {
 }
 
 /// Builds one linearized staged `vmap` op from its primal body.
-pub(crate) fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<VMapOp<V>, TraceError>
+pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<VMapOp<V>, TraceError>
 where
     V: TransformLeaf,
 {

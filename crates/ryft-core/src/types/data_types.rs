@@ -4,9 +4,6 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 use thiserror::Error;
 
-#[cfg(feature = "xla")]
-use ryft_pjrt::BufferType;
-
 use crate::parameters::Parameter;
 use crate::types::Type;
 
@@ -1403,108 +1400,8 @@ impl Type for DataType {
     }
 }
 
-#[cfg(feature = "xla")]
-impl DataType {
-    /// Creates a [`DataType`] from the provided PJRT [`BufferType`]. Returns [`DataTypeError::InvalidDataType`]
-    /// when the provided [`BufferType`] is [`BufferType::Invalid``], which is a PJRT-internal sentinel value.
-    pub fn from_pjrt_buffer_type(buffer_type: BufferType) -> Result<Self, DataTypeError> {
-        buffer_type.try_into()
-    }
-
-    /// Returns the PJRT [`BufferType`] that corresponds to this [`DataType`].
-    pub fn to_pjrt_buffer_type(self) -> BufferType {
-        self.into()
-    }
-}
-
-#[cfg(feature = "xla")]
-impl TryFrom<BufferType> for DataType {
-    type Error = DataTypeError;
-
-    fn try_from(value: BufferType) -> Result<Self, Self::Error> {
-        match value {
-            BufferType::Invalid => Err(DataTypeError::InvalidDataType {
-                message: format!("invalid data type from PJRT: '{value}'"),
-                backtrace: Backtrace::capture().to_string(),
-            }),
-            BufferType::Token => Ok(Self::Token),
-            BufferType::Predicate => Ok(Self::Boolean),
-            BufferType::I1 => Ok(Self::I1),
-            BufferType::I2 => Ok(Self::I2),
-            BufferType::I4 => Ok(Self::I4),
-            BufferType::I8 => Ok(Self::I8),
-            BufferType::I16 => Ok(Self::I16),
-            BufferType::I32 => Ok(Self::I32),
-            BufferType::I64 => Ok(Self::I64),
-            BufferType::U1 => Ok(Self::U1),
-            BufferType::U2 => Ok(Self::U2),
-            BufferType::U4 => Ok(Self::U4),
-            BufferType::U8 => Ok(Self::U8),
-            BufferType::U16 => Ok(Self::U16),
-            BufferType::U32 => Ok(Self::U32),
-            BufferType::U64 => Ok(Self::U64),
-            BufferType::F4E2M1FN => Ok(Self::F4E2M1FN),
-            BufferType::F8E3M4 => Ok(Self::F8E3M4),
-            BufferType::F8E4M3 => Ok(Self::F8E4M3),
-            BufferType::F8E4M3FN => Ok(Self::F8E4M3FN),
-            BufferType::F8E4M3FNUZ => Ok(Self::F8E4M3FNUZ),
-            BufferType::F8E4M3B11FNUZ => Ok(Self::F8E4M3B11FNUZ),
-            BufferType::F8E5M2 => Ok(Self::F8E5M2),
-            BufferType::F8E5M2FNUZ => Ok(Self::F8E5M2FNUZ),
-            BufferType::F8E8M0FNU => Ok(Self::F8E8M0FNU),
-            BufferType::BF16 => Ok(Self::BF16),
-            BufferType::F16 => Ok(Self::F16),
-            BufferType::F32 => Ok(Self::F32),
-            BufferType::F64 => Ok(Self::F64),
-            BufferType::C64 => Ok(Self::C64),
-            BufferType::C128 => Ok(Self::C128),
-        }
-    }
-}
-
-#[cfg(feature = "xla")]
-impl From<DataType> for BufferType {
-    fn from(value: DataType) -> Self {
-        match value {
-            DataType::Token => Self::Token,
-            DataType::Boolean => Self::Predicate,
-            DataType::I1 => Self::I1,
-            DataType::I2 => Self::I2,
-            DataType::I4 => Self::I4,
-            DataType::I8 => Self::I8,
-            DataType::I16 => Self::I16,
-            DataType::I32 => Self::I32,
-            DataType::I64 => Self::I64,
-            DataType::U1 => Self::U1,
-            DataType::U2 => Self::U2,
-            DataType::U4 => Self::U4,
-            DataType::U8 => Self::U8,
-            DataType::U16 => Self::U16,
-            DataType::U32 => Self::U32,
-            DataType::U64 => Self::U64,
-            DataType::F4E2M1FN => Self::F4E2M1FN,
-            DataType::F8E3M4 => Self::F8E3M4,
-            DataType::F8E4M3 => Self::F8E4M3,
-            DataType::F8E4M3FN => Self::F8E4M3FN,
-            DataType::F8E4M3FNUZ => Self::F8E4M3FNUZ,
-            DataType::F8E4M3B11FNUZ => Self::F8E4M3B11FNUZ,
-            DataType::F8E5M2 => Self::F8E5M2,
-            DataType::F8E5M2FNUZ => Self::F8E5M2FNUZ,
-            DataType::F8E8M0FNU => Self::F8E8M0FNU,
-            DataType::BF16 => Self::BF16,
-            DataType::F16 => Self::F16,
-            DataType::F32 => Self::F32,
-            DataType::F64 => Self::F64,
-            DataType::C64 => Self::C64,
-            DataType::C128 => Self::C128,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "xla")]
-    use super::BufferType;
     use super::{DataType, DataTypeError};
 
     #[test]
@@ -1680,50 +1577,5 @@ mod tests {
         assert_eq!(DataType::BF16.to_string(), "bf16");
         assert_eq!(DataType::F64.to_string(), "f64");
         assert_eq!(DataType::C128.to_string(), "c128");
-    }
-
-    #[cfg(feature = "xla")]
-    #[test]
-    fn test_data_type_from_and_to_pjrt_buffer_type() {
-        assert!(matches!(
-            DataType::from_pjrt_buffer_type(BufferType::Invalid),
-            Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: 'invalid'",
-        ));
-        for &(data_type, buffer_type) in &[
-            (DataType::Token, BufferType::Token),
-            (DataType::Boolean, BufferType::Predicate),
-            (DataType::I1, BufferType::I1),
-            (DataType::I2, BufferType::I2),
-            (DataType::I4, BufferType::I4),
-            (DataType::I8, BufferType::I8),
-            (DataType::I16, BufferType::I16),
-            (DataType::I32, BufferType::I32),
-            (DataType::I64, BufferType::I64),
-            (DataType::U1, BufferType::U1),
-            (DataType::U2, BufferType::U2),
-            (DataType::U4, BufferType::U4),
-            (DataType::U8, BufferType::U8),
-            (DataType::U16, BufferType::U16),
-            (DataType::U32, BufferType::U32),
-            (DataType::U64, BufferType::U64),
-            (DataType::F4E2M1FN, BufferType::F4E2M1FN),
-            (DataType::F8E3M4, BufferType::F8E3M4),
-            (DataType::F8E4M3, BufferType::F8E4M3),
-            (DataType::F8E4M3FN, BufferType::F8E4M3FN),
-            (DataType::F8E4M3FNUZ, BufferType::F8E4M3FNUZ),
-            (DataType::F8E4M3B11FNUZ, BufferType::F8E4M3B11FNUZ),
-            (DataType::F8E5M2, BufferType::F8E5M2),
-            (DataType::F8E5M2FNUZ, BufferType::F8E5M2FNUZ),
-            (DataType::F8E8M0FNU, BufferType::F8E8M0FNU),
-            (DataType::BF16, BufferType::BF16),
-            (DataType::F16, BufferType::F16),
-            (DataType::F32, BufferType::F32),
-            (DataType::F64, BufferType::F64),
-            (DataType::C64, BufferType::C64),
-            (DataType::C128, BufferType::C128),
-        ] {
-            assert_eq!(DataType::from_pjrt_buffer_type(buffer_type), Ok(data_type));
-            assert_eq!(data_type.to_pjrt_buffer_type(), buffer_type);
-        }
     }
 }

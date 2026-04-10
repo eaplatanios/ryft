@@ -20,19 +20,6 @@ pub enum BenchmarkError {
     #[error("{0}")]
     Trace(#[from] TraceError),
 
-    /// Wrapper around XLA shard-map tracing failures while building a benchmark case.
-    #[cfg(feature = "xla")]
-    #[error("{0}")]
-    ShardMapTrace(#[from] crate::xla::ShardMapTraceError),
-
-    /// Wrapper around StableHLO/Shardy lowering failures while building a benchmark case.
-    #[cfg(feature = "xla")]
-    #[error("{message}")]
-    Lowering {
-        /// Lowering failure message.
-        message: String,
-    },
-
     /// Error returned when the requested case ID is unknown.
     #[error("unknown IR benchmark case '{case_id}'")]
     UnknownCase {
@@ -116,13 +103,6 @@ pub struct IrBenchmarkRecord {
     pub summary: IrBenchmarkSummary,
 }
 
-#[cfg(feature = "xla")]
-impl From<crate::xla::lowering::LoweringError> for BenchmarkError {
-    fn from(error: crate::xla::lowering::LoweringError) -> Self {
-        Self::Lowering { message: error.to_string() }
-    }
-}
-
 /// Internal descriptor for one benchmark case.
 #[derive(Clone, Copy)]
 pub(crate) struct BenchmarkCase {
@@ -135,10 +115,7 @@ pub(crate) struct BenchmarkCase {
 
 /// Returns the stable set of benchmark case IDs supported by the Rust-side emitter.
 pub fn benchmark_case_ids() -> Vec<&'static str> {
-    let mut cases = tracing_v2_cases();
-    #[cfg(feature = "xla")]
-    cases.extend(xla_cases());
-    cases.into_iter().map(|case| case.case_id).collect()
+    tracing_v2_cases().into_iter().map(|case| case.case_id).collect()
 }
 
 /// Emits the requested benchmark records.
@@ -149,9 +126,7 @@ pub fn benchmark_case_ids() -> Vec<&'static str> {
 ///
 ///   - `case_ids`: Optional exact case IDs to emit.
 pub fn collect_ir_benchmark_records(case_ids: &[String]) -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let mut all_cases = tracing_v2_cases();
-    #[cfg(feature = "xla")]
-    all_cases.extend(xla_cases());
+    let all_cases = tracing_v2_cases();
 
     let selected_cases = if case_ids.is_empty() {
         all_cases
@@ -305,12 +280,6 @@ pub(crate) fn tracing_v2_cases() -> Vec<BenchmarkCase> {
     super::benchmark_support::cases()
 }
 
-/// Returns the XLA benchmark cases.
-#[cfg(feature = "xla")]
-pub(crate) fn xla_cases() -> Vec<BenchmarkCase> {
-    crate::xla::benchmark_support::cases()
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -367,18 +336,6 @@ mod tests {
         assert!(case_ids.contains(&"matrix_matmul_vjp_pullback"));
         #[cfg(feature = "ndarray")]
         assert!(case_ids.contains(&"matrix_three_matmul_sine_hessian_style"));
-        #[cfg(feature = "xla")]
-        assert!(case_ids.contains(&"shard_map_basic"));
-        #[cfg(feature = "xla")]
-        assert!(case_ids.contains(&"shard_map_matmul"));
-        #[cfg(feature = "xla")]
-        assert!(case_ids.contains(&"shard_map_grad_inside"));
-        #[cfg(feature = "xla")]
-        assert!(case_ids.contains(&"grad_around_shard_map"));
-        #[cfg(feature = "xla")]
-        assert!(case_ids.contains(&"nested_shard_map"));
-        #[cfg(feature = "xla")]
-        assert!(case_ids.contains(&"shard_map_grad_vmap_composition"));
     }
 
     /// Verifies that exact case filtering emits only the requested case.

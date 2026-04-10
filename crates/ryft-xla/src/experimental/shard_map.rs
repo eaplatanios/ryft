@@ -24,7 +24,7 @@
 //! The public [`shard_map`] function accepts structured mesh-bound [`Sharding`] values.
 //!
 //! By default the public [`shard_map`] helper treats every mesh axis whose type is
-//! [`Manual`](crate::sharding::MeshAxisType::Manual) as manual for the
+//! [`Manual`](ryft_core::sharding::MeshAxisType::Manual) as manual for the
 //! `sdy.manual_computation` region. The more configurable [`shard_map_with_options`] helper can
 //! instead activate only a subset of those manual mesh axes, mirroring JAX's `axis_names`
 //! parameter.
@@ -65,14 +65,16 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use crate::tracing_v2::{
+use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use ryft_core::tracing_v2::{
     CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
-    operations::WithShardingConstraintOp,
 };
-use crate::types::{ArrayType, Shape, Size, Typed};
-use crate::xla::sharding::SHARDY_MESH_SYMBOL_NAME;
+
+use crate::experimental::operations::WithShardingConstraintOp;
+use ryft_core::types::{ArrayType, Shape, Size, Typed};
+
+use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
 use super::lowering::LoweringError;
 
@@ -309,7 +311,7 @@ impl Typed<ArrayType> for ShardMapTensor {
 
 impl TraceValue for ShardMapTensor {}
 
-impl crate::tracing_v2::TransformLeaf for ShardMapTensor {}
+impl ryft_core::tracing_v2::TransformLeaf for ShardMapTensor {}
 
 fn without_varying_manual_axes(r#type: &ArrayType) -> ArrayType {
     let mut r#type = r#type.clone();
@@ -336,7 +338,7 @@ impl Add for ShardMapTensor {
 
     fn add(self, rhs: Self) -> Self::Output {
         let output_type =
-            crate::tracing_v2::operations::binary_same_abstract("add", &[self.r#type.clone(), rhs.r#type.clone()])
+            ryft_core::tracing_v2::operations::binary_same_abstract("add", &[self.r#type.clone(), rhs.r#type.clone()])
                 .unwrap_or(self.r#type);
         Self::new(output_type)
     }
@@ -347,7 +349,7 @@ impl Mul for ShardMapTensor {
 
     fn mul(self, rhs: Self) -> Self::Output {
         let output_type =
-            crate::tracing_v2::operations::binary_same_abstract("mul", &[self.r#type.clone(), rhs.r#type.clone()])
+            ryft_core::tracing_v2::operations::binary_same_abstract("mul", &[self.r#type.clone(), rhs.r#type.clone()])
                 .unwrap_or(self.r#type);
         Self::new(output_type)
     }
@@ -385,7 +387,7 @@ impl MatrixOps for ShardMapTensor {
                 right_data_type,
                 [Size::Static(right_rows), Size::Static(right_cols)],
             ) if left_data_type == right_data_type && left_cols == right_rows => Self::new(
-                crate::tracing_v2::operations::matrix::matmul_abstract(&self.r#type, &rhs.r#type, "matmul")
+                ryft_core::tracing_v2::operations::matrix::matmul_abstract(&self.r#type, &rhs.r#type, "matmul")
                     .unwrap_or_else(|_| {
                         ArrayType::new(
                             left_data_type,
@@ -403,7 +405,7 @@ impl MatrixOps for ShardMapTensor {
     fn transpose_matrix(self) -> Self {
         match self.r#type.shape.dimensions.as_slice() {
             [_, _] => Self::new(
-                crate::tracing_v2::operations::matrix::transpose_abstract(&self.r#type, "matrix_transpose")
+                ryft_core::tracing_v2::operations::matrix::transpose_abstract(&self.r#type, "matrix_transpose")
                     .unwrap_or(self.r#type),
             ),
             _ => Self::new(self.r#type),
@@ -549,7 +551,7 @@ where
 /// function-first shape of JAX's `shard_map` while adapting it to Rust and `tracing_v2` by
 /// requiring explicit `global_input_types`.
 ///
-/// Mesh axes whose type is [`Manual`](crate::sharding::MeshAxisType::Manual) define the default
+/// Mesh axes whose type is [`Manual`](ryft_core::sharding::MeshAxisType::Manual) define the default
 /// manual axes of the computation. Structured `in_specs` and `out_specs` follow the same
 /// `Parameterized` layout as the corresponding input and output types. The body closure receives
 /// only the traced local inputs, which lets common cases compile cleanly as `|x| ...` or
@@ -591,7 +593,7 @@ where
 /// Stages a traced shard-map body with one explicit manual-axis subset and `check_vma` mode.
 ///
 /// `manual_axes` mirrors JAX's `axis_names`: when the list is empty, all mesh axes whose type is
-/// [`Manual`](crate::sharding::MeshAxisType::Manual) are active for this shard-map. `check_vma`
+/// [`Manual`](ryft_core::sharding::MeshAxisType::Manual) are active for this shard-map. `check_vma`
 /// mirrors JAX's default output-validity check for omitted manual axes.
 ///
 /// # Parameters
@@ -683,7 +685,7 @@ impl ShardMap {
     /// Creates a `ShardMap` with one explicit manual-axis selection and `check_vma` mode.
     ///
     /// When `manual_axes` is empty, every mesh axis with type
-    /// [`Manual`](crate::sharding::MeshAxisType::Manual) is treated as manual inside the body.
+    /// [`Manual`](ryft_core::sharding::MeshAxisType::Manual) is treated as manual inside the body.
     /// The constructor returns [`ShardMapError::MeshHasNoManualAxes`] if the resulting active set
     /// is empty.
     ///
@@ -972,7 +974,7 @@ where
 
 /// Erased shard-map body payload used by nested higher-order shard-map ops.
 #[derive(Clone)]
-pub(crate) struct FlatTracedShardMap {
+pub struct FlatTracedShardMap {
     pub(crate) shard_map: ShardMap,
     pub(crate) global_input_types: Vec<ArrayType>,
     pub(crate) local_input_types: Vec<ArrayType>,
@@ -1729,14 +1731,14 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+    use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
+    use ryft_core::tracing_v2::{FloatExt, OneLike, grad, vmap};
+    use ryft_core::types::data_types::DataType;
+
+    use crate::mlir::ToMlir;
+
+    use super::super::arrays::Array;
     use super::*;
-    use crate::sharding::DeviceMesh;
-    use crate::sharding::MeshDevice;
-    use crate::sharding::ShardingDimension;
-    use crate::sharding::{MeshAxis, MeshAxisType, Sharding};
-    use crate::tracing_v2::{FloatExt, OneLike, grad, vmap};
-    use crate::types::data_types::DataType;
-    use crate::xla::arrays::Array;
 
     fn test_logical_mesh_2x2() -> LogicalMesh {
         LogicalMesh::new(vec![
@@ -2983,7 +2985,7 @@ mod tests {
                 let gradient: ShardMapTracer =
                     grad(|y: ShardMapTracer| y.sin(), x.clone()).expect("gradient inside shard_map should succeed");
                 let lanes: Vec<ShardMapTracer> = vmap(
-                    |y: crate::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
+                    |y: ryft_core::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
                     vec![gradient.clone(), gradient],
                 )
                 .expect("vmap should succeed");
@@ -3283,13 +3285,13 @@ mod tests {
         assert_eq!(shard_map.local_output_shape(0, &[8]).unwrap(), vec![2]);
 
         let context = MlirContext::new();
-        let input_sharding = shard_map.in_shardings()[0].to_shardy(context.unknown_location()).to_string();
-        let output_sharding = shard_map.out_shardings()[0].to_shardy(context.unknown_location()).to_string();
+        let input_sharding = shard_map.in_shardings()[0].to_mlir(context.unknown_location()).to_string();
+        let output_sharding = shard_map.out_shardings()[0].to_mlir(context.unknown_location()).to_string();
         let manual_computation_attributes = shard_map.to_shardy_manual_computation_attributes();
         let mesh_module = context.module(context.unknown_location());
         let mesh_operation = mesh_module
             .body()
-            .append_operation(shard_map.mesh().to_shardy(context.unknown_location()))
+            .append_operation(shard_map.mesh().to_mlir(context.unknown_location()))
             .to_string();
 
         let mlir_program = format!(

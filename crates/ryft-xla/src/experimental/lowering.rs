@@ -4,19 +4,25 @@ use std::collections::HashMap;
 
 #[cfg(feature = "ndarray")]
 use ndarray::Array2;
-use ryft_mlir::dialects::{func, shardy, stable_hlo};
+use ryft_mlir::dialects::{func, shardy, stable_hlo, stable_hlo::Accuracy, stable_hlo::Precision};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef, Operation,
     Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
 };
 
-use crate::parameters::Parameterized;
-use crate::sharding::{LogicalMesh, ShardingError};
-use crate::tracing_v2::{
+use ryft_core::parameters::Parameterized;
+use ryft_core::sharding::{LogicalMesh, ShardingError};
+use ryft_core::tracing_v2::{
     AtomSource, Graph, ProgramOpRef, StagedOpRef, TraceValue,
-    operations::{FlatTracedVMap, LinearShardMapEvalMode, ShardMapOp, VMapOp, WithShardingConstraintOp},
+    operations::{
+        AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, MulOp,
+        NegOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
+    },
 };
-use crate::types::{ArrayType, DataType, Shape, Size, Typed};
+use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
+
+use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp, WithShardingConstraintOp};
+use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
 /// Error type for StableHLO/Shardy lowering.
@@ -130,7 +136,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        V: MlirLowerableValue,
+        V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -171,7 +177,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        V: MlirLowerableValue,
+        V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -252,14 +258,14 @@ where
         .iter()
         .map(|array_type| lower_tensor_type(array_type, &context, location))
         .collect::<Result<Vec<_>, _>>()?;
-    let mesh_operation = shard_map.mesh().to_shardy(location);
+    let mesh_operation = shard_map.mesh().to_mlir(location);
     module.body().append_operation(mesh_operation);
 
     let function_arguments = global_input_tensor_types
         .iter()
         .zip(shard_map.in_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy(location);
+            let sharding = sharding.to_mlir(location);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -270,7 +276,7 @@ where
         .iter()
         .zip(shard_map.out_shardings().iter())
         .map(|(tensor_type, sharding)| {
-            let sharding = sharding.to_shardy(location);
+            let sharding = sharding.to_mlir(location);
             Ok(TypeAndAttributes {
                 r#type: tensor_type.as_ref(),
                 attributes: Some(HashMap::from([("sdy.sharding".into(), sharding.as_ref())])),
@@ -340,7 +346,7 @@ where
     let module = context.module(location);
 
     if let Some(mesh) = collect_nested_sharding_mesh(graph, None)? {
-        let mesh_operation = mesh.to_shardy(location);
+        let mesh_operation = mesh.to_mlir(location);
         module.body().append_operation(mesh_operation);
     }
 
@@ -490,7 +496,7 @@ pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, S>(
     function_name: S,
 ) -> Result<String, LoweringError>
 where
-    V: MlirLowerableValue,
+    V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     S: AsRef<str>,
@@ -958,7 +964,7 @@ fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, V, L>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue,
+    V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
     L: Location<'c, 't> + Copy,
 {
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, V, L>(
@@ -1066,7 +1072,7 @@ fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, V, L>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue,
+    V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
     L: Location<'c, 't> + Copy,
 {
     let lane_count = body.lane_count();
@@ -1138,7 +1144,7 @@ fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, V, Input, Output>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue,
+    V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1429,6 +1435,297 @@ where
     Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
 
+/// Dispatches plain StableHLO lowering for one traced operation by downcasting to concrete op types.
+#[allow(dead_code)]
+fn dispatch_lower_plain_mlir<'b, 'c: 'b, 't: 'c, V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps>(
+    op: &dyn ryft_core::tracing_v2::ops::Op<V>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    mode: PlainMlirLoweringMode,
+    lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let any = op.as_any();
+
+    if any.downcast_ref::<AddOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<MulOp>().is_some() {
+        let result =
+            lowerer.block.append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<NegOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<SinOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<CosOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::cosine(input_values[0], Accuracy::Default, lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<MatrixTransposeOp>().is_some() || any.downcast_ref::<LinearMatrixTransposeOp>().is_some() {
+        let result =
+            lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<MatMulOp>().is_some() {
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            input_values[0],
+            input_values[1],
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        return Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()]);
+    }
+    if let Some(scale_op) = any.downcast_ref::<ScaleOp<V>>() {
+        let factor_value = lowerer.lower_literal_value(scale_op.factor())?;
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let factor_type = scale_op.factor().tpe();
+        let factor_broadcast = if factor_type != output_types[0] {
+            match mode {
+                PlainMlirLoweringMode::Packed { lane_count } => {
+                    lowerer.lower_packed_literal_value(scale_op.factor(), &packed_array_type(&factor_type, lane_count))?
+                }
+                PlainMlirLoweringMode::Unpacked => {
+                    let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
+                        factor_value,
+                        output_tensor_type,
+                        &[],
+                        lowerer.location,
+                    ));
+                    broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
+                }
+            }
+        } else {
+            factor_value
+        };
+        let result = lowerer
+            .block
+            .append_operation(stable_hlo::multiply(input_values[0], factor_broadcast, lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()]);
+    }
+    if let Some(left_matmul_op) = any.downcast_ref::<LeftMatMulOp<V>>() {
+        let factor_value = match mode {
+            PlainMlirLoweringMode::Packed { lane_count } => {
+                let packed_type = packed_array_type(&left_matmul_op.factor().tpe(), lane_count);
+                lowerer.lower_packed_literal_value(left_matmul_op.factor(), &packed_type)?
+            }
+            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(left_matmul_op.factor())?,
+        };
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            factor_value,
+            input_values[0],
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        return Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()]);
+    }
+    if let Some(right_matmul_op) = any.downcast_ref::<RightMatMulOp<V>>() {
+        let factor_value = match mode {
+            PlainMlirLoweringMode::Packed { lane_count } => {
+                let packed_type = packed_array_type(&right_matmul_op.factor().tpe(), lane_count);
+                lowerer.lower_packed_literal_value(right_matmul_op.factor(), &packed_type)?
+            }
+            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(right_matmul_op.factor())?,
+        };
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            input_values[0],
+            factor_value,
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        return Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()]);
+    }
+    if let Some(reshape_op) = any.downcast_ref::<ReshapeOp>() {
+        let output_shape = static_dimensions(reshape_op.output_type())?;
+        let result = lowerer
+            .block
+            .append_operation(stable_hlo::reshape(input_values[0], output_shape.as_slice(), lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()]);
+    }
+    if let Some(vmap_op) = any.downcast_ref::<VMapOp<V>>() {
+        return lowerer.lower_vmap(vmap_op, input_values);
+    }
+
+    Err(LoweringError::UnsupportedOp { op: op.name().to_string() })
+}
+
+/// Dispatches shard-map StableHLO lowering for one traced operation by downcasting to concrete op types.
+fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
+    op: &dyn ryft_core::tracing_v2::ops::Op<ShardMapTensor>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let any = op.as_any();
+
+    if let Some(shard_map_op) = any.downcast_ref::<ShardMapOp<ShardMapTensor>>() {
+        if let Some(eval_mode) = shard_map_op.eval_mode() {
+            return lowerer.lower_linear_shard_map_eval_mode(eval_mode, input_values);
+        }
+        let simplified_body = shard_map_op
+            .body()
+            .simplified()
+            .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+        return lowerer.lower_manual_computation(
+            input_values,
+            &simplified_body.shard_map,
+            simplified_body.compiled.graph(),
+            simplified_body.local_input_types.as_slice(),
+            simplified_body.global_output_types.as_slice(),
+        );
+    }
+    if let Some(sharding_constraint_op) = any.downcast_ref::<WithShardingConstraintOp>() {
+        let operation = lowerer.block.append_operation(shardy::sharding_constraint(
+            input_values[0],
+            sharding_constraint_op.sharding().to_mlir(lowerer.location),
+            lowerer.location,
+        ));
+        return Ok(vec![
+            operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()
+        ]);
+    }
+    if any.downcast_ref::<AddOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<MulOp>().is_some() {
+        let result =
+            lowerer.block.append_operation(stable_hlo::multiply(input_values[0], input_values[1], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<NegOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<SinOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<CosOp>().is_some() {
+        let result = lowerer.block.append_operation(stable_hlo::cosine(input_values[0], Accuracy::Default, lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<MatrixTransposeOp>().is_some() || any.downcast_ref::<LinearMatrixTransposeOp>().is_some() {
+        let result =
+            lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()]);
+    }
+    if any.downcast_ref::<MatMulOp>().is_some() {
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            input_values[0],
+            input_values[1],
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        return Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()]);
+    }
+    if let Some(scale_op) = any.downcast_ref::<ScaleOp<ShardMapTensor>>() {
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let factor_value = lower_constant(
+            0,
+            scale_op.factor(),
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        let factor_type = scale_op.factor().tpe();
+        let factor_broadcast = if factor_type != output_types[0] {
+            let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
+                factor_value,
+                output_tensor_type,
+                &[],
+                lowerer.location,
+            ));
+            broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
+        } else {
+            factor_value
+        };
+        let result = lowerer
+            .block
+            .append_operation(stable_hlo::multiply(input_values[0], factor_broadcast, lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()]);
+    }
+    if let Some(left_matmul_op) = any.downcast_ref::<LeftMatMulOp<ShardMapTensor>>() {
+        let factor_value = lower_constant(
+            0,
+            left_matmul_op.factor(),
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            factor_value,
+            input_values[0],
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        return Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()]);
+    }
+    if let Some(right_matmul_op) = any.downcast_ref::<RightMatMulOp<ShardMapTensor>>() {
+        let factor_value = lower_constant(
+            0,
+            right_matmul_op.factor(),
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            input_values[0],
+            factor_value,
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        return Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()]);
+    }
+    if let Some(reshape_op) = any.downcast_ref::<ReshapeOp>() {
+        let output_shape = static_dimensions(reshape_op.output_type())?;
+        let result = lowerer
+            .block
+            .append_operation(stable_hlo::reshape(input_values[0], output_shape.as_slice(), lowerer.location));
+        return Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()]);
+    }
+    if let Some(vmap_op) = any.downcast_ref::<VMapOp<ShardMapTensor>>() {
+        return lowerer.lower_vmap(vmap_op, input_values);
+    }
+
+    Err(LoweringError::UnsupportedOp { op: op.name().to_string() })
+}
+
 /// Lowers one traced equation from a plain `tracing_v2` program.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
@@ -1441,7 +1738,7 @@ fn lower_plain_equation<'b, 'c: 'b, 't: 'c, V, Input, Output>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue,
+    V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1452,9 +1749,13 @@ where
         .map(|output| graph.atom(*output).expect("equation output should exist").abstract_value.clone())
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-    equation
-        .op
-        .lower_plain_mlir(input_values, output_types.as_slice(), PlainMlirLoweringMode::Unpacked, &mut lowerer)
+    dispatch_lower_plain_mlir(
+        equation.op.as_ref(),
+        input_values,
+        output_types.as_slice(),
+        PlainMlirLoweringMode::Unpacked,
+        &mut lowerer,
+    )
 }
 
 /// Lowers one equation inside a packed `vmap` body graph.
@@ -1468,7 +1769,7 @@ fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, V>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue,
+    V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps,
 {
     let equation = &graph.equations()[equation_index];
     let output_types = equation
@@ -1479,7 +1780,8 @@ where
         })
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-    equation.op.lower_plain_mlir(
+    dispatch_lower_plain_mlir(
+        equation.op.as_ref(),
         input_values,
         output_types.as_slice(),
         PlainMlirLoweringMode::Packed { lane_count },
@@ -1507,7 +1809,7 @@ where
         .map(|output| graph.atom(*output).expect("equation output should exist").abstract_value.clone())
         .collect::<Vec<_>>();
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
-    equation.op.lower_shard_map_mlir(input_values, output_types.as_slice(), &mut lowerer)
+    dispatch_lower_shard_map_mlir(equation.op.as_ref(), input_values, output_types.as_slice(), &mut lowerer)
 }
 
 /// Normalizes a user-provided MLIR symbol name.
@@ -1737,13 +2039,12 @@ mod tests {
     #[cfg(feature = "ndarray")]
     use ndarray::{Array2, arr2};
 
-    use crate::sharding::{MeshAxis, MeshAxisType};
-    use crate::tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike};
-    use crate::types::Shape;
+    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use ryft_core::tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike};
+    use ryft_core::types::Shape;
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use super::*;
-    use crate::sharding::{LogicalMesh, Sharding, ShardingDimension};
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
         LogicalMesh::new(vec![MeshAxis::new(axis_name, axis_size, MeshAxisType::Manual).unwrap()]).unwrap()
@@ -1854,8 +2155,8 @@ mod tests {
         let right = arr2(&[[5.0f64, 6.0], [7.0, 8.0]]);
         let (_, pullback): (
             Array2<f64>,
-            crate::tracing_v2::LinearProgram<Array2<f64>, Array2<f64>, (Array2<f64>, Array2<f64>)>,
-        ) = crate::tracing_v2::vjp(bilinear_matmul, (left, right)).unwrap();
+            ryft_core::tracing_v2::LinearProgram<Array2<f64>, Array2<f64>, (Array2<f64>, Array2<f64>)>,
+        ) = ryft_core::tracing_v2::vjp(bilinear_matmul, (left, right)).unwrap();
 
         assert_eq!(
             to_mlir_module_for_plain_graph(pullback.program().graph(), "main").unwrap(),

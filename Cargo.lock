@@ -1782,8 +1782,6 @@ dependencies = [
  "paste",
  "pretty_assertions",
  "ryft-macros",
- "ryft-mlir",
- "ryft-pjrt",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1842,11 +1840,14 @@ version = "0.0.3"
 dependencies = [
  "half",
  "indoc",
+ "ndarray",
  "paste",
  "pretty_assertions",
  "ryft-core",
+ "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

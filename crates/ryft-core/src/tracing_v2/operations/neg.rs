@@ -7,11 +7,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(feature = "xla")]
-use ryft_mlir::dialects::stable_hlo;
-#[cfg(feature = "xla")]
-use ryft_mlir::{Block, Operation, Value, ValueRef};
-
 use crate::tracing_v2::{
     FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
@@ -23,16 +18,12 @@ use crate::tracing_v2::{
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{
-    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
-};
 
 use super::{expect_input_count, unary_abstract};
 
 /// Elementwise negation primitive.
 #[derive(Clone, Default)]
-pub(crate) struct NegOp;
+pub struct NegOp;
 
 impl Debug for NegOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -100,32 +91,6 @@ impl<V: TraceValue + Neg<Output = V>> Op<V> for NegOp {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = builder.add_equation(Arc::new(NegOp), vec![output_cotangents[0]])?[0];
         Ok(vec![Some(contribution)])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let operation = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.negate should return one result").as_ref()])
-    }
-
-    #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let operation = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
-        Ok(vec![operation.result(0).expect("stablehlo.negate should return one result").as_ref()])
     }
 }
 

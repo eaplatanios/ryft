@@ -44,97 +44,86 @@ fn binary_output_sharding(inputs: &[ArrayType]) -> Option<Sharding> {
 }
 
 /// Elementwise addition.
-pub(crate) mod add;
+pub mod add;
 
 /// Elementwise cosine.
-pub(crate) mod cos;
+pub mod cos;
 
 /// Linear matrix transposition.
-pub(crate) mod linear_matrix_transpose;
+pub mod linear_matrix_transpose;
 
 /// Linear left matrix multiplication.
-pub(crate) mod left_matmul;
+pub mod left_matmul;
 
 /// Matrix capability layer shared by matrix staged operations.
-pub(crate) mod matrix;
+pub mod matrix;
 
 /// Matrix multiplication.
-pub(crate) mod matmul;
+pub mod matmul;
 
 /// Matrix transposition.
-pub(crate) mod matrix_transpose;
+pub mod matrix_transpose;
 
 /// Elementwise multiplication.
-pub(crate) mod mul;
+pub mod mul;
 
 /// Elementwise negation.
-pub(crate) mod neg;
+pub mod neg;
 
 /// Reshaping primitive.
-pub(crate) mod reshape;
+pub mod reshape;
 
 /// Linear right matrix multiplication.
-pub(crate) mod right_matmul;
+pub mod right_matmul;
 
 /// Scalar and tensor scaling.
-pub(crate) mod scale;
+pub mod scale;
 
 /// Elementwise sine.
-pub(crate) mod sin;
+pub mod sin;
 
 /// Traced `vmap` operations.
-pub(crate) mod vmap;
+pub mod vmap;
 
-#[cfg(feature = "xla")]
-/// Traced XLA sharding-constraint primitive.
-pub(crate) mod with_sharding_constraint;
-
-#[cfg(feature = "xla")]
-/// Traced `shard_map` operations.
-pub(crate) mod shard_map;
-
-pub(crate) use add::AddOp;
-pub(crate) use cos::CosOp;
-pub(crate) use left_matmul::LeftMatMulOp;
-pub(crate) use linear_matrix_transpose::LinearMatrixTransposeOp;
-pub(crate) use matmul::MatMulOp;
-pub(crate) use matrix_transpose::MatrixTransposeOp;
-pub(crate) use mul::MulOp;
-pub(crate) use neg::NegOp;
-pub(crate) use right_matmul::RightMatMulOp;
-pub(crate) use scale::ScaleOp;
-#[cfg(feature = "xla")]
-pub(crate) use shard_map::{LinearShardMapEvalMode, ShardMapOp};
-pub(crate) use sin::SinOp;
-pub(crate) use vmap::{FlatTracedVMap, VMapOp};
-#[cfg(feature = "xla")]
-pub(crate) use with_sharding_constraint::WithShardingConstraintOp;
+pub use add::AddOp;
+pub use cos::CosOp;
+pub use left_matmul::LeftMatMulOp;
+pub use linear_matrix_transpose::LinearMatrixTransposeOp;
+pub use matmul::MatMulOp;
+pub use matrix_transpose::MatrixTransposeOp;
+pub use mul::MulOp;
+pub use neg::NegOp;
+pub use right_matmul::RightMatMulOp;
+pub use scale::ScaleOp;
+pub use reshape::ReshapeOp;
+pub use sin::SinOp;
+pub use vmap::{FlatTracedVMap, VMapOp};
 
 /// Returns an input-count error when one staged op receives the wrong arity.
-pub(crate) fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {
+pub fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {
     if inputs == expected { Ok(()) } else { Err(TraceError::InvalidInputCount { expected, got: inputs }) }
 }
 
 /// Returns a batch-size error when two batched inputs disagree on their lane count.
-pub(crate) fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<(), TraceError> {
+pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<(), TraceError> {
     if left.len() == right.len() { Ok(()) } else { Err(TraceError::MismatchedBatchSize) }
 }
 
 /// Lifts one concrete value into the staged graph owned by a JIT tracer.
-pub(crate) fn lift_jit_constant<V: TraceValue>(constant: &V, exemplar: &JitTracer<V>) -> JitTracer<V> {
+pub fn lift_jit_constant<V: TraceValue>(constant: &V, exemplar: &JitTracer<V>) -> JitTracer<V> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
     JitTracer::from_staged_parts(constant.clone(), atom, builder, exemplar.staging_error_handle())
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.
-pub(crate) fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TraceError> {
+pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TraceError> {
     expect_input_count(inputs.len(), 1)?;
     Ok(inputs[0].clone())
 }
 
 /// Propagates one binary input type through a shape-preserving staged op.
-pub(crate) fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Result<ArrayType, TraceError> {
+pub fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Result<ArrayType, TraceError> {
     expect_input_count(inputs.len(), 2)?;
     if inputs[0].data_type != inputs[1].data_type || inputs[0].shape != inputs[1].shape {
         Err(TraceError::IncompatibleAbstractValues { op })

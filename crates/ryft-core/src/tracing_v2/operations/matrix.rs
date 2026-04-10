@@ -161,7 +161,7 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
 }
 
 /// Computes the abstract output type of one matrix multiplication.
-pub(crate) fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
+pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
     let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
     let (rhs_data_type, rhs_rows, rhs_cols) = matrix_parts(rhs, op)?;
     if lhs_data_type != rhs_data_type || lhs_cols != rhs_rows {
@@ -172,7 +172,7 @@ pub(crate) fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str
 }
 
 /// Computes the abstract output type of one matrix transpose.
-pub(crate) fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
+pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
     let (data_type, rows, cols) = matrix_parts(input, op)?;
     let sharding = transpose_array_sharding(input);
     Ok(matrix_array_type(data_type, cols, rows, sharding))

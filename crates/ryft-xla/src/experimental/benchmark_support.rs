@@ -3,9 +3,9 @@
 //! This module owns the Rust-side benchmark cases that exercise the XLA tracing path and the
 //! higher-order `shard_map` operation.
 
-use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-use crate::tracing_v2::{
+use ryft_core::parameters::{Parameterized, ParameterizedFamily};
+use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+use ryft_core::tracing_v2::{
     FloatExt, MatrixOps, OneLike, Program,
     benchmarking::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
@@ -15,10 +15,10 @@ use crate::tracing_v2::{
     operations::{LinearShardMapEvalMode, ShardMapOp},
     vmap,
 };
-use crate::types::{ArrayType, DataType, Shape, Size};
+use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-use super::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer};
-use super::{TracedXlaProgram, shard_map, trace};
+use crate::experimental::lowering::to_mlir_module_for_graph;
+use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
 pub(crate) fn cases() -> Vec<BenchmarkCase> {
@@ -165,7 +165,7 @@ where
         case_id,
         "xla",
         "program",
-        super::lowering::to_mlir_module_for_graph(
+        to_mlir_module_for_graph(
             program.graph(),
             traced.global_input_types(),
             traced.global_output_types(),

@@ -18,38 +18,39 @@ pub(crate) mod batch;
 pub(crate) mod benchmark_support;
 #[cfg(feature = "benchmarking")]
 pub mod benchmarking;
-mod forward;
-pub(crate) mod graph;
-mod jit;
-mod linear;
-pub(crate) mod operations;
-pub(crate) mod ops;
-pub(crate) mod program;
+pub mod forward;
+pub mod graph;
+pub mod jit;
+pub mod linear;
+pub mod operations;
+pub mod ops;
+pub mod program;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod value;
 
 pub use batch::{Batch, stack, unstack, vmap};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub(crate) use graph::{AtomId, AtomSource, Graph, GraphBuilder};
-pub(crate) use jit::try_jit;
+pub use graph::{AtomId, AtomSource, Graph, GraphBuilder};
+pub use jit::try_jit;
 pub use jit::{CompiledFunction, JitTracer, jit};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, grad, hessian, jacfwd, jacrev, jvp_program, linearize,
     value_and_grad, vjp,
 };
-pub(crate) use linear::{LinearTerm, Linearized};
+pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
-pub(crate) use ops::{Op, StagedOpRef};
-pub(crate) use program::{Program, ProgramBuilder, ProgramOpRef};
+pub use ops::{Op, StagedOpRef};
+pub use program::Program;
+pub use program::{ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};
 
 /// Canonical concrete leaf types supported by the public `tracing_v2` transform entry points.
 ///
 /// This trait is intentionally not implemented for [`JitTracer`]. Higher-order transform composition should go
 /// through staged replay rather than recursively instantiating `JitTracer<JitTracer<...>>`.
-pub(crate) trait TransformLeaf: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps {}
+pub trait TransformLeaf: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps {}
 
 impl TransformLeaf for f32 {}
 

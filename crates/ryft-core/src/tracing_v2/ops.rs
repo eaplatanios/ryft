@@ -9,9 +9,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(feature = "xla")]
-use ryft_mlir::ValueRef;
-
 use crate::tracing_v2::{
     FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
@@ -22,13 +19,9 @@ use crate::tracing_v2::{
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
-#[cfg(feature = "xla")]
-use crate::xla::lowering::{
-    LoweringError, MlirLowerableValue, PlainMlirLowerer, PlainMlirLoweringMode, ShardMapMlirLowerer,
-};
 
 /// Core primitive operation interface understood by staged graphs.
-pub(crate) trait Op<V: TraceValue>: Debug + Display {
+pub trait Op<V: TraceValue>: Debug + Display {
     /// Returns this operation as [`Any`] for downcasting.
     fn as_any(&self) -> &dyn Any;
 
@@ -85,39 +78,10 @@ pub(crate) trait Op<V: TraceValue>: Debug + Display {
             message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
         })
     }
-
-    /// Lowers this op inside a plain StableHLO MLIR graph.
-    #[cfg(feature = "xla")]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        _lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        Err(LoweringError::UnsupportedOp { op: self.name().to_string() })
-    }
-
-    /// Lowers this op inside a Shardy/StableHLO MLIR graph for traced XLA programs.
-    #[cfg(feature = "xla")]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        Err(LoweringError::UnsupportedOp { op: self.name().to_string() })
-    }
 }
 
 /// Shared reference to a dynamically dispatched staged operation.
-pub(crate) type StagedOpRef<V> = Arc<dyn Op<V>>;
+pub type StagedOpRef<V> = Arc<dyn Op<V>>;
 
 /// Primitive operation with a forward-mode differentiation rule.
 pub(crate) trait JvpOp<V: TraceValue>: Op<V> {
@@ -188,35 +152,6 @@ impl<T: Op<V> + ?Sized, V: TraceValue> Op<V> for Arc<T> {
         V: FloatExt + ZeroLike + MatrixOps,
     {
         (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
-    }
-
-    #[cfg(feature = "xla")]
-    #[inline]
-    fn lower_plain_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        (**self).lower_plain_mlir(input_values, output_types, mode, lowerer)
-    }
-
-    #[cfg(feature = "xla")]
-    #[inline]
-    fn lower_shard_map_mlir<'b, 'c, 't>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        (**self).lower_shard_map_mlir(input_values, output_types, lowerer)
     }
 }
 

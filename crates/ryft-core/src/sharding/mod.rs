@@ -652,7 +652,7 @@ impl Sharding {
     }
 
     /// Returns a copy of this [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.
-    pub(crate) fn without_auto_axes(&self) -> Self {
+    pub fn without_auto_axes(&self) -> Self {
         let dimensions = self
             .dimensions
             .iter()
