@@ -8,7 +8,7 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    Eval, FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
     forward::JvpTracer, graph::AtomId, jit::JitTracer, linear::LinearTerm, ops::{DifferentiableOp, Op},
     program::ProgramBuilder, operations::{expect_input_count, unary_abstract},
 };
@@ -46,7 +46,7 @@ impl Display for WithShardingConstraintOp {
     }
 }
 
-impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
+impl Op for WithShardingConstraintOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -69,7 +69,9 @@ impl<V: TraceValue> Op<V> for WithShardingConstraintOp {
         output.sharding = Some(sharding);
         Ok(vec![output])
     }
+}
 
+impl<V: TraceValue> Eval<V> for WithShardingConstraintOp {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
@@ -179,7 +181,7 @@ mod tests {
         let op = WithShardingConstraintOp::new(sharding.clone());
 
         assert_eq!(
-            <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
+            <WithShardingConstraintOp as Op>::abstract_eval(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap()],
             ),
@@ -202,7 +204,7 @@ mod tests {
         let op = WithShardingConstraintOp::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
+            <WithShardingConstraintOp as Op>::abstract_eval(
                 &op,
                 &[
                     ArrayType::new(
@@ -253,7 +255,7 @@ mod tests {
         let op = WithShardingConstraintOp::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
+            <WithShardingConstraintOp as Op>::abstract_eval(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(input_sharding),)
                     .unwrap()],
@@ -285,7 +287,7 @@ mod tests {
         let op = WithShardingConstraintOp::new(test_sharding(&mesh));
 
         assert_eq!(
-            <WithShardingConstraintOp as Op<ShardMapTensor>>::abstract_eval(
+            <WithShardingConstraintOp as Op>::abstract_eval(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)
                     .unwrap()],

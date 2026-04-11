@@ -11,7 +11,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op},
 };
 use crate::types::ArrayType;
 
@@ -33,7 +33,7 @@ impl Display for SinOp {
     }
 }
 
-impl<V: TraceValue + FloatExt> Op<V> for SinOp {
+impl Op for SinOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -45,7 +45,9 @@ impl<V: TraceValue + FloatExt> Op<V> for SinOp {
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract(inputs)?])
     }
+}
 
+impl<V: TraceValue + FloatExt> Eval<V> for SinOp {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().sin()])

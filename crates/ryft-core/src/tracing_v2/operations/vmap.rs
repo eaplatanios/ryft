@@ -4,10 +4,10 @@ use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Op, TraceError, TraceValue,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
         TransformLeaf, ZeroLike,
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, PrimitiveOp},
+        ops::{DifferentiableOp, Eval, Op, PrimitiveOp},
         linear::{linearize_program, transpose_linear_program},
     },
     types::{ArrayType, Typed},
@@ -148,7 +148,7 @@ impl<V: TraceValue> Display for VMapOp<V> {
     }
 }
 
-impl<V: TransformLeaf> Op<V> for VMapOp<V> {
+impl<V: TraceValue> Op for VMapOp<V> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -167,10 +167,12 @@ impl<V: TransformLeaf> Op<V> for VMapOp<V> {
         }
         Ok(self.body.repeated_output_types())
     }
+}
 
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eval<V> for VMapOp<V> {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
-        let _ = <Self as Op<V>>::abstract_eval(self, abstract_inputs.as_slice())?;
+        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }
 }
@@ -191,7 +193,7 @@ impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
         }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_output_values =
-            self.eval(primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice())?;
+            <Self as Eval<V>>::eval(self, primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice())?;
         let primal_outputs =
             JitTracer::apply_staged_op(primal_inputs.as_slice(), PrimitiveOp::VMap(Box::new(self.clone())), primal_output_values)?;
         let lane_input_count = self.body().input_types().len();
@@ -225,7 +227,7 @@ impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
         }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let primal_outputs = self.eval(primal_inputs.as_slice())?;
+        let primal_outputs = <Self as Eval<V>>::eval(self, primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
             PrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
@@ -284,22 +286,10 @@ impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
     }
 }
 
-impl<V: TransformLeaf> Op<JitTracer<V>> for VMapOp<V> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "vmap"
-    }
-
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
-        <Self as Op<V>>::abstract_eval(self, inputs)
-    }
-
+impl<V: TransformLeaf> Eval<JitTracer<V>> for VMapOp<V> {
     fn eval(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let output_values = <Self as Op<V>>::eval(self, concrete_inputs.as_slice())?;
+        let output_values = <Self as Eval<V>>::eval(self, concrete_inputs.as_slice())?;
         JitTracer::apply_staged_op(inputs, PrimitiveOp::VMap(Box::new(self.clone())), output_values)
     }
 }

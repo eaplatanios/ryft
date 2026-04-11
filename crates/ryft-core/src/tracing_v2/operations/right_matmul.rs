@@ -9,7 +9,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::{ArrayType, Typed};
@@ -37,6 +37,13 @@ impl<V: MatrixValue> RightMatMulOp<V> {
     pub fn factor(&self) -> &V {
         &self.factor
     }
+
+}
+
+/// Validates abstract inputs using the factor's abstract type without needing a concrete instance.
+pub fn right_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    expect_input_count(inputs.len(), 1)?;
+    Ok(vec![matmul_abstract(&inputs[0], factor_type, "right_matmul")?])
 }
 
 impl<V: MatrixValue> Debug for RightMatMulOp<V> {
@@ -51,7 +58,7 @@ impl<V: MatrixValue> Display for RightMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue> Op<V> for RightMatMulOp<V> {
+impl<V: MatrixValue> Op for RightMatMulOp<V> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -61,10 +68,11 @@ impl<V: MatrixValue> Op<V> for RightMatMulOp<V> {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![matmul_abstract(&inputs[0], &<V as Typed<ArrayType>>::tpe(&self.factor), "right_matmul")?])
+        right_matmul_abstract_eval(&<V as Typed<ArrayType>>::tpe(&self.factor), inputs)
     }
+}
 
+impl<V: MatrixValue> Eval<V> for RightMatMulOp<V> {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().matmul(self.factor.clone())])

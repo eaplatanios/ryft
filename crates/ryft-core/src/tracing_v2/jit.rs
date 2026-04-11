@@ -264,11 +264,8 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledF
     }
 }
 
-impl<
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> Display for CompiledFunction<V, Input, Output>
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
+    for CompiledFunction<V, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)

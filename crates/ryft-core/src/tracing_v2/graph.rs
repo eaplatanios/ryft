@@ -7,7 +7,7 @@ use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{Op, TraceError, TraceValue},
+    tracing_v2::{Eval, Op, TraceError, TraceValue},
     types::{ArrayType, Typed},
 };
 
@@ -132,7 +132,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     /// output atoms are recorded as constants and no equation is added to the graph.
     pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
     where
-        O: Op<V>,
+        O: Eval<V>,
     {
         let input_abstracts = inputs
             .iter()
@@ -301,7 +301,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
     /// Interprets the staged graph on concrete input values.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
-        O: Op<V>,
+        O: Eval<V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -352,7 +352,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
     /// Eliminates dead constants and equations that do not contribute to the graph outputs.
     pub fn simplify(&self) -> Result<Self, TraceError>
     where
-        O: Op<V>,
+        O: Op,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -388,7 +388,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
             equation_by_output: &[Option<usize>],
         ) -> Result<usize, TraceError>
         where
-            O: Clone + Op<V>,
+            O: Clone + Op,
             V: TraceValue,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
@@ -420,7 +420,22 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
                             remap_atom(input, graph, builder, atom_mapping, live_equations, equation_by_output)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let remapped_outputs = builder.add_equation(equation.op.clone(), remapped_inputs)?;
+                    let input_abstracts = equation
+                        .outputs
+                        .iter()
+                        .map(|output| graph.atom(*output).expect("output atom should exist").abstract_value.clone())
+                        .collect::<Vec<_>>();
+                    let input_examples = equation
+                        .outputs
+                        .iter()
+                        .map(|output| graph.atom(*output).expect("output atom should exist").example_value.clone())
+                        .collect::<Vec<_>>();
+                    let remapped_outputs = builder.add_equation_prevalidated(
+                        equation.op.clone(),
+                        remapped_inputs,
+                        input_abstracts,
+                        input_examples,
+                    );
                     for (old_output, new_output) in
                         equation.outputs.iter().copied().zip(remapped_outputs.iter().copied())
                     {
@@ -482,7 +497,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
     }
 }
 
-impl<O: Clone + Display + Op<V>, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
+impl<O: Clone + Display, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
     for Graph<O, V, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

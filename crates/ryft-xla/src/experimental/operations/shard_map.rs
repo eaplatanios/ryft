@@ -9,7 +9,7 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, DifferentiableOp, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op,
+        AtomId, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op,
         PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
     },
     types::{ArrayType, Typed},
@@ -182,7 +182,7 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
         }
 }
 
-impl Op<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
+impl Op for ShardMapOp<ShardMapTensor> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -204,7 +204,9 @@ impl Op<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
         }
         Ok(self.output_types.clone())
     }
+}
 
+impl Eval<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn eval(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -297,7 +299,7 @@ impl DifferentiableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl Op<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
+impl Op for ShardMapOp<ShardMapTracer> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -319,7 +321,9 @@ impl Op<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
         }
         Ok(self.output_types.clone())
     }
+}
 
+impl Eval<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn eval(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;

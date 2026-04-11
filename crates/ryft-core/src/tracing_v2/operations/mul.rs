@@ -12,7 +12,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op},
 };
 use crate::types::ArrayType;
 
@@ -34,7 +34,7 @@ impl Display for MulOp {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>> Op<V> for MulOp {
+impl Op for MulOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -46,7 +46,9 @@ impl<V: TraceValue + Mul<Output = V>> Op<V> for MulOp {
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![binary_same_abstract("mul", inputs)?])
     }
+}
 
+impl<V: TraceValue + Mul<Output = V>> Eval<V> for MulOp {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() * inputs[1].clone()])

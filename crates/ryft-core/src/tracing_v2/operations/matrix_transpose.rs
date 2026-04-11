@@ -8,7 +8,7 @@ use crate::tracing_v2::{
     forward::JvpTracer,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, Op},
 };
 use crate::types::ArrayType;
 
@@ -33,7 +33,7 @@ impl Display for MatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue> Op<V> for MatrixTransposeOp {
+impl Op for MatrixTransposeOp {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -46,7 +46,9 @@ impl<V: MatrixValue> Op<V> for MatrixTransposeOp {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![transpose_abstract(&inputs[0], "matrix_transpose")?])
     }
+}
 
+impl<V: MatrixValue> Eval<V> for MatrixTransposeOp {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])

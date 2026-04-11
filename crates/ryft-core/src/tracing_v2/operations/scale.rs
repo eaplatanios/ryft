@@ -16,7 +16,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, JvpOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -41,6 +41,11 @@ impl<V: TraceValue> ScaleOp<V> {
     pub fn factor(&self) -> &V {
         &self.factor
     }
+
+    /// Validates abstract inputs without needing a concrete instance.
+    pub fn abstract_eval_static(inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        Ok(vec![unary_abstract(inputs)?])
+    }
 }
 
 impl<V: TraceValue> Debug for ScaleOp<V> {
@@ -55,7 +60,7 @@ impl<V: TraceValue> Display for ScaleOp<V> {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>> Op<V> for ScaleOp<V> {
+impl<V: TraceValue> Op for ScaleOp<V> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -65,9 +70,11 @@ impl<V: TraceValue + Mul<Output = V>> Op<V> for ScaleOp<V> {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
-        Ok(vec![unary_abstract(inputs)?])
+        Self::abstract_eval_static(inputs)
     }
+}
 
+impl<V: TraceValue + Mul<Output = V>> Eval<V> for ScaleOp<V> {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor().clone() * inputs[0].clone()])

@@ -18,9 +18,9 @@ use crate::{
         FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, Graph},
-        jit::{JitTracer, try_trace_program},
+        jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, Op, PrimitiveOp},
+        ops::{DifferentiableOp, Eval, Op, PrimitiveOp},
         program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };
@@ -209,11 +209,8 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
     }
 }
 
-impl<
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> Display for LinearProgram<V, Input, Output>
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
+    for LinearProgram<V, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
@@ -1246,6 +1243,33 @@ where
     jacfwd::<F, Input, Input, V>(gradient_function, primals)
 }
 
+// ---------------------------------------------------------------------------
+// Compiled transforms — reusable programs not specialized to a primal point
+// ---------------------------------------------------------------------------
+
+/// Compiles a reverse-mode gradient function into a reusable staged program.
+///
+/// Unlike [`grad`], which returns concrete gradient values at a single primal point, this function returns a
+/// [`CompiledFunction`] that takes primal inputs and produces gradient outputs symbolically. The compiled
+/// program embeds both the forward residual computation and the backward pass, so it can be replayed at
+/// arbitrary primal points without re-tracing.
+///
+/// This is analogous to JAX's `jit(grad(f))`.
+pub fn compile_grad<F, Input, V>(
+    function: F,
+    example_primals: Input,
+) -> Result<CompiledFunction<V, Input, Input>, TraceError>
+where
+    V: TransformLeaf,
+    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    F: Fn(Input::To<JitTracer<V>>) -> JitTracer<V>,
+{
+    let (_, compiled) = try_jit(|primals| Ok(grad(|x| function(x), primals)?), example_primals)?;
+    Ok(compiled)
+}
+
+
 #[cfg(test)]
 mod tests {
     use std::ops::{Add, Mul, Neg};
@@ -1360,5 +1384,42 @@ mod tests {
         );
         assert_eq!(pushforward.to_string(), pushforward.program().graph().to_string());
         test_support::assert_quadratic_pushforward_rendering();
+    }
+
+    #[test]
+    fn compile_grad_produces_reusable_gradient_program() {
+        let compiled = compile_grad(quadratic_plus_sin, 2.0f64).unwrap();
+
+        // d/dx(x^2 + sin(x)) = 2x + cos(x)
+
+        // Verify at the original primal point.
+        let grad_at_2 = compiled.call(2.0f64).unwrap();
+        approx_eq(grad_at_2, 2.0 * 2.0 + 2.0f64.cos());
+
+        // Verify at a DIFFERENT primal point — this is the key test.
+        let grad_at_half = compiled.call(0.5f64).unwrap();
+        approx_eq(grad_at_half, 2.0 * 0.5 + 0.5f64.cos());
+
+        let grad_at_pi = compiled.call(std::f64::consts::PI).unwrap();
+        approx_eq(grad_at_pi, 2.0 * std::f64::consts::PI + std::f64::consts::PI.cos());
+
+        // The program should contain cos (from sin's derivative), not baked constants.
+        let ir = compiled.to_string();
+        assert!(ir.contains("cos"), "compiled grad should compute cos symbolically, not bake constants");
+    }
+
+    #[test]
+    fn compile_grad_bilinear_returns_both_partial_derivatives() {
+        let compiled = compile_grad(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+
+        // df/dx = y + cos(x), df/dy = x
+        let (grad_x, grad_y) = compiled.call((2.0f64, 3.0f64)).unwrap();
+        approx_eq(grad_x, 3.0 + 2.0f64.cos());
+        approx_eq(grad_y, 2.0);
+
+        // At a different primal point:
+        let (grad_x2, grad_y2) = compiled.call((1.0f64, 5.0f64)).unwrap();
+        approx_eq(grad_x2, 5.0 + 1.0f64.cos());
+        approx_eq(grad_y2, 1.0);
     }
 }

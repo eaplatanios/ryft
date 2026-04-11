@@ -35,13 +35,13 @@ pub use graph::{AtomId, AtomSource, Graph, GraphBuilder};
 pub use jit::try_jit;
 pub use jit::{CompiledFunction, JitTracer, jit};
 pub use linear::{
-    CoordinateValue, DenseJacobian, LinearProgram, grad, hessian, jacfwd, jacrev, jvp_program, linearize,
+    CoordinateValue, DenseJacobian, LinearProgram, compile_grad, grad, hessian, jacfwd, jacrev, jvp_program, linearize,
     value_and_grad, vjp,
 };
 pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
-pub use ops::{DifferentiableOp, Op, PrimitiveOp, StagedOpRef};
+pub use ops::{CustomOp, DifferentiableOp, Eval, Op, PrimitiveOp, StagedOpRef};
 pub use program::Program;
 pub use program::{ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};

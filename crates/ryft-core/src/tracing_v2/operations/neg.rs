@@ -13,7 +13,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, JvpOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -36,7 +36,7 @@ impl Display for NegOp {
     }
 }
 
-impl<V: TraceValue + Neg<Output = V>> Op<V> for NegOp {
+impl Op for NegOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -48,7 +48,9 @@ impl<V: TraceValue + Neg<Output = V>> Op<V> for NegOp {
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract(inputs)?])
     }
+}
 
+impl<V: TraceValue + Neg<Output = V>> Eval<V> for NegOp {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![-inputs[0].clone()])

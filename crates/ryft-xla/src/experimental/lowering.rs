@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    AtomSource, Graph, PrimitiveOp, ProgramOpRef, TraceValue,
+    AtomSource, Graph, Op, PrimitiveOp, ProgramOpRef, TraceValue,
     operations::{FlatTracedVMap, VMapOp},
 };
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
@@ -156,7 +156,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 /// Implementing this trait makes an operation eligible for MLIR lowering via
 /// [`to_mlir_module_for_plain_graph`] and related entry points. The [`PrimitiveOp`] enum
 /// provides a blanket implementation covering all built-in primitives.
-pub(crate) trait XlaOp<V: TraceValue>: ryft_core::tracing_v2::ops::Op<V> {
+pub(crate) trait XlaOp<V: TraceValue>: ryft_core::tracing_v2::ops::Op {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -323,7 +323,7 @@ impl<
             }
             PrimitiveOp::VMap(vmap) => lowerer.lower_vmap(vmap.as_ref(), input_values),
             PrimitiveOp::Custom(_) => {
-                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::<V>::name(self).to_string() })
+                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
             }
         }
     }

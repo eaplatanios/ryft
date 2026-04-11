@@ -8,10 +8,7 @@ use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{
-        FloatExt, Graph, GraphBuilder, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
-        operations::reshape::ReshapeOps, ops::PrimitiveOp,
-    },
+    tracing_v2::{Eval, Graph, GraphBuilder, Op, TraceError, TraceValue, ops::PrimitiveOp},
 };
 
 /// Canonical operation type used by the staged program IR.
@@ -54,7 +51,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     #[inline]
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
-        ProgramOpRef<V>: crate::tracing_v2::Op<V>,
+        ProgramOpRef<V>: Eval<V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -64,7 +61,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     /// Eliminates dead constants and equations that do not contribute to the program outputs.
     pub fn simplify(&self) -> Result<Self, TraceError>
     where
-        ProgramOpRef<V>: crate::tracing_v2::Op<V>,
+        ProgramOpRef<V>: Op,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -72,12 +69,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     }
 }
 
-impl<
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> Display for Program<V, Input, Output>
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for Program<V, Input, Output> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.graph, formatter)
     }

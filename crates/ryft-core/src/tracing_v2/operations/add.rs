@@ -13,7 +13,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -36,7 +36,7 @@ impl Display for AddOp {
     }
 }
 
-impl<V: TraceValue + Add<Output = V>> Op<V> for AddOp {
+impl Op for AddOp {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -48,7 +48,9 @@ impl<V: TraceValue + Add<Output = V>> Op<V> for AddOp {
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![binary_same_abstract("add", inputs)?])
     }
+}
 
+impl<V: TraceValue + Add<Output = V>> Eval<V> for AddOp {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
@@ -139,7 +141,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_rejects_incompatible_inputs() {
-        let error = <AddOp as Op<f64>>::abstract_eval(
+        let error = <AddOp as Op>::abstract_eval(
             &AddOp,
             &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
         )
@@ -151,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_drops_layout_when_inputs_disagree() {
-        let output = <AddOp as Op<f64>>::abstract_eval(
+        let output = <AddOp as Op>::abstract_eval(
             &AddOp,
             &[
                 ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None)

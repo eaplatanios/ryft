@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::parameters::Parameterized;
 
-use super::{AtomSource, Graph, ProgramOpRef, TraceError, TraceValue};
+use super::{AtomSource, Graph, Op, ProgramOpRef, TraceError, TraceValue};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]

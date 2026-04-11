@@ -2,6 +2,20 @@
 //!
 //! The staged op set is intentionally open: each primitive is represented by its own concrete type implementing one
 //! or more transform-specific traits. This module keeps only the operation-neutral dispatch interfaces.
+//!
+//! # Trait hierarchy
+//!
+//! ```text
+//! Op (shape-level, NOT generic over V)
+//! ├─ Eval<V>          — concrete execution on values of type V
+//! ├─ DifferentiableOp<V> — JVP / transpose / replay rules
+//! ├─ JvpOp<V>         — eager forward-mode rule
+//! └─ BatchOp<V>       — batching rule for vmap
+//! ```
+//!
+//! [`Op`] is intentionally non-generic: `abstract_eval`, `name`, and `as_any` operate on [`ArrayType`] metadata
+//! only. This means `Graph<O: Op, V, ...>` can be constructed, displayed, and simplified for *any* value type
+//! without requiring operation-specific value bounds.
 
 use std::{
     any::Any,
@@ -18,23 +32,29 @@ use crate::tracing_v2::{
     linear::LinearTerm,
     program::ProgramBuilder,
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Typed};
 
-/// Core primitive operation interface understood by staged graphs.
+/// Shape-level operation interface for staged graphs.
 ///
-/// This trait covers the minimum surface required for JIT tracing: abstract evaluation for shape propagation and
-/// concrete evaluation for eager execution. Operations that additionally support differentiation should implement
+/// This trait covers the metadata surface needed for graph construction, display, simplification, and MLIR lowering.
+/// Concrete execution is provided by the separate [`Eval`] trait. Differentiation rules are provided by
 /// [`DifferentiableOp`].
-pub trait Op<V: TraceValue>: Debug + Display {
+pub trait Op: Debug + Display {
     /// Returns this operation as [`Any`] for downcasting.
     fn as_any(&self) -> &dyn Any;
 
     /// Returns the stable primitive name used in diagnostics and pretty-printing.
     fn name(&self) -> &'static str;
 
-    /// Computes abstract outputs from abstract inputs without executing the operation.
+    /// Computes abstract output types from abstract input types without executing the operation.
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError>;
+}
 
+/// Concrete execution capability for staged operations.
+///
+/// Separated from [`Op`] so that graph construction, display, and simplification can work without value-type bounds.
+/// Only code paths that actually execute operations (graph replay, JIT example propagation) require this trait.
+pub trait Eval<V: TraceValue>: Op {
     /// Executes the operation on concrete values.
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
 }
@@ -49,7 +69,7 @@ pub trait Op<V: TraceValue>: Debug + Display {
 /// [`apply_program_jvp_rule`]: DifferentiableOp::apply_program_jvp_rule
 /// [`transpose_program_op`]: DifferentiableOp::transpose_program_op
 /// [`replay_linearized_jit`]: DifferentiableOp::replay_linearized_jit
-pub trait DifferentiableOp<V: TraceValue>: Op<V> {
+pub trait DifferentiableOp<V: TraceValue>: Op {
     /// Replays this staged op while tracing a linearized JIT program.
     fn replay_linearized_jit(
         &self,
@@ -70,7 +90,7 @@ pub trait DifferentiableOp<V: TraceValue>: Op<V> {
         _inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
     {
         Err(TraceError::HigherOrderOpFailure {
             op: "linearize_program",
@@ -87,7 +107,7 @@ pub trait DifferentiableOp<V: TraceValue>: Op<V> {
         _output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
     {
         Err(TraceError::HigherOrderOpFailure {
             op: "transpose_linear_program",
@@ -95,6 +115,15 @@ pub trait DifferentiableOp<V: TraceValue>: Op<V> {
         })
     }
 }
+
+/// Combined trait for custom operations that support both evaluation and differentiation.
+///
+/// This is the required capability set for the [`PrimitiveOp::Custom`] escape hatch. External
+/// operations must implement [`Eval<V>`] (concrete execution), [`DifferentiableOp<V>`]
+/// (linearization/transposition rules), and [`Op`] (shape-level metadata).
+pub trait CustomOp<V: TraceValue>: Eval<V> + DifferentiableOp<V> {}
+
+impl<V: TraceValue, T: Eval<V> + DifferentiableOp<V>> CustomOp<V> for T {}
 
 /// Closed set of built-in staged operations.
 ///
@@ -137,16 +166,13 @@ pub enum PrimitiveOp<V: TraceValue> {
     RightMatMul { factor: V },
 
     /// Reshape between two statically known shapes.
-    Reshape {
-        input_type: ArrayType,
-        output_type: ArrayType,
-    },
+    Reshape { input_type: ArrayType, output_type: ArrayType },
 
     /// Higher-order `vmap` carrying a compiled per-lane body and optional transpose body.
     VMap(Box<crate::tracing_v2::operations::VMapOp<V>>),
 
     /// Escape hatch for user- or crate-defined operations outside `ryft-core`.
-    Custom(Arc<dyn DifferentiableOp<V>>),
+    Custom(Arc<dyn CustomOp<V>>),
 }
 
 /// Canonical operation type used by the staged program IR.
@@ -156,10 +182,10 @@ pub type PrimitiveOpRef<V> = PrimitiveOp<V>;
 ///
 /// NOTE: This alias is kept for backward compatibility with code that still wraps ops in `Arc`.
 /// New code should prefer [`PrimitiveOp`] directly.
-pub type StagedOpRef<V> = Arc<dyn DifferentiableOp<V>>;
+pub type StagedOpRef<V> = Arc<dyn CustomOp<V>>;
 
 /// Primitive operation with a forward-mode differentiation rule.
-pub(crate) trait JvpOp<V: TraceValue>: Op<V> {
+pub(crate) trait JvpOp<V: TraceValue>: Op {
     /// Applies the primitive's forward-mode rule to traced inputs.
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
@@ -167,12 +193,16 @@ pub(crate) trait JvpOp<V: TraceValue>: Op<V> {
 }
 
 /// Primitive operation with a batching rule used by `vmap`.
-pub(crate) trait BatchOp<V: TraceValue>: Op<V> {
+pub(crate) trait BatchOp<V: TraceValue>: Op {
     /// Applies the primitive's batching rule to batched inputs.
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
 
-impl<T: Op<V> + ?Sized, V: TraceValue> Op<V> for Arc<T> {
+// ---------------------------------------------------------------------------
+// Arc forwarding impls
+// ---------------------------------------------------------------------------
+
+impl<T: Op + ?Sized> Op for Arc<T> {
     #[inline]
     fn as_any(&self) -> &dyn Any {
         (**self).as_any()
@@ -187,7 +217,9 @@ impl<T: Op<V> + ?Sized, V: TraceValue> Op<V> for Arc<T> {
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         (**self).abstract_eval(inputs)
     }
+}
 
+impl<T: Eval<V> + ?Sized, V: TraceValue> Eval<V> for Arc<T> {
     #[inline]
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         (**self).eval(inputs)
@@ -212,7 +244,7 @@ impl<T: DifferentiableOp<V> + ?Sized, V: TraceValue> DifferentiableOp<V> for Arc
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
     {
         (**self).apply_program_jvp_rule(inputs)
     }
@@ -226,7 +258,7 @@ impl<T: DifferentiableOp<V> + ?Sized, V: TraceValue> DifferentiableOp<V> for Arc
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
     {
         (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
     }
@@ -250,13 +282,12 @@ impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
-// PrimitiveOp — Debug, Display, Op, DifferentiableOp, JvpOp, BatchOp impls
+// PrimitiveOp — Debug, Display, Op, Eval, DifferentiableOp, JvpOp, BatchOp
 // ---------------------------------------------------------------------------
 
 use crate::tracing_v2::operations::{
-    self,
     AddOp, CosOp, LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, MulOp, NegOp, ReshapeOp,
-    RightMatMulOp, ScaleOp, SinOp,
+    RightMatMulOp, ScaleOp, SinOp, left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
 };
 
 impl<V: TraceValue> Debug for PrimitiveOp<V> {
@@ -291,9 +322,13 @@ impl<V: TraceValue> Display for PrimitiveOp<V> {
     }
 }
 
-impl<V: TraceValue> PrimitiveOp<V> {
-    /// Returns the stable primitive name for this operation.
-    pub fn name(&self) -> &'static str {
+/// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: TraceValue`.
+impl<V: TraceValue> Op for PrimitiveOp<V> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
             Self::Mul => "mul",
@@ -307,142 +342,62 @@ impl<V: TraceValue> PrimitiveOp<V> {
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
-            Self::VMap(_) => "vmap",
+            Self::VMap(vmap) => vmap.name(),
             Self::Custom(op) => op.name(),
         }
-    }
-}
-
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps> Op<V>
-    for PrimitiveOp<V>
-{
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        PrimitiveOp::name(self)
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         match self {
-            Self::Add => Ok(vec![operations::binary_same_abstract("add", inputs)?]),
-            Self::Mul => Ok(vec![operations::binary_same_abstract("mul", inputs)?]),
-            Self::Neg => Ok(vec![operations::unary_abstract(inputs)?]),
-            Self::Sin => Ok(vec![operations::unary_abstract(inputs)?]),
-            Self::Cos => Ok(vec![operations::unary_abstract(inputs)?]),
-            Self::MatMul => {
-                operations::expect_input_count(inputs.len(), 2)?;
-                Ok(vec![operations::matrix::matmul_abstract(&inputs[0], &inputs[1], "matmul")?])
-            }
-            Self::MatrixTranspose => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![operations::matrix::transpose_abstract(&inputs[0], "matrix_transpose")?])
-            }
-            Self::LinearMatrixTranspose => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![operations::matrix::transpose_abstract(&inputs[0], "linear_matrix_transpose")?])
-            }
-            Self::Scale { .. } => Ok(vec![operations::unary_abstract(inputs)?]),
-            Self::LeftMatMul { factor } => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![operations::matrix::matmul_abstract(
-                    &<V as crate::types::Typed<ArrayType>>::tpe(factor),
-                    &inputs[0],
-                    "left_matmul",
-                )?])
-            }
-            Self::RightMatMul { factor } => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![operations::matrix::matmul_abstract(
-                    &inputs[0],
-                    &<V as crate::types::Typed<ArrayType>>::tpe(factor),
-                    "right_matmul",
-                )?])
-            }
+            Self::Add => AddOp.abstract_eval(inputs),
+            Self::Mul => MulOp.abstract_eval(inputs),
+            Self::Neg => NegOp.abstract_eval(inputs),
+            Self::Sin => SinOp.abstract_eval(inputs),
+            Self::Cos => CosOp.abstract_eval(inputs),
+            Self::MatMul => MatMulOp.abstract_eval(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.abstract_eval(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.abstract_eval(inputs),
+            Self::Scale { .. } => ScaleOp::<V>::abstract_eval_static(inputs),
+            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::tpe(factor), inputs),
+            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::tpe(factor), inputs),
             Self::Reshape { input_type, output_type } => {
-                <ReshapeOp as Op<V>>::abstract_eval(
-                    &ReshapeOp::new(input_type.clone(), output_type.clone()),
-                    inputs,
-                )
+                <ReshapeOp as Op>::abstract_eval(&ReshapeOp::new(input_type.clone(), output_type.clone()), inputs)
             }
-            Self::VMap(vmap) => {
-                let expected_inputs = vmap.body().repeated_input_types();
-                if inputs.len() != expected_inputs.len() {
-                    return Err(TraceError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
-                }
-                if inputs != expected_inputs.as_slice() {
-                    return Err(TraceError::IncompatibleAbstractValues { op: "vmap" });
-                }
-                Ok(vmap.body().repeated_output_types())
-            }
+            Self::VMap(vmap) => vmap.abstract_eval(inputs),
             Self::Custom(op) => op.abstract_eval(inputs),
         }
     }
+}
 
+/// [`Eval`] for [`PrimitiveOp`] requires the full value capability set.
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+    Eval<V> for PrimitiveOp<V>
+{
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         match self {
-            Self::Add => {
-                operations::expect_input_count(inputs.len(), 2)?;
-                Ok(vec![inputs[0].clone() + inputs[1].clone()])
+            Self::Add => AddOp.eval(inputs),
+            Self::Mul => MulOp.eval(inputs),
+            Self::Neg => NegOp.eval(inputs),
+            Self::Sin => SinOp.eval(inputs),
+            Self::Cos => CosOp.eval(inputs),
+            Self::MatMul => MatMulOp.eval(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.eval(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.eval(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).eval(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).eval(inputs),
+            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).eval(inputs),
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOp::new(input_type.clone(), output_type.clone()).eval(inputs)
             }
-            Self::Mul => {
-                operations::expect_input_count(inputs.len(), 2)?;
-                Ok(vec![inputs[0].clone() * inputs[1].clone()])
-            }
-            Self::Neg => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![-inputs[0].clone()])
-            }
-            Self::Sin => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![inputs[0].clone().sin()])
-            }
-            Self::Cos => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![inputs[0].clone().cos()])
-            }
-            Self::MatMul => {
-                operations::expect_input_count(inputs.len(), 2)?;
-                Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
-            }
-            Self::MatrixTranspose => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![inputs[0].clone().transpose_matrix()])
-            }
-            Self::LinearMatrixTranspose => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![inputs[0].clone().transpose_matrix()])
-            }
-            Self::Scale { factor } => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![factor.clone() * inputs[0].clone()])
-            }
-            Self::LeftMatMul { factor } => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![factor.clone().matmul(inputs[0].clone())])
-            }
-            Self::RightMatMul { factor } => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![inputs[0].clone().matmul(factor.clone())])
-            }
-            Self::Reshape { input_type: _, output_type } => {
-                operations::expect_input_count(inputs.len(), 1)?;
-                Ok(vec![inputs[0].clone().reshape(output_type.shape.clone())?])
-            }
-            Self::VMap(vmap) => vmap.body().eval_lanes(inputs),
+            Self::VMap(vmap) => vmap.eval(inputs),
             Self::Custom(op) => op.eval(inputs),
         }
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     DifferentiableOp<V> for PrimitiveOp<V>
 {
-    // NOTE: The VMap arms in the methods below delegate to `VMapOp<V>: DifferentiableOp<V>` which requires
-    // `V: TransformLeaf`. This is fine because vmap ops are only ever staged for leaf value types. When the
-    // dispatch is used with non-leaf types (e.g. `JitTracer<V>`) the VMap arm is unreachable and the error
-    // fallback fires safely.
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -475,7 +430,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::res
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
     where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
     {
         match self {
             Self::Add => AddOp.apply_program_jvp_rule(inputs),
@@ -492,9 +447,9 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::res
             Self::Reshape { input_type, output_type } => {
                 ReshapeOp::new(input_type.clone(), output_type.clone()).apply_program_jvp_rule(inputs)
             }
-            Self::VMap(_) => Err(TraceError::HigherOrderOpFailure {
+            Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
                 op: "linearize_program",
-                message: "vmap JVP rule requires TransformLeaf values; use the replay path instead".to_string(),
+                message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
             Self::Custom(op) => op.apply_program_jvp_rule(inputs),
         }
@@ -508,7 +463,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::res
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError>
     where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
     {
         match self {
             Self::Add => AddOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
@@ -543,10 +498,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::res
     }
 }
 
-impl<V: TraceValue> JvpOp<V> for PrimitiveOp<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> JvpOp<V> for PrimitiveOp<V> {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,
@@ -557,8 +509,6 @@ where
             Self::Neg => NegOp.jvp(inputs),
             Self::Sin => SinOp.jvp(inputs),
             Self::Cos => CosOp.jvp(inputs),
-            // MatMul and MatrixTranspose JVP rules are handled through `MatrixOps for JvpTracer<V, T>` in
-            // `operations::matrix` and are never dispatched through the `JvpOp` trait on `PrimitiveOp`.
             _ => Err(TraceError::HigherOrderOpFailure {
                 op: "jvp",
                 message: format!("eager JVP rule for staged op '{}' is not implemented", self.name()),
@@ -567,10 +517,7 @@ where
     }
 }
 
-impl<V: TraceValue> BatchOp<V> for PrimitiveOp<V>
-where
-    V: TransformLeaf,
-{
+impl<V: TransformLeaf> BatchOp<V> for PrimitiveOp<V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         match self {
             Self::Add => AddOp.batch(inputs),
