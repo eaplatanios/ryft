@@ -23,7 +23,7 @@ use crate::{
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         operations::rematerialize::{FlatTracedRematerialize, RematerializeOp},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
+        ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
         program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };
@@ -523,7 +523,7 @@ where
     V: TraceValue + FloatExt + ZeroLike + OneLike + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + MatrixOps + ReshapeOps,
 {
     replay_program_graph_with(graph, inputs, lift_linearized_traced_constant, |op, values| {
-        Eval::<Linearized<JitTracer<V>>>::eval(op, &values)
+        InterpretableOp::<Linearized<JitTracer<V>>>::interpret(op, &values)
     })
 }
 
@@ -1728,7 +1728,7 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
                     .map(|atom| atom.example_value.clone())
             })
             .collect::<Result<_, _>>()?;
-        let example_outputs = remat_op.eval(example_inputs.as_slice())?;
+        let example_outputs = remat_op.interpret(example_inputs.as_slice())?;
 
         // Add the RematerializeOp equation to the outer builder.
         let outer_inputs: Vec<AtomId> = boundary_input_atoms
@@ -1808,7 +1808,7 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + ZeroLike + OneLike +
                 .map(|atom| atom.example_value.clone())
         })
         .collect::<Result<_, _>>()?;
-    let example_outputs = remat_op.eval(example_inputs.as_slice())?;
+    let example_outputs = remat_op.interpret(example_inputs.as_slice())?;
 
     let mut outer_builder: ProgramBuilder<V> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> = graph

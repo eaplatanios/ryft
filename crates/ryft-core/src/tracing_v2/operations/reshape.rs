@@ -21,7 +21,7 @@ use crate::{
         graph::AtomId,
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
+        ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
         program::ProgramBuilder,
     },
     types::{ArrayType, Shape, Size, Typed},
@@ -380,8 +380,8 @@ impl Op for ReshapeOp {
     }
 }
 
-impl<V: ReshapeValue> Eval<V> for ReshapeOp {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl<V: ReshapeValue> InterpretableOp<V> for ReshapeOp {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }

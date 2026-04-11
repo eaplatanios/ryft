@@ -11,7 +11,7 @@ use crate::tracing_v2::{
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
+    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -48,8 +48,8 @@ impl Op for AddOp {
     }
 }
 
-impl<V: TraceValue + Add<Output = V>> Eval<V> for AddOp {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl<V: TraceValue + Add<Output = V>> InterpretableOp<V> for AddOp {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }

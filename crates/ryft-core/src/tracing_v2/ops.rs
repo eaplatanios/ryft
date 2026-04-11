@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! Op (shape-level, NOT generic over V)
-//! ├─ Eval<V>               — concrete execution on values of type V
+//! ├─ InterpretableOp<V>               — concrete execution on values of type V
 //! ├─ LinearOp<V>           — transpose rule for linear programs
 //! ├─ DifferentiableOp<V, T> — forward-mode JVP rule, generic over tangent type T
 //! └─ BatchOp<V>            — batching rule for vmap
@@ -25,15 +25,15 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, batch::Batch, forward::JvpTracer, graph::AtomId,
-    jit::JitTracer, linear::LinearTerm, program::ProgramBuilder,
+    FloatExt, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, batch::Batch, forward::JvpTracer,
+    graph::AtomId, jit::JitTracer, linear::LinearTerm, program::ProgramBuilder,
 };
 use crate::types::{ArrayType, Typed};
 
 /// Shape-level operation interface for staged graphs.
 ///
 /// This trait covers the metadata surface needed for graph construction, display, simplification, and MLIR lowering.
-/// Concrete execution is provided by the separate [`Eval`] trait. Staged-program differentiation rules are split
+/// Concrete execution is provided by the separate [`InterpretableOp`] trait. Staged-program differentiation rules are split
 /// between [`LinearOp`] (transpose/replay) and [`DifferentiableOp`] (forward-mode JVP).
 pub trait Op: Debug + Display {
     /// Returns this operation as [`Any`] for downcasting.
@@ -50,9 +50,9 @@ pub trait Op: Debug + Display {
 ///
 /// Separated from [`Op`] so that graph construction, display, and simplification can work without value-type bounds.
 /// Only code paths that actually execute operations (graph replay, JIT example propagation) require this trait.
-pub trait Eval<V: TraceValue>: Op {
+pub trait InterpretableOp<V: TraceValue>: Op {
     /// Executes the operation on concrete values.
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
 }
 
 /// Operations that can appear in tangent/cotangent programs and support reverse-mode transposition.
@@ -89,22 +89,16 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
 ///
 /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
 pub trait CustomOp<V: TraceValue>:
-    Eval<V>
-    + LinearOp<V>
-    + DifferentiableOp<V, LinearTerm<V>>
-    + Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
+    InterpretableOp<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> + InterpretableOp<Linearized<JitTracer<V>>>
 where
-    crate::tracing_v2::linear::Linearized<JitTracer<V>>: TraceValue,
+    Linearized<JitTracer<V>>: TraceValue,
 {
 }
 
-impl<V: TraceValue, T> CustomOp<V> for T
+impl<V: TraceValue, T: InterpretableOp<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> + InterpretableOp<Linearized<JitTracer<V>>>>
+    CustomOp<V> for T
 where
-    T: Eval<V>
-        + LinearOp<V>
-        + DifferentiableOp<V, LinearTerm<V>>
-        + Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>>,
-    crate::tracing_v2::linear::Linearized<JitTracer<V>>: TraceValue,
+    Linearized<JitTracer<V>>: TraceValue,
 {
 }
 
@@ -191,10 +185,10 @@ impl<T: Op + ?Sized> Op for Arc<T> {
     }
 }
 
-impl<T: Eval<V> + ?Sized, V: TraceValue> Eval<V> for Arc<T> {
+impl<T: InterpretableOp<V> + ?Sized, V: TraceValue> InterpretableOp<V> for Arc<T> {
     #[inline]
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
-        (**self).eval(inputs)
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        (**self).interpret(inputs)
     }
 }
 
@@ -226,7 +220,7 @@ impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
-// PrimitiveOp — Debug, Display, Op, Eval, LinearOp, DifferentiableOp, BatchOp
+// PrimitiveOp — Debug, Display, Op, InterpretableOp, LinearOp, DifferentiableOp, BatchOp
 // ---------------------------------------------------------------------------
 
 use crate::tracing_v2::operations::{
@@ -316,29 +310,29 @@ impl<V: TraceValue> Op for PrimitiveOp<V> {
     }
 }
 
-/// [`Eval`] for [`PrimitiveOp`] requires the full value capability set.
+/// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
-    Eval<V> for PrimitiveOp<V>
+    InterpretableOp<V> for PrimitiveOp<V>
 {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         match self {
-            Self::Add => AddOp.eval(inputs),
-            Self::Mul => MulOp.eval(inputs),
-            Self::Neg => NegOp.eval(inputs),
-            Self::Sin => SinOp.eval(inputs),
-            Self::Cos => CosOp.eval(inputs),
-            Self::MatMul => MatMulOp.eval(inputs),
-            Self::MatrixTranspose => MatrixTransposeOp.eval(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.eval(inputs),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).eval(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).eval(inputs),
-            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).eval(inputs),
+            Self::Add => AddOp.interpret(inputs),
+            Self::Mul => MulOp.interpret(inputs),
+            Self::Neg => NegOp.interpret(inputs),
+            Self::Sin => SinOp.interpret(inputs),
+            Self::Cos => CosOp.interpret(inputs),
+            Self::MatMul => MatMulOp.interpret(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.interpret(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.interpret(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).interpret(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).interpret(inputs),
+            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).interpret(inputs),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOp::new(input_type.clone(), output_type.clone()).eval(inputs)
+                ReshapeOp::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::VMap(vmap) => vmap.eval(inputs),
-            Self::Rematerialize(remat) => remat.eval(inputs),
-            Self::Custom(op) => Eval::<V>::eval(op.as_ref(), inputs),
+            Self::VMap(vmap) => vmap.interpret(inputs),
+            Self::Rematerialize(remat) => remat.interpret(inputs),
+            Self::Custom(op) => InterpretableOp::<V>::interpret(op.as_ref(), inputs),
         }
     }
 }
@@ -360,9 +354,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
             Self::Sin => SinOp.transpose(builder, inputs, outputs, output_cotangents),
             Self::Cos => CosOp.transpose(builder, inputs, outputs, output_cotangents),
             Self::MatMul => MatMulOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::MatrixTranspose => {
-                MatrixTransposeOp.transpose(builder, inputs, outputs, output_cotangents)
-            }
+            Self::MatrixTranspose => MatrixTransposeOp.transpose(builder, inputs, outputs, output_cotangents),
             Self::LinearMatrixTranspose => {
                 LinearMatrixTransposeOp.transpose(builder, inputs, outputs, output_cotangents)
             }
@@ -389,12 +381,12 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 
 /// Linearized JIT replay: evaluates staged operations on [`Linearized<JitTracer<V>>`] values.
 ///
-/// For pure (non-capturing) ops, this is covered by their generic [`Eval<V>`] implementations
+/// For pure (non-capturing) ops, this is covered by their generic [`InterpretableOp<V>`] implementations
 /// because [`JvpTracer`] already implements all necessary arithmetic, matrix, and reshape traits.
 /// Capturing ops ([`ScaleOp`], [`LeftMatMulOp`], [`RightMatMulOp`]) and higher-order ops
 /// ([`VMapOp`](crate::tracing_v2::operations::VMapOp),
 /// [`RematerializeOp`](crate::tracing_v2::operations::RematerializeOp)) provide dedicated
-/// [`Eval`] implementations that lift captured constants into the JIT trace.
+/// [`InterpretableOp`] implementations that lift captured constants into the JIT trace.
 ///
 /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
 /// [`ScaleOp`]: crate::tracing_v2::operations::ScaleOp
@@ -410,32 +402,30 @@ impl<
         + Neg<Output = V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
-> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for PrimitiveOp<V>
+> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for PrimitiveOp<V>
 {
-    fn eval(
+    fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
         match self {
-            Self::Add => AddOp.eval(inputs),
-            Self::Mul => MulOp.eval(inputs),
-            Self::Neg => NegOp.eval(inputs),
-            Self::Sin => SinOp.eval(inputs),
-            Self::Cos => CosOp.eval(inputs),
-            Self::MatMul => MatMulOp.eval(inputs),
-            Self::MatrixTranspose => MatrixTransposeOp.eval(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.eval(inputs),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).eval(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).eval(inputs),
-            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).eval(inputs),
+            Self::Add => AddOp.interpret(inputs),
+            Self::Mul => MulOp.interpret(inputs),
+            Self::Neg => NegOp.interpret(inputs),
+            Self::Sin => SinOp.interpret(inputs),
+            Self::Cos => CosOp.interpret(inputs),
+            Self::MatMul => MatMulOp.interpret(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.interpret(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.interpret(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).interpret(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).interpret(inputs),
+            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).interpret(inputs),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOp::new(input_type.clone(), output_type.clone()).eval(inputs)
+                ReshapeOp::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::VMap(vmap) => vmap.eval(inputs),
-            Self::Rematerialize(remat) => remat.eval(inputs),
-            Self::Custom(op) => {
-                Eval::<crate::tracing_v2::linear::Linearized<JitTracer<V>>>::eval(op.as_ref(), inputs)
-            }
+            Self::VMap(vmap) => vmap.interpret(inputs),
+            Self::Rematerialize(remat) => remat.interpret(inputs),
+            Self::Custom(op) => InterpretableOp::<crate::tracing_v2::linear::Linearized<JitTracer<V>>>::interpret(op.as_ref(), inputs),
         }
     }
 }

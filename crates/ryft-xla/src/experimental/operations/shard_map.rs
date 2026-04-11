@@ -9,7 +9,7 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
+        AtomId, DifferentiableOp, InterpretableOp, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
         MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
     },
     types::{ArrayType, Typed},
@@ -206,8 +206,8 @@ impl Op for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl Eval<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
-    fn eval(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+impl InterpretableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
+    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         Ok(self.output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>())
@@ -246,14 +246,14 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl Eval<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
-    fn eval(
+impl InterpretableOp<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
+    fn interpret(
         &self,
         inputs: &[Linearized<ShardMapTracer>],
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let primal_output_values = Eval::eval(self, primal_values.as_slice())?;
+        let primal_output_values = InterpretableOp::interpret(self, primal_values.as_slice())?;
         let primal_outputs = JitTracer::apply_staged_op(
             primal_inputs.as_slice(),
             PrimitiveOp::Custom(std::sync::Arc::new(self.clone())),
@@ -316,8 +316,8 @@ impl Op for ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl Eval<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
-    fn eval(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
+impl InterpretableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
+    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         match &self.linear_state {
@@ -391,8 +391,8 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for ShardMapOp
     }
 }
 
-impl Eval<Linearized<JitTracer<ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
-    fn eval(
+impl InterpretableOp<Linearized<JitTracer<ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
+    fn interpret(
         &self,
         _inputs: &[Linearized<JitTracer<ShardMapTracer>>],
     ) -> Result<Vec<Linearized<JitTracer<ShardMapTracer>>>, TraceError> {
@@ -830,7 +830,7 @@ fn apply_staged_shard_map_jvp_rule(
     inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
 ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
     let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-    let primal_outputs = Eval::eval(op, primal_inputs.as_slice())?;
+    let primal_outputs = InterpretableOp::interpret(op, primal_inputs.as_slice())?;
     let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
     let tangent_outputs = LinearTerm::apply_staged_op(
         tangent_inputs.as_slice(),

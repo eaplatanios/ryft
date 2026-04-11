@@ -8,7 +8,7 @@ use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{Eval, Graph, GraphBuilder, Op, TraceError, TraceValue, ops::PrimitiveOp},
+    tracing_v2::{InterpretableOp, Graph, GraphBuilder, Op, TraceError, TraceValue, ops::PrimitiveOp},
 };
 
 /// Canonical operation type used by the staged program IR.
@@ -51,7 +51,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Program<V
     #[inline]
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
-        ProgramOpRef<V>: Eval<V>,
+        ProgramOpRef<V>: InterpretableOp<V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {

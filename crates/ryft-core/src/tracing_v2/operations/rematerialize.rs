@@ -16,7 +16,7 @@ use crate::{
         jit::try_trace_program,
         linear::{linearize_program, replay_program_graph_linearized_jit, transpose_linear_program},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
+        ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
     },
     types::{ArrayType, Typed},
 };
@@ -145,8 +145,8 @@ impl<V: TraceValue> Op for RematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eval<V> for RematerializeOp<V> {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for RematerializeOp<V> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.compiled.call(inputs.to_vec())
@@ -186,9 +186,9 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
-    Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RematerializeOp<V>
+    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RematerializeOp<V>
 {
-    fn eval(
+    fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
@@ -202,7 +202,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
         // forward equations symbolically in the primal JIT builder and produces tangent atoms that
         // reference those symbolic forward values rather than baked constants.
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_output_values = <Self as Eval<V>>::eval(
+        let primal_output_values = <Self as InterpretableOp<V>>::interpret(
             self,
             primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice(),
         )?;
@@ -245,7 +245,7 @@ impl<
         }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let primal_outputs = <Self as Eval<V>>::eval(self, primal_inputs.as_slice())?;
+        let primal_outputs = <Self as InterpretableOp<V>>::interpret(self, primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
             PrimitiveOp::Rematerialize(Box::new(make_linear_rematerialize(&self.body)?)),
@@ -259,10 +259,10 @@ impl<
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eval<JitTracer<V>> for RematerializeOp<V> {
-    fn eval(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for RematerializeOp<V> {
+    fn interpret(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let output_values = <Self as Eval<V>>::eval(self, concrete_inputs.as_slice())?;
+        let output_values = <Self as InterpretableOp<V>>::interpret(self, concrete_inputs.as_slice())?;
         JitTracer::apply_staged_op(inputs, PrimitiveOp::Rematerialize(Box::new(self.clone())), output_values)
     }
 }

@@ -15,7 +15,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
     jit::JitTracer,
-    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -73,8 +73,8 @@ impl<V: TraceValue> Op for ScaleOp<V> {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>> Eval<V> for ScaleOp<V> {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl<V: TraceValue + Mul<Output = V>> InterpretableOp<V> for ScaleOp<V> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
@@ -112,9 +112,9 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
 }
 
 impl<V: TraceValue + ZeroLike + Mul<Output = V>>
-    Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for ScaleOp<V>
+    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for ScaleOp<V>
 {
-    fn eval(
+    fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {

@@ -7,7 +7,7 @@ use crate::tracing_v2::{
     batch::Batch as BatchedValue,
     forward::JvpTracer,
     graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
+    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -48,8 +48,8 @@ impl Op for MatMulOp {
     }
 }
 
-impl<V: MatrixValue> Eval<V> for MatMulOp {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl<V: MatrixValue> InterpretableOp<V> for MatMulOp {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }

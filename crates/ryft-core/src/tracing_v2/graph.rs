@@ -7,7 +7,7 @@ use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{Eval, Op, TraceError, TraceValue, ops::PrimitiveOp},
+    tracing_v2::{InterpretableOp, Op, TraceError, TraceValue, ops::PrimitiveOp},
     types::{ArrayType, Typed},
 };
 
@@ -128,7 +128,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     /// Adds a staged equation using pre-computed output values, performing abstract-eval validation,
     /// algebraic identity elimination, and constant folding.
     ///
-    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`Eval::eval`] —
+    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`InterpretableOp::eval`] —
     /// the caller supplies the concrete output values directly. Use this when the caller has already
     /// computed the outputs (e.g., inside [`JitTracer`](crate::tracing_v2::JitTracer) staging
     /// methods).
@@ -184,7 +184,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     /// output atoms are recorded as constants and no equation is added to the graph.
     pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
     where
-        O: Eval<V>,
+        O: InterpretableOp<V>,
     {
         let input_examples = inputs
             .iter()
@@ -194,7 +194,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
                     .ok_or(TraceError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output_values = op.eval(input_examples.as_slice())?;
+        let output_values = op.interpret(input_examples.as_slice())?;
         self.add_equation_with_output_values(op, inputs, output_values)
     }
 
@@ -438,7 +438,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
     /// Interprets the staged graph on concrete input values.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
-        O: Eval<V>,
+        O: InterpretableOp<V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -468,7 +468,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
                 .iter()
                 .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
                 .collect::<Result<Vec<_>, _>>()?;
-            let outputs = equation.op.eval(inputs.as_slice())?;
+            let outputs = equation.op.interpret(inputs.as_slice())?;
             if outputs.len() != equation.outputs.len() {
                 return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: outputs.len() });
             }

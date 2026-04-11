@@ -8,7 +8,7 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    Eval, PrimitiveOp, TraceError,
+    InterpretableOp, PrimitiveOp, TraceError,
     forward::JvpTracer,
     graph::AtomId,
     jit::JitTracer,
@@ -78,8 +78,8 @@ impl Op for WithShardingConstraintOp {
     }
 }
 
-impl Eval<ShardMapTensor> for WithShardingConstraintOp {
-    fn eval(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+impl InterpretableOp<ShardMapTensor> for WithShardingConstraintOp {
+    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
@@ -122,8 +122,8 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for WithShardi
     }
 }
 
-impl Eval<Linearized<ShardMapTracer>> for WithShardingConstraintOp {
-    fn eval(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+impl InterpretableOp<Linearized<ShardMapTracer>> for WithShardingConstraintOp {
+    fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
         let primal = JitTracer::apply_staged_op(
@@ -146,8 +146,8 @@ impl Eval<Linearized<ShardMapTracer>> for WithShardingConstraintOp {
     }
 }
 
-impl Eval<ShardMapTracer> for WithShardingConstraintOp {
-    fn eval(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
+impl InterpretableOp<ShardMapTracer> for WithShardingConstraintOp {
+    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
@@ -190,8 +190,8 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for WithShardi
     }
 }
 
-impl Eval<Linearized<JitTracer<ShardMapTracer>>> for WithShardingConstraintOp {
-    fn eval(
+impl InterpretableOp<Linearized<JitTracer<ShardMapTracer>>> for WithShardingConstraintOp {
+    fn interpret(
         &self,
         _inputs: &[Linearized<JitTracer<ShardMapTracer>>],
     ) -> Result<Vec<Linearized<JitTracer<ShardMapTracer>>>, TraceError> {

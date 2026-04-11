@@ -7,7 +7,7 @@ use crate::tracing_v2::{
     batch::Batch as BatchedValue,
     forward::JvpTracer,
     graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -48,8 +48,8 @@ impl Op for LinearMatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue> Eval<V> for LinearMatrixTransposeOp {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl<V: MatrixValue> InterpretableOp<V> for LinearMatrixTransposeOp {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }

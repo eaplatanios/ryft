@@ -9,7 +9,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::{ArrayType, Typed};
@@ -71,8 +71,8 @@ impl<V: MatrixValue> Op for LeftMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue> Eval<V> for LeftMatMulOp<V> {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl<V: MatrixValue> InterpretableOp<V> for LeftMatMulOp<V> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor.clone().matmul(inputs[0].clone())])
     }
@@ -100,9 +100,9 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps>
-    Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for LeftMatMulOp<V>
+    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for LeftMatMulOp<V>
 {
-    fn eval(
+    fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
