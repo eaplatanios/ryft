@@ -7,7 +7,7 @@ use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{Eval, Op, TraceError, TraceValue},
+    tracing_v2::{Eval, Op, TraceError, TraceValue, ops::PrimitiveOp},
     types::{ArrayType, Typed},
 };
 
@@ -153,6 +153,11 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         let output_examples = op.eval(input_examples.as_slice())?;
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
+        // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
+        if let Some(simplified) = try_identity_elimination(self, &op, &inputs) {
+            return Ok(simplified);
+        }
+
         let all_constant = inputs
             .iter()
             .all(|input| self.atom(*input).map_or(false, |atom| matches!(atom.source, AtomSource::Constant)));
@@ -173,6 +178,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         }
         Ok(outputs)
     }
+
 
     /// Finalizes the builder into a graph with the given input/output structures.
     pub fn build<Input, Output>(
@@ -200,6 +206,113 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
 impl<O: Clone, V: TraceValue> Default for GraphBuilder<O, V> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Algebraic identity elimination helpers
+// ---------------------------------------------------------------------------
+
+/// Checks if a value is a constant zero, using `Any` downcasting for supported types.
+fn is_identity_zero<V: TraceValue>(value: &V) -> bool {
+    let any = value as &dyn std::any::Any;
+    if let Some(v) = any.downcast_ref::<f32>() {
+        return *v == 0.0;
+    }
+    if let Some(v) = any.downcast_ref::<f64>() {
+        return *v == 0.0;
+    }
+    #[cfg(any(feature = "ndarray", test))]
+    {
+        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f32>>() {
+            return arr.iter().all(|&x| x == 0.0);
+        }
+        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f64>>() {
+            return arr.iter().all(|&x| x == 0.0);
+        }
+    }
+    false
+}
+
+/// Checks if a value is a constant one, using `Any` downcasting for supported types.
+fn is_identity_one<V: TraceValue>(value: &V) -> bool {
+    let any = value as &dyn std::any::Any;
+    if let Some(v) = any.downcast_ref::<f32>() {
+        return *v == 1.0;
+    }
+    if let Some(v) = any.downcast_ref::<f64>() {
+        return *v == 1.0;
+    }
+    #[cfg(any(feature = "ndarray", test))]
+    {
+        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f32>>() {
+            return arr.iter().all(|&x| x == 1.0);
+        }
+        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f64>>() {
+            return arr.iter().all(|&x| x == 1.0);
+        }
+    }
+    false
+}
+
+/// Attempts to eliminate a trivial operation via algebraic identity rules.
+///
+/// Returns `Some(output_atoms)` if the operation was eliminated, `None` otherwise.
+fn try_identity_elimination<O: Clone + Op, V: TraceValue>(
+    builder: &GraphBuilder<O, V>,
+    op: &O,
+    inputs: &[AtomId],
+) -> Option<Vec<AtomId>> {
+    let primitive: &PrimitiveOp<V> = op.as_any().downcast_ref()?;
+    match primitive {
+        PrimitiveOp::Scale { factor } if is_identity_one(factor) => Some(inputs.to_vec()),
+        PrimitiveOp::Add if inputs.len() == 2 => {
+            let left_zero = builder.atom(inputs[0]).map_or(false, |a| {
+                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
+            });
+            let right_zero = builder.atom(inputs[1]).map_or(false, |a| {
+                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
+            });
+            if left_zero {
+                Some(vec![inputs[1]])
+            } else if right_zero {
+                Some(vec![inputs[0]])
+            } else {
+                None
+            }
+        }
+        PrimitiveOp::Mul if inputs.len() == 2 => {
+            let left_one = builder.atom(inputs[0]).map_or(false, |a| {
+                matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value)
+            });
+            let right_one = builder.atom(inputs[1]).map_or(false, |a| {
+                matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value)
+            });
+            let left_zero = builder.atom(inputs[0]).map_or(false, |a| {
+                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
+            });
+            let right_zero = builder.atom(inputs[1]).map_or(false, |a| {
+                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
+            });
+            if left_one {
+                Some(vec![inputs[1]])
+            } else if right_one {
+                Some(vec![inputs[0]])
+            } else if left_zero {
+                Some(vec![inputs[0]])
+            } else if right_zero {
+                Some(vec![inputs[1]])
+            } else {
+                None
+            }
+        }
+        PrimitiveOp::Neg if inputs.len() == 1 => {
+            let zero = builder.atom(inputs[0]).map_or(false, |a| {
+                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
+            });
+            if zero { Some(vec![inputs[0]]) } else { None }
+        }
+        _ => None,
     }
 }
 

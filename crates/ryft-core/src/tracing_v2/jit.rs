@@ -516,6 +516,16 @@ mod tests {
             }
         }
 
+        impl crate::tracing_v2::IdentityValue for TestAbstractValue {
+            fn is_zero(&self) -> bool {
+                false
+            }
+
+            fn is_one(&self) -> bool {
+                false
+            }
+        }
+
         impl TransformLeaf for TestAbstractValue {}
 
         let result: Result<

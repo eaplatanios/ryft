@@ -44,14 +44,14 @@ pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use ops::{CustomOp, DifferentiableOp, Eval, Op, PrimitiveOp, StagedOpRef};
 pub use program::Program;
 pub use program::{ProgramBuilder, ProgramOpRef};
-pub use value::{FloatExt, OneLike, TraceValue, ZeroLike};
+pub use value::{FloatExt, IdentityValue, OneLike, TraceValue, ZeroLike};
 
 /// Canonical concrete leaf types supported by the public `tracing_v2` transform entry points.
 ///
 /// This trait is intentionally not implemented for [`JitTracer`]. Higher-order transform composition should go
 /// through staged replay rather than recursively instantiating `JitTracer<JitTracer<...>>`.
 pub trait TransformLeaf:
-    TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + operations::reshape::ReshapeOps
+    TraceValue + FloatExt + ZeroLike + OneLike + IdentityValue + MatrixOps + operations::reshape::ReshapeOps
 {
 }
 

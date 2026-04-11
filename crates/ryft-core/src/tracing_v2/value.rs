@@ -104,6 +104,64 @@ impl OneLike for f64 {
     }
 }
 
+/// Value types that support compile-time identity detection for algebraic simplification.
+///
+/// This trait enables the graph builder to eliminate trivial operations such as multiplying by one,
+/// adding zero, or scaling by an identity factor at graph construction time.
+pub trait IdentityValue: TraceValue {
+    /// Returns `true` if every element of this value is exactly zero.
+    fn is_zero(&self) -> bool;
+
+    /// Returns `true` if every element of this value is exactly one.
+    fn is_one(&self) -> bool;
+}
+
+impl IdentityValue for f32 {
+    #[inline]
+    fn is_zero(&self) -> bool {
+        *self == 0.0
+    }
+
+    #[inline]
+    fn is_one(&self) -> bool {
+        *self == 1.0
+    }
+}
+
+impl IdentityValue for f64 {
+    #[inline]
+    fn is_zero(&self) -> bool {
+        *self == 0.0
+    }
+
+    #[inline]
+    fn is_one(&self) -> bool {
+        *self == 1.0
+    }
+}
+
+#[cfg(any(feature = "ndarray", test))]
+impl IdentityValue for ndarray::Array2<f32> {
+    fn is_zero(&self) -> bool {
+        self.iter().all(|&x| x == 0.0)
+    }
+
+    fn is_one(&self) -> bool {
+        self.iter().all(|&x| x == 1.0)
+    }
+}
+
+#[cfg(any(feature = "ndarray", test))]
+impl IdentityValue for ndarray::Array2<f64> {
+    fn is_zero(&self) -> bool {
+        self.iter().all(|&x| x == 0.0)
+    }
+
+    fn is_one(&self) -> bool {
+        self.iter().all(|&x| x == 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{

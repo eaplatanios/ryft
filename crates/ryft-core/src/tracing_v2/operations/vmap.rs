@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
+        CompiledFunction, FloatExt, IdentityValue, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
         TransformLeaf, ZeroLike,
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, Eval, Op, PrimitiveOp},
