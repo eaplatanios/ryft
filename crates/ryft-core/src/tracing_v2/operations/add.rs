@@ -13,7 +13,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, Op},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -91,9 +91,7 @@ impl<V: TraceValue + Add<Output = V> + ZeroLike> DifferentiableOp<V> for AddOp {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0]), Some(output_cotangents[0])])
     }
-}
 
-impl<V: TraceValue + Add<Output = V>> JvpOp<V> for AddOp {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,

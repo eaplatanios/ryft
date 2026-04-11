@@ -14,7 +14,7 @@ use crate::{
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         linear::{LinearProgram, jvp_program, try_jvp_traced, try_linearize_traced_program},
         operations::{AddOp, CosOp, MulOp, NegOp, SinOp},
-        ops::JvpOp,
+        ops::DifferentiableOp,
         program::Program,
     },
     types::{ArrayType, Typed},
@@ -133,7 +133,7 @@ where
     outputs.pop().expect("single-output primitive should return one JVP output")
 }
 
-impl<V: TraceValue + Add<Output = V>, T: TangentSpace<V>> Add for JvpTracer<V, T> {
+impl<V: TraceValue + Add<Output = V> + ZeroLike, T: TangentSpace<V>> Add for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -142,7 +142,7 @@ impl<V: TraceValue + Add<Output = V>, T: TangentSpace<V>> Add for JvpTracer<V, T
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> Mul for JvpTracer<V, T> {
+impl<V: TraceValue + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> Mul for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -151,7 +151,7 @@ impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> Mul for JvpTracer<V, T
     }
 }
 
-impl<V: TraceValue + Neg<Output = V>, T: TangentSpace<V>> Neg for JvpTracer<V, T> {
+impl<V: TraceValue + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> Neg for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -160,7 +160,7 @@ impl<V: TraceValue + Neg<Output = V>, T: TangentSpace<V>> Neg for JvpTracer<V, T
     }
 }
 
-impl<V: TraceValue + FloatExt, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> {
+impl<V: TraceValue + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> {
     #[inline]
     fn sin(self) -> Self {
         single_output(SinOp.jvp(&[self]).expect("sin JVP rule should succeed"), "sin")

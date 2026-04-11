@@ -11,7 +11,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, Op},
 };
 use crate::types::ArrayType;
 
@@ -76,9 +76,7 @@ impl<V: TraceValue + FloatExt + ZeroLike> DifferentiableOp<V> for SinOp {
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         self.jvp(inputs)
     }
-}
 
-impl<V: TraceValue + FloatExt> JvpOp<V> for SinOp {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,

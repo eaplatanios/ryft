@@ -16,7 +16,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -124,9 +124,7 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for ScaleOp
         )[0];
         Ok(vec![Some(contribution)])
     }
-}
 
-impl<V: TraceValue + Mul<Output = V>> JvpOp<V> for ScaleOp<V> {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,

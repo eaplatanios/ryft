@@ -13,7 +13,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, JvpOp, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -91,9 +91,7 @@ impl<V: TraceValue + Neg<Output = V> + ZeroLike> DifferentiableOp<V> for NegOp {
         let contribution = builder.add_equation_prevalidated(PrimitiveOp::Neg, vec![output_cotangents[0]], vec![abstract_value], vec![example_value])[0];
         Ok(vec![Some(contribution)])
     }
-}
 
-impl<V: TraceValue + Neg<Output = V>> JvpOp<V> for NegOp {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,

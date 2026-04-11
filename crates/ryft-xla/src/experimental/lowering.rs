@@ -13,8 +13,11 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    AtomSource, Graph, Op, PrimitiveOp, ProgramOpRef, TraceValue,
-    operations::{FlatTracedVMap, VMapOp},
+    AtomSource, Graph, Op, PrimitiveOp, ProgramOpRef, ReshapeOps, TraceValue,
+    operations::{
+        AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, MulOp,
+        NegOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
+    },
 };
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -169,13 +172,320 @@ pub(crate) trait XlaOp<V: TraceValue>: ryft_core::tracing_v2::ops::Op {
         V: MlirLowerableValue;
 }
 
+impl<V: TraceValue> XlaOp<V> for AddOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let result =
+            lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
+        Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for MulOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let result = lowerer.block.append_operation(stable_hlo::multiply(
+            input_values[0],
+            input_values[1],
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for NegOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+        Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for SinOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let result = lowerer.block.append_operation(stable_hlo::sine(
+            input_values[0],
+            Accuracy::Default,
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for CosOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let result = lowerer.block.append_operation(stable_hlo::cosine(
+            input_values[0],
+            Accuracy::Default,
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for MatrixTransposeOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let result =
+            lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
+        Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for LinearMatrixTransposeOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let result =
+            lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
+        Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for MatMulOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            input_values[0],
+            input_values[1],
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for ScaleOp<V> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let factor = self.factor();
+        let factor_value = lowerer.lower_literal_value(factor)?;
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let factor_type = factor.tpe();
+        let factor_broadcast = if factor_type != output_types[0] {
+            match mode {
+                PlainMlirLoweringMode::Packed { lane_count } => {
+                    lowerer.lower_packed_literal_value(factor, &packed_array_type(&factor_type, lane_count))?
+                }
+                PlainMlirLoweringMode::Unpacked => {
+                    let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
+                        factor_value,
+                        output_tensor_type,
+                        &[],
+                        lowerer.location,
+                    ));
+                    broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
+                }
+            }
+        } else {
+            factor_value
+        };
+        let result = lowerer.block.append_operation(stable_hlo::multiply(
+            input_values[0],
+            factor_broadcast,
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for LeftMatMulOp<V> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let factor = self.factor();
+        let factor_value = match mode {
+            PlainMlirLoweringMode::Packed { lane_count } => {
+                let packed_type = packed_array_type(&factor.tpe(), lane_count);
+                lowerer.lower_packed_literal_value(factor, &packed_type)?
+            }
+            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
+        };
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            factor_value,
+            input_values[0],
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for RightMatMulOp<V> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let factor = self.factor();
+        let factor_value = match mode {
+            PlainMlirLoweringMode::Packed { lane_count } => {
+                let packed_type = packed_array_type(&factor.tpe(), lane_count);
+                lowerer.lower_packed_literal_value(factor, &packed_type)?
+            }
+            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
+        };
+        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
+        let result = lowerer.block.append_operation(stable_hlo::dot_general(
+            input_values[0],
+            factor_value,
+            dimensions,
+            Some((Precision::Default, Precision::Default)),
+            None,
+            output_tensor_type,
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+    }
+}
+
+impl<V: TraceValue> XlaOp<V> for ReshapeOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        let output_shape = static_dimensions(self.output_type())?;
+        let result = lowerer.block.append_operation(stable_hlo::reshape(
+            input_values[0],
+            output_shape.as_slice(),
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
+    }
+}
+
 impl<
     V: TraceValue
         + ryft_core::tracing_v2::FloatExt
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+        + ReshapeOps,
+> XlaOp<V> for VMapOp<V>
+{
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        lowerer.lower_vmap(self, input_values)
+    }
+}
+
+impl<
+    V: TraceValue
+        + ryft_core::tracing_v2::FloatExt
+        + ryft_core::tracing_v2::ZeroLike
+        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::MatrixOps
+        + ReshapeOps,
 > XlaOp<V> for PrimitiveOp<V>
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -190,138 +500,80 @@ impl<
     {
         match self {
             PrimitiveOp::Add => {
-                let result =
-                    lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
-                Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
+                <AddOp as XlaOp<V>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer)
             }
             PrimitiveOp::Mul => {
-                let result = lowerer.block.append_operation(stable_hlo::multiply(
-                    input_values[0],
-                    input_values[1],
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+                <MulOp as XlaOp<V>>::lower_to_mlir(&MulOp, input_values, output_types, mode, lowerer)
             }
             PrimitiveOp::Neg => {
-                let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
-                Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
+                <NegOp as XlaOp<V>>::lower_to_mlir(&NegOp, input_values, output_types, mode, lowerer)
             }
             PrimitiveOp::Sin => {
-                let result = lowerer.block.append_operation(stable_hlo::sine(
-                    input_values[0],
-                    Accuracy::Default,
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
+                <SinOp as XlaOp<V>>::lower_to_mlir(&SinOp, input_values, output_types, mode, lowerer)
             }
             PrimitiveOp::Cos => {
-                let result = lowerer.block.append_operation(stable_hlo::cosine(
-                    input_values[0],
-                    Accuracy::Default,
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
+                <CosOp as XlaOp<V>>::lower_to_mlir(&CosOp, input_values, output_types, mode, lowerer)
             }
-            PrimitiveOp::MatrixTranspose | PrimitiveOp::LinearMatrixTranspose => {
-                let result =
-                    lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
-                Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
+            PrimitiveOp::MatrixTranspose => {
+                <MatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
+                    &MatrixTransposeOp,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            PrimitiveOp::LinearMatrixTranspose => {
+                <LinearMatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
+                    &LinearMatrixTransposeOp,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
             PrimitiveOp::MatMul => {
-                let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-                let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
-                let result = lowerer.block.append_operation(stable_hlo::dot_general(
-                    input_values[0],
-                    input_values[1],
-                    dimensions,
-                    Some((Precision::Default, Precision::Default)),
-                    None,
-                    output_tensor_type,
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+                <MatMulOp as XlaOp<V>>::lower_to_mlir(&MatMulOp, input_values, output_types, mode, lowerer)
             }
             PrimitiveOp::Scale { factor } => {
-                let factor_value = lowerer.lower_literal_value(factor)?;
-                let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-                let factor_type = factor.tpe();
-                let factor_broadcast = if factor_type != output_types[0] {
-                    match mode {
-                        PlainMlirLoweringMode::Packed { lane_count } => {
-                            lowerer.lower_packed_literal_value(factor, &packed_array_type(&factor_type, lane_count))?
-                        }
-                        PlainMlirLoweringMode::Unpacked => {
-                            let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
-                                factor_value,
-                                output_tensor_type,
-                                &[],
-                                lowerer.location,
-                            ));
-                            broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
-                        }
-                    }
-                } else {
-                    factor_value
-                };
-                let result = lowerer.block.append_operation(stable_hlo::multiply(
-                    input_values[0],
-                    factor_broadcast,
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+                <ScaleOp<V> as XlaOp<V>>::lower_to_mlir(
+                    &ScaleOp::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
             PrimitiveOp::LeftMatMul { factor } => {
-                let factor_value = match mode {
-                    PlainMlirLoweringMode::Packed { lane_count } => {
-                        let packed_type = packed_array_type(&factor.tpe(), lane_count);
-                        lowerer.lower_packed_literal_value(factor, &packed_type)?
-                    }
-                    PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
-                };
-                let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-                let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
-                let result = lowerer.block.append_operation(stable_hlo::dot_general(
-                    factor_value,
-                    input_values[0],
-                    dimensions,
-                    Some((Precision::Default, Precision::Default)),
-                    None,
-                    output_tensor_type,
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+                <LeftMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
+                    &LeftMatMulOp::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
             PrimitiveOp::RightMatMul { factor } => {
-                let factor_value = match mode {
-                    PlainMlirLoweringMode::Packed { lane_count } => {
-                        let packed_type = packed_array_type(&factor.tpe(), lane_count);
-                        lowerer.lower_packed_literal_value(factor, &packed_type)?
-                    }
-                    PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
-                };
-                let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-                let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
-                let result = lowerer.block.append_operation(stable_hlo::dot_general(
-                    input_values[0],
-                    factor_value,
-                    dimensions,
-                    Some((Precision::Default, Precision::Default)),
-                    None,
-                    output_tensor_type,
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+                <RightMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
+                    &RightMatMulOp::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
-            PrimitiveOp::Reshape { output_type, .. } => {
-                let output_shape = static_dimensions(output_type)?;
-                let result = lowerer.block.append_operation(stable_hlo::reshape(
-                    input_values[0],
-                    output_shape.as_slice(),
-                    lowerer.location,
-                ));
-                Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
+            PrimitiveOp::Reshape { input_type, output_type } => {
+                <ReshapeOp as XlaOp<V>>::lower_to_mlir(
+                    &ReshapeOp::new(input_type.clone(), output_type.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
-            PrimitiveOp::VMap(vmap) => lowerer.lower_vmap(vmap.as_ref(), input_values),
+            PrimitiveOp::VMap(vmap) => {
+                <VMapOp<V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
+            }
             PrimitiveOp::Custom(_) => {
                 Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
             }

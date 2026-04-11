@@ -9,7 +9,6 @@
 //! Op (shape-level, NOT generic over V)
 //! ├─ Eval<V>          — concrete execution on values of type V
 //! ├─ DifferentiableOp<V> — JVP / transpose / replay rules
-//! ├─ JvpOp<V>         — eager forward-mode rule
 //! └─ BatchOp<V>       — batching rule for vmap
 //! ```
 //!
@@ -116,6 +115,21 @@ pub trait DifferentiableOp<V: TraceValue>: Op {
             message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
         })
     }
+
+    /// Applies the primitive's forward-mode rule to traced inputs.
+    ///
+    /// This is the generic JVP rule that works with any [`TangentSpace`] -- including both
+    /// concrete dual-number evaluation and staged linearization.
+    fn jvp<T>(&self, _inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
+    where
+        Self: Sized,
+        T: TangentSpace<V>,
+    {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "jvp",
+            message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
+        })
+    }
 }
 
 /// Combined trait for custom operations that support both evaluation and differentiation.
@@ -186,14 +200,6 @@ pub type PrimitiveOpRef<V> = PrimitiveOp<V>;
 /// New code should prefer [`PrimitiveOp`] directly.
 pub type StagedOpRef<V> = Arc<dyn CustomOp<V>>;
 
-/// Primitive operation with a forward-mode differentiation rule.
-pub(crate) trait JvpOp<V: TraceValue>: Op {
-    /// Applies the primitive's forward-mode rule to traced inputs.
-    fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
-    where
-        T: TangentSpace<V>;
-}
-
 /// Primitive operation with a batching rule used by `vmap`.
 pub(crate) trait BatchOp<V: TraceValue>: Op {
     /// Applies the primitive's batching rule to batched inputs.
@@ -260,16 +266,6 @@ impl<T: DifferentiableOp<V> + ?Sized, V: TraceValue> DifferentiableOp<V> for Arc
     }
 }
 
-impl<T: JvpOp<V> + ?Sized, V: TraceValue> JvpOp<V> for Arc<T> {
-    #[inline]
-    fn jvp<U>(&self, inputs: &[JvpTracer<V, U>]) -> Result<Vec<JvpTracer<V, U>>, TraceError>
-    where
-        U: TangentSpace<V>,
-    {
-        (**self).jvp(inputs)
-    }
-}
-
 impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
     #[inline]
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
@@ -278,7 +274,7 @@ impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
-// PrimitiveOp — Debug, Display, Op, Eval, DifferentiableOp, JvpOp, BatchOp
+// PrimitiveOp — Debug, Display, Op, Eval, DifferentiableOp, BatchOp
 // ---------------------------------------------------------------------------
 
 use crate::tracing_v2::operations::{
@@ -486,9 +482,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
             Self::Custom(op) => op.transpose_program_op(builder, inputs, outputs, output_cotangents),
         }
     }
-}
 
-impl<V: TransformLeaf> JvpOp<V> for PrimitiveOp<V> {
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,
@@ -499,9 +493,10 @@ impl<V: TransformLeaf> JvpOp<V> for PrimitiveOp<V> {
             Self::Neg => NegOp.jvp(inputs),
             Self::Sin => SinOp.jvp(inputs),
             Self::Cos => CosOp.jvp(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).jvp(inputs),
             _ => Err(TraceError::HigherOrderOpFailure {
                 op: "jvp",
-                message: format!("eager JVP rule for staged op '{}' is not implemented", self.name()),
+                message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
             }),
         }
     }
