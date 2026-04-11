@@ -191,6 +191,8 @@ pub(crate) trait VMapInvocationLeaf<
         F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>;
 }
 
+/// Concrete-value dispatch for [`vmap`]: stacks inputs into [`Batch`] leaves, applies the user function
+/// over the batched representation, and unstacks the result back into per-lane outputs.
 impl<
     V: TransformLeaf,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -209,6 +211,10 @@ where
     }
 }
 
+/// Already-traced dispatch for [`vmap`]: stages a compact higher-order [`VMapOp`] in the enclosing
+/// [`JitTracer`] scope instead of eagerly duplicating the scalar graph per lane. The body is traced
+/// once at a single-lane exemplar and compiled into a [`CompiledFunction`] that lowering can later
+/// emit as packed StableHLO.
 impl<
     V: TransformLeaf,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
@@ -311,6 +317,31 @@ where
     }
 }
 
+/// Nested-batch dispatch for [`vmap`], enabling `vmap(|xs| vmap(g, xs))` -- applying vectorization
+/// recursively. This delegates to the concrete `V` implementation: the outer batch is unstacked,
+/// the inner [`vmap`] runs per outer lane using the existing [`VMapInvocationLeaf`] for `V`, and
+/// results are stacked back. No trace-once pattern is needed here because the delegation to the
+/// concrete implementation handles each lane directly.
+impl<
+    V: TransformLeaf,
+    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
+    Output: Parameterized<Batch<V>, ParameterStructure: Clone>,
+> VMapInvocationLeaf<Input, Output> for Batch<V>
+where
+    Input::Family: ParameterizedFamily<Batch<Batch<V>>>,
+    Output::Family: ParameterizedFamily<Batch<Batch<V>>>,
+{
+    fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
+    where
+        Input::Family: ParameterizedFamily<Batch<Self>>,
+        Output::Family: ParameterizedFamily<Batch<Self>>,
+        F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>,
+    {
+        let batched_input = stack(inputs)?;
+        unstack(function(batched_input))
+    }
+}
+
 /// Maps `function` over a leading batch axis by stacking inputs, running the batched computation, and then
 /// unstacking the result.
 #[allow(private_bounds)]
@@ -398,5 +429,77 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    fn approx_eq(left: f64, right: f64) {
+        let delta = (left - right).abs();
+        assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
+    }
+
+    #[test]
+    fn test_vmap_of_grad_computes_per_lane_gradients() {
+        // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
+        let gradients: Vec<f64> = vmap(
+            |batch: Batch<f64>| {
+                crate::tracing_v2::grad(
+                    |x: JitTracer<f64>| x.clone() * x.clone() + x.sin(),
+                    batch,
+                )
+                .expect("batched grad should succeed")
+            },
+            vec![1.0f64, 2.0, 3.0],
+        )
+        .unwrap();
+
+        approx_eq(gradients[0], 2.0 * 1.0 + 1.0f64.cos());
+        approx_eq(gradients[1], 2.0 * 2.0 + 2.0f64.cos());
+        approx_eq(gradients[2], 2.0 * 3.0 + 3.0f64.cos());
+        test_support::assert_reference_scalar_sine_jit_rendering();
+    }
+
+    #[test]
+    fn test_vmap_of_value_and_grad_returns_batched_values_and_gradients() {
+        // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
+        let results: Vec<(f64, f64)> = vmap(
+            |batch: Batch<f64>| {
+                crate::tracing_v2::value_and_grad(
+                    |x: JitTracer<f64>| x.clone() * x.clone() + x.sin(),
+                    batch,
+                )
+                .expect("batched value_and_grad should succeed")
+            },
+            vec![1.0f64, 2.0, 3.0],
+        )
+        .unwrap();
+
+        for (i, x) in [1.0f64, 2.0, 3.0].into_iter().enumerate() {
+            approx_eq(results[i].0, x * x + x.sin());
+            approx_eq(results[i].1, 2.0 * x + x.cos());
+        }
+        test_support::assert_reference_scalar_sine_jit_rendering();
+    }
+
+    #[test]
+    fn test_vmap_of_jvp_propagates_tangents_per_lane() {
+        // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
+        // jvp at x with tangent t gives (f(x), (2x + cos(x)) * t)
+        let results: Vec<(f64, f64)> = vmap(
+            |(primals, tangents): (Batch<f64>, Batch<f64>)| {
+                crate::tracing_v2::jvp(
+                    |x: JitTracer<f64>| x.clone() * x.clone() + x.sin(),
+                    primals,
+                    tangents,
+                )
+                .expect("batched jvp should succeed")
+            },
+            vec![(1.0f64, 1.0f64), (2.0, 0.5), (3.0, 2.0)],
+        )
+        .unwrap();
+
+        for (i, (x, t)) in [(1.0f64, 1.0f64), (2.0, 0.5), (3.0, 2.0)].into_iter().enumerate() {
+            approx_eq(results[i].0, x * x + x.sin());
+            approx_eq(results[i].1, (2.0 * x + x.cos()) * t);
+        }
+        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 }

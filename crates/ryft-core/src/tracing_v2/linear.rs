@@ -16,6 +16,7 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        batch::{Batch, stack, unstack},
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, Graph},
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
@@ -521,7 +522,7 @@ where
     })
 }
 
-fn try_linearize_traced_program<V>(
+pub(crate) fn try_linearize_traced_program<V>(
     program: &Program<V, Vec<V>, Vec<V>>,
     primals: Vec<JitTracer<V>>,
 ) -> Result<(Vec<JitTracer<V>>, LinearProgram<JitTracer<V>, Vec<JitTracer<V>>, Vec<JitTracer<V>>>), TraceError>
@@ -722,6 +723,8 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
         F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>;
 }
 
+/// Concrete-value dispatch for [`grad`]: traces the user function with [`JitTracer`] to build a staged
+/// reverse-mode gradient and evaluates it at the supplied primals.
 impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
     for V
 where
@@ -739,6 +742,9 @@ where
     }
 }
 
+/// Already-traced dispatch for [`grad`]: replays the user function symbolically inside an enclosing
+/// [`JitTracer`] scope, linearizes the resulting [`Program`], transposes the pushforward into a pullback,
+/// and stages the full backward pass so it becomes part of the outer compiled graph.
 impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
     for JitTracer<V>
 where
@@ -784,6 +790,87 @@ where
     }
 }
 
+/// Batched dispatch for [`grad`], enabling standalone `vmap(|x| grad(f, x), inputs)` -- computing
+/// per-element gradients over a batch without requiring an outer [`jit`] wrapper.
+///
+/// Because the dispatch trait requires `F: FnOnce`, the user function can only be called once. This impl
+/// traces the function once at the first lane's primals to obtain a [`Program`], then compiles a reusable
+/// [`CompiledFunction`] via [`try_jit`] that embeds the full forward and backward passes symbolically.
+/// The compiled gradient function is called independently for each lane.
+impl<V: TransformLeaf, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>>
+    GradInvocationLeaf<Input> for Batch<V>
+where
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
+    Input::To<V>: Clone
+        + Parameterized<
+            V,
+            ParameterStructure: Clone + PartialEq,
+            To<Batch<V>> = Input,
+            To<JitTracer<V>> = Input::To<JitTracer<V>>,
+        >,
+    <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
+{
+    type Base = V;
+    type Return = Input;
+    type FunctionInput = Input::To<JitTracer<V>>;
+
+    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>,
+    {
+        let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
+        if lane_primals.is_empty() {
+            return Err(TraceError::EmptyBatch);
+        }
+
+        let lane0 = lane_primals[0].clone();
+        let input_structure = lane0.parameter_structure();
+        let parameter_count = input_structure.parameter_count();
+        let lane0_flat: Vec<V> = lane0.into_parameters().collect();
+
+        // Trace the user function once at lane 0 primals, consuming the FnOnce closure.
+        let (_, traced_program): (V, Program<V, Input::To<V>, V>) = try_trace_program(
+            |staged_input| Ok(function(staged_input)),
+            lane_primals[0].clone(),
+        )?;
+
+        // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
+        let flat_program = Program::from_graph(
+            traced_program
+                .graph()
+                .clone_with_structures::<Vec<V>, Vec<V>>(vec![Placeholder; parameter_count], vec![Placeholder; 1]),
+        )
+        .simplify()?;
+
+        // Compile the gradient into a reusable program by wrapping linearize + transpose + pullback
+        // inside a JIT scope. This stages the full backward pass symbolically so it can be replayed
+        // at arbitrary primal points.
+        let (_, compiled_grad): (Vec<V>, CompiledFunction<V, Vec<V>, Vec<V>>) = try_jit(
+            |jit_primals: Vec<JitTracer<V>>| {
+                let (outputs, pushforward) = try_linearize_traced_program(&flat_program, jit_primals)?;
+                if outputs.len() != 1 {
+                    return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+                }
+                let pullback = pushforward.transpose()?;
+                pullback.call(vec![outputs[0].one_like()])
+            },
+            lane0_flat,
+        )?;
+
+        // Apply the compiled gradient per-lane and re-structure the flat results.
+        let lane_grads = lane_primals
+            .into_iter()
+            .map(|lane| {
+                let flat: Vec<V> = lane.into_parameters().collect();
+                let flat_grad = compiled_grad.call(flat)?;
+                Input::To::<V>::from_parameters(input_structure.clone(), flat_grad).map_err(TraceError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        stack(lane_grads)
+    }
+}
+
 /// Computes the reverse-mode gradient of a scalar-output function.
 #[allow(private_bounds, private_interfaces)]
 pub fn grad<F, Input, Leaf>(
@@ -820,6 +907,8 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
         F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>;
 }
 
+/// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`] and
+/// pulls back a unit seed to obtain both the primal scalar output and its gradient.
 impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>
     ValueAndGradInvocationLeaf<Input> for V
 where
@@ -839,6 +928,9 @@ where
     }
 }
 
+/// Already-traced dispatch for [`value_and_grad`]: replays the user function symbolically inside an
+/// enclosing [`JitTracer`] scope, linearizes, transposes, and stages both the forward output and the
+/// backward gradient so they become part of the outer compiled graph.
 impl<V: TransformLeaf, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>
     ValueAndGradInvocationLeaf<Input> for JitTracer<V>
 where
@@ -883,6 +975,95 @@ where
         let pullback = pushforward.transpose()?;
         let traced_gradient = pullback.call(vec![traced_output.one_like()])?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
+    }
+}
+
+/// Batched dispatch for [`value_and_grad`], enabling standalone
+/// `vmap(|x| value_and_grad(f, x), inputs)` -- computing per-element function values and gradients
+/// over a batch without requiring an outer [`jit`] wrapper.
+///
+/// Uses the same trace-once strategy as [`GradInvocationLeaf`] for [`Batch`]: the user function is
+/// traced once to a [`Program`], and a [`CompiledFunction`] that produces `(V, Input::To<V>)` per lane
+/// is compiled via [`try_jit`]. Values and gradients are collected per lane and stacked separately.
+impl<V: TransformLeaf, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>>
+    ValueAndGradInvocationLeaf<Input> for Batch<V>
+where
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
+    Input::To<V>: Clone
+        + Parameterized<
+            V,
+            ParameterStructure: Clone + PartialEq,
+            To<Batch<V>> = Input,
+            To<JitTracer<V>> = Input::To<JitTracer<V>>,
+        >,
+    <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
+{
+    type Base = V;
+    type Return = (Batch<V>, Input);
+    type FunctionInput = Input::To<JitTracer<V>>;
+
+    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> JitTracer<Self::Base>,
+    {
+        let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
+        if lane_primals.is_empty() {
+            return Err(TraceError::EmptyBatch);
+        }
+
+        let lane0 = lane_primals[0].clone();
+        let input_structure = lane0.parameter_structure();
+        let parameter_count = input_structure.parameter_count();
+        let lane0_flat: Vec<V> = lane0.into_parameters().collect();
+
+        // Trace the user function once at lane 0 primals, consuming the FnOnce closure.
+        let (_, traced_program): (V, Program<V, Input::To<V>, V>) = try_trace_program(
+            |staged_input| Ok(function(staged_input)),
+            lane_primals[0].clone(),
+        )?;
+
+        // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
+        let flat_program = Program::from_graph(
+            traced_program
+                .graph()
+                .clone_with_structures::<Vec<V>, Vec<V>>(vec![Placeholder; parameter_count], vec![Placeholder; 1]),
+        )
+        .simplify()?;
+
+        // Compile both the forward evaluation and gradient into a reusable program.
+        let (_, compiled_vg): (Vec<V>, CompiledFunction<V, Vec<V>, Vec<V>>) = try_jit(
+            |jit_primals: Vec<JitTracer<V>>| {
+                let (outputs, pushforward) = try_linearize_traced_program(&flat_program, jit_primals)?;
+                if outputs.len() != 1 {
+                    return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+                }
+                let pullback = pushforward.transpose()?;
+                let gradient = pullback.call(vec![outputs[0].one_like()])?;
+                let mut result = Vec::with_capacity(1 + gradient.len());
+                result.push(outputs[0].clone());
+                result.extend(gradient);
+                Ok(result)
+            },
+            lane0_flat,
+        )?;
+
+        // Apply per-lane and split into (value, gradient).
+        let mut lane_values = Vec::with_capacity(lane_primals.len());
+        let mut lane_grads = Vec::with_capacity(lane_primals.len());
+        for lane in lane_primals {
+            let flat: Vec<V> = lane.into_parameters().collect();
+            let flat_result = compiled_vg.call(flat)?;
+            let (value, grad_flat) = flat_result.split_first().ok_or(TraceError::EmptyParameterizedValue)?;
+            lane_values.push(value.clone());
+            lane_grads.push(
+                Input::To::<V>::from_parameters(input_structure.clone(), grad_flat.to_vec())
+                    .map_err(TraceError::from)?,
+            );
+        }
+
+        let batched_values = Batch::new(lane_values);
+        let batched_grads = stack(lane_grads)?;
+        Ok((batched_values, batched_grads))
     }
 }
 

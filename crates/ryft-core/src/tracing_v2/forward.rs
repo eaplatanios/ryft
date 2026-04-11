@@ -7,13 +7,15 @@
 use std::ops::{Add, Mul, Neg};
 
 use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily},
+    parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         FloatExt, MatrixOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
-        jit::JitTracer,
-        linear::{LinearProgram, jvp_program, try_jvp_traced},
+        batch::{Batch, stack, unstack},
+        jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
+        linear::{LinearProgram, jvp_program, try_jvp_traced, try_linearize_traced_program},
         operations::{AddOp, CosOp, MulOp, NegOp, SinOp},
         ops::JvpOp,
+        program::Program,
     },
     types::{ArrayType, Typed},
 };
@@ -165,6 +167,8 @@ impl<V: TraceValue + FloatExt, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> 
     }
 }
 
+/// Concrete-value dispatch for [`jvp`]: traces the user function with [`JitTracer`] to build a staged
+/// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
     V: TransformLeaf,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
@@ -193,6 +197,9 @@ where
     }
 }
 
+/// Already-traced dispatch for [`jvp`]: delegates to [`try_jvp_traced`] to replay the user function
+/// symbolically inside an enclosing [`JitTracer`] scope, staging both the primal output and the
+/// tangent propagation as part of the outer compiled graph.
 impl<
     V: TransformLeaf,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
@@ -213,6 +220,129 @@ where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
         try_jvp_traced(|input| Ok(function(input)), primals, tangents)
+    }
+}
+
+/// Batched dispatch for [`jvp`], enabling standalone `vmap(|x| jvp(f, x, dx), inputs)` -- computing
+/// per-element Jacobian-vector products over a batch without requiring an outer [`jit`] wrapper.
+///
+/// Uses the same trace-once strategy as [`GradInvocationLeaf`](crate::tracing_v2::GradInvocationLeaf)
+/// for [`Batch`]: the user function is traced once to a [`Program`], and a [`CompiledFunction`] that
+/// takes primals and tangents and returns `(primal_output, tangent_output)` per lane is compiled via
+/// [`try_jit`]. Primal and tangent outputs are collected per lane and stacked separately.
+impl<
+    V: TransformLeaf,
+    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
+    Output: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
+> JvpInvocationLeaf<Input, Output> for Batch<V>
+where
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
+    Input::To<V>: Clone
+        + Parameterized<
+            V,
+            ParameterStructure: Clone + PartialEq,
+            To<Batch<V>> = Input,
+            To<JitTracer<V>> = Input::To<JitTracer<V>>,
+        >,
+    Output::To<V>: Clone
+        + Parameterized<
+            V,
+            ParameterStructure: Clone + PartialEq,
+            To<Batch<V>> = Output,
+            To<JitTracer<V>> = Output::To<JitTracer<V>>,
+        >,
+    <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
+    <Output::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
+{
+    type Base = V;
+    type FunctionInput = Input::To<JitTracer<V>>;
+    type FunctionOutput = Output::To<JitTracer<V>>;
+
+    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    where
+        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
+    {
+        if primals.parameter_structure() != tangents.parameter_structure() {
+            return Err(TraceError::MismatchedParameterStructure);
+        }
+
+        let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
+        let lane_tangents: Vec<Input::To<V>> = unstack(tangents)?;
+        if lane_primals.is_empty() {
+            return Err(TraceError::EmptyBatch);
+        }
+
+        let lane0_primals = lane_primals[0].clone();
+        let input_structure = lane0_primals.parameter_structure();
+        let input_parameter_count = input_structure.parameter_count();
+
+        // Trace the function once at lane 0 primals, consuming the FnOnce closure.
+        let (primal_output_0, traced_program): (Output::To<V>, Program<V, Input::To<V>, Output::To<V>>) =
+            try_trace_program(|staged_input| Ok(function(staged_input)), lane0_primals)?;
+
+        let output_structure = primal_output_0.parameter_structure();
+        let output_parameter_count = output_structure.parameter_count();
+
+        // Reshape to flat Vec program for the JIT compilation step.
+        let flat_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+            vec![Placeholder; input_parameter_count],
+            vec![Placeholder; output_parameter_count],
+        ))
+        .simplify()?;
+
+        // Compile the full JVP into a reusable program. Inside the JIT scope, the program is
+        // replayed symbolically with `try_linearize_traced_program`, which produces both the
+        // primal outputs and a pushforward parameterized over the JIT-symbolic primals.
+        let combined_input_count = input_parameter_count * 2;
+        let combined_output_count = output_parameter_count * 2;
+
+        let (_, compiled_jvp): (Vec<V>, CompiledFunction<V, Vec<V>, Vec<V>>) = try_jit(
+            |jit_combined: Vec<JitTracer<V>>| {
+                let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
+
+                // Replay the forward pass symbolically and linearize at the symbolic primals.
+                let (primal_outputs, pushforward) =
+                    try_linearize_traced_program(&flat_program, jit_primals.to_vec())?;
+
+                // Apply the pushforward to the symbolic tangents.
+                let tangent_outputs = pushforward.call(jit_tangents.to_vec())?;
+
+                let mut result = Vec::with_capacity(combined_output_count);
+                result.extend(primal_outputs);
+                result.extend(tangent_outputs);
+                Ok(result)
+            },
+            {
+                let mut combined = Vec::with_capacity(combined_input_count);
+                combined.extend(lane_primals[0].clone().into_parameters());
+                combined.extend(lane_tangents[0].clone().into_parameters());
+                combined
+            },
+        )?;
+
+        // Apply per-lane and split into (primal_output, tangent_output).
+        let mut lane_primal_outputs = Vec::with_capacity(lane_primals.len());
+        let mut lane_tangent_outputs = Vec::with_capacity(lane_primals.len());
+        for (lane_p, lane_t) in lane_primals.into_iter().zip(lane_tangents) {
+            let mut combined_flat = Vec::with_capacity(combined_input_count);
+            combined_flat.extend(lane_p.into_parameters());
+            combined_flat.extend(lane_t.into_parameters());
+            let combined_result = compiled_jvp.call(combined_flat)?;
+            let (primal_flat, tangent_flat) = combined_result.split_at(output_parameter_count);
+            lane_primal_outputs.push(
+                Output::To::<V>::from_parameters(output_structure.clone(), primal_flat.to_vec())
+                    .map_err(TraceError::from)?,
+            );
+            lane_tangent_outputs.push(
+                Output::To::<V>::from_parameters(output_structure.clone(), tangent_flat.to_vec())
+                    .map_err(TraceError::from)?,
+            );
+        }
+
+        let primal_output = stack(lane_primal_outputs)?;
+        let tangent_output = stack(lane_tangent_outputs)?;
+        Ok((primal_output, tangent_output))
     }
 }
 
