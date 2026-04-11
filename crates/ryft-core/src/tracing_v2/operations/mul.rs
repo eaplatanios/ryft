@@ -7,11 +7,9 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    TraceError, TraceValue, TransformLeaf, ZeroLike,
+    TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    jit::JitTracer,
-    linear::LinearTerm,
     ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
 };
 use crate::types::ArrayType;
@@ -55,26 +53,7 @@ impl<V: TraceValue + Mul<Output = V>> Eval<V> for MulOp {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for MulOp {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 2)?;
-        let left = &inputs[0];
-        let right = &inputs[1];
-        Ok(vec![JvpTracer {
-            primal: left.primal.clone() * right.primal.clone(),
-            tangent: LinearTerm::add(
-                LinearTerm::scale(left.tangent.clone(), right.primal.clone()),
-                LinearTerm::scale(right.tangent.clone(), left.primal.clone()),
-            ),
-        }])
-    }
-}
+impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for MulOp {}
 
 impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for MulOp {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {

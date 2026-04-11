@@ -15,7 +15,6 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
     jit::JitTracer,
-    linear::LinearTerm,
     ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
@@ -110,14 +109,15 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
         )[0];
         Ok(vec![Some(contribution)])
     }
+}
 
-    fn replay_linearized_jit(
+impl<V: TransformLeaf + Mul<Output = V>>
+    Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for ScaleOp<V>
+{
+    fn eval(
         &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         Ok(vec![JvpTracer {

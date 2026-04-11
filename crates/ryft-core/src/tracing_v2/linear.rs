@@ -523,7 +523,7 @@ where
     V: TransformLeaf + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
 {
     replay_program_graph_with(graph, inputs, lift_linearized_traced_constant, |op, values| {
-        op.replay_linearized_jit(values)
+        Eval::<Linearized<JitTracer<V>>>::eval(op, &values)
     })
 }
 

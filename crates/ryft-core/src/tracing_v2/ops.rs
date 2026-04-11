@@ -8,7 +8,7 @@
 //! ```text
 //! Op (shape-level, NOT generic over V)
 //! ├─ Eval<V>               — concrete execution on values of type V
-//! ├─ LinearOp<V>           — transpose + replay rules for linear programs
+//! ├─ LinearOp<V>           — transpose rule for linear programs
 //! ├─ DifferentiableOp<V, T> — forward-mode JVP rule, generic over tangent type T
 //! └─ BatchOp<V>            — batching rule for vmap
 //! ```
@@ -56,13 +56,8 @@ pub trait Eval<V: TraceValue>: Op {
 
 /// Operations that can appear in tangent/cotangent programs and support reverse-mode transposition.
 ///
-/// This trait covers the staged-program side of differentiation: transposing linearized programs
-/// ([`transpose_program_op`]) and replaying them inside a JIT scope ([`replay_linearized_jit`]).
-/// Default implementations return [`TraceError::HigherOrderOpFailure`] so that operations only need
-/// to override the methods relevant to their transform support.
-///
-/// [`transpose_program_op`]: LinearOp::transpose_program_op
-/// [`replay_linearized_jit`]: LinearOp::replay_linearized_jit
+/// The default implementation returns [`TraceError::HigherOrderOpFailure`] so that operations only
+/// need to override the method when they support transposition.
 pub trait LinearOp<V: TraceValue>: Op {
     /// Applies the transpose rule for reverse-mode differentiation.
     fn transpose_program_op(
@@ -75,20 +70,6 @@ pub trait LinearOp<V: TraceValue>: Op {
         Err(TraceError::HigherOrderOpFailure {
             op: "transpose_linear_program",
             message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
-        })
-    }
-
-    /// Replays this staged op while tracing a linearized JIT program.
-    fn replay_linearized_jit(
-        &self,
-        _inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "replay_program_graph",
-            message: format!("replaying linearized values through staged op '{}' is not implemented", self.name()),
         })
     }
 }
@@ -109,15 +90,14 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
 
 /// Combined trait for custom operations that support evaluation, linearization, and differentiation.
 ///
-/// This is the required capability set for the [`PrimitiveOp::Custom`] escape hatch. External
-/// operations must implement [`Eval<V>`] (concrete execution), [`LinearOp<V>`]
-/// (transpose/replay rules), [`DifferentiableOp<V, LinearTerm<V>>`] (program-level JVP), and
-/// [`Op`] (shape-level metadata).
-/// User- or crate-defined operation for the [`Custom`](PrimitiveOp::Custom) escape hatch.
+/// This is the required capability set for the [`PrimitiveOp::Custom`] escape hatch. User- or
+/// crate-defined operations implement this single trait for dynamic dispatch behind
+/// `Arc<dyn CustomOp<V>>`.
 ///
-/// Each method has a default that returns an error, so custom ops only override the capabilities they support.
-/// A JIT-only op overrides just [`eval`](CustomOp::eval). A differentiable op also overrides
-/// [`jvp`](CustomOp::jvp) and [`transpose_program_op`](CustomOp::transpose_program_op).
+/// Each method has a default that returns an error, so custom ops only override the capabilities
+/// they support. A JIT-only op overrides just [`eval`](CustomOp::eval). A differentiable op also
+/// overrides [`jvp`](CustomOp::jvp), [`transpose_program_op`](CustomOp::transpose_program_op),
+/// and [`eval_linearized_jit`](CustomOp::eval_linearized_jit).
 pub trait CustomOp<V: TraceValue>: Op {
     /// Executes the operation on concrete values.
     fn eval(&self, _inputs: &[V]) -> Result<Vec<V>, TraceError> {
@@ -149,17 +129,25 @@ pub trait CustomOp<V: TraceValue>: Op {
         })
     }
 
-    /// Replays this staged op while tracing a linearized JIT program.
-    fn replay_linearized_jit(
+    /// Evaluates this staged op on linearized JIT tracer values.
+    ///
+    /// This is the trait-object equivalent of [`Eval<Linearized<JitTracer<V>>>`] — built-in ops
+    /// implement [`Eval`] directly, but custom ops behind `dyn CustomOp<V>` use this method instead.
+    ///
+    /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
+    fn eval_linearized_jit(
         &self,
-        _inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+        _inputs: &[JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>],
     ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
     where
         V: TransformLeaf,
     {
         Err(TraceError::HigherOrderOpFailure {
-            op: "replay_program_graph",
-            message: format!("replaying linearized values through custom op '{}' is not implemented", self.name()),
+            op: "eval_linearized_jit",
+            message: format!(
+                "linearized JIT evaluation for custom op '{}' is not implemented",
+                self.name()
+            ),
         })
     }
 }
@@ -270,17 +258,6 @@ impl<T: LinearOp<V> + ?Sized, V: TraceValue> LinearOp<V> for Arc<T> {
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError> {
         (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
-    }
-
-    #[inline]
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        (**self).replay_linearized_jit(inputs)
     }
 }
 
@@ -458,32 +435,44 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
             Self::Custom(op) => op.transpose_program_op(builder, inputs, outputs, output_cotangents),
         }
     }
+}
 
-    fn replay_linearized_jit(
+/// Linearized JIT replay: evaluates staged operations on [`Linearized<JitTracer<V>>`] values.
+///
+/// For pure (non-capturing) ops, this is covered by their generic [`Eval<V>`] implementations
+/// because [`JvpTracer`] already implements all necessary arithmetic, matrix, and reshape traits.
+/// Capturing ops ([`ScaleOp`], [`LeftMatMulOp`], [`RightMatMulOp`]) and higher-order ops
+/// ([`VMapOp`](crate::tracing_v2::operations::VMapOp),
+/// [`RematerializeOp`](crate::tracing_v2::operations::RematerializeOp)) provide dedicated
+/// [`Eval`] implementations that lift captured constants into the JIT trace.
+///
+/// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
+/// [`ScaleOp`]: crate::tracing_v2::operations::ScaleOp
+/// [`LeftMatMulOp`]: crate::tracing_v2::operations::LeftMatMulOp
+/// [`RightMatMulOp`]: crate::tracing_v2::operations::RightMatMulOp
+impl<V: TransformLeaf> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for PrimitiveOp<V> {
+    fn eval(
         &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
         match self {
-            Self::Add => AddOp.replay_linearized_jit(inputs),
-            Self::Mul => MulOp.replay_linearized_jit(inputs),
-            Self::Neg => NegOp.replay_linearized_jit(inputs),
-            Self::Sin => SinOp.replay_linearized_jit(inputs),
-            Self::Cos => CosOp.replay_linearized_jit(inputs),
-            Self::MatMul => MatMulOp.replay_linearized_jit(inputs),
-            Self::MatrixTranspose => MatrixTransposeOp.replay_linearized_jit(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.replay_linearized_jit(inputs),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).replay_linearized_jit(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).replay_linearized_jit(inputs),
-            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).replay_linearized_jit(inputs),
+            Self::Add => AddOp.eval(inputs),
+            Self::Mul => MulOp.eval(inputs),
+            Self::Neg => NegOp.eval(inputs),
+            Self::Sin => SinOp.eval(inputs),
+            Self::Cos => CosOp.eval(inputs),
+            Self::MatMul => MatMulOp.eval(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.eval(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.eval(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).eval(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).eval(inputs),
+            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).eval(inputs),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOp::new(input_type.clone(), output_type.clone()).replay_linearized_jit(inputs)
+                ReshapeOp::new(input_type.clone(), output_type.clone()).eval(inputs)
             }
-            Self::VMap(vmap) => vmap.replay_linearized_jit(inputs),
-            Self::Rematerialize(remat) => remat.replay_linearized_jit(inputs),
-            Self::Custom(op) => op.replay_linearized_jit(inputs),
+            Self::VMap(vmap) => vmap.eval(inputs),
+            Self::Rematerialize(remat) => remat.eval(inputs),
+            Self::Custom(op) => op.eval_linearized_jit(inputs),
         }
     }
 }

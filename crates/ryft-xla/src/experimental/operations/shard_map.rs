@@ -244,10 +244,12 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
             .add_equation(PrimitiveOp::Custom(std::sync::Arc::new(self.transpose_op()?)), output_cotangents.to_vec())?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
+}
 
-    fn replay_linearized_jit(
+impl Eval<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
+    fn eval(
         &self,
-        inputs: Vec<Linearized<ShardMapTracer>>,
+        inputs: &[Linearized<ShardMapTracer>],
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
@@ -312,11 +314,11 @@ impl CustomOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
         LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
     }
 
-    fn replay_linearized_jit(
+    fn eval_linearized_jit(
         &self,
-        inputs: Vec<Linearized<ShardMapTracer>>,
+        inputs: &[Linearized<ShardMapTracer>],
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
-        LinearOp::replay_linearized_jit(self, inputs)
+        Eval::<Linearized<ShardMapTracer>>::eval(self, inputs)
     }
 }
 

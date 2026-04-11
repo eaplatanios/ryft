@@ -6,11 +6,9 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    FloatExt, TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    jit::JitTracer,
-    linear::LinearTerm,
     ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
 };
 use crate::types::ArrayType;
@@ -54,22 +52,7 @@ impl<V: TraceValue + FloatExt> Eval<V> for SinOp {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike> LinearOp<V> for SinOp {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        let input = &inputs[0];
-        Ok(vec![JvpTracer {
-            primal: input.primal.clone().sin(),
-            tangent: LinearTerm::scale(input.tangent.clone(), input.primal.clone().cos()),
-        }])
-    }
-}
+impl<V: TraceValue + FloatExt + ZeroLike> LinearOp<V> for SinOp {}
 
 impl<V: TraceValue + FloatExt, T: TangentSpace<V>> DifferentiableOp<V, T> for SinOp {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {

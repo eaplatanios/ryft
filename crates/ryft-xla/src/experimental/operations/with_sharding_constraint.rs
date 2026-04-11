@@ -13,7 +13,7 @@ use ryft_core::tracing_v2::{
     forward::JvpTracer,
     graph::AtomId,
     jit::JitTracer,
-    linear::LinearTerm,
+    linear::{LinearTerm, Linearized},
     operations::{expect_input_count, unary_abstract},
     ops::{DifferentiableOp, LinearOp, Op},
     program::ProgramBuilder,
@@ -101,34 +101,6 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
         )?[0];
         Ok(vec![Some(contribution)])
     }
-
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        let input = inputs.into_iter().next().expect("validated single input should exist");
-        let primal = JitTracer::apply_staged_op(
-            std::slice::from_ref(&input.primal),
-            PrimitiveOp::Custom(Arc::new(self.clone())),
-            vec![input.primal.value.clone()],
-        )?
-        .into_iter()
-        .next()
-        .expect("sharding constraint should produce one primal output");
-        let tangent = LinearTerm::apply_staged_op(
-            std::slice::from_ref(&input.tangent),
-            PrimitiveOp::Custom(Arc::new(self.clone())),
-            1,
-        )?
-        .into_iter()
-        .next()
-        .expect("sharding constraint should produce one tangent output");
-        Ok(vec![JvpTracer { primal, tangent }])
-    }
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>>
@@ -167,14 +139,32 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Cus
         LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
     }
 
-    fn replay_linearized_jit(
+    fn eval_linearized_jit(
         &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+        inputs: &[Linearized<JitTracer<V>>],
+    ) -> Result<Vec<Linearized<JitTracer<V>>>, TraceError>
     where
         V: TransformLeaf,
     {
-        LinearOp::replay_linearized_jit(self, inputs)
+        expect_input_count(inputs.len(), 1)?;
+        let input = &inputs[0];
+        let primal = JitTracer::apply_staged_op(
+            std::slice::from_ref(&input.primal),
+            PrimitiveOp::Custom(Arc::new(self.clone())),
+            vec![input.primal.value.clone()],
+        )?
+        .into_iter()
+        .next()
+        .expect("sharding constraint should produce one primal output");
+        let tangent = LinearTerm::apply_staged_op(
+            std::slice::from_ref(&input.tangent),
+            PrimitiveOp::Custom(Arc::new(self.clone())),
+            1,
+        )?
+        .into_iter()
+        .next()
+        .expect("sharding constraint should produce one tangent output");
+        Ok(vec![Linearized { primal, tangent }])
     }
 }
 

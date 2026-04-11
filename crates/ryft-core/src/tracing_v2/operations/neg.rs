@@ -7,12 +7,10 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    TraceError, TraceValue, TransformLeaf, ZeroLike,
+    TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
-    jit::JitTracer,
-    linear::LinearTerm,
     ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
@@ -85,17 +83,6 @@ impl<V: TraceValue + Neg<Output = V> + ZeroLike> LinearOp<V> for NegOp {
             vec![example_value],
         )[0];
         Ok(vec![Some(contribution)])
-    }
-
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: inputs[0].tangent.clone().neg() }])
     }
 }
 

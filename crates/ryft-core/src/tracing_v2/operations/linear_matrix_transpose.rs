@@ -3,12 +3,10 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    TraceError, TransformLeaf,
+    TraceError,
     batch::Batch as BatchedValue,
     forward::JvpTracer,
     graph::AtomId,
-    jit::JitTracer,
-    linear::LinearTerm,
     ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
@@ -85,17 +83,6 @@ impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
             vec![example_value],
         )[0];
         Ok(vec![Some(contribution)])
-    }
-
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
 

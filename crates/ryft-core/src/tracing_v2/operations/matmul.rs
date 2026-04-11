@@ -3,11 +3,9 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, TransformLeaf, ZeroLike,
+    FloatExt, TraceError, ZeroLike,
     batch::Batch as BatchedValue,
     forward::JvpTracer,
-    jit::JitTracer,
-    linear::LinearTerm,
     ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
 };
 use crate::types::ArrayType;
@@ -55,18 +53,7 @@ impl<V: MatrixValue> Eval<V> for MatMulOp {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatMulOp {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 2)?;
-        Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
-    }
-}
+impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatMulOp {}
 
 impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V, T>
     for MatMulOp

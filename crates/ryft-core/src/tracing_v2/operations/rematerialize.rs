@@ -183,18 +183,19 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
         );
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
+}
 
-    fn replay_linearized_jit(
+impl<V: TransformLeaf + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
+    Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RematerializeOp<V>
+{
+    fn eval(
         &self,
-        inputs: Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
         if self.has_transpose_body() {
             return Err(TraceError::HigherOrderOpFailure {
-                op: "replay_program_graph",
-                message: "replaying linearized values through a linear rematerialize op is not implemented".to_string(),
+                op: "eval_linearized_jit",
+                message: "linearized JIT evaluation through a linear rematerialize op is not implemented".to_string(),
             });
         }
         // Replay the body sub-program with JitTracer+LinearTerm inputs. This stages the body's
@@ -210,7 +211,8 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
             PrimitiveOp::Rematerialize(Box::new(self.clone())),
             primal_output_values,
         )?;
-        let tangent_outputs = replay_program_graph_linearized_jit(self.body().compiled().program().graph(), inputs)?;
+        let tangent_outputs =
+            replay_program_graph_linearized_jit(self.body().compiled().program().graph(), inputs.to_vec())?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs.into_iter().map(|output| output.tangent))

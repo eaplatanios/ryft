@@ -97,14 +97,15 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
         )?[0];
         Ok(vec![Some(contribution)])
     }
+}
 
-    fn replay_linearized_jit(
+impl<V: TransformLeaf + MatrixOps>
+    Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for LeftMatMulOp<V>
+{
+    fn eval(
         &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };

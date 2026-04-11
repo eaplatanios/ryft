@@ -415,23 +415,6 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> fo
         )[0];
         Ok(vec![Some(contribution)])
     }
-
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![
-            inputs
-                .into_iter()
-                .next()
-                .expect("validated reshape input should exist")
-                .reshape(self.output_type().shape.clone())?,
-        ])
-    }
 }
 
 impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> DifferentiableOp<V, LinearTerm<V>> for ReshapeOp {

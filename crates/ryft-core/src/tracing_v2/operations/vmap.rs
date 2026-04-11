@@ -222,18 +222,17 @@ impl<V: TransformLeaf> LinearOp<V> for VMapOp<V> {
         );
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
+}
 
-    fn replay_linearized_jit(
+impl<V: TransformLeaf> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V> {
+    fn eval(
         &self,
-        inputs: Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
         if self.has_transpose_body() {
             return Err(TraceError::HigherOrderOpFailure {
-                op: "replay_program_graph",
-                message: "replaying linearized values through a linear vmap op is not implemented".to_string(),
+                op: "eval_linearized_jit",
+                message: "linearized JIT evaluation through a linear vmap op is not implemented".to_string(),
             });
         }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
