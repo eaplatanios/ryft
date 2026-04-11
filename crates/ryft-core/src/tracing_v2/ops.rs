@@ -91,39 +91,20 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
 
 /// Marker trait bundling all capabilities required by the [`PrimitiveOp::Custom`] escape hatch.
 ///
-/// User- or crate-defined operations implement [`Eval<V>`], [`LinearOp<V>`], and
-/// [`DifferentiableOp<V, LinearTerm<V>>`] independently, then declare an `impl CustomOp<V>` to
-/// opt in to dynamic dispatch behind `Arc<dyn CustomOp<V>>`.
-///
-/// The [`eval_linearized_jit`](CustomOp::eval_linearized_jit) method provides the trait-object
-/// equivalent of `Eval<Linearized<JitTracer<V>>>` for custom ops. Built-in ops implement
-/// [`Eval`] directly for the linearized type, but custom ops behind `dyn CustomOp<V>` use this
-/// method instead because `Eval<Linearized<JitTracer<V>>>` cannot be a supertrait without
-/// requiring additional bounds.
+/// User- or crate-defined operations implement [`Eval<V>`], [`LinearOp<V>`],
+/// [`DifferentiableOp<V, LinearTerm<V>>`], and [`Eval<Linearized<JitTracer<V>>>`] independently,
+/// then declare an empty `impl CustomOp<V>` to opt in to dynamic dispatch behind
+/// `Arc<dyn CustomOp<V>>`.
 ///
 /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
-pub trait CustomOp<V: TraceValue>: Eval<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> {
-    /// Evaluates this staged op on linearized JIT tracer values.
-    fn eval_linearized_jit(
-        &self,
-        _inputs: &[JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>],
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TraceValue
-            + FloatExt
-            + ZeroLike
-            + OneLike
-            + Add<Output = V>
-            + Mul<Output = V>
-            + Neg<Output = V>
-            + MatrixOps
-            + crate::tracing_v2::operations::reshape::ReshapeOps,
-    {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "eval_linearized_jit",
-            message: format!("linearized JIT evaluation for custom op '{}' is not implemented", self.name()),
-        })
-    }
+pub trait CustomOp<V: TraceValue>:
+    Eval<V>
+    + LinearOp<V>
+    + DifferentiableOp<V, LinearTerm<V>>
+    + Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
+where
+    crate::tracing_v2::linear::Linearized<JitTracer<V>>: TraceValue,
+{
 }
 
 /// Closed set of built-in staged operations.
@@ -457,7 +438,9 @@ impl<
             }
             Self::VMap(vmap) => vmap.eval(inputs),
             Self::Rematerialize(remat) => remat.eval(inputs),
-            Self::Custom(op) => op.eval_linearized_jit(inputs),
+            Self::Custom(op) => {
+                Eval::<crate::tracing_v2::linear::Linearized<JitTracer<V>>>::eval(op.as_ref(), inputs)
+            }
         }
     }
 }

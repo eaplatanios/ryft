@@ -190,14 +190,21 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for WithShardi
     }
 }
 
-impl CustomOp<ShardMapTensor> for WithShardingConstraintOp {
-    fn eval_linearized_jit(
+impl Eval<Linearized<JitTracer<ShardMapTracer>>> for WithShardingConstraintOp {
+    fn eval(
         &self,
-        inputs: &[Linearized<ShardMapTracer>],
-    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
-        Eval::<Linearized<ShardMapTracer>>::eval(self, inputs)
+        _inputs: &[Linearized<JitTracer<ShardMapTracer>>],
+    ) -> Result<Vec<Linearized<JitTracer<ShardMapTracer>>>, TraceError> {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "eval_linearized_jit",
+            message: "linearized JIT evaluation for 'with_sharding_constraint' at the JIT-tracer level is not \
+                      supported"
+                .to_string(),
+        })
     }
 }
+
+impl CustomOp<ShardMapTensor> for WithShardingConstraintOp {}
 
 impl CustomOp<ShardMapTracer> for WithShardingConstraintOp {}
 

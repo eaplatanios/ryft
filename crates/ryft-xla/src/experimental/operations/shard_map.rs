@@ -292,14 +292,7 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
     }
 }
 
-impl CustomOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
-    fn eval_linearized_jit(
-        &self,
-        inputs: &[Linearized<ShardMapTracer>],
-    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
-        Eval::<Linearized<ShardMapTracer>>::eval(self, inputs)
-    }
-}
+impl CustomOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {}
 
 impl Op for ShardMapOp<ShardMapTracer> {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -396,6 +389,21 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for ShardMapOp
         Err(TraceError::HigherOrderOpFailure {
             op: "jvp",
             message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
+        })
+    }
+}
+
+impl Eval<Linearized<JitTracer<ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
+    fn eval(
+        &self,
+        _inputs: &[Linearized<JitTracer<ShardMapTracer>>],
+    ) -> Result<Vec<Linearized<JitTracer<ShardMapTracer>>>, TraceError> {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "eval_linearized_jit",
+            message: format!(
+                "linearized JIT evaluation for staged op '{}' at the JIT-tracer level is not supported",
+                self.name()
+            ),
         })
     }
 }
