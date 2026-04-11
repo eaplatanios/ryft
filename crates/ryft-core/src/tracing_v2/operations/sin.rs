@@ -70,13 +70,6 @@ impl<V: TraceValue + FloatExt + ZeroLike> DifferentiableOp<V> for SinOp {
         }])
     }
 
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        self.jvp(inputs)
-    }
-
     fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
     where
         T: TangentSpace<V>,

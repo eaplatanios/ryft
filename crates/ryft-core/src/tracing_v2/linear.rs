@@ -222,16 +222,6 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
     }
 }
 
-fn apply_program_jvp_rule<V>(
-    op: &PrimitiveOp<V>,
-    inputs: &[JvpTracer<V, LinearTerm<V>>],
-) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
-{
-    op.apply_program_jvp_rule(inputs)
-}
-
 fn transpose_program_op<V>(
     op: &PrimitiveOp<V>,
     builder: &mut ProgramBuilder<V>,
@@ -304,7 +294,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TraceError>>()?;
-        let output_duals = apply_program_jvp_rule(&equation.op, input_duals.as_slice())?;
+        let output_duals = equation.op.apply_program_jvp_rule(input_duals.as_slice())?;
         if output_duals.len() != equation.outputs.len() {
             return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
         }

@@ -97,13 +97,6 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for ScaleOp
         }])
     }
 
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        self.jvp(inputs)
-    }
-
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,

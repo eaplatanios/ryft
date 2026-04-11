@@ -69,13 +69,6 @@ impl<V: TraceValue + Neg<Output = V> + ZeroLike> DifferentiableOp<V> for NegOp {
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: inputs[0].tangent.clone().neg() }])
     }
 
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        self.jvp(inputs)
-    }
-
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,

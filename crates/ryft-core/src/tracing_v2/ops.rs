@@ -60,14 +60,21 @@ pub trait Eval<V: TraceValue>: Op {
 
 /// Extension of [`Op`] for operations that participate in program-level differentiation.
 ///
-/// Operations implementing this trait provide rules for forward-mode linearization ([`apply_program_jvp_rule`]),
+/// Operations implementing this trait provide rules for forward-mode differentiation ([`jvp`]),
 /// reverse-mode transposition ([`transpose_program_op`]), and higher-order JIT replay
 /// ([`replay_linearized_jit`]). Default implementations return [`TraceError::HigherOrderOpFailure`] so that
 /// operations only need to override the methods relevant to their transform support.
 ///
+/// Most operations should implement [`jvp`] for the generic forward-mode rule and rely on the default
+/// [`apply_program_jvp_rule`] which delegates to it. Operations whose program-level JVP rule requires
+/// tangent-space capabilities beyond [`TangentSpace`] (e.g., higher-order ops that manipulate
+/// [`LinearTerm`] directly) can override [`apply_program_jvp_rule`] instead.
+///
+/// [`jvp`]: DifferentiableOp::jvp
 /// [`apply_program_jvp_rule`]: DifferentiableOp::apply_program_jvp_rule
 /// [`transpose_program_op`]: DifferentiableOp::transpose_program_op
 /// [`replay_linearized_jit`]: DifferentiableOp::replay_linearized_jit
+/// [`TangentSpace`]: crate::tracing_v2::forward::TangentSpace
 pub trait DifferentiableOp<V: TraceValue>: Op {
     /// Replays this staged op while tracing a linearized JIT program.
     fn replay_linearized_jit(
@@ -85,10 +92,11 @@ pub trait DifferentiableOp<V: TraceValue>: Op {
 
     /// Applies this op's program-level JVP rule while linearizing a staged program.
     ///
-    /// The required value bounds are determined by each operation's impl block, not by this trait method.
-    /// For example, [`SinOp`](crate::tracing_v2::operations::SinOp) needs `V: FloatExt` for `cos(x)` in the
-    /// chain rule, while [`AddOp`](crate::tracing_v2::operations::AddOp) only needs the tangent addition
-    /// provided by [`LinearTerm`].
+    /// The default implementation delegates to [`jvp`](DifferentiableOp::jvp) with `T = LinearTerm<V>`,
+    /// which is correct for operations whose forward-mode rule is generic over any
+    /// [`TangentSpace`](crate::tracing_v2::forward::TangentSpace). Operations that need
+    /// [`LinearTerm`]-specific capabilities (e.g., higher-order ops that stage sub-programs into the
+    /// tangent builder) should override this method directly.
     fn apply_program_jvp_rule(
         &self,
         _inputs: &[JvpTracer<V, LinearTerm<V>>],
@@ -101,8 +109,8 @@ pub trait DifferentiableOp<V: TraceValue>: Op {
 
     /// Applies this op's transpose rule while transposing a linearized staged program.
     ///
-    /// Like [`apply_program_jvp_rule`](DifferentiableOp::apply_program_jvp_rule), the required value bounds
-    /// are determined by each operation's impl block.
+    /// Like [`jvp`](DifferentiableOp::jvp), the required value bounds are determined by each operation's
+    /// impl block.
     fn transpose_program_op(
         &self,
         _builder: &mut ProgramBuilder<V>,
@@ -422,15 +430,15 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         match self {
-            Self::Add => AddOp.apply_program_jvp_rule(inputs),
-            Self::Mul => MulOp.apply_program_jvp_rule(inputs),
-            Self::Neg => NegOp.apply_program_jvp_rule(inputs),
-            Self::Sin => SinOp.apply_program_jvp_rule(inputs),
-            Self::Cos => CosOp.apply_program_jvp_rule(inputs),
+            Self::Add => AddOp.jvp(inputs),
+            Self::Mul => MulOp.jvp(inputs),
+            Self::Neg => NegOp.jvp(inputs),
+            Self::Sin => SinOp.jvp(inputs),
+            Self::Cos => CosOp.jvp(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).jvp(inputs),
             Self::MatMul => MatMulOp.apply_program_jvp_rule(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.apply_program_jvp_rule(inputs),
             Self::LinearMatrixTranspose => LinearMatrixTransposeOp.apply_program_jvp_rule(inputs),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).apply_program_jvp_rule(inputs),
             Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).apply_program_jvp_rule(inputs),
             Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).apply_program_jvp_rule(inputs),
             Self::Reshape { input_type, output_type } => {
