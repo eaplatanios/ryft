@@ -9,7 +9,7 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, CustomOp, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
+        AtomId, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
         MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
     },
     types::{ArrayType, Typed},
@@ -292,8 +292,6 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
     }
 }
 
-impl CustomOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {}
-
 impl Op for ShardMapOp<ShardMapTracer> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -407,8 +405,6 @@ impl Eval<Linearized<JitTracer<ShardMapTracer>>> for ShardMapOp<ShardMapTracer> 
         })
     }
 }
-
-impl CustomOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {}
 
 trait ReplayShardMapValue:
     Clone

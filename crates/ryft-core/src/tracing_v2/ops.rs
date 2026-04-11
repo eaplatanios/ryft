@@ -89,12 +89,11 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>;
 }
 
-/// Marker trait bundling all capabilities required by the [`PrimitiveOp::Custom`] escape hatch.
+/// Bundle of all capabilities required by the [`PrimitiveOp::Custom`] escape hatch.
 ///
-/// User- or crate-defined operations implement [`Eval<V>`], [`LinearOp<V>`],
-/// [`DifferentiableOp<V, LinearTerm<V>>`], and [`Eval<Linearized<JitTracer<V>>>`] independently,
-/// then declare an empty `impl CustomOp<V>` to opt in to dynamic dispatch behind
-/// `Arc<dyn CustomOp<V>>`.
+/// This trait exists solely to give Rust a single name for `dyn` dispatch. It is automatically
+/// implemented for any type that satisfies the four underlying trait bounds — user code should
+/// never write `impl CustomOp<V>` directly.
 ///
 /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
 pub trait CustomOp<V: TraceValue>:
@@ -103,6 +102,16 @@ pub trait CustomOp<V: TraceValue>:
     + DifferentiableOp<V, LinearTerm<V>>
     + Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
 where
+    crate::tracing_v2::linear::Linearized<JitTracer<V>>: TraceValue,
+{
+}
+
+impl<V: TraceValue, T> CustomOp<V> for T
+where
+    T: Eval<V>
+        + LinearOp<V>
+        + DifferentiableOp<V, LinearTerm<V>>
+        + Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>>,
     crate::tracing_v2::linear::Linearized<JitTracer<V>>: TraceValue,
 {
 }

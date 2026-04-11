@@ -8,7 +8,7 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomOp, Eval, PrimitiveOp, TraceError,
+    Eval, PrimitiveOp, TraceError,
     forward::JvpTracer,
     graph::AtomId,
     jit::JitTracer,
@@ -203,10 +203,6 @@ impl Eval<Linearized<JitTracer<ShardMapTracer>>> for WithShardingConstraintOp {
         })
     }
 }
-
-impl CustomOp<ShardMapTensor> for WithShardingConstraintOp {}
-
-impl CustomOp<ShardMapTracer> for WithShardingConstraintOp {}
 
 #[cfg(test)]
 mod tests {
