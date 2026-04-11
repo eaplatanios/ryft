@@ -112,10 +112,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
     fn apply_program_jvp_rule(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + MatrixOps,
-    {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
@@ -134,10 +131,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + MatrixOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;

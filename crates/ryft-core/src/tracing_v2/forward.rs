@@ -61,8 +61,13 @@ impl<V: TraceValue + FloatExt + ZeroLike> TangentSpace<V> for V {
 }
 
 /// Forward-mode tracer carrying both a primal and a tangent.
+///
+/// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
+/// signatures (e.g., trait default methods) without propagating value-level bounds. The required
+/// relationship `T: TangentSpace<V>` is enforced on the impl blocks that actually operate on the
+/// values.
 #[derive(Clone, Debug)]
-pub struct JvpTracer<V: TraceValue, T: TangentSpace<V>> {
+pub struct JvpTracer<V, T> {
     /// The primal value.
     pub primal: V,
     /// The tangent value associated with the primal.

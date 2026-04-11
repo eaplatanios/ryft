@@ -238,7 +238,7 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<V: TransformLeaf + ReshapeValue> ReshapeOps for JitTracer<V> {
+impl<V: TransformLeaf> ReshapeOps for JitTracer<V> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
         let input_type = self.tpe();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
@@ -391,7 +391,7 @@ impl<V: ReshapeValue> Eval<V> for ReshapeOp {
     }
 }
 
-impl<V: ReshapeValue> DifferentiableOp<V> for ReshapeOp {
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> DifferentiableOp<V> for ReshapeOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -412,10 +412,7 @@ impl<V: ReshapeValue> DifferentiableOp<V> for ReshapeOp {
     fn apply_program_jvp_rule(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
@@ -426,10 +423,7 @@ impl<V: ReshapeValue> DifferentiableOp<V> for ReshapeOp {
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;

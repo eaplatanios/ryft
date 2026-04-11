@@ -85,13 +85,15 @@ pub trait DifferentiableOp<V: TraceValue>: Op {
     }
 
     /// Applies this op's program-level JVP rule while linearizing a staged program.
+    ///
+    /// The required value bounds are determined by each operation's impl block, not by this trait method.
+    /// For example, [`SinOp`](crate::tracing_v2::operations::SinOp) needs `V: FloatExt` for `cos(x)` in the
+    /// chain rule, while [`AddOp`](crate::tracing_v2::operations::AddOp) only needs the tangent addition
+    /// provided by [`LinearTerm`].
     fn apply_program_jvp_rule(
         &self,
         _inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "linearize_program",
             message: format!("JVP rule for staged op '{}' is not implemented", self.name()),
@@ -99,16 +101,16 @@ pub trait DifferentiableOp<V: TraceValue>: Op {
     }
 
     /// Applies this op's transpose rule while transposing a linearized staged program.
+    ///
+    /// Like [`apply_program_jvp_rule`](DifferentiableOp::apply_program_jvp_rule), the required value bounds
+    /// are determined by each operation's impl block.
     fn transpose_program_op(
         &self,
         _builder: &mut ProgramBuilder<V>,
         _inputs: &[AtomId],
         _outputs: &[AtomId],
         _output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "transpose_linear_program",
             message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
@@ -242,10 +244,7 @@ impl<T: DifferentiableOp<V> + ?Sized, V: TraceValue> DifferentiableOp<V> for Arc
     fn apply_program_jvp_rule(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         (**self).apply_program_jvp_rule(inputs)
     }
 
@@ -256,10 +255,7 @@ impl<T: DifferentiableOp<V> + ?Sized, V: TraceValue> DifferentiableOp<V> for Arc
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
     }
 }
@@ -428,10 +424,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
     fn apply_program_jvp_rule(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         match self {
             Self::Add => AddOp.apply_program_jvp_rule(inputs),
             Self::Mul => MulOp.apply_program_jvp_rule(inputs),
@@ -461,10 +454,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         match self {
             Self::Add => AddOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
             Self::Mul => MulOp.transpose_program_op(builder, inputs, outputs, output_cotangents),

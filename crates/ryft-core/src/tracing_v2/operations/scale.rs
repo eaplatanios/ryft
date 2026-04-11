@@ -10,7 +10,7 @@ use std::{
 use indoc::indoc;
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
@@ -81,7 +81,7 @@ impl<V: TraceValue + Mul<Output = V>> Eval<V> for ScaleOp<V> {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>> DifferentiableOp<V> for ScaleOp<V> {
+impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for ScaleOp<V> {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -100,10 +100,7 @@ impl<V: TraceValue + Mul<Output = V>> DifferentiableOp<V> for ScaleOp<V> {
     fn apply_program_jvp_rule(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         self.jvp(inputs)
     }
 
@@ -113,10 +110,7 @@ impl<V: TraceValue + Mul<Output = V>> DifferentiableOp<V> for ScaleOp<V> {
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;

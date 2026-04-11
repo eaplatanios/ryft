@@ -79,7 +79,9 @@ impl<V: MatrixValue> Eval<V> for RightMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue> DifferentiableOp<V> for RightMatMulOp<V> {
+impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps> DifferentiableOp<V>
+    for RightMatMulOp<V>
+{
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -99,10 +101,7 @@ impl<V: MatrixValue> DifferentiableOp<V> for RightMatMulOp<V> {
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;

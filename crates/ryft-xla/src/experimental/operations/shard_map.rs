@@ -218,10 +218,7 @@ impl DifferentiableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<Linearized<ShardMapTracer>>,
-    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError>
-    where
-        ShardMapTensor: FloatExt + ZeroLike + OneLike + MatrixOps,
-    {
+    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let primal_output_values = self.eval(primal_values.as_slice())?;
@@ -250,10 +247,7 @@ impl DifferentiableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn apply_program_jvp_rule(
         &self,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError>
-    where
-        ShardMapTensor: FloatExt + ZeroLike + MatrixOps,
-    {
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
         if self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "linearize_program",
@@ -269,10 +263,7 @@ impl DifferentiableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        ShardMapTensor: FloatExt + ZeroLike + MatrixOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         if !self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
@@ -361,10 +352,7 @@ impl DifferentiableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>
-    where
-        ShardMapTracer: FloatExt + ZeroLike + MatrixOps,
-    {
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
         if !self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",

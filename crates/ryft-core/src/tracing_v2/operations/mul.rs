@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
+    TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
@@ -55,7 +55,7 @@ impl<V: TraceValue + Mul<Output = V>> Eval<V> for MulOp {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>> DifferentiableOp<V> for MulOp {
+impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for MulOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -78,10 +78,7 @@ impl<V: TraceValue + Mul<Output = V>> DifferentiableOp<V> for MulOp {
     fn apply_program_jvp_rule(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         self.jvp(inputs)
     }
 }

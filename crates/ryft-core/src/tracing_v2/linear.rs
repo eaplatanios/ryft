@@ -7,6 +7,7 @@ use std::{
     cell::RefCell,
     fmt::{Debug, Display},
     marker::PhantomData,
+    ops::{Add, Mul, Neg},
     rc::Rc,
 };
 
@@ -21,7 +22,7 @@ use crate::{
         graph::{AtomId, Graph},
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, Eval, Op, PrimitiveOp},
+        ops::{DifferentiableOp, Op, PrimitiveOp},
         program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };
@@ -33,7 +34,7 @@ pub struct LinearTerm<V: TraceValue> {
     builder: Rc<RefCell<ProgramBuilder<V>>>,
 }
 
-impl<V: TraceValue + FloatExt> LinearTerm<V> {
+impl<V: TraceValue> LinearTerm<V> {
     #[inline]
     pub fn atom(&self) -> AtomId {
         self.atom
@@ -49,14 +50,16 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
         Self { atom, builder }
     }
 
+    /// Stages a multi-input operation in the tangent program builder.
+    ///
+    /// Shape validation is performed via [`Op::abstract_eval`]. Concrete evaluation is intentionally
+    /// skipped — tangent program atoms carry placeholder example values (cloned from the first input)
+    /// since the tangent program is never interpreted for its example values.
     pub fn apply_staged_op(
         inputs: &[Self],
         op: ProgramOpRef<V>,
         output_count: usize,
-    ) -> Result<Vec<Self>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
-    {
+    ) -> Result<Vec<Self>, TraceError> {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
         }
@@ -76,12 +79,9 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
                 .map(|id| borrow.atom(*id).expect("staged input should exist").abstract_value.clone())
                 .collect::<Vec<_>>(),
         )?;
-        let output_examples = op.eval(
-            &input_atoms
-                .iter()
-                .map(|id| borrow.atom(*id).expect("staged input should exist").example_value.clone())
-                .collect::<Vec<_>>(),
-        )?;
+        // Tangent program example values are placeholders — use the first input's example for each output.
+        let placeholder = borrow.atom(input_atoms[0]).expect("staged input should exist").example_value.clone();
+        let output_examples = vec![placeholder; output_abstracts.len()];
         let output_atoms = borrow.add_equation_prevalidated(op, input_atoms, output_abstracts, output_examples);
         drop(borrow);
         if output_atoms.len() != output_count {
@@ -90,9 +90,10 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
         Ok(output_atoms.into_iter().map(|atom| Self { atom, builder: builder.clone() }).collect())
     }
 
-    /// Stages a unary linear op in the program builder, bypassing `Op::eval` validation.
+    /// Stages a unary linear op in the program builder.
     ///
-    /// The output atom reuses the abstract type of the input atom (valid for shape-preserving linear ops).
+    /// The output atom reuses the abstract type and example value of the input atom, which is valid
+    /// for shape-preserving linear operations in tangent programs.
     #[inline]
     pub fn apply_linear_op(self, op: ProgramOpRef<V>) -> Self {
         let mut borrow = self.builder.borrow_mut();
@@ -104,6 +105,7 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
         Self { atom, builder: self.builder }
     }
 
+    /// Stages an addition of two tangent terms.
     #[inline]
     pub fn add(self, rhs: Self) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
@@ -121,18 +123,20 @@ impl<V: TraceValue + FloatExt> LinearTerm<V> {
         Self { atom, builder: self.builder }
     }
 
+    /// Stages a negation of this tangent term.
     #[inline]
     pub fn neg(self) -> Self {
         self.apply_linear_op(PrimitiveOp::Neg)
     }
 
+    /// Stages a scaling of this tangent term by a concrete factor.
     #[inline]
     pub fn scale(self, factor: V) -> Self {
         self.apply_linear_op(PrimitiveOp::Scale { factor })
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + MatrixOps> TangentSpace<V> for LinearTerm<V> {
+impl<V: TraceValue + ZeroLike> TangentSpace<V> for LinearTerm<V> {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
         lhs.add(rhs)
@@ -223,7 +227,7 @@ fn apply_program_jvp_rule<V>(
     inputs: &[JvpTracer<V, LinearTerm<V>>],
 ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
 {
     op.apply_program_jvp_rule(inputs)
 }
@@ -236,7 +240,7 @@ fn transpose_program_op<V>(
     output_cotangents: &[AtomId],
 ) -> Result<Vec<Option<AtomId>>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
 {
     op.transpose_program_op(builder, inputs, outputs, output_cotangents)
 }
@@ -245,7 +249,7 @@ pub fn linearize_program<V, Input, Output>(
     program: &Program<V, Input, Output>,
 ) -> Result<LinearProgram<V, Input, Output>, TraceError>
 where
-    V: TransformLeaf,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
@@ -515,7 +519,7 @@ pub fn replay_program_graph_linearized_jit<GraphInput, GraphOutput, V>(
 where
     GraphInput: Parameterized<V>,
     GraphOutput: Parameterized<V>,
-    V: TransformLeaf,
+    V: TransformLeaf + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
 {
     replay_program_graph_with(graph, inputs, lift_linearized_traced_constant, |op, values| {
         op.replay_linearized_jit(values)

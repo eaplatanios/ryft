@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, IdentityValue, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
         TransformLeaf, ZeroLike,
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, Eval, Op, PrimitiveOp},
@@ -215,10 +215,7 @@ impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
     fn apply_program_jvp_rule(
         &self,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError> {
         if self.has_transpose_body() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "linearize_program",
@@ -246,10 +243,7 @@ impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
         inputs: &[crate::tracing_v2::AtomId],
         outputs: &[crate::tracing_v2::AtomId],
         output_cotangents: &[crate::tracing_v2::AtomId],
-    ) -> Result<Vec<Option<crate::tracing_v2::AtomId>>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + super::reshape::ReshapeOps,
-    {
+    ) -> Result<Vec<Option<crate::tracing_v2::AtomId>>, TraceError> {
         if !self.has_transpose_body() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
@@ -297,7 +291,7 @@ impl<V: TransformLeaf> Eval<JitTracer<V>> for VMapOp<V> {
 /// Builds one linearized staged `vmap` op from its primal body.
 pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<VMapOp<V>, TraceError>
 where
-    V: TransformLeaf,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + std::ops::Add<Output = V> + std::ops::Mul<Output = V> + std::ops::Neg<Output = V>,
 {
     let pushforward = linearize_program(body.compiled.program())?;
     let pullback = transpose_linear_program(&pushforward)?;
