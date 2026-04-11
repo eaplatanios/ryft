@@ -10,7 +10,7 @@ use std::{
 use indoc::indoc;
 
 use crate::tracing_v2::{
-    TraceError, TraceValue, TransformLeaf, ZeroLike,
+    TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
@@ -111,7 +111,7 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
     }
 }
 
-impl<V: TransformLeaf + Mul<Output = V>>
+impl<V: TraceValue + ZeroLike + Mul<Output = V>>
     Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for ScaleOp<V>
 {
     fn eval(

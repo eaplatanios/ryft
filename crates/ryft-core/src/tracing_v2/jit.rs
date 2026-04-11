@@ -17,7 +17,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         graph::AtomId,
         operations::reshape::ReshapeOps,
         ops::PrimitiveOp,
@@ -57,10 +57,7 @@ impl<V: TraceValue> JitTracer<V> {
         Self { value, atom, builder, staging_error }
     }
 
-    pub fn apply_staged_op(inputs: &[Self], op: PrimitiveOp<V>, output_values: Vec<V>) -> Result<Vec<Self>, TraceError>
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
-    {
+    pub fn apply_staged_op(inputs: &[Self], op: PrimitiveOp<V>, output_values: Vec<V>) -> Result<Vec<Self>, TraceError> {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
         }
@@ -82,7 +79,7 @@ impl<V: TraceValue> JitTracer<V> {
         let output_atoms = if staging_error.borrow().is_some() {
             vec![inputs[0].atom; output_values.len()]
         } else {
-            match builder.borrow_mut().add_equation(op, input_atoms) {
+            match builder.borrow_mut().add_equation_with_output_values(op, input_atoms, output_values.clone()) {
                 Ok(outputs) => outputs,
                 Err(error) => {
                     *staging_error.borrow_mut() = Some(error);
@@ -98,15 +95,12 @@ impl<V: TraceValue> JitTracer<V> {
             .collect())
     }
 
-    pub fn unary(self, op: PrimitiveOp<V>, apply: impl FnOnce(V) -> V) -> Self
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
-    {
+    pub fn unary(self, op: PrimitiveOp<V>, apply: impl FnOnce(V) -> V) -> Self {
         let value = apply(self.value);
         let atom = if self.staging_error.borrow().is_some() {
             self.atom
         } else {
-            match self.builder.borrow_mut().add_equation(op, vec![self.atom]) {
+            match self.builder.borrow_mut().add_equation_with_output_values(op, vec![self.atom], vec![value.clone()]) {
                 Ok(outputs) => outputs[0],
                 Err(error) => {
                     *self.staging_error.borrow_mut() = Some(error);
@@ -117,17 +111,18 @@ impl<V: TraceValue> JitTracer<V> {
         Self { value, atom, builder: self.builder, staging_error: self.staging_error }
     }
 
-    pub fn binary(self, rhs: Self, op: PrimitiveOp<V>, apply: impl FnOnce(V, V) -> V) -> Self
-    where
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
-    {
+    pub fn binary(self, rhs: Self, op: PrimitiveOp<V>, apply: impl FnOnce(V, V) -> V) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         debug_assert!(Rc::ptr_eq(&self.staging_error, &rhs.staging_error));
         let value = apply(self.value, rhs.value);
         let atom = if self.staging_error.borrow().is_some() {
             self.atom
         } else {
-            match self.builder.borrow_mut().add_equation(op, vec![self.atom, rhs.atom]) {
+            match self
+                .builder
+                .borrow_mut()
+                .add_equation_with_output_values(op, vec![self.atom, rhs.atom], vec![value.clone()])
+            {
                 Ok(outputs) => outputs[0],
                 Err(error) => {
                     *self.staging_error.borrow_mut() = Some(error);
@@ -148,7 +143,7 @@ impl<V: TraceValue> Typed<ArrayType> for JitTracer<V> {
 
 impl<V: TraceValue> TraceValue for JitTracer<V> {}
 
-impl<V: TransformLeaf> ZeroLike for JitTracer<V> {
+impl<V: TraceValue + ZeroLike> ZeroLike for JitTracer<V> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.value.zero_like();
@@ -157,7 +152,7 @@ impl<V: TransformLeaf> ZeroLike for JitTracer<V> {
     }
 }
 
-impl<V: TransformLeaf> OneLike for JitTracer<V> {
+impl<V: TraceValue + OneLike> OneLike for JitTracer<V> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.value.one_like();
@@ -166,7 +161,7 @@ impl<V: TransformLeaf> OneLike for JitTracer<V> {
     }
 }
 
-impl<V: TransformLeaf + Add<Output = V>> Add for JitTracer<V> {
+impl<V: TraceValue + Add<Output = V>> Add for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -175,7 +170,7 @@ impl<V: TransformLeaf + Add<Output = V>> Add for JitTracer<V> {
     }
 }
 
-impl<V: TransformLeaf + Mul<Output = V>> Mul for JitTracer<V> {
+impl<V: TraceValue + Mul<Output = V>> Mul for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -184,7 +179,7 @@ impl<V: TransformLeaf + Mul<Output = V>> Mul for JitTracer<V> {
     }
 }
 
-impl<V: TransformLeaf + Neg<Output = V>> Neg for JitTracer<V> {
+impl<V: TraceValue + Neg<Output = V>> Neg for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -193,7 +188,7 @@ impl<V: TransformLeaf + Neg<Output = V>> Neg for JitTracer<V> {
     }
 }
 
-impl<V: TransformLeaf> FloatExt for JitTracer<V> {
+impl<V: TraceValue + FloatExt> FloatExt for JitTracer<V> {
     #[inline]
     fn sin(self) -> Self {
         self.unary(PrimitiveOp::Sin, FloatExt::sin)
@@ -431,7 +426,7 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing_v2::{FloatExt, MatrixOps, OneLike, TransformLeaf, ZeroLike, operations::reshape::ReshapeOps},
+            tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike, operations::reshape::ReshapeOps},
             types::{ArrayType, DataType, Typed},
         };
 
@@ -519,8 +514,6 @@ mod tests {
                 false
             }
         }
-
-        impl TransformLeaf for TestAbstractValue {}
 
         let result: Result<
             (

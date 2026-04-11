@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        FloatExt, TraceError, TraceValue, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
@@ -204,7 +204,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     }
 }
 
-impl<V: TransformLeaf> MatrixOps for JitTracer<V> {
+impl<V: TraceValue + MatrixOps> MatrixOps for JitTracer<V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
         self.binary(rhs, PrimitiveOp::MatMul, MatrixOps::matmul)

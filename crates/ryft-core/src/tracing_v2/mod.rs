@@ -47,25 +47,6 @@ pub use program::Program;
 pub use program::{ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, IdentityValue, OneLike, TraceValue, ZeroLike};
 
-/// Canonical concrete leaf types supported by the public `tracing_v2` transform entry points.
-///
-/// This trait is intentionally not implemented for [`JitTracer`]. Higher-order transform composition should go
-/// through staged replay rather than recursively instantiating `JitTracer<JitTracer<...>>`.
-pub trait TransformLeaf:
-    TraceValue + FloatExt + ZeroLike + OneLike + IdentityValue + MatrixOps + operations::reshape::ReshapeOps
-{
-}
-
-impl TransformLeaf for f32 {}
-
-impl TransformLeaf for f64 {}
-
-#[cfg(any(feature = "ndarray", test))]
-impl TransformLeaf for ndarray::Array2<f32> {}
-
-#[cfg(any(feature = "ndarray", test))]
-impl TransformLeaf for ndarray::Array2<f64> {}
-
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TraceError {

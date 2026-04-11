@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
         ZeroLike,
         linear::{linearize_program, transpose_linear_program},
         operations::reshape::ReshapeOps,
@@ -177,7 +177,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eva
     }
 }
 
-impl<V: TransformLeaf> LinearOp<V> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for VMapOp<V> {
     fn transpose_program_op(
         &self,
         builder: &mut crate::tracing_v2::ProgramBuilder<V>,
@@ -224,7 +224,7 @@ impl<V: TransformLeaf> LinearOp<V> for VMapOp<V> {
     }
 }
 
-impl<V: TransformLeaf> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V> {
     fn eval(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
@@ -262,7 +262,7 @@ impl<V: TransformLeaf> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
     }
 }
 
-impl<V: TransformLeaf> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V> {
     fn jvp(
         &self,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
@@ -289,7 +289,7 @@ impl<V: TransformLeaf> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V> {
     }
 }
 
-impl<V: TransformLeaf> Eval<JitTracer<V>> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eval<JitTracer<V>> for VMapOp<V> {
     fn eval(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let output_values = <Self as Eval<V>>::eval(self, concrete_inputs.as_slice())?;

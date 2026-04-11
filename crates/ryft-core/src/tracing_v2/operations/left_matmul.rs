@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, OneLike, TraceError, TransformLeaf, ZeroLike,
+    FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
     batch::Batch as BatchedValue,
     forward::{JvpTracer, TangentSpace},
     graph::AtomId,
@@ -99,7 +99,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
     }
 }
 
-impl<V: TransformLeaf + MatrixOps>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps>
     Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for LeftMatMulOp<V>
 {
     fn eval(

@@ -20,12 +20,13 @@
 use std::{
     any::Any,
     fmt::{Debug, Display},
+    ops::{Add, Mul, Neg},
     sync::Arc,
 };
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike, batch::Batch, forward::JvpTracer,
-    graph::AtomId, jit::JitTracer, linear::LinearTerm, program::ProgramBuilder,
+    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, batch::Batch, forward::JvpTracer, graph::AtomId,
+    jit::JitTracer, linear::LinearTerm, program::ProgramBuilder,
 };
 use crate::types::{ArrayType, Typed};
 
@@ -98,7 +99,7 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
 /// equivalent of `Eval<Linearized<JitTracer<V>>>` for custom ops. Built-in ops implement
 /// [`Eval`] directly for the linearized type, but custom ops behind `dyn CustomOp<V>` use this
 /// method instead because `Eval<Linearized<JitTracer<V>>>` cannot be a supertrait without
-/// requiring `V: TransformLeaf`.
+/// requiring additional bounds.
 ///
 /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
 pub trait CustomOp<V: TraceValue>: Eval<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> {
@@ -108,14 +109,19 @@ pub trait CustomOp<V: TraceValue>: Eval<V> + LinearOp<V> + DifferentiableOp<V, L
         _inputs: &[JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>],
     ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
     where
-        V: TransformLeaf,
+        V: TraceValue
+            + FloatExt
+            + ZeroLike
+            + OneLike
+            + Add<Output = V>
+            + Mul<Output = V>
+            + Neg<Output = V>
+            + MatrixOps
+            + crate::tracing_v2::operations::reshape::ReshapeOps,
     {
         Err(TraceError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
-            message: format!(
-                "linearized JIT evaluation for custom op '{}' is not implemented",
-                self.name()
-            ),
+            message: format!("linearized JIT evaluation for custom op '{}' is not implemented", self.name()),
         })
     }
 }
@@ -397,7 +403,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
                 .transpose_program_op(builder, inputs, outputs, output_cotangents),
             Self::VMap(_) => Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
-                message: "vmap transpose rule requires TransformLeaf values; use the replay path instead".to_string(),
+                message: "vmap transpose rule requires concrete leaf values; use the replay path instead".to_string(),
             }),
             Self::Rematerialize(remat) => remat.transpose_program_op(builder, inputs, outputs, output_cotangents),
             Self::Custom(op) => op.transpose_program_op(builder, inputs, outputs, output_cotangents),
@@ -418,7 +424,18 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 /// [`ScaleOp`]: crate::tracing_v2::operations::ScaleOp
 /// [`LeftMatMulOp`]: crate::tracing_v2::operations::LeftMatMulOp
 /// [`RightMatMulOp`]: crate::tracing_v2::operations::RightMatMulOp
-impl<V: TransformLeaf> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for PrimitiveOp<V> {
+impl<
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
+> Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for PrimitiveOp<V>
+{
     fn eval(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
@@ -479,7 +496,9 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
     }
 }
 
-impl<V: TransformLeaf> BatchOp<V> for PrimitiveOp<V> {
+impl<V: TraceValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + FloatExt + MatrixOps> BatchOp<V>
+    for PrimitiveOp<V>
+{
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         match self {
             Self::Add => AddOp.batch(inputs),

@@ -12,7 +12,7 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Program, TraceError, TraceValue,
-        TransformLeaf, ZeroLike,
+        ZeroLike,
         jit::try_trace_program,
         linear::{linearize_program, replay_program_graph_linearized_jit, transpose_linear_program},
         operations::reshape::ReshapeOps,
@@ -185,7 +185,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
     }
 }
 
-impl<V: TransformLeaf + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
     Eval<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RematerializeOp<V>
 {
     fn eval(
@@ -259,7 +259,7 @@ impl<
     }
 }
 
-impl<V: TransformLeaf> Eval<JitTracer<V>> for RematerializeOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eval<JitTracer<V>> for RematerializeOp<V> {
     fn eval(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let output_values = <Self as Eval<V>>::eval(self, concrete_inputs.as_slice())?;
@@ -317,7 +317,7 @@ pub(crate) trait RematerializeInvocationLeaf<
 /// Concrete-value dispatch for [`rematerialize`]: the rematerialization boundary is a no-op during
 /// eager execution and simply applies the body function directly.
 impl<
-    V: TransformLeaf,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::IdentityValue + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for V
@@ -334,7 +334,7 @@ impl<
 /// stages a [`RematerializeOp`] in the enclosing [`JitTracer`] scope. The sub-program is traced
 /// once over exemplar values and compiled into a [`CompiledFunction`] that lowering can later handle.
 impl<
-    V: TransformLeaf,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for JitTracer<V>

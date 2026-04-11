@@ -15,7 +15,7 @@ use indoc::indoc;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
+        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         batch::Batch,
         forward::{JvpTracer, TangentSpace},
         graph::AtomId,
@@ -234,7 +234,7 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<V: TransformLeaf> ReshapeOps for JitTracer<V> {
+impl<V: TraceValue + ReshapeOps> ReshapeOps for JitTracer<V> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
         let input_type = self.tpe();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;

@@ -125,14 +125,21 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         self.equations.len()
     }
 
-    /// Adds a staged equation, validating its inputs through abstract evaluation first.
+    /// Adds a staged equation using pre-computed output values, performing abstract-eval validation,
+    /// algebraic identity elimination, and constant folding.
     ///
-    /// When every input atom has [`AtomSource::Constant`] as its source, the operation is folded at
-    /// graph-construction time: `abstract_eval` and `eval` are still executed for validation, but the
-    /// output atoms are recorded as constants and no equation is added to the graph.
-    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
+    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`Eval::eval`] —
+    /// the caller supplies the concrete output values directly. Use this when the caller has already
+    /// computed the outputs (e.g., inside [`JitTracer`](crate::tracing_v2::JitTracer) staging
+    /// methods).
+    pub fn add_equation_with_output_values(
+        &mut self,
+        op: O,
+        inputs: Vec<AtomId>,
+        output_values: Vec<V>,
+    ) -> Result<Vec<AtomId>, TraceError>
     where
-        O: Eval<V>,
+        O: Op,
     {
         let input_abstracts = inputs
             .iter()
@@ -142,15 +149,6 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
                     .ok_or(TraceError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let input_examples = inputs
-            .iter()
-            .map(|input| {
-                self.atom(*input)
-                    .map(|atom| atom.example_value.clone())
-                    .ok_or(TraceError::UnboundAtomId { id: *input })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_examples = op.eval(input_examples.as_slice())?;
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
         // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
@@ -165,7 +163,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         let source = if all_constant { AtomSource::Constant } else { AtomSource::Derived };
         let outputs = output_abstracts
             .into_iter()
-            .zip(output_examples)
+            .zip(output_values)
             .map(|(abstract_value, example_value)| {
                 let id = self.atoms.len();
                 self.atoms.push(Atom { abstract_value, example_value, source: source.clone() });
@@ -177,6 +175,27 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
             self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
         }
         Ok(outputs)
+    }
+
+    /// Adds a staged equation, validating its inputs through abstract evaluation first.
+    ///
+    /// When every input atom has [`AtomSource::Constant`] as its source, the operation is folded at
+    /// graph-construction time: `abstract_eval` and `eval` are still executed for validation, but the
+    /// output atoms are recorded as constants and no equation is added to the graph.
+    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
+    where
+        O: Eval<V>,
+    {
+        let input_examples = inputs
+            .iter()
+            .map(|input| {
+                self.atom(*input)
+                    .map(|atom| atom.example_value.clone())
+                    .ok_or(TraceError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_values = op.eval(input_examples.as_slice())?;
+        self.add_equation_with_output_values(op, inputs, output_values)
     }
 
     /// Finalizes the builder into a graph with the given input/output structures.
