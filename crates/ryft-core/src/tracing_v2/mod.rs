@@ -42,7 +42,7 @@ pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
-pub use ops::{CustomOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp, StagedOpRef};
+pub use ops::{CustomOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp};
 pub use program::Program;
 pub use program::{ProgramBuilder, ProgramOpRef};
 pub use value::{FloatExt, IdentityValue, OneLike, TraceValue, ZeroLike};

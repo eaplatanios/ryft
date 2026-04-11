@@ -172,12 +172,6 @@ pub enum PrimitiveOp<V: TraceValue> {
 /// Canonical operation type used by the staged program IR.
 pub type PrimitiveOpRef<V> = PrimitiveOp<V>;
 
-/// Shared reference to a dynamically dispatched staged operation that supports differentiation.
-///
-/// NOTE: This alias is kept for backward compatibility with code that still wraps ops in `Arc`.
-/// New code should prefer [`PrimitiveOp`] directly.
-pub type StagedOpRef<V> = Arc<dyn CustomOp<V>>;
-
 /// Primitive operation with a batching rule used by `vmap`.
 pub(crate) trait BatchOp<V: TraceValue>: Op {
     /// Applies the primitive's batching rule to batched inputs.
