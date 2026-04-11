@@ -9,8 +9,8 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized, MatrixOps,
-        OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
+        AtomId, CustomOp, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
+        MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
     },
     types::{ArrayType, Typed},
 };
@@ -253,7 +253,7 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let primal_output_values = self.eval(primal_values.as_slice())?;
+        let primal_output_values = Eval::eval(self, primal_values.as_slice())?;
         let primal_outputs = JitTracer::apply_staged_op(
             primal_inputs.as_slice(),
             PrimitiveOp::Custom(std::sync::Arc::new(self.clone())),
@@ -289,6 +289,36 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
             });
         }
         apply_staged_shard_map_jvp_rule(self, inputs)
+    }
+}
+
+impl CustomOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
+    fn eval(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+        Eval::eval(self, inputs)
+    }
+
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
+        DifferentiableOp::jvp(self, inputs)
+    }
+
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<ShardMapTensor>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<Linearized<ShardMapTracer>>,
+    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+        LinearOp::replay_linearized_jit(self, inputs)
     }
 }
 
@@ -390,6 +420,22 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for ShardMapOp
             op: "jvp",
             message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
         })
+    }
+}
+
+impl CustomOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
+    fn eval(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
+        Eval::eval(self, inputs)
+    }
+
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<ShardMapTracer>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
     }
 }
 
@@ -817,7 +863,7 @@ fn apply_staged_shard_map_jvp_rule(
     inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
 ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
     let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-    let primal_outputs = op.eval(primal_inputs.as_slice())?;
+    let primal_outputs = Eval::eval(op, primal_inputs.as_slice())?;
     let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
     let tangent_outputs = LinearTerm::apply_staged_op(
         tangent_inputs.as_slice(),

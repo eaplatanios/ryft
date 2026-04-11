@@ -8,9 +8,9 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    Eval, FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
-    forward::JvpTracer, graph::AtomId, jit::JitTracer, linear::LinearTerm, ops::{DifferentiableOp, LinearOp, Op},
-    program::ProgramBuilder, operations::{expect_input_count, unary_abstract},
+    CustomOp, Eval, FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf,
+    ZeroLike, forward::JvpTracer, graph::AtomId, jit::JitTracer, linear::LinearTerm,
+    ops::{DifferentiableOp, LinearOp, Op}, program::ProgramBuilder, operations::{expect_input_count, unary_abstract},
 };
 use ryft_core::types::ArrayType;
 
@@ -144,6 +144,41 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
         .next()
         .expect("sharding constraint should produce one tangent output");
         Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent }])
+    }
+}
+
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> CustomOp<V>
+    for WithShardingConstraintOp
+{
+    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        Eval::eval(self, inputs)
+    }
+
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        DifferentiableOp::jvp(self, inputs)
+    }
+
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        LinearOp::replay_linearized_jit(self, inputs)
     }
 }
 
@@ -311,8 +346,13 @@ mod tests {
 
         let mut transpose_builder = ProgramBuilder::<ShardMapTensor>::new();
         let output_cotangent = transpose_builder.add_input(&ShardMapTensor::new(input_type));
-        let contribution = WithShardingConstraintOp::new(sharding.clone())
-            .transpose_program_op(&mut transpose_builder, &[input], &[output], &[output_cotangent])
+        let contribution = LinearOp::transpose_program_op(
+            &WithShardingConstraintOp::new(sharding.clone()),
+            &mut transpose_builder,
+            &[input],
+            &[output],
+            &[output_cotangent],
+        )
             .unwrap()[0]
             .unwrap();
 

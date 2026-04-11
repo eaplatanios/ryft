@@ -118,9 +118,62 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
 /// operations must implement [`Eval<V>`] (concrete execution), [`LinearOp<V>`]
 /// (transpose/replay rules), [`DifferentiableOp<V, LinearTerm<V>>`] (program-level JVP), and
 /// [`Op`] (shape-level metadata).
-pub trait CustomOp<V: TraceValue>: Eval<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> {}
+/// User- or crate-defined operation for the [`Custom`](PrimitiveOp::Custom) escape hatch.
+///
+/// Each method has a default that returns an error, so custom ops only override the capabilities they support.
+/// A JIT-only op overrides just [`eval`](CustomOp::eval). A differentiable op also overrides
+/// [`jvp`](CustomOp::jvp) and [`transpose_program_op`](CustomOp::transpose_program_op).
+pub trait CustomOp<V: TraceValue>: Op {
+    /// Executes the operation on concrete values.
+    fn eval(&self, _inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "eval",
+            message: format!("eval for custom op '{}' is not implemented", self.name()),
+        })
+    }
 
-impl<V: TraceValue, T: Eval<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>>> CustomOp<V> for T {}
+    /// Applies the forward-mode JVP rule during program linearization.
+    fn jvp(
+        &self,
+        _inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "linearize_program",
+            message: format!("JVP rule for custom op '{}' is not implemented", self.name()),
+        })
+    }
+
+    /// Applies the transpose rule for reverse-mode differentiation.
+    fn transpose_program_op(
+        &self,
+        _builder: &mut ProgramBuilder<V>,
+        _inputs: &[AtomId],
+        _outputs: &[AtomId],
+        _output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "transpose_linear_program",
+            message: format!("transpose rule for custom op '{}' is not implemented", self.name()),
+        })
+    }
+
+    /// Replays this staged op while tracing a linearized JIT program.
+    fn replay_linearized_jit(
+        &self,
+        _inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "replay_program_graph",
+            message: format!(
+                "replaying linearized values through custom op '{}' is not implemented",
+                self.name()
+            ),
+        })
+    }
+}
 
 /// Closed set of built-in staged operations.
 ///
