@@ -293,27 +293,6 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
 }
 
 impl CustomOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
-    fn eval(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
-        Eval::eval(self, inputs)
-    }
-
-    fn jvp(
-        &self,
-        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
-        DifferentiableOp::jvp(self, inputs)
-    }
-
-    fn transpose_program_op(
-        &self,
-        builder: &mut ProgramBuilder<ShardMapTensor>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
-    }
-
     fn eval_linearized_jit(
         &self,
         inputs: &[Linearized<ShardMapTracer>],
@@ -421,21 +400,7 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for ShardMapOp
     }
 }
 
-impl CustomOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
-    fn eval(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
-        Eval::eval(self, inputs)
-    }
-
-    fn transpose_program_op(
-        &self,
-        builder: &mut ProgramBuilder<ShardMapTracer>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
-    }
-}
+impl CustomOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {}
 
 trait ReplayShardMapValue:
     Clone

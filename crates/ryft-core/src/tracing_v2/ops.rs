@@ -88,53 +88,21 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>;
 }
 
-/// Combined trait for custom operations that support evaluation, linearization, and differentiation.
+/// Marker trait bundling all capabilities required by the [`PrimitiveOp::Custom`] escape hatch.
 ///
-/// This is the required capability set for the [`PrimitiveOp::Custom`] escape hatch. User- or
-/// crate-defined operations implement this single trait for dynamic dispatch behind
-/// `Arc<dyn CustomOp<V>>`.
+/// User- or crate-defined operations implement [`Eval<V>`], [`LinearOp<V>`], and
+/// [`DifferentiableOp<V, LinearTerm<V>>`] independently, then declare an `impl CustomOp<V>` to
+/// opt in to dynamic dispatch behind `Arc<dyn CustomOp<V>>`.
 ///
-/// Each method has a default that returns an error, so custom ops only override the capabilities
-/// they support. A JIT-only op overrides just [`eval`](CustomOp::eval). A differentiable op also
-/// overrides [`jvp`](CustomOp::jvp), [`transpose_program_op`](CustomOp::transpose_program_op),
-/// and [`eval_linearized_jit`](CustomOp::eval_linearized_jit).
-pub trait CustomOp<V: TraceValue>: Op {
-    /// Executes the operation on concrete values.
-    fn eval(&self, _inputs: &[V]) -> Result<Vec<V>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "eval",
-            message: format!("eval for custom op '{}' is not implemented", self.name()),
-        })
-    }
-
-    /// Applies the forward-mode JVP rule during program linearization.
-    fn jvp(&self, _inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "linearize_program",
-            message: format!("JVP rule for custom op '{}' is not implemented", self.name()),
-        })
-    }
-
-    /// Applies the transpose rule for reverse-mode differentiation.
-    fn transpose_program_op(
-        &self,
-        _builder: &mut ProgramBuilder<V>,
-        _inputs: &[AtomId],
-        _outputs: &[AtomId],
-        _output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "transpose_linear_program",
-            message: format!("transpose rule for custom op '{}' is not implemented", self.name()),
-        })
-    }
-
+/// The [`eval_linearized_jit`](CustomOp::eval_linearized_jit) method provides the trait-object
+/// equivalent of `Eval<Linearized<JitTracer<V>>>` for custom ops. Built-in ops implement
+/// [`Eval`] directly for the linearized type, but custom ops behind `dyn CustomOp<V>` use this
+/// method instead because `Eval<Linearized<JitTracer<V>>>` cannot be a supertrait without
+/// requiring `V: TransformLeaf`.
+///
+/// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
+pub trait CustomOp<V: TraceValue>: Eval<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> {
     /// Evaluates this staged op on linearized JIT tracer values.
-    ///
-    /// This is the trait-object equivalent of [`Eval<Linearized<JitTracer<V>>>`] — built-in ops
-    /// implement [`Eval`] directly, but custom ops behind `dyn CustomOp<V>` use this method instead.
-    ///
-    /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
     fn eval_linearized_jit(
         &self,
         _inputs: &[JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>],
@@ -388,7 +356,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
             }
             Self::VMap(vmap) => vmap.eval(inputs),
             Self::Rematerialize(remat) => remat.eval(inputs),
-            Self::Custom(op) => op.eval(inputs),
+            Self::Custom(op) => Eval::<V>::eval(op.as_ref(), inputs),
         }
     }
 }
@@ -506,7 +474,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
             Self::Rematerialize(remat) => DifferentiableOp::<V, LinearTerm<V>>::jvp(remat.as_ref(), inputs),
-            Self::Custom(op) => op.jvp(inputs),
+            Self::Custom(op) => DifferentiableOp::<V, LinearTerm<V>>::jvp(op.as_ref(), inputs),
         }
     }
 }

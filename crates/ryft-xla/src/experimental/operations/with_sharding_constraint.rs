@@ -8,8 +8,7 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomOp, Eval, FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf,
-    ZeroLike,
+    CustomOp, Eval, PrimitiveOp, TraceError,
     forward::JvpTracer,
     graph::AtomId,
     jit::JitTracer,
@@ -19,6 +18,8 @@ use ryft_core::tracing_v2::{
     program::ProgramBuilder,
 };
 use ryft_core::types::ArrayType;
+
+use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
 #[derive(Clone)]
@@ -77,17 +78,17 @@ impl Op for WithShardingConstraintOp {
     }
 }
 
-impl<V: TraceValue> Eval<V> for WithShardingConstraintOp {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+impl Eval<ShardMapTensor> for WithShardingConstraintOp {
+    fn eval(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for WithShardingConstraintOp {
+impl LinearOp<ShardMapTensor> for WithShardingConstraintOp {
     fn transpose_program_op(
         &self,
-        builder: &mut ProgramBuilder<V>,
+        builder: &mut ProgramBuilder<ShardMapTensor>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
@@ -103,10 +104,11 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>>
-    for WithShardingConstraintOp
-{
-    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for WithShardingConstraintOp {
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
@@ -120,32 +122,8 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> CustomOp<V> for WithShardingConstraintOp {
-    fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
-        Eval::eval(self, inputs)
-    }
-
-    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        DifferentiableOp::jvp(self, inputs)
-    }
-
-    fn transpose_program_op(
-        &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        LinearOp::transpose_program_op(self, builder, inputs, outputs, output_cotangents)
-    }
-
-    fn eval_linearized_jit(
-        &self,
-        inputs: &[Linearized<JitTracer<V>>],
-    ) -> Result<Vec<Linearized<JitTracer<V>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
+impl Eval<Linearized<ShardMapTracer>> for WithShardingConstraintOp {
+    fn eval(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
         let primal = JitTracer::apply_staged_op(
@@ -168,6 +146,61 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Cus
     }
 }
 
+impl Eval<ShardMapTracer> for WithShardingConstraintOp {
+    fn eval(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![inputs[0].clone()])
+    }
+}
+
+impl LinearOp<ShardMapTracer> for WithShardingConstraintOp {
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<ShardMapTracer>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        expect_input_count(outputs.len(), 1)?;
+        expect_input_count(output_cotangents.len(), 1)?;
+        let contribution = builder.add_equation(
+            PrimitiveOp::Custom(Arc::new(WithShardingConstraintOp::new(self.sharding().clone()))),
+            vec![output_cotangents[0]],
+        )?[0];
+        Ok(vec![Some(contribution)])
+    }
+}
+
+impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for WithShardingConstraintOp {
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        let tangent = LinearTerm::apply_staged_op(
+            std::slice::from_ref(&inputs[0].tangent),
+            PrimitiveOp::Custom(Arc::new(self.clone())),
+            1,
+        )?
+        .into_iter()
+        .next()
+        .expect("sharding constraint should produce one tangent output");
+        Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent }])
+    }
+}
+
+impl CustomOp<ShardMapTensor> for WithShardingConstraintOp {
+    fn eval_linearized_jit(
+        &self,
+        inputs: &[Linearized<ShardMapTracer>],
+    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+        Eval::<Linearized<ShardMapTracer>>::eval(self, inputs)
+    }
+}
+
+impl CustomOp<ShardMapTracer> for WithShardingConstraintOp {}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -176,8 +209,6 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::ProgramBuilder;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
-
-    use crate::experimental::shard_map::ShardMapTensor;
 
     use super::*;
 
