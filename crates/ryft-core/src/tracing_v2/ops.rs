@@ -13,12 +13,11 @@
 //! └─ BatchOp<V>            — batching rule for vmap
 //! ```
 //!
-//! [`Op`] is intentionally non-generic: `abstract_eval`, `name`, and `as_any` operate on [`ArrayType`] metadata
-//! only. This means `Graph<O: Op, V, ...>` can be constructed, displayed, and simplified for *any* value type
+//! [`Op`] is intentionally non-generic: `abstract_eval` and `name` operate on [`ArrayType`] metadata only.
+//! This means `Graph<O: Op, V, ...>` can be constructed, displayed, and simplified for *any* value type
 //! without requiring operation-specific value bounds.
 
 use std::{
-    any::Any,
     fmt::{Debug, Display},
     ops::{Add, Mul, Neg},
     sync::Arc,
@@ -36,14 +35,25 @@ use crate::types::{ArrayType, Typed};
 /// Concrete execution is provided by the separate [`InterpretableOp`] trait. Staged-program differentiation rules are split
 /// between [`LinearOp`] (transpose/replay) and [`DifferentiableOp`] (forward-mode JVP).
 pub trait Op: Debug + Display {
-    /// Returns this operation as [`Any`] for downcasting.
-    fn as_any(&self) -> &dyn Any;
-
     /// Returns the stable primitive name used in diagnostics and pretty-printing.
     fn name(&self) -> &'static str;
 
     /// Computes abstract output types from abstract input types without executing the operation.
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError>;
+
+    /// Returns simplified output atoms if this operation is a trivial algebraic identity.
+    ///
+    /// Called during graph construction to eliminate no-op operations like `x + 0`, `x * 1`,
+    /// or `scale(x, 1)`. The callbacks check whether an input atom is a constant zero or one.
+    /// Returns `None` if no simplification applies.
+    fn try_simplify(
+        &self,
+        _inputs: &[usize],
+        _is_zero_constant: &dyn Fn(usize) -> bool,
+        _is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        None
+    }
 }
 
 /// Concrete execution capability for staged operations.
@@ -93,13 +103,24 @@ pub trait CustomOp<V: TraceValue>:
 where
     Linearized<JitTracer<V>>: TraceValue,
 {
+    /// Returns this operation as [`Any`](std::any::Any) for downcasting.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
-impl<V: TraceValue, T: InterpretableOp<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> + InterpretableOp<Linearized<JitTracer<V>>>>
-    CustomOp<V> for T
+impl<
+    V: TraceValue,
+    T: 'static
+        + InterpretableOp<V>
+        + LinearOp<V>
+        + DifferentiableOp<V, LinearTerm<V>>
+        + InterpretableOp<Linearized<JitTracer<V>>>,
+> CustomOp<V> for T
 where
     Linearized<JitTracer<V>>: TraceValue,
 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Closed set of built-in staged operations.
@@ -170,11 +191,6 @@ pub(crate) trait BatchOp<V: TraceValue>: Op {
 
 impl<T: Op + ?Sized> Op for Arc<T> {
     #[inline]
-    fn as_any(&self) -> &dyn Any {
-        (**self).as_any()
-    }
-
-    #[inline]
     fn name(&self) -> &'static str {
         (**self).name()
     }
@@ -182,6 +198,16 @@ impl<T: Op + ?Sized> Op for Arc<T> {
     #[inline]
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         (**self).abstract_eval(inputs)
+    }
+
+    #[inline]
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        is_zero_constant: &dyn Fn(usize) -> bool,
+        is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        (**self).try_simplify(inputs, is_zero_constant, is_one_constant)
     }
 }
 
@@ -263,10 +289,6 @@ impl<V: TraceValue> Display for PrimitiveOp<V> {
 
 /// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: TraceValue`.
 impl<V: TraceValue> Op for PrimitiveOp<V> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -306,6 +328,38 @@ impl<V: TraceValue> Op for PrimitiveOp<V> {
             Self::VMap(vmap) => vmap.abstract_eval(inputs),
             Self::Rematerialize(remat) => remat.abstract_eval(inputs),
             Self::Custom(op) => op.abstract_eval(inputs),
+        }
+    }
+
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        is_zero_constant: &dyn Fn(usize) -> bool,
+        is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        match self {
+            Self::Add => AddOp.try_simplify(inputs, is_zero_constant, is_one_constant),
+            Self::Mul => MulOp.try_simplify(inputs, is_zero_constant, is_one_constant),
+            Self::Neg => NegOp.try_simplify(inputs, is_zero_constant, is_one_constant),
+            Self::Scale { factor } => {
+                ScaleOp::new(factor.clone()).try_simplify(inputs, is_zero_constant, is_one_constant)
+            }
+            Self::LeftMatMul { factor } => {
+                if crate::tracing_v2::graph::is_identity_one(factor) {
+                    Some(inputs.to_vec())
+                } else {
+                    None
+                }
+            }
+            Self::RightMatMul { factor } => {
+                if crate::tracing_v2::graph::is_identity_one(factor) {
+                    Some(inputs.to_vec())
+                } else {
+                    None
+                }
+            }
+            Self::Custom(op) => op.try_simplify(inputs, is_zero_constant, is_one_constant),
+            _ => None,
         }
     }
 }
@@ -425,7 +479,9 @@ impl<
             }
             Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Custom(op) => InterpretableOp::<crate::tracing_v2::linear::Linearized<JitTracer<V>>>::interpret(op.as_ref(), inputs),
+            Self::Custom(op) => {
+                InterpretableOp::<crate::tracing_v2::linear::Linearized<JitTracer<V>>>::interpret(op.as_ref(), inputs)
+            }
         }
     }
 }

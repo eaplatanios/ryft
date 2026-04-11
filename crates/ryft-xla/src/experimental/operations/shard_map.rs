@@ -183,10 +183,6 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
 }
 
 impl Op for ShardMapOp<ShardMapTensor> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }
@@ -293,10 +289,6 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
 }
 
 impl Op for ShardMapOp<ShardMapTracer> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }

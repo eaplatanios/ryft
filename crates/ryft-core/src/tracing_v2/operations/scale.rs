@@ -1,7 +1,6 @@
 //! Scaling primitive for [`crate::tracing_v2`].
 
 use std::{
-    any::Any,
     fmt::{Debug, Display},
     ops::Mul,
 };
@@ -60,16 +59,21 @@ impl<V: TraceValue> Display for ScaleOp<V> {
 }
 
 impl<V: TraceValue> Op for ScaleOp<V> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "scale"
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Self::abstract_eval_static(inputs)
+    }
+
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        _is_zero_constant: &dyn Fn(usize) -> bool,
+        _is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        if crate::tracing_v2::graph::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
     }
 }
 

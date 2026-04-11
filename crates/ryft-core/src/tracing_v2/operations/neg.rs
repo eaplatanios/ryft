@@ -1,7 +1,6 @@
 //! Negation primitive for [`crate::tracing_v2`].
 
 use std::{
-    any::Any,
     fmt::{Debug, Display},
     ops::Neg,
 };
@@ -35,16 +34,21 @@ impl Display for NegOp {
 }
 
 impl Op for NegOp {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "neg"
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract(inputs)?])
+    }
+
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        is_zero_constant: &dyn Fn(usize) -> bool,
+        _is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        if inputs.len() == 1 && is_zero_constant(inputs[0]) { Some(vec![inputs[0]]) } else { None }
     }
 }
 

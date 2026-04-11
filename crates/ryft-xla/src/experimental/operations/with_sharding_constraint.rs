@@ -1,7 +1,6 @@
 //! Sharding-constraint primitive for traced XLA programs.
 
 use std::{
-    any::Any,
     fmt::{Debug, Display},
     sync::Arc,
 };
@@ -54,10 +53,6 @@ impl Display for WithShardingConstraintOp {
 }
 
 impl Op for WithShardingConstraintOp {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "with_sharding_constraint"
     }

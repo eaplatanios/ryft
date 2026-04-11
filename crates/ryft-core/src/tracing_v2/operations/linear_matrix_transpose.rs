@@ -34,10 +34,6 @@ impl Display for LinearMatrixTransposeOp {
 }
 
 impl Op for LinearMatrixTransposeOp {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "linear_matrix_transpose"
     }

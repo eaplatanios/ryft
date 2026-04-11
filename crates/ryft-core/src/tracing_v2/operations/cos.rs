@@ -1,9 +1,6 @@
 //! Cosine primitive for [`crate::tracing_v2`].
 
-use std::{
-    any::Any,
-    fmt::{Debug, Display},
-};
+use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
     FloatExt, TraceError, TraceValue, ZeroLike,
@@ -34,10 +31,6 @@ impl Display for CosOp {
 }
 
 impl Op for CosOp {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "cos"
     }

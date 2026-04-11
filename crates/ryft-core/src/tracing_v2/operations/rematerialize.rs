@@ -126,10 +126,6 @@ impl<V: TraceValue> Display for RematerializeOp<V> {
 }
 
 impl<V: TraceValue> Op for RematerializeOp<V> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "rematerialize"
     }

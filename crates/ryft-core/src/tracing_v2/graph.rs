@@ -7,7 +7,7 @@ use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{InterpretableOp, Op, TraceError, TraceValue, ops::PrimitiveOp},
+    tracing_v2::{InterpretableOp, Op, TraceError, TraceValue},
     types::{ArrayType, Typed},
 };
 
@@ -152,7 +152,15 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
         // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
-        if let Some(simplified) = try_identity_elimination(self, &op, &inputs) {
+        let is_zero = |id: usize| {
+            self.atom(id)
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value))
+        };
+        let is_one = |id: usize| {
+            self.atom(id)
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value))
+        };
+        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
 
@@ -232,7 +240,7 @@ impl<O: Clone, V: TraceValue> Default for GraphBuilder<O, V> {
 // ---------------------------------------------------------------------------
 
 /// Checks if a value is a constant zero, using `Any` downcasting for supported types.
-fn is_identity_zero<V: TraceValue>(value: &V) -> bool {
+pub(crate) fn is_identity_zero<V: TraceValue>(value: &V) -> bool {
     let any = value as &dyn std::any::Any;
     if let Some(v) = any.downcast_ref::<f32>() {
         return *v == 0.0;
@@ -253,7 +261,7 @@ fn is_identity_zero<V: TraceValue>(value: &V) -> bool {
 }
 
 /// Checks if a value is a constant one, using `Any` downcasting for supported types.
-fn is_identity_one<V: TraceValue>(value: &V) -> bool {
+pub(crate) fn is_identity_one<V: TraceValue>(value: &V) -> bool {
     let any = value as &dyn std::any::Any;
     if let Some(v) = any.downcast_ref::<f32>() {
         return *v == 1.0;
@@ -271,67 +279,6 @@ fn is_identity_one<V: TraceValue>(value: &V) -> bool {
         }
     }
     false
-}
-
-/// Attempts to eliminate a trivial operation via algebraic identity rules.
-///
-/// Returns `Some(output_atoms)` if the operation was eliminated, `None` otherwise.
-fn try_identity_elimination<O: Clone + Op, V: TraceValue>(
-    builder: &GraphBuilder<O, V>,
-    op: &O,
-    inputs: &[AtomId],
-) -> Option<Vec<AtomId>> {
-    let primitive: &PrimitiveOp<V> = op.as_any().downcast_ref()?;
-    match primitive {
-        PrimitiveOp::Scale { factor } if is_identity_one(factor) => Some(inputs.to_vec()),
-        PrimitiveOp::Add if inputs.len() == 2 => {
-            let left_zero = builder
-                .atom(inputs[0])
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
-            let right_zero = builder
-                .atom(inputs[1])
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
-            if left_zero {
-                Some(vec![inputs[1]])
-            } else if right_zero {
-                Some(vec![inputs[0]])
-            } else {
-                None
-            }
-        }
-        PrimitiveOp::Mul if inputs.len() == 2 => {
-            let left_one = builder
-                .atom(inputs[0])
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value));
-            let right_one = builder
-                .atom(inputs[1])
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value));
-            let left_zero = builder
-                .atom(inputs[0])
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
-            let right_zero = builder
-                .atom(inputs[1])
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
-            if left_one {
-                Some(vec![inputs[1]])
-            } else if right_one {
-                Some(vec![inputs[0]])
-            } else if left_zero {
-                Some(vec![inputs[0]])
-            } else if right_zero {
-                Some(vec![inputs[1]])
-            } else {
-                None
-            }
-        }
-        PrimitiveOp::Neg if inputs.len() == 1 => {
-            let zero = builder
-                .atom(inputs[0])
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
-            if zero { Some(vec![inputs[0]]) } else { None }
-        }
-        _ => None,
-    }
 }
 
 /// Executable staged graph over an open operation set.

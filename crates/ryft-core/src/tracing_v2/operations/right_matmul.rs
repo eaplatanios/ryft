@@ -58,16 +58,21 @@ impl<V: MatrixValue> Display for RightMatMulOp<V> {
 }
 
 impl<V: MatrixValue> Op for RightMatMulOp<V> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "right_matmul"
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         right_matmul_abstract_eval(&<V as Typed<ArrayType>>::tpe(&self.factor), inputs)
+    }
+
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        _is_zero_constant: &dyn Fn(usize) -> bool,
+        _is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        if crate::tracing_v2::graph::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
     }
 }
 

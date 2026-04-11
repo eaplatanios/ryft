@@ -149,10 +149,6 @@ impl<V: TraceValue> Display for VMapOp<V> {
 }
 
 impl<V: TraceValue> Op for VMapOp<V> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "vmap"
     }

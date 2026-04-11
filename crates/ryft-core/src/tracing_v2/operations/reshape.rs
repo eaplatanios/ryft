@@ -4,10 +4,7 @@
 //! and element count. The public trait surface is deliberately fallible because not every traceable leaf type can
 //! represent every logical target shape with the same Rust type.
 
-use std::{
-    any::Any,
-    fmt::{Debug, Display},
-};
+use std::fmt::{Debug, Display};
 
 #[cfg(test)]
 use indoc::indoc;
@@ -363,10 +360,6 @@ impl Display for ReshapeOp {
 }
 
 impl Op for ReshapeOp {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "reshape"
     }

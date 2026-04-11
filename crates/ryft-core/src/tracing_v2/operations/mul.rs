@@ -1,7 +1,6 @@
 //! Multiplication primitive for [`crate::tracing_v2`].
 
 use std::{
-    any::Any,
     fmt::{Debug, Display},
     ops::Mul,
 };
@@ -35,16 +34,35 @@ impl Display for MulOp {
 }
 
 impl Op for MulOp {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "mul"
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![binary_same_abstract("mul", inputs)?])
+    }
+
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        is_zero_constant: &dyn Fn(usize) -> bool,
+        is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        if inputs.len() == 2 {
+            if is_one_constant(inputs[0]) {
+                Some(vec![inputs[1]])
+            } else if is_one_constant(inputs[1]) {
+                Some(vec![inputs[0]])
+            } else if is_zero_constant(inputs[0]) {
+                Some(vec![inputs[0]])
+            } else if is_zero_constant(inputs[1]) {
+                Some(vec![inputs[1]])
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 }
 

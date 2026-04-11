@@ -34,10 +34,6 @@ impl Display for MatMulOp {
 }
 
 impl Op for MatMulOp {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "matmul"
     }
