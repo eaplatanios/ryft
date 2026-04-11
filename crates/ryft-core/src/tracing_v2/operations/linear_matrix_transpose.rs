@@ -68,8 +68,16 @@ impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let abstract_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").abstract_value.clone();
-        let example_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").example_value.clone();
+        let abstract_value = builder
+            .atom(output_cotangents[0])
+            .expect("output cotangent atom should exist")
+            .abstract_value
+            .clone();
+        let example_value = builder
+            .atom(output_cotangents[0])
+            .expect("output cotangent atom should exist")
+            .example_value
+            .clone();
         let contribution = builder.add_equation_prevalidated(
             PrimitiveOp::LinearMatrixTranspose,
             vec![output_cotangents[0]],
@@ -91,9 +99,7 @@ impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V, T>
-    for LinearMatrixTransposeOp
-{
+impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V, T> for LinearMatrixTransposeOp {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])

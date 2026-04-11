@@ -11,15 +11,16 @@ use ryft_core::tracing_v2::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
         record, summarize_graph,
     },
-    grad,
-    vmap,
+    grad, vmap,
 };
 
 use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_graph;
-use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace};
+use crate::experimental::shard_map::{
+    FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace,
+};
 
 /// Returns the XLA-focused IR benchmark cases.
 pub fn cases() -> Vec<BenchmarkCase> {
@@ -169,13 +170,8 @@ where
         case_id,
         "xla",
         "program",
-        to_mlir_module_for_graph(
-            program.graph(),
-            traced.global_input_types(),
-            traced.global_output_types(),
-            "main",
-        )
-        .map_err(|error| BenchmarkError::External(Box::new(error)))?,
+        to_mlir_module_for_graph(program.graph(), traced.global_input_types(), traced.global_output_types(), "main")
+            .map_err(|error| BenchmarkError::External(Box::new(error)))?,
         summary,
     )])
 }

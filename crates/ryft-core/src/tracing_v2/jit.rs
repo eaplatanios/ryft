@@ -57,11 +57,7 @@ impl<V: TraceValue> JitTracer<V> {
         Self { value, atom, builder, staging_error }
     }
 
-    pub fn apply_staged_op(
-        inputs: &[Self],
-        op: PrimitiveOp<V>,
-        output_values: Vec<V>,
-    ) -> Result<Vec<Self>, TraceError>
+    pub fn apply_staged_op(inputs: &[Self], op: PrimitiveOp<V>, output_values: Vec<V>) -> Result<Vec<Self>, TraceError>
     where
         V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     {
@@ -264,9 +260,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledF
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for CompiledFunction<V, Input, Output>
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for CompiledFunction<V, Input, Output> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
     }

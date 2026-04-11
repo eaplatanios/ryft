@@ -122,14 +122,11 @@ mod tests {
     fn test_mul_jvp_matches_the_product_rule() {
         let output = DifferentiableOp::<f64, f64>::jvp(
             &MulOp,
-            &[
-                JvpTracer { primal: 2.0f64, tangent: 3.0f64 },
-                JvpTracer { primal: 5.0f64, tangent: -1.0f64 },
-            ],
+            &[JvpTracer { primal: 2.0f64, tangent: 3.0f64 }, JvpTracer { primal: 5.0f64, tangent: -1.0f64 }],
         )
-            .unwrap()
-            .pop()
-            .unwrap();
+        .unwrap()
+        .pop()
+        .unwrap();
 
         approx_eq(output.primal, 10.0);
         approx_eq(output.tangent, 13.0);

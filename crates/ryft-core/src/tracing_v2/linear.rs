@@ -55,11 +55,7 @@ impl<V: TraceValue> LinearTerm<V> {
     /// Shape validation is performed via [`Op::abstract_eval`]. Concrete evaluation is intentionally
     /// skipped — tangent program atoms carry placeholder example values (cloned from the first input)
     /// since the tangent program is never interpreted for its example values.
-    pub fn apply_staged_op(
-        inputs: &[Self],
-        op: ProgramOpRef<V>,
-        output_count: usize,
-    ) -> Result<Vec<Self>, TraceError> {
+    pub fn apply_staged_op(inputs: &[Self], op: ProgramOpRef<V>, output_count: usize) -> Result<Vec<Self>, TraceError> {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
         }
@@ -214,9 +210,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for LinearProgram<V, Input, Output>
-{
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for LinearProgram<V, Input, Output> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
     }
@@ -230,7 +224,15 @@ fn transpose_program_op<V>(
     output_cotangents: &[AtomId],
 ) -> Result<Vec<Option<AtomId>>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>,
 {
     LinearOp::transpose_program_op(op, builder, inputs, outputs, output_cotangents)
 }
@@ -239,7 +241,15 @@ pub fn linearize_program<V, Input, Output>(
     program: &Program<V, Input, Output>,
 ) -> Result<LinearProgram<V, Input, Output>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
@@ -791,8 +801,8 @@ where
 /// traces the function once at the first lane's primals to obtain a [`Program`], then compiles a reusable
 /// [`CompiledFunction`] via [`try_jit`] that embeds the full forward and backward passes symbolically.
 /// The compiled gradient function is called independently for each lane.
-impl<V: TransformLeaf, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>>
-    GradInvocationLeaf<Input> for Batch<V>
+impl<V: TransformLeaf, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
+    for Batch<V>
 where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Clone
@@ -823,10 +833,8 @@ where
         let lane0_flat: Vec<V> = lane0.into_parameters().collect();
 
         // Trace the user function once at lane 0 primals, consuming the FnOnce closure.
-        let (_, traced_program): (V, Program<V, Input::To<V>, V>) = try_trace_program(
-            |staged_input| Ok(function(staged_input)),
-            lane_primals[0].clone(),
-        )?;
+        let (_, traced_program): (V, Program<V, Input::To<V>, V>) =
+            try_trace_program(|staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
         let flat_program = Program::from_graph(
@@ -1011,10 +1019,8 @@ where
         let lane0_flat: Vec<V> = lane0.into_parameters().collect();
 
         // Trace the user function once at lane 0 primals, consuming the FnOnce closure.
-        let (_, traced_program): (V, Program<V, Input::To<V>, V>) = try_trace_program(
-            |staged_input| Ok(function(staged_input)),
-            lane_primals[0].clone(),
-        )?;
+        let (_, traced_program): (V, Program<V, Input::To<V>, V>) =
+            try_trace_program(|staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
         let flat_program = Program::from_graph(
@@ -1443,7 +1449,6 @@ where
     let (_, compiled) = try_jit(|primals| Ok(grad(|x| function(x), primals)?), example_primals)?;
     Ok(compiled)
 }
-
 
 #[cfg(test)]
 mod tests {

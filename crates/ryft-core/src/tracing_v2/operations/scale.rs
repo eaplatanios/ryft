@@ -92,8 +92,16 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let abstract_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").abstract_value.clone();
-        let example_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").example_value.clone();
+        let abstract_value = builder
+            .atom(output_cotangents[0])
+            .expect("output cotangent atom should exist")
+            .abstract_value
+            .clone();
+        let example_value = builder
+            .atom(output_cotangents[0])
+            .expect("output cotangent atom should exist")
+            .example_value
+            .clone();
         let contribution = builder.add_equation_prevalidated(
             PrimitiveOp::Scale { factor: self.factor().clone() },
             vec![output_cotangents[0]],

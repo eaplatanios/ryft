@@ -68,8 +68,8 @@ impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>>
-    DifferentiableOp<V, T> for MatrixTransposeOp
+impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V, T>
+    for MatrixTransposeOp
 {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

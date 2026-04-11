@@ -40,6 +40,7 @@ pub use linear::{
 };
 pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
+pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use ops::{CustomOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp, StagedOpRef};
 pub use program::Program;

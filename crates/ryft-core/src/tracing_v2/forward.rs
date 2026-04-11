@@ -307,8 +307,7 @@ where
                 let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
 
                 // Replay the forward pass symbolically and linearize at the symbolic primals.
-                let (primal_outputs, pushforward) =
-                    try_linearize_traced_program(&flat_program, jit_primals.to_vec())?;
+                let (primal_outputs, pushforward) = try_linearize_traced_program(&flat_program, jit_primals.to_vec())?;
 
                 // Apply the pushforward to the symbolic tangents.
                 let tangent_outputs = pushforward.call(jit_tangents.to_vec())?;

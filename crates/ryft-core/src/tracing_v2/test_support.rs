@@ -4,7 +4,7 @@ use indoc::indoc;
 
 use crate::{
     parameters::Placeholder,
-    tracing_v2::{*, ops::PrimitiveOp},
+    tracing_v2::{ops::PrimitiveOp, *},
 };
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {

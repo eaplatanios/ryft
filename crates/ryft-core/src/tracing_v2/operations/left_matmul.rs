@@ -37,7 +37,6 @@ impl<V: MatrixValue> LeftMatMulOp<V> {
     pub fn factor(&self) -> &V {
         &self.factor
     }
-
 }
 
 /// Validates abstract inputs using the factor's abstract type without needing a concrete instance.
@@ -79,8 +78,8 @@ impl<V: MatrixValue> Eval<V> for LeftMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
-    LinearOp<V> for LeftMatMulOp<V>
+impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
+    for LeftMatMulOp<V>
 {
     fn transpose_program_op(
         &self,
@@ -116,10 +115,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
 impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
     DifferentiableOp<V, LinearTerm<V>> for LeftMatMulOp<V>
 {
-    fn jvp(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = JvpTracer {
             primal: self.factor().clone(),

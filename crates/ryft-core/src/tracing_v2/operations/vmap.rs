@@ -4,11 +4,11 @@ use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
-        TransformLeaf, ZeroLike,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf,
+        ZeroLike,
+        linear::{linearize_program, transpose_linear_program},
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
-        linear::{linearize_program, transpose_linear_program},
     },
     types::{ArrayType, Typed},
 };
@@ -209,7 +209,10 @@ impl<V: TransformLeaf> LinearOp<V> for VMapOp<V> {
         let transpose = self.transpose_op()?;
         let output_abstracts = transpose.body().repeated_output_types();
         let output_examples = transpose.body().eval_lanes(
-            &output_cotangents.iter().map(|id| builder.atom(*id).expect("cotangent atom should exist").example_value.clone()).collect::<Vec<_>>(),
+            &output_cotangents
+                .iter()
+                .map(|id| builder.atom(*id).expect("cotangent atom should exist").example_value.clone())
+                .collect::<Vec<_>>(),
         )?;
         let contributions = builder.add_equation_prevalidated(
             PrimitiveOp::VMap(Box::new(transpose)),
@@ -234,10 +237,15 @@ impl<V: TransformLeaf> LinearOp<V> for VMapOp<V> {
             });
         }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_output_values =
-            <Self as Eval<V>>::eval(self, primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice())?;
-        let primal_outputs =
-            JitTracer::apply_staged_op(primal_inputs.as_slice(), PrimitiveOp::VMap(Box::new(self.clone())), primal_output_values)?;
+        let primal_output_values = <Self as Eval<V>>::eval(
+            self,
+            primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice(),
+        )?;
+        let primal_outputs = JitTracer::apply_staged_op(
+            primal_inputs.as_slice(),
+            PrimitiveOp::VMap(Box::new(self.clone())),
+            primal_output_values,
+        )?;
         let lane_input_count = self.body().input_types().len();
         let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
@@ -293,7 +301,15 @@ impl<V: TransformLeaf> Eval<JitTracer<V>> for VMapOp<V> {
 /// Builds one linearized staged `vmap` op from its primal body.
 pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<VMapOp<V>, TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + std::ops::Add<Output = V> + std::ops::Mul<Output = V> + std::ops::Neg<Output = V>,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>,
 {
     let pushforward = linearize_program(body.compiled.program())?;
     let pullback = transpose_linear_program(&pushforward)?;

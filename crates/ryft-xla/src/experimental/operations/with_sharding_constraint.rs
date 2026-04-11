@@ -9,8 +9,14 @@ use std::{
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
     CustomOp, Eval, FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf,
-    ZeroLike, forward::JvpTracer, graph::AtomId, jit::JitTracer, linear::LinearTerm,
-    ops::{DifferentiableOp, LinearOp, Op}, program::ProgramBuilder, operations::{expect_input_count, unary_abstract},
+    ZeroLike,
+    forward::JvpTracer,
+    graph::AtomId,
+    jit::JitTracer,
+    linear::LinearTerm,
+    operations::{expect_input_count, unary_abstract},
+    ops::{DifferentiableOp, LinearOp, Op},
+    program::ProgramBuilder,
 };
 use ryft_core::types::ArrayType;
 
@@ -78,9 +84,7 @@ impl<V: TraceValue> Eval<V> for WithShardingConstraintOp {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V>
-    for WithShardingConstraintOp
-{
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for WithShardingConstraintOp {
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,
@@ -127,13 +131,10 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
-    DifferentiableOp<V, LinearTerm<V>> for WithShardingConstraintOp
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>>
+    for WithShardingConstraintOp
 {
-    fn jvp(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
@@ -147,17 +148,12 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> CustomOp<V>
-    for WithShardingConstraintOp
-{
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> CustomOp<V> for WithShardingConstraintOp {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         Eval::eval(self, inputs)
     }
 
-    fn jvp(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         DifferentiableOp::jvp(self, inputs)
     }
 
@@ -191,7 +187,7 @@ mod tests {
     use ryft_core::tracing_v2::ProgramBuilder;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-        use crate::experimental::shard_map::ShardMapTensor;
+    use crate::experimental::shard_map::ShardMapTensor;
 
     use super::*;
 
@@ -200,11 +196,7 @@ mod tests {
     }
 
     fn test_sharding(mesh: &LogicalMesh) -> Sharding {
-        Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-        )
-        .unwrap()
+        Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
     }
 
     #[test]
@@ -278,13 +270,10 @@ mod tests {
             MeshAxis::new("z", 4, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let target_sharding = Sharding::new(
-            mesh.clone(),
-            vec![ShardingDimension::sharded(["x"])],
-        )
-        .unwrap();
+        let target_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_sharding =
-            Sharding::with_manual_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["y"], ["z"], ["x"]).unwrap();
+            Sharding::with_manual_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["y"], ["z"], ["x"])
+                .unwrap();
         let op = WithShardingConstraintOp::new(target_sharding);
 
         assert_eq!(
@@ -338,10 +327,7 @@ mod tests {
         let mut forward_builder = ProgramBuilder::<ShardMapTensor>::new();
         let input = forward_builder.add_input(&ShardMapTensor::new(input_type.clone()));
         let output = forward_builder
-            .add_equation(
-                PrimitiveOp::Custom(Arc::new(WithShardingConstraintOp::new(sharding.clone()))),
-                vec![input],
-            )
+            .add_equation(PrimitiveOp::Custom(Arc::new(WithShardingConstraintOp::new(sharding.clone()))), vec![input])
             .unwrap()[0];
 
         let mut transpose_builder = ProgramBuilder::<ShardMapTensor>::new();
@@ -353,7 +339,7 @@ mod tests {
             &[output],
             &[output_cotangent],
         )
-            .unwrap()[0]
+        .unwrap()[0]
             .unwrap();
 
         let transpose_graph =

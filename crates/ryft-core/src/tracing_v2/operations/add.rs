@@ -125,11 +125,9 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_rejects_incompatible_inputs() {
-        let error = <AddOp as Op>::abstract_eval(
-            &AddOp,
-            &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
-        )
-        .unwrap_err();
+        let error =
+            <AddOp as Op>::abstract_eval(&AddOp, &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)])
+                .unwrap_err();
 
         assert_eq!(error, TraceError::IncompatibleAbstractValues { op: "add" });
         test_support::assert_reference_graph_rendering();

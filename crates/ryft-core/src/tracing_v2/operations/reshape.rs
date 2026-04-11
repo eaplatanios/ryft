@@ -161,11 +161,7 @@ fn reshape_array_sharding(
 }
 
 /// Computes the abstract output type of one reshape application.
-pub fn reshape_abstract(
-    input: &ArrayType,
-    target_shape: &Shape,
-    op: &'static str,
-) -> Result<ArrayType, TraceError> {
+pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static str) -> Result<ArrayType, TraceError> {
     if input.shape == *target_shape {
         return Ok(input.clone());
     }
@@ -406,7 +402,11 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> fo
             return Ok(vec![Some(output_cotangents[0])]);
         }
         let abstract_value = self.input_type().clone();
-        let example_value = builder.atom(output_cotangents[0]).expect("output cotangent atom should exist").example_value.clone();
+        let example_value = builder
+            .atom(output_cotangents[0])
+            .expect("output cotangent atom should exist")
+            .example_value
+            .clone();
         let contribution = builder.add_equation_prevalidated(
             PrimitiveOp::Reshape { input_type: self.output_type().clone(), output_type: self.input_type().clone() },
             vec![output_cotangents[0]],
@@ -434,13 +434,8 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> fo
     }
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps>
-    DifferentiableOp<V, LinearTerm<V>> for ReshapeOp
-{
-    fn jvp(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> DifferentiableOp<V, LinearTerm<V>> for ReshapeOp {
+    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }

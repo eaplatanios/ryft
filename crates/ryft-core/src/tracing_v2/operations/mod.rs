@@ -82,6 +82,9 @@ pub mod scale;
 /// Elementwise sine.
 pub mod sin;
 
+/// Traced rematerialization boundary.
+pub mod rematerialize;
+
 /// Traced `vmap` operations.
 pub mod vmap;
 
@@ -93,9 +96,10 @@ pub use matmul::MatMulOp;
 pub use matrix_transpose::MatrixTransposeOp;
 pub use mul::MulOp;
 pub use neg::NegOp;
+pub use rematerialize::{FlatTracedRematerialize, RematerializeOp};
+pub use reshape::ReshapeOp;
 pub use right_matmul::RightMatMulOp;
 pub use scale::ScaleOp;
-pub use reshape::ReshapeOp;
 pub use sin::SinOp;
 pub use vmap::{FlatTracedVMap, VMapOp};
 
@@ -204,13 +208,7 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Size::Static(8)]),
             None,
-            Some(
-                Sharding::new(
-                    mesh.clone(),
-                    vec![ShardingDimension::sharded(["x"])],
-                )
-                .unwrap(),
-            ),
+            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
         )
         .unwrap();
         let right = ArrayType::new(

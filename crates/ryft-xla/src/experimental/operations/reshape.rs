@@ -22,7 +22,9 @@ mod tests {
     use ryft_core::tracing_v2::operations::reshape::ReshapeOps;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-    use crate::experimental::shard_map::{ShardMapTracer, TracedShardMap, TracedXlaProgram, shard_map, with_sharding_constraint};
+    use crate::experimental::shard_map::{
+        ShardMapTracer, TracedShardMap, TracedXlaProgram, shard_map, with_sharding_constraint,
+    };
     use crate::experimental::trace;
 
     fn test_manual_mesh(axis_size: usize) -> LogicalMesh {

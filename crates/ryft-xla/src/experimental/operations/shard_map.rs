@@ -240,10 +240,8 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
                 got: output_cotangents.len(),
             });
         }
-        let contributions = builder.add_equation(
-            PrimitiveOp::Custom(std::sync::Arc::new(self.transpose_op()?)),
-            output_cotangents.to_vec(),
-        )?;
+        let contributions = builder
+            .add_equation(PrimitiveOp::Custom(std::sync::Arc::new(self.transpose_op()?)), output_cotangents.to_vec())?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 
@@ -403,10 +401,8 @@ impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
                 got: output_cotangents.len(),
             });
         }
-        let contributions = builder.add_equation(
-            PrimitiveOp::Custom(std::sync::Arc::new(self.transpose_op()?)),
-            output_cotangents.to_vec(),
-        )?;
+        let contributions = builder
+            .add_equation(PrimitiveOp::Custom(std::sync::Arc::new(self.transpose_op()?)), output_cotangents.to_vec())?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }
@@ -902,7 +898,10 @@ fn try_linearize_traced_shard_map_body<
     function: F,
     primals: Vec<ShardMapTracer>,
 ) -> Result<
-    (Vec<ShardMapTracer>, ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>),
+    (
+        Vec<ShardMapTracer>,
+        ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+    ),
     TraceError,
 > {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
@@ -926,11 +925,9 @@ fn try_linearize_traced_shard_map_body<
             return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
         }
     };
-    let program = ryft_core::tracing_v2::Program::from_graph(builder.build::<Vec<ShardMapTracer>, Vec<ShardMapTracer>>(
-        tangent_outputs,
-        input_structure,
-        output_structure,
-    ))
+    let program = ryft_core::tracing_v2::Program::from_graph(
+        builder.build::<Vec<ShardMapTracer>, Vec<ShardMapTracer>>(tangent_outputs, input_structure, output_structure),
+    )
     .simplify()?;
     Ok((primal_outputs, ryft_core::tracing_v2::LinearProgram::from_program(program, zero)))
 }
@@ -941,7 +938,10 @@ fn try_transpose_traced_shard_map_body<
     function: F,
     primals: Vec<ShardMapTracer>,
 ) -> Result<
-    (Vec<ShardMapTracer>, ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>),
+    (
+        Vec<ShardMapTracer>,
+        ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+    ),
     TraceError,
 > {
     let (outputs, pushforward) = try_linearize_traced_shard_map_body(function, primals)?;
@@ -965,12 +965,7 @@ fn replay_traced_xla_graph<
     GraphOutput: ryft_core::parameters::Parameterized<ShardMapTensor>,
     V: ReplayShardMapValue,
 >(
-    graph: &ryft_core::tracing_v2::Graph<
-        PrimitiveOp<ShardMapTensor>,
-        ShardMapTensor,
-        GraphInput,
-        GraphOutput,
-    >,
+    graph: &ryft_core::tracing_v2::Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
     inputs: Vec<V>,
 ) -> Result<Vec<V>, ShardMapTraceError> {
     let mut values = vec![None; graph.atom_count()];

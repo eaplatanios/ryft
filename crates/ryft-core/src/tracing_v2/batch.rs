@@ -304,8 +304,11 @@ where
             .flatten()
             .collect::<Vec<_>>();
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
-        let staged_outputs =
-            JitTracer::apply_staged_op(staged_inputs.as_slice(), PrimitiveOp::VMap(Box::new(VMapOp::new(body))), output_values)?;
+        let staged_outputs = JitTracer::apply_staged_op(
+            staged_inputs.as_slice(),
+            PrimitiveOp::VMap(Box::new(VMapOp::new(body))),
+            output_values,
+        )?;
         (0..lane_count)
             .map(|lane_index| {
                 let start = lane_index * output_leaf_count;
@@ -441,11 +444,8 @@ mod tests {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         let gradients: Vec<f64> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::grad(
-                    |x: JitTracer<f64>| x.clone() * x.clone() + x.sin(),
-                    batch,
-                )
-                .expect("batched grad should succeed")
+                crate::tracing_v2::grad(|x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), batch)
+                    .expect("batched grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
         )
@@ -462,11 +462,8 @@ mod tests {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         let results: Vec<(f64, f64)> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::value_and_grad(
-                    |x: JitTracer<f64>| x.clone() * x.clone() + x.sin(),
-                    batch,
-                )
-                .expect("batched value_and_grad should succeed")
+                crate::tracing_v2::value_and_grad(|x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), batch)
+                    .expect("batched value_and_grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
         )
@@ -485,12 +482,8 @@ mod tests {
         // jvp at x with tangent t gives (f(x), (2x + cos(x)) * t)
         let results: Vec<(f64, f64)> = vmap(
             |(primals, tangents): (Batch<f64>, Batch<f64>)| {
-                crate::tracing_v2::jvp(
-                    |x: JitTracer<f64>| x.clone() * x.clone() + x.sin(),
-                    primals,
-                    tangents,
-                )
-                .expect("batched jvp should succeed")
+                crate::tracing_v2::jvp(|x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), primals, tangents)
+                    .expect("batched jvp should succeed")
             },
             vec![(1.0f64, 1.0f64), (2.0, 0.5), (3.0, 2.0)],
         )

@@ -24,13 +24,8 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
-    batch::Batch,
-    forward::JvpTracer,
-    graph::AtomId,
-    jit::JitTracer,
-    linear::LinearTerm,
-    program::ProgramBuilder,
+    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike, batch::Batch, forward::JvpTracer,
+    graph::AtomId, jit::JitTracer, linear::LinearTerm, program::ProgramBuilder,
 };
 use crate::types::{ArrayType, Typed};
 
@@ -133,10 +128,7 @@ pub trait CustomOp<V: TraceValue>: Op {
     }
 
     /// Applies the forward-mode JVP rule during program linearization.
-    fn jvp(
-        &self,
-        _inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+    fn jvp(&self, _inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "linearize_program",
             message: format!("JVP rule for custom op '{}' is not implemented", self.name()),
@@ -167,10 +159,7 @@ pub trait CustomOp<V: TraceValue>: Op {
     {
         Err(TraceError::HigherOrderOpFailure {
             op: "replay_program_graph",
-            message: format!(
-                "replaying linearized values through custom op '{}' is not implemented",
-                self.name()
-            ),
+            message: format!("replaying linearized values through custom op '{}' is not implemented", self.name()),
         })
     }
 }
@@ -220,6 +209,9 @@ pub enum PrimitiveOp<V: TraceValue> {
 
     /// Higher-order `vmap` carrying a compiled per-lane body and optional transpose body.
     VMap(Box<crate::tracing_v2::operations::VMapOp<V>>),
+
+    /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
+    Rematerialize(Box<crate::tracing_v2::operations::RematerializeOp<V>>),
 
     /// Escape hatch for user- or crate-defined operations outside `ryft-core`.
     Custom(Arc<dyn CustomOp<V>>),
@@ -333,6 +325,7 @@ impl<V: TraceValue> Debug for PrimitiveOp<V> {
                 write!(formatter, "Reshape({input_type} -> {output_type})")
             }
             Self::VMap(vmap) => Debug::fmt(vmap, formatter),
+            Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
         }
     }
@@ -368,6 +361,7 @@ impl<V: TraceValue> Op for PrimitiveOp<V> {
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
             Self::VMap(vmap) => vmap.name(),
+            Self::Rematerialize(remat) => remat.name(),
             Self::Custom(op) => op.name(),
         }
     }
@@ -389,6 +383,7 @@ impl<V: TraceValue> Op for PrimitiveOp<V> {
                 <ReshapeOp as Op>::abstract_eval(&ReshapeOp::new(input_type.clone(), output_type.clone()), inputs)
             }
             Self::VMap(vmap) => vmap.abstract_eval(inputs),
+            Self::Rematerialize(remat) => remat.abstract_eval(inputs),
             Self::Custom(op) => op.abstract_eval(inputs),
         }
     }
@@ -415,6 +410,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
                 ReshapeOp::new(input_type.clone(), output_type.clone()).eval(inputs)
             }
             Self::VMap(vmap) => vmap.eval(inputs),
+            Self::Rematerialize(remat) => remat.eval(inputs),
             Self::Custom(op) => op.eval(inputs),
         }
     }
@@ -458,6 +454,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
                 op: "transpose_linear_program",
                 message: "vmap transpose rule requires TransformLeaf values; use the replay path instead".to_string(),
             }),
+            Self::Rematerialize(remat) => remat.transpose_program_op(builder, inputs, outputs, output_cotangents),
             Self::Custom(op) => op.transpose_program_op(builder, inputs, outputs, output_cotangents),
         }
     }
@@ -485,6 +482,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
                 ReshapeOp::new(input_type.clone(), output_type.clone()).replay_linearized_jit(inputs)
             }
             Self::VMap(vmap) => vmap.replay_linearized_jit(inputs),
+            Self::Rematerialize(remat) => remat.replay_linearized_jit(inputs),
             Self::Custom(op) => op.replay_linearized_jit(inputs),
         }
     }
@@ -493,10 +491,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     DifferentiableOp<V, LinearTerm<V>> for PrimitiveOp<V>
 {
-    fn jvp(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         match self {
             Self::Add => DifferentiableOp::<V, LinearTerm<V>>::jvp(&AddOp, inputs),
             Self::Mul => DifferentiableOp::<V, LinearTerm<V>>::jvp(&MulOp, inputs),
@@ -506,22 +501,22 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
             Self::Scale { factor } => DifferentiableOp::<V, LinearTerm<V>>::jvp(&ScaleOp::new(factor.clone()), inputs),
             Self::MatMul => DifferentiableOp::<V, LinearTerm<V>>::jvp(&MatMulOp, inputs),
             Self::MatrixTranspose => DifferentiableOp::<V, LinearTerm<V>>::jvp(&MatrixTransposeOp, inputs),
-            Self::LinearMatrixTranspose => {
-                DifferentiableOp::<V, LinearTerm<V>>::jvp(&LinearMatrixTransposeOp, inputs)
-            }
+            Self::LinearMatrixTranspose => DifferentiableOp::<V, LinearTerm<V>>::jvp(&LinearMatrixTransposeOp, inputs),
             Self::LeftMatMul { factor } => {
                 DifferentiableOp::<V, LinearTerm<V>>::jvp(&LeftMatMulOp::new(factor.clone()), inputs)
             }
             Self::RightMatMul { factor } => {
                 DifferentiableOp::<V, LinearTerm<V>>::jvp(&RightMatMulOp::new(factor.clone()), inputs)
             }
-            Self::Reshape { input_type, output_type } => {
-                DifferentiableOp::<V, LinearTerm<V>>::jvp(&ReshapeOp::new(input_type.clone(), output_type.clone()), inputs)
-            }
+            Self::Reshape { input_type, output_type } => DifferentiableOp::<V, LinearTerm<V>>::jvp(
+                &ReshapeOp::new(input_type.clone(), output_type.clone()),
+                inputs,
+            ),
             Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
                 op: "linearize_program",
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
+            Self::Rematerialize(remat) => DifferentiableOp::<V, LinearTerm<V>>::jvp(remat.as_ref(), inputs),
             Self::Custom(op) => op.jvp(inputs),
         }
     }

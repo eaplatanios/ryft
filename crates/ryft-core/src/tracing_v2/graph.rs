@@ -179,7 +179,6 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         Ok(outputs)
     }
 
-
     /// Finalizes the builder into a graph with the given input/output structures.
     pub fn build<Input, Output>(
         self,
@@ -267,12 +266,12 @@ fn try_identity_elimination<O: Clone + Op, V: TraceValue>(
     match primitive {
         PrimitiveOp::Scale { factor } if is_identity_one(factor) => Some(inputs.to_vec()),
         PrimitiveOp::Add if inputs.len() == 2 => {
-            let left_zero = builder.atom(inputs[0]).map_or(false, |a| {
-                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
-            });
-            let right_zero = builder.atom(inputs[1]).map_or(false, |a| {
-                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
-            });
+            let left_zero = builder
+                .atom(inputs[0])
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
+            let right_zero = builder
+                .atom(inputs[1])
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
             if left_zero {
                 Some(vec![inputs[1]])
             } else if right_zero {
@@ -282,18 +281,18 @@ fn try_identity_elimination<O: Clone + Op, V: TraceValue>(
             }
         }
         PrimitiveOp::Mul if inputs.len() == 2 => {
-            let left_one = builder.atom(inputs[0]).map_or(false, |a| {
-                matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value)
-            });
-            let right_one = builder.atom(inputs[1]).map_or(false, |a| {
-                matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value)
-            });
-            let left_zero = builder.atom(inputs[0]).map_or(false, |a| {
-                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
-            });
-            let right_zero = builder.atom(inputs[1]).map_or(false, |a| {
-                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
-            });
+            let left_one = builder
+                .atom(inputs[0])
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value));
+            let right_one = builder
+                .atom(inputs[1])
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value));
+            let left_zero = builder
+                .atom(inputs[0])
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
+            let right_zero = builder
+                .atom(inputs[1])
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
             if left_one {
                 Some(vec![inputs[1]])
             } else if right_one {
@@ -307,9 +306,9 @@ fn try_identity_elimination<O: Clone + Op, V: TraceValue>(
             }
         }
         PrimitiveOp::Neg if inputs.len() == 1 => {
-            let zero = builder.atom(inputs[0]).map_or(false, |a| {
-                matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value)
-            });
+            let zero = builder
+                .atom(inputs[0])
+                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value));
             if zero { Some(vec![inputs[0]]) } else { None }
         }
         _ => None,
@@ -666,7 +665,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{test_support, ops::PrimitiveOp},
+        tracing_v2::{ops::PrimitiveOp, test_support},
     };
 
     use super::*;
@@ -677,11 +676,8 @@ mod tests {
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
-        let scaled_x = builder
-            .add_equation(PrimitiveOp::Scale { factor: 2.0 }, vec![x])
-            .unwrap()[0];
-        let sum =
-            builder.add_equation(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
+        let scaled_x = builder.add_equation(PrimitiveOp::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
+        let sum = builder.add_equation(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
         let graph = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(graph.atom(x).unwrap().source, AtomSource::Input));
