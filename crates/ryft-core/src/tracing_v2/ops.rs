@@ -99,12 +99,14 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
 ///
 /// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
 pub trait CustomOp<V: TraceValue>:
-    InterpretableOp<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> + InterpretableOp<Linearized<JitTracer<V>>>
+    InterpretableOp<V>
+    + LinearOp<V>
+    + DifferentiableOp<V, LinearTerm<V>>
+    + InterpretableOp<Linearized<JitTracer<V>>>
+    + AsAny
 where
     Linearized<JitTracer<V>>: TraceValue,
 {
-    /// Returns this operation as [`Any`](std::any::Any) for downcasting.
-    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 impl<
@@ -118,6 +120,19 @@ impl<
 where
     Linearized<JitTracer<V>>: TraceValue,
 {
+}
+
+/// Upcasting helper for downcasting custom operations behind `dyn CustomOp<V>`.
+///
+/// Automatically implemented for all `'static` types. Used by crate-external code (e.g., XLA
+/// lowering) that needs to recover the concrete type of a custom operation via
+/// [`Any::downcast_ref`](std::any::Any::downcast_ref).
+pub trait AsAny {
+    /// Returns `self` as a `&dyn Any` for downcasting.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+impl<T: 'static> AsAny for T {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
