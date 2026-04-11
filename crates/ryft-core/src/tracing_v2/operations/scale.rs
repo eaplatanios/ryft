@@ -16,7 +16,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -81,22 +81,7 @@ impl<V: TraceValue + Mul<Output = V>> Eval<V> for ScaleOp<V> {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for ScaleOp<V> {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
-        Ok(vec![JvpTracer {
-            primal: factor.clone() * inputs[0].primal.clone(),
-            tangent: inputs[0].tangent.clone().scale(factor),
-        }])
-    }
-
+impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,
@@ -118,10 +103,24 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for ScaleOp
         Ok(vec![Some(contribution)])
     }
 
-    fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
     where
-        T: TangentSpace<V>,
+        V: TransformLeaf,
     {
+        expect_input_count(inputs.len(), 1)?;
+        let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
+        Ok(vec![JvpTracer {
+            primal: factor.clone() * inputs[0].primal.clone(),
+            tangent: inputs[0].tangent.clone().scale(factor),
+        }])
+    }
+}
+
+impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for ScaleOp<V> {
+    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
         Ok(vec![JvpTracer {

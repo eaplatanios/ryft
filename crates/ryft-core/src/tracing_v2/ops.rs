@@ -7,9 +7,10 @@
 //!
 //! ```text
 //! Op (shape-level, NOT generic over V)
-//! ├─ Eval<V>          — concrete execution on values of type V
-//! ├─ DifferentiableOp<V> — JVP / transpose / replay rules
-//! └─ BatchOp<V>       — batching rule for vmap
+//! ├─ Eval<V>               — concrete execution on values of type V
+//! ├─ LinearOp<V>           — transpose + replay rules for linear programs
+//! ├─ DifferentiableOp<V, T> — forward-mode JVP rule, generic over tangent type T
+//! └─ BatchOp<V>            — batching rule for vmap
 //! ```
 //!
 //! [`Op`] is intentionally non-generic: `abstract_eval`, `name`, and `as_any` operate on [`ArrayType`] metadata
@@ -25,7 +26,7 @@ use std::{
 use crate::tracing_v2::{
     FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
     batch::Batch,
-    forward::{JvpTracer, TangentSpace},
+    forward::JvpTracer,
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
@@ -36,8 +37,8 @@ use crate::types::{ArrayType, Typed};
 /// Shape-level operation interface for staged graphs.
 ///
 /// This trait covers the metadata surface needed for graph construction, display, simplification, and MLIR lowering.
-/// Concrete execution is provided by the separate [`Eval`] trait. Differentiation rules are provided by
-/// [`DifferentiableOp`].
+/// Concrete execution is provided by the separate [`Eval`] trait. Staged-program differentiation rules are split
+/// between [`LinearOp`] (transpose/replay) and [`DifferentiableOp`] (forward-mode JVP).
 pub trait Op: Debug + Display {
     /// Returns this operation as [`Any`] for downcasting.
     fn as_any(&self) -> &dyn Any;
@@ -58,59 +59,17 @@ pub trait Eval<V: TraceValue>: Op {
     fn eval(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
 }
 
-/// Extension of [`Op`] for operations that participate in program-level differentiation.
+/// Operations that can appear in tangent/cotangent programs and support reverse-mode transposition.
 ///
-/// Operations implementing this trait provide rules for forward-mode differentiation ([`jvp`]),
-/// reverse-mode transposition ([`transpose_program_op`]), and higher-order JIT replay
-/// ([`replay_linearized_jit`]). Default implementations return [`TraceError::HigherOrderOpFailure`] so that
-/// operations only need to override the methods relevant to their transform support.
+/// This trait covers the staged-program side of differentiation: transposing linearized programs
+/// ([`transpose_program_op`]) and replaying them inside a JIT scope ([`replay_linearized_jit`]).
+/// Default implementations return [`TraceError::HigherOrderOpFailure`] so that operations only need
+/// to override the methods relevant to their transform support.
 ///
-/// Most operations should implement [`jvp`] for the generic forward-mode rule and rely on the default
-/// [`apply_program_jvp_rule`] which delegates to it. Operations whose program-level JVP rule requires
-/// tangent-space capabilities beyond [`TangentSpace`] (e.g., higher-order ops that manipulate
-/// [`LinearTerm`] directly) can override [`apply_program_jvp_rule`] instead.
-///
-/// [`jvp`]: DifferentiableOp::jvp
-/// [`apply_program_jvp_rule`]: DifferentiableOp::apply_program_jvp_rule
-/// [`transpose_program_op`]: DifferentiableOp::transpose_program_op
-/// [`replay_linearized_jit`]: DifferentiableOp::replay_linearized_jit
-/// [`TangentSpace`]: crate::tracing_v2::forward::TangentSpace
-pub trait DifferentiableOp<V: TraceValue>: Op {
-    /// Replays this staged op while tracing a linearized JIT program.
-    fn replay_linearized_jit(
-        &self,
-        _inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "replay_program_graph",
-            message: format!("replaying linearized values through staged op '{}' is not implemented", self.name()),
-        })
-    }
-
-    /// Applies this op's program-level JVP rule while linearizing a staged program.
-    ///
-    /// The default implementation delegates to [`jvp`](DifferentiableOp::jvp) with `T = LinearTerm<V>`,
-    /// which is correct for operations whose forward-mode rule is generic over any
-    /// [`TangentSpace`](crate::tracing_v2::forward::TangentSpace). Operations that need
-    /// [`LinearTerm`]-specific capabilities (e.g., higher-order ops that stage sub-programs into the
-    /// tangent builder) should override this method directly.
-    fn apply_program_jvp_rule(
-        &self,
-        _inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "linearize_program",
-            message: format!("JVP rule for staged op '{}' is not implemented", self.name()),
-        })
-    }
-
-    /// Applies this op's transpose rule while transposing a linearized staged program.
-    ///
-    /// Like [`jvp`](DifferentiableOp::jvp), the required value bounds are determined by each operation's
-    /// impl block.
+/// [`transpose_program_op`]: LinearOp::transpose_program_op
+/// [`replay_linearized_jit`]: LinearOp::replay_linearized_jit
+pub trait LinearOp<V: TraceValue>: Op {
+    /// Applies the transpose rule for reverse-mode differentiation.
     fn transpose_program_op(
         &self,
         _builder: &mut ProgramBuilder<V>,
@@ -124,30 +83,44 @@ pub trait DifferentiableOp<V: TraceValue>: Op {
         })
     }
 
-    /// Applies the primitive's forward-mode rule to traced inputs.
-    ///
-    /// This is the generic JVP rule that works with any [`TangentSpace`] -- including both
-    /// concrete dual-number evaluation and staged linearization.
-    fn jvp<T>(&self, _inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
+    /// Replays this staged op while tracing a linearized JIT program.
+    fn replay_linearized_jit(
+        &self,
+        _inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
     where
-        Self: Sized,
-        T: TangentSpace<V>,
+        V: TransformLeaf,
     {
         Err(TraceError::HigherOrderOpFailure {
-            op: "jvp",
-            message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
+            op: "replay_program_graph",
+            message: format!("replaying linearized values through staged op '{}' is not implemented", self.name()),
         })
     }
 }
 
-/// Combined trait for custom operations that support both evaluation and differentiation.
+/// Forward-mode differentiation rule, generic over the tangent type `T`.
+///
+/// Each operation implements this trait with the exact bounds on `T` that its JVP rule requires.
+/// For example, [`AddOp`](crate::tracing_v2::operations::AddOp) only needs `T: TangentSpace<V>`,
+/// while [`MatMulOp`](crate::tracing_v2::operations::MatMulOp) needs
+/// `T: TangentSpace<V> + MatrixTangentSpace<V>`.
+///
+/// [`TangentSpace`]: crate::tracing_v2::forward::TangentSpace
+/// [`MatrixTangentSpace`]: crate::tracing_v2::MatrixTangentSpace
+pub trait DifferentiableOp<V: TraceValue, T>: Op {
+    /// Applies the forward-mode JVP rule.
+    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>;
+}
+
+/// Combined trait for custom operations that support evaluation, linearization, and differentiation.
 ///
 /// This is the required capability set for the [`PrimitiveOp::Custom`] escape hatch. External
-/// operations must implement [`Eval<V>`] (concrete execution), [`DifferentiableOp<V>`]
-/// (linearization/transposition rules), and [`Op`] (shape-level metadata).
-pub trait CustomOp<V: TraceValue>: Eval<V> + DifferentiableOp<V> {}
+/// operations must implement [`Eval<V>`] (concrete execution), [`LinearOp<V>`]
+/// (transpose/replay rules), [`DifferentiableOp<V, LinearTerm<V>>`] (program-level JVP), and
+/// [`Op`] (shape-level metadata).
+pub trait CustomOp<V: TraceValue>: Eval<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>> {}
 
-impl<V: TraceValue, T: Eval<V> + DifferentiableOp<V>> CustomOp<V> for T {}
+impl<V: TraceValue, T: Eval<V> + LinearOp<V> + DifferentiableOp<V, LinearTerm<V>>> CustomOp<V> for T {}
 
 /// Closed set of built-in staged operations.
 ///
@@ -242,7 +215,18 @@ impl<T: Eval<V> + ?Sized, V: TraceValue> Eval<V> for Arc<T> {
     }
 }
 
-impl<T: DifferentiableOp<V> + ?Sized, V: TraceValue> DifferentiableOp<V> for Arc<T> {
+impl<T: LinearOp<V> + ?Sized, V: TraceValue> LinearOp<V> for Arc<T> {
+    #[inline]
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
+    }
+
     #[inline]
     fn replay_linearized_jit(
         &self,
@@ -253,24 +237,12 @@ impl<T: DifferentiableOp<V> + ?Sized, V: TraceValue> DifferentiableOp<V> for Arc
     {
         (**self).replay_linearized_jit(inputs)
     }
+}
 
+impl<T: DifferentiableOp<V, U> + ?Sized, V: TraceValue, U> DifferentiableOp<V, U> for Arc<T> {
     #[inline]
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        (**self).apply_program_jvp_rule(inputs)
-    }
-
-    #[inline]
-    fn transpose_program_op(
-        &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
+    fn jvp(&self, inputs: &[JvpTracer<V, U>]) -> Result<Vec<JvpTracer<V, U>>, TraceError> {
+        (**self).jvp(inputs)
     }
 }
 
@@ -282,7 +254,7 @@ impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
-// PrimitiveOp — Debug, Display, Op, Eval, DifferentiableOp, BatchOp
+// PrimitiveOp — Debug, Display, Op, Eval, LinearOp, DifferentiableOp, BatchOp
 // ---------------------------------------------------------------------------
 
 use crate::tracing_v2::operations::{
@@ -396,62 +368,8 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
-    DifferentiableOp<V> for PrimitiveOp<V>
+    LinearOp<V> for PrimitiveOp<V>
 {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        match self {
-            Self::Add => AddOp.replay_linearized_jit(inputs),
-            Self::Mul => MulOp.replay_linearized_jit(inputs),
-            Self::Neg => NegOp.replay_linearized_jit(inputs),
-            Self::Sin => SinOp.replay_linearized_jit(inputs),
-            Self::Cos => CosOp.replay_linearized_jit(inputs),
-            Self::MatMul => MatMulOp.replay_linearized_jit(inputs),
-            Self::MatrixTranspose => MatrixTransposeOp.replay_linearized_jit(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.replay_linearized_jit(inputs),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).replay_linearized_jit(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).replay_linearized_jit(inputs),
-            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).replay_linearized_jit(inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOp::new(input_type.clone(), output_type.clone()).replay_linearized_jit(inputs)
-            }
-            Self::VMap(vmap) => vmap.replay_linearized_jit(inputs),
-            Self::Custom(op) => op.replay_linearized_jit(inputs),
-        }
-    }
-
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        match self {
-            Self::Add => AddOp.jvp(inputs),
-            Self::Mul => MulOp.jvp(inputs),
-            Self::Neg => NegOp.jvp(inputs),
-            Self::Sin => SinOp.jvp(inputs),
-            Self::Cos => CosOp.jvp(inputs),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).jvp(inputs),
-            Self::MatMul => MatMulOp.apply_program_jvp_rule(inputs),
-            Self::MatrixTranspose => MatrixTransposeOp.apply_program_jvp_rule(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.apply_program_jvp_rule(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).apply_program_jvp_rule(inputs),
-            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).apply_program_jvp_rule(inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOp::new(input_type.clone(), output_type.clone()).apply_program_jvp_rule(inputs)
-            }
-            Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
-                op: "linearize_program",
-                message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
-            }),
-            Self::Custom(op) => op.apply_program_jvp_rule(inputs),
-        }
-    }
-
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,
@@ -491,21 +409,67 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
         }
     }
 
-    fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
     where
-        T: TangentSpace<V>,
+        V: TransformLeaf,
     {
         match self {
-            Self::Add => AddOp.jvp(inputs),
-            Self::Mul => MulOp.jvp(inputs),
-            Self::Neg => NegOp.jvp(inputs),
-            Self::Sin => SinOp.jvp(inputs),
-            Self::Cos => CosOp.jvp(inputs),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).jvp(inputs),
-            _ => Err(TraceError::HigherOrderOpFailure {
-                op: "jvp",
-                message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
+            Self::Add => AddOp.replay_linearized_jit(inputs),
+            Self::Mul => MulOp.replay_linearized_jit(inputs),
+            Self::Neg => NegOp.replay_linearized_jit(inputs),
+            Self::Sin => SinOp.replay_linearized_jit(inputs),
+            Self::Cos => CosOp.replay_linearized_jit(inputs),
+            Self::MatMul => MatMulOp.replay_linearized_jit(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.replay_linearized_jit(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.replay_linearized_jit(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).replay_linearized_jit(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).replay_linearized_jit(inputs),
+            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).replay_linearized_jit(inputs),
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOp::new(input_type.clone(), output_type.clone()).replay_linearized_jit(inputs)
+            }
+            Self::VMap(vmap) => vmap.replay_linearized_jit(inputs),
+            Self::Custom(op) => op.replay_linearized_jit(inputs),
+        }
+    }
+}
+
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+    DifferentiableOp<V, LinearTerm<V>> for PrimitiveOp<V>
+{
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        match self {
+            Self::Add => DifferentiableOp::<V, LinearTerm<V>>::jvp(&AddOp, inputs),
+            Self::Mul => DifferentiableOp::<V, LinearTerm<V>>::jvp(&MulOp, inputs),
+            Self::Neg => DifferentiableOp::<V, LinearTerm<V>>::jvp(&NegOp, inputs),
+            Self::Sin => DifferentiableOp::<V, LinearTerm<V>>::jvp(&SinOp, inputs),
+            Self::Cos => DifferentiableOp::<V, LinearTerm<V>>::jvp(&CosOp, inputs),
+            Self::Scale { factor } => DifferentiableOp::<V, LinearTerm<V>>::jvp(&ScaleOp::new(factor.clone()), inputs),
+            Self::MatMul => DifferentiableOp::<V, LinearTerm<V>>::jvp(&MatMulOp, inputs),
+            Self::MatrixTranspose => DifferentiableOp::<V, LinearTerm<V>>::jvp(&MatrixTransposeOp, inputs),
+            Self::LinearMatrixTranspose => {
+                DifferentiableOp::<V, LinearTerm<V>>::jvp(&LinearMatrixTransposeOp, inputs)
+            }
+            Self::LeftMatMul { factor } => {
+                DifferentiableOp::<V, LinearTerm<V>>::jvp(&LeftMatMulOp::new(factor.clone()), inputs)
+            }
+            Self::RightMatMul { factor } => {
+                DifferentiableOp::<V, LinearTerm<V>>::jvp(&RightMatMulOp::new(factor.clone()), inputs)
+            }
+            Self::Reshape { input_type, output_type } => {
+                DifferentiableOp::<V, LinearTerm<V>>::jvp(&ReshapeOp::new(input_type.clone(), output_type.clone()), inputs)
+            }
+            Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
+                op: "linearize_program",
+                message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
+            Self::Custom(op) => op.jvp(inputs),
         }
     }
 }

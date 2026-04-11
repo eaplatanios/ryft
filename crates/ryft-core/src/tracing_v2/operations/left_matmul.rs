@@ -9,7 +9,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::{ArrayType, Typed};
@@ -79,22 +79,9 @@ impl<V: MatrixValue> Eval<V> for LeftMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps> DifferentiableOp<V>
-    for LeftMatMulOp<V>
+impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
+    LinearOp<V> for LeftMatMulOp<V>
 {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
-        let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };
-        Ok(vec![factor.matmul(inputs[0].clone())])
-    }
-
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,
@@ -110,6 +97,35 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
             vec![output_cotangents[0]],
         )?[0];
         Ok(vec![Some(contribution)])
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
+        let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };
+        Ok(vec![factor.matmul(inputs[0].clone())])
+    }
+}
+
+impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
+    DifferentiableOp<V, LinearTerm<V>> for LeftMatMulOp<V>
+{
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        let factor = JvpTracer {
+            primal: self.factor().clone(),
+            tangent: TangentSpace::zero_like(&self.factor, &inputs[0].tangent),
+        };
+        Ok(vec![factor.matmul(inputs[0].clone())])
     }
 }
 

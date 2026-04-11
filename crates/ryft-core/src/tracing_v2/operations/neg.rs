@@ -13,7 +13,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -57,18 +57,7 @@ impl<V: TraceValue + Neg<Output = V>> Eval<V> for NegOp {
     }
 }
 
-impl<V: TraceValue + Neg<Output = V> + ZeroLike> DifferentiableOp<V> for NegOp {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: inputs[0].tangent.clone().neg() }])
-    }
-
+impl<V: TraceValue + Neg<Output = V> + ZeroLike> LinearOp<V> for NegOp {
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,
@@ -85,10 +74,20 @@ impl<V: TraceValue + Neg<Output = V> + ZeroLike> DifferentiableOp<V> for NegOp {
         Ok(vec![Some(contribution)])
     }
 
-    fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
     where
-        T: TangentSpace<V>,
+        V: TransformLeaf,
     {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: inputs[0].tangent.clone().neg() }])
+    }
+}
+
+impl<V: TraceValue + Neg<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for NegOp {
+    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: T::neg(inputs[0].tangent.clone()) }])
     }

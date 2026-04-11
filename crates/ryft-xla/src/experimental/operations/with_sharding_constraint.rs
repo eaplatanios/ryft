@@ -9,7 +9,7 @@ use std::{
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
     Eval, FloatExt, MatrixOps, OneLike, PrimitiveOp, ReshapeOps, TraceError, TraceValue, TransformLeaf, ZeroLike,
-    forward::JvpTracer, graph::AtomId, jit::JitTracer, linear::LinearTerm, ops::{DifferentiableOp, Op},
+    forward::JvpTracer, graph::AtomId, jit::JitTracer, linear::LinearTerm, ops::{DifferentiableOp, LinearOp, Op},
     program::ProgramBuilder, operations::{expect_input_count, unary_abstract},
 };
 use ryft_core::types::ArrayType;
@@ -78,9 +78,26 @@ impl<V: TraceValue> Eval<V> for WithShardingConstraintOp {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V>
     for WithShardingConstraintOp
 {
+    fn transpose_program_op(
+        &self,
+        builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        expect_input_count(outputs.len(), 1)?;
+        expect_input_count(output_cotangents.len(), 1)?;
+        let contribution = builder.add_equation(
+            PrimitiveOp::Custom(Arc::new(WithShardingConstraintOp::new(self.sharding().clone()))),
+            vec![output_cotangents[0]],
+        )?[0];
+        Ok(vec![Some(contribution)])
+    }
+
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -108,8 +125,12 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
         .expect("sharding constraint should produce one tangent output");
         Ok(vec![JvpTracer { primal, tangent }])
     }
+}
 
-    fn apply_program_jvp_rule(
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
+    DifferentiableOp<V, LinearTerm<V>> for WithShardingConstraintOp
+{
+    fn jvp(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
@@ -123,23 +144,6 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
         .next()
         .expect("sharding constraint should produce one tangent output");
         Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent }])
-    }
-
-    fn transpose_program_op(
-        &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
-        expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = builder.add_equation(
-            PrimitiveOp::Custom(Arc::new(WithShardingConstraintOp::new(self.sharding().clone()))),
-            vec![output_cotangents[0]],
-        )?[0];
-        Ok(vec![Some(contribution)])
     }
 }
 

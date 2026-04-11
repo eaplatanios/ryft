@@ -12,7 +12,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
 };
 use crate::types::ArrayType;
 
@@ -55,7 +55,7 @@ impl<V: TraceValue + Mul<Output = V>> Eval<V> for MulOp {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for MulOp {
+impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for MulOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -74,11 +74,10 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> DifferentiableOp<V> for MulOp {
             ),
         }])
     }
+}
 
-    fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
-    where
-        T: TangentSpace<V>,
-    {
+impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for MulOp {
+    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         let left = &inputs[0];
         let right = &inputs[1];
@@ -121,11 +120,13 @@ mod tests {
 
     #[test]
     fn test_mul_jvp_matches_the_product_rule() {
-        let output = MulOp
-            .jvp::<f64>(&[
+        let output = DifferentiableOp::<f64, f64>::jvp(
+            &MulOp,
+            &[
                 JvpTracer { primal: 2.0f64, tangent: 3.0f64 },
                 JvpTracer { primal: 5.0f64, tangent: -1.0f64 },
-            ])
+            ],
+        )
             .unwrap()
             .pop()
             .unwrap();

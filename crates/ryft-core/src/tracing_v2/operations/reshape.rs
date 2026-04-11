@@ -21,7 +21,7 @@ use crate::{
         graph::AtomId,
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
+        ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
         program::ProgramBuilder,
     },
     types::{ArrayType, Shape, Size, Typed},
@@ -391,32 +391,7 @@ impl<V: ReshapeValue> Eval<V> for ReshapeOp {
     }
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> DifferentiableOp<V> for ReshapeOp {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![
-            inputs
-                .into_iter()
-                .next()
-                .expect("validated reshape input should exist")
-                .reshape(self.output_type().shape.clone())?,
-        ])
-    }
-
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
-    }
-
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> for ReshapeOp {
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,
@@ -439,6 +414,35 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> Differentiable
             vec![example_value],
         )[0];
         Ok(vec![Some(contribution)])
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![
+            inputs
+                .into_iter()
+                .next()
+                .expect("validated reshape input should exist")
+                .reshape(self.output_type().shape.clone())?,
+        ])
+    }
+}
+
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps>
+    DifferentiableOp<V, LinearTerm<V>> for ReshapeOp
+{
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
 }
 

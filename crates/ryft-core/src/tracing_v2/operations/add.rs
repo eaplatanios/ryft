@@ -13,7 +13,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -57,21 +57,7 @@ impl<V: TraceValue + Add<Output = V>> Eval<V> for AddOp {
     }
 }
 
-impl<V: TraceValue + Add<Output = V> + ZeroLike> DifferentiableOp<V> for AddOp {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 2)?;
-        Ok(vec![JvpTracer {
-            primal: inputs[0].primal.clone() + inputs[1].primal.clone(),
-            tangent: inputs[0].tangent.clone().add(inputs[1].tangent.clone()),
-        }])
-    }
-
+impl<V: TraceValue + Add<Output = V> + ZeroLike> LinearOp<V> for AddOp {
     fn transpose_program_op(
         &self,
         _builder: &mut ProgramBuilder<V>,
@@ -85,10 +71,23 @@ impl<V: TraceValue + Add<Output = V> + ZeroLike> DifferentiableOp<V> for AddOp {
         Ok(vec![Some(output_cotangents[0]), Some(output_cotangents[0])])
     }
 
-    fn jvp<T>(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
     where
-        T: TangentSpace<V>,
+        V: TransformLeaf,
     {
+        expect_input_count(inputs.len(), 2)?;
+        Ok(vec![JvpTracer {
+            primal: inputs[0].primal.clone() + inputs[1].primal.clone(),
+            tangent: inputs[0].tangent.clone().add(inputs[1].tangent.clone()),
+        }])
+    }
+}
+
+impl<V: TraceValue + Add<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for AddOp {
+    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![JvpTracer {
             primal: inputs[0].primal.clone() + inputs[1].primal.clone(),

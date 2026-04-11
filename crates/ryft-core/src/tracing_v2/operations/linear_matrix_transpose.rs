@@ -9,7 +9,7 @@ use crate::tracing_v2::{
     graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, Op, PrimitiveOp},
+    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
     program::ProgramBuilder,
 };
 use crate::types::ArrayType;
@@ -57,18 +57,7 @@ impl<V: MatrixValue> Eval<V> for LinearMatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue> DifferentiableOp<V> for LinearMatrixTransposeOp {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        expect_input_count(inputs.len(), 1)?;
-        Ok(vec![inputs[0].clone().transpose_matrix()])
-    }
-
+impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<V>,
@@ -88,6 +77,26 @@ impl<V: MatrixValue> DifferentiableOp<V> for LinearMatrixTransposeOp {
             vec![example_value],
         )[0];
         Ok(vec![Some(contribution)])
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![inputs[0].clone().transpose_matrix()])
+    }
+}
+
+impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V, T>
+    for LinearMatrixTransposeOp
+{
+    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
 

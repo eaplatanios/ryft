@@ -22,7 +22,7 @@ use crate::{
         graph::{AtomId, Graph},
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, Op, PrimitiveOp},
+        ops::{DifferentiableOp, LinearOp, Op, PrimitiveOp},
         program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };
@@ -232,7 +232,7 @@ fn transpose_program_op<V>(
 where
     V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps + Add<Output = V> + Mul<Output = V> + Neg<Output = V>,
 {
-    op.transpose_program_op(builder, inputs, outputs, output_cotangents)
+    LinearOp::transpose_program_op(op, builder, inputs, outputs, output_cotangents)
 }
 
 pub fn linearize_program<V, Input, Output>(
@@ -294,7 +294,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TraceError>>()?;
-        let output_duals = equation.op.apply_program_jvp_rule(input_duals.as_slice())?;
+        let output_duals = DifferentiableOp::<V, LinearTerm<V>>::jvp(&equation.op, input_duals.as_slice())?;
         if output_duals.len() != equation.outputs.len() {
             return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
         }

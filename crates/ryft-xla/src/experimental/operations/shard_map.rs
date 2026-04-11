@@ -9,8 +9,8 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearTerm, Linearized, MatrixOps, OneLike, Op,
-        PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
+        AtomId, DifferentiableOp, Eval, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized, MatrixOps,
+        OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
     },
     types::{ArrayType, Typed},
 };
@@ -214,49 +214,7 @@ impl Eval<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl DifferentiableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<Linearized<ShardMapTracer>>,
-    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let primal_output_values = self.eval(primal_values.as_slice())?;
-        let primal_outputs = JitTracer::apply_staged_op(
-            primal_inputs.as_slice(),
-            PrimitiveOp::Custom(std::sync::Arc::new(self.clone())),
-            primal_output_values,
-        )?;
-
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let tangent_outputs = LinearTerm::apply_staged_op(
-            tangent_inputs.as_slice(),
-            PrimitiveOp::Custom(std::sync::Arc::new(
-                make_replayed_linear_shard_map(self, primal_inputs).map_err(trace_error_from_shard_map)?,
-            )),
-            self.output_types.len(),
-        )?;
-
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| Linearized { primal, tangent })
-            .collect::<Vec<_>>())
-    }
-
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
-        if self.has_linear_state() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "linearize_program",
-                message: "JVP rule for staged op 'linear_shard_map' is not implemented".to_string(),
-            });
-        }
-        apply_staged_shard_map_jvp_rule(self, inputs)
-    }
-
+impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<ShardMapTensor>,
@@ -287,6 +245,50 @@ impl DifferentiableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
             output_cotangents.to_vec(),
         )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<Linearized<ShardMapTracer>>,
+    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
+        let primal_output_values = self.eval(primal_values.as_slice())?;
+        let primal_outputs = JitTracer::apply_staged_op(
+            primal_inputs.as_slice(),
+            PrimitiveOp::Custom(std::sync::Arc::new(self.clone())),
+            primal_output_values,
+        )?;
+
+        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_inputs.as_slice(),
+            PrimitiveOp::Custom(std::sync::Arc::new(
+                make_replayed_linear_shard_map(self, primal_inputs).map_err(trace_error_from_shard_map)?,
+            )),
+            self.output_types.len(),
+        )?;
+
+        Ok(primal_outputs
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| Linearized { primal, tangent })
+            .collect::<Vec<_>>())
+    }
+}
+
+impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp<ShardMapTensor> {
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
+        if self.has_linear_state() {
+            return Err(TraceError::HigherOrderOpFailure {
+                op: "linearize_program",
+                message: "JVP rule for staged op 'linear_shard_map' is not implemented".to_string(),
+            });
+        }
+        apply_staged_shard_map_jvp_rule(self, inputs)
     }
 }
 
@@ -345,7 +347,7 @@ impl Eval<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl DifferentiableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
+impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn transpose_program_op(
         &self,
         builder: &mut ProgramBuilder<ShardMapTracer>,
@@ -376,6 +378,18 @@ impl DifferentiableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
             output_cotangents.to_vec(),
         )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
+    }
+}
+
+impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for ShardMapOp<ShardMapTracer> {
+    fn jvp(
+        &self,
+        _inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>>, TraceError> {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "jvp",
+            message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
+        })
     }
 }
 

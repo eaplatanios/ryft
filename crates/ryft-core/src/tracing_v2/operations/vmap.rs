@@ -7,7 +7,7 @@ use crate::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
         TransformLeaf, ZeroLike,
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, Eval, Op, PrimitiveOp},
+        ops::{DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
         linear::{linearize_program, transpose_linear_program},
     },
     types::{ArrayType, Typed},
@@ -177,66 +177,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eva
     }
 }
 
-impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
-    fn replay_linearized_jit(
-        &self,
-        inputs: Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
-    where
-        V: TransformLeaf,
-    {
-        if self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "replay_program_graph",
-                message: "replaying linearized values through a linear vmap op is not implemented".to_string(),
-            });
-        }
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_output_values =
-            <Self as Eval<V>>::eval(self, primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice())?;
-        let primal_outputs =
-            JitTracer::apply_staged_op(primal_inputs.as_slice(), PrimitiveOp::VMap(Box::new(self.clone())), primal_output_values)?;
-        let lane_input_count = self.body().input_types().len();
-        let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
-        for lane_inputs in inputs.chunks(lane_input_count) {
-            let lane_outputs = crate::tracing_v2::linear::replay_program_graph_linearized_jit(
-                self.body().compiled().program().graph(),
-                lane_inputs.to_vec(),
-            )?;
-            tangent_outputs.extend(lane_outputs.into_iter().map(|output| output.tangent));
-        }
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| crate::tracing_v2::JvpTracer { primal, tangent })
-            .collect::<Vec<_>>())
-    }
-
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        if self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "linearize_program",
-                message: "JVP rule for staged op 'vmap' is not implemented".to_string(),
-            });
-        }
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let primal_outputs = <Self as Eval<V>>::eval(self, primal_inputs.as_slice())?;
-        let tangent_outputs = LinearTerm::apply_staged_op(
-            tangent_inputs.as_slice(),
-            PrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
-            self.body.total_output_count(),
-        )?;
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| crate::tracing_v2::JvpTracer { primal, tangent })
-            .collect::<Vec<_>>())
-    }
-
+impl<V: TransformLeaf> LinearOp<V> for VMapOp<V> {
     fn transpose_program_op(
         &self,
         builder: &mut crate::tracing_v2::ProgramBuilder<V>,
@@ -277,6 +218,67 @@ impl<V: TransformLeaf> DifferentiableOp<V> for VMapOp<V> {
             output_examples,
         );
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
+    }
+
+    fn replay_linearized_jit(
+        &self,
+        inputs: Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>, TraceError>
+    where
+        V: TransformLeaf,
+    {
+        if self.has_transpose_body() {
+            return Err(TraceError::HigherOrderOpFailure {
+                op: "replay_program_graph",
+                message: "replaying linearized values through a linear vmap op is not implemented".to_string(),
+            });
+        }
+        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_output_values =
+            <Self as Eval<V>>::eval(self, primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice())?;
+        let primal_outputs =
+            JitTracer::apply_staged_op(primal_inputs.as_slice(), PrimitiveOp::VMap(Box::new(self.clone())), primal_output_values)?;
+        let lane_input_count = self.body().input_types().len();
+        let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
+        for lane_inputs in inputs.chunks(lane_input_count) {
+            let lane_outputs = crate::tracing_v2::linear::replay_program_graph_linearized_jit(
+                self.body().compiled().program().graph(),
+                lane_inputs.to_vec(),
+            )?;
+            tangent_outputs.extend(lane_outputs.into_iter().map(|output| output.tangent));
+        }
+        Ok(primal_outputs
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| crate::tracing_v2::JvpTracer { primal, tangent })
+            .collect::<Vec<_>>())
+    }
+}
+
+impl<V: TransformLeaf> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V> {
+    fn jvp(
+        &self,
+        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        if self.has_transpose_body() {
+            return Err(TraceError::HigherOrderOpFailure {
+                op: "linearize_program",
+                message: "JVP rule for staged op 'vmap' is not implemented".to_string(),
+            });
+        }
+        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let primal_outputs = <Self as Eval<V>>::eval(self, primal_inputs.as_slice())?;
+        let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_inputs.as_slice(),
+            PrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
+            self.body.total_output_count(),
+        )?;
+        Ok(primal_outputs
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| crate::tracing_v2::JvpTracer { primal, tangent })
+            .collect::<Vec<_>>())
     }
 }
 

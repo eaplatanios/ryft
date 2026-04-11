@@ -8,7 +8,7 @@ use crate::tracing_v2::{
     forward::JvpTracer,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, Eval, Op},
+    ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
 };
 use crate::types::ArrayType;
 
@@ -55,7 +55,7 @@ impl<V: MatrixValue> Eval<V> for MatMulOp {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike> DifferentiableOp<V> for MatMulOp {
+impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatMulOp {
     fn replay_linearized_jit(
         &self,
         inputs: Vec<JvpTracer<JitTracer<V>, LinearTerm<JitTracer<V>>>>,
@@ -66,11 +66,12 @@ impl<V: MatrixValue + FloatExt + ZeroLike> DifferentiableOp<V> for MatMulOp {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
+}
 
-    fn apply_program_jvp_rule(
-        &self,
-        inputs: &[JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>>
+    DifferentiableOp<V, T> for MatMulOp
+{
+    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
