@@ -19,10 +19,11 @@ use crate::{
         FloatExt, MatrixOps, OneLike, TraceError, TraceValue, TransformLeaf, ZeroLike,
         batch::{Batch, stack, unstack},
         forward::{JvpTracer, TangentSpace},
-        graph::{AtomId, Graph},
+        graph::{AtomId, AtomSource, Equation, Graph},
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
+        operations::rematerialize::{FlatTracedRematerialize, RematerializeOp},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, LinearOp, Op, PrimitiveOp},
+        ops::{DifferentiableOp, Eval, LinearOp, Op, PrimitiveOp},
         program::{Program, ProgramBuilder, ProgramOpRef},
     },
 };
@@ -1450,6 +1451,480 @@ where
     Ok(compiled)
 }
 
+/// Policy controlling how forward-pass intermediates are handled during reverse-mode differentiation.
+///
+/// This trades off memory usage against recomputation cost. [`SaveAll`](RematerializationPolicy::SaveAll) is the
+/// default: all intermediates are saved, giving fast backward passes at the cost of high memory.
+/// [`RecomputeAll`](RematerializationPolicy::RecomputeAll) saves nothing, recomputing everything from inputs.
+/// [`Checkpoint`](RematerializationPolicy::Checkpoint) is the classic middle ground, saving intermediates at
+/// regular intervals and recomputing within each segment.
+#[derive(Clone, Debug)]
+pub enum RematerializationPolicy {
+    /// Save all forward-pass intermediates (maximum memory, no recomputation).
+    SaveAll,
+
+    /// Recompute all forward-pass intermediates from inputs (minimum memory, maximum recomputation).
+    RecomputeAll,
+
+    /// Save intermediates every `segment_size` equations, recomputing within each segment.
+    ///
+    /// With a program of N equations, setting `segment_size` to approximately the square root of N gives O(sqrt(N))
+    /// memory usage. A `segment_size` of zero or one degenerates to [`SaveAll`](RematerializationPolicy::SaveAll)
+    /// since each segment contains at most one equation.
+    Checkpoint {
+        /// Number of equations per rematerialization segment.
+        segment_size: usize,
+    },
+}
+
+/// Compiles a reverse-mode gradient function with an explicit rematerialization policy.
+///
+/// This generalizes [`compile_grad`] by letting the caller control how forward-pass intermediates are handled
+/// during the backward pass:
+///
+///   - [`RematerializationPolicy::SaveAll`]: identical to [`compile_grad`] — no rematerialization boundaries are
+///     inserted, so the XLA compiler decides which intermediates to save.
+///   - [`RematerializationPolicy::RecomputeAll`]: the entire forward body is wrapped in a single
+///     [`rematerialize`] boundary, forcing the backward pass to recompute all intermediates from inputs.
+///   - [`RematerializationPolicy::Checkpoint`]: the forward body is partitioned into segments of at most
+///     `segment_size` equations, each wrapped in its own [`rematerialize`] boundary. Intermediates at segment
+///     boundaries are saved while within-segment intermediates are recomputed.
+pub fn compile_grad_with_policy<F, Input, V>(
+    function: F,
+    example_primals: Input,
+    policy: RematerializationPolicy,
+) -> Result<CompiledFunction<V, Input, Input>, TraceError>
+where
+    V: TransformLeaf,
+    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    F: Fn(Input::To<JitTracer<V>>) -> JitTracer<V>,
+{
+    match policy {
+        RematerializationPolicy::SaveAll => compile_grad(&function, example_primals),
+        RematerializationPolicy::RecomputeAll => compile_grad_segmented(&function, example_primals, None),
+        RematerializationPolicy::Checkpoint { segment_size } => {
+            if segment_size <= 1 {
+                return compile_grad(&function, example_primals);
+            }
+            compile_grad_segmented(&function, example_primals, Some(segment_size))
+        }
+    }
+}
+
+/// Compiles a gradient function with rematerialization boundaries inserted via program segmentation.
+///
+/// When `segment_size` is `None`, the entire program is wrapped in a single [`RematerializeOp`]
+/// (equivalent to [`RematerializationPolicy::RecomputeAll`]). When `Some(s)`, the program is
+/// partitioned into segments of at most `s` equations, each wrapped in its own [`RematerializeOp`].
+///
+/// Internally, this replicates the flow of `grad` for [`JitTracer`]-level inputs — trace, linearize,
+/// transpose, stage pullback — but inserts a segmentation step between tracing and linearization so
+/// that the differentiation transform sees and respects the rematerialization boundaries.
+fn compile_grad_segmented<F, Input, V>(
+    function: &F,
+    example_primals: Input,
+    segment_size: Option<usize>,
+) -> Result<CompiledFunction<V, Input, Input>, TraceError>
+where
+    V: TransformLeaf,
+    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    F: Fn(Input::To<JitTracer<V>>) -> JitTracer<V>,
+{
+    let input_structure = example_primals.parameter_structure();
+    let (_, compiled) = try_jit(
+        |primals: Input::To<JitTracer<V>>| {
+            let traced_primals = primals.into_parameters().collect::<Vec<_>>();
+
+            // Step 1: Trace the function at the base V level to get a program.
+            let staged_primals = Input::To::<V>::from_parameters(
+                input_structure.clone(),
+                traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+            )?;
+            let (_, traced_program): (V, Program<V, Input::To<V>, V>) = try_trace_program(
+                |staged_input| {
+                    let adapted_input = Input::To::<JitTracer<V>>::from_parameters(
+                        input_structure.clone(),
+                        staged_input.into_parameters().collect::<Vec<_>>(),
+                    )?;
+                    Ok(function(adapted_input))
+                },
+                staged_primals,
+            )?;
+            let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+                vec![Placeholder; traced_primals.len()],
+                vec![Placeholder; 1],
+            ))
+            .simplify()?;
+
+            // Step 2: Segment the traced program to insert rematerialization boundaries.
+            let segmented_program = match segment_size {
+                None => wrap_program_in_rematerialize(&traced_program)?,
+                Some(size) => segment_program(&traced_program, size)?,
+            };
+
+            // Step 3: Linearize and transpose the segmented program to produce the pullback.
+            // `try_linearize_traced_program` replays the graph at the JitTracer level (staging
+            // both forward and backward equations in the outer JIT builder) and returns the
+            // primal outputs alongside the linear pushforward map.
+            let (outputs, pushforward) = try_linearize_traced_program(&segmented_program, traced_primals)?;
+            if outputs.len() != 1 {
+                return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+            }
+            let pullback = pushforward.transpose()?;
+            let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
+            Ok(Input::To::<JitTracer<V>>::from_parameters(input_structure.clone(), traced_gradient)?)
+        },
+        example_primals,
+    )?;
+    Ok(compiled)
+}
+
+/// Partitions a program's equations into segments of at most `segment_size`, wrapping each segment in a
+/// [`RematerializeOp`].
+///
+/// Given a program with N equations and a segment size S, this produces a new program with at most
+/// `ceil(N / S)` equations. Each equation is a [`RematerializeOp`] whose body sub-program contains the
+/// original equations from that segment. Atoms crossing segment boundaries become inputs/outputs of the
+/// respective sub-programs.
+///
+/// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
+/// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOp`]
+/// boundary forces recomputation of within-segment intermediates rather than saving them.
+fn segment_program<V: TransformLeaf>(
+    program: &Program<V, Vec<V>, Vec<V>>,
+    segment_size: usize,
+) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
+    let graph = program.graph();
+    let equations = graph.equations();
+
+    // If the program has fewer equations than a single segment, no segmentation is needed — wrap the
+    // whole thing in a single RematerializeOp.
+    if equations.len() <= segment_size {
+        return wrap_program_in_rematerialize(program);
+    }
+
+    // Divide equations into segments.
+    let segments: Vec<&[Equation<ProgramOpRef<V>>]> = equations.chunks(segment_size).collect();
+
+    // Build a mapping from atom ID to which equation produces it (if any).
+    let mut atom_producer: Vec<Option<usize>> = vec![None; graph.atom_count()];
+    for (equation_index, equation) in equations.iter().enumerate() {
+        for &output_atom in &equation.outputs {
+            atom_producer[output_atom] = Some(equation_index);
+        }
+    }
+
+    // Build a set tracking which atoms are consumed after a given equation index.
+    // For each atom, track all equation indices that consume it.
+    let mut atom_consumers: Vec<Vec<usize>> = vec![Vec::new(); graph.atom_count()];
+    for (equation_index, equation) in equations.iter().enumerate() {
+        for &input_atom in &equation.inputs {
+            atom_consumers[input_atom].push(equation_index);
+        }
+    }
+    // Also mark program outputs as "consumed" at equation_count (sentinel for "after all equations").
+    let sentinel = equations.len();
+    for &output_atom in graph.outputs() {
+        atom_consumers[output_atom].push(sentinel);
+    }
+
+    // Build the outer program.
+    let input_atoms = graph.input_atoms();
+    let mut outer_builder: ProgramBuilder<V> = ProgramBuilder::new();
+
+    // Map from original atom IDs to outer-program atom IDs.
+    let mut atom_mapping: Vec<Option<AtomId>> = vec![None; graph.atom_count()];
+
+    // Register program inputs in the outer builder.
+    for &input_atom in input_atoms {
+        let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+        let outer_atom = outer_builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone());
+        atom_mapping[input_atom] = Some(outer_atom);
+    }
+
+    // Register constants that are used by equations (they might be referenced across segments).
+    for (atom_id, atom) in graph.atoms_iter() {
+        if matches!(atom.source, AtomSource::Constant) {
+            let outer_atom = outer_builder.add_constant(atom.example_value.clone());
+            atom_mapping[atom_id] = Some(outer_atom);
+        }
+    }
+
+    // Process each segment.
+    let mut equation_offset = 0;
+    for segment in &segments {
+        let segment_start = equation_offset;
+        let segment_end = equation_offset + segment.len();
+
+        // Identify boundary inputs: atoms consumed by this segment that are produced outside it
+        // (by previous segments or program inputs/constants).
+        let mut boundary_input_atoms: Vec<AtomId> = Vec::new();
+        let mut boundary_input_set = std::collections::HashSet::new();
+        for equation in *segment {
+            for &input_atom in &equation.inputs {
+                // If this atom is produced by an equation outside this segment (or is an input/constant).
+                let produced_in_segment = atom_producer[input_atom]
+                    .map_or(false, |producer_idx| producer_idx >= segment_start && producer_idx < segment_end);
+                if !produced_in_segment && boundary_input_set.insert(input_atom) {
+                    boundary_input_atoms.push(input_atom);
+                }
+            }
+        }
+
+        // Identify boundary outputs: atoms produced by this segment that are consumed outside it
+        // (by later segments or as program outputs).
+        let mut boundary_output_atoms: Vec<AtomId> = Vec::new();
+        let mut boundary_output_set = std::collections::HashSet::new();
+        for equation in *segment {
+            for &output_atom in &equation.outputs {
+                let consumed_outside = atom_consumers[output_atom]
+                    .iter()
+                    .any(|&consumer_idx| consumer_idx < segment_start || consumer_idx >= segment_end);
+                if consumed_outside && boundary_output_set.insert(output_atom) {
+                    boundary_output_atoms.push(output_atom);
+                }
+            }
+        }
+
+        // Build the sub-program for this segment.
+        let sub_program = build_segment_sub_program(graph, *segment, &boundary_input_atoms, &boundary_output_atoms)?;
+
+        // Build the RematerializeOp.
+        let input_types: Vec<_> = boundary_input_atoms
+            .iter()
+            .map(|&atom_id| {
+                graph
+                    .atom(atom_id)
+                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .map(|atom| atom.abstract_value.clone())
+            })
+            .collect::<Result<_, _>>()?;
+        let output_types: Vec<_> = boundary_output_atoms
+            .iter()
+            .map(|&atom_id| {
+                graph
+                    .atom(atom_id)
+                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .map(|atom| atom.abstract_value.clone())
+            })
+            .collect::<Result<_, _>>()?;
+
+        let body = FlatTracedRematerialize::from_parts(
+            input_types.clone(),
+            output_types.clone(),
+            CompiledFunction::from_program(sub_program),
+        );
+        let remat_op = RematerializeOp::new(body);
+
+        // Compute example output values for the RematerializeOp.
+        let example_inputs: Vec<V> = boundary_input_atoms
+            .iter()
+            .map(|&atom_id| {
+                graph
+                    .atom(atom_id)
+                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .map(|atom| atom.example_value.clone())
+            })
+            .collect::<Result<_, _>>()?;
+        let example_outputs = remat_op.eval(example_inputs.as_slice())?;
+
+        // Add the RematerializeOp equation to the outer builder.
+        let outer_inputs: Vec<AtomId> = boundary_input_atoms
+            .iter()
+            .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TraceError::UnboundAtomId { id: orig_atom }))
+            .collect::<Result<_, _>>()?;
+        let outer_outputs = outer_builder.add_equation_prevalidated(
+            PrimitiveOp::Rematerialize(Box::new(remat_op)),
+            outer_inputs,
+            output_types,
+            example_outputs,
+        );
+
+        // Map the boundary output atoms to their outer-program counterparts.
+        for (orig_atom, outer_atom) in boundary_output_atoms.iter().zip(outer_outputs.iter()) {
+            atom_mapping[*orig_atom] = Some(*outer_atom);
+        }
+
+        equation_offset = segment_end;
+    }
+
+    // Wire up the program outputs.
+    let outer_outputs: Vec<AtomId> = graph
+        .outputs()
+        .iter()
+        .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TraceError::UnboundAtomId { id: orig_atom }))
+        .collect::<Result<_, _>>()?;
+
+    let outer_graph = outer_builder.build::<Vec<V>, Vec<V>>(
+        outer_outputs,
+        vec![Placeholder; input_atoms.len()],
+        vec![Placeholder; graph.outputs().len()],
+    );
+    Ok(Program::from_graph(outer_graph))
+}
+
+/// Wraps an entire program in a single [`RematerializeOp`] boundary.
+fn wrap_program_in_rematerialize<V: TransformLeaf>(
+    program: &Program<V, Vec<V>, Vec<V>>,
+) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
+    let graph = program.graph();
+    let input_types: Vec<_> = graph
+        .input_atoms()
+        .iter()
+        .map(|&atom_id| {
+            graph
+                .atom(atom_id)
+                .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                .map(|atom| atom.abstract_value.clone())
+        })
+        .collect::<Result<_, _>>()?;
+    let output_types: Vec<_> = graph
+        .outputs()
+        .iter()
+        .map(|&atom_id| {
+            graph
+                .atom(atom_id)
+                .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                .map(|atom| atom.abstract_value.clone())
+        })
+        .collect::<Result<_, _>>()?;
+
+    let body = FlatTracedRematerialize::from_parts(
+        input_types.clone(),
+        output_types.clone(),
+        CompiledFunction::from_program(program.clone()),
+    );
+    let remat_op = RematerializeOp::new(body);
+
+    let example_inputs: Vec<V> = graph
+        .input_atoms()
+        .iter()
+        .map(|&atom_id| {
+            graph
+                .atom(atom_id)
+                .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                .map(|atom| atom.example_value.clone())
+        })
+        .collect::<Result<_, _>>()?;
+    let example_outputs = remat_op.eval(example_inputs.as_slice())?;
+
+    let mut outer_builder: ProgramBuilder<V> = ProgramBuilder::new();
+    let outer_inputs: Vec<AtomId> = graph
+        .input_atoms()
+        .iter()
+        .map(|&atom_id| {
+            let atom = graph.atom(atom_id).expect("input atom should exist");
+            outer_builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone())
+        })
+        .collect();
+
+    let outer_outputs = outer_builder.add_equation_prevalidated(
+        PrimitiveOp::Rematerialize(Box::new(remat_op)),
+        outer_inputs.clone(),
+        output_types,
+        example_outputs,
+    );
+
+    let outer_graph = outer_builder.build::<Vec<V>, Vec<V>>(
+        outer_outputs,
+        vec![Placeholder; outer_inputs.len()],
+        vec![Placeholder; graph.outputs().len()],
+    );
+    Ok(Program::from_graph(outer_graph))
+}
+
+/// Builds a sub-program for a single segment of equations.
+///
+/// The sub-program takes the boundary input atoms as its inputs and produces the boundary output atoms as its
+/// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
+/// and equations within the sub-program.
+fn build_segment_sub_program<V: TransformLeaf>(
+    graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
+    segment_equations: &[Equation<ProgramOpRef<V>>],
+    boundary_input_atoms: &[AtomId],
+    boundary_output_atoms: &[AtomId],
+) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
+    let mut sub_builder: ProgramBuilder<V> = ProgramBuilder::new();
+
+    // Map from original atom IDs to sub-program atom IDs.
+    let mut sub_atom_mapping: std::collections::HashMap<AtomId, AtomId> = std::collections::HashMap::new();
+
+    // Register boundary inputs as sub-program inputs.
+    for &input_atom in boundary_input_atoms {
+        let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+        let sub_atom = sub_builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone());
+        sub_atom_mapping.insert(input_atom, sub_atom);
+    }
+
+    // Register constants used by equations in this segment.
+    for equation in segment_equations {
+        for &input_atom in &equation.inputs {
+            if sub_atom_mapping.contains_key(&input_atom) {
+                continue;
+            }
+            let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+            if matches!(atom.source, AtomSource::Constant) {
+                let sub_atom = sub_builder.add_constant(atom.example_value.clone());
+                sub_atom_mapping.insert(input_atom, sub_atom);
+            }
+        }
+    }
+
+    // Add equations to the sub-program.
+    for equation in segment_equations {
+        let sub_inputs: Vec<AtomId> = equation
+            .inputs
+            .iter()
+            .map(|&orig_atom| {
+                sub_atom_mapping.get(&orig_atom).copied().ok_or(TraceError::UnboundAtomId { id: orig_atom })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let output_abstracts: Vec<_> = equation
+            .outputs
+            .iter()
+            .map(|&atom_id| {
+                graph
+                    .atom(atom_id)
+                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .map(|atom| atom.abstract_value.clone())
+            })
+            .collect::<Result<_, _>>()?;
+        let output_examples: Vec<V> = equation
+            .outputs
+            .iter()
+            .map(|&atom_id| {
+                graph
+                    .atom(atom_id)
+                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .map(|atom| atom.example_value.clone())
+            })
+            .collect::<Result<_, _>>()?;
+
+        let sub_outputs =
+            sub_builder.add_equation_prevalidated(equation.op.clone(), sub_inputs, output_abstracts, output_examples);
+
+        for (orig_atom, sub_atom) in equation.outputs.iter().zip(sub_outputs.iter()) {
+            sub_atom_mapping.insert(*orig_atom, *sub_atom);
+        }
+    }
+
+    // Wire up boundary outputs.
+    let sub_outputs: Vec<AtomId> = boundary_output_atoms
+        .iter()
+        .map(|&orig_atom| sub_atom_mapping.get(&orig_atom).copied().ok_or(TraceError::UnboundAtomId { id: orig_atom }))
+        .collect::<Result<_, _>>()?;
+
+    let sub_graph = sub_builder.build::<Vec<V>, Vec<V>>(
+        sub_outputs,
+        vec![Placeholder; boundary_input_atoms.len()],
+        vec![Placeholder; boundary_output_atoms.len()],
+    );
+    Ok(Program::from_graph(sub_graph))
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::{Add, Mul, Neg};
@@ -1601,5 +2076,136 @@ mod tests {
         let (grad_x2, grad_y2) = compiled.call((1.0f64, 5.0f64)).unwrap();
         approx_eq(grad_x2, 5.0 + 1.0f64.cos());
         approx_eq(grad_y2, 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // RematerializationPolicy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compile_grad_save_all_matches_compile_grad() {
+        // SaveAll should produce the same gradient as the plain compile_grad.
+        let compiled_plain = compile_grad(quadratic_plus_sin, 2.0f64).unwrap();
+        let compiled_save_all =
+            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
+
+        let grad_plain = compiled_plain.call(2.0f64).unwrap();
+        let grad_save_all = compiled_save_all.call(2.0f64).unwrap();
+        approx_eq(grad_plain, grad_save_all);
+
+        // Also verify at a different primal point.
+        let grad_plain_2 = compiled_plain.call(0.5f64).unwrap();
+        let grad_save_all_2 = compiled_save_all.call(0.5f64).unwrap();
+        approx_eq(grad_plain_2, grad_save_all_2);
+    }
+
+    #[test]
+    fn test_compile_grad_recompute_all_gives_correct_gradient() {
+        // RecomputeAll should give d/dx(x^2 + sin(x)) = 2x + cos(x).
+        let compiled =
+            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll).unwrap();
+
+        approx_eq(compiled.call(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
+        approx_eq(compiled.call(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
+        approx_eq(
+            compiled.call(std::f64::consts::PI).unwrap(),
+            2.0 * std::f64::consts::PI + std::f64::consts::PI.cos(),
+        );
+    }
+
+    #[test]
+    fn test_compile_grad_recompute_all_matches_compile_grad() {
+        // RecomputeAll should give the same numerical gradient as compile_grad.
+        let compiled_plain = compile_grad(quadratic_plus_sin, 2.0f64).unwrap();
+        let compiled_recompute =
+            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll).unwrap();
+
+        for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
+            let grad_plain = compiled_plain.call(x).unwrap();
+            let grad_recompute = compiled_recompute.call(x).unwrap();
+            approx_eq(grad_plain, grad_recompute);
+        }
+    }
+
+    #[test]
+    fn test_compile_grad_checkpoint_gives_correct_gradient() {
+        // Checkpoint with segment_size=2 should give the correct gradient for a function with
+        // ~4 equations: x*x, sin(x), x*x + sin(x).
+        let compiled = compile_grad_with_policy(
+            quadratic_plus_sin,
+            2.0f64,
+            RematerializationPolicy::Checkpoint { segment_size: 2 },
+        )
+        .unwrap();
+
+        approx_eq(compiled.call(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
+        approx_eq(compiled.call(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
+    }
+
+    #[test]
+    fn test_compile_grad_checkpoint_is_reusable_at_different_primals() {
+        // The compiled gradient with Checkpoint can be called at multiple primal points.
+        let compiled = compile_grad_with_policy(
+            quadratic_plus_sin,
+            1.0f64,
+            RematerializationPolicy::Checkpoint { segment_size: 2 },
+        )
+        .unwrap();
+
+        for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
+            let expected = 2.0 * x + x.cos();
+            approx_eq(compiled.call(x).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_compile_grad_checkpoint_matches_compile_grad() {
+        // Checkpoint should give the same numerical gradient as compile_grad.
+        let compiled_plain = compile_grad(quadratic_plus_sin, 2.0f64).unwrap();
+        let compiled_checkpoint = compile_grad_with_policy(
+            quadratic_plus_sin,
+            2.0f64,
+            RematerializationPolicy::Checkpoint { segment_size: 2 },
+        )
+        .unwrap();
+
+        for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
+            let grad_plain = compiled_plain.call(x).unwrap();
+            let grad_checkpoint = compiled_checkpoint.call(x).unwrap();
+            approx_eq(grad_plain, grad_checkpoint);
+        }
+    }
+
+    #[test]
+    fn test_compile_grad_checkpoint_segment_size_one_matches_save_all() {
+        // Checkpoint with segment_size=1 should degenerate to SaveAll.
+        let compiled_save_all =
+            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
+        let compiled_checkpoint = compile_grad_with_policy(
+            quadratic_plus_sin,
+            2.0f64,
+            RematerializationPolicy::Checkpoint { segment_size: 1 },
+        )
+        .unwrap();
+
+        for x in [0.0, 1.0, 2.0] {
+            approx_eq(compiled_save_all.call(x).unwrap(), compiled_checkpoint.call(x).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_compile_grad_checkpoint_large_segment_wraps_whole_program() {
+        // Checkpoint with a segment_size larger than the number of equations should wrap
+        // the entire program in a single RematerializeOp, equivalent to RecomputeAll.
+        let compiled = compile_grad_with_policy(
+            quadratic_plus_sin,
+            2.0f64,
+            RematerializationPolicy::Checkpoint { segment_size: 100 },
+        )
+        .unwrap();
+
+        for x in [0.0, 1.0, 2.0, std::f64::consts::PI] {
+            approx_eq(compiled.call(x).unwrap(), 2.0 * x + x.cos());
+        }
     }
 }

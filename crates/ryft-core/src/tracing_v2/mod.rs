@@ -31,12 +31,12 @@ mod value;
 
 pub use batch::{Batch, stack, unstack, vmap};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub use graph::{AtomId, AtomSource, Graph, GraphBuilder};
+pub use graph::{AtomId, AtomSource, Equation, Graph, GraphBuilder};
 pub use jit::try_jit;
 pub use jit::{CompiledFunction, JitTracer, jit};
 pub use linear::{
-    CoordinateValue, DenseJacobian, LinearProgram, compile_grad, grad, hessian, jacfwd, jacrev, jvp_program, linearize,
-    value_and_grad, vjp,
+    CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
+    grad, hessian, jacfwd, jacrev, jvp_program, linearize, value_and_grad, vjp,
 };
 pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};

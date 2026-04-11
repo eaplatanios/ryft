@@ -359,6 +359,12 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
         self.atoms.get(id)
     }
 
+    /// Returns an iterator over all atoms in the graph, yielding `(atom_id, &Atom<V>)` pairs.
+    #[inline]
+    pub fn atoms_iter(&self) -> impl Iterator<Item = (AtomId, &Atom<V>)> {
+        self.atoms.iter().enumerate()
+    }
+
     /// Returns the graph input atoms in parameter order.
     #[inline]
     pub fn input_atoms(&self) -> &[AtomId] {
