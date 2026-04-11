@@ -10,7 +10,9 @@ use crate::tracing_v2::{
     TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
+    graph::AtomId,
     ops::{BatchOp, DifferentiableOp, Eval, LinearOp, Op},
+    program::ProgramBuilder,
 };
 use crate::types::ArrayType;
 
@@ -53,7 +55,20 @@ impl<V: TraceValue + Mul<Output = V>> Eval<V> for MulOp {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for MulOp {}
+impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for MulOp {
+    fn transpose(
+        &self,
+        _builder: &mut ProgramBuilder<V>,
+        _inputs: &[AtomId],
+        _outputs: &[AtomId],
+        _output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        Err(TraceError::HigherOrderOpFailure {
+            op: "transpose_linear_program",
+            message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
+        })
+    }
+}
 
 impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for MulOp {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {

@@ -81,7 +81,7 @@ impl<V: TraceValue + Mul<Output = V>> Eval<V> for ScaleOp<V> {
 }
 
 impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<V>,
         inputs: &[AtomId],
@@ -167,7 +167,7 @@ mod tests {
         let mut transpose_builder = ProgramBuilder::<f64>::new();
         let output_cotangent = transpose_builder.add_input(&1.0f64);
         let contribution = ScaleOp::new(3.0f64)
-            .transpose_program_op(&mut transpose_builder, &[input], &[output], &[output_cotangent])
+            .transpose(&mut transpose_builder, &[input], &[output], &[output_cotangent])
             .unwrap()[0]
             .unwrap();
 

@@ -56,23 +56,15 @@ pub trait Eval<V: TraceValue>: Op {
 }
 
 /// Operations that can appear in tangent/cotangent programs and support reverse-mode transposition.
-///
-/// The default implementation returns [`TraceError::HigherOrderOpFailure`] so that operations only
-/// need to override the method when they support transposition.
 pub trait LinearOp<V: TraceValue>: Op {
     /// Applies the transpose rule for reverse-mode differentiation.
-    fn transpose_program_op(
+    fn transpose(
         &self,
-        _builder: &mut ProgramBuilder<V>,
-        _inputs: &[AtomId],
-        _outputs: &[AtomId],
-        _output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "transpose_linear_program",
-            message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
-        })
-    }
+        builder: &mut ProgramBuilder<V>,
+        inputs: &[AtomId],
+        outputs: &[AtomId],
+        output_cotangents: &[AtomId],
+    ) -> Result<Vec<Option<AtomId>>, TraceError>;
 }
 
 /// Forward-mode differentiation rule, generic over the tangent type `T`.
@@ -208,14 +200,14 @@ impl<T: Eval<V> + ?Sized, V: TraceValue> Eval<V> for Arc<T> {
 
 impl<T: LinearOp<V> + ?Sized, V: TraceValue> LinearOp<V> for Arc<T> {
     #[inline]
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<V>,
         inputs: &[AtomId],
         outputs: &[AtomId],
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        (**self).transpose_program_op(builder, inputs, outputs, output_cotangents)
+        (**self).transpose(builder, inputs, outputs, output_cotangents)
     }
 }
 
@@ -354,7 +346,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     LinearOp<V> for PrimitiveOp<V>
 {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<V>,
         inputs: &[AtomId],
@@ -362,35 +354,35 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
         output_cotangents: &[AtomId],
     ) -> Result<Vec<Option<AtomId>>, TraceError> {
         match self {
-            Self::Add => AddOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
-            Self::Mul => MulOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
-            Self::Neg => NegOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
-            Self::Sin => SinOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
-            Self::Cos => CosOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
-            Self::MatMul => MatMulOp.transpose_program_op(builder, inputs, outputs, output_cotangents),
+            Self::Add => AddOp.transpose(builder, inputs, outputs, output_cotangents),
+            Self::Mul => MulOp.transpose(builder, inputs, outputs, output_cotangents),
+            Self::Neg => NegOp.transpose(builder, inputs, outputs, output_cotangents),
+            Self::Sin => SinOp.transpose(builder, inputs, outputs, output_cotangents),
+            Self::Cos => CosOp.transpose(builder, inputs, outputs, output_cotangents),
+            Self::MatMul => MatMulOp.transpose(builder, inputs, outputs, output_cotangents),
             Self::MatrixTranspose => {
-                MatrixTransposeOp.transpose_program_op(builder, inputs, outputs, output_cotangents)
+                MatrixTransposeOp.transpose(builder, inputs, outputs, output_cotangents)
             }
             Self::LinearMatrixTranspose => {
-                LinearMatrixTransposeOp.transpose_program_op(builder, inputs, outputs, output_cotangents)
+                LinearMatrixTransposeOp.transpose(builder, inputs, outputs, output_cotangents)
             }
             Self::Scale { factor } => {
-                ScaleOp::new(factor.clone()).transpose_program_op(builder, inputs, outputs, output_cotangents)
+                ScaleOp::new(factor.clone()).transpose(builder, inputs, outputs, output_cotangents)
             }
             Self::LeftMatMul { factor } => {
-                LeftMatMulOp::new(factor.clone()).transpose_program_op(builder, inputs, outputs, output_cotangents)
+                LeftMatMulOp::new(factor.clone()).transpose(builder, inputs, outputs, output_cotangents)
             }
             Self::RightMatMul { factor } => {
-                RightMatMulOp::new(factor.clone()).transpose_program_op(builder, inputs, outputs, output_cotangents)
+                RightMatMulOp::new(factor.clone()).transpose(builder, inputs, outputs, output_cotangents)
             }
             Self::Reshape { input_type, output_type } => ReshapeOp::new(input_type.clone(), output_type.clone())
-                .transpose_program_op(builder, inputs, outputs, output_cotangents),
+                .transpose(builder, inputs, outputs, output_cotangents),
             Self::VMap(_) => Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
                 message: "vmap transpose rule requires concrete leaf values; use the replay path instead".to_string(),
             }),
-            Self::Rematerialize(remat) => remat.transpose_program_op(builder, inputs, outputs, output_cotangents),
-            Self::Custom(op) => op.transpose_program_op(builder, inputs, outputs, output_cotangents),
+            Self::Rematerialize(remat) => remat.transpose(builder, inputs, outputs, output_cotangents),
+            Self::Custom(op) => op.transpose(builder, inputs, outputs, output_cotangents),
         }
     }
 }

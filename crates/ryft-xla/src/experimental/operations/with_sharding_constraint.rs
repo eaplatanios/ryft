@@ -86,7 +86,7 @@ impl Eval<ShardMapTensor> for WithShardingConstraintOp {
 }
 
 impl LinearOp<ShardMapTensor> for WithShardingConstraintOp {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<ShardMapTensor>,
         inputs: &[AtomId],
@@ -154,7 +154,7 @@ impl Eval<ShardMapTracer> for WithShardingConstraintOp {
 }
 
 impl LinearOp<ShardMapTracer> for WithShardingConstraintOp {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<ShardMapTracer>,
         inputs: &[AtomId],
@@ -356,7 +356,7 @@ mod tests {
 
         let mut transpose_builder = ProgramBuilder::<ShardMapTensor>::new();
         let output_cotangent = transpose_builder.add_input(&ShardMapTensor::new(input_type));
-        let contribution = LinearOp::transpose_program_op(
+        let contribution = LinearOp::transpose(
             &WithShardingConstraintOp::new(sharding.clone()),
             &mut transpose_builder,
             &[input],

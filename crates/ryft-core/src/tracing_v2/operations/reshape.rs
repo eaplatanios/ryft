@@ -388,7 +388,7 @@ impl<V: ReshapeValue> Eval<V> for ReshapeOp {
 }
 
 impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> for ReshapeOp {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<V>,
         inputs: &[AtomId],
@@ -705,7 +705,7 @@ mod tests {
             input_type.clone(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap(),
         )
-        .transpose_program_op(&mut transpose_builder, &[input], &[output], &[output_cotangent])
+        .transpose(&mut transpose_builder, &[input], &[output], &[output_cotangent])
         .unwrap()[0]
             .unwrap();
 

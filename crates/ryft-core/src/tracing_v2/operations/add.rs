@@ -56,7 +56,7 @@ impl<V: TraceValue + Add<Output = V>> Eval<V> for AddOp {
 }
 
 impl<V: TraceValue + Add<Output = V> + ZeroLike> LinearOp<V> for AddOp {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         _builder: &mut ProgramBuilder<V>,
         inputs: &[AtomId],

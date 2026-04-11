@@ -178,7 +178,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Eva
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for VMapOp<V> {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut crate::tracing_v2::ProgramBuilder<V>,
         inputs: &[crate::tracing_v2::AtomId],

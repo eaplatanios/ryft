@@ -217,7 +217,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display f
     }
 }
 
-fn transpose_program_op<V>(
+fn transpose<V>(
     op: &PrimitiveOp<V>,
     builder: &mut ProgramBuilder<V>,
     inputs: &[AtomId],
@@ -235,7 +235,7 @@ where
         + Mul<Output = V>
         + Neg<Output = V>,
 {
-    LinearOp::transpose_program_op(op, builder, inputs, outputs, output_cotangents)
+    LinearOp::transpose(op, builder, inputs, outputs, output_cotangents)
 }
 
 pub fn linearize_program<V, Input, Output>(
@@ -395,7 +395,7 @@ where
         let Some(equation_output_cotangents) = equation_output_cotangents else {
             continue;
         };
-        let input_cotangents = transpose_program_op(
+        let input_cotangents = transpose(
             &equation.op,
             &mut builder,
             equation.inputs.as_slice(),

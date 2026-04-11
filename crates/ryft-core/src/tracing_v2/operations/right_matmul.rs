@@ -81,7 +81,7 @@ impl<V: MatrixValue> Eval<V> for RightMatMulOp<V> {
 impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
     for RightMatMulOp<V>
 {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<V>,
         inputs: &[AtomId],

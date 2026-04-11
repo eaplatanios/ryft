@@ -215,7 +215,7 @@ impl Eval<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 }
 
 impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<ShardMapTensor>,
         inputs: &[AtomId],
@@ -348,7 +348,7 @@ impl Eval<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
 }
 
 impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<ShardMapTracer>,
         inputs: &[AtomId],

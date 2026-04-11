@@ -56,7 +56,7 @@ impl<V: MatrixValue> Eval<V> for LinearMatrixTransposeOp {
 }
 
 impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
-    fn transpose_program_op(
+    fn transpose(
         &self,
         builder: &mut ProgramBuilder<V>,
         inputs: &[AtomId],
