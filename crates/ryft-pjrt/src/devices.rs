@@ -1354,7 +1354,11 @@ mod tests {
         assert_eq!(error.payload("reason"), Some("unit-test"));
         assert_eq!(error.payload("missing"), None);
         assert_eq!(
-            error.payloads().iter().map(|(name, value)| (name.as_str(), value.as_str())).collect::<HashMap<_, _>>(),
+            error
+                .payloads()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<HashMap<_, _>>(),
             HashMap::from([("launch_id", "17"), ("reason", "unit-test")]),
         );
     }

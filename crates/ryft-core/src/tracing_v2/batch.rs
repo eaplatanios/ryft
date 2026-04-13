@@ -194,7 +194,13 @@ pub(crate) trait VMapInvocationLeaf<
 /// Concrete-value dispatch for [`vmap`]: stacks inputs into [`Batch`] leaves, applies the user function
 /// over the batched representation, and unstacks the result back into per-lane outputs.
 impl<
-    V: TraceValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::IdentityValue + crate::tracing_v2::MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::ConcreteTraceValue
+        + crate::tracing_v2::MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > VMapInvocationLeaf<Input, Output> for V
@@ -216,7 +222,12 @@ where
 /// once at a single-lane exemplar and compiled into a [`CompiledFunction`] that lowering can later
 /// emit as packed StableHLO.
 impl<
-    V: TraceValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > VMapInvocationLeaf<Input, Output> for JitTracer<V>
@@ -326,7 +337,12 @@ where
 /// results are stacked back. No trace-once pattern is needed here because the delegation to the
 /// concrete implementation handles each lane directly.
 impl<
-    V: TraceValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Batch<V>, ParameterStructure: Clone>,
 > VMapInvocationLeaf<Input, Output> for Batch<V>

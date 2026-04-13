@@ -1464,7 +1464,7 @@ where
         let atom = graph.atom(atom_id).ok_or(LoweringError::MissingAtomValue { atom_id })?;
         match &atom.source {
             AtomSource::Constant => lower_packed_literal_value(
-                &atom.example_value,
+                atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
                 &packed_array_type(&atom.abstract_value, lane_count),
                 block,
                 context,
@@ -1650,7 +1650,12 @@ where
         match &atom.source {
             AtomSource::Input => {}
             AtomSource::Constant => {
-                atom_values[atom_id] = Some(lower_literal_value(&atom.example_value, block, context, location)?);
+                atom_values[atom_id] = Some(lower_literal_value(
+                    atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
+                    block,
+                    context,
+                    location,
+                )?);
             }
             AtomSource::Derived => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
@@ -1724,7 +1729,12 @@ where
         match &atom.source {
             AtomSource::Input => {}
             AtomSource::Constant => {
-                atom_values[atom_id] = Some(lower_literal_value(&atom.example_value, block, context, location)?);
+                atom_values[atom_id] = Some(lower_literal_value(
+                    atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
+                    block,
+                    context,
+                    location,
+                )?);
             }
             AtomSource::Derived => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
@@ -1780,7 +1790,13 @@ where
         match &atom.source {
             AtomSource::Input => {}
             AtomSource::Constant => {
-                atom_values[atom_id] = Some(lower_constant(atom_id, &atom.example_value, block, context, location)?);
+                atom_values[atom_id] = Some(lower_constant(
+                    atom_id,
+                    atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
+                    block,
+                    context,
+                    location,
+                )?);
             }
             AtomSource::Derived => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {

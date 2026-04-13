@@ -8,7 +8,7 @@ use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{InterpretableOp, Graph, GraphBuilder, Op, TraceError, TraceValue, ops::PrimitiveOp},
+    tracing_v2::{Graph, GraphBuilder, InterpretableOp, Op, TraceError, TraceValue, ops::PrimitiveOp},
 };
 
 /// Canonical operation type used by the staged program IR.

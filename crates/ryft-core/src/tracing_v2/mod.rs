@@ -45,7 +45,7 @@ pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use ops::{AsAny, CustomOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp};
 pub use program::Program;
 pub use program::{ProgramBuilder, ProgramOpRef};
-pub use value::{FloatExt, IdentityValue, OneLike, TraceValue, ZeroLike};
+pub use value::{ConcreteTraceValue, FloatExt, OneLike, TraceValue, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

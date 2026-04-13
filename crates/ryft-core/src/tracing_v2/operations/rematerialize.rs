@@ -165,17 +165,10 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
         }
         let transpose = self.transpose_op()?;
         let output_abstracts = transpose.body().output_types().to_vec();
-        let output_examples = transpose.body().compiled().call(
-            output_cotangents
-                .iter()
-                .map(|id| builder.atom(*id).expect("cotangent atom should exist").example_value.clone())
-                .collect::<Vec<_>>(),
-        )?;
         let contributions = builder.add_equation_prevalidated(
             PrimitiveOp::Rematerialize(Box::new(transpose)),
             output_cotangents.to_vec(),
             output_abstracts,
-            output_examples,
         );
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
@@ -255,7 +248,9 @@ impl<
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for RematerializeOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
+    for RematerializeOp<V>
+{
     fn interpret(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let output_values = <Self as InterpretableOp<V>>::interpret(self, concrete_inputs.as_slice())?;
@@ -313,7 +308,7 @@ pub(crate) trait RematerializeInvocationLeaf<
 /// Concrete-value dispatch for [`rematerialize`]: the rematerialization boundary is a no-op during
 /// eager execution and simply applies the body function directly.
 impl<
-    V: TraceValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::IdentityValue + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::ConcreteTraceValue + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for V

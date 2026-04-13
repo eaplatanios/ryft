@@ -395,16 +395,10 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> fo
             return Ok(vec![Some(output_cotangents[0])]);
         }
         let abstract_value = self.input_type().clone();
-        let example_value = builder
-            .atom(output_cotangents[0])
-            .expect("output cotangent atom should exist")
-            .example_value
-            .clone();
         let contribution = builder.add_equation_prevalidated(
             PrimitiveOp::Reshape { input_type: self.output_type().clone(), output_type: self.input_type().clone() },
             vec![output_cotangents[0]],
             vec![abstract_value],
-            vec![example_value],
         )[0];
         Ok(vec![Some(contribution)])
     }

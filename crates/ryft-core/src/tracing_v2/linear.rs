@@ -16,7 +16,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        FloatExt, IdentityValue, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
+        ConcreteTraceValue, FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         batch::{Batch, stack, unstack},
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, AtomSource, Equation, Graph},
@@ -54,8 +54,8 @@ impl<V: TraceValue> LinearTerm<V> {
     /// Stages a multi-input operation in the tangent program builder.
     ///
     /// Shape validation is performed via [`Op::abstract_eval`]. Concrete evaluation is intentionally
-    /// skipped — tangent program atoms carry placeholder example values (cloned from the first input)
-    /// since the tangent program is never interpreted for its example values.
+    /// skipped because tangent-program outputs remain abstract until the staged linear program is
+    /// replayed on concrete tangents.
     pub fn apply_staged_op(inputs: &[Self], op: ProgramOpRef<V>, output_count: usize) -> Result<Vec<Self>, TraceError> {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
@@ -76,10 +76,7 @@ impl<V: TraceValue> LinearTerm<V> {
                 .map(|id| borrow.atom(*id).expect("staged input should exist").abstract_value.clone())
                 .collect::<Vec<_>>(),
         )?;
-        // Tangent program example values are placeholders — use the first input's example for each output.
-        let placeholder = borrow.atom(input_atoms[0]).expect("staged input should exist").example_value.clone();
-        let output_examples = vec![placeholder; output_abstracts.len()];
-        let output_atoms = borrow.add_equation_prevalidated(op, input_atoms, output_abstracts, output_examples);
+        let output_atoms = borrow.add_equation_prevalidated(op, input_atoms, output_abstracts);
         drop(borrow);
         if output_atoms.len() != output_count {
             return Err(TraceError::InvalidOutputCount { expected: output_count, got: output_atoms.len() });
@@ -89,15 +86,14 @@ impl<V: TraceValue> LinearTerm<V> {
 
     /// Stages a unary linear op in the program builder.
     ///
-    /// The output atom reuses the abstract type and example value of the input atom, which is valid
-    /// for shape-preserving linear operations in tangent programs.
+    /// The output atom reuses the abstract type of the input atom, which is valid for shape-preserving
+    /// linear operations in tangent programs.
     #[inline]
     pub fn apply_linear_op(self, op: ProgramOpRef<V>) -> Self {
         let mut borrow = self.builder.borrow_mut();
         let input_atom = borrow.atom(self.atom).expect("staged input should exist");
         let abstract_value = input_atom.abstract_value.clone();
-        let example_value = input_atom.example_value.clone();
-        let atom = borrow.add_equation_prevalidated(op, vec![self.atom], vec![abstract_value], vec![example_value])[0];
+        let atom = borrow.add_equation_prevalidated(op, vec![self.atom], vec![abstract_value])[0];
         drop(borrow);
         Self { atom, builder: self.builder }
     }
@@ -109,13 +105,8 @@ impl<V: TraceValue> LinearTerm<V> {
         let mut borrow = self.builder.borrow_mut();
         let input_atom = borrow.atom(self.atom).expect("staged input should exist");
         let abstract_value = input_atom.abstract_value.clone();
-        let example_value = input_atom.example_value.clone();
-        let atom = borrow.add_equation_prevalidated(
-            PrimitiveOp::Add,
-            vec![self.atom, rhs.atom],
-            vec![abstract_value],
-            vec![example_value],
-        )[0];
+        let atom =
+            borrow.add_equation_prevalidated(PrimitiveOp::Add, vec![self.atom, rhs.atom], vec![abstract_value])[0];
         drop(borrow);
         Self { atom, builder: self.builder }
     }
@@ -255,7 +246,8 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
     fn tangent_for_atom<V, Input, Output>(
-        graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
+        _graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
+        representative_values: &[V],
         builder: &Rc<RefCell<ProgramBuilder<V>>>,
         tangents: &mut [Option<LinearTerm<V>>],
         atom_id: AtomId,
@@ -268,19 +260,18 @@ where
         if let Some(term) = tangents[atom_id].clone() {
             return Ok(term);
         }
-        let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let tangent_atom = builder.borrow_mut().add_constant(atom.example_value.zero_like());
+        let tangent_atom = builder.borrow_mut().add_constant(representative_values[atom_id].zero_like());
         let tangent = LinearTerm::from_staged_parts(tangent_atom, builder.clone());
         tangents[atom_id] = Some(tangent.clone());
         Ok(tangent)
     }
 
     let graph = program.graph();
+    let representative_values = graph.representative_atom_values()?;
     let zero = graph
         .input_atoms()
         .first()
-        .and_then(|input_atom| graph.atom(*input_atom))
-        .map(|atom| atom.example_value.zero_like())
+        .map(|input_atom| representative_values[*input_atom].zero_like())
         .ok_or(TraceError::EmptyParameterizedValue)?;
     let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
     let mut tangents = vec![None; graph.atom_count()];
@@ -288,7 +279,7 @@ where
         let input = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
         let tangent_atom = builder
             .borrow_mut()
-            .add_input_abstract(input.abstract_value.clone(), input.example_value.zero_like());
+            .add_input_abstract(input.abstract_value.clone(), representative_values[input_atom].zero_like());
         tangents[input_atom] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
     }
 
@@ -298,10 +289,15 @@ where
             .iter()
             .copied()
             .map(|input_atom| {
-                let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
                 Ok(JvpTracer {
-                    primal: atom.example_value.clone(),
-                    tangent: tangent_for_atom(graph, &builder, tangents.as_mut_slice(), input_atom)?,
+                    primal: representative_values[input_atom].clone(),
+                    tangent: tangent_for_atom(
+                        graph,
+                        representative_values.as_slice(),
+                        &builder,
+                        tangents.as_mut_slice(),
+                        input_atom,
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, TraceError>>()?;
@@ -319,7 +315,8 @@ where
         .iter()
         .copied()
         .map(|output_atom| {
-            tangent_for_atom(graph, &builder, tangents.as_mut_slice(), output_atom).map(|term| term.atom)
+            tangent_for_atom(graph, representative_values.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
+                .map(|term| term.atom)
         })
         .collect::<Result<Vec<_>, _>>()?;
     drop(tangents);
@@ -361,13 +358,8 @@ where
         adjoints[atom] = Some(match adjoints[atom] {
             Some(existing) => {
                 let abstract_value = builder.atom(existing).expect("adjoint atom should exist").abstract_value.clone();
-                let example_value = builder.atom(existing).expect("adjoint atom should exist").example_value.clone();
-                builder.add_equation_prevalidated(
-                    PrimitiveOp::Add,
-                    vec![existing, contribution],
-                    vec![abstract_value],
-                    vec![example_value],
-                )[0]
+                builder.add_equation_prevalidated(PrimitiveOp::Add, vec![existing, contribution], vec![abstract_value])
+                    [0]
             }
             None => contribution,
         });
@@ -375,12 +367,13 @@ where
     }
 
     let graph = program.program.graph();
+    let representative_values = graph.representative_atom_values()?;
     let mut builder = ProgramBuilder::<V>::new();
     let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
     for output in graph.outputs() {
         let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
         output_cotangent_inputs.push(
-            builder.add_input_abstract(output_atom.abstract_value.clone(), output_atom.example_value.zero_like()),
+            builder.add_input_abstract(output_atom.abstract_value.clone(), representative_values[*output].zero_like()),
         );
     }
 
@@ -486,7 +479,12 @@ where
                 if seed_inputs.is_empty() {
                     return Err(TraceError::EmptyParameterizedValue);
                 }
-                values[atom_id] = Some(lift_constant(&atom.example_value, seed_inputs.as_slice())?);
+                values[atom_id] = Some(lift_constant(
+                    atom.constant_value().ok_or(TraceError::InternalInvariantViolation(
+                        "staged graph constant atom did not retain a literal value",
+                    ))?,
+                    seed_inputs.as_slice(),
+                )?);
             }
             crate::tracing_v2::AtomSource::Derived => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
@@ -520,7 +518,15 @@ pub fn replay_program_graph_linearized_jit<GraphInput, GraphOutput, V>(
 where
     GraphInput: Parameterized<V>,
     GraphOutput: Parameterized<V>,
-    V: TraceValue + FloatExt + ZeroLike + OneLike + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + MatrixOps + ReshapeOps,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + MatrixOps
+        + ReshapeOps,
 {
     replay_program_graph_with(graph, inputs, lift_linearized_traced_constant, |op, values| {
         InterpretableOp::<Linearized<JitTracer<V>>>::interpret(op, &values)
@@ -730,8 +736,10 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
 
 /// Concrete-value dispatch for [`grad`]: traces the user function with [`JitTracer`] to build a staged
 /// reverse-mode gradient and evaluates it at the supplied primals.
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + IdentityValue + MatrixOps + ReshapeOps, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
-    for V
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + ConcreteTraceValue + MatrixOps + ReshapeOps,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+> GradInvocationLeaf<Input> for V
 where
     Input::Family: ParameterizedFamily<JitTracer<V>>,
 {
@@ -750,8 +758,10 @@ where
 /// Already-traced dispatch for [`grad`]: replays the user function symbolically inside an enclosing
 /// [`JitTracer`] scope, linearizes the resulting [`Program`], transposes the pushforward into a pullback,
 /// and stages the full backward pass so it becomes part of the outer compiled graph.
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
-    for JitTracer<V>
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+> GradInvocationLeaf<Input> for JitTracer<V>
 where
     Input::Family: ParameterizedFamily<V>,
 {
@@ -802,8 +812,10 @@ where
 /// traces the function once at the first lane's primals to obtain a [`Program`], then compiles a reusable
 /// [`CompiledFunction`] via [`try_jit`] that embeds the full forward and backward passes symbolically.
 /// The compiled gradient function is called independently for each lane.
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>> GradInvocationLeaf<Input>
-    for Batch<V>
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
+> GradInvocationLeaf<Input> for Batch<V>
 where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Clone
@@ -912,8 +924,10 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
 
 /// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`] and
 /// pulls back a unit seed to obtain both the primal scalar output and its gradient.
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + IdentityValue + MatrixOps + ReshapeOps, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>
-    ValueAndGradInvocationLeaf<Input> for V
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + ConcreteTraceValue + MatrixOps + ReshapeOps,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+> ValueAndGradInvocationLeaf<Input> for V
 where
     Input::Family: ParameterizedFamily<JitTracer<V>>,
 {
@@ -934,8 +948,10 @@ where
 /// Already-traced dispatch for [`value_and_grad`]: replays the user function symbolically inside an
 /// enclosing [`JitTracer`] scope, linearizes, transposes, and stages both the forward output and the
 /// backward gradient so they become part of the outer compiled graph.
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps, Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>>
-    ValueAndGradInvocationLeaf<Input> for JitTracer<V>
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+> ValueAndGradInvocationLeaf<Input> for JitTracer<V>
 where
     Input::Family: ParameterizedFamily<V>,
     Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
@@ -988,8 +1004,10 @@ where
 /// Uses the same trace-once strategy as [`GradInvocationLeaf`] for [`Batch`]: the user function is
 /// traced once to a [`Program`], and a [`CompiledFunction`] that produces `(V, Input::To<V>)` per lane
 /// is compiled via [`try_jit`]. Values and gradients are collected per lane and stacked separately.
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>>
-    ValueAndGradInvocationLeaf<Input> for Batch<V>
+impl<
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
+> ValueAndGradInvocationLeaf<Input> for Batch<V>
 where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Clone
@@ -1597,6 +1615,7 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
     segment_size: usize,
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
     let graph = program.graph();
+    let representative_values = graph.representative_atom_values()?;
     let equations = graph.equations();
 
     // If the program has fewer equations than a single segment, no segmentation is needed — wrap the
@@ -1640,14 +1659,17 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
     // Register program inputs in the outer builder.
     for &input_atom in input_atoms {
         let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
-        let outer_atom = outer_builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone());
+        let outer_atom =
+            outer_builder.add_input_abstract(atom.abstract_value.clone(), representative_values[input_atom].clone());
         atom_mapping[input_atom] = Some(outer_atom);
     }
 
     // Register constants that are used by equations (they might be referenced across segments).
     for (atom_id, atom) in graph.atoms_iter() {
         if matches!(atom.source, AtomSource::Constant) {
-            let outer_atom = outer_builder.add_constant(atom.example_value.clone());
+            let outer_atom = outer_builder.add_constant(atom.constant_value().cloned().ok_or(
+                TraceError::InternalInvariantViolation("staged graph constant atom did not retain a literal value"),
+            )?);
             atom_mapping[atom_id] = Some(outer_atom);
         }
     }
@@ -1718,18 +1740,6 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
         );
         let remat_op = RematerializeOp::new(body);
 
-        // Compute example output values for the RematerializeOp.
-        let example_inputs: Vec<V> = boundary_input_atoms
-            .iter()
-            .map(|&atom_id| {
-                graph
-                    .atom(atom_id)
-                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
-                    .map(|atom| atom.example_value.clone())
-            })
-            .collect::<Result<_, _>>()?;
-        let example_outputs = remat_op.interpret(example_inputs.as_slice())?;
-
         // Add the RematerializeOp equation to the outer builder.
         let outer_inputs: Vec<AtomId> = boundary_input_atoms
             .iter()
@@ -1739,7 +1749,6 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
             PrimitiveOp::Rematerialize(Box::new(remat_op)),
             outer_inputs,
             output_types,
-            example_outputs,
         );
 
         // Map the boundary output atoms to their outer-program counterparts.
@@ -1770,6 +1779,7 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + ZeroLike + OneLike +
     program: &Program<V, Vec<V>, Vec<V>>,
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
     let graph = program.graph();
+    let representative_values = graph.representative_atom_values()?;
     let input_types: Vec<_> = graph
         .input_atoms()
         .iter()
@@ -1798,25 +1808,13 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + ZeroLike + OneLike +
     );
     let remat_op = RematerializeOp::new(body);
 
-    let example_inputs: Vec<V> = graph
-        .input_atoms()
-        .iter()
-        .map(|&atom_id| {
-            graph
-                .atom(atom_id)
-                .ok_or(TraceError::UnboundAtomId { id: atom_id })
-                .map(|atom| atom.example_value.clone())
-        })
-        .collect::<Result<_, _>>()?;
-    let example_outputs = remat_op.interpret(example_inputs.as_slice())?;
-
     let mut outer_builder: ProgramBuilder<V> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> = graph
         .input_atoms()
         .iter()
         .map(|&atom_id| {
             let atom = graph.atom(atom_id).expect("input atom should exist");
-            outer_builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone())
+            outer_builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone())
         })
         .collect();
 
@@ -1824,7 +1822,6 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + ZeroLike + OneLike +
         PrimitiveOp::Rematerialize(Box::new(remat_op)),
         outer_inputs.clone(),
         output_types,
-        example_outputs,
     );
 
     let outer_graph = outer_builder.build::<Vec<V>, Vec<V>>(
@@ -1847,6 +1844,7 @@ fn build_segment_sub_program<V: TraceValue + FloatExt + ZeroLike + OneLike + Mat
     boundary_output_atoms: &[AtomId],
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
     let mut sub_builder: ProgramBuilder<V> = ProgramBuilder::new();
+    let representative_values = graph.representative_atom_values()?;
 
     // Map from original atom IDs to sub-program atom IDs.
     let mut sub_atom_mapping: std::collections::HashMap<AtomId, AtomId> = std::collections::HashMap::new();
@@ -1854,7 +1852,8 @@ fn build_segment_sub_program<V: TraceValue + FloatExt + ZeroLike + OneLike + Mat
     // Register boundary inputs as sub-program inputs.
     for &input_atom in boundary_input_atoms {
         let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
-        let sub_atom = sub_builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone());
+        let sub_atom =
+            sub_builder.add_input_abstract(atom.abstract_value.clone(), representative_values[input_atom].clone());
         sub_atom_mapping.insert(input_atom, sub_atom);
     }
 
@@ -1866,7 +1865,9 @@ fn build_segment_sub_program<V: TraceValue + FloatExt + ZeroLike + OneLike + Mat
             }
             let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
             if matches!(atom.source, AtomSource::Constant) {
-                let sub_atom = sub_builder.add_constant(atom.example_value.clone());
+                let sub_atom = sub_builder.add_constant(atom.constant_value().cloned().ok_or(
+                    TraceError::InternalInvariantViolation("staged graph constant atom did not retain a literal value"),
+                )?);
                 sub_atom_mapping.insert(input_atom, sub_atom);
             }
         }
@@ -1892,19 +1893,7 @@ fn build_segment_sub_program<V: TraceValue + FloatExt + ZeroLike + OneLike + Mat
                     .map(|atom| atom.abstract_value.clone())
             })
             .collect::<Result<_, _>>()?;
-        let output_examples: Vec<V> = equation
-            .outputs
-            .iter()
-            .map(|&atom_id| {
-                graph
-                    .atom(atom_id)
-                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
-                    .map(|atom| atom.example_value.clone())
-            })
-            .collect::<Result<_, _>>()?;
-
-        let sub_outputs =
-            sub_builder.add_equation_prevalidated(equation.op.clone(), sub_inputs, output_abstracts, output_examples);
+        let sub_outputs = sub_builder.add_equation_prevalidated(equation.op.clone(), sub_inputs, output_abstracts);
 
         for (orig_atom, sub_atom) in equation.outputs.iter().zip(sub_outputs.iter()) {
             sub_atom_mapping.insert(*orig_atom, *sub_atom);

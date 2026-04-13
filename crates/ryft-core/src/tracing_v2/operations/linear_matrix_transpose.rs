@@ -67,16 +67,10 @@ impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
             .expect("output cotangent atom should exist")
             .abstract_value
             .clone();
-        let example_value = builder
-            .atom(output_cotangents[0])
-            .expect("output cotangent atom should exist")
-            .example_value
-            .clone();
         let contribution = builder.add_equation_prevalidated(
             PrimitiveOp::LinearMatrixTranspose,
             vec![output_cotangents[0]],
             vec![abstract_value],
-            vec![example_value],
         )[0];
         Ok(vec![Some(contribution)])
     }

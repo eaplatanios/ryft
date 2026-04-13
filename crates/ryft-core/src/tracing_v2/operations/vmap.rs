@@ -4,8 +4,7 @@ use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue,
-        ZeroLike,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         linear::{linearize_program, transpose_linear_program},
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
@@ -204,23 +203,18 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
         }
         let transpose = self.transpose_op()?;
         let output_abstracts = transpose.body().repeated_output_types();
-        let output_examples = transpose.body().eval_lanes(
-            &output_cotangents
-                .iter()
-                .map(|id| builder.atom(*id).expect("cotangent atom should exist").example_value.clone())
-                .collect::<Vec<_>>(),
-        )?;
         let contributions = builder.add_equation_prevalidated(
             PrimitiveOp::VMap(Box::new(transpose)),
             output_cotangents.to_vec(),
             output_abstracts,
-            output_examples,
         );
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
+    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V>
+{
     fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
@@ -258,7 +252,9 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>>
+    for VMapOp<V>
+{
     fn jvp(
         &self,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
@@ -285,7 +281,9 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
+    for VMapOp<V>
+{
     fn interpret(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let output_values = <Self as InterpretableOp<V>>::interpret(self, concrete_inputs.as_slice())?;

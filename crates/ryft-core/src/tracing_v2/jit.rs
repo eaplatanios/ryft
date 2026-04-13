@@ -57,7 +57,11 @@ impl<V: TraceValue> JitTracer<V> {
         Self { value, atom, builder, staging_error }
     }
 
-    pub fn apply_staged_op(inputs: &[Self], op: PrimitiveOp<V>, output_values: Vec<V>) -> Result<Vec<Self>, TraceError> {
+    pub fn apply_staged_op(
+        inputs: &[Self],
+        op: PrimitiveOp<V>,
+        output_values: Vec<V>,
+    ) -> Result<Vec<Self>, TraceError> {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
         }
@@ -118,11 +122,11 @@ impl<V: TraceValue> JitTracer<V> {
         let atom = if self.staging_error.borrow().is_some() {
             self.atom
         } else {
-            match self
-                .builder
-                .borrow_mut()
-                .add_equation_with_output_values(op, vec![self.atom, rhs.atom], vec![value.clone()])
-            {
+            match self.builder.borrow_mut().add_equation_with_output_values(
+                op,
+                vec![self.atom, rhs.atom],
+                vec![value.clone()],
+            ) {
                 Ok(outputs) => outputs[0],
                 Err(error) => {
                     *self.staging_error.borrow_mut() = Some(error);
@@ -441,7 +445,17 @@ mod tests {
             }
         }
 
-        impl TraceValue for TestAbstractValue {}
+        impl TraceValue for TestAbstractValue {
+            fn is_zero(&self) -> bool {
+                false
+            }
+
+            fn is_one(&self) -> bool {
+                false
+            }
+        }
+
+        impl crate::tracing_v2::ConcreteTraceValue for TestAbstractValue {}
 
         impl Add for TestAbstractValue {
             type Output = Self;
@@ -502,16 +516,6 @@ mod tests {
         impl ReshapeOps for TestAbstractValue {
             fn reshape(self, _target_shape: crate::types::Shape) -> Result<Self, TraceError> {
                 Ok(self)
-            }
-        }
-
-        impl crate::tracing_v2::IdentityValue for TestAbstractValue {
-            fn is_zero(&self) -> bool {
-                false
-            }
-
-            fn is_one(&self) -> bool {
-                false
             }
         }
 

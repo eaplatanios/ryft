@@ -309,9 +309,7 @@ impl Typed<ArrayType> for ShardMapTensor {
     }
 }
 
-impl TraceValue for ShardMapTensor {}
-
-impl ryft_core::tracing_v2::IdentityValue for ShardMapTensor {
+impl TraceValue for ShardMapTensor {
     fn is_zero(&self) -> bool {
         false
     }
@@ -321,6 +319,7 @@ impl ryft_core::tracing_v2::IdentityValue for ShardMapTensor {
     }
 }
 
+impl ryft_core::tracing_v2::ConcreteTraceValue for ShardMapTensor {}
 
 fn without_varying_manual_axes(r#type: &ArrayType) -> ArrayType {
     let mut r#type = r#type.clone();

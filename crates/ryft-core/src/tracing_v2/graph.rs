@@ -30,10 +30,58 @@ pub enum AtomSource {
 pub struct Atom<V: TraceValue> {
     /// Array type used for validation and shape propagation.
     pub abstract_value: ArrayType,
-    /// Example value produced while staging this atom.
-    pub example_value: V,
+    /// Stored concrete value when this atom semantically owns one.
+    ///
+    /// Inputs retain one exemplar so later transforms can recover representative primal values without
+    /// requiring the caller to re-supply them. Constants retain their literal value because interpreter
+    /// replay and MLIR lowering need it. Derived atoms do not retain concrete payloads in finalized
+    /// staged graphs.
+    stored_value: Option<V>,
     /// The way this atom entered the graph.
     pub source: AtomSource,
+}
+
+impl<V: TraceValue> Atom<V> {
+    #[inline]
+    fn input(abstract_value: ArrayType, exemplar_value: V) -> Self {
+        Self { abstract_value, stored_value: Some(exemplar_value), source: AtomSource::Input }
+    }
+
+    #[inline]
+    fn constant(abstract_value: ArrayType, value: V) -> Self {
+        Self { abstract_value, stored_value: Some(value), source: AtomSource::Constant }
+    }
+
+    #[inline]
+    fn derived(abstract_value: ArrayType, stored_value: Option<V>) -> Self {
+        Self { abstract_value, stored_value, source: AtomSource::Derived }
+    }
+
+    #[inline]
+    fn into_staged(mut self) -> Self {
+        if matches!(self.source, AtomSource::Derived) {
+            self.stored_value = None;
+        }
+        self
+    }
+
+    /// Returns the stored concrete value, if this atom retains one.
+    #[inline]
+    pub fn stored_value(&self) -> Option<&V> {
+        self.stored_value.as_ref()
+    }
+
+    /// Returns the exemplar value retained for an input atom.
+    #[inline]
+    pub fn input_exemplar(&self) -> Option<&V> {
+        if matches!(self.source, AtomSource::Input) { self.stored_value() } else { None }
+    }
+
+    /// Returns the literal value retained for a constant atom.
+    #[inline]
+    pub fn constant_value(&self) -> Option<&V> {
+        if matches!(self.source, AtomSource::Constant) { self.stored_value() } else { None }
+    }
 }
 
 /// Single equation in a staged graph.
@@ -73,7 +121,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     #[inline]
     pub fn add_input_abstract(&mut self, abstract_value: ArrayType, example_value: V) -> AtomId {
         let id = self.atoms.len();
-        self.atoms.push(Atom { abstract_value, example_value, source: AtomSource::Input });
+        self.atoms.push(Atom::input(abstract_value, example_value));
         self.input_atoms.push(id);
         id
     }
@@ -88,30 +136,24 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = self.atoms.len();
-        self.atoms.push(Atom {
-            abstract_value: <V as Typed<ArrayType>>::tpe(&value),
-            example_value: value,
-            source: AtomSource::Constant,
-        });
+        self.atoms.push(Atom::constant(<V as Typed<ArrayType>>::tpe(&value), value));
         id
     }
 
     /// Adds a staged equation without running abstract or concrete evaluation.
     ///
     /// This is intended for linear program construction where the output types are already known.
-    pub(crate) fn add_equation_prevalidated(
+    pub fn add_equation_prevalidated(
         &mut self,
         op: O,
         inputs: Vec<AtomId>,
         output_abstracts: Vec<ArrayType>,
-        output_examples: Vec<V>,
     ) -> Vec<AtomId> {
         let outputs = output_abstracts
             .into_iter()
-            .zip(output_examples)
-            .map(|(abstract_value, example_value)| {
+            .map(|abstract_value| {
                 let id = self.atoms.len();
-                self.atoms.push(Atom { abstract_value, example_value, source: AtomSource::Derived });
+                self.atoms.push(Atom::derived(abstract_value, None));
                 id
             })
             .collect::<Vec<_>>();
@@ -152,14 +194,9 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
         // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
-        let is_zero = |id: usize| {
-            self.atom(id)
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_zero(&a.example_value))
-        };
-        let is_one = |id: usize| {
-            self.atom(id)
-                .map_or(false, |a| matches!(a.source, AtomSource::Constant) && is_identity_one(&a.example_value))
-        };
+        let is_zero =
+            |id: usize| self.atom(id).map_or(false, |atom| atom.constant_value().is_some_and(is_identity_zero));
+        let is_one = |id: usize| self.atom(id).map_or(false, |atom| atom.constant_value().is_some_and(is_identity_one));
         if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
@@ -168,13 +205,16 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
             .iter()
             .all(|input| self.atom(*input).map_or(false, |atom| matches!(atom.source, AtomSource::Constant)));
 
-        let source = if all_constant { AtomSource::Constant } else { AtomSource::Derived };
         let outputs = output_abstracts
             .into_iter()
             .zip(output_values)
-            .map(|(abstract_value, example_value)| {
+            .map(|(abstract_value, output_value)| {
                 let id = self.atoms.len();
-                self.atoms.push(Atom { abstract_value, example_value, source: source.clone() });
+                self.atoms.push(if all_constant {
+                    Atom::constant(abstract_value, output_value)
+                } else {
+                    Atom::derived(abstract_value, Some(output_value))
+                });
                 id
             })
             .collect::<Vec<_>>();
@@ -198,7 +238,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
             .iter()
             .map(|input| {
                 self.atom(*input)
-                    .map(|atom| atom.example_value.clone())
+                    .and_then(|atom| atom.stored_value().cloned())
                     .ok_or(TraceError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -218,7 +258,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         Output: Parameterized<V>,
     {
         Graph {
-            atoms: self.atoms,
+            atoms: self.atoms.into_iter().map(Atom::into_staged).collect(),
             input_atoms: self.input_atoms,
             equations: self.equations,
             outputs,
@@ -239,46 +279,14 @@ impl<O: Clone, V: TraceValue> Default for GraphBuilder<O, V> {
 // Algebraic identity elimination helpers
 // ---------------------------------------------------------------------------
 
-/// Checks if a value is a constant zero, using `Any` downcasting for supported types.
+/// Checks if a value is a constant zero through [`TraceValue::is_zero`].
 pub(crate) fn is_identity_zero<V: TraceValue>(value: &V) -> bool {
-    let any = value as &dyn std::any::Any;
-    if let Some(v) = any.downcast_ref::<f32>() {
-        return *v == 0.0;
-    }
-    if let Some(v) = any.downcast_ref::<f64>() {
-        return *v == 0.0;
-    }
-    #[cfg(any(feature = "ndarray", test))]
-    {
-        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f32>>() {
-            return arr.iter().all(|&x| x == 0.0);
-        }
-        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f64>>() {
-            return arr.iter().all(|&x| x == 0.0);
-        }
-    }
-    false
+    value.is_zero()
 }
 
-/// Checks if a value is a constant one, using `Any` downcasting for supported types.
+/// Checks if a value is a constant one through [`TraceValue::is_one`].
 pub(crate) fn is_identity_one<V: TraceValue>(value: &V) -> bool {
-    let any = value as &dyn std::any::Any;
-    if let Some(v) = any.downcast_ref::<f32>() {
-        return *v == 1.0;
-    }
-    if let Some(v) = any.downcast_ref::<f64>() {
-        return *v == 1.0;
-    }
-    #[cfg(any(feature = "ndarray", test))]
-    {
-        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f32>>() {
-            return arr.iter().all(|&x| x == 1.0);
-        }
-        if let Some(arr) = any.downcast_ref::<ndarray::Array2<f64>>() {
-            return arr.iter().all(|&x| x == 1.0);
-        }
-    }
-    false
+    value.is_one()
 }
 
 /// Executable staged graph over an open operation set.
@@ -361,6 +369,70 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
         &self.output_structure
     }
 
+    /// Returns the representative concrete inputs retained by this graph.
+    pub fn representative_input_values(&self) -> Result<Vec<V>, TraceError> {
+        self.input_atoms
+            .iter()
+            .copied()
+            .map(|atom_id| {
+                self.atom(atom_id).and_then(|atom| atom.input_exemplar().cloned()).ok_or(
+                    TraceError::InternalInvariantViolation("staged graph input atom did not retain an exemplar value"),
+                )
+            })
+            .collect()
+    }
+
+    /// Evaluates every atom in the graph on the supplied flat input values.
+    pub fn evaluate_atom_values(&self, input_values: Vec<V>) -> Result<Vec<V>, TraceError>
+    where
+        O: InterpretableOp<V>,
+    {
+        if input_values.len() != self.input_atoms.len() {
+            return Err(TraceError::InvalidInputCount { expected: self.input_atoms.len(), got: input_values.len() });
+        }
+
+        let mut values = vec![None; self.atoms.len()];
+        for (atom, value) in self.input_atoms.iter().copied().zip(input_values) {
+            values[atom] = Some(value);
+        }
+
+        for (atom_id, atom) in self.atoms.iter().enumerate() {
+            if let Some(value) = atom.constant_value() {
+                values[atom_id] = Some(value.clone());
+            }
+        }
+
+        for equation in &self.equations {
+            let inputs = equation
+                .inputs
+                .iter()
+                .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = equation.op.interpret(inputs.as_slice())?;
+            if outputs.len() != equation.outputs.len() {
+                return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: outputs.len() });
+            }
+
+            for (atom, value) in equation.outputs.iter().copied().zip(outputs) {
+                values[atom] = Some(value);
+            }
+        }
+
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(atom_id, value)| value.ok_or(TraceError::UnboundAtomId { id: atom_id }))
+            .collect()
+    }
+
+    /// Evaluates every atom in the graph on its retained representative input exemplars.
+    pub fn representative_atom_values(&self) -> Result<Vec<V>, TraceError>
+    where
+        O: InterpretableOp<V>,
+    {
+        self.evaluate_atom_values(self.representative_input_values()?)
+    }
+
     /// Clones this graph while replacing only the typed input/output structures.
     pub fn clone_with_structures<NewInput, NewOutput>(
         &self,
@@ -393,43 +465,8 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
             return Err(TraceError::MismatchedParameterStructure);
         }
 
-        let input_values = input.into_parameters().collect::<Vec<_>>();
-        if input_values.len() != self.input_atoms.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.input_atoms.len(), got: input_values.len() });
-        }
-
-        let mut values = vec![None; self.atoms.len()];
-        for (atom, value) in self.input_atoms.iter().copied().zip(input_values) {
-            values[atom] = Some(value);
-        }
-
-        for (atom_id, atom) in self.atoms.iter().enumerate() {
-            if matches!(atom.source, AtomSource::Constant) {
-                values[atom_id] = Some(atom.example_value.clone());
-            }
-        }
-
-        for equation in &self.equations {
-            let inputs = equation
-                .inputs
-                .iter()
-                .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
-                .collect::<Result<Vec<_>, _>>()?;
-            let outputs = equation.op.interpret(inputs.as_slice())?;
-            if outputs.len() != equation.outputs.len() {
-                return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: outputs.len() });
-            }
-
-            for (atom, value) in equation.outputs.iter().copied().zip(outputs) {
-                values[atom] = Some(value);
-            }
-        }
-
-        let outputs = self
-            .outputs
-            .iter()
-            .map(|output| values[*output].clone().ok_or(TraceError::UnboundAtomId { id: *output }))
-            .collect::<Result<Vec<_>, _>>()?;
+        let values = self.evaluate_atom_values(input.into_parameters().collect::<Vec<_>>())?;
+        let outputs = self.outputs.iter().map(|output| values[*output].clone()).collect::<Vec<_>>();
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
@@ -483,10 +520,15 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
 
             let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom.source {
-                AtomSource::Input => {
-                    builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone())
-                }
-                AtomSource::Constant => builder.add_constant(atom.example_value.clone()),
+                AtomSource::Input => builder.add_input_abstract(
+                    atom.abstract_value.clone(),
+                    atom.input_exemplar().cloned().ok_or(TraceError::InternalInvariantViolation(
+                        "staged graph input atom did not retain an exemplar value",
+                    ))?,
+                ),
+                AtomSource::Constant => builder.add_constant(atom.constant_value().cloned().ok_or(
+                    TraceError::InternalInvariantViolation("staged graph constant atom did not retain a literal value"),
+                )?),
                 AtomSource::Derived => {
                     let equation_index = equation_by_output[atom_id]
                         .ok_or(TraceError::InternalInvariantViolation("derived atom had no owning equation"))?;
@@ -509,17 +551,8 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
                         .iter()
                         .map(|output| graph.atom(*output).expect("output atom should exist").abstract_value.clone())
                         .collect::<Vec<_>>();
-                    let input_examples = equation
-                        .outputs
-                        .iter()
-                        .map(|output| graph.atom(*output).expect("output atom should exist").example_value.clone())
-                        .collect::<Vec<_>>();
-                    let remapped_outputs = builder.add_equation_prevalidated(
-                        equation.op.clone(),
-                        remapped_inputs,
-                        input_abstracts,
-                        input_examples,
-                    );
+                    let remapped_outputs =
+                        builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, input_abstracts);
                     for (old_output, new_output) in
                         equation.outputs.iter().copied().zip(remapped_outputs.iter().copied())
                     {
@@ -557,7 +590,12 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_atoms.iter().copied() {
             let input = self.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
-            let mapped = builder.add_input_abstract(input.abstract_value.clone(), input.example_value.clone());
+            let mapped = builder.add_input_abstract(
+                input.abstract_value.clone(),
+                input.input_exemplar().cloned().ok_or(TraceError::InternalInvariantViolation(
+                    "staged graph input atom did not retain an exemplar value",
+                ))?,
+            );
             atom_mapping.insert(input_atom, mapped);
         }
 
@@ -633,11 +671,17 @@ impl<O: Clone + Display, V: TraceValue, Input: Parameterized<V>, Output: Paramet
 
 #[cfg(test)]
 mod tests {
+    use std::ops::{Add, Mul, Neg};
+
     use indoc::indoc;
+    use ryft_macros::Parameter;
 
     use crate::{
-        parameters::Placeholder,
-        tracing_v2::{ops::PrimitiveOp, test_support},
+        parameters::{Parameter, Placeholder},
+        tracing_v2::{
+            ConcreteTraceValue, FloatExt, MatrixOps, OneLike, TraceError, ZeroLike, ops::PrimitiveOp, test_support,
+        },
+        types::{ArrayType, DataType, Shape, Typed},
     };
 
     use super::*;
@@ -747,5 +791,133 @@ mod tests {
         assert_eq!(graph.call(10.0).unwrap(), 50.0);
         assert_eq!(graph.call(0.5).unwrap(), 2.5);
         assert_eq!(graph.call(0.0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn built_graph_drops_derived_stored_values_but_reconstructs_representatives() {
+        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let x = builder.add_input(&2.0f64);
+        let three = builder.add_constant(3.0f64);
+        let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
+
+        assert_eq!(builder.atom(x).unwrap().input_exemplar(), Some(&2.0));
+        assert_eq!(builder.atom(three).unwrap().constant_value(), Some(&3.0));
+        assert_eq!(builder.atom(sum).unwrap().stored_value(), Some(&5.0));
+
+        let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
+        assert_eq!(graph.atom(x).unwrap().input_exemplar(), Some(&2.0));
+        assert_eq!(graph.atom(three).unwrap().constant_value(), Some(&3.0));
+        assert_eq!(graph.atom(sum).unwrap().stored_value(), None);
+        assert_eq!(graph.representative_atom_values().unwrap(), vec![2.0, 3.0, 5.0]);
+        assert_eq!(graph.call(4.0).unwrap(), 7.0);
+    }
+
+    #[test]
+    fn custom_identity_values_participate_in_algebraic_simplification() {
+        #[derive(Clone, Debug, PartialEq, Parameter)]
+        struct TestIdentityValue {
+            r#type: ArrayType,
+            value: f64,
+        }
+
+        impl TestIdentityValue {
+            fn scalar(value: f64) -> Self {
+                Self { r#type: ArrayType::scalar(DataType::F64), value }
+            }
+        }
+
+        impl Typed<ArrayType> for TestIdentityValue {
+            fn tpe(&self) -> ArrayType {
+                self.r#type.clone()
+            }
+        }
+
+        impl TraceValue for TestIdentityValue {
+            fn is_zero(&self) -> bool {
+                self.value == 0.0
+            }
+
+            fn is_one(&self) -> bool {
+                self.value == 1.0
+            }
+        }
+
+        impl ConcreteTraceValue for TestIdentityValue {}
+
+        impl Add for TestIdentityValue {
+            type Output = Self;
+
+            fn add(self, rhs: Self) -> Self::Output {
+                Self { r#type: self.r#type, value: self.value + rhs.value }
+            }
+        }
+
+        impl Mul for TestIdentityValue {
+            type Output = Self;
+
+            fn mul(self, rhs: Self) -> Self::Output {
+                Self { r#type: self.r#type, value: self.value * rhs.value }
+            }
+        }
+
+        impl Neg for TestIdentityValue {
+            type Output = Self;
+
+            fn neg(self) -> Self::Output {
+                Self { r#type: self.r#type, value: -self.value }
+            }
+        }
+
+        impl FloatExt for TestIdentityValue {
+            fn sin(self) -> Self {
+                self
+            }
+
+            fn cos(self) -> Self {
+                self
+            }
+        }
+
+        impl ZeroLike for TestIdentityValue {
+            fn zero_like(&self) -> Self {
+                Self::scalar(0.0)
+            }
+        }
+
+        impl OneLike for TestIdentityValue {
+            fn one_like(&self) -> Self {
+                Self::scalar(1.0)
+            }
+        }
+
+        impl MatrixOps for TestIdentityValue {
+            fn matmul(self, rhs: Self) -> Self {
+                Self { r#type: self.r#type, value: self.value * rhs.value }
+            }
+
+            fn transpose_matrix(self) -> Self {
+                self
+            }
+        }
+
+        impl crate::tracing_v2::operations::reshape::ReshapeOps for TestIdentityValue {
+            fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+                Ok(Self { r#type: ArrayType::new(DataType::F64, target_shape, None, None).unwrap(), value: self.value })
+            }
+        }
+
+        let mut builder = GraphBuilder::<PrimitiveOp<TestIdentityValue>, TestIdentityValue>::new();
+        let x = builder.add_input(&TestIdentityValue::scalar(5.0));
+        let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
+
+        let simplified_add = builder.add_equation(PrimitiveOp::Add, vec![x, zero]).unwrap();
+        assert_eq!(simplified_add, vec![x]);
+        assert_eq!(builder.equation_count(), 0);
+
+        let simplified_scale = builder
+            .add_equation(PrimitiveOp::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
+            .unwrap();
+        assert_eq!(simplified_scale, vec![x]);
+        assert_eq!(builder.equation_count(), 0);
     }
 }

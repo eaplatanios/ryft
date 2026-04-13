@@ -299,7 +299,17 @@ mod ndarray_support {
         }
     }
 
-    impl TraceValue for Array2<f32> {}
+    impl TraceValue for Array2<f32> {
+        fn is_zero(&self) -> bool {
+            self.iter().all(|&x| x == 0.0)
+        }
+
+        fn is_one(&self) -> bool {
+            self.iter().all(|&x| x == 1.0)
+        }
+    }
+
+    impl crate::tracing_v2::ConcreteTraceValue for Array2<f32> {}
 
     impl Typed<ArrayType> for Array2<f64> {
         #[inline]
@@ -308,7 +318,17 @@ mod ndarray_support {
         }
     }
 
-    impl TraceValue for Array2<f64> {}
+    impl TraceValue for Array2<f64> {
+        fn is_zero(&self) -> bool {
+            self.iter().all(|&x| x == 0.0)
+        }
+
+        fn is_one(&self) -> bool {
+            self.iter().all(|&x| x == 1.0)
+        }
+    }
+
+    impl crate::tracing_v2::ConcreteTraceValue for Array2<f64> {}
 
     impl ZeroLike for Array2<f32> {
         #[inline]

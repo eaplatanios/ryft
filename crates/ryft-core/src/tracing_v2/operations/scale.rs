@@ -100,23 +100,17 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
             .expect("output cotangent atom should exist")
             .abstract_value
             .clone();
-        let example_value = builder
-            .atom(output_cotangents[0])
-            .expect("output cotangent atom should exist")
-            .example_value
-            .clone();
         let contribution = builder.add_equation_prevalidated(
             PrimitiveOp::Scale { factor: self.factor().clone() },
             vec![output_cotangents[0]],
             vec![abstract_value],
-            vec![example_value],
         )[0];
         Ok(vec![Some(contribution)])
     }
 }
 
-impl<V: TraceValue + ZeroLike + Mul<Output = V>>
-    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for ScaleOp<V>
+impl<V: TraceValue + ZeroLike + Mul<Output = V>> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
+    for ScaleOp<V>
 {
     fn interpret(
         &self,

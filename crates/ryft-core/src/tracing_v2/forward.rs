@@ -175,7 +175,13 @@ impl<V: TraceValue + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTr
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`JitTracer`] to build a staged
 /// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
-    V: TraceValue + FloatExt + ZeroLike + crate::tracing_v2::OneLike + crate::tracing_v2::IdentityValue + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + crate::tracing_v2::OneLike
+        + crate::tracing_v2::ConcreteTraceValue
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > JvpInvocationLeaf<Input, Output> for V
@@ -206,7 +212,12 @@ where
 /// symbolically inside an enclosing [`JitTracer`] scope, staging both the primal output and the
 /// tangent propagation as part of the outer compiled graph.
 impl<
-    V: TraceValue + FloatExt + ZeroLike + crate::tracing_v2::OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + crate::tracing_v2::OneLike
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > JvpInvocationLeaf<Input, Output> for JitTracer<V>
@@ -236,7 +247,12 @@ where
 /// takes primals and tangents and returns `(primal_output, tangent_output)` per lane is compiled via
 /// [`try_jit`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
-    V: TraceValue + FloatExt + ZeroLike + crate::tracing_v2::OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + crate::tracing_v2::OneLike
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
 > JvpInvocationLeaf<Input, Output> for Batch<V>

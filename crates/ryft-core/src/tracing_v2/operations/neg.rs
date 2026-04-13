@@ -75,17 +75,8 @@ impl<V: TraceValue + Neg<Output = V> + ZeroLike> LinearOp<V> for NegOp {
             .expect("output cotangent atom should exist")
             .abstract_value
             .clone();
-        let example_value = builder
-            .atom(output_cotangents[0])
-            .expect("output cotangent atom should exist")
-            .example_value
-            .clone();
-        let contribution = builder.add_equation_prevalidated(
-            PrimitiveOp::Neg,
-            vec![output_cotangents[0]],
-            vec![abstract_value],
-            vec![example_value],
-        )[0];
+        let contribution =
+            builder.add_equation_prevalidated(PrimitiveOp::Neg, vec![output_cotangents[0]], vec![abstract_value])[0];
         Ok(vec![Some(contribution)])
     }
 }

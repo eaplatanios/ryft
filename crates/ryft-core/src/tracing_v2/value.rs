@@ -39,6 +39,13 @@ pub trait OneLike: Clone {
     fn one_like(&self) -> Self;
 }
 
+/// Marker trait for concrete tracing leaves that participate in eager transform dispatch.
+///
+/// Exact identity detection itself lives on [`TraceValue`]. This marker exists only to partition the blanket impls
+/// for concrete leaf regimes from the corresponding traced-leaf impls for
+/// [`JitTracer`](crate::tracing_v2::JitTracer).
+pub trait ConcreteTraceValue: TraceValue {}
+
 /// Convenience trait for stageable leaves used by `tracing_v2`.
 ///
 /// [`TraceValue`] identifies leaf values that can appear in staged graphs and participate in abstract evaluation. It
@@ -46,7 +53,23 @@ pub trait OneLike: Clone {
 /// via [`Typed`], while deliberately not implying eager numeric operations such as [`FloatExt`] or
 /// differentiation-specific capabilities such as [`ZeroLike`]. Those requirements live on the primitive operations
 /// and transforms that actually use them.
-pub trait TraceValue: Clone + Parameter + Typed<ArrayType> + 'static {}
+///
+/// Leaf types that support exact algebraic identity detection should override [`TraceValue::is_zero`] and
+/// [`TraceValue::is_one`]. The default implementations return `false`, which keeps purely abstract leaves valid while
+/// opting them out of constant-identity simplification.
+pub trait TraceValue: Clone + Parameter + Typed<ArrayType> + 'static {
+    /// Returns `true` if every element of this value is exactly zero.
+    #[inline]
+    fn is_zero(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` if every element of this value is exactly one.
+    #[inline]
+    fn is_one(&self) -> bool {
+        false
+    }
+}
 
 impl FloatExt for f32 {
     #[inline]
@@ -60,7 +83,19 @@ impl FloatExt for f32 {
     }
 }
 
-impl TraceValue for f32 {}
+impl TraceValue for f32 {
+    #[inline]
+    fn is_zero(&self) -> bool {
+        *self == 0.0
+    }
+
+    #[inline]
+    fn is_one(&self) -> bool {
+        *self == 1.0
+    }
+}
+
+impl ConcreteTraceValue for f32 {}
 
 impl ZeroLike for f32 {
     #[inline]
@@ -88,7 +123,19 @@ impl FloatExt for f64 {
     }
 }
 
-impl TraceValue for f64 {}
+impl TraceValue for f64 {
+    #[inline]
+    fn is_zero(&self) -> bool {
+        *self == 0.0
+    }
+
+    #[inline]
+    fn is_one(&self) -> bool {
+        *self == 1.0
+    }
+}
+
+impl ConcreteTraceValue for f64 {}
 
 impl ZeroLike for f64 {
     #[inline]
@@ -101,64 +148,6 @@ impl OneLike for f64 {
     #[inline]
     fn one_like(&self) -> Self {
         1.0
-    }
-}
-
-/// Value types that support compile-time identity detection for algebraic simplification.
-///
-/// This trait enables the graph builder to eliminate trivial operations such as multiplying by one,
-/// adding zero, or scaling by an identity factor at graph construction time.
-pub trait IdentityValue: TraceValue {
-    /// Returns `true` if every element of this value is exactly zero.
-    fn is_zero(&self) -> bool;
-
-    /// Returns `true` if every element of this value is exactly one.
-    fn is_one(&self) -> bool;
-}
-
-impl IdentityValue for f32 {
-    #[inline]
-    fn is_zero(&self) -> bool {
-        *self == 0.0
-    }
-
-    #[inline]
-    fn is_one(&self) -> bool {
-        *self == 1.0
-    }
-}
-
-impl IdentityValue for f64 {
-    #[inline]
-    fn is_zero(&self) -> bool {
-        *self == 0.0
-    }
-
-    #[inline]
-    fn is_one(&self) -> bool {
-        *self == 1.0
-    }
-}
-
-#[cfg(any(feature = "ndarray", test))]
-impl IdentityValue for ndarray::Array2<f32> {
-    fn is_zero(&self) -> bool {
-        self.iter().all(|&x| x == 0.0)
-    }
-
-    fn is_one(&self) -> bool {
-        self.iter().all(|&x| x == 1.0)
-    }
-}
-
-#[cfg(any(feature = "ndarray", test))]
-impl IdentityValue for ndarray::Array2<f64> {
-    fn is_zero(&self) -> bool {
-        self.iter().all(|&x| x == 0.0)
-    }
-
-    fn is_one(&self) -> bool {
-        self.iter().all(|&x| x == 1.0)
     }
 }
 

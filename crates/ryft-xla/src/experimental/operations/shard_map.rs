@@ -9,7 +9,7 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, DifferentiableOp, InterpretableOp, FloatExt, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
+        AtomId, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
         MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
     },
     types::{ArrayType, Typed},
@@ -243,10 +243,7 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 }
 
 impl InterpretableOp<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
-    fn interpret(
-        &self,
-        inputs: &[Linearized<ShardMapTracer>],
-    ) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+    fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let primal_output_values = InterpretableOp::interpret(self, primal_values.as_slice())?;
@@ -512,6 +509,7 @@ fn project_flat_shard_map_graph(
         builder: &mut ProgramBuilder<ShardMapTensor>,
         atom_mapping: &mut std::collections::HashMap<usize, usize>,
         kept_input_atoms: &std::collections::HashMap<usize, usize>,
+        representative_values: &[ShardMapTensor],
         equation_by_output: &[Option<usize>],
     ) -> Result<usize, TraceError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
@@ -523,7 +521,9 @@ fn project_flat_shard_map_graph(
             ryft_core::tracing_v2::AtomSource::Input => *kept_input_atoms.get(&atom_id).ok_or(
                 TraceError::InternalInvariantViolation("projected flat shard-map graph referenced a removed input"),
             )?,
-            ryft_core::tracing_v2::AtomSource::Constant => builder.add_constant(atom.example_value.clone()),
+            ryft_core::tracing_v2::AtomSource::Constant => builder.add_constant(atom.constant_value().cloned().ok_or(
+                TraceError::InternalInvariantViolation("staged graph constant atom did not retain a literal value"),
+            )?),
             ryft_core::tracing_v2::AtomSource::Derived => {
                 let equation_index = equation_by_output[atom_id]
                     .ok_or(TraceError::InternalInvariantViolation("derived atom had no owning equation"))?;
@@ -532,9 +532,27 @@ fn project_flat_shard_map_graph(
                     .inputs
                     .iter()
                     .copied()
-                    .map(|input| remap_atom(input, graph, builder, atom_mapping, kept_input_atoms, equation_by_output))
+                    .map(|input| {
+                        remap_atom(
+                            input,
+                            graph,
+                            builder,
+                            atom_mapping,
+                            kept_input_atoms,
+                            representative_values,
+                            equation_by_output,
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
-                let remapped_outputs = builder.add_equation(equation.op.clone(), remapped_inputs)?;
+                let output_abstracts = equation
+                    .outputs
+                    .iter()
+                    .map(|output| {
+                        graph.atom(*output).expect("equation output atom should exist").abstract_value.clone()
+                    })
+                    .collect::<Vec<_>>();
+                let remapped_outputs =
+                    builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
                 for (old_output, new_output) in equation.outputs.iter().copied().zip(remapped_outputs.iter().copied()) {
                     atom_mapping.insert(old_output, new_output);
                 }
@@ -549,11 +567,13 @@ fn project_flat_shard_map_graph(
     }
 
     let equation_by_output = equation_by_output(graph);
+    let representative_values = graph.representative_atom_values()?;
     let mut builder = ProgramBuilder::<ShardMapTensor>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
         let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom = builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone());
+        let mapped_atom =
+            builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone());
         input_mapping.insert(atom_id, mapped_atom);
     }
 
@@ -562,7 +582,15 @@ fn project_flat_shard_map_graph(
         .iter()
         .copied()
         .map(|output| {
-            remap_atom(output, graph, &mut builder, &mut atom_mapping, &input_mapping, equation_by_output.as_slice())
+            remap_atom(
+                output,
+                graph,
+                &mut builder,
+                &mut atom_mapping,
+                &input_mapping,
+                representative_values.as_slice(),
+                equation_by_output.as_slice(),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
@@ -585,6 +613,7 @@ fn build_factorized_apply_graph(
         atom_mapping: &mut std::collections::HashMap<usize, usize>,
         replacement_inputs: &std::collections::HashMap<usize, usize>,
         depends_on_cotangent: &[bool],
+        representative_values: &[ShardMapTensor],
         equation_by_output: &[Option<usize>],
     ) -> Result<usize, TraceError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
@@ -602,7 +631,9 @@ fn build_factorized_apply_graph(
                     "factorized apply graph referenced a primal input that was not materialized as a residual",
                 ));
             }
-            ryft_core::tracing_v2::AtomSource::Constant => builder.add_constant(atom.example_value.clone()),
+            ryft_core::tracing_v2::AtomSource::Constant => builder.add_constant(atom.constant_value().cloned().ok_or(
+                TraceError::InternalInvariantViolation("staged graph constant atom did not retain a literal value"),
+            )?),
             ryft_core::tracing_v2::AtomSource::Derived => {
                 if !depends_on_cotangent[atom_id] {
                     return Err(TraceError::InternalInvariantViolation(
@@ -624,11 +655,20 @@ fn build_factorized_apply_graph(
                             atom_mapping,
                             replacement_inputs,
                             depends_on_cotangent,
+                            representative_values,
                             equation_by_output,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let remapped_outputs = builder.add_equation(equation.op.clone(), remapped_inputs)?;
+                let output_abstracts = equation
+                    .outputs
+                    .iter()
+                    .map(|output| {
+                        graph.atom(*output).expect("equation output atom should exist").abstract_value.clone()
+                    })
+                    .collect::<Vec<_>>();
+                let remapped_outputs =
+                    builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
                 for (old_output, new_output) in equation.outputs.iter().copied().zip(remapped_outputs.iter().copied()) {
                     atom_mapping.insert(old_output, new_output);
                 }
@@ -643,6 +683,7 @@ fn build_factorized_apply_graph(
     }
 
     let graph = body.compiled.graph();
+    let representative_values = graph.representative_atom_values()?;
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = graph.input_atoms()[primal_input_count..].to_vec();
     let equation_by_output = equation_by_output(graph);
@@ -651,12 +692,14 @@ fn build_factorized_apply_graph(
 
     for atom_id in cotangent_input_atoms.iter().copied() {
         let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom = builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone());
+        let mapped_atom =
+            builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
     for atom_id in residual_atoms.iter().copied() {
         let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom = builder.add_input_abstract(atom.abstract_value.clone(), atom.example_value.clone());
+        let mapped_atom =
+            builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
 
@@ -673,6 +716,7 @@ fn build_factorized_apply_graph(
                 &mut atom_mapping,
                 &replacement_inputs,
                 depends_on_cotangent,
+                representative_values.as_slice(),
                 equation_by_output.as_slice(),
             )
         })
@@ -952,7 +996,12 @@ fn replay_traced_xla_graph<
                 if seed_inputs.is_empty() {
                     return Err(ShardMapTraceError::TraceError(TraceError::EmptyParameterizedValue));
                 }
-                values[atom_id] = Some(V::lift_constant(&atom.example_value, seed_inputs.as_slice())?);
+                values[atom_id] = Some(V::lift_constant(
+                    atom.constant_value().ok_or(TraceError::InternalInvariantViolation(
+                        "staged graph constant atom did not retain a literal value",
+                    ))?,
+                    seed_inputs.as_slice(),
+                )?);
             }
             ryft_core::tracing_v2::AtomSource::Derived => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
