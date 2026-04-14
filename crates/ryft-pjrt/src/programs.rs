@@ -580,7 +580,9 @@ pub struct ExecutableMemoryStatistics {
     /// [`ExecutableMemoryStatistics::device_peak_memory_in_bytes`] when the allocator keeps a pool of memory alive.
     pub device_total_allocation_bytes: usize,
 
-    /// Number of device allocations that are considered indefinite by the backend allocator.
+    /// Number of device allocations whose lifetime is not modeled as a bounded allocation/deallocation interval by the
+    /// backend allocator. These are typically long-lived allocations, such as live-out or aliased buffers, that stay
+    /// resident outside the ordinary temporary heap schedule.
     pub device_indefinite_allocations: usize,
 
     /// Peak number of bytes in the unpadded heap used by the device allocator.
