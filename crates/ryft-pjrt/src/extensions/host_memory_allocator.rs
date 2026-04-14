@@ -149,20 +149,6 @@ impl HostMemoryAllocation {
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
-
-    /// Consumes this [`HostMemoryAllocation`] and returns its raw parts.
-    ///
-    /// The caller becomes responsible for eventually invoking the returned deleter callback, if present.
-    pub fn into_raw_parts(
-        mut self,
-    ) -> (*mut u8, usize, Option<unsafe extern "C" fn(ptr: *mut c_void, arg: *mut c_void)>, *mut c_void) {
-        let raw_parts = (self.pointer, self.size, self.deleter, self.deleter_arg);
-        self.pointer = std::ptr::null_mut();
-        self.size = 0;
-        self.deleter = None;
-        self.deleter_arg = std::ptr::null_mut();
-        raw_parts
-    }
 }
 
 unsafe impl Send for HostMemoryAllocation {}
@@ -252,32 +238,6 @@ mod tests {
             deleter_arg: &counter as *const AtomicUsize as *mut c_void,
         };
         drop(allocation);
-
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_host_memory_allocation_into_raw_parts_disarms_drop() {
-        unsafe extern "C" fn test_deleter(pointer: *mut c_void, deleter_arg: *mut c_void) {
-            let counter = unsafe { &*(deleter_arg as *const AtomicUsize) };
-            counter.fetch_add(1, Ordering::SeqCst);
-            drop(unsafe { Box::from_raw(pointer as *mut [u8; 4]) });
-        }
-
-        let counter = AtomicUsize::new(0);
-        let allocation = HostMemoryAllocation {
-            pointer: Box::into_raw(Box::new([0u8; 4])).cast(),
-            size: 4,
-            deleter: Some(test_deleter),
-            deleter_arg: &counter as *const AtomicUsize as *mut c_void,
-        };
-        let (pointer, size, deleter, deleter_arg) = allocation.into_raw_parts();
-
-        assert_eq!(size, 4);
-        assert!(!pointer.is_null());
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-
-        unsafe { deleter.unwrap()(pointer.cast(), deleter_arg) };
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
