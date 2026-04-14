@@ -150,7 +150,7 @@ impl NamedValue {
             Value::Bool(value) => ffi::PJRT_NamedValue {
                 struct_size: size_of::<ffi::PJRT_NamedValue>(),
                 extension_start: std::ptr::null_mut(),
-                name,
+                name: name as *const _,
                 name_size,
                 value_type: ffi::PJRT_NamedValue_Type_kBool,
                 value: ffi::PJRT_Value { bool_value: *value },
@@ -159,7 +159,7 @@ impl NamedValue {
             Value::I64(value) => ffi::PJRT_NamedValue {
                 struct_size: size_of::<ffi::PJRT_NamedValue>(),
                 extension_start: std::ptr::null_mut(),
-                name,
+                name: name as *const _,
                 name_size,
                 value_type: ffi::PJRT_NamedValue_Type_kInt64,
                 value: ffi::PJRT_Value { int64_value: *value },
@@ -168,7 +168,7 @@ impl NamedValue {
             Value::I64List(value) => ffi::PJRT_NamedValue {
                 struct_size: size_of::<ffi::PJRT_NamedValue>(),
                 extension_start: std::ptr::null_mut(),
-                name,
+                name: name as *const _,
                 name_size,
                 value_type: ffi::PJRT_NamedValue_Type_kInt64List,
                 value: ffi::PJRT_Value { int64_array_value: value.as_ptr() },
@@ -177,7 +177,7 @@ impl NamedValue {
             Value::F32(value) => ffi::PJRT_NamedValue {
                 struct_size: size_of::<ffi::PJRT_NamedValue>(),
                 extension_start: std::ptr::null_mut(),
-                name,
+                name: name as *const _,
                 name_size,
                 value_type: ffi::PJRT_NamedValue_Type_kFloat,
                 value: ffi::PJRT_Value { float_value: *value },
@@ -186,10 +186,10 @@ impl NamedValue {
             Value::String(value) => ffi::PJRT_NamedValue {
                 struct_size: size_of::<ffi::PJRT_NamedValue>(),
                 extension_start: std::ptr::null_mut(),
-                name,
+                name: name as *const _,
                 name_size,
                 value_type: ffi::PJRT_NamedValue_Type_kString,
-                value: ffi::PJRT_Value { string_value: value.as_ptr() as *const i8 },
+                value: ffi::PJRT_Value { string_value: value.as_ptr() as *const _ },
                 value_size: value.len(),
             },
         }
