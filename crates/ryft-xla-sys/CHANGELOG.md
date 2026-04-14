@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Added
+
+- Added support for Linux AArch64.
+
 ### Changed
 
 - Upgraded the OpenXLA dependency pin to commit `6e9c133d38ff253a4627ad62fbed0af677a067f3`.

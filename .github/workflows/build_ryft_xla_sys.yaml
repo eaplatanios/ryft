@@ -3,158 +3,187 @@ name: Build `ryft-xla-sys` Binaries
 on: workflow_dispatch
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
 
 permissions:
-  contents: write
+    contents: write
 
 jobs:
-  build:
-    name: Build [${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}]
-    runs-on: ${{ matrix.config.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - os: linux
-            architecture: amd64
-            device: cpu
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=true/extras=s3-cache
-          - os: linux
-            architecture: amd64
-            device: cuda-12
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
-          - os: linux
-            architecture: amd64
-            device: cuda-13
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
-          - os: linux
-            architecture: amd64
-            device: rocm-7
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
-          - os: macos
-            architecture: arm64
-            device: cpu
-            runner: macos-26
-          - os: windows
-            architecture: amd64
-            device: cpu
-            runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.16xlarge/volume=120g/spot=true/extras=s3-cache
-    outputs:
-      xla_commit_id: ${{ steps.extract_xla_commit_id.outputs.xla_commit_id }}
-    steps:
-      - uses: runs-on/action@v2
-      - name: Check Out Repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          path: "ryft"
-      - name: Install Chocolatey, Git, Visual Studio 2019 Build Tools, and LLVM 18
-        if: ${{ matrix.config.os == 'windows' }}
-        run: |
-          # Install Chocolatey
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+    build:
+        name: Build [${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}]
+        runs-on: ${{ matrix.config.runner }}
+        strategy:
+            fail-fast: false
+            matrix:
+                config:
+                    - os: linux
+                      architecture: amd64
+                      device: cpu
+                      platform: linux_x86_64
+                      runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-full-x64/volume=120g/spot=true/extras=s3-cache
+                    - os: linux
+                      architecture: amd64
+                      device: cuda-12
+                      platform: linux_x86_64
+                      runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
+                    - os: linux
+                      architecture: amd64
+                      device: cuda-13
+                      platform: linux_x86_64
+                      runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
+                    - os: linux
+                      architecture: arm64
+                      device: cpu
+                      platform: linux_aarch64
+                      runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=true/extras=s3-cache
+                    - os: linux
+                      architecture: arm64
+                      device: cuda-12
+                      platform: linux_aarch64
+                      runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=true/extras=s3-cache
+                    - os: linux
+                      architecture: arm64
+                      device: cuda-13
+                      platform: linux_aarch64
+                      runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu24-full-arm64/volume=120g/spot=true/extras=s3-cache
+                    - os: linux
+                      architecture: amd64
+                      device: rocm-7
+                      platform: linux_x86_64
+                      runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu24-gpu-x64/volume=120g/spot=true/extras=s3-cache
+                    - os: macos
+                      architecture: arm64
+                      device: cpu
+                      platform: macos
+                      runner: macos-26
+                    - os: windows
+                      architecture: amd64
+                      device: cpu
+                      platform: windows
+                      runner: runs-on=${{ github.run_id }}/image=windows22-base-x64/family=c7i-flex.16xlarge/volume=120g/spot=true/extras=s3-cache
+        outputs:
+            xla_commit_id: ${{ steps.extract_xla_commit_id.outputs.xla_commit_id }}
+        steps:
+            - uses: runs-on/action@v2
+            - name: Check Out Repository
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.ref }}
+                  path: "ryft"
+            - name: Install Chocolatey, Git, Visual Studio 2019 Build Tools, and LLVM 18
+              if: ${{ matrix.config.os == 'windows' }}
+              run: |
+                  # Install Chocolatey
+                  Set-ExecutionPolicy Bypass -Scope Process -Force
+                  [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+                  iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 
-          # Install Git
-          choco install git.install -y
-          echo "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                  # Install Git
+                  choco install git.install -y
+                  echo "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-          # Install Visual Studio 2019 Build Tools
-          choco install visualstudio2019buildtools -y
-          choco install visualstudio2019-workload-vctools -y
-          echo "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Current\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                  # Install Visual Studio 2019 Build Tools
+                  choco install visualstudio2019buildtools -y
+                  choco install visualstudio2019-workload-vctools -y
+                  echo "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\MSBuild\Current\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-          # Install LLVM 18
-          choco install llvm --version 18.1.8 -y
-          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Install LLVM 18 & NUMA
-        if: ${{ matrix.config.os == 'linux' && matrix.config.device == 'rocm-7' }}
-        run: |
-          sudo apt purge llvm* clang* lld* -y
-          sudo apt autoremove -y
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
-          sudo apt-get install libnuma-dev -y
-      - name: Install CUDA 13
-        if: ${{ matrix.config.device == 'cuda-13' }}
-        run: |
-          wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -qq
-          sudo apt install -y --no-install-recommends cuda-13-0 cuda-toolkit-13-0 cuda-nvcc-13-0 cuda-nvrtc-dev-13-0
-      - name: Install Python
-        uses: actions/setup-python@v5
-        if: ${{ matrix.config.os == 'windows' }}
-        with:
-          python-version: "3.11.9"
-      - name: Install Bazel
-        uses: bazel-contrib/setup-bazel@0.15.0
-        with:
-          bazelisk-version: 1.26.0
-          bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}
-          repository-cache: true
-      - name: Extract XLA Commit ID
-        id: extract_xla_commit_id
-        shell: bash
-        run: |
-          XLA_COMMIT_ID=$(grep 'XLA_COMMIT = "' ryft/crates/ryft-xla-sys/WORKSPACE | sed 's/.*XLA_COMMIT = "\([^"]*\)".*/\1/')
-          echo "Extracted XLA Commit ID: $XLA_COMMIT_ID"
-          echo "xla_commit_id=$XLA_COMMIT_ID" >> "$GITHUB_OUTPUT"
-      - name: Build `ryft-xla-sys` Library
-        if: ${{ matrix.config.device == 'cpu' }}
-        working-directory: ./ryft/crates/ryft-xla-sys
-        id: build_ryft_xla_sys_library
-        shell: bash
-        run: |
-          OUTPUT=ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-          bazel build --config=${{ matrix.config.os }} //:ryft-xla-sys-archive
-          cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
-          echo "library=$OUTPUT" >> $GITHUB_OUTPUT
-      - name: Upload `ryft-xla-sys` Library
-        if: ${{ matrix.config.device == 'cpu' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
-          path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
-      - name: Build PJRT Plugin
-        if: ${{ matrix.config.device != 'cpu' }}
-        working-directory: ./ryft/crates/ryft-xla-sys
-        id: build_pjrt_plugin
-        shell: bash
-        run: |
-          LIB_PREFIX="${{ matrix.config.os != 'windows' && 'lib' || '' }}"
-          LIB_SUFFIX="${{ matrix.config.os == 'linux' && '.so' || '' }}${{ matrix.config.os == 'macos' && '.dylib' || '' }}${{ matrix.config.os == 'windows' && '.dll' || '' }}"
-          OUTPUT="${LIB_PREFIX}pjrt-plugin-${{ matrix.config.device }}${LIB_SUFFIX}"
-          bazel build --config=${{ matrix.config.os }} ${{ matrix.config.device == 'cuda-12' && '--config=cuda-12' || '' }} ${{ matrix.config.device == 'cuda-13' && '--config=cuda-13' || '' }} ${{ matrix.config.device == 'rocm-7' && '--config=rocm-7' || '' }} //:pjrt-gpu-plugin
-          cp bazel-bin/libpjrt-gpu-plugin.so $OUTPUT
-          echo "library=$OUTPUT" >> $GITHUB_OUTPUT
-      - name: Create PJRT Plugin Archive
-        if: ${{ matrix.config.device != 'cpu' }}
-        uses: a7ul/tar-action@v1.2.0
-        with:
-          command: c
-          cwd: ./ryft/crates/ryft-xla-sys/
-          files: ${{ steps.build_pjrt_plugin.outputs.library }}
-          outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-      - name: Upload PJRT Plugin
-        if: ${{ matrix.config.device != 'cpu' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
-          path: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+                  # Install LLVM 18
+                  choco install llvm --version 18.1.8 -y
+                  echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            - name: Install LLVM 18 & NUMA
+              if: ${{ matrix.config.os == 'linux' && matrix.config.device == 'rocm-7' }}
+              run: |
+                  sudo apt purge llvm* clang* lld* -y
+                  sudo apt autoremove -y
+                  wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+                  sudo apt-get install libnuma-dev -y
+            - name: Install CUDA 12
+              if: ${{ matrix.config.device == 'cuda-12' && matrix.config.architecture == 'arm64' }}
+              run: |
+                  wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb"
+                  sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
+                  sudo apt-get update -qq
+                  sudo apt install -y --no-install-recommends cuda-12-9 cuda-toolkit-12-9 cuda-nvcc-12-9 cuda-nvrtc-dev-12-9
+            - name: Install CUDA 13
+              if: ${{ matrix.config.device == 'cuda-13' }}
+              run: |
+                  CUDA_ARCHIVE=$([[ "${{ matrix.config.architecture }}" == "arm64" ]] && echo "sbsa" || echo "x86_64")
+                  wget "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${CUDA_ARCHIVE}/cuda-keyring_1.1-1_all.deb"
+                  sudo dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb
+                  sudo apt-get update -qq
+                  sudo apt install -y --no-install-recommends cuda-13-0 cuda-toolkit-13-0 cuda-nvcc-13-0 cuda-nvrtc-dev-13-0
+            - name: Install Python
+              uses: actions/setup-python@v5
+              if: ${{ matrix.config.os == 'windows' }}
+              with:
+                  python-version: "3.11.9"
+            - name: Install Bazel
+              uses: bazel-contrib/setup-bazel@0.15.0
+              with:
+                  bazelisk-version: 1.26.0
+                  bazelisk-cache: true
+                  disk-cache: ${{ github.workflow }}
+                  repository-cache: true
+            - name: Extract XLA Commit ID
+              id: extract_xla_commit_id
+              shell: bash
+              run: |
+                  XLA_COMMIT_ID=$(grep 'XLA_COMMIT = "' ryft/crates/ryft-xla-sys/WORKSPACE | sed 's/.*XLA_COMMIT = "\([^"]*\)".*/\1/')
+                  echo "Extracted XLA Commit ID: $XLA_COMMIT_ID"
+                  echo "xla_commit_id=$XLA_COMMIT_ID" >> "$GITHUB_OUTPUT"
+            - name: Build `ryft-xla-sys` Library
+              if: ${{ matrix.config.device == 'cpu' }}
+              working-directory: ./ryft/crates/ryft-xla-sys
+              id: build_ryft_xla_sys_library
+              shell: bash
+              run: |
+                  OUTPUT=ryft-xla-sys-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+                  bazel build --config=${{ matrix.config.platform }} //:ryft-xla-sys-archive
+                  cp bazel-bin/ryft-xla-sys-archive.tar.gz $OUTPUT
+                  echo "library=$OUTPUT" >> $GITHUB_OUTPUT
+            - name: Upload `ryft-xla-sys` Library
+              if: ${{ matrix.config.device == 'cpu' }}
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
+                  path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
+            - name: Build PJRT Plugin
+              if: ${{ matrix.config.device != 'cpu' }}
+              working-directory: ./ryft/crates/ryft-xla-sys
+              id: build_pjrt_plugin
+              shell: bash
+              run: |
+                  LIB_PREFIX="${{ matrix.config.os != 'windows' && 'lib' || '' }}"
+                  LIB_SUFFIX="${{ matrix.config.os == 'linux' && '.so' || '' }}${{ matrix.config.os == 'macos' && '.dylib' || '' }}${{ matrix.config.os == 'windows' && '.dll' || '' }}"
+                  OUTPUT="${LIB_PREFIX}pjrt-plugin-${{ matrix.config.device }}${LIB_SUFFIX}"
+                  bazel build --config=${{ matrix.config.platform }} ${{ matrix.config.device == 'cuda-12' && '--config=cuda-12' || '' }} ${{ matrix.config.device == 'cuda-13' && '--config=cuda-13' || '' }} ${{ matrix.config.device == 'rocm-7' && '--config=rocm-7' || '' }} //:pjrt-gpu-plugin
+                  cp bazel-bin/libpjrt-gpu-plugin.so $OUTPUT
+                  echo "library=$OUTPUT" >> $GITHUB_OUTPUT
+            - name: Create PJRT Plugin Archive
+              if: ${{ matrix.config.device != 'cpu' }}
+              uses: a7ul/tar-action@v1.2.0
+              with:
+                  command: c
+                  cwd: ./ryft/crates/ryft-xla-sys/
+                  files: ${{ steps.build_pjrt_plugin.outputs.library }}
+                  outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+            - name: Upload PJRT Plugin
+              if: ${{ matrix.config.device != 'cpu' }}
+              uses: actions/upload-artifact@v4
+              with:
+                  name: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
+                  path: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
 
-  release:
-    name: Release
-    needs: ["build"]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-      - name: Release Artifacts
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ryft-xla-sys-${{ needs.build.outputs.xla_commit_id }}
-          files: "*.tar.gz/*.tar.gz"
+    release:
+        name: Release
+        needs: ["build"]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Download Artifacts
+              uses: actions/download-artifact@v4
+            - name: Release Artifacts
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ryft-xla-sys-${{ needs.build.outputs.xla_commit_id }}
+                  files: "*.tar.gz/*.tar.gz"
