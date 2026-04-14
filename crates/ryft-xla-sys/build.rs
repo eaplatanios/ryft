@@ -694,13 +694,27 @@ impl BuildConfiguration {
             }
         }
 
-        let bazel_config = match &self.device {
-            Device::Cpu => format!("--config={}", self.operating_system),
-            Device::Cuda12 => format!("--config={} --config=cuda-12", self.operating_system),
-            Device::Cuda13 => format!("--config={} --config=cuda-13", self.operating_system),
-            Device::Rocm7 => format!("--config={} --config=rocm-7", self.operating_system),
-            Device::Tpu | Device::Neuron | Device::Metal => {
+        let bazel_configs = match (self.operating_system, self.architecture, self.device) {
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => vec!["linux_x86_64"],
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => vec!["linux_x86_64", "cuda-12"],
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => vec!["linux_x86_64", "cuda-13"],
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => vec!["linux_x86_64", "rocm-7"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => vec!["linux_aarch64"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => vec!["linux_aarch64", "cuda-12"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => vec!["linux_aarch64", "cuda-13"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Rocm7) => vec!["linux_aarch64", "rocm-7"],
+            (OperatingSystem::MacOS, _, Device::Cpu) => vec!["macos"],
+            (OperatingSystem::Windows, _, Device::Cpu) => vec!["windows"],
+            (_, _, Device::Tpu | Device::Neuron | Device::Metal) => {
                 bail!("the PJRT {} plugin is closed source and does not support Bazel compilation", self.device)
+            }
+            _ => {
+                bail!(
+                    "the PJRT {} plugin does not support Bazel compilation on {} {}",
+                    self.device,
+                    self.operating_system,
+                    self.architecture,
+                )
             }
         };
 
@@ -709,13 +723,12 @@ impl BuildConfiguration {
             Artifact::PjrtPlugin => "//:pjrt-gpu-plugin",
         };
 
-        let status = Command::new("bazel")
-            .current_dir(&output_path)
-            .arg("build")
-            .arg(bazel_config)
-            .arg("--verbose_failures")
-            .arg(bazel_target)
-            .status()?;
+        let mut bazel_command = Command::new("bazel");
+        bazel_command.current_dir(&output_path).arg("build");
+        for bazel_config in bazel_configs {
+            bazel_command.arg(format!("--config={bazel_config}"));
+        }
+        let status = bazel_command.arg("--verbose_failures").arg(bazel_target).status()?;
 
         if !status.success() {
             bail!("failed to build {}: '{status}'", artifact.name());
