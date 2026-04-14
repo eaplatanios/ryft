@@ -67,7 +67,7 @@ jobs:
         steps:
             - uses: runs-on/action@v2
             - name: Check Out Repository
-              uses: actions/checkout@v4
+              uses: actions/checkout@v6
               with:
                   ref: ${{ github.ref }}
                   path: "ryft"
@@ -119,9 +119,9 @@ jobs:
               with:
                   python-version: "3.11.9"
             - name: Install Bazel
-              uses: bazel-contrib/setup-bazel@0.15.0
+              uses: bazel-contrib/setup-bazel@0.19.0
               with:
-                  bazelisk-version: 1.26.0
+                  bazelisk-version: 1.28.1
                   bazelisk-cache: true
                   disk-cache: ${{ github.workflow }}
                   repository-cache: true
@@ -144,7 +144,7 @@ jobs:
                   echo "library=$OUTPUT" >> $GITHUB_OUTPUT
             - name: Upload `ryft-xla-sys` Library
               if: ${{ matrix.config.device == 'cpu' }}
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: ${{ steps.build_ryft_xla_sys_library.outputs.library }}
                   path: ryft/crates/ryft-xla-sys/${{ steps.build_ryft_xla_sys_library.outputs.library }}
@@ -170,7 +170,7 @@ jobs:
                   outPath: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
             - name: Upload PJRT Plugin
               if: ${{ matrix.config.device != 'cpu' }}
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz
                   path: pjrt-plugin-${{ matrix.config.os }}-${{ matrix.config.architecture }}-${{ matrix.config.device }}.tar.gz

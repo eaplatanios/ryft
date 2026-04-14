@@ -31,7 +31,7 @@ pub(crate) mod ffi {
     use crate::ffi::PJRT_Extension_Base;
 
     pub const PJRT_API_MAJOR: u32 = 0;
-    pub const PJRT_API_MINOR: u32 = 103;
+    pub const PJRT_API_MINOR: u32 = 104;
 
     #[repr(C)]
     pub struct PJRT_Api_Version {
@@ -61,6 +61,6 @@ mod tests {
 
     #[test]
     fn test_version_display() {
-        assert_eq!(format!("{VERSION}"), "0.103");
+        assert_eq!(format!("{VERSION}"), "0.104");
     }
 }

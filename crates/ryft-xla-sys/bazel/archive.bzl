@@ -109,6 +109,8 @@ HEADERS = [
     "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h",
     "xla/pjrt/c/pjrt_c_api_stream_extension.h",
     "xla/pjrt/c/pjrt_c_api_triton_extension.h",
+    "xla/pjrt/extensions/host_allocator/host_allocator_extension.h",
+    "xla/pjrt/extensions/host_allocator/host_memory_allocator/host_memory_allocator_extension.h",
     "xla/service/custom_call_status.h",
     "xla/service/spmd/shardy/integrations/c/passes.h",
 ]
