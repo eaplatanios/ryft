@@ -11,8 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added support for Linux AArch64.
-- Added the upstream host allocator and host memory allocator extension headers to the packaged `ryft-xla-sys`
-  archive and bindgen input set.
 
 ### Changed
 
