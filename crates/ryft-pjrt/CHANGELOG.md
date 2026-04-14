@@ -14,10 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust
   wrappers for error buffers and execution poisoning.
 - Added support for querying executable parameter memory kinds and topology fingerprints.
+- Added support for the new `PJRT_HostMemoryAllocator` extension and its owned host-memory allocation wrapper.
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.103`.
+- Updated our PJRT C API bindings for version `0.104`.
+- Expanded executable compiled-memory statistics support to include total allocator bytes, indefinite allocations,
+  and peak unpadded heap bytes.
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 
 ## [0.0.2] - 2026-03-02

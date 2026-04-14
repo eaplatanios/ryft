@@ -11,10 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added support for Linux AArch64.
+- Added the upstream host allocator and host memory allocator extension headers to the packaged `ryft-xla-sys`
+  archive and bindgen input set.
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `6e9c133d38ff253a4627ad62fbed0af677a067f3`.
+- Upgraded the OpenXLA dependency pin to commit `7b1be14958aac5c83f1b9f7bcdfc51fdbd29acba`.
 - Synchronized the mirrored protobuf definitions with the upstream PJRT and StreamExecutor schema changes.
 - Pinned macOS Bazel artifacts to a macOS `11.0` deployment target so the published static library remains linkable
   from Rust consumers that target the workspace baseline.

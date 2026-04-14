@@ -334,6 +334,9 @@ impl Executable {
                 host_temp_size_in_bytes,
                 peak_memory_in_bytes,
                 total_size_in_bytes,
+                total_allocation_bytes,
+                indefinite_allocations,
+                peak_unpadded_heap_bytes,
             },
         )
         .map(
@@ -350,6 +353,9 @@ impl Executable {
                 host_temp_size_in_bytes,
                 peak_memory_in_bytes,
                 total_size_in_bytes,
+                total_allocation_bytes,
+                indefinite_allocations,
+                peak_unpadded_heap_bytes,
             )| ExecutableMemoryStatistics {
                 device_generated_code_size_in_bytes: generated_code_size_in_bytes as usize,
                 device_input_size_in_bytes: argument_size_in_bytes as usize,
@@ -358,6 +364,9 @@ impl Executable {
                 device_temporary_size_in_bytes: temp_size_in_bytes as usize,
                 device_peak_memory_in_bytes: peak_memory_in_bytes as usize,
                 device_total_memory_in_bytes: total_size_in_bytes as usize,
+                device_total_allocation_bytes: total_allocation_bytes as usize,
+                device_indefinite_allocations: indefinite_allocations as usize,
+                device_peak_unpadded_heap_bytes: peak_unpadded_heap_bytes as usize,
                 host_generated_code_size_in_bytes: host_generated_code_size_in_bytes as usize,
                 host_input_size_in_bytes: host_argument_size_in_bytes as usize,
                 host_output_size_in_bytes: host_output_size_in_bytes as usize,
@@ -566,6 +575,16 @@ pub struct ExecutableMemoryStatistics {
 
     /// Total number of bytes available in device memory.
     pub device_total_memory_in_bytes: usize,
+
+    /// Number of bytes held by the device allocator, which may exceed
+    /// [`ExecutableMemoryStatistics::device_peak_memory_in_bytes`] when the allocator keeps a pool of memory alive.
+    pub device_total_allocation_bytes: usize,
+
+    /// Number of device allocations that are considered indefinite by the backend allocator.
+    pub device_indefinite_allocations: usize,
+
+    /// Peak number of bytes in the unpadded heap used by the device allocator.
+    pub device_peak_unpadded_heap_bytes: usize,
 
     /// Number of bytes used for storing the generated code in host memory.
     pub host_generated_code_size_in_bytes: usize,
@@ -1813,6 +1832,9 @@ pub(crate) mod ffi {
         pub host_temp_size_in_bytes: i64,
         pub peak_memory_in_bytes: i64,
         pub total_size_in_bytes: i64,
+        pub total_allocation_bytes: i64,
+        pub indefinite_allocations: i64,
+        pub peak_unpadded_heap_bytes: i64,
     }
 
     impl PJRT_Executable_GetCompiledMemoryStats_Args {
@@ -1833,6 +1855,9 @@ pub(crate) mod ffi {
                 host_temp_size_in_bytes: 0,
                 peak_memory_in_bytes: 0,
                 total_size_in_bytes: 0,
+                total_allocation_bytes: 0,
+                indefinite_allocations: 0,
+                peak_unpadded_heap_bytes: 0,
             }
         }
     }

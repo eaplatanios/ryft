@@ -122,7 +122,7 @@ build:rocm --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
 build:rocm --dynamic_mode=off
 build:rocm --repo_env="OS=ubuntu_22.04"
 build:rocm --action_env TF_ROCM_AMDGPU_TARGETS="gfx900,gfx906,gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1200,gfx1201"
-build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain-local
+build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain
 # build:rocm --define=using_rocm=true
 build:rocm --define=using_rocm_hipcc=true
 build:rocm --define=tensorflow_mkldnn_contraction_kernel=0

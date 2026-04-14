@@ -333,6 +333,25 @@ impl BuildConfiguration {
             .header(pjrt_include_path.join("pjrt_c_api_memory_descriptions_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_phase_compile_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_profiler_extension.h").to_str().unwrap())
+            .header(
+                xla_include_path
+                    .join("pjrt")
+                    .join("extensions")
+                    .join("host_allocator")
+                    .join("host_allocator_extension.h")
+                    .to_str()
+                    .unwrap(),
+            )
+            .header(
+                xla_include_path
+                    .join("pjrt")
+                    .join("extensions")
+                    .join("host_allocator")
+                    .join("host_memory_allocator")
+                    .join("host_memory_allocator_extension.h")
+                    .to_str()
+                    .unwrap(),
+            )
             .header(xla_include_path.join("ffi").join("api").join("c_api.h").to_str().unwrap())
             .header(xla_include_path.join("service").join("custom_call_status.h").to_str().unwrap())
             .header(

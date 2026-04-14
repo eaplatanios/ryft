@@ -200,6 +200,7 @@ pub(crate) mod ffi {
     pub const PJRT_Extension_Type_AbiVersion: PJRT_Extension_Type = 20;
     pub const PJRT_Extension_Type_Collectives: PJRT_Extension_Type = 21;
     pub const PJRT_Extension_Type_MultiSlice: PJRT_Extension_Type = 22;
+    pub const PJRT_Extension_Type_HostMemoryAllocator: PJRT_Extension_Type = 23;
 
     /// PJRT extension base type. The `extension_type` field must be used to identify the type of the extension
     /// and reinterpret its instance accordingly.
