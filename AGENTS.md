@@ -302,6 +302,9 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - For OpenXLA / PJRT / MLIR upgrade work, do not stop at smoke tests once core crate code has changed; run the full
   affected crate `--lib` unit suites so runtime-attribute drift, printer-format churn, and environment-sensitive test
   assumptions are caught before handoff.
+- When a user asks you to wait for a specific GitHub Actions run before updating `ryft-xla-sys` release metadata,
+  do not report the task as complete until that exact run has reached `completed` and you have refreshed every
+  affected published checksum from the finalized release assets.
 
 ## Convention References / Examples
 
