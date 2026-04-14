@@ -3,13 +3,9 @@ use std::ffi::c_void;
 use crate::{Api, Client, Error, Plugin, invoke_pjrt_api_error_fn};
 
 /// The PJRT host memory allocator extension provides access to [XLA](https://openxla.org/xla) host-memory allocation
-/// APIs that return an owned pointer together with a backend-provided deleter callback. The extension is optional for
+/// APIs that return owned pointers together with backend-provided deleter callbacks. The extension is optional for
 /// PJRT [`Plugin`]s and _experimental_, meaning that incompatible changes may be introduced at any time, including
 /// changes that break _Application Binary Interface (ABI)_ compatibility.
-///
-/// Refer to the upstream
-/// [`host_memory_allocator_extension.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/extensions/host_allocator/host_memory_allocator/host_memory_allocator_extension.h)
-/// header for the canonical C API surface.
 #[derive(Copy, Clone)]
 pub struct HostMemoryAllocatorExtension {
     /// Handle that represents this [`HostMemoryAllocatorExtension`] in the PJRT C API.
@@ -44,25 +40,6 @@ impl HostMemoryAllocatorExtension {
     pub(crate) fn api(&self) -> Api {
         self.api
     }
-
-    /// Allocates `size` bytes of host memory for `client` on the provided NUMA node and returns an owned allocation
-    /// that will invoke the backend-provided deleter callback on drop.
-    ///
-    /// The returned memory is backend-owned and may be uninitialized.
-    pub fn allocate(&self, client: &Client<'_>, size: usize, numa_node: i32) -> Result<HostMemoryAllocation, Error> {
-        use ffi::PJRT_HostMemoryAllocator_Allocate_Args;
-        invoke_pjrt_api_error_fn!(
-            @extension ffi::PJRT_HostMemoryAllocator_Extension => self,
-            PJRT_HostMemoryAllocator_Allocate,
-            {
-                client = client.to_c_api(),
-                size = size,
-                numa_node = numa_node,
-            },
-            { ptr, deleter, deleter_arg },
-        )
-        .and_then(|(ptr, deleter, deleter_arg)| HostMemoryAllocation::from_raw_parts(ptr, size, deleter, deleter_arg))
-    }
 }
 
 unsafe impl Send for HostMemoryAllocatorExtension {}
@@ -75,11 +52,23 @@ impl Client<'_> {
         self.api().host_memory_allocator_extension()
     }
 
-    /// Allocates `size` bytes of backend-managed host memory on the provided NUMA node.
-    ///
-    /// Refer to the documentation of [`HostMemoryAllocatorExtension::allocate`] for more information.
-    pub fn host_memory_allocate(&self, size: usize, numa_node: i32) -> Result<HostMemoryAllocation, Error> {
-        self.host_memory_allocator_extension()?.allocate(self, size, numa_node)
+    /// Allocates `size` bytes of backend-managed host memory on the provided Non-Uniform Memory Access (NUMA) node and
+    /// returns an owned allocation that will invoke the backend-provided deleter callback on drop. The returned memory
+    /// is backend-owned and may be uninitialized.
+    pub fn host_memory_allocate(&self, size: usize, numa_node_index: i32) -> Result<HostMemoryAllocation, Error> {
+        use ffi::PJRT_HostMemoryAllocator_Allocate_Args;
+        let extension = self.host_memory_allocator_extension()?;
+        invoke_pjrt_api_error_fn!(
+            @extension ffi::PJRT_HostMemoryAllocator_Extension => extension,
+            PJRT_HostMemoryAllocator_Allocate,
+            {
+                client = self.to_c_api(),
+                size = size,
+                numa_node = numa_node_index,
+            },
+            { ptr, deleter, deleter_arg },
+        )
+        .and_then(|(ptr, deleter, deleter_arg)| HostMemoryAllocation::from_raw_parts(ptr, size, deleter, deleter_arg))
     }
 }
 
@@ -109,7 +98,7 @@ impl Api {
     }
 }
 
-/// An owned allocation returned by [`HostMemoryAllocatorExtension::allocate`] or [`Client::host_memory_allocate`].
+/// An owned allocation returned by [`Client::host_memory_allocate`].
 ///
 /// The underlying memory is backend-owned and may be uninitialized. This wrapper only tracks the pointer, size, and
 /// backend-provided deleter callback so that the allocation can be released safely when dropped.
