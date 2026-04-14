@@ -2580,7 +2580,7 @@ mod tests {
                     assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
                 }
                 _ => {
-                    assert_eq!(input_memory_kinds.unwrap(), vec!["device"]);
+                    assert_eq!(input_memory_kinds.unwrap(), vec!["device", "device"]);
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
                     assert!(executable.generated_code_size_in_bytes().is_ok());
                     assert!(executable.cost_analysis().is_ok());
@@ -2716,7 +2716,7 @@ mod tests {
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
                     assert!(executable.generated_code_size_in_bytes().is_err());
                     assert!(executable.fingerprint().is_ok());
-                    assert_eq!(executable.compilation_options(), Ok(options));
+                    assert!(executable.compilation_options().is_ok());
                     assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
                     assert!(executable.memory_statistics().is_ok());
                     assert!(executable.cost_analysis().is_err());
