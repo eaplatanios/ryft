@@ -68,7 +68,15 @@ impl Client<'_> {
             },
             { ptr, deleter, deleter_arg },
         )
-        .and_then(|(ptr, deleter, deleter_arg)| HostMemoryAllocation::from_raw_parts(ptr, size, deleter, deleter_arg))
+        .and_then(|(pointer, deleter, deleter_arg)| {
+            if size != 0 && pointer.is_null() {
+                Err(Error::invalid_argument(
+                    "the host memory allocator returned a null pointer for a non-empty allocation",
+                ))
+            } else {
+                Ok(HostMemoryAllocation { pointer, size, deleter, deleter_arg })
+            }
+        })
     }
 }
 
@@ -98,18 +106,17 @@ impl Api {
     }
 }
 
-/// An owned allocation returned by [`Client::host_memory_allocate`].
-///
-/// The underlying memory is backend-owned and may be uninitialized. This wrapper only tracks the pointer, size, and
-/// backend-provided deleter callback so that the allocation can be released safely when dropped.
+/// Owned host memory allocation returned by [`Client::host_memory_allocate`]. The underlying memory is backend-owned
+/// and may be uninitialized. This wrapper only tracks the pointer, size, and backend-provided deleter callback so that
+/// the allocation can be released safely when dropped.
 pub struct HostMemoryAllocation {
     /// Pointer to the allocated host memory.
     pointer: *mut u8,
 
-    /// Number of bytes in the allocation.
+    /// Number of bytes in this [`HostMemoryAllocation`].
     size: usize,
 
-    /// Backend-provided deleter callback for this allocation.
+    /// Backend-provided deleter callback for this [`HostMemoryAllocation`].
     deleter: Option<unsafe extern "C" fn(ptr: *mut c_void, arg: *mut c_void)>,
 
     /// Opaque deleter state that must be passed back to the backend-provided deleter callback.
@@ -117,41 +124,33 @@ pub struct HostMemoryAllocation {
 }
 
 impl HostMemoryAllocation {
-    /// Constructs a new [`HostMemoryAllocation`] from raw parts returned by the PJRT C API.
-    fn from_raw_parts(
-        pointer: *mut u8,
-        size: usize,
-        deleter: Option<unsafe extern "C" fn(ptr: *mut c_void, arg: *mut c_void)>,
-        deleter_arg: *mut c_void,
-    ) -> Result<Self, Error> {
-        if size != 0 && pointer.is_null() {
-            Err(Error::invalid_argument("the host memory allocator returned a null pointer for a non-empty allocation"))
-        } else {
-            Ok(Self { pointer, size, deleter, deleter_arg })
-        }
-    }
-
-    /// Returns a const pointer to the start of this allocation.
-    pub fn as_ptr(&self) -> *const u8 {
+    /// Returns a pointer to the start of this [`HostMemoryAllocation`]. This is unsafe because the returned pointer
+    /// refers to backend-owned memory whose initialization state, aliasing constraints, and validity for dereferencing
+    /// are not enforced by Rust. This API is exposed so callers can pass the backend-owned allocation to external FFI
+    /// or backend-specific code.
+    pub unsafe fn as_ptr(&self) -> *const u8 {
         self.pointer
     }
 
-    /// Returns a mutable pointer to the start of this allocation.
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    /// Returns a mutable pointer to the start of this [`HostMemoryAllocation`]. This is unsafe because the returned
+    /// pointer refers to backend-owned memory whose initialization state, aliasing constraints, and validity for
+    /// dereferencing are not enforced by Rust. This API is exposed so callers can pass the backend-owned allocation
+    /// to external FFI or backend-specific code.
+    pub unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
         self.pointer
     }
 
-    /// Returns the number of bytes in this allocation.
+    /// Returns the number of bytes in this [`HostMemoryAllocation`].
     pub fn len(&self) -> usize {
         self.size
     }
 
-    /// Returns `true` if this allocation contains zero bytes.
+    /// Returns `true` if this [`HostMemoryAllocation`] contains zero bytes.
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
 
-    /// Consumes this allocation and returns its raw parts.
+    /// Consumes this [`HostMemoryAllocation`] and returns its raw parts.
     ///
     /// The caller becomes responsible for eventually invoking the returned deleter callback, if present.
     pub fn into_raw_parts(
