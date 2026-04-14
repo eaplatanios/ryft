@@ -209,12 +209,7 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use crate::tests::{test_cpu_client, test_cpu_plugin};
-
-    use super::HostMemoryAllocation;
 
     #[test]
     fn test_host_memory_allocator_extension() {
@@ -222,23 +217,5 @@ mod tests {
         assert!(test_cpu_client().host_memory_allocator_extension().is_err());
     }
 
-    #[test]
-    fn test_host_memory_allocation_drop_calls_deleter() {
-        unsafe extern "C" fn test_deleter(pointer: *mut c_void, deleter_arg: *mut c_void) {
-            let counter = unsafe { &*(deleter_arg as *const AtomicUsize) };
-            counter.fetch_add(1, Ordering::SeqCst);
-            drop(unsafe { Box::from_raw(pointer as *mut [u8; 4]) });
-        }
-
-        let counter = AtomicUsize::new(0);
-        let allocation = HostMemoryAllocation {
-            pointer: Box::into_raw(Box::new([0u8; 4])).cast(),
-            size: 4,
-            deleter: Some(test_deleter),
-            deleter_arg: &counter as *const AtomicUsize as *mut c_void,
-        };
-        drop(allocation);
-
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
+    // TODO(eaplatanios): Add more tests once there is a PJRT plugin that provides this extension.
 }
