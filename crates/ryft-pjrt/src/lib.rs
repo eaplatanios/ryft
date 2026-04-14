@@ -572,7 +572,7 @@ mod tests {
 
         let plugin = test_cpu_plugin();
         let api = plugin.api();
-        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 15, 0])));
+        assert_eq!(plugin.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 16, 0])));
         assert_eq!(plugin.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(plugin.attribute("xla_version"), Ok(Value::i64(2)));
         assert_eq!(plugin.attribute("xla_version"), api.attribute("xla_version"));
@@ -580,7 +580,7 @@ mod tests {
             plugin.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = plugin.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 15, 0])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 16, 0])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);
