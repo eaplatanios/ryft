@@ -60,8 +60,8 @@ potentially different build time and runtime requirements:
   a precompiled plugin from GitHub releases of `ryft`, if one can be found for the target platform and
   `PJRT_PLUGIN_CUDA_13_LIB` is not set. Note that this plugin has various runtime dependencies that are not included
   in the shared library provided by this feature, including but not limited to: `cublas`, `cudart`, `cudnn`, `cufft`,
-  `cupti`, `cusolver`, `cusparse`, `nccl`, `nvjitlink`, `nvptxcompiler`, `nvrtc`, and `nvshmem`. For Ubuntu 24.04 on
-  x86-64, you can install these dependencies using the following commands:
+  `cupti`, `cusolver`, `cusparse`, `nccl`, `nvjitlink`, `nvptxcompiler`, `nccl`, `nvrtc`, and `nvshmem`. For Ubuntu
+  24.04 on x86-64, you can install these dependencies using the following commands:
 
   ```bash
   wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -72,10 +72,20 @@ potentially different build time and runtime requirements:
     cuda-cudart-13-0 \
     cuda-nvrtc-13-0 \
     libcufft-13-0 \
+    libnccl2 \
     libnvjitlink-13-0 \
     libcudnn9-cuda-13 \
     libcudnn9-dev-cuda-13
   ```
+
+  You might also need to install `nvshmem` version 3 specifically if version 5 is installed for your system by default.
+  You can do that with a command similar to this:
+
+  ```bash
+  pip install nvidia-nvshmem-cu13==3.3.20 --target /usr/lib/nvshmem3 --no-deps
+  ```
+
+  Then, you will need to add this path to your `LD_LIBRARY_PATH`: `/usr/lib/nvshmem3/nvidia/nvshmem/lib`.
 
 - **`rocm-7`:** Enables support for loading the PJRT [ROCm 7](https://rocm.docs.amd.com/) plugin for leveraging
   ROCm-enabled GPUs by AMD. If this feature is enabled, similar to what happens with the static XLA library,
