@@ -540,7 +540,7 @@ where
         let output_value = input.value.with_type(output_type);
         Ok(JitTracer::apply_staged_op(
             std::slice::from_ref(&input),
-            ryft_core::tracing_v2::PrimitiveOp::Custom(std::sync::Arc::new(op)),
+            ryft_core::tracing_v2::PrimitiveOp::Custom(std::sync::Arc::new(op.to_tensor_custom_primitive())),
             vec![output_value],
         )?
         .into_iter()
@@ -3193,15 +3193,12 @@ mod tests {
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
                     %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
                     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<8xf32>
-                    %1 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %3 = stablehlo.cosine %arg1 : tensor<2xf32>
-                      sdy.return %3 : tensor<2xf32>
-                    } : (tensor<8xf32>) -> tensor<8xf32>
-                    %2 = sdy.manual_computation(%0, %1) in_shardings=[<@mesh, [{"x"}]>, <@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>, %arg2: tensor<2xf32>) {
-                      %3 = stablehlo.multiply %arg2, %arg1 : tensor<2xf32>
+                    %1 = sdy.manual_computation(%arg0, %0) in_shardings=[<@mesh, [{"x"}]>, <@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>, %arg2: tensor<2xf32>) {
+                      %2 = stablehlo.cosine %arg1 : tensor<2xf32>
+                      %3 = stablehlo.multiply %2, %arg2 : tensor<2xf32>
                       sdy.return %3 : tensor<2xf32>
                     } : (tensor<8xf32>, tensor<8xf32>) -> tensor<8xf32>
-                    return %2 : tensor<8xf32>
+                    return %1 : tensor<8xf32>
                   }
                 }
             "#}

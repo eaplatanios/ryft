@@ -6,9 +6,8 @@ use crate::tracing_v2::{
     TraceError,
     batch::Batch as BatchedValue,
     forward::JvpTracer,
-    graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
-    program::ProgramBuilder,
+    linear::LinearTerm,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -54,25 +53,23 @@ impl<V: MatrixValue> InterpretableOp<V> for LinearMatrixTransposeOp {
 impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let abstract_value = builder
-            .atom(output_cotangents[0])
-            .expect("output cotangent atom should exist")
-            .abstract_value
-            .clone();
-        let contribution = builder.add_equation_prevalidated(
-            PrimitiveOp::LinearMatrixTranspose,
-            vec![output_cotangents[0]],
-            vec![abstract_value],
-        )[0];
-        Ok(vec![Some(contribution)])
+        Ok(vec![Some(
+            LinearTerm::apply_staged_op(
+                std::slice::from_ref(&output_cotangents[0]),
+                PrimitiveOp::LinearMatrixTranspose,
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("linear matrix transpose should produce one cotangent contribution"),
+        )])
     }
 }
 
@@ -83,7 +80,7 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V
     }
 }
 
-impl<V: MatrixValue> BatchOp<V> for LinearMatrixTransposeOp {
+impl<V: MatrixValue> VectorizableOp<V> for LinearMatrixTransposeOp {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])

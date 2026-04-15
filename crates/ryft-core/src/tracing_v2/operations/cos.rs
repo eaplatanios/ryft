@@ -6,9 +6,8 @@ use crate::tracing_v2::{
     FloatExt, TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op},
-    program::ProgramBuilder,
+    linear::LinearTerm,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -50,11 +49,11 @@ impl<V: TraceValue + FloatExt> InterpretableOp<V> for CosOp {
 impl<V: TraceValue + FloatExt + ZeroLike> LinearOp<V> for CosOp {
     fn transpose(
         &self,
-        _builder: &mut ProgramBuilder<V>,
-        _inputs: &[AtomId],
-        _outputs: &[AtomId],
-        _output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        _inputs: &[V],
+        _outputs: &[V],
+        _output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        // TODO(eaplatanios): We should not have to implement `LinearOp` for non-linear ops. Something is wrong.
         Err(TraceError::HigherOrderOpFailure {
             op: "transpose_linear_program",
             message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
@@ -73,7 +72,7 @@ impl<V: TraceValue + FloatExt, T: TangentSpace<V>> DifferentiableOp<V, T> for Co
     }
 }
 
-impl<V: TraceValue + FloatExt> BatchOp<V> for CosOp {
+impl<V: TraceValue + FloatExt> VectorizableOp<V> for CosOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.cos()).collect())])

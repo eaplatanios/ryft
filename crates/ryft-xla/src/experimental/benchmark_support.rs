@@ -130,7 +130,7 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
 
     summarize_graph(program.graph(), |op| {
         if let PrimitiveOp::Custom(custom_op) = op {
-            if let Some(shard_map_op) = custom_op.as_any().downcast_ref::<ShardMapOp<ShardMapTensor>>() {
+            if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
                 let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
                     nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);
@@ -379,13 +379,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_emit_grad_around_shard_map_matches_compact_two_region_factorization() {
+    fn test_emit_grad_around_shard_map_matches_compact_single_region_lowering() {
         let records = emit_grad_around_shard_map().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].raw_ir.matches("sdy.manual_computation").count(), 2);
-        assert_eq!(records[0].summary.op_histogram.get("shard_map"), Some(&2));
+        assert_eq!(records[0].raw_ir.matches("sdy.manual_computation").count(), 1);
+        assert_eq!(records[0].summary.op_histogram.get("shard_map"), Some(&1));
         assert_eq!(records[0].summary.nested_regions[0].op_histogram.get("cos"), Some(&1));
-        assert_eq!(records[0].summary.nested_regions[1].op_histogram.get("mul"), Some(&1));
+        assert_eq!(records[0].summary.nested_regions[0].op_histogram.get("mul"), Some(&1));
     }
 
     #[test]

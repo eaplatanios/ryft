@@ -37,6 +37,12 @@ pub struct JitTracer<V: TraceValue> {
 }
 
 impl<V: TraceValue> JitTracer<V> {
+    #[doc(hidden)]
+    #[inline]
+    pub fn atom(&self) -> AtomId {
+        self.atom
+    }
+
     #[inline]
     pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
         self.builder.clone()

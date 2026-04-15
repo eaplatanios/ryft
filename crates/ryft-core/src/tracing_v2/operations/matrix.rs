@@ -14,7 +14,7 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{BatchOp, PrimitiveOp},
+        ops::{PrimitiveOp, VectorizableOp},
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
 };

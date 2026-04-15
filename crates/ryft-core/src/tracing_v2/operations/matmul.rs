@@ -6,9 +6,8 @@ use crate::tracing_v2::{
     FloatExt, TraceError, ZeroLike,
     batch::Batch as BatchedValue,
     forward::JvpTracer,
-    graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op},
-    program::ProgramBuilder,
+    linear::LinearTerm,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -54,11 +53,10 @@ impl<V: MatrixValue> InterpretableOp<V> for MatMulOp {
 impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatMulOp {
     fn transpose(
         &self,
-        _builder: &mut ProgramBuilder<V>,
-        _inputs: &[AtomId],
-        _outputs: &[AtomId],
-        _output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        _inputs: &[V],
+        _outputs: &[V],
+        _output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "transpose_linear_program",
             message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
@@ -75,7 +73,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<
     }
 }
 
-impl<V: MatrixValue> BatchOp<V> for MatMulOp {
+impl<V: MatrixValue> VectorizableOp<V> for MatMulOp {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

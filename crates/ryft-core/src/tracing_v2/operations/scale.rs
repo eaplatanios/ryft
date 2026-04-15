@@ -12,10 +12,9 @@ use crate::tracing_v2::{
     TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    graph::AtomId,
     jit::JitTracer,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
-    program::ProgramBuilder,
+    linear::LinearTerm,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -87,25 +86,14 @@ impl<V: TraceValue + Mul<Output = V>> InterpretableOp<V> for ScaleOp<V> {
 impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let abstract_value = builder
-            .atom(output_cotangents[0])
-            .expect("output cotangent atom should exist")
-            .abstract_value
-            .clone();
-        let contribution = builder.add_equation_prevalidated(
-            PrimitiveOp::Scale { factor: self.factor().clone() },
-            vec![output_cotangents[0]],
-            vec![abstract_value],
-        )[0];
-        Ok(vec![Some(contribution)])
+        Ok(vec![Some(output_cotangents[0].clone().scale(self.factor().clone()))])
     }
 }
 
@@ -136,7 +124,7 @@ impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T>
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>> BatchOp<V> for ScaleOp<V> {
+impl<V: TraceValue + Mul<Output = V>> VectorizableOp<V> for ScaleOp<V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| self.factor().clone() * lane).collect())])
@@ -145,6 +133,8 @@ impl<V: TraceValue + Mul<Output = V>> BatchOp<V> for ScaleOp<V> {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use pretty_assertions::assert_eq;
 
     use crate::{parameters::Placeholder, tracing_v2::ProgramBuilder};
@@ -158,18 +148,23 @@ mod tests {
 
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
-        let mut forward_builder = ProgramBuilder::<f64>::new();
-        let input = forward_builder.add_input(&1.0f64);
-        let output = forward_builder.add_equation(PrimitiveOp::Scale { factor: 3.0f64 }, vec![input]).unwrap()[0];
-
-        let mut transpose_builder = ProgramBuilder::<f64>::new();
-        let output_cotangent = transpose_builder.add_input(&1.0f64);
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
+        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ScaleOp::new(3.0f64)
-            .transpose(&mut transpose_builder, &[input], &[output], &[output_cotangent])
-            .unwrap()[0]
-            .unwrap();
+            .transpose(&[1.0f64], &[3.0f64], &[output_cotangent])
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("transpose should return one contribution")
+            .expect("transpose should produce one cotangent contribution");
+        let contribution_atom = contribution.atom();
+        drop(contribution);
 
-        let transpose_graph = transpose_builder.build::<f64, f64>(vec![contribution], Placeholder, Placeholder);
+        let transpose_builder = Rc::try_unwrap(transpose_builder)
+            .expect("transpose builder should not have outstanding linear terms")
+            .into_inner();
+        let transpose_graph = transpose_builder.build::<f64, f64>(vec![contribution_atom], Placeholder, Placeholder);
         approx_eq(transpose_graph.call(2.0f64).unwrap(), 6.0);
         assert_eq!(
             transpose_graph.to_string(),

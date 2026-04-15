@@ -2,19 +2,25 @@
 
 use std::{
     fmt::{Debug, Display},
+    marker::PhantomData,
     ops::{Add, Mul, Neg},
+    sync::Arc,
 };
 
 use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, JvpTracer, LinearOp, LinearTerm, Linearized,
-        MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
+        AtomId, CustomPrimitive, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, LinearOp, LinearTerm,
+        Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
+        forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
 
+use crate::experimental::lowering::{
+    LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
+};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap,
@@ -56,8 +62,15 @@ pub enum LinearShardMapEvalMode {
 
 /// Linear execution state carried by one canonical traced shard-map op.
 #[derive(Clone)]
-struct LinearShardMapState<V: TraceValue> {
-    captured_global_primals: Vec<V>,
+enum CapturedGlobalPrimal {
+    Concrete(ShardMapTensor),
+    Staged { value: ShardMapTensor, atom: AtomId },
+}
+
+/// Linear execution state carried by one canonical traced shard-map op.
+#[derive(Clone)]
+struct LinearShardMapState {
+    captured_global_primals: Vec<CapturedGlobalPrimal>,
     eval_mode: LinearShardMapEvalMode,
     transpose_mode: LinearShardMapEvalMode,
 }
@@ -68,7 +81,8 @@ pub struct ShardMapOp<V: TraceValue> {
     body: FlatTracedShardMap,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
-    linear_state: Option<LinearShardMapState<V>>,
+    linear_state: Option<LinearShardMapState>,
+    marker: PhantomData<fn() -> V>,
 }
 
 impl<V: TraceValue> ShardMapOp<V> {
@@ -80,6 +94,7 @@ impl<V: TraceValue> ShardMapOp<V> {
             output_types: body.global_output_types.clone(),
             body,
             linear_state: None,
+            marker: PhantomData,
         }
     }
 
@@ -87,7 +102,7 @@ impl<V: TraceValue> ShardMapOp<V> {
     #[inline]
     fn new_linear(
         body: FlatTracedShardMap,
-        captured_global_primals: Vec<V>,
+        captured_global_primals: Vec<CapturedGlobalPrimal>,
         input_types: Vec<ArrayType>,
         output_types: Vec<ArrayType>,
         eval_mode: LinearShardMapEvalMode,
@@ -98,6 +113,7 @@ impl<V: TraceValue> ShardMapOp<V> {
             input_types,
             output_types,
             linear_state: Some(LinearShardMapState { captured_global_primals, eval_mode, transpose_mode }),
+            marker: PhantomData,
         }
     }
 
@@ -126,6 +142,14 @@ impl<V: TraceValue> ShardMapOp<V> {
         self.linear_state.is_some()
     }
 
+    /// Returns the shared custom-primitive registration used by this shard-map variant.
+    fn base_custom_primitive(&self) -> CustomPrimitive<V>
+    where
+        Self: InterpretableOp<V> + LinearOp<V> + Clone + Send + Sync + 'static,
+    {
+        CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
+    }
+
     fn transpose_op(&self) -> Result<Self, TraceError> {
         let linear_state = self.linear_state.clone().ok_or(TraceError::HigherOrderOpFailure {
             op: "shard_map",
@@ -139,6 +163,58 @@ impl<V: TraceValue> ShardMapOp<V> {
             linear_state.transpose_mode,
             linear_state.eval_mode,
         ))
+    }
+}
+
+impl ShardMapOp<ShardMapTensor> {
+    /// Returns the tensor-leaf custom-primitive registration for this shard-map op.
+    pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ShardMapTensor> {
+        self.base_custom_primitive()
+            .with_jvp_rule(self.clone())
+            .with_linearized_jit_rule(self.clone())
+            .with_extension(self.clone())
+            .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
+    }
+
+    /// Rebuilds this tensor-leaf shard-map op for traced linearized-JIT replay.
+    fn to_linearized_jit_tracer_op(
+        &self,
+        primals: &[ShardMapTracer],
+    ) -> Result<ShardMapOp<ShardMapTracer>, TraceError> {
+        match &self.linear_state {
+            Some(linear_state) => Ok(ShardMapOp::new_linear(
+                self.body.clone(),
+                primals
+                    .iter()
+                    .map(|primal| CapturedGlobalPrimal::Staged { value: primal.value.clone(), atom: primal.atom() })
+                    .collect::<Vec<_>>(),
+                self.input_types.clone(),
+                self.output_types.clone(),
+                linear_state.eval_mode.clone(),
+                linear_state.transpose_mode.clone(),
+            )),
+            None => {
+                let linear_bodies = trace_linear_shard_map_bodies(&self.body).map_err(trace_error_from_shard_map)?;
+                Ok(ShardMapOp::new_linear(
+                    self.body.clone(),
+                    primals
+                        .iter()
+                        .map(|primal| CapturedGlobalPrimal::Staged { value: primal.value.clone(), atom: primal.atom() })
+                        .collect::<Vec<_>>(),
+                    self.body.global_input_types.clone(),
+                    self.body.global_output_types.clone(),
+                    LinearShardMapEvalMode::Body(linear_bodies.pushforward),
+                    LinearShardMapEvalMode::Body(linear_bodies.pullback),
+                ))
+            }
+        }
+    }
+}
+
+impl ShardMapOp<ShardMapTracer> {
+    /// Returns the traced-leaf custom-primitive registration for this shard-map op.
+    pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ShardMapTracer> {
+        self.base_custom_primitive().with_jvp_rule(self.clone()).with_linearized_jit_rule(self.clone())
     }
 }
 
@@ -213,11 +289,10 @@ impl InterpretableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<ShardMapTensor>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[ShardMapTensor],
+        outputs: &[ShardMapTensor],
+        output_cotangents: &[LinearTerm<ShardMapTensor>],
+    ) -> Result<Vec<Option<LinearTerm<ShardMapTensor>>>, TraceError> {
         if !self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
@@ -236,37 +311,12 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
                 got: output_cotangents.len(),
             });
         }
-        let contributions = builder
-            .add_equation(PrimitiveOp::Custom(std::sync::Arc::new(self.transpose_op()?)), output_cotangents.to_vec())?;
+        let contributions = LinearTerm::apply_staged_op(
+            output_cotangents,
+            PrimitiveOp::Custom(Arc::new(self.transpose_op()?.to_tensor_custom_primitive())),
+            self.input_types.len(),
+        )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
-    }
-}
-
-impl InterpretableOp<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
-    fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
-        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let primal_output_values = InterpretableOp::interpret(self, primal_values.as_slice())?;
-        let primal_outputs = JitTracer::apply_staged_op(
-            primal_inputs.as_slice(),
-            PrimitiveOp::Custom(std::sync::Arc::new(self.clone())),
-            primal_output_values,
-        )?;
-
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let tangent_outputs = LinearTerm::apply_staged_op(
-            tangent_inputs.as_slice(),
-            PrimitiveOp::Custom(std::sync::Arc::new(
-                make_replayed_linear_shard_map(self, primal_inputs).map_err(trace_error_from_shard_map)?,
-            )),
-            self.output_types.len(),
-        )?;
-
-        Ok(primal_outputs
-            .into_iter()
-            .zip(tangent_outputs)
-            .map(|(primal, tangent)| Linearized { primal, tangent })
-            .collect::<Vec<_>>())
     }
 }
 
@@ -281,7 +331,51 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
                 message: "JVP rule for staged op 'linear_shard_map' is not implemented".to_string(),
             });
         }
-        apply_staged_shard_map_jvp_rule(self, inputs)
+        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_outputs = InterpretableOp::interpret(self, primal_inputs.as_slice())?;
+        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_inputs.as_slice(),
+            PrimitiveOp::Custom(Arc::new(
+                make_linear_tensor_shard_map(self.body(), primal_inputs)
+                    .map_err(trace_error_from_shard_map)?
+                    .to_tensor_custom_primitive(),
+            )),
+            self.output_types.len(),
+        )?;
+        Ok(primal_outputs
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| JvpTracer { primal, tangent })
+            .collect::<Vec<_>>())
+    }
+}
+
+impl InterpretableOp<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
+    fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+        let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+        let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
+        let primal_output_values = InterpretableOp::interpret(self, primal_values.as_slice())?;
+        let primal_outputs = JitTracer::apply_staged_op(
+            primal_inputs.as_slice(),
+            PrimitiveOp::Custom(Arc::new(self.to_tensor_custom_primitive())),
+            primal_output_values,
+        )?;
+
+        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_inputs.as_slice(),
+            PrimitiveOp::Custom(Arc::new(
+                self.to_linearized_jit_tracer_op(primal_inputs.as_slice())?.to_tracer_custom_primitive(),
+            )),
+            self.output_types.len(),
+        )?;
+
+        Ok(primal_outputs
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| Linearized { primal, tangent })
+            .collect::<Vec<_>>())
     }
 }
 
@@ -313,20 +407,19 @@ impl InterpretableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
             None => apply_flat_traced_shard_map(self.body.clone(), inputs.to_vec()).map_err(trace_error_from_shard_map),
             Some(linear_state) => match &linear_state.eval_mode {
                 LinearShardMapEvalMode::Body(body) => {
-                    let combined_inputs = linear_state
-                        .captured_global_primals
-                        .iter()
-                        .cloned()
-                        .chain(inputs.iter().cloned())
-                        .collect::<Vec<_>>();
+                    let combined_inputs =
+                        reify_captured_global_primals(linear_state.captured_global_primals.as_slice(), inputs)?
+                            .into_iter()
+                            .chain(inputs.iter().cloned())
+                            .collect::<Vec<_>>();
                     apply_flat_traced_shard_map(body.clone(), combined_inputs).map_err(trace_error_from_shard_map)
                 }
                 LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
-                    let residuals = apply_flat_traced_shard_map(
-                        factorized.residual_body.clone(),
-                        linear_state.captured_global_primals.clone(),
-                    )
-                    .map_err(trace_error_from_shard_map)?;
+                    let captured_global_primals =
+                        reify_captured_global_primals(linear_state.captured_global_primals.as_slice(), inputs)?;
+                    let residuals =
+                        apply_flat_traced_shard_map(factorized.residual_body.clone(), captured_global_primals)
+                            .map_err(trace_error_from_shard_map)?;
                     let apply_inputs = inputs.iter().cloned().chain(residuals).collect::<Vec<_>>();
                     apply_flat_traced_shard_map(factorized.apply_body.clone(), apply_inputs)
                         .map_err(trace_error_from_shard_map)
@@ -339,11 +432,10 @@ impl InterpretableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
 impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<ShardMapTracer>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[ShardMapTracer],
+        outputs: &[ShardMapTracer],
+        output_cotangents: &[LinearTerm<ShardMapTracer>],
+    ) -> Result<Vec<Option<LinearTerm<ShardMapTracer>>>, TraceError> {
         if !self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
@@ -362,8 +454,11 @@ impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
                 got: output_cotangents.len(),
             });
         }
-        let contributions = builder
-            .add_equation(PrimitiveOp::Custom(std::sync::Arc::new(self.transpose_op()?)), output_cotangents.to_vec())?;
+        let contributions = LinearTerm::apply_staged_op(
+            output_cotangents,
+            PrimitiveOp::Custom(Arc::new(self.transpose_op()?.to_tracer_custom_primitive())),
+            self.input_types.len(),
+        )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
 }
@@ -395,6 +490,31 @@ impl InterpretableOp<Linearized<JitTracer<ShardMapTracer>>> for ShardMapOp<Shard
     }
 }
 
+impl StableHloCustomLowering<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        _op: &CustomPrimitive<ShardMapTensor>,
+        input_values: &[ryft_mlir::ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ryft_mlir::ValueRef<'b, 'c, 't>>, LoweringError> {
+        if let Some(eval_mode) = self.eval_mode() {
+            return lowerer.lower_linear_shard_map_eval_mode(eval_mode, input_values);
+        }
+        let simplified_body = self
+            .body()
+            .simplified()
+            .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+        lowerer.lower_manual_computation(
+            input_values,
+            &simplified_body.shard_map,
+            simplified_body.compiled.graph(),
+            simplified_body.local_input_types.as_slice(),
+            simplified_body.global_output_types.as_slice(),
+        )
+    }
+}
+
 trait ReplayShardMapValue:
     Clone
     + TraceValue
@@ -413,6 +533,27 @@ trait ReplayShardMapValue:
 
 fn trace_error_from_shard_map(error: ShardMapTraceError) -> TraceError {
     TraceError::HigherOrderOpFailure { op: "shard_map", message: error.to_string() }
+}
+
+/// Reifies captured shard-map primals into traced values in the current staging context.
+fn reify_captured_global_primals(
+    captured_global_primals: &[CapturedGlobalPrimal],
+    inputs: &[ShardMapTracer],
+) -> Result<Vec<ShardMapTracer>, TraceError> {
+    let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+    let builder = exemplar.builder_handle();
+    let staging_error = exemplar.staging_error_handle();
+    captured_global_primals
+        .iter()
+        .map(|primal| match primal {
+            CapturedGlobalPrimal::Concrete(value) => {
+                <ShardMapTracer as ReplayShardMapValue>::lift_constant(value, inputs)
+            }
+            CapturedGlobalPrimal::Staged { value, atom } => {
+                Ok(JitTracer::from_staged_parts(value.clone(), *atom, builder.clone(), staging_error.clone()))
+            }
+        })
+        .collect()
 }
 
 /// Returns the number of primal inputs consumed by one transpose shard-map body.
@@ -853,50 +994,12 @@ fn make_linear_tensor_shard_map(
     let linear_bodies = trace_linear_shard_map_bodies(body)?;
     Ok(ShardMapOp::new_linear(
         body.clone(),
-        captured_global_primals,
+        captured_global_primals.into_iter().map(CapturedGlobalPrimal::Concrete).collect::<Vec<_>>(),
         body.global_input_types.clone(),
         body.global_output_types.clone(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),
         LinearShardMapEvalMode::Body(linear_bodies.pullback),
     ))
-}
-
-fn apply_staged_shard_map_jvp_rule(
-    op: &ShardMapOp<ShardMapTensor>,
-    inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
-) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
-    let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-    let primal_outputs = InterpretableOp::interpret(op, primal_inputs.as_slice())?;
-    let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-    let tangent_outputs = LinearTerm::apply_staged_op(
-        tangent_inputs.as_slice(),
-        PrimitiveOp::Custom(std::sync::Arc::new(
-            make_linear_tensor_shard_map(op.body(), primal_inputs).map_err(trace_error_from_shard_map)?,
-        )),
-        primal_outputs.len(),
-    )?;
-    Ok(primal_outputs
-        .into_iter()
-        .zip(tangent_outputs)
-        .map(|(primal, tangent)| JvpTracer { primal, tangent })
-        .collect::<Vec<_>>())
-}
-
-fn make_replayed_linear_shard_map(
-    op: &ShardMapOp<ShardMapTensor>,
-    captured_global_primals: Vec<ShardMapTracer>,
-) -> Result<ShardMapOp<ShardMapTracer>, ShardMapTraceError> {
-    match &op.linear_state {
-        Some(linear_state) => Ok(ShardMapOp::new_linear(
-            op.body.clone(),
-            captured_global_primals,
-            op.input_types.clone(),
-            op.output_types.clone(),
-            linear_state.eval_mode.clone(),
-            linear_state.transpose_mode.clone(),
-        )),
-        None => make_linear_shard_map(op.body(), captured_global_primals),
-    }
 }
 
 fn try_linearize_traced_shard_map_body<
@@ -961,7 +1064,7 @@ fn apply_flat_traced_shard_map(
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
     JitTracer::apply_staged_op(
         traced_inputs.as_slice(),
-        PrimitiveOp::Custom(std::sync::Arc::new(ShardMapOp::new(body.clone()))),
+        PrimitiveOp::Custom(Arc::new(ShardMapOp::new(body.clone()).to_tensor_custom_primitive())),
         body.global_output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>(),
     )
     .map_err(ShardMapTraceError::from)
@@ -1015,7 +1118,7 @@ fn replay_traced_xla_graph<
                     .collect::<Result<Vec<_>, _>>()?;
                 let outputs = match &equation.op {
                     PrimitiveOp::Custom(custom_op) => {
-                        if let Some(shard_map_op) = custom_op.as_any().downcast_ref::<ShardMapOp<ShardMapTensor>>() {
+                        if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
                             if shard_map_op.has_linear_state() {
                                 return Err(ShardMapTraceError::TraceError(TraceError::HigherOrderOpFailure {
                                     op: "shard_map",
@@ -1080,7 +1183,13 @@ fn make_linear_shard_map(
     };
     Ok(ShardMapOp::new_linear(
         body.clone(),
-        captured_global_primals,
+        captured_global_primals
+            .into_iter()
+            .map(|primal| {
+                let atom = primal.atom();
+                CapturedGlobalPrimal::Staged { value: primal.value, atom }
+            })
+            .collect::<Vec<_>>(),
         body.global_input_types.clone(),
         body.global_output_types.clone(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),
@@ -1236,7 +1345,7 @@ pub(crate) fn apply_linearized_flat_shard_map(
     let primal_outputs = apply_flat_traced_shard_map(body.clone(), traced_primals.clone())?;
     let tangent_outputs = LinearTerm::apply_staged_op(
         traced_tangents.as_slice(),
-        PrimitiveOp::Custom(std::sync::Arc::new(make_linear_shard_map(&body, traced_primals)?)),
+        PrimitiveOp::Custom(Arc::new(make_linear_shard_map(&body, traced_primals)?.to_tracer_custom_primitive())),
         body.global_output_types.len(),
     )?;
     Ok(primal_outputs
@@ -1313,7 +1422,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
 ) -> Result<Output, ShardMapTraceError> {
     let staged_outputs = JitTracer::apply_staged_op(
         traced_inputs.as_slice(),
-        PrimitiveOp::Custom(std::sync::Arc::new(ShardMapOp::new(traced.clone()))),
+        PrimitiveOp::Custom(Arc::new(ShardMapOp::new(traced.clone()).to_tensor_custom_primitive())),
         traced.global_output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>(),
     )?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)

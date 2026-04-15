@@ -6,11 +6,9 @@ use crate::tracing_v2::{
     FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
     batch::Batch as BatchedValue,
     forward::{JvpTracer, TangentSpace},
-    graph::AtomId,
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
-    program::ProgramBuilder,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp, VectorizableOp},
 };
 use crate::types::{ArrayType, Typed};
 
@@ -88,19 +86,23 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
 {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let contribution = builder.add_equation(
-            PrimitiveOp::RightMatMul { factor: self.factor.clone().transpose_matrix() },
-            vec![output_cotangents[0]],
-        )?[0];
-        Ok(vec![Some(contribution)])
+        Ok(vec![Some(
+            LinearTerm::apply_staged_op(
+                std::slice::from_ref(&output_cotangents[0]),
+                PrimitiveOp::RightMatMul { factor: self.factor.clone().transpose_matrix() },
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("right matmul should produce one cotangent contribution"),
+        )])
     }
 }
 
@@ -131,7 +133,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
     }
 }
 
-impl<V: MatrixValue> BatchOp<V> for RightMatMulOp<V> {
+impl<V: MatrixValue> VectorizableOp<V> for RightMatMulOp<V> {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(

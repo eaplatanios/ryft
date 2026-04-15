@@ -12,7 +12,7 @@ use crate::{
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, OneLike, Program, TraceError, TraceValue, ZeroLike,
         operations::{AddOp, CosOp, FlatTracedVMap, MulOp, NegOp, SinOp, VMapOp},
-        ops::{BatchOp, PrimitiveOp},
+        ops::{PrimitiveOp, VectorizableOp},
     },
     types::Typed,
 };

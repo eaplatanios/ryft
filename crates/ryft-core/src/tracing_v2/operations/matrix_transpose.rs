@@ -6,9 +6,8 @@ use crate::tracing_v2::{
     FloatExt, TraceError, ZeroLike,
     batch::Batch as BatchedValue,
     forward::JvpTracer,
-    graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op},
-    program::ProgramBuilder,
+    linear::LinearTerm,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -54,15 +53,23 @@ impl<V: MatrixValue> InterpretableOp<V> for MatrixTransposeOp {
 impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatrixTransposeOp {
     fn transpose(
         &self,
-        _builder: &mut ProgramBuilder<V>,
-        _inputs: &[AtomId],
-        _outputs: &[AtomId],
-        _output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "transpose_linear_program",
-            message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
-        })
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        expect_input_count(inputs.len(), 1)?;
+        expect_input_count(outputs.len(), 1)?;
+        expect_input_count(output_cotangents.len(), 1)?;
+        Ok(vec![Some(
+            LinearTerm::apply_staged_op(
+                std::slice::from_ref(&output_cotangents[0]),
+                PrimitiveOp::LinearMatrixTranspose,
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("matrix transpose should produce one cotangent contribution"),
+        )])
     }
 }
 
@@ -75,7 +82,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<
     }
 }
 
-impl<V: MatrixValue> BatchOp<V> for MatrixTransposeOp {
+impl<V: MatrixValue> VectorizableOp<V> for MatrixTransposeOp {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])

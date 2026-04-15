@@ -9,9 +9,8 @@ use crate::tracing_v2::{
     TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op},
-    program::ProgramBuilder,
+    linear::LinearTerm,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -76,11 +75,10 @@ impl<V: TraceValue + Mul<Output = V>> InterpretableOp<V> for MulOp {
 impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for MulOp {
     fn transpose(
         &self,
-        _builder: &mut ProgramBuilder<V>,
-        _inputs: &[AtomId],
-        _outputs: &[AtomId],
-        _output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        _inputs: &[V],
+        _outputs: &[V],
+        _output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "transpose_linear_program",
             message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
@@ -103,7 +101,7 @@ impl<V: TraceValue + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T>
     }
 }
 
-impl<V: TraceValue + Mul<Output = V>> BatchOp<V> for MulOp {
+impl<V: TraceValue + Mul<Output = V>> VectorizableOp<V> for MulOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

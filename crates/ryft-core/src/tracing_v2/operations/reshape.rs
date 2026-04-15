@@ -15,11 +15,9 @@ use crate::{
         FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         batch::Batch,
         forward::{JvpTracer, TangentSpace},
-        graph::AtomId,
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
-        program::ProgramBuilder,
+        ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp, VectorizableOp},
     },
     types::{ArrayType, Shape, Size, Typed},
 };
@@ -383,24 +381,21 @@ impl<V: ReshapeValue> InterpretableOp<V> for ReshapeOp {
 impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> for ReshapeOp {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
         if self.input_type() == self.output_type() {
-            return Ok(vec![Some(output_cotangents[0])]);
+            return Ok(vec![Some(output_cotangents[0].clone())]);
         }
-        let abstract_value = self.input_type().clone();
-        let contribution = builder.add_equation_prevalidated(
-            PrimitiveOp::Reshape { input_type: self.output_type().clone(), output_type: self.input_type().clone() },
-            vec![output_cotangents[0]],
-            vec![abstract_value],
-        )[0];
-        Ok(vec![Some(contribution)])
+        Ok(vec![Some(<LinearTerm<V> as ReshapeTangentSpace<V>>::reshape(
+            self.output_type(),
+            self.input_type(),
+            output_cotangents[0].clone(),
+        )?)])
     }
 }
 
@@ -411,7 +406,7 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> Differentiable
     }
 }
 
-impl<V: ReshapeValue> BatchOp<V> for ReshapeOp {
+impl<V: ReshapeValue> VectorizableOp<V> for ReshapeOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
@@ -420,6 +415,8 @@ impl<V: ReshapeValue> BatchOp<V> for ReshapeOp {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use ndarray::arr2;
     use pretty_assertions::assert_eq;
 
@@ -677,27 +674,30 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap();
-        let mut forward_builder = ProgramBuilder::<ndarray::Array2<f64>>::new();
-        let input = forward_builder.add_input_abstract(input_type.clone(), arr2(&[[1.0f64, 2.0], [3.0, 4.0]]));
-        let output = forward_builder
-            .add_equation(
-                PrimitiveOp::Reshape { input_type: input_type.clone(), output_type: output_type.clone() },
-                vec![input],
-            )
-            .unwrap()[0];
-
-        let mut transpose_builder = ProgramBuilder::<ndarray::Array2<f64>>::new();
-        let output_cotangent = transpose_builder.add_input_abstract(output_type, arr2(&[[1.0f64, 2.0, 3.0, 4.0]]));
+        let input_value = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
+        let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<ndarray::Array2<f64>>::new()));
+        let output_cotangent_atom =
+            transpose_builder.borrow_mut().add_input_abstract(output_type.clone(), output_value.clone());
+        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ReshapeOp::new(
             input_type.clone(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap(),
         )
-        .transpose(&mut transpose_builder, &[input], &[output], &[output_cotangent])
-        .unwrap()[0]
-            .unwrap();
+        .transpose(std::slice::from_ref(&input_value), std::slice::from_ref(&output_value), &[output_cotangent])
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("transpose should return one contribution")
+        .expect("transpose should produce one cotangent contribution");
+        let contribution_atom = contribution.atom();
+        drop(contribution);
 
+        let transpose_builder = Rc::try_unwrap(transpose_builder)
+            .expect("transpose builder should not have outstanding linear terms")
+            .into_inner();
         let transpose_graph = transpose_builder.build::<ndarray::Array2<f64>, ndarray::Array2<f64>>(
-            vec![contribution],
+            vec![contribution_atom],
             Placeholder,
             Placeholder,
         );

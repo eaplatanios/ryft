@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    AtomSource, Graph, Op, PrimitiveOp, ProgramOpRef, ReshapeOps, TraceValue,
+    AtomSource, CustomPrimitive, Graph, Op, PrimitiveOp, ProgramOpRef, ReshapeOps, TraceValue,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, MulOp, NegOp,
         RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -75,6 +75,10 @@ pub(crate) enum LoweringError {
     /// Error returned when simplifying a staged program prior to lowering fails.
     #[error("failed to simplify staged XLA program before lowering: {message}")]
     SimplificationFailure { message: String },
+
+    /// Error returned when one custom primitive does not provide StableHLO lowering.
+    #[error("custom primitive '{op}' does not provide StableHLO lowering")]
+    MissingCustomLowering { op: String },
 }
 
 /// Lowering mode used for plain `tracing_v2` MLIR emission.
@@ -175,6 +179,42 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
         )
+    }
+}
+
+/// StableHLO lowering hook carried by one [`CustomPrimitive`].
+pub(crate) trait StableHloCustomLowering<V: TraceValue>: Send + Sync {
+    /// Lowers one custom primitive to StableHLO/Shardy operations.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        op: &CustomPrimitive<V>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
+}
+
+/// Typed StableHLO lowering extension stored inside one [`CustomPrimitive`].
+#[derive(Clone)]
+pub(crate) struct StableHloCustomLoweringExtension<V: TraceValue> {
+    lowering: std::sync::Arc<dyn StableHloCustomLowering<V>>,
+}
+
+impl<V: TraceValue> StableHloCustomLoweringExtension<V> {
+    /// Creates one StableHLO lowering extension from a registered lowering rule.
+    pub(crate) fn new(lowering: std::sync::Arc<dyn StableHloCustomLowering<V>>) -> Self {
+        Self { lowering }
+    }
+
+    /// Lowers one custom primitive through the registered StableHLO lowering rule.
+    pub(crate) fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        op: &CustomPrimitive<V>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        self.lowering.lower_to_mlir(op, input_values, output_types, lowerer)
     }
 }
 
@@ -1032,8 +1072,7 @@ where
     let mut mesh = existing;
     for equation in graph.equations() {
         if let PrimitiveOp::Custom(ref custom_op) = equation.op {
-            let any = custom_op.as_any();
-            if let Some(shard_map_op) = any.downcast_ref::<ShardMapOp<ShardMapTensor>>() {
+            if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
                     mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
                 } else {
@@ -1045,7 +1084,7 @@ where
                     });
                     mesh = collect_nested_sharding_mesh(shard_map_op.body().compiled.graph(), mesh)?;
                 }
-            } else if let Some(sharding_constraint_op) = any.downcast_ref::<WithShardingConstraintOp>() {
+            } else if let Some(sharding_constraint_op) = custom_op.extensions().get::<WithShardingConstraintOp>() {
                 mesh = Some(match mesh.take() {
                     Some(existing_mesh) => {
                         merge_logical_meshes(&existing_mesh, &sharding_constraint_op.sharding().mesh)?
@@ -2132,36 +2171,11 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         PrimitiveOp::VMap(vmap_op) => lowerer.lower_vmap(vmap_op, input_values),
         PrimitiveOp::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op, input_values),
-        PrimitiveOp::Custom(custom_op) => {
-            let any = custom_op.as_any();
-            if let Some(shard_map_op) = any.downcast_ref::<ShardMapOp<ShardMapTensor>>() {
-                if let Some(eval_mode) = shard_map_op.eval_mode() {
-                    return lowerer.lower_linear_shard_map_eval_mode(eval_mode, input_values);
-                }
-                let simplified_body = shard_map_op
-                    .body()
-                    .simplified()
-                    .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
-                return lowerer.lower_manual_computation(
-                    input_values,
-                    &simplified_body.shard_map,
-                    simplified_body.compiled.graph(),
-                    simplified_body.local_input_types.as_slice(),
-                    simplified_body.global_output_types.as_slice(),
-                );
-            }
-            if let Some(sharding_constraint_op) = any.downcast_ref::<WithShardingConstraintOp>() {
-                let operation = lowerer.block.append_operation(shardy::sharding_constraint(
-                    input_values[0],
-                    sharding_constraint_op.sharding().to_mlir(lowerer.location),
-                    lowerer.location,
-                ));
-                return Ok(vec![
-                    operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref(),
-                ]);
-            }
-            Err(LoweringError::UnsupportedOp { op: op.name().to_string() })
-        }
+        PrimitiveOp::Custom(custom_op) => custom_op
+            .extensions()
+            .get::<StableHloCustomLoweringExtension<ShardMapTensor>>()
+            .ok_or_else(|| LoweringError::MissingCustomLowering { op: op.name().to_string() })?
+            .lower_to_mlir(custom_op.as_ref(), input_values, output_types, lowerer),
     }
 }
 
@@ -2477,14 +2491,20 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     #[cfg(feature = "ndarray")]
     use ndarray::{Array2, arr2};
 
+    use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike};
+    use ryft_core::tracing_v2::{
+        CustomPrimitive, FloatExt, InterpretableOp, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
+        ZeroLike,
+    };
     use ryft_core::types::Shape;
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -2507,6 +2527,62 @@ mod tests {
         function_name: &str,
     ) -> Result<String, super::super::shard_map::ShardMapTraceError> {
         traced.to_mlir_module(function_name)
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestCustomLoweredOp;
+
+    impl std::fmt::Display for TestCustomLoweredOp {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "test_custom_lowered")
+        }
+    }
+
+    impl Op for TestCustomLoweredOp {
+        fn name(&self) -> &'static str {
+            "test_custom_lowered"
+        }
+
+        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![inputs[0].clone()])
+        }
+    }
+
+    impl InterpretableOp<ShardMapTensor> for TestCustomLoweredOp {
+        fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![inputs[0].clone()])
+        }
+    }
+
+    struct TestCustomLowering;
+
+    impl StableHloCustomLowering<ShardMapTensor> for TestCustomLowering {
+        fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+            &self,
+            _op: &CustomPrimitive<ShardMapTensor>,
+            input_values: &[ValueRef<'b, 'c, 't>],
+            _output_types: &[ArrayType],
+            lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
+        ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+            let operation = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
+            Ok(vec![operation.result(0).expect("stablehlo.negate should return one result").as_ref()])
+        }
+    }
+
+    fn custom_graph(
+        op: PrimitiveOp<ShardMapTensor>,
+    ) -> Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
+        let input_type = test_vector_type(4);
+        let mut builder = ProgramBuilder::<ShardMapTensor>::new();
+        let input = builder.add_input(&ShardMapTensor::new(input_type));
+        let output = builder.add_equation(op, vec![input]).unwrap()[0];
+        builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)
     }
 
     #[cfg(feature = "ndarray")]
@@ -2589,6 +2665,37 @@ mod tests {
                   }
                 }
             "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_graph_uses_registered_custom_lowering() {
+        let primitive = CustomPrimitive::new(TestCustomLoweredOp)
+            .with_extension(StableHloCustomLoweringExtension::new(Arc::new(TestCustomLowering)));
+        let graph = custom_graph(PrimitiveOp::Custom(Arc::new(primitive)));
+        let input_type = test_vector_type(4);
+
+        assert_eq!(
+            to_mlir_module_for_graph(&graph, &input_type, &input_type, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.negate %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_graph_reports_missing_custom_lowering() {
+        let graph = custom_graph(PrimitiveOp::Custom(Arc::new(CustomPrimitive::new(TestCustomLoweredOp))));
+        let input_type = test_vector_type(4);
+
+        assert_eq!(
+            to_mlir_module_for_graph(&graph, &input_type, &input_type, "main"),
+            Err(LoweringError::MissingCustomLowering { op: "test_custom_lowered".to_string() }),
         );
     }
 

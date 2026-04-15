@@ -175,11 +175,10 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for VMapOp<V> {
     fn transpose(
         &self,
-        builder: &mut crate::tracing_v2::ProgramBuilder<V>,
-        inputs: &[crate::tracing_v2::AtomId],
-        outputs: &[crate::tracing_v2::AtomId],
-        output_cotangents: &[crate::tracing_v2::AtomId],
-    ) -> Result<Vec<Option<crate::tracing_v2::AtomId>>, TraceError> {
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         if !self.has_transpose_body() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
@@ -202,13 +201,14 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Lin
             });
         }
         let transpose = self.transpose_op()?;
-        let output_abstracts = transpose.body().repeated_output_types();
-        let contributions = builder.add_equation_prevalidated(
+        Ok(LinearTerm::apply_staged_op(
+            output_cotangents,
             PrimitiveOp::VMap(Box::new(transpose)),
-            output_cotangents.to_vec(),
-            output_abstracts,
-        );
-        Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
+            self.body.total_input_count(),
+        )?
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>())
     }
 }
 

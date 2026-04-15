@@ -7,10 +7,10 @@
 //!
 //! ```text
 //! Op (shape-level, NOT generic over V)
-//! ├─ InterpretableOp<V>               — concrete execution on values of type V
-//! ├─ LinearOp<V>           — transpose rule for linear programs
-//! ├─ DifferentiableOp<V, T> — forward-mode JVP rule, generic over tangent type T
-//! └─ BatchOp<V>            — batching rule for vmap
+//! ├─ InterpretableOp<V>        — concrete execution on values of type V
+//! ├─ LinearOp<V>               — semantic reverse-mode transpose rule
+//! ├─ DifferentiableOp<V, T>    — forward-mode JVP rule, generic over tangent type T
+//! └─ VectorizableOp<V>         — batching rule for vmap
 //! ```
 //!
 //! [`Op`] is intentionally non-generic: `abstract_eval` and `name` operate on [`ArrayType`] metadata only.
@@ -18,14 +18,19 @@
 //! without requiring operation-specific value bounds.
 
 use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
     fmt::{Debug, Display},
     ops::{Add, Mul, Neg},
     sync::Arc,
 };
 
 use crate::tracing_v2::{
-    FloatExt, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, batch::Batch, forward::JvpTracer,
-    graph::AtomId, jit::JitTracer, linear::LinearTerm, program::ProgramBuilder,
+    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
+    batch::Batch,
+    forward::JvpTracer,
+    jit::JitTracer,
+    linear::{LinearTerm, Linearized},
 };
 use crate::types::{ArrayType, Typed};
 
@@ -66,15 +71,18 @@ pub trait InterpretableOp<V: TraceValue>: Op {
 }
 
 /// Operations that can appear in tangent/cotangent programs and support reverse-mode transposition.
+///
+/// The `inputs` and `outputs` are the representative concrete values recorded while staging the
+/// forward program. The `output_cotangents` are staged cotangents in the transpose program and can
+/// be transformed with existing [`LinearTerm`] helpers such as [`LinearTerm::apply_staged_op`].
 pub trait LinearOp<V: TraceValue>: Op {
     /// Applies the transpose rule for reverse-mode differentiation.
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError>;
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError>;
 }
 
 /// Forward-mode differentiation rule, generic over the tangent type `T`.
@@ -91,50 +99,211 @@ pub trait DifferentiableOp<V: TraceValue, T>: Op {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>;
 }
 
-/// Bundle of all capabilities required by the [`PrimitiveOp::Custom`] escape hatch.
-///
-/// This trait exists solely to give Rust a single name for `dyn` dispatch. It is automatically
-/// implemented for any type that satisfies the four underlying trait bounds — user code should
-/// never write `impl CustomOp<V>` directly.
-///
-/// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
-pub trait CustomOp<V: TraceValue>:
-    InterpretableOp<V>
-    + LinearOp<V>
-    + DifferentiableOp<V, LinearTerm<V>>
-    + InterpretableOp<Linearized<JitTracer<V>>>
-    + AsAny
-where
-    Linearized<JitTracer<V>>: TraceValue,
-{
+/// Primitive operation with a batching rule used by `vmap`.
+pub trait VectorizableOp<V: TraceValue>: Op {
+    /// Applies the primitive's batching rule to batched inputs.
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
 
-impl<
-    V: TraceValue,
-    T: 'static
-        + InterpretableOp<V>
-        + LinearOp<V>
-        + DifferentiableOp<V, LinearTerm<V>>
-        + InterpretableOp<Linearized<JitTracer<V>>>,
-> CustomOp<V> for T
-where
-    Linearized<JitTracer<V>>: TraceValue,
-{
+/// Typed extension registry carried by one [`CustomPrimitive`].
+#[derive(Clone, Default)]
+pub struct CustomPrimitiveExtensions {
+    entries: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
 }
 
-/// Upcasting helper for downcasting custom operations behind `dyn CustomOp<V>`.
+impl Debug for CustomPrimitiveExtensions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CustomPrimitiveExtensions").field("count", &self.entries.len()).finish()
+    }
+}
+
+impl CustomPrimitiveExtensions {
+    /// Inserts one typed extension into the registry, replacing any previous extension of the same type.
+    pub fn insert<T: Send + Sync + 'static>(&mut self, extension: T) {
+        self.entries.insert(TypeId::of::<T>(), Arc::new(extension));
+    }
+
+    /// Returns the registered extension of type `T`, if present.
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.entries.get(&TypeId::of::<T>()).and_then(|extension| extension.as_ref().downcast_ref::<T>())
+    }
+}
+
+trait CustomBaseOp<V: TraceValue>: Op + InterpretableOp<V> + Send + Sync {}
+
+impl<V: TraceValue, T: Op + InterpretableOp<V> + Send + Sync> CustomBaseOp<V> for T {}
+
+/// Rule-based registration object used by [`PrimitiveOp::Custom`].
 ///
-/// Automatically implemented for all `'static` types. Used by crate-external code (e.g., XLA
-/// lowering) that needs to recover the concrete type of a custom operation via
-/// [`Any::downcast_ref`](std::any::Any::downcast_ref).
-pub trait AsAny {
-    /// Returns `self` as a `&dyn Any` for downcasting.
-    fn as_any(&self) -> &dyn std::any::Any;
+/// The base op always supplies shape metadata and eager interpretation. Optional transform rules are
+/// registered using the existing tracing traits directly:
+///
+/// - [`LinearOp<V>`] for reverse-mode transpose,
+/// - [`DifferentiableOp<V, LinearTerm<V>>`] for forward-mode JVP,
+/// - [`VectorizableOp<V>`] for `vmap`, and
+/// - [`InterpretableOp<Linearized<JitTracer<V>>>`] for fully general linearized-JIT replay.
+#[derive(Clone)]
+pub struct CustomPrimitive<V: TraceValue> {
+    base: Arc<dyn CustomBaseOp<V>>,
+    transpose_rule: Option<Arc<dyn LinearOp<V> + Send + Sync>>,
+    jvp_rule: Option<Arc<dyn DifferentiableOp<V, LinearTerm<V>> + Send + Sync>>,
+    vectorization_rule: Option<Arc<dyn VectorizableOp<V> + Send + Sync>>,
+    linearized_jit_rule: Option<Arc<dyn InterpretableOp<Linearized<JitTracer<V>>> + Send + Sync>>,
+    extensions: CustomPrimitiveExtensions,
 }
 
-impl<T: 'static> AsAny for T {
-    fn as_any(&self) -> &dyn std::any::Any {
+impl<V: TraceValue> CustomPrimitive<V> {
+    /// Creates one custom primitive from its required base operation.
+    pub fn new<Base>(base: Base) -> Self
+    where
+        Base: Op + InterpretableOp<V> + Send + Sync + 'static,
+    {
+        Self {
+            base: Arc::new(base),
+            transpose_rule: None,
+            jvp_rule: None,
+            vectorization_rule: None,
+            linearized_jit_rule: None,
+            extensions: CustomPrimitiveExtensions::default(),
+        }
+    }
+
+    /// Registers one transpose rule for reverse-mode differentiation.
+    pub fn with_transpose_rule<Rule>(mut self, rule: Rule) -> Self
+    where
+        Rule: LinearOp<V> + Send + Sync + 'static,
+    {
+        self.transpose_rule = Some(Arc::new(rule));
         self
+    }
+
+    /// Registers one forward-mode JVP rule.
+    pub fn with_jvp_rule<Rule>(mut self, rule: Rule) -> Self
+    where
+        Rule: DifferentiableOp<V, LinearTerm<V>> + Send + Sync + 'static,
+    {
+        self.jvp_rule = Some(Arc::new(rule));
+        self
+    }
+
+    /// Registers one batching rule.
+    pub fn with_vectorization_rule<Rule>(mut self, rule: Rule) -> Self
+    where
+        Rule: VectorizableOp<V> + Send + Sync + 'static,
+    {
+        self.vectorization_rule = Some(Arc::new(rule));
+        self
+    }
+
+    /// Registers one linearized-JIT replay rule for nested custom primitives.
+    #[doc(hidden)]
+    pub fn with_linearized_jit_rule<Rule>(mut self, rule: Rule) -> Self
+    where
+        Rule: InterpretableOp<Linearized<JitTracer<V>>> + Send + Sync + 'static,
+        Linearized<JitTracer<V>>: TraceValue,
+    {
+        self.linearized_jit_rule = Some(Arc::new(rule));
+        self
+    }
+
+    /// Registers one typed extension.
+    pub fn with_extension<T: Send + Sync + 'static>(mut self, extension: T) -> Self {
+        self.extensions.insert(extension);
+        self
+    }
+
+    /// Returns the typed extension registry carried by this primitive.
+    #[inline]
+    pub fn extensions(&self) -> &CustomPrimitiveExtensions {
+        &self.extensions
+    }
+
+    fn missing_rule(&self, transform: &'static str) -> TraceError {
+        TraceError::MissingCustomRule { op: self.name(), transform }
+    }
+
+    fn jvp_rule(&self) -> Result<&(dyn DifferentiableOp<V, LinearTerm<V>> + Send + Sync), TraceError> {
+        self.jvp_rule.as_deref().ok_or_else(|| self.missing_rule("jvp"))
+    }
+}
+
+impl<V: TraceValue> Debug for CustomPrimitive<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self.base.as_ref(), formatter)
+    }
+}
+
+impl<V: TraceValue> Display for CustomPrimitive<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self.base.as_ref(), formatter)
+    }
+}
+
+impl<V: TraceValue> Op for CustomPrimitive<V> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        self.base.name()
+    }
+
+    #[inline]
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        self.base.abstract_eval(inputs)
+    }
+
+    #[inline]
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        is_zero_constant: &dyn Fn(usize) -> bool,
+        is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        self.base.try_simplify(inputs, is_zero_constant, is_one_constant)
+    }
+}
+
+impl<V: TraceValue> InterpretableOp<V> for CustomPrimitive<V> {
+    #[inline]
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        self.base.interpret(inputs)
+    }
+}
+
+impl<V: TraceValue> LinearOp<V> for CustomPrimitive<V> {
+    fn transpose(
+        &self,
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        self.transpose_rule.as_deref().ok_or_else(|| self.missing_rule("transpose"))?.transpose(
+            inputs,
+            outputs,
+            output_cotangents,
+        )
+    }
+}
+
+impl<V: TraceValue> VectorizableOp<V> for CustomPrimitive<V> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+        self.vectorization_rule.as_deref().ok_or_else(|| self.missing_rule("vectorize"))?.batch(inputs)
+    }
+}
+
+impl<V: TraceValue> DifferentiableOp<V, LinearTerm<V>> for CustomPrimitive<V> {
+    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        self.jvp_rule()?.jvp(inputs)
+    }
+}
+
+impl<V: TraceValue> InterpretableOp<Linearized<JitTracer<V>>> for CustomPrimitive<V>
+where
+    Linearized<JitTracer<V>>: TraceValue,
+{
+    fn interpret(&self, inputs: &[Linearized<JitTracer<V>>]) -> Result<Vec<Linearized<JitTracer<V>>>, TraceError> {
+        self.linearized_jit_rule
+            .as_deref()
+            .ok_or_else(|| self.missing_rule("linearized JIT replay"))?
+            .interpret(inputs)
     }
 }
 
@@ -188,17 +357,11 @@ pub enum PrimitiveOp<V: TraceValue> {
     Rematerialize(Box<crate::tracing_v2::operations::RematerializeOp<V>>),
 
     /// Escape hatch for user- or crate-defined operations outside `ryft-core`.
-    Custom(Arc<dyn CustomOp<V>>),
+    Custom(Arc<CustomPrimitive<V>>),
 }
 
 /// Canonical operation type used by the staged program IR.
 pub type PrimitiveOpRef<V> = PrimitiveOp<V>;
-
-/// Primitive operation with a batching rule used by `vmap`.
-pub(crate) trait BatchOp<V: TraceValue>: Op {
-    /// Applies the primitive's batching rule to batched inputs.
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
-}
 
 // ---------------------------------------------------------------------------
 // Arc forwarding impls
@@ -237,12 +400,11 @@ impl<T: LinearOp<V> + ?Sized, V: TraceValue> LinearOp<V> for Arc<T> {
     #[inline]
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
-        (**self).transpose(builder, inputs, outputs, output_cotangents)
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        (**self).transpose(inputs, outputs, output_cotangents)
     }
 }
 
@@ -253,7 +415,7 @@ impl<T: DifferentiableOp<V, U> + ?Sized, V: TraceValue, U> DifferentiableOp<V, U
     }
 }
 
-impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
+impl<T: VectorizableOp<V> + ?Sized, V: TraceValue> VectorizableOp<V> for Arc<T> {
     #[inline]
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         (**self).batch(inputs)
@@ -261,7 +423,7 @@ impl<T: BatchOp<V> + ?Sized, V: TraceValue> BatchOp<V> for Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
-// PrimitiveOp — Debug, Display, Op, InterpretableOp, LinearOp, DifferentiableOp, BatchOp
+// PrimitiveOp — Debug, Display, Op, InterpretableOp, LinearOp, DifferentiableOp, VectorizableOp
 // ---------------------------------------------------------------------------
 
 use crate::tracing_v2::operations::{
@@ -401,7 +563,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
             }
             Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Custom(op) => InterpretableOp::<V>::interpret(op.as_ref(), inputs),
+            Self::Custom(op) => op.interpret(inputs),
         }
     }
 }
@@ -411,39 +573,32 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         match self {
-            Self::Add => AddOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::Mul => MulOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::Neg => NegOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::Sin => SinOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::Cos => CosOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::MatMul => MatMulOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::MatrixTranspose => MatrixTransposeOp.transpose(builder, inputs, outputs, output_cotangents),
-            Self::LinearMatrixTranspose => {
-                LinearMatrixTransposeOp.transpose(builder, inputs, outputs, output_cotangents)
-            }
-            Self::Scale { factor } => {
-                ScaleOp::new(factor.clone()).transpose(builder, inputs, outputs, output_cotangents)
-            }
+            Self::Add => AddOp.transpose(inputs, outputs, output_cotangents),
+            Self::Mul => MulOp.transpose(inputs, outputs, output_cotangents),
+            Self::Neg => NegOp.transpose(inputs, outputs, output_cotangents),
+            Self::Sin => SinOp.transpose(inputs, outputs, output_cotangents),
+            Self::Cos => CosOp.transpose(inputs, outputs, output_cotangents),
+            Self::MatMul => MatMulOp.transpose(inputs, outputs, output_cotangents),
+            Self::MatrixTranspose => MatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents),
             Self::LeftMatMul { factor } => {
-                LeftMatMulOp::new(factor.clone()).transpose(builder, inputs, outputs, output_cotangents)
+                LeftMatMulOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents)
             }
             Self::RightMatMul { factor } => {
-                RightMatMulOp::new(factor.clone()).transpose(builder, inputs, outputs, output_cotangents)
+                RightMatMulOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents)
             }
-            Self::Reshape { input_type, output_type } => ReshapeOp::new(input_type.clone(), output_type.clone())
-                .transpose(builder, inputs, outputs, output_cotangents),
-            Self::VMap(_) => Err(TraceError::HigherOrderOpFailure {
-                op: "transpose_linear_program",
-                message: "vmap transpose rule requires concrete leaf values; use the replay path instead".to_string(),
-            }),
-            Self::Rematerialize(remat) => remat.transpose(builder, inputs, outputs, output_cotangents),
-            Self::Custom(op) => op.transpose(builder, inputs, outputs, output_cotangents),
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOp::new(input_type.clone(), output_type.clone()).transpose(inputs, outputs, output_cotangents)
+            }
+            Self::VMap(vmap) => vmap.transpose(inputs, outputs, output_cotangents),
+            Self::Rematerialize(remat) => remat.transpose(inputs, outputs, output_cotangents),
+            Self::Custom(op) => op.transpose(inputs, outputs, output_cotangents),
         }
     }
 }
@@ -494,9 +649,7 @@ impl<
             }
             Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Custom(op) => {
-                InterpretableOp::<crate::tracing_v2::linear::Linearized<JitTracer<V>>>::interpret(op.as_ref(), inputs)
-            }
+            Self::Custom(op) => op.interpret(inputs),
         }
     }
 }
@@ -530,12 +683,12 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
             Self::Rematerialize(remat) => DifferentiableOp::<V, LinearTerm<V>>::jvp(remat.as_ref(), inputs),
-            Self::Custom(op) => DifferentiableOp::<V, LinearTerm<V>>::jvp(op.as_ref(), inputs),
+            Self::Custom(op) => op.jvp(inputs),
         }
     }
 }
 
-impl<V: TraceValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + FloatExt + MatrixOps> BatchOp<V>
+impl<V: TraceValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + FloatExt + MatrixOps> VectorizableOp<V>
     for PrimitiveOp<V>
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
@@ -547,10 +700,300 @@ impl<V: TraceValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Float
             Self::Cos => CosOp.batch(inputs),
             Self::MatMul => MatMulOp.batch(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.batch(inputs),
+            Self::Custom(op) => op.batch(inputs),
             _ => Err(TraceError::HigherOrderOpFailure {
-                op: "batch",
-                message: format!("batching rule for staged op '{}' is not implemented", self.name()),
+                op: "vectorize",
+                message: format!("vectorization rule for staged op '{}' is not implemented", self.name()),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    use pretty_assertions::assert_eq;
+
+    use crate::tracing_v2::{Batch, CompiledFunction, ProgramBuilder, TraceError, grad, jvp, try_jit, vmap};
+    use crate::types::{ArrayType, DataType, Shape};
+
+    use super::*;
+
+    /// Simple unary custom op used to exercise the rule-based custom primitive API.
+    #[derive(Clone, Debug)]
+    struct ShiftOp {
+        amount: f64,
+    }
+
+    impl ShiftOp {
+        /// Creates one shift op with the provided additive amount.
+        fn new(amount: f64) -> Self {
+            Self { amount }
+        }
+    }
+
+    impl Display for ShiftOp {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "test_shift")
+        }
+    }
+
+    impl Op for ShiftOp {
+        fn name(&self) -> &'static str {
+            "test_shift"
+        }
+
+        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![inputs[0].clone()])
+        }
+    }
+
+    impl InterpretableOp<f64> for ShiftOp {
+        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![inputs[0] + self.amount])
+        }
+    }
+
+    impl LinearOp<f64> for ShiftOp {
+        fn transpose(
+            &self,
+            inputs: &[f64],
+            outputs: &[f64],
+            output_cotangents: &[LinearTerm<f64>],
+        ) -> Result<Vec<Option<LinearTerm<f64>>>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            if outputs.len() != 1 {
+                return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+            }
+            if output_cotangents.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+            }
+            Ok(vec![Some(output_cotangents[0].clone())])
+        }
+    }
+
+    impl DifferentiableOp<f64, LinearTerm<f64>> for ShiftOp {
+        fn jvp(
+            &self,
+            inputs: &[JvpTracer<f64, LinearTerm<f64>>],
+        ) -> Result<Vec<JvpTracer<f64, LinearTerm<f64>>>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![JvpTracer { primal: inputs[0].primal + self.amount, tangent: inputs[0].tangent.clone() }])
+        }
+    }
+
+    impl VectorizableOp<f64> for ShiftOp {
+        fn batch(&self, inputs: &[Batch<f64>]) -> Result<Vec<Batch<f64>>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![Batch::new(inputs[0].lanes().iter().map(|lane| lane + self.amount).collect::<Vec<_>>())])
+        }
+    }
+
+    impl InterpretableOp<Linearized<JitTracer<f64>>> for ShiftOp {
+        fn interpret(
+            &self,
+            inputs: &[Linearized<JitTracer<f64>>],
+        ) -> Result<Vec<Linearized<JitTracer<f64>>>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            let primal =
+                apply_custom_traced_unary(inputs[0].primal.clone(), CustomPrimitive::<f64>::new(self.clone()))?;
+            Ok(vec![Linearized { primal, tangent: inputs[0].tangent.clone() }])
+        }
+    }
+
+    /// Applies one unary custom primitive to one traced scalar.
+    fn apply_custom_traced_unary(
+        input: JitTracer<f64>,
+        primitive: CustomPrimitive<f64>,
+    ) -> Result<JitTracer<f64>, TraceError> {
+        let output_values = primitive.interpret(std::slice::from_ref(&input.value))?;
+        Ok(JitTracer::apply_staged_op(
+            std::slice::from_ref(&input),
+            PrimitiveOp::Custom(Arc::new(primitive)),
+            output_values,
+        )?
+        .into_iter()
+        .next()
+        .expect("unary custom primitive should produce one output"))
+    }
+
+    /// Applies one unary custom primitive to one traced scalar and expects staging to succeed.
+    fn stage_custom_traced_unary(input: JitTracer<f64>, primitive: CustomPrimitive<f64>) -> JitTracer<f64> {
+        apply_custom_traced_unary(input, primitive).expect("custom primitive staging should succeed")
+    }
+
+    /// Applies one unary custom primitive to one batched scalar.
+    fn apply_custom_batched_unary(
+        input: Batch<f64>,
+        primitive: CustomPrimitive<f64>,
+    ) -> Result<Batch<f64>, TraceError> {
+        Ok(VectorizableOp::batch(&PrimitiveOp::Custom(Arc::new(primitive)), &[input])?
+            .into_iter()
+            .next()
+            .expect("unary custom primitive should produce one batched output"))
+    }
+
+    /// Returns one scalar array type used by these custom-primitive tests.
+    fn scalar_type() -> ArrayType {
+        ArrayType::new(DataType::F64, Shape::scalar(), None, None).expect("scalar array types should be valid")
+    }
+
+    #[test]
+    fn test_custom_primitive_base_execution_replays_without_optional_rules() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0));
+        let (output, compiled): (f64, CompiledFunction<f64, f64, f64>) = try_jit(
+            {
+                let primitive = primitive.clone();
+                move |x: JitTracer<f64>| Ok(stage_custom_traced_unary(x, primitive.clone()))
+            },
+            3.0f64,
+        )
+        .unwrap();
+
+        assert_eq!(output, 5.0);
+        assert_eq!(compiled.call(4.0f64), Ok(6.0));
+    }
+
+    #[test]
+    fn test_custom_primitive_missing_transpose_rule_reports_targeted_error() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
+        let cotangent_atom = builder.borrow_mut().add_input(&0.0);
+        let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder);
+
+        assert!(matches!(
+            primitive.transpose(&[3.0f64], &[5.0f64], &[cotangent]),
+            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "transpose" })
+        ));
+    }
+
+    #[test]
+    fn test_custom_primitive_missing_jvp_rule_reports_targeted_error() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0));
+        let result: Result<(f64, f64), TraceError> = jvp(
+            {
+                let primitive = primitive.clone();
+                move |x: JitTracer<f64>| stage_custom_traced_unary(x, primitive.clone())
+            },
+            3.0f64,
+            1.0f64,
+        );
+
+        assert_eq!(result, Err(TraceError::MissingCustomRule { op: "test_shift", transform: "jvp" }),);
+    }
+
+    #[test]
+    fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
+        let result: Result<(f64, CompiledFunction<f64, f64, f64>), TraceError> = try_jit(
+            {
+                let primitive = primitive.clone();
+                move |x: JitTracer<f64>| {
+                    let (primal, tangent) = jvp(
+                        {
+                            let primitive = primitive.clone();
+                            move |inner: JitTracer<f64>| stage_custom_traced_unary(inner, primitive.clone())
+                        },
+                        x.clone(),
+                        x.one_like(),
+                    )?;
+                    Ok(primal + tangent)
+                }
+            },
+            3.0f64,
+        );
+
+        assert!(matches!(
+            result,
+            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "linearized JIT replay" })
+        ));
+    }
+
+    #[test]
+    fn test_custom_primitive_jvp_rule_participates_in_grad_and_linearized_jit_replay() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0))
+            .with_jvp_rule(ShiftOp::new(2.0))
+            .with_linearized_jit_rule(ShiftOp::new(2.0));
+
+        assert_eq!(
+            grad(
+                {
+                    let primitive = primitive.clone();
+                    move |x: JitTracer<f64>| stage_custom_traced_unary(x, primitive.clone())
+                },
+                3.0f64,
+            ),
+            Ok(1.0f64),
+        );
+
+        let (output, compiled): (f64, CompiledFunction<f64, f64, f64>) = try_jit(
+            {
+                let primitive = primitive.clone();
+                move |x: JitTracer<f64>| {
+                    let (primal, tangent) = jvp(
+                        {
+                            let primitive = primitive.clone();
+                            move |inner: JitTracer<f64>| stage_custom_traced_unary(inner, primitive.clone())
+                        },
+                        x.clone(),
+                        x.one_like(),
+                    )?;
+                    Ok(primal + tangent)
+                }
+            },
+            3.0f64,
+        )
+        .unwrap();
+
+        assert_eq!(output, 6.0);
+        assert_eq!(compiled.call(4.0f64), Ok(7.0));
+    }
+
+    #[test]
+    fn test_custom_primitive_batch_rule_reports_targeted_error_when_missing() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0));
+
+        assert_eq!(
+            apply_custom_batched_unary(Batch::new(vec![1.0f64, 2.0]), primitive),
+            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "vectorize" }),
+        );
+    }
+
+    #[test]
+    fn test_custom_primitive_batch_rule_participates_in_vmap() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0)).with_vectorization_rule(ShiftOp::new(2.0));
+
+        assert_eq!(
+            vmap(
+                {
+                    let primitive = primitive.clone();
+                    move |batch: Batch<f64>| apply_custom_batched_unary(batch, primitive.clone()).unwrap()
+                },
+                vec![1.0f64, 2.0, 3.0],
+            ),
+            Ok(vec![3.0f64, 4.0, 5.0]),
+        );
+    }
+
+    #[test]
+    fn test_custom_primitive_abstract_eval_uses_the_registered_base_op() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0));
+
+        assert_eq!(primitive.abstract_eval(&[scalar_type()]), Ok(vec![scalar_type()]));
     }
 }

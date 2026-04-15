@@ -208,9 +208,46 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display f
     }
 }
 
+/// Applies one primitive's semantic transpose rule while transposing a staged linear program.
+///
+/// [`LinearOp::transpose`] is intentionally expressed in semantic terms: representative primal
+/// inputs and outputs of type `V`, plus staged output cotangents as [`LinearTerm<V>`]. The
+/// transpose pass, however, walks the already-built forward graph in terms of atom ids. This
+/// helper bridges those two views by reconstructing the primitive's representative primals from the
+/// original graph and wrapping the transpose builder's cotangent atoms as [`LinearTerm<V>`].
+///
+/// The `representative_values` slice is the per-atom exemplar data returned by
+/// `graph.representative_atom_values()` for the original forward graph. It is indexed by the
+/// forward graph's atom ids, not by atoms in the transpose builder. The values are not re-executed
+/// or differentiated here. They serve as concrete witnesses for the staged atoms so semantic
+/// transpose rules can recover any primal-dependent information they need, such as shapes,
+/// dimensions, broadcast structure, or stored scalar/matrix factors.
+///
+/// Without this slice, reverse-mode transposition would have to expose the internal
+/// `ProgramBuilder<V>` / `AtomId` API directly to every primitive transpose implementation. Keeping
+/// the representative values here lets [`LinearOp`] stay at the right abstraction level while the
+/// transpose pass remains responsible for adapting between graph atoms and semantic rule inputs.
+///
+/// The returned atom ids are staged cotangent contributions in the transpose builder, aligned with
+/// `inputs`.
+///
+/// # Parameters
+///   - `op`: primitive whose transpose rule should be applied.
+///   - `representative_values`: concrete exemplar value for every atom in the original forward
+///     graph, indexed by forward-graph atom id. Used to reconstruct the primitive's primal inputs
+///     and outputs for semantic transpose dispatch.
+///   - `builder`: transpose-program builder that owns the staged cotangent atoms created while
+///     constructing the pullback program.
+///   - `inputs`: forward-graph atom ids for the primitive inputs whose cotangent contributions this
+///     helper returns.
+///   - `outputs`: forward-graph atom ids for the primitive outputs, used to reconstruct the
+///     representative output values expected by [`LinearOp::transpose`].
+///   - `output_cotangents`: transpose-builder atom ids for the already-staged cotangents of
+///     `outputs`.
 fn transpose<V>(
     op: &PrimitiveOp<V>,
-    builder: &mut ProgramBuilder<V>,
+    representative_values: &[V],
+    builder: &Rc<RefCell<ProgramBuilder<V>>>,
     inputs: &[AtomId],
     outputs: &[AtomId],
     output_cotangents: &[AtomId],
@@ -226,7 +263,17 @@ where
         + Mul<Output = V>
         + Neg<Output = V>,
 {
-    LinearOp::transpose(op, builder, inputs, outputs, output_cotangents)
+    let input_values = inputs.iter().map(|input| representative_values[*input].clone()).collect::<Vec<_>>();
+    let output_values = outputs.iter().map(|output| representative_values[*output].clone()).collect::<Vec<_>>();
+    let cotangent_terms = output_cotangents
+        .iter()
+        .map(|cotangent| LinearTerm::from_staged_parts(*cotangent, builder.clone()))
+        .collect::<Vec<_>>();
+    Ok(op
+        .transpose(input_values.as_slice(), output_values.as_slice(), cotangent_terms.as_slice())?
+        .into_iter()
+        .map(|term| term.map(|term| term.atom()))
+        .collect::<Vec<_>>())
 }
 
 pub fn linearize_program<V, Input, Output>(
@@ -347,7 +394,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
     fn accumulate<V>(
-        builder: &mut ProgramBuilder<V>,
+        builder: &Rc<RefCell<ProgramBuilder<V>>>,
         adjoints: &mut [Option<AtomId>],
         atom: AtomId,
         contribution: AtomId,
@@ -357,9 +404,14 @@ where
     {
         adjoints[atom] = Some(match adjoints[atom] {
             Some(existing) => {
-                let abstract_value = builder.atom(existing).expect("adjoint atom should exist").abstract_value.clone();
-                builder.add_equation_prevalidated(PrimitiveOp::Add, vec![existing, contribution], vec![abstract_value])
-                    [0]
+                let mut builder_borrow = builder.borrow_mut();
+                let abstract_value =
+                    builder_borrow.atom(existing).expect("adjoint atom should exist").abstract_value.clone();
+                builder_borrow.add_equation_prevalidated(
+                    PrimitiveOp::Add,
+                    vec![existing, contribution],
+                    vec![abstract_value],
+                )[0]
             }
             None => contribution,
         });
@@ -368,18 +420,20 @@ where
 
     let graph = program.program.graph();
     let representative_values = graph.representative_atom_values()?;
-    let mut builder = ProgramBuilder::<V>::new();
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<V>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
     for output in graph.outputs() {
         let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
         output_cotangent_inputs.push(
-            builder.add_input_abstract(output_atom.abstract_value.clone(), representative_values[*output].zero_like()),
+            builder
+                .borrow_mut()
+                .add_input_abstract(output_atom.abstract_value.clone(), representative_values[*output].zero_like()),
         );
     }
 
     let mut adjoints = vec![None; graph.atom_count()];
     for (cotangent, output) in output_cotangent_inputs.into_iter().zip(graph.outputs().iter().copied()) {
-        accumulate(&mut builder, adjoints.as_mut_slice(), output, cotangent)?;
+        accumulate(&builder, adjoints.as_mut_slice(), output, cotangent)?;
     }
 
     for equation in graph.equations().iter().rev() {
@@ -390,25 +444,34 @@ where
         };
         let input_cotangents = transpose(
             &equation.op,
-            &mut builder,
+            representative_values.as_slice(),
+            &builder,
             equation.inputs.as_slice(),
             equation.outputs.as_slice(),
             equation_output_cotangents.as_slice(),
         )?;
         for (input, contribution) in equation.inputs.iter().copied().zip(input_cotangents) {
             if let Some(contribution) = contribution {
-                accumulate(&mut builder, adjoints.as_mut_slice(), input, contribution)?;
+                accumulate(&builder, adjoints.as_mut_slice(), input, contribution)?;
             }
         }
     }
 
-    let zero_atom = builder.add_constant(program.zero.clone());
+    let zero_atom = builder.borrow_mut().add_constant(program.zero.clone());
     let outputs = graph
         .input_atoms()
         .iter()
         .copied()
         .map(|input| adjoints[input].unwrap_or(zero_atom))
         .collect::<Vec<_>>();
+    let builder = match Rc::try_unwrap(builder) {
+        Ok(builder) => builder.into_inner(),
+        Err(_) => {
+            return Err(TraceError::InternalInvariantViolation(
+                "transpose builder should not have outstanding linear terms",
+            ));
+        }
+    };
     Ok(LinearProgram {
         program: Program::from_graph(builder.build::<Output, Input>(
             outputs,

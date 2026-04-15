@@ -9,9 +9,8 @@ use crate::tracing_v2::{
     TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    graph::AtomId,
-    ops::{BatchOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
-    program::ProgramBuilder,
+    linear::LinearTerm,
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -62,22 +61,14 @@ impl<V: TraceValue + Neg<Output = V>> InterpretableOp<V> for NegOp {
 impl<V: TraceValue + Neg<Output = V> + ZeroLike> LinearOp<V> for NegOp {
     fn transpose(
         &self,
-        builder: &mut ProgramBuilder<V>,
-        inputs: &[AtomId],
-        outputs: &[AtomId],
-        output_cotangents: &[AtomId],
-    ) -> Result<Vec<Option<AtomId>>, TraceError> {
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
-        let abstract_value = builder
-            .atom(output_cotangents[0])
-            .expect("output cotangent atom should exist")
-            .abstract_value
-            .clone();
-        let contribution =
-            builder.add_equation_prevalidated(PrimitiveOp::Neg, vec![output_cotangents[0]], vec![abstract_value])[0];
-        Ok(vec![Some(contribution)])
+        Ok(vec![Some(output_cotangents[0].clone().neg())])
     }
 }
 
@@ -88,7 +79,7 @@ impl<V: TraceValue + Neg<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T>
     }
 }
 
-impl<V: TraceValue + Neg<Output = V>> BatchOp<V> for NegOp {
+impl<V: TraceValue + Neg<Output = V>> VectorizableOp<V> for NegOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| -lane).collect())])

@@ -42,7 +42,10 @@ pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
-pub use ops::{AsAny, CustomOp, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp};
+pub use ops::{
+    CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp,
+    VectorizableOp,
+};
 pub use program::Program;
 pub use program::{ProgramBuilder, ProgramOpRef};
 pub use value::{ConcreteTraceValue, FloatExt, OneLike, TraceValue, ZeroLike};
@@ -81,6 +84,10 @@ pub enum TraceError {
     /// Abstract evaluation detected incompatible operand metadata for a primitive application.
     #[error("incompatible abstract values while tracing operation '{op}'")]
     IncompatibleAbstractValues { op: &'static str },
+
+    /// A custom primitive was used by a transform without registering the required rule.
+    #[error("custom primitive '{op}' does not provide a '{transform}' rule")]
+    MissingCustomRule { op: &'static str, transform: &'static str },
 
     /// An internal tracing invariant was violated while constructing or replaying a program.
     #[error("{0}")]
