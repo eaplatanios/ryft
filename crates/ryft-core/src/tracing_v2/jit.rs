@@ -17,7 +17,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
+        FloatExt, InterpretableOp, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         graph::AtomId,
         operations::reshape::ReshapeOps,
         ops::PrimitiveOp,
@@ -215,8 +215,13 @@ impl<V: TraceValue + FloatExt> FloatExt for JitTracer<V> {
 /// In the current prototype this type stores only the staged graph and replays it with the built-in interpreter.
 /// Later, once a concrete backend exists, it can grow additional fields that hold backend-specific compiled artifacts
 /// while keeping the same high-level API shape.
-pub struct CompiledFunction<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
-    program: Program<V, Input, Output>,
+pub struct CompiledFunction<
+    V: TraceValue,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+    O: Clone = ProgramOpRef<V>,
+> {
+    program: Program<V, Input, Output, O>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
@@ -224,39 +229,41 @@ impl<
     V: TraceValue,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-> Clone for CompiledFunction<V, Input, Output>
+    O: Clone,
+> Clone for CompiledFunction<V, Input, Output, O>
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), marker: PhantomData }
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledFunction<V, Input, Output> {
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> CompiledFunction<V, Input, Output, O> {
     #[inline]
-    pub fn from_graph(graph: crate::tracing_v2::Graph<ProgramOpRef<V>, V, Input, Output>) -> Self {
+    pub fn from_graph(graph: crate::tracing_v2::Graph<O, V, Input, Output>) -> Self {
         Self::from_program(Program::from_graph(graph))
     }
 
     #[inline]
-    pub fn from_program(program: Program<V, Input, Output>) -> Self {
+    pub fn from_program(program: Program<V, Input, Output, O>) -> Self {
         Self { program, marker: PhantomData }
     }
 
     /// Returns the staged graph backing this compiled function.
     #[inline]
-    pub fn graph(&self) -> &crate::tracing_v2::Graph<ProgramOpRef<V>, V, Input, Output> {
+    pub fn graph(&self) -> &crate::tracing_v2::Graph<O, V, Input, Output> {
         self.program.graph()
     }
 
     /// Returns the staged program backing this compiled function.
     #[inline]
-    pub fn program(&self) -> &Program<V, Input, Output> {
+    pub fn program(&self) -> &Program<V, Input, Output, O> {
         &self.program
     }
 
     /// Replays the staged graph on concrete input values.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
+        O: InterpretableOp<V>,
         V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
@@ -265,7 +272,9 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> CompiledF
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display for CompiledFunction<V, Input, Output> {
+impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
+    for CompiledFunction<V, Input, Output, O>
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)
     }

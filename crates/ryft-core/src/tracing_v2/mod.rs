@@ -43,11 +43,11 @@ pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use ops::{
-    CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp,
-    VectorizableOp,
+    CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive, LinearOp,
+    LinearPrimitiveOp, Op, PrimitiveOp, VectorizableOp,
 };
 pub use program::Program;
-pub use program::{ProgramBuilder, ProgramOpRef};
+pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};
 pub use value::{ConcreteTraceValue, FloatExt, OneLike, TraceValue, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.

@@ -137,7 +137,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::{parameters::Placeholder, tracing_v2::ProgramBuilder};
+    use crate::{parameters::Placeholder, tracing_v2::LinearProgramBuilder};
 
     use super::*;
 
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
+        let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ScaleOp::new(3.0f64)

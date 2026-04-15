@@ -8,7 +8,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, VectorizableOp},
 };
 use crate::types::{ArrayType, Typed};
 
@@ -96,7 +96,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
                 std::slice::from_ref(&output_cotangents[0]),
-                PrimitiveOp::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
+                LinearPrimitiveOp::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
                 1,
             )?
             .into_iter()

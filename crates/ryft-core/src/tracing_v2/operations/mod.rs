@@ -96,12 +96,12 @@ pub use matmul::MatMulOp;
 pub use matrix_transpose::MatrixTransposeOp;
 pub use mul::MulOp;
 pub use neg::NegOp;
-pub use rematerialize::{FlatTracedRematerialize, RematerializeOp};
+pub use rematerialize::{FlatTracedRematerialize, LinearRematerializeOp, RematerializeOp};
 pub use reshape::ReshapeOp;
 pub use right_matmul::RightMatMulOp;
 pub use scale::ScaleOp;
 pub use sin::SinOp;
-pub use vmap::{FlatTracedVMap, VMapOp};
+pub use vmap::{FlatTracedVMap, LinearVMapOp, VMapOp};
 
 /// Returns an input-count error when one staged op receives the wrong arity.
 pub fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {

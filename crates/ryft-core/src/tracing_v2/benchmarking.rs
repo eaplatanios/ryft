@@ -4,14 +4,14 @@
 //! normalized structural summaries that can be compared against external MLIR producers such as
 //! JAX StableHLO lowering.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Display};
 
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::parameters::Parameterized;
 
-use super::{AtomSource, Graph, Op, ProgramOpRef, TraceError, TraceValue};
+use super::{AtomSource, Graph, Op, TraceError, TraceValue};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -219,15 +219,16 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
 ///   - `graph`: Graph to summarize.
 ///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
 ///     staged op.
-pub fn summarize_graph<V, Input, Output, F>(
-    graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
+pub fn summarize_graph<V, Input, Output, O, F>(
+    graph: &Graph<O, V, Input, Output>,
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
     V: TraceValue,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    F: Fn(&ProgramOpRef<V>) -> Result<Vec<IrNestedRegionSummary>, BenchmarkError>,
+    O: Clone + Display + Op,
+    F: Fn(&O) -> Result<Vec<IrNestedRegionSummary>, BenchmarkError>,
 {
     let mut op_histogram = BTreeMap::new();
     let mut nested_regions = Vec::new();

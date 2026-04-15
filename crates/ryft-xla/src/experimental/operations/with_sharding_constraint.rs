@@ -7,7 +7,8 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOp, PrimitiveOp, TraceError, VectorizableOp,
+    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp, PrimitiveOp,
+    TraceError, VectorizableOp,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
     operations::{expect_input_count, unary_abstract},
@@ -125,7 +126,7 @@ impl LinearOp<ShardMapTensor> for WithShardingConstraintOp {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
-            PrimitiveOp::Custom(Arc::new(self.to_tensor_custom_primitive())),
+            LinearPrimitiveOp::custom(self.to_tensor_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -143,7 +144,7 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for WithShardi
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
-            PrimitiveOp::Custom(Arc::new(self.to_tensor_custom_primitive())),
+            LinearPrimitiveOp::custom(self.to_tensor_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -167,7 +168,7 @@ impl InterpretableOp<Linearized<ShardMapTracer>> for WithShardingConstraintOp {
         .expect("sharding constraint should produce one primal output");
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&input.tangent),
-            PrimitiveOp::Custom(Arc::new(self.to_tracer_custom_primitive())),
+            LinearPrimitiveOp::custom(self.to_tracer_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -196,7 +197,7 @@ impl LinearOp<ShardMapTracer> for WithShardingConstraintOp {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
-            PrimitiveOp::Custom(Arc::new(self.to_tracer_custom_primitive())),
+            LinearPrimitiveOp::custom(self.to_tracer_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -214,7 +215,7 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for WithShardi
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
-            PrimitiveOp::Custom(Arc::new(self.to_tracer_custom_primitive())),
+            LinearPrimitiveOp::custom(self.to_tracer_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -273,7 +274,7 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{LinearOp, LinearTerm, ProgramBuilder};
+    use ryft_core::tracing_v2::{LinearOp, LinearProgramBuilder, LinearTerm};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -413,7 +414,7 @@ mod tests {
         let input_value = ShardMapTensor::new(input_type.clone());
         let output_value = input_value.clone();
 
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<ShardMapTensor>::new()));
+        let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ShardMapTensor>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&ShardMapTensor::new(input_type));
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = LinearOp::transpose(

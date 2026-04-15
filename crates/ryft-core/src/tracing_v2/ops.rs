@@ -218,6 +218,16 @@ impl<V: TraceValue> CustomPrimitive<V> {
         &self.extensions
     }
 
+    /// Returns one linear-only wrapper for this primitive after verifying that it provides a transpose rule.
+    pub fn into_linear(self) -> Result<LinearCustomPrimitive<V>, TraceError> {
+        LinearCustomPrimitive::from_custom_primitive(Arc::new(self))
+    }
+
+    /// Clones this primitive into one linear-only wrapper after verifying that it provides a transpose rule.
+    pub fn to_linear(&self) -> Result<LinearCustomPrimitive<V>, TraceError> {
+        self.clone().into_linear()
+    }
+
     fn missing_rule(&self, transform: &'static str) -> TraceError {
         TraceError::MissingCustomRule { op: self.name(), transform }
     }
@@ -307,6 +317,82 @@ where
     }
 }
 
+/// Linear-only wrapper around one [`CustomPrimitive`] that guarantees a transpose rule is present.
+#[derive(Clone)]
+pub struct LinearCustomPrimitive<V: TraceValue> {
+    primitive: Arc<CustomPrimitive<V>>,
+}
+
+impl<V: TraceValue> LinearCustomPrimitive<V> {
+    /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
+    pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<V>>) -> Result<Self, TraceError> {
+        primitive.transpose_rule.as_ref().ok_or_else(|| primitive.missing_rule("transpose"))?;
+        Ok(Self { primitive })
+    }
+
+    /// Returns the wrapped custom primitive.
+    #[inline]
+    pub fn primitive(&self) -> &Arc<CustomPrimitive<V>> {
+        &self.primitive
+    }
+}
+
+impl<V: TraceValue> Debug for LinearCustomPrimitive<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self.primitive.as_ref(), formatter)
+    }
+}
+
+impl<V: TraceValue> Display for LinearCustomPrimitive<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self.primitive.as_ref(), formatter)
+    }
+}
+
+impl<V: TraceValue> Op for LinearCustomPrimitive<V> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        self.primitive.name()
+    }
+
+    #[inline]
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        self.primitive.abstract_eval(inputs)
+    }
+
+    #[inline]
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        is_zero_constant: &dyn Fn(usize) -> bool,
+        is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        self.primitive.try_simplify(inputs, is_zero_constant, is_one_constant)
+    }
+}
+
+impl<V: TraceValue> InterpretableOp<V> for LinearCustomPrimitive<V> {
+    #[inline]
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        self.primitive.interpret(inputs)
+    }
+}
+
+impl<V: TraceValue> LinearOp<V> for LinearCustomPrimitive<V> {
+    fn transpose(
+        &self,
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        self.primitive
+            .transpose_rule
+            .as_deref()
+            .expect("linear custom primitives must carry a transpose rule")
+            .transpose(inputs, outputs, output_cotangents)
+    }
+}
+
 /// Closed set of built-in staged operations.
 ///
 /// Every known primitive is a zero-cost enum variant. Operations originating outside
@@ -362,6 +448,55 @@ pub enum PrimitiveOp<V: TraceValue> {
 
 /// Canonical operation type used by the staged program IR.
 pub type PrimitiveOpRef<V> = PrimitiveOp<V>;
+
+/// Closed set of operations that may appear in staged linear programs.
+#[derive(Clone)]
+pub enum LinearPrimitiveOp<V: TraceValue> {
+    /// Elementwise addition.
+    Add,
+
+    /// Elementwise negation.
+    Neg,
+
+    /// Matrix transposition.
+    MatrixTranspose,
+
+    /// Linear matrix transposition used in cotangent programs.
+    LinearMatrixTranspose,
+
+    /// Scalar or tensor scaling by a captured factor.
+    Scale { factor: V },
+
+    /// Left matrix multiplication by a captured factor: `factor @ input`.
+    LeftMatMul { factor: V },
+
+    /// Right matrix multiplication by a captured factor: `input @ factor`.
+    RightMatMul { factor: V },
+
+    /// Reshape between two statically known shapes.
+    Reshape { input_type: ArrayType, output_type: ArrayType },
+
+    /// Higher-order `vmap` restricted to linear bodies and linear transpose bodies.
+    VMap(Box<crate::tracing_v2::operations::LinearVMapOp<V>>),
+
+    /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
+    Rematerialize(Box<crate::tracing_v2::operations::LinearRematerializeOp<V>>),
+
+    /// Escape hatch for user- or crate-defined linear custom operations.
+    Custom(Arc<LinearCustomPrimitive<V>>),
+}
+
+impl<V: TraceValue> LinearPrimitiveOp<V> {
+    /// Wraps one custom primitive in the linear-only operation universe after verifying transpose support.
+    pub fn custom(primitive: CustomPrimitive<V>) -> Result<Self, TraceError> {
+        Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
+    }
+
+    /// Wraps one shared custom primitive in the linear-only operation universe after verifying transpose support.
+    pub fn custom_arc(primitive: Arc<CustomPrimitive<V>>) -> Result<Self, TraceError> {
+        Ok(Self::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Arc forwarding impls
@@ -464,6 +599,35 @@ impl<V: TraceValue> Display for PrimitiveOp<V> {
     }
 }
 
+impl<V: TraceValue> Debug for LinearPrimitiveOp<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Add => write!(formatter, "Add"),
+            Self::Neg => write!(formatter, "Neg"),
+            Self::MatrixTranspose => write!(formatter, "MatrixTranspose"),
+            Self::LinearMatrixTranspose => write!(formatter, "LinearMatrixTranspose"),
+            Self::Scale { .. } => write!(formatter, "Scale"),
+            Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
+            Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
+            Self::Reshape { input_type, output_type } => {
+                write!(formatter, "Reshape({input_type} -> {output_type})")
+            }
+            Self::VMap(vmap) => Debug::fmt(vmap, formatter),
+            Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
+            Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
+        }
+    }
+}
+
+impl<V: TraceValue> Display for LinearPrimitiveOp<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
+            _ => write!(formatter, "{}", self.name()),
+        }
+    }
+}
+
 /// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: TraceValue`.
 impl<V: TraceValue> Op for PrimitiveOp<V> {
     fn name(&self) -> &'static str {
@@ -541,6 +705,74 @@ impl<V: TraceValue> Op for PrimitiveOp<V> {
     }
 }
 
+/// [`Op`] for [`LinearPrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: TraceValue`.
+impl<V: TraceValue> Op for LinearPrimitiveOp<V> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Neg => "neg",
+            Self::MatrixTranspose => "matrix_transpose",
+            Self::LinearMatrixTranspose => "linear_matrix_transpose",
+            Self::Scale { .. } => "scale",
+            Self::LeftMatMul { .. } => "left_matmul",
+            Self::RightMatMul { .. } => "right_matmul",
+            Self::Reshape { .. } => "reshape",
+            Self::VMap(vmap) => vmap.name(),
+            Self::Rematerialize(remat) => remat.name(),
+            Self::Custom(op) => op.name(),
+        }
+    }
+
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        match self {
+            Self::Add => AddOp.abstract_eval(inputs),
+            Self::Neg => NegOp.abstract_eval(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.abstract_eval(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.abstract_eval(inputs),
+            Self::Scale { .. } => ScaleOp::<V>::abstract_eval_static(inputs),
+            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::tpe(factor), inputs),
+            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::tpe(factor), inputs),
+            Self::Reshape { input_type, output_type } => {
+                <ReshapeOp as Op>::abstract_eval(&ReshapeOp::new(input_type.clone(), output_type.clone()), inputs)
+            }
+            Self::VMap(vmap) => vmap.abstract_eval(inputs),
+            Self::Rematerialize(remat) => remat.abstract_eval(inputs),
+            Self::Custom(op) => op.abstract_eval(inputs),
+        }
+    }
+
+    fn try_simplify(
+        &self,
+        inputs: &[usize],
+        is_zero_constant: &dyn Fn(usize) -> bool,
+        is_one_constant: &dyn Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
+        match self {
+            Self::Add => AddOp.try_simplify(inputs, is_zero_constant, is_one_constant),
+            Self::Neg => NegOp.try_simplify(inputs, is_zero_constant, is_one_constant),
+            Self::Scale { factor } => {
+                ScaleOp::new(factor.clone()).try_simplify(inputs, is_zero_constant, is_one_constant)
+            }
+            Self::LeftMatMul { factor } => {
+                if crate::tracing_v2::graph::is_identity_one(factor) {
+                    Some(inputs.to_vec())
+                } else {
+                    None
+                }
+            }
+            Self::RightMatMul { factor } => {
+                if crate::tracing_v2::graph::is_identity_one(factor) {
+                    Some(inputs.to_vec())
+                } else {
+                    None
+                }
+            }
+            Self::Custom(op) => op.try_simplify(inputs, is_zero_constant, is_one_constant),
+            _ => None,
+        }
+    }
+}
+
 /// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for PrimitiveOp<V>
@@ -568,16 +800,30 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
     }
 }
 
-/// Returns the transpose-time error used when one non-linear primitive leaks into a staged linear program.
-fn unexpected_nonlinear_primitive_in_linear_program(op_name: &'static str) -> TraceError {
-    TraceError::HigherOrderOpFailure {
-        op: "transpose_linear_program",
-        message: format!("staged linear program unexpectedly contains non-linear op '{op_name}'"),
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+    InterpretableOp<V> for LinearPrimitiveOp<V>
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        match self {
+            Self::Add => AddOp.interpret(inputs),
+            Self::Neg => NegOp.interpret(inputs),
+            Self::MatrixTranspose => MatrixTransposeOp.interpret(inputs),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.interpret(inputs),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).interpret(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).interpret(inputs),
+            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).interpret(inputs),
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOp::new(input_type.clone(), output_type.clone()).interpret(inputs)
+            }
+            Self::VMap(vmap) => vmap.interpret(inputs),
+            Self::Rematerialize(remat) => remat.interpret(inputs),
+            Self::Custom(op) => op.interpret(inputs),
+        }
     }
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
-    LinearOp<V> for PrimitiveOp<V>
+    LinearOp<V> for LinearPrimitiveOp<V>
 {
     fn transpose(
         &self,
@@ -588,9 +834,6 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
         match self {
             Self::Add => AddOp.transpose(inputs, outputs, output_cotangents),
             Self::Neg => NegOp.transpose(inputs, outputs, output_cotangents),
-            Self::Mul | Self::Sin | Self::Cos | Self::MatMul => {
-                Err(unexpected_nonlinear_primitive_in_linear_program(self.name()))
-            }
             Self::MatrixTranspose => MatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
             Self::LinearMatrixTranspose => LinearMatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
             Self::Scale { factor } => ScaleOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents),
@@ -722,7 +965,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{Batch, CompiledFunction, ProgramBuilder, TraceError, grad, jvp, try_jit, vmap};
+    use crate::tracing_v2::{Batch, CompiledFunction, LinearProgramBuilder, TraceError, grad, jvp, try_jit, vmap};
     use crate::types::{ArrayType, DataType, Shape};
 
     use super::*;
@@ -861,20 +1104,13 @@ mod tests {
     }
 
     #[test]
-    fn test_primitive_op_transpose_rejects_nonlinear_cos() {
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
-        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder);
+    fn test_linear_custom_primitive_requires_transpose_rule_up_front() {
+        let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0));
 
-        let error = PrimitiveOp::Cos.transpose(&[0.5f64], &[0.5f64.cos()], &[output_cotangent]).unwrap_err();
-
-        assert_eq!(
-            error,
-            TraceError::HigherOrderOpFailure {
-                op: "transpose_linear_program",
-                message: "staged linear program unexpectedly contains non-linear op 'cos'".to_string(),
-            }
-        );
+        assert!(matches!(
+            primitive.into_linear(),
+            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "transpose" })
+        ));
     }
 
     #[test]
@@ -896,7 +1132,7 @@ mod tests {
     #[test]
     fn test_custom_primitive_missing_transpose_rule_reports_targeted_error() {
         let primitive = CustomPrimitive::<f64>::new(ShiftOp::new(2.0));
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
+        let builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
         let cotangent_atom = builder.borrow_mut().add_input(&0.0);
         let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder);
 

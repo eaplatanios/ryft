@@ -62,13 +62,14 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_program<V, Input, Output>(
-    program: &Program<V, Input, Output>,
+fn summarize_program<V, Input, Output, O>(
+    program: &Program<V, Input, Output, O>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
     V: TraceValue,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
+    O: Clone + std::fmt::Display + crate::tracing_v2::Op,
 {
     summarize_graph(program.graph(), |_| Ok(Vec::new()))
 }
@@ -80,10 +81,10 @@ where
 ///   - `case_id`: Stable benchmark case identifier.
 ///   - `surface`: Artifact surface to record.
 ///   - `program`: Program to render and summarize.
-fn tracing_record<V, Input, Output>(
+fn tracing_record<V, Input, Output, O>(
     case_id: &'static str,
     surface: &'static str,
-    program: &Program<V, Input, Output>,
+    program: &Program<V, Input, Output, O>,
 ) -> Result<IrBenchmarkRecord, BenchmarkError>
 where
     V: TraceValue
@@ -94,6 +95,7 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
+    O: Clone + std::fmt::Display + crate::tracing_v2::Op,
 {
     Ok(record(case_id, tracing_category(case_id), surface, program.to_string(), summarize_program(program)?))
 }

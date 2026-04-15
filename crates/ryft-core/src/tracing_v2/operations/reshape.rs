@@ -17,7 +17,7 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp, VectorizableOp},
+        ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp, VectorizableOp},
     },
     types::{ArrayType, Shape, Size, Typed},
 };
@@ -208,7 +208,7 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> ReshapeTangent
         }
         Ok(LinearTerm::apply_staged_op(
             std::slice::from_ref(&tangent),
-            PrimitiveOp::Reshape { input_type: input_type.clone(), output_type: output_type.clone() },
+            LinearPrimitiveOp::Reshape { input_type: input_type.clone(), output_type: output_type.clone() },
             1,
         )?
         .into_iter()
@@ -423,7 +423,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
-        tracing_v2::{CompiledFunction, JitTracer, ProgramBuilder, jit::try_jit},
+        tracing_v2::{CompiledFunction, JitTracer, LinearProgramBuilder, jit::try_jit},
         types::{DataType, Shape},
     };
 
@@ -676,7 +676,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap();
         let input_value = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
         let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<ndarray::Array2<f64>>::new()));
+        let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ndarray::Array2<f64>>::new()));
         let output_cotangent_atom =
             transpose_builder.borrow_mut().add_input_abstract(output_type.clone(), output_value.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());

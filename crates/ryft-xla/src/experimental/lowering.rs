@@ -13,10 +13,10 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    AtomSource, CustomPrimitive, Graph, Op, PrimitiveOp, ProgramOpRef, ReshapeOps, TraceValue,
+    AtomSource, CustomPrimitive, Graph, LinearPrimitiveOp, Op, PrimitiveOp, ReshapeOps, TraceValue,
     operations::{
-        AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, MulOp, NegOp,
-        RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
+        AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, LinearRematerializeOp, LinearVMapOp,
+        MatMulOp, MatrixTransposeOp, MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
     },
 };
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
@@ -221,8 +221,9 @@ impl<V: TraceValue> StableHloCustomLoweringExtension<V> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Implementing this trait makes an operation eligible for MLIR lowering via
-/// [`to_mlir_module_for_plain_graph`] and related entry points. The [`PrimitiveOp`] enum
-/// provides a blanket implementation covering all built-in primitives.
+/// [`to_mlir_module_for_plain_graph`] and related entry points. The [`PrimitiveOp`] and
+/// [`LinearPrimitiveOp`] enums provide blanket implementations covering the built-in forward and
+/// linear op universes respectively.
 pub(crate) trait XlaOp<V: TraceValue>: ryft_core::tracing_v2::ops::Op {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -544,6 +545,65 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
+> XlaOp<V> for LinearVMapOp<V>
+{
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        lower_vmap_results(
+            self.body(),
+            VMapLoweringMode::Transpose,
+            input_values,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )
+    }
+}
+
+impl<
+    V: TraceValue
+        + ryft_core::tracing_v2::FloatExt
+        + ryft_core::tracing_v2::ZeroLike
+        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::MatrixOps
+        + ReshapeOps,
+> XlaOp<V> for LinearRematerializeOp<V>
+{
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        lower_rematerialize_inline(
+            self.body().compiled().program().graph(),
+            input_values,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )
+    }
+}
+
+impl<
+    V: TraceValue
+        + ryft_core::tracing_v2::FloatExt
+        + ryft_core::tracing_v2::ZeroLike
+        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::MatrixOps
+        + ReshapeOps,
 > XlaOp<V> for PrimitiveOp<V>
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -612,6 +672,87 @@ impl<
             }
             PrimitiveOp::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
             PrimitiveOp::Custom(_) => {
+                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
+            }
+        }
+    }
+}
+
+impl<
+    V: TraceValue
+        + ryft_core::tracing_v2::FloatExt
+        + ryft_core::tracing_v2::ZeroLike
+        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::MatrixOps
+        + ReshapeOps,
+> XlaOp<V> for LinearPrimitiveOp<V>
+{
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        V: MlirLowerableValue,
+    {
+        match self {
+            LinearPrimitiveOp::Add => {
+                <AddOp as XlaOp<V>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer)
+            }
+            LinearPrimitiveOp::Neg => {
+                <NegOp as XlaOp<V>>::lower_to_mlir(&NegOp, input_values, output_types, mode, lowerer)
+            }
+            LinearPrimitiveOp::MatrixTranspose => <MatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
+                &MatrixTransposeOp,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOp::LinearMatrixTranspose => <LinearMatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
+                &LinearMatrixTransposeOp,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOp::Scale { factor } => <ScaleOp<V> as XlaOp<V>>::lower_to_mlir(
+                &ScaleOp::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOp::LeftMatMul { factor } => <LeftMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
+                &LeftMatMulOp::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOp::RightMatMul { factor } => <RightMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
+                &RightMatMulOp::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOp::Reshape { input_type, output_type } => <ReshapeOp as XlaOp<V>>::lower_to_mlir(
+                &ReshapeOp::new(input_type.clone(), output_type.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOp::VMap(vmap) => {
+                <LinearVMapOp<V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
+            }
+            LinearPrimitiveOp::Rematerialize(remat) => {
+                <LinearRematerializeOp<V> as XlaOp<V>>::lower_to_mlir(remat, input_values, output_types, mode, lowerer)
+            }
+            LinearPrimitiveOp::Custom(_) => {
                 Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
             }
         }
@@ -989,8 +1130,8 @@ impl MlirLowerableValue for ShardMapTensor {
 /// Lowers a plain traced `tracing_v2` graph to a textual StableHLO MLIR module.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
-pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, S>(
-    graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
+pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, O, S>(
+    graph: &Graph<O, V, Input, Output>,
     function_name: S,
 ) -> Result<String, LoweringError>
 where
@@ -1000,7 +1141,7 @@ where
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
-    PrimitiveOp<V>: XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     S: AsRef<str>,
@@ -1142,11 +1283,11 @@ enum VMapLoweringMode {
 }
 
 /// Maps the canonical traced `vmap` op to the lowering-specific packing mode.
-fn lower_vmap_mode<V>(vmap_op: &VMapOp<V>) -> VMapLoweringMode
+fn lower_vmap_mode<V>(_vmap_op: &VMapOp<V>) -> VMapLoweringMode
 where
     V: TraceValue,
 {
-    if vmap_op.has_transpose_body() { VMapLoweringMode::Transpose } else { VMapLoweringMode::Forward }
+    VMapLoweringMode::Forward
 }
 
 /// Returns the static dimensions for one tensor type.
@@ -1464,8 +1605,8 @@ where
 }
 
 /// Lowers one packed `vmap` body graph whose inputs and outputs already carry a leading batch axis.
-fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, V, L>(
-    graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
+fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
+    graph: &Graph<O, V, Vec<V>, Vec<V>>,
     packed_inputs: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
     block: &mut B,
@@ -1480,10 +1621,11 @@ where
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
+    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
-    fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, V, L>(
-        graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
+    fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
+        graph: &Graph<O, V, Vec<V>, Vec<V>>,
         atom_values: &[Option<ValueRef<'b, 'c, 't>>],
         atom_id: usize,
         lane_count: usize,
@@ -1493,6 +1635,7 @@ where
     ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
     where
         B: Block<'b, 'c, 't>,
+        O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
         V: MlirLowerableValue,
         L: Location<'c, 't> + Copy,
     {
@@ -1577,8 +1720,8 @@ where
 }
 
 /// Lowers one higher-order `vmap` op by explicitly packing inputs, lowering the packed body, and unpacking outputs.
-fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, V, L>(
-    body: &FlatTracedVMap<V>,
+fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
+    body: &FlatTracedVMap<V, O>,
     mode: VMapLoweringMode,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut B,
@@ -1593,6 +1736,7 @@ where
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
+    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
     let lane_count = body.lane_count();
@@ -1657,8 +1801,8 @@ where
 /// Inlines a rematerialize body's sub-program into the given block by mapping the provided input
 /// MLIR values to the body's input atoms, lowering constants and equations in topological order,
 /// and returning the MLIR values corresponding to the body's output atoms.
-fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, V>(
-    graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
+fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
+    graph: &Graph<O, V, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -1671,6 +1815,7 @@ where
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
+    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
 {
     let mut atom_values = vec![None; graph.atom_count()];
     for (atom_id, mlir_value) in graph.input_atoms().iter().copied().zip(input_values.iter().copied()) {
@@ -1735,8 +1880,8 @@ where
 /// Lowers one plain traced graph to values inside a block.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
-fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, V, Input, Output>(
-    graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
+fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
+    graph: &Graph<O, V, Input, Output>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1748,6 +1893,7 @@ where
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
+    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -2182,8 +2328,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
 /// Lowers one traced equation from a plain `tracing_v2` program.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
-fn lower_plain_equation<'b, 'c: 'b, 't: 'c, V, Input, Output>(
-    graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
+fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
+    graph: &Graph<O, V, Input, Output>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2197,6 +2343,7 @@ where
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
+    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -2213,8 +2360,8 @@ where
 }
 
 /// Lowers one equation inside a packed `vmap` body graph.
-fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, V>(
-    graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
+fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
+    graph: &Graph<O, V, Vec<V>, Vec<V>>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
@@ -2229,6 +2376,7 @@ where
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
+    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
 {
     let equation = &graph.equations()[equation_index];
     let output_types = equation

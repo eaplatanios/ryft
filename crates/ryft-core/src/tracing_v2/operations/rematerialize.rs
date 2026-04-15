@@ -16,14 +16,15 @@ use crate::{
         jit::try_trace_program,
         linear::{linearize_program, replay_program_graph_linearized_jit, transpose_linear_program},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
+        ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
+        program::{LinearProgramOpRef, ProgramOpRef},
     },
     types::{ArrayType, Typed},
 };
 
 /// Erased traced body for a rematerialization boundary.
 #[derive(Clone)]
-pub struct FlatTracedRematerialize<V: TraceValue> {
+pub struct FlatTracedRematerialize<V: TraceValue, O: Clone = ProgramOpRef<V>> {
     /// Canonical input types of the body.
     input_types: Vec<ArrayType>,
 
@@ -31,16 +32,16 @@ pub struct FlatTracedRematerialize<V: TraceValue> {
     output_types: Vec<ArrayType>,
 
     /// The compiled body sub-program.
-    compiled: CompiledFunction<V, Vec<V>, Vec<V>>,
+    compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
 }
 
-impl<V: TraceValue> FlatTracedRematerialize<V> {
+impl<V: TraceValue, O: Clone> FlatTracedRematerialize<V, O> {
     /// Builds one erased traced rematerialize body from explicit staged parts.
     #[inline]
     pub fn from_parts(
         input_types: Vec<ArrayType>,
         output_types: Vec<ArrayType>,
-        compiled: CompiledFunction<V, Vec<V>, Vec<V>>,
+        compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
     ) -> Self {
         Self { input_types, output_types, compiled }
     }
@@ -59,7 +60,7 @@ impl<V: TraceValue> FlatTracedRematerialize<V> {
 
     /// Returns the compiled body sub-program.
     #[inline]
-    pub fn compiled(&self) -> &CompiledFunction<V, Vec<V>, Vec<V>> {
+    pub fn compiled(&self) -> &CompiledFunction<V, Vec<V>, Vec<V>, O> {
         &self.compiled
     }
 }
@@ -68,48 +69,24 @@ impl<V: TraceValue> FlatTracedRematerialize<V> {
 ///
 /// During forward execution the body is evaluated normally. When linearized, the body's pushforward
 /// is computed and staged so that the tangent program recomputes forward intermediates from the
-/// inputs rather than storing them as constants. The transpose body is populated lazily on the first
-/// linearization request.
+/// inputs rather than storing them as constants.
 #[derive(Clone)]
 pub struct RematerializeOp<V: TraceValue> {
     /// The forward body sub-program.
     body: FlatTracedRematerialize<V>,
-
-    /// Optional transpose body, populated when the op appears in a linear program.
-    transpose_body: Option<FlatTracedRematerialize<V>>,
 }
 
 impl<V: TraceValue> RematerializeOp<V> {
     /// Builds one ordinary (non-linear) rematerialize op wrapping the given body.
     #[inline]
     pub fn new(body: FlatTracedRematerialize<V>) -> Self {
-        Self { body, transpose_body: None }
-    }
-
-    /// Builds a linear rematerialize op with an explicit transpose body.
-    #[inline]
-    pub fn new_linear(body: FlatTracedRematerialize<V>, transpose_body: FlatTracedRematerialize<V>) -> Self {
-        Self { body, transpose_body: Some(transpose_body) }
+        Self { body }
     }
 
     /// Returns the forward body.
     #[inline]
     pub fn body(&self) -> &FlatTracedRematerialize<V> {
         &self.body
-    }
-
-    /// Returns whether the op carries a transpose body.
-    #[inline]
-    pub fn has_transpose_body(&self) -> bool {
-        self.transpose_body.is_some()
-    }
-
-    fn transpose_op(&self) -> Result<Self, TraceError> {
-        let transpose_body = self.transpose_body.clone().ok_or(TraceError::HigherOrderOpFailure {
-            op: "rematerialize",
-            message: "transpose requested for a rematerialize op without a transpose body".to_string(),
-        })?;
-        Ok(Self::new_linear(transpose_body, self.body.clone()))
     }
 }
 
@@ -149,31 +126,6 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for RematerializeOp<V> {
-    fn transpose(
-        &self,
-        _inputs: &[V],
-        _outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        if !self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "transpose_linear_program",
-                message: "transpose rule for staged op 'rematerialize' is not implemented".to_string(),
-            });
-        }
-        let transpose = self.transpose_op()?;
-        Ok(LinearTerm::apply_staged_op(
-            output_cotangents,
-            PrimitiveOp::Rematerialize(Box::new(transpose)),
-            self.body.input_types().len(),
-        )?
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>())
-    }
-}
-
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
     InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RematerializeOp<V>
 {
@@ -181,12 +133,6 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
-        if self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "eval_linearized_jit",
-                message: "linearized JIT evaluation through a linear rematerialize op is not implemented".to_string(),
-            });
-        }
         // Replay the body sub-program with JitTracer+LinearTerm inputs. This stages the body's
         // forward equations symbolically in the primal JIT builder and produces tangent atoms that
         // reference those symbolic forward values rather than baked constants.
@@ -226,18 +172,12 @@ impl<
         &self,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        if self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "linearize_program",
-                message: "JVP rule for staged op 'rematerialize' is not implemented for linear variant".to_string(),
-            });
-        }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOp<V>>::interpret(self, primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            PrimitiveOp::Rematerialize(Box::new(make_linear_rematerialize(&self.body)?)),
+            LinearPrimitiveOp::Rematerialize(Box::new(make_linear_rematerialize(&self.body)?)),
             self.body.output_types.len(),
         )?;
         Ok(primal_outputs
@@ -258,9 +198,97 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
     }
 }
 
+/// Linear-only rematerialization boundary that always carries both the linear body and its transpose body.
+#[derive(Clone)]
+pub struct LinearRematerializeOp<V: TraceValue> {
+    /// The forward linear body sub-program.
+    body: FlatTracedRematerialize<V, LinearProgramOpRef<V>>,
+
+    /// The transpose linear body.
+    transpose_body: FlatTracedRematerialize<V, LinearProgramOpRef<V>>,
+}
+
+impl<V: TraceValue> LinearRematerializeOp<V> {
+    /// Builds one linear rematerialize op with an explicit transpose body.
+    #[inline]
+    pub fn new(
+        body: FlatTracedRematerialize<V, LinearProgramOpRef<V>>,
+        transpose_body: FlatTracedRematerialize<V, LinearProgramOpRef<V>>,
+    ) -> Self {
+        Self { body, transpose_body }
+    }
+
+    /// Returns the forward body.
+    #[inline]
+    pub fn body(&self) -> &FlatTracedRematerialize<V, LinearProgramOpRef<V>> {
+        &self.body
+    }
+
+    fn transpose_op(&self) -> Self {
+        Self::new(self.transpose_body.clone(), self.body.clone())
+    }
+}
+
+impl<V: TraceValue> Debug for LinearRematerializeOp<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "LinearRematerialize")
+    }
+}
+
+impl<V: TraceValue> Display for LinearRematerializeOp<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "rematerialize")
+    }
+}
+
+impl<V: TraceValue> Op for LinearRematerializeOp<V> {
+    fn name(&self) -> &'static str {
+        "rematerialize"
+    }
+
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        if inputs.len() != self.body.input_types.len() {
+            return Err(TraceError::InvalidInputCount { expected: self.body.input_types.len(), got: inputs.len() });
+        }
+        if inputs != self.body.input_types.as_slice() {
+            return Err(TraceError::IncompatibleAbstractValues { op: "rematerialize" });
+        }
+        Ok(self.body.output_types.clone())
+    }
+}
+
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V>
+    for LinearRematerializeOp<V>
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        self.body.compiled.call(inputs.to_vec())
+    }
+}
+
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V> {
+    fn transpose(
+        &self,
+        _inputs: &[V],
+        _outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        let transpose = self.transpose_op();
+        Ok(LinearTerm::apply_staged_op(
+            output_cotangents,
+            LinearPrimitiveOp::Rematerialize(Box::new(transpose)),
+            self.body.input_types().len(),
+        )?
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>())
+    }
+}
+
 /// Builds a linearized rematerialize op from its primal body by computing the pushforward and
 /// pullback programs.
-pub fn make_linear_rematerialize<V>(body: &FlatTracedRematerialize<V>) -> Result<RematerializeOp<V>, TraceError>
+pub fn make_linear_rematerialize<V>(body: &FlatTracedRematerialize<V>) -> Result<LinearRematerializeOp<V>, TraceError>
 where
     V: TraceValue
         + FloatExt
@@ -274,7 +302,7 @@ where
 {
     let pushforward = linearize_program(body.compiled.program())?;
     let pullback = transpose_linear_program(&pushforward)?;
-    Ok(RematerializeOp::new_linear(
+    Ok(LinearRematerializeOp::new(
         FlatTracedRematerialize::from_parts(
             body.input_types.clone(),
             body.output_types.clone(),

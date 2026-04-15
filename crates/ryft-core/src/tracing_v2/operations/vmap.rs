@@ -7,28 +7,29 @@ use crate::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         linear::{linearize_program, transpose_linear_program},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
+        ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
+        program::{LinearProgramOpRef, ProgramOpRef},
     },
     types::{ArrayType, Typed},
 };
 
 /// Erased traced `vmap` body used by the staged higher-order op.
 #[derive(Clone)]
-pub struct FlatTracedVMap<V: TraceValue> {
+pub struct FlatTracedVMap<V: TraceValue, O: Clone = ProgramOpRef<V>> {
     lane_count: usize,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
-    compiled: CompiledFunction<V, Vec<V>, Vec<V>>,
+    compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
 }
 
-impl<V: TraceValue> FlatTracedVMap<V> {
+impl<V: TraceValue, O: Clone> FlatTracedVMap<V, O> {
     /// Builds one erased traced `vmap` body from explicit staged parts.
     #[inline]
     pub fn from_parts(
         lane_count: usize,
         input_types: Vec<ArrayType>,
         output_types: Vec<ArrayType>,
-        compiled: CompiledFunction<V, Vec<V>, Vec<V>>,
+        compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
     ) -> Self {
         Self { lane_count, input_types, output_types, compiled }
     }
@@ -53,7 +54,7 @@ impl<V: TraceValue> FlatTracedVMap<V> {
 
     /// Returns the compiled flat body.
     #[inline]
-    pub fn compiled(&self) -> &CompiledFunction<V, Vec<V>, Vec<V>> {
+    pub fn compiled(&self) -> &CompiledFunction<V, Vec<V>, Vec<V>, O> {
         &self.compiled
     }
 
@@ -79,6 +80,7 @@ impl<V: TraceValue> FlatTracedVMap<V> {
 
     pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
     where
+        O: InterpretableOp<V>,
         V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     {
         if inputs.len() != self.total_input_count() {
@@ -94,44 +96,23 @@ impl<V: TraceValue> FlatTracedVMap<V> {
     }
 }
 
-/// Higher-order `vmap` op that carries one canonical program payload and, when linear, its transpose payload too.
+/// Higher-order `vmap` op that carries one canonical forward program payload.
 #[derive(Clone)]
 pub struct VMapOp<V: TraceValue> {
     body: FlatTracedVMap<V>,
-    transpose_body: Option<FlatTracedVMap<V>>,
 }
 
 impl<V: TraceValue> VMapOp<V> {
     /// Builds one ordinary traced `vmap` op.
     #[inline]
     pub fn new(body: FlatTracedVMap<V>) -> Self {
-        Self { body, transpose_body: None }
-    }
-
-    /// Builds one linear traced `vmap` op with an explicit transpose body.
-    #[inline]
-    pub fn new_linear(body: FlatTracedVMap<V>, transpose_body: FlatTracedVMap<V>) -> Self {
-        Self { body, transpose_body: Some(transpose_body) }
+        Self { body }
     }
 
     /// Returns the canonical traced body.
     #[inline]
     pub fn body(&self) -> &FlatTracedVMap<V> {
         &self.body
-    }
-
-    /// Returns whether the op carries a transpose body.
-    #[inline]
-    pub fn has_transpose_body(&self) -> bool {
-        self.transpose_body.is_some()
-    }
-
-    fn transpose_op(&self) -> Result<Self, TraceError> {
-        let transpose_body = self.transpose_body.clone().ok_or(TraceError::HigherOrderOpFailure {
-            op: "vmap",
-            message: "transpose requested for a vmap op without a transpose body".to_string(),
-        })?;
-        Ok(Self::new_linear(transpose_body, self.body.clone()))
     }
 }
 
@@ -172,46 +153,6 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for VMapOp<V> {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        if !self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "transpose_linear_program",
-                message: "transpose rule for staged op 'vmap' is not implemented".to_string(),
-            });
-        }
-        if inputs.len() != self.body.total_input_count() {
-            return Err(TraceError::InvalidInputCount { expected: self.body.total_input_count(), got: inputs.len() });
-        }
-        if outputs.len() != self.body.total_output_count() {
-            return Err(TraceError::InvalidOutputCount {
-                expected: self.body.total_output_count(),
-                got: outputs.len(),
-            });
-        }
-        if output_cotangents.len() != self.body.total_output_count() {
-            return Err(TraceError::InvalidInputCount {
-                expected: self.body.total_output_count(),
-                got: output_cotangents.len(),
-            });
-        }
-        let transpose = self.transpose_op()?;
-        Ok(LinearTerm::apply_staged_op(
-            output_cotangents,
-            PrimitiveOp::VMap(Box::new(transpose)),
-            self.body.total_input_count(),
-        )?
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>())
-    }
-}
-
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
     InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V>
 {
@@ -219,12 +160,6 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
-        if self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "eval_linearized_jit",
-                message: "linearized JIT evaluation through a linear vmap op is not implemented".to_string(),
-            });
-        }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_output_values = <Self as InterpretableOp<V>>::interpret(
             self,
@@ -259,18 +194,12 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
         &self,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError> {
-        if self.has_transpose_body() {
-            return Err(TraceError::HigherOrderOpFailure {
-                op: "linearize_program",
-                message: "JVP rule for staged op 'vmap' is not implemented".to_string(),
-            });
-        }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOp<V>>::interpret(self, primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            PrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
+            LinearPrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
             self.body.total_output_count(),
         )?;
         Ok(primal_outputs
@@ -291,8 +220,107 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
     }
 }
 
+/// Linear-only `vmap` op that always carries both the linear body and its transpose body.
+#[derive(Clone)]
+pub struct LinearVMapOp<V: TraceValue> {
+    body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
+    transpose_body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
+}
+
+impl<V: TraceValue> LinearVMapOp<V> {
+    /// Builds one linear traced `vmap` op with its transpose body.
+    #[inline]
+    pub fn new(
+        body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
+        transpose_body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
+    ) -> Self {
+        Self { body, transpose_body }
+    }
+
+    /// Returns the canonical traced body.
+    #[inline]
+    pub fn body(&self) -> &FlatTracedVMap<V, LinearProgramOpRef<V>> {
+        &self.body
+    }
+
+    fn transpose_op(&self) -> Self {
+        Self::new(self.transpose_body.clone(), self.body.clone())
+    }
+}
+
+impl<V: TraceValue> Debug for LinearVMapOp<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "LinearVMap")
+    }
+}
+
+impl<V: TraceValue> Display for LinearVMapOp<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "vmap")
+    }
+}
+
+impl<V: TraceValue> Op for LinearVMapOp<V> {
+    fn name(&self) -> &'static str {
+        "vmap"
+    }
+
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        let expected_inputs = self.body.repeated_input_types();
+        if inputs.len() != expected_inputs.len() {
+            return Err(TraceError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
+        }
+        if inputs != expected_inputs.as_slice() {
+            return Err(TraceError::IncompatibleAbstractValues { op: "vmap" });
+        }
+        Ok(self.body.repeated_output_types())
+    }
+}
+
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        self.body.eval_lanes(inputs)
+    }
+}
+
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V> {
+    fn transpose(
+        &self,
+        inputs: &[V],
+        outputs: &[V],
+        output_cotangents: &[LinearTerm<V>],
+    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        if inputs.len() != self.body.total_input_count() {
+            return Err(TraceError::InvalidInputCount { expected: self.body.total_input_count(), got: inputs.len() });
+        }
+        if outputs.len() != self.body.total_output_count() {
+            return Err(TraceError::InvalidOutputCount {
+                expected: self.body.total_output_count(),
+                got: outputs.len(),
+            });
+        }
+        if output_cotangents.len() != self.body.total_output_count() {
+            return Err(TraceError::InvalidInputCount {
+                expected: self.body.total_output_count(),
+                got: output_cotangents.len(),
+            });
+        }
+        let transpose = self.transpose_op();
+        Ok(LinearTerm::apply_staged_op(
+            output_cotangents,
+            LinearPrimitiveOp::VMap(Box::new(transpose)),
+            self.body.total_input_count(),
+        )?
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>())
+    }
+}
+
 /// Builds one linearized staged `vmap` op from its primal body.
-pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<VMapOp<V>, TraceError>
+pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<LinearVMapOp<V>, TraceError>
 where
     V: TraceValue
         + FloatExt
@@ -306,7 +334,7 @@ where
 {
     let pushforward = linearize_program(body.compiled.program())?;
     let pullback = transpose_linear_program(&pushforward)?;
-    Ok(VMapOp::new_linear(
+    Ok(LinearVMapOp::new(
         FlatTracedVMap::from_parts(
             body.lane_count,
             body.input_types.clone(),

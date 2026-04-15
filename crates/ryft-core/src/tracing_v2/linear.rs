@@ -23,8 +23,8 @@ use crate::{
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         operations::rematerialize::{FlatTracedRematerialize, RematerializeOp},
         operations::reshape::ReshapeOps,
-        ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp},
-        program::{Program, ProgramBuilder, ProgramOpRef},
+        ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
+        program::{LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder, ProgramOpRef},
     },
 };
 
@@ -32,7 +32,7 @@ use crate::{
 #[derive(Clone, Debug, Parameter)]
 pub struct LinearTerm<V: TraceValue> {
     atom: AtomId,
-    builder: Rc<RefCell<ProgramBuilder<V>>>,
+    builder: Rc<RefCell<LinearProgramBuilder<V>>>,
 }
 
 impl<V: TraceValue> LinearTerm<V> {
@@ -42,12 +42,12 @@ impl<V: TraceValue> LinearTerm<V> {
     }
 
     #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<LinearProgramBuilder<V>>> {
         self.builder.clone()
     }
 
     #[inline]
-    pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<V>>>) -> Self {
+    pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<LinearProgramBuilder<V>>>) -> Self {
         Self { atom, builder }
     }
 
@@ -56,7 +56,11 @@ impl<V: TraceValue> LinearTerm<V> {
     /// Shape validation is performed via [`Op::abstract_eval`]. Concrete evaluation is intentionally
     /// skipped because tangent-program outputs remain abstract until the staged linear program is
     /// replayed on concrete tangents.
-    pub fn apply_staged_op(inputs: &[Self], op: ProgramOpRef<V>, output_count: usize) -> Result<Vec<Self>, TraceError> {
+    pub fn apply_staged_op(
+        inputs: &[Self],
+        op: LinearProgramOpRef<V>,
+        output_count: usize,
+    ) -> Result<Vec<Self>, TraceError> {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
         }
@@ -89,7 +93,7 @@ impl<V: TraceValue> LinearTerm<V> {
     /// The output atom reuses the abstract type of the input atom, which is valid for shape-preserving
     /// linear operations in tangent programs.
     #[inline]
-    pub fn apply_linear_op(self, op: ProgramOpRef<V>) -> Self {
+    pub fn apply_linear_op(self, op: LinearProgramOpRef<V>) -> Self {
         let mut borrow = self.builder.borrow_mut();
         let input_atom = borrow.atom(self.atom).expect("staged input should exist");
         let abstract_value = input_atom.abstract_value.clone();
@@ -106,7 +110,8 @@ impl<V: TraceValue> LinearTerm<V> {
         let input_atom = borrow.atom(self.atom).expect("staged input should exist");
         let abstract_value = input_atom.abstract_value.clone();
         let atom =
-            borrow.add_equation_prevalidated(PrimitiveOp::Add, vec![self.atom, rhs.atom], vec![abstract_value])[0];
+            borrow.add_equation_prevalidated(LinearPrimitiveOp::Add, vec![self.atom, rhs.atom], vec![abstract_value])
+                [0];
         drop(borrow);
         Self { atom, builder: self.builder }
     }
@@ -114,13 +119,13 @@ impl<V: TraceValue> LinearTerm<V> {
     /// Stages a negation of this tangent term.
     #[inline]
     pub fn neg(self) -> Self {
-        self.apply_linear_op(PrimitiveOp::Neg)
+        self.apply_linear_op(LinearPrimitiveOp::Neg)
     }
 
     /// Stages a scaling of this tangent term by a concrete factor.
     #[inline]
     pub fn scale(self, factor: V) -> Self {
-        self.apply_linear_op(PrimitiveOp::Scale { factor })
+        self.apply_linear_op(LinearPrimitiveOp::Scale { factor })
     }
 }
 
@@ -153,7 +158,7 @@ pub type Linearized<V> = JvpTracer<V, LinearTerm<V>>;
 
 /// Staged linear map produced by `linearize`, `jvp_program`, or `vjp`.
 pub struct LinearProgram<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
-    program: Program<V, Input, Output>,
+    program: Program<V, Input, Output, LinearProgramOpRef<V>>,
     zero: V,
     marker: PhantomData<fn(Input) -> Output>,
 }
@@ -171,13 +176,13 @@ impl<
 
 impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearProgram<V, Input, Output> {
     #[inline]
-    pub fn from_program(program: Program<V, Input, Output>, zero: V) -> Self {
+    pub fn from_program(program: Program<V, Input, Output, LinearProgramOpRef<V>>, zero: V) -> Self {
         Self { program, zero, marker: PhantomData }
     }
 
     /// Returns the staged graph backing this linear program.
     #[inline]
-    pub fn program(&self) -> &Program<V, Input, Output> {
+    pub fn program(&self) -> &Program<V, Input, Output, LinearProgramOpRef<V>> {
         &self.program
     }
 
@@ -245,9 +250,9 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display f
 ///   - `output_cotangents`: transpose-builder atom ids for the already-staged cotangents of
 ///     `outputs`.
 fn transpose<V>(
-    op: &PrimitiveOp<V>,
+    op: &LinearProgramOpRef<V>,
     representative_values: &[V],
-    builder: &Rc<RefCell<ProgramBuilder<V>>>,
+    builder: &Rc<RefCell<LinearProgramBuilder<V>>>,
     inputs: &[AtomId],
     outputs: &[AtomId],
     output_cotangents: &[AtomId],
@@ -295,7 +300,7 @@ where
     fn tangent_for_atom<V, Input, Output>(
         _graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
         representative_values: &[V],
-        builder: &Rc<RefCell<ProgramBuilder<V>>>,
+        builder: &Rc<RefCell<LinearProgramBuilder<V>>>,
         tangents: &mut [Option<LinearTerm<V>>],
         atom_id: AtomId,
     ) -> Result<LinearTerm<V>, TraceError>
@@ -320,7 +325,7 @@ where
         .first()
         .map(|input_atom| representative_values[*input_atom].zero_like())
         .ok_or(TraceError::EmptyParameterizedValue)?;
-    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::new()));
     let mut tangents = vec![None; graph.atom_count()];
     for input_atom in graph.input_atoms().iter().copied() {
         let input = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
@@ -394,7 +399,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
     fn accumulate<V>(
-        builder: &Rc<RefCell<ProgramBuilder<V>>>,
+        builder: &Rc<RefCell<LinearProgramBuilder<V>>>,
         adjoints: &mut [Option<AtomId>],
         atom: AtomId,
         contribution: AtomId,
@@ -408,7 +413,7 @@ where
                 let abstract_value =
                     builder_borrow.atom(existing).expect("adjoint atom should exist").abstract_value.clone();
                 builder_borrow.add_equation_prevalidated(
-                    PrimitiveOp::Add,
+                    LinearPrimitiveOp::Add,
                     vec![existing, contribution],
                     vec![abstract_value],
                 )[0]
@@ -420,7 +425,7 @@ where
 
     let graph = program.program.graph();
     let representative_values = graph.representative_atom_values()?;
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<V>::new()));
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
     for output in graph.outputs() {
         let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
@@ -605,7 +610,7 @@ where
 {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_count = primals.len();
-    let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::new()));
     let traced_input = primals
         .into_iter()
         .map(|primal| {

@@ -11,9 +11,9 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, CustomPrimitive, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, LinearOp, LinearTerm,
-        Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError, TraceValue, ZeroLike,
-        forward::JvpTracer,
+        AtomId, CustomPrimitive, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp,
+        LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
+        TraceValue, ZeroLike, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -313,7 +313,7 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
         }
         let contributions = LinearTerm::apply_staged_op(
             output_cotangents,
-            PrimitiveOp::Custom(Arc::new(self.transpose_op()?.to_tensor_custom_primitive())),
+            LinearPrimitiveOp::custom(self.transpose_op()?.to_tensor_custom_primitive())?,
             self.input_types.len(),
         )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
@@ -336,11 +336,11 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            PrimitiveOp::Custom(Arc::new(
+            LinearPrimitiveOp::custom(
                 make_linear_tensor_shard_map(self.body(), primal_inputs)
                     .map_err(trace_error_from_shard_map)?
                     .to_tensor_custom_primitive(),
-            )),
+            )?,
             self.output_types.len(),
         )?;
         Ok(primal_outputs
@@ -365,9 +365,9 @@ impl InterpretableOp<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> 
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            PrimitiveOp::Custom(Arc::new(
+            LinearPrimitiveOp::custom(
                 self.to_linearized_jit_tracer_op(primal_inputs.as_slice())?.to_tracer_custom_primitive(),
-            )),
+            )?,
             self.output_types.len(),
         )?;
 
@@ -456,7 +456,7 @@ impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
         }
         let contributions = LinearTerm::apply_staged_op(
             output_cotangents,
-            PrimitiveOp::Custom(Arc::new(self.transpose_op()?.to_tracer_custom_primitive())),
+            LinearPrimitiveOp::custom(self.transpose_op()?.to_tracer_custom_primitive())?,
             self.input_types.len(),
         )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
@@ -1016,7 +1016,7 @@ fn try_linearize_traced_shard_map_body<
 > {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_structure = vec![ryft_core::parameters::Placeholder; primals.len()];
-    let builder = std::rc::Rc::new(std::cell::RefCell::new(ProgramBuilder::new()));
+    let builder = std::rc::Rc::new(std::cell::RefCell::new(LinearProgramBuilder::new()));
     let traced_input = primals
         .into_iter()
         .map(|primal| {
@@ -1345,7 +1345,7 @@ pub(crate) fn apply_linearized_flat_shard_map(
     let primal_outputs = apply_flat_traced_shard_map(body.clone(), traced_primals.clone())?;
     let tangent_outputs = LinearTerm::apply_staged_op(
         traced_tangents.as_slice(),
-        PrimitiveOp::Custom(Arc::new(make_linear_shard_map(&body, traced_primals)?.to_tracer_custom_primitive())),
+        LinearPrimitiveOp::custom(make_linear_shard_map(&body, traced_primals)?.to_tracer_custom_primitive())?,
         body.global_output_types.len(),
     )?;
     Ok(primal_outputs

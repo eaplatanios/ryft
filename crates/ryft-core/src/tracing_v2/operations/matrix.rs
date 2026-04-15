@@ -14,7 +14,7 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{PrimitiveOp, VectorizableOp},
+        ops::{LinearPrimitiveOp, PrimitiveOp, VectorizableOp},
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
 };
@@ -240,17 +240,17 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
 impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<V> {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
-        tangent.apply_linear_op(PrimitiveOp::LeftMatMul { factor })
+        tangent.apply_linear_op(LinearPrimitiveOp::LeftMatMul { factor })
     }
 
     #[inline]
     fn matmul_right(tangent: Self, factor: V) -> Self {
-        tangent.apply_linear_op(PrimitiveOp::RightMatMul { factor })
+        tangent.apply_linear_op(LinearPrimitiveOp::RightMatMul { factor })
     }
 
     #[inline]
     fn transpose_matrix(value: Self) -> Self {
-        value.apply_linear_op(PrimitiveOp::LinearMatrixTranspose)
+        value.apply_linear_op(LinearPrimitiveOp::LinearMatrixTranspose)
     }
 }
 

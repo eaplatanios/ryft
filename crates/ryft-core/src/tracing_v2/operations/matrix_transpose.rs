@@ -7,7 +7,7 @@ use crate::tracing_v2::{
     batch::Batch as BatchedValue,
     forward::JvpTracer,
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, PrimitiveOp, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -63,7 +63,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatrixTransposeOp {
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
                 std::slice::from_ref(&output_cotangents[0]),
-                PrimitiveOp::LinearMatrixTranspose,
+                LinearPrimitiveOp::LinearMatrixTranspose,
                 1,
             )?
             .into_iter()
