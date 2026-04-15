@@ -568,6 +568,14 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
     }
 }
 
+/// Returns the transpose-time error used when one non-linear primitive leaks into a staged linear program.
+fn unexpected_nonlinear_primitive_in_linear_program(op_name: &'static str) -> TraceError {
+    TraceError::HigherOrderOpFailure {
+        op: "transpose_linear_program",
+        message: format!("staged linear program unexpectedly contains non-linear op '{op_name}'"),
+    }
+}
+
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     LinearOp<V> for PrimitiveOp<V>
 {
@@ -579,11 +587,10 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
     ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         match self {
             Self::Add => AddOp.transpose(inputs, outputs, output_cotangents),
-            Self::Mul => MulOp.transpose(inputs, outputs, output_cotangents),
             Self::Neg => NegOp.transpose(inputs, outputs, output_cotangents),
-            Self::Sin => SinOp.transpose(inputs, outputs, output_cotangents),
-            Self::Cos => CosOp.transpose(inputs, outputs, output_cotangents),
-            Self::MatMul => MatMulOp.transpose(inputs, outputs, output_cotangents),
+            Self::Mul | Self::Sin | Self::Cos | Self::MatMul => {
+                Err(unexpected_nonlinear_primitive_in_linear_program(self.name()))
+            }
             Self::MatrixTranspose => MatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
             Self::LinearMatrixTranspose => LinearMatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
             Self::Scale { factor } => ScaleOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents),
@@ -851,6 +858,23 @@ mod tests {
     /// Returns one scalar array type used by these custom-primitive tests.
     fn scalar_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::scalar(), None, None).expect("scalar array types should be valid")
+    }
+
+    #[test]
+    fn test_primitive_op_transpose_rejects_nonlinear_cos() {
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
+        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder);
+
+        let error = PrimitiveOp::Cos.transpose(&[0.5f64], &[0.5f64.cos()], &[output_cotangent]).unwrap_err();
+
+        assert_eq!(
+            error,
+            TraceError::HigherOrderOpFailure {
+                op: "transpose_linear_program",
+                message: "staged linear program unexpectedly contains non-linear op 'cos'".to_string(),
+            }
+        );
     }
 
     #[test]

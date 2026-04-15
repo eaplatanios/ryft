@@ -3,11 +3,10 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, TraceValue, ZeroLike,
+    FloatExt, TraceError, TraceValue,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -43,21 +42,6 @@ impl<V: TraceValue + FloatExt> InterpretableOp<V> for CosOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().cos()])
-    }
-}
-
-impl<V: TraceValue + FloatExt + ZeroLike> LinearOp<V> for CosOp {
-    fn transpose(
-        &self,
-        _inputs: &[V],
-        _outputs: &[V],
-        _output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        // TODO(eaplatanios): We should not have to implement `LinearOp` for non-linear ops. Something is wrong.
-        Err(TraceError::HigherOrderOpFailure {
-            op: "transpose_linear_program",
-            message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
-        })
     }
 }
 

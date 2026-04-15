@@ -6,11 +6,10 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    TraceError, TraceValue, ZeroLike,
+    TraceError, TraceValue,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
-    linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -69,20 +68,6 @@ impl<V: TraceValue + Mul<Output = V>> InterpretableOp<V> for MulOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
-    }
-}
-
-impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for MulOp {
-    fn transpose(
-        &self,
-        _inputs: &[V],
-        _outputs: &[V],
-        _output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "transpose_linear_program",
-            message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
-        })
     }
 }
 

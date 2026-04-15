@@ -6,8 +6,7 @@ use crate::tracing_v2::{
     FloatExt, TraceError, ZeroLike,
     batch::Batch as BatchedValue,
     forward::JvpTracer,
-    linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -47,20 +46,6 @@ impl<V: MatrixValue> InterpretableOp<V> for MatMulOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
-    }
-}
-
-impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<V> for MatMulOp {
-    fn transpose(
-        &self,
-        _inputs: &[V],
-        _outputs: &[V],
-        _output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
-            op: "transpose_linear_program",
-            message: format!("transpose rule for staged op '{}' is not implemented", self.name()),
-        })
     }
 }
 
