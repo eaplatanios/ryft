@@ -4,6 +4,7 @@ pub mod executable_metadata;
 pub mod ffi;
 pub mod gpu_custom_call;
 pub mod host_allocator;
+pub mod host_memory_allocator;
 pub mod layouts;
 pub mod memory_descriptions;
 pub mod profiler;

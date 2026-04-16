@@ -33,14 +33,19 @@ build:posix --copt=-Wno-error=c23-extensions
 build:linux --config=posix
 build:linux --incompatible_enable_cc_toolchain_resolution
 build:linux --repo_env BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
-build:linux --copt=-mavx
-build:linux --host_copt=-mavx
 build:linux --copt=-Wno-unknown-warning-option
 build:linux --copt=-Wno-stringop-truncation
 build:linux --copt=-Wno-array-parameter
 build:linux --copt=-Wno-deprecated-register
 build:linux --copt=-Wno-register
 build:linux --define=tensorflow_mkldnn_contraction_kernel=1
+build:linux_x86_64 --config=linux
+build:linux_x86_64 --copt=-mavx
+build:linux_x86_64 --host_copt=-mavx
+build:linux_aarch64 --config=linux
+build:linux_aarch64 --copt=-mtune=generic
+build:linux_aarch64 --copt=-march=armv8-a
+build:linux_aarch64 --copt=-O3
 
 # MacOS Configuration
 build:macos --config=posix
@@ -101,13 +106,13 @@ build:cuda-12 --repo_env=HERMETIC_CUDA_VERSION="12.9.1"
 build:cuda-12 --repo_env=HERMETIC_CUDNN_VERSION="9.8.0"
 build:cuda-12 --repo_env=HERMETIC_NVSHMEM_VERSION="3.2.5"
 build:cuda-12 --repo_env=HERMETIC_NCCL_VERSION="2.27.7"
-build:cuda-12 --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_50,sm_60,sm_70,sm_80,sm_90,sm_100,compute_120"
+build:cuda-12 --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_50,sm_60,sm_70,sm_80,sm_90,sm_100,compute_120,compute_121"
 build:cuda-13 --config=cuda
 build:cuda-13 --repo_env=HERMETIC_CUDA_VERSION="13.0.0"
 build:cuda-13 --repo_env=HERMETIC_CUDNN_VERSION="9.12.0"
 build:cuda-13 --repo_env=HERMETIC_NVSHMEM_VERSION="3.3.20"
 build:cuda-13 --repo_env=HERMETIC_NCCL_VERSION="2.29.3"
-build:cuda-13 --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_75,sm_80,sm_90,sm_100,compute_120"
+build:cuda-13 --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_75,sm_80,sm_90,sm_100,compute_120,compute_121"
 
 # ROCm Configuration
 build:rocm --noincompatible_enable_cc_toolchain_resolution
@@ -117,7 +122,7 @@ build:rocm --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
 build:rocm --dynamic_mode=off
 build:rocm --repo_env="OS=ubuntu_22.04"
 build:rocm --action_env TF_ROCM_AMDGPU_TARGETS="gfx900,gfx906,gfx908,gfx90a,gfx942,gfx950,gfx1030,gfx1100,gfx1200,gfx1201"
-build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain-local
+build:rocm --crosstool_top=@local_config_rocm//crosstool:toolchain
 # build:rocm --define=using_rocm=true
 build:rocm --define=using_rocm_hipcc=true
 build:rocm --define=tensorflow_mkldnn_contraction_kernel=0

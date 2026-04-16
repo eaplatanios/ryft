@@ -333,6 +333,25 @@ impl BuildConfiguration {
             .header(pjrt_include_path.join("pjrt_c_api_memory_descriptions_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_phase_compile_extension.h").to_str().unwrap())
             .header(pjrt_include_path.join("pjrt_c_api_profiler_extension.h").to_str().unwrap())
+            .header(
+                xla_include_path
+                    .join("pjrt")
+                    .join("extensions")
+                    .join("host_allocator")
+                    .join("host_allocator_extension.h")
+                    .to_str()
+                    .unwrap(),
+            )
+            .header(
+                xla_include_path
+                    .join("pjrt")
+                    .join("extensions")
+                    .join("host_allocator")
+                    .join("host_memory_allocator")
+                    .join("host_memory_allocator_extension.h")
+                    .to_str()
+                    .unwrap(),
+            )
             .header(xla_include_path.join("ffi").join("api").join("c_api.h").to_str().unwrap())
             .header(xla_include_path.join("service").join("custom_call_status.h").to_str().unwrap())
             .header(
@@ -694,13 +713,27 @@ impl BuildConfiguration {
             }
         }
 
-        let bazel_config = match &self.device {
-            Device::Cpu => format!("--config={}", self.operating_system),
-            Device::Cuda12 => format!("--config={} --config=cuda-12", self.operating_system),
-            Device::Cuda13 => format!("--config={} --config=cuda-13", self.operating_system),
-            Device::Rocm7 => format!("--config={} --config=rocm-7", self.operating_system),
-            Device::Tpu | Device::Neuron | Device::Metal => {
+        let bazel_configs = match (self.operating_system, self.architecture, self.device) {
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => vec!["linux_x86_64"],
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => vec!["linux_x86_64", "cuda-12"],
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => vec!["linux_x86_64", "cuda-13"],
+            (OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => vec!["linux_x86_64", "rocm-7"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => vec!["linux_aarch64"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => vec!["linux_aarch64", "cuda-12"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => vec!["linux_aarch64", "cuda-13"],
+            (OperatingSystem::Linux, Architecture::AArch64, Device::Rocm7) => vec!["linux_aarch64", "rocm-7"],
+            (OperatingSystem::MacOS, _, Device::Cpu) => vec!["macos"],
+            (OperatingSystem::Windows, _, Device::Cpu) => vec!["windows"],
+            (_, _, Device::Tpu | Device::Neuron | Device::Metal) => {
                 bail!("the PJRT {} plugin is closed source and does not support Bazel compilation", self.device)
+            }
+            _ => {
+                bail!(
+                    "the PJRT {} plugin does not support Bazel compilation on {} {}",
+                    self.device,
+                    self.operating_system,
+                    self.architecture,
+                )
             }
         };
 
@@ -709,13 +742,12 @@ impl BuildConfiguration {
             Artifact::PjrtPlugin => "//:pjrt-gpu-plugin",
         };
 
-        let status = Command::new("bazel")
-            .current_dir(&output_path)
-            .arg("build")
-            .arg(bazel_config)
-            .arg("--verbose_failures")
-            .arg(bazel_target)
-            .status()?;
+        let mut bazel_command = Command::new("bazel");
+        bazel_command.current_dir(&output_path).arg("build");
+        for bazel_config in bazel_configs {
+            bazel_command.arg(format!("--config={bazel_config}"));
+        }
+        let status = bazel_command.arg("--verbose_failures").arg(bazel_target).status()?;
 
         if !status.success() {
             bail!("failed to build {}: '{status}'", artifact.name());
@@ -801,22 +833,31 @@ impl BuildConfiguration {
     fn precompiled_artifact_checksum(&self, artifact: Artifact) -> Option<&'static str> {
         match (artifact, self.operating_system, self.architecture, self.device) {
             (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::X86_64, Device::Cpu) => {
-                Some("af59336ef70cb676cfbae23a20d7a474cbd67a122e477a29a8daa1e411777bce")
+                Some("7a0885864e5198f1b06d4acae909a2782084b054b3b88d00523a1aadba75dd09")
+            }
+            (Artifact::RyftXlaSys, OperatingSystem::Linux, Architecture::AArch64, Device::Cpu) => {
+                Some("10471ce254399d117f61afce9d1bc893bc6072e62ca3f30ccbf49cae450717a8")
             }
             (Artifact::RyftXlaSys, OperatingSystem::MacOS, Architecture::AArch64, Device::Cpu) => {
-                Some("c73be003b6111bd7838e5b3bdf3c55cdecbb3bc412102c6702d4ff29e5072657")
+                Some("2fcfb55ff7e9222a087edac39a64c973bb8367887b15083a42ec00c1745dad91")
             }
             (Artifact::RyftXlaSys, OperatingSystem::Windows, Architecture::X86_64, Device::Cpu) => {
-                Some("5d814d3e99206261f72d57fb6756ae5a507681ecc9c20c9d962aacf41513d4cf")
+                Some("35890ec5c68084294014358f73e50fe88b16a6893a61a7232f7ecdf2deb97a54")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda12) => {
-                Some("923fb684f2aa43222676a79c8584099f62b642432b47f763845b8e886befeb8d")
+                Some("474fc234e6612c44a3733a542d844245a93d1df9edeecb3697f440c86d4e1485")
+            }
+            (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda12) => {
+                Some("72a06953e2414647576bd6326be91666ef6a05cb830eee8c5833b188091cd8ae")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Cuda13) => {
-                Some("f1fba4ec1a094cb324ed982fc7c996a6ab4a218569d58fdbcb0fb4c2f770be56")
+                Some("5ccbed44b1c56acfac35b1273c0719273148456d667949fe0ec9ec8e647dae8e")
+            }
+            (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::AArch64, Device::Cuda13) => {
+                Some("055821bc9ac6c80b377d256447936812853e8f8a88083cc808837716f1bfefa0")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Rocm7) => {
-                Some("964330c744e9144d4d4af03a87f6c3819977beaabe46a2820c50474aeb1754ad")
+                Some("8ced71ee2c738f71049c460d553c12afc58151f83c43298cd334913a99e1e4eb")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
                 Some("5e600d7797ac801d0c903f52ae46c03538bb77817a48579aa581faa8d2a8a734")
