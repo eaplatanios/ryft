@@ -12,7 +12,7 @@ use indoc::indoc;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, MatrixOps, One, TraceError, TraceValue, Zero,
+        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         batch::Batch,
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
@@ -195,13 +195,13 @@ pub trait ReshapeTangentSpace<V: ReshapeValue>: TangentSpace<V> {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError>;
 }
 
-impl<V: ReshapeValue + FloatExt + Zero> ReshapeTangentSpace<V> for V {
+impl<V: ReshapeValue + FloatExt + ZeroLike> ReshapeTangentSpace<V> for V {
     fn reshape(_input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         tangent.reshape(output_type.shape.clone())
     }
 }
 
-impl<V: ReshapeValue + FloatExt + Zero + One + MatrixOps> ReshapeTangentSpace<V> for LinearTerm<V> {
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> ReshapeTangentSpace<V> for LinearTerm<V> {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         if input_type == output_type {
             return Ok(tangent);
@@ -378,7 +378,7 @@ impl<V: ReshapeValue> InterpretableOp<V> for ReshapeOp {
     }
 }
 
-impl<V: ReshapeValue + FloatExt + Zero + One + MatrixOps> LinearOp<V> for ReshapeOp {
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> for ReshapeOp {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         if self.input_type() == self.output_type() {
@@ -392,7 +392,7 @@ impl<V: ReshapeValue + FloatExt + Zero + One + MatrixOps> LinearOp<V> for Reshap
     }
 }
 
-impl<V: ReshapeValue + FloatExt + Zero + One + MatrixOps> DifferentiableOp<V, LinearTerm<V>> for ReshapeOp {
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> DifferentiableOp<V, LinearTerm<V>> for ReshapeOp {
     fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])

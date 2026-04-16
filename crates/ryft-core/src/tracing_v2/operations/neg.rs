@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    TraceError, TraceValue, Zero,
+    TraceError, TraceValue, ZeroLike,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     linear::LinearTerm,
@@ -58,7 +58,7 @@ impl<V: TraceValue + Neg<Output = V>> InterpretableOp<V> for NegOp {
     }
 }
 
-impl<V: TraceValue + Neg<Output = V> + Zero> LinearOp<V> for NegOp {
+impl<V: TraceValue + Neg<Output = V> + ZeroLike> LinearOp<V> for NegOp {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone().neg())])

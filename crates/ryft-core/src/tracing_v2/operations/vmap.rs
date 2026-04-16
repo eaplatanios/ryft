@@ -5,7 +5,7 @@ use std::fmt::{Debug, Display};
 use crate::{
     parameters::Parameterized,
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, One, TraceError, TraceValue, Zero,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         linear::{linearize_program, transpose_linear_program_with_output_examples},
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
@@ -82,7 +82,7 @@ impl<V: TraceValue, O: Clone> FlatTracedVMap<V, O> {
     pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
     where
         O: InterpretableOp<V>,
-        V: FloatExt + Zero + One + MatrixOps + ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
         Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     {
         if inputs.len() != self.total_input_count() {
@@ -147,7 +147,7 @@ impl<V: TraceValue> Op for VMapOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -161,8 +161,9 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
+        + Parameterized<V>
         + MatrixOps
         + ReshapeOps
         + std::ops::Add<Output = V>
@@ -207,8 +208,9 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
+        + Parameterized<V>
         + MatrixOps
         + ReshapeOps
         + std::ops::Add<Output = V>
@@ -239,7 +241,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -307,7 +309,7 @@ impl<V: TraceValue> Op for LinearVMapOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -318,7 +320,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -346,8 +348,9 @@ pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<LinearVMapOp<V>, 
 where
     V: TraceValue
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
+        + Parameterized<V>
         + MatrixOps
         + ReshapeOps
         + std::ops::Add<Output = V>

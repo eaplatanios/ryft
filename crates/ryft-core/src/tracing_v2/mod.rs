@@ -48,7 +48,7 @@ pub use ops::{
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};
-pub use value::{ConcreteTraceValue, FloatExt, One, TraceValue, Zero};
+pub use value::{ConcreteTraceValue, FloatExt, One, OneLike, TraceValue, Zero, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

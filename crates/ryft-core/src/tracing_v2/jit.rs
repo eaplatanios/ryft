@@ -17,7 +17,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, InterpretableOp, MatrixOps, One, TraceError, TraceValue, Zero,
+        FloatExt, InterpretableOp, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         graph::AtomId,
         operations::reshape::ReshapeOps,
         ops::PrimitiveOp,
@@ -153,15 +153,7 @@ impl<V: TraceValue> Typed<ArrayType> for JitTracer<V> {
 
 impl<V: TraceValue> TraceValue for JitTracer<V> {}
 
-impl<V: TraceValue + Zero> Zero for JitTracer<V> {
-    #[inline]
-    fn zero(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
-        Err(TraceError::CannotSynthesizeZeroWitness {
-            value_kind: std::any::type_name::<Self>(),
-            abstract_value: r#type,
-        })
-    }
-
+impl<V: TraceValue + ZeroLike> ZeroLike for JitTracer<V> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.value.zero_like();
@@ -170,15 +162,7 @@ impl<V: TraceValue + Zero> Zero for JitTracer<V> {
     }
 }
 
-impl<V: TraceValue + One> One for JitTracer<V> {
-    #[inline]
-    fn one(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
-        Err(TraceError::CannotSynthesizeOneWitness {
-            value_kind: std::any::type_name::<Self>(),
-            abstract_value: r#type,
-        })
-    }
-
+impl<V: TraceValue + OneLike> OneLike for JitTracer<V> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.value.one_like();
@@ -280,7 +264,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         O: InterpretableOp<V>,
-        V: FloatExt + Zero + One + MatrixOps + ReshapeOps,
+        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -302,7 +286,7 @@ fn try_trace_program_with_options<F, Input, Output, V>(
     simplify_program: bool,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -349,7 +333,7 @@ pub fn try_trace_program<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -364,7 +348,7 @@ pub fn try_jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -384,7 +368,7 @@ pub fn jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -461,7 +445,7 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing_v2::{FloatExt, MatrixOps, One, Zero, operations::reshape::ReshapeOps},
+            tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike, operations::reshape::ReshapeOps},
             types::{ArrayType, DataType, Typed},
         };
 
@@ -522,21 +506,13 @@ mod tests {
             }
         }
 
-        impl Zero for TestAbstractValue {
-            fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
-                Ok(Self { r#type })
-            }
-
+        impl ZeroLike for TestAbstractValue {
             fn zero_like(&self) -> Self {
                 self.clone()
             }
         }
 
-        impl One for TestAbstractValue {
-            fn one(r#type: ArrayType) -> Result<Self, TraceError> {
-                Ok(Self { r#type })
-            }
-
+        impl OneLike for TestAbstractValue {
             fn one_like(&self) -> Self {
                 self.clone()
             }

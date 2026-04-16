@@ -10,11 +10,11 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, One, Program, TraceError, TraceValue, Zero,
+        CompiledFunction, FloatExt, JitTracer, OneLike, Program, TraceError, TraceValue, ZeroLike,
         operations::{AddOp, CosOp, FlatTracedVMap, MulOp, NegOp, SinOp, VMapOp},
         ops::{PrimitiveOp, VectorizableOp},
     },
-    types::{ArrayType, Typed},
+    types::Typed,
 };
 use ryft_macros::Parameter;
 
@@ -100,33 +100,17 @@ impl<V: TraceValue + FloatExt> FloatExt for Batch<V> {
     }
 }
 
-impl<V: Parameter + Zero> Zero for Batch<V> {
-    #[inline]
-    fn zero(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
-        Err(TraceError::CannotSynthesizeZeroWitness {
-            value_kind: std::any::type_name::<Self>(),
-            abstract_value: r#type,
-        })
-    }
-
+impl<V: Parameter + ZeroLike> ZeroLike for Batch<V> {
     #[inline]
     fn zero_like(&self) -> Self {
-        Self::new(self.lanes.iter().map(Zero::zero_like).collect())
+        Self::new(self.lanes.iter().map(ZeroLike::zero_like).collect())
     }
 }
 
-impl<V: Parameter + One> One for Batch<V> {
-    #[inline]
-    fn one(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
-        Err(TraceError::CannotSynthesizeOneWitness {
-            value_kind: std::any::type_name::<Self>(),
-            abstract_value: r#type,
-        })
-    }
-
+impl<V: Parameter + OneLike> OneLike for Batch<V> {
     #[inline]
     fn one_like(&self) -> Self {
-        Self::new(self.lanes.iter().map(One::one_like).collect())
+        Self::new(self.lanes.iter().map(OneLike::one_like).collect())
     }
 }
 
@@ -213,8 +197,8 @@ impl<
     V: TraceValue
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
         + crate::tracing_v2::ConcreteTraceValue
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
@@ -242,8 +226,8 @@ impl<
     V: TraceValue
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
@@ -365,8 +349,8 @@ impl<
     V: TraceValue
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,

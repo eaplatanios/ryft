@@ -11,7 +11,8 @@ use std::fmt::{Debug, Display};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, One, Program, TraceError, TraceValue, Zero,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Program, TraceError, TraceValue,
+        ZeroLike,
         jit::try_trace_program,
         linear::{
             linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
@@ -119,7 +120,7 @@ impl<V: TraceValue> Op for RematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for RematerializeOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for RematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -133,10 +134,11 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
         + MatrixOps
         + ReshapeOps
+        + Parameterized<V>
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
@@ -175,10 +177,11 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
         + MatrixOps
         + ReshapeOps
+        + Parameterized<V>
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
@@ -207,7 +210,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
     for RematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -278,7 +281,7 @@ impl<V: TraceValue> Op for LinearRematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearRematerializeOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearRematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -289,7 +292,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -312,10 +315,11 @@ pub fn make_linear_rematerialize<V>(body: &FlatTracedRematerialize<V>) -> Result
 where
     V: TraceValue
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
         + MatrixOps
         + ReshapeOps
+        + Parameterized<V>
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
@@ -363,8 +367,8 @@ impl<
     V: TraceValue
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
         + crate::tracing_v2::ConcreteTraceValue
         + MatrixOps
         + ReshapeOps,
@@ -384,7 +388,7 @@ impl<
 /// stages a [`RematerializeOp`] in the enclosing [`JitTracer`] scope. The sub-program is traced
 /// once over exemplar values and compiled into a [`CompiledFunction`] that lowering can later handle.
 impl<
-    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for JitTracer<V>

@@ -28,7 +28,7 @@ use std::{
 use crate::{
     parameters::Parameterized,
     tracing_v2::{
-        FloatExt, MatrixOps, One, TraceError, TraceValue, Zero,
+        FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         batch::Batch,
         forward::JvpTracer,
         jit::JitTracer,
@@ -822,7 +822,7 @@ impl<V: TraceValue> Op for LinearPrimitiveOp<V> {
 }
 
 /// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for PrimitiveOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -850,7 +850,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for LinearPrimitiveOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -874,7 +874,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
+impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
     for LinearPrimitiveOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -914,8 +914,9 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + Zero
-        + One
+        + ZeroLike
+        + OneLike
+        + Parameterized<V>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -952,8 +953,15 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
-    DifferentiableOp<V, LinearTerm<V>> for PrimitiveOp<V>
+impl<
+    V: TraceValue
+        + FloatExt
+        + ZeroLike
+        + OneLike
+        + Parameterized<V>
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps,
+> DifferentiableOp<V, LinearTerm<V>> for PrimitiveOp<V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,

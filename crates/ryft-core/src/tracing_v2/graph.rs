@@ -6,7 +6,7 @@
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
-    parameters::{Parameterized, ParameterizedFamily, Placeholder},
+    parameters::Parameterized,
     tracing_v2::{InterpretableOp, Op, TraceError, TraceValue, Zero},
     types::{ArrayType, Typed},
 };
@@ -130,10 +130,9 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     #[inline]
     pub fn add_input_abstract_zero(&mut self, abstract_value: ArrayType) -> Result<AtomId, TraceError>
     where
-        V: Zero<V, To<ArrayType> = ArrayType, ParameterStructure = Placeholder>,
-        V::Family: ParameterizedFamily<ArrayType>,
+        ArrayType: Zero<V>,
     {
-        let example_value = V::zero(abstract_value.clone())?;
+        let example_value = abstract_value.zero()?;
         Ok(self.add_input_abstract(abstract_value, example_value))
     }
 
@@ -689,7 +688,10 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{ConcreteTraceValue, FloatExt, MatrixOps, One, TraceError, Zero, ops::PrimitiveOp, test_support},
+        tracing_v2::{
+            ConcreteTraceValue, FloatExt, MatrixOps, One, OneLike, TraceError, Zero, ZeroLike, ops::PrimitiveOp,
+            test_support,
+        },
         types::{ArrayType, DataType, Shape, Typed},
     };
 
@@ -887,23 +889,27 @@ mod tests {
             }
         }
 
-        impl Zero for TestIdentityValue {
-            fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
-                Ok(Self { r#type, value: 0.0 })
-            }
-
+        impl ZeroLike for TestIdentityValue {
             fn zero_like(&self) -> Self {
                 Self::scalar(0.0)
             }
         }
 
-        impl One for TestIdentityValue {
-            fn one(r#type: ArrayType) -> Result<Self, TraceError> {
-                Ok(Self { r#type, value: 1.0 })
+        impl Zero<TestIdentityValue> for ArrayType {
+            fn zero(&self) -> Result<TestIdentityValue, TraceError> {
+                Ok(TestIdentityValue { r#type: self.clone(), value: 0.0 })
             }
+        }
 
+        impl OneLike for TestIdentityValue {
             fn one_like(&self) -> Self {
                 Self::scalar(1.0)
+            }
+        }
+
+        impl One<TestIdentityValue> for ArrayType {
+            fn one(&self) -> Result<TestIdentityValue, TraceError> {
+                Ok(TestIdentityValue { r#type: self.clone(), value: 1.0 })
             }
         }
 

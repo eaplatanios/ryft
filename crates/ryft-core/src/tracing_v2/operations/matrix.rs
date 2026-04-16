@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, TraceError, TraceValue, Zero,
+        FloatExt, TraceError, TraceValue, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
@@ -74,7 +74,7 @@ pub trait MatrixTangentSpace<V: MatrixValue>: TangentSpace<V> {
     fn transpose_matrix(value: Self) -> Self;
 }
 
-impl<V: MatrixValue + FloatExt + Zero> MatrixTangentSpace<V> for V {
+impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for V {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
         factor.matmul(tangent)
@@ -237,7 +237,7 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
     }
 }
 
-impl<V: MatrixValue + FloatExt + Zero> MatrixTangentSpace<V> for LinearTerm<V> {
+impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<V> {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
         tangent.apply_linear_op(LinearPrimitiveOp::LeftMatMul { factor })
@@ -261,7 +261,7 @@ mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, FloatExt, One, TraceError, TraceValue, Zero},
+        tracing_v2::{CoordinateValue, FloatExt, One, OneLike, TraceError, TraceValue, Zero, ZeroLike},
         types::{ArrayType, DataType, Size, Typed},
     };
 
@@ -345,73 +345,81 @@ mod ndarray_support {
 
     impl crate::tracing_v2::ConcreteTraceValue for Array2<f64> {}
 
-    impl Zero for Array2<f32> {
-        #[inline]
-        fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
-            let (rows, cols) = static_matrix_shape(&r#type, DataType::F32, |abstract_value| {
-                TraceError::CannotSynthesizeZeroWitness {
-                    value_kind: std::any::type_name::<Self>(),
-                    abstract_value: abstract_value.clone(),
-                }
-            })?;
-            Ok(Array2::from_elem((rows, cols), 0.0))
-        }
-
+    impl ZeroLike for Array2<f32> {
         #[inline]
         fn zero_like(&self) -> Self {
             Array2::from_elem(self.raw_dim(), 0.0)
         }
     }
 
-    impl Zero for Array2<f64> {
+    impl Zero<Array2<f32>> for ArrayType {
         #[inline]
-        fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
-            let (rows, cols) = static_matrix_shape(&r#type, DataType::F64, |abstract_value| {
+        fn zero(&self) -> Result<Array2<f32>, TraceError> {
+            let (rows, cols) = static_matrix_shape(self, DataType::F32, |abstract_value| {
                 TraceError::CannotSynthesizeZeroWitness {
-                    value_kind: std::any::type_name::<Self>(),
+                    value_kind: std::any::type_name::<Array2<f32>>(),
                     abstract_value: abstract_value.clone(),
                 }
             })?;
             Ok(Array2::from_elem((rows, cols), 0.0))
         }
+    }
 
+    impl ZeroLike for Array2<f64> {
         #[inline]
         fn zero_like(&self) -> Self {
             Array2::from_elem(self.raw_dim(), 0.0)
         }
     }
 
-    impl One for Array2<f32> {
+    impl Zero<Array2<f64>> for ArrayType {
         #[inline]
-        fn one(r#type: ArrayType) -> Result<Self, TraceError> {
-            let (rows, cols) =
-                static_matrix_shape(&r#type, DataType::F32, |abstract_value| TraceError::CannotSynthesizeOneWitness {
-                    value_kind: std::any::type_name::<Self>(),
+        fn zero(&self) -> Result<Array2<f64>, TraceError> {
+            let (rows, cols) = static_matrix_shape(self, DataType::F64, |abstract_value| {
+                TraceError::CannotSynthesizeZeroWitness {
+                    value_kind: std::any::type_name::<Array2<f64>>(),
                     abstract_value: abstract_value.clone(),
-                })?;
-            Ok(Array2::from_elem((rows, cols), 1.0))
+                }
+            })?;
+            Ok(Array2::from_elem((rows, cols), 0.0))
         }
+    }
 
+    impl OneLike for Array2<f32> {
         #[inline]
         fn one_like(&self) -> Self {
             Array2::from_elem(self.raw_dim(), 1.0)
         }
     }
 
-    impl One for Array2<f64> {
+    impl One<Array2<f32>> for ArrayType {
         #[inline]
-        fn one(r#type: ArrayType) -> Result<Self, TraceError> {
+        fn one(&self) -> Result<Array2<f32>, TraceError> {
             let (rows, cols) =
-                static_matrix_shape(&r#type, DataType::F64, |abstract_value| TraceError::CannotSynthesizeOneWitness {
-                    value_kind: std::any::type_name::<Self>(),
+                static_matrix_shape(self, DataType::F32, |abstract_value| TraceError::CannotSynthesizeOneWitness {
+                    value_kind: std::any::type_name::<Array2<f32>>(),
                     abstract_value: abstract_value.clone(),
                 })?;
             Ok(Array2::from_elem((rows, cols), 1.0))
         }
+    }
 
+    impl OneLike for Array2<f64> {
         #[inline]
         fn one_like(&self) -> Self {
             Array2::from_elem(self.raw_dim(), 1.0)
+        }
+    }
+
+    impl One<Array2<f64>> for ArrayType {
+        #[inline]
+        fn one(&self) -> Result<Array2<f64>, TraceError> {
+            let (rows, cols) =
+                static_matrix_shape(self, DataType::F64, |abstract_value| TraceError::CannotSynthesizeOneWitness {
+                    value_kind: std::any::type_name::<Array2<f64>>(),
+                    abstract_value: abstract_value.clone(),
+                })?;
+            Ok(Array2::from_elem((rows, cols), 1.0))
         }
     }
 
