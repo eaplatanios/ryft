@@ -689,9 +689,7 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{
-            ConcreteTraceValue, FloatExt, MatrixOps, One, TraceError, Zero, ops::PrimitiveOp, test_support,
-        },
+        tracing_v2::{ConcreteTraceValue, FloatExt, MatrixOps, One, TraceError, Zero, ops::PrimitiveOp, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 

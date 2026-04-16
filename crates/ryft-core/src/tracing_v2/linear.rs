@@ -1820,7 +1820,9 @@ where
 /// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
 /// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOp`]
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
-fn segment_program<V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
+fn segment_program<
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+>(
     program: &Program<V, Vec<V>, Vec<V>>,
     segment_size: usize,
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError>
@@ -1994,7 +1996,9 @@ where
 }
 
 /// Wraps an entire program in a single [`RematerializeOp`] boundary.
-fn wrap_program_in_rematerialize<V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
+fn wrap_program_in_rematerialize<
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+>(
     program: &Program<V, Vec<V>, Vec<V>>,
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError>
 where
@@ -2060,7 +2064,9 @@ where
 /// The sub-program takes the boundary input atoms as its inputs and produces the boundary output atoms as its
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
 /// and equations within the sub-program.
-fn build_segment_sub_program<V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
+fn build_segment_sub_program<
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+>(
     graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
     representative_values: &[V],
     segment_equations: &[Equation<ProgramOpRef<V>>],
