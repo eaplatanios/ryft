@@ -156,12 +156,28 @@ pub trait Value: Traceable {}
 /// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
 pub trait Traceable: Clone + Parameter + Typed<ArrayType> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
+    ///
+    /// The graph builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)
+    /// to detect and eliminate algebraic identities at staging time — for example, folding `x + 0` into `x` or `x * 0`
+    /// into `0` without emitting the operation into the staged graph.
+    ///
+    /// The default returns `false`, which is always safe: it simply opts the value out of identity-based
+    /// simplification. Concrete leaf types that can inspect their contents (e.g., `f32`, dense arrays) should override
+    /// this to return an accurate answer. Tracing wrappers like [`JitTracer`](crate::tracing_v2::JitTracer) cannot
+    /// meaningfully inspect their contents at staging time and therefore keep the default.
     #[inline]
     fn is_zero(&self) -> bool {
         false
     }
 
     /// Returns `true` if every element of this value is exactly one.
+    ///
+    /// This is the multiplicative-identity counterpart of [`Traceable::is_zero`]. The graph builder uses it during
+    /// [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify) to fold operations like `x * 1` into `x` or
+    /// `scale(x, 1)` into `x`.
+    ///
+    /// The same defaulting rationale applies: `false` is always safe, and only concrete leaf types that can inspect
+    /// their contents should override this.
     #[inline]
     fn is_one(&self) -> bool {
         false
