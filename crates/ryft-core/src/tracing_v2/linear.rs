@@ -16,7 +16,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        ConcreteTraceValue, FloatExt, MatrixOps, OneLike, TraceError, TraceValue, Zero, ZeroLike,
+        ConcreteTraceValue, FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
         batch::{Batch, stack, unstack},
         forward::{JvpTracer, TangentSpace},
         graph::{AtomId, AtomSource, Equation, Graph},
@@ -213,7 +213,6 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
             + MatrixOps
             + ReshapeOps,
         V::Family: ParameterizedFamily<ArrayType>,
-        ArrayType: Zero<V>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -405,12 +404,12 @@ where
         + MatrixOps
         + ReshapeOps,
     V::Family: ParameterizedFamily<ArrayType>,
-    ArrayType: Zero<V>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
+    let zero = program.zero.zero_like();
     transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V>, abstract_value, _| {
-        builder.add_input_abstract_zero(abstract_value.clone())
+        Ok(builder.add_input_abstract(abstract_value.clone(), zero.clone()))
     })
 }
 

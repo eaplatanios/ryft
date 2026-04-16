@@ -39,15 +39,17 @@ pub trait ZeroLike: Clone {
 /// Synthesizes a zero value from abstract [`ArrayType`] metadata alone.
 ///
 /// Unlike [`ZeroLike`], which produces a zero from an existing exemplar value, this trait is implemented on the
-/// _type-metadata_ side: `Self` is a type parameterized by [`ArrayType`] (e.g., [`ArrayType`] itself for scalar
-/// leaves, or `Pair<ArrayType>` for compound structures), and [`Zero::zero`] produces the corresponding concrete value
-/// by reparameterizing from [`ArrayType`] to `P`.
+/// _type-metadata_ side: `Self` is a type parameterized by [`ArrayType`] (e.g., [`ArrayType`] itself for backend
+/// array leaves, or `Pair<ArrayType>` for compound structures), and [`Zero::zero`] produces the corresponding
+/// concrete value by reparameterizing from [`ArrayType`] to `P`.
 ///
-/// This trait is only meaningful for concrete leaf types and parameterized containers of them — tracer wrappers that
-/// carry builder state cannot be synthesized from metadata.
+/// The target value type `P` must be capable of representing any shape described by the metadata. This makes the
+/// conversion infallible — the trait should only be implemented when every metadata value maps to a valid zero of type
+/// `P`. For value types that cannot represent arbitrary shapes (e.g., `f32` can only represent scalar metadata), use
+/// [`ZeroLike`] instead, which produces a zero from an existing exemplar value.
 pub trait Zero<P: Parameter>: Parameterized<ArrayType> {
     /// Constructs one zero value from the abstract metadata in `self`.
-    fn zero(&self) -> Result<Self::To<P>, crate::tracing_v2::TraceError>
+    fn zero(&self) -> Self::To<P>
     where
         Self::Family: ParameterizedFamily<P>;
 }
@@ -63,10 +65,11 @@ pub trait OneLike: Clone {
 /// Synthesizes a one value from abstract [`ArrayType`] metadata alone.
 ///
 /// This mirrors [`Zero`] for the multiplicative identity. `Self` is a type parameterized by [`ArrayType`], and
-/// [`One::one`] produces the corresponding concrete value by reparameterizing from [`ArrayType`] to `P`.
+/// [`One::one`] produces the corresponding concrete value by reparameterizing from [`ArrayType`] to `P`. Like
+/// [`Zero`], this trait should only be implemented when every metadata value maps to a valid one of type `P`.
 pub trait One<P: Parameter>: Parameterized<ArrayType> {
     /// Constructs one one-valued value from the abstract metadata in `self`.
-    fn one(&self) -> Result<Self::To<P>, crate::tracing_v2::TraceError>
+    fn one(&self) -> Self::To<P>
     where
         Self::Family: ParameterizedFamily<P>;
 }
@@ -136,38 +139,10 @@ impl ZeroLike for f32 {
     }
 }
 
-impl Zero<f32> for ArrayType {
-    #[inline]
-    fn zero(&self) -> Result<f32, crate::tracing_v2::TraceError> {
-        if *self == ArrayType::scalar(crate::types::DataType::F32) {
-            Ok(0.0)
-        } else {
-            Err(crate::tracing_v2::TraceError::CannotSynthesizeZeroWitness {
-                value_kind: std::any::type_name::<f32>(),
-                abstract_value: self.clone(),
-            })
-        }
-    }
-}
-
 impl OneLike for f32 {
     #[inline]
     fn one_like(&self) -> Self {
         1.0
-    }
-}
-
-impl One<f32> for ArrayType {
-    #[inline]
-    fn one(&self) -> Result<f32, crate::tracing_v2::TraceError> {
-        if *self == ArrayType::scalar(crate::types::DataType::F32) {
-            Ok(1.0)
-        } else {
-            Err(crate::tracing_v2::TraceError::CannotSynthesizeOneWitness {
-                value_kind: std::any::type_name::<f32>(),
-                abstract_value: self.clone(),
-            })
-        }
     }
 }
 
@@ -204,20 +179,6 @@ impl ZeroLike for f64 {
     }
 }
 
-impl Zero<f64> for ArrayType {
-    #[inline]
-    fn zero(&self) -> Result<f64, crate::tracing_v2::TraceError> {
-        if *self == ArrayType::scalar(crate::types::DataType::F64) {
-            Ok(0.0)
-        } else {
-            Err(crate::tracing_v2::TraceError::CannotSynthesizeZeroWitness {
-                value_kind: std::any::type_name::<f64>(),
-                abstract_value: self.clone(),
-            })
-        }
-    }
-}
-
 impl OneLike for f64 {
     #[inline]
     fn one_like(&self) -> Self {
@@ -225,27 +186,9 @@ impl OneLike for f64 {
     }
 }
 
-impl One<f64> for ArrayType {
-    #[inline]
-    fn one(&self) -> Result<f64, crate::tracing_v2::TraceError> {
-        if *self == ArrayType::scalar(crate::types::DataType::F64) {
-            Ok(1.0)
-        } else {
-            Err(crate::tracing_v2::TraceError::CannotSynthesizeOneWitness {
-                value_kind: std::any::type_name::<f64>(),
-                abstract_value: self.clone(),
-            })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use ryft_macros::Parameterized;
-
     use crate::{
-        parameters::Parameter,
-        tracing_v2::TraceError,
         tracing_v2::test_support,
         types::ArrayType,
         types::{DataType, Typed},
@@ -254,54 +197,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scalar_leaf_traits_report_expected_values() {
+    fn test_scalar_leaf_traits_report_expected_values() {
         assert_eq!(<f32 as Typed<ArrayType>>::tpe(&1.25f32), ArrayType::scalar(DataType::F32));
         assert_eq!(<f64 as Typed<ArrayType>>::tpe(&2.5f64), ArrayType::scalar(DataType::F64));
         assert_eq!(ZeroLike::zero_like(&3.0f32), 0.0);
+        assert_eq!(ZeroLike::zero_like(&7.0f64), 0.0);
+        assert_eq!(OneLike::one_like(&3.0f32), 1.0);
         assert_eq!(OneLike::one_like(&3.0f64), 1.0);
-        assert_eq!(Zero::<f32>::zero(&ArrayType::scalar(DataType::F32)), Ok(0.0));
-        assert_eq!(Zero::<f64>::zero(&ArrayType::scalar(DataType::F64)), Ok(0.0));
-        assert_eq!(One::<f32>::one(&ArrayType::scalar(DataType::F32)), Ok(1.0));
-        assert_eq!(One::<f64>::one(&ArrayType::scalar(DataType::F64)), Ok(1.0));
         test_support::assert_reference_scalar_sine_jit_rendering();
-    }
-
-    #[test]
-    fn parameterized_zero_and_one_accept_structured_array_types() {
-        #[derive(Clone, Debug, PartialEq, Parameterized)]
-        #[ryft(crate = "crate::parameters")]
-        struct Pair<T: Parameter> {
-            left: T,
-            right: T,
-        }
-
-        impl ZeroLike for Pair<f32> {
-            fn zero_like(&self) -> Self {
-                Self { left: 0.0, right: 0.0 }
-            }
-        }
-
-        impl Zero<f32> for Pair<ArrayType> {
-            fn zero(&self) -> Result<Pair<f32>, TraceError> {
-                Ok(Pair { left: Zero::<f32>::zero(&self.left)?, right: Zero::<f32>::zero(&self.right)? })
-            }
-        }
-
-        impl OneLike for Pair<f32> {
-            fn one_like(&self) -> Self {
-                Self { left: 1.0, right: 1.0 }
-            }
-        }
-
-        impl One<f32> for Pair<ArrayType> {
-            fn one(&self) -> Result<Pair<f32>, TraceError> {
-                Ok(Pair { left: One::<f32>::one(&self.left)?, right: One::<f32>::one(&self.right)? })
-            }
-        }
-
-        let abstract_value = Pair { left: ArrayType::scalar(DataType::F32), right: ArrayType::scalar(DataType::F32) };
-        assert_eq!(Zero::<f32>::zero(&abstract_value), Ok(Pair { left: 0.0, right: 0.0 }));
-        assert_eq!(One::<f32>::one(&abstract_value), Ok(Pair { left: 1.0, right: 1.0 }));
     }
 
     #[test]

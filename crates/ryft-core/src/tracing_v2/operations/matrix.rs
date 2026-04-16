@@ -261,24 +261,9 @@ mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, FloatExt, One, OneLike, TraceError, TraceValue, Zero, ZeroLike},
-        types::{ArrayType, DataType, Size, Typed},
+        tracing_v2::{CoordinateValue, FloatExt, OneLike, TraceValue, ZeroLike},
+        types::{ArrayType, DataType, Typed},
     };
-
-    fn static_matrix_shape(
-        abstract_value: &ArrayType,
-        data_type: DataType,
-        make_error: impl Fn(&ArrayType) -> TraceError,
-    ) -> Result<(usize, usize), TraceError> {
-        if abstract_value.data_type != data_type || abstract_value.layout.is_some() || abstract_value.sharding.is_some()
-        {
-            return Err(make_error(abstract_value));
-        }
-        match abstract_value.shape.dimensions.as_slice() {
-            [Size::Static(rows), Size::Static(cols)] => Ok((*rows, *cols)),
-            _ => Err(make_error(abstract_value)),
-        }
-    }
 
     impl Parameter for Array2<f32> {}
     impl Parameter for Array2<f64> {}
@@ -352,36 +337,10 @@ mod ndarray_support {
         }
     }
 
-    impl Zero<Array2<f32>> for ArrayType {
-        #[inline]
-        fn zero(&self) -> Result<Array2<f32>, TraceError> {
-            let (rows, cols) = static_matrix_shape(self, DataType::F32, |abstract_value| {
-                TraceError::CannotSynthesizeZeroWitness {
-                    value_kind: std::any::type_name::<Array2<f32>>(),
-                    abstract_value: abstract_value.clone(),
-                }
-            })?;
-            Ok(Array2::from_elem((rows, cols), 0.0))
-        }
-    }
-
     impl ZeroLike for Array2<f64> {
         #[inline]
         fn zero_like(&self) -> Self {
             Array2::from_elem(self.raw_dim(), 0.0)
-        }
-    }
-
-    impl Zero<Array2<f64>> for ArrayType {
-        #[inline]
-        fn zero(&self) -> Result<Array2<f64>, TraceError> {
-            let (rows, cols) = static_matrix_shape(self, DataType::F64, |abstract_value| {
-                TraceError::CannotSynthesizeZeroWitness {
-                    value_kind: std::any::type_name::<Array2<f64>>(),
-                    abstract_value: abstract_value.clone(),
-                }
-            })?;
-            Ok(Array2::from_elem((rows, cols), 0.0))
         }
     }
 
@@ -392,34 +351,10 @@ mod ndarray_support {
         }
     }
 
-    impl One<Array2<f32>> for ArrayType {
-        #[inline]
-        fn one(&self) -> Result<Array2<f32>, TraceError> {
-            let (rows, cols) =
-                static_matrix_shape(self, DataType::F32, |abstract_value| TraceError::CannotSynthesizeOneWitness {
-                    value_kind: std::any::type_name::<Array2<f32>>(),
-                    abstract_value: abstract_value.clone(),
-                })?;
-            Ok(Array2::from_elem((rows, cols), 1.0))
-        }
-    }
-
     impl OneLike for Array2<f64> {
         #[inline]
         fn one_like(&self) -> Self {
             Array2::from_elem(self.raw_dim(), 1.0)
-        }
-    }
-
-    impl One<Array2<f64>> for ArrayType {
-        #[inline]
-        fn one(&self) -> Result<Array2<f64>, TraceError> {
-            let (rows, cols) =
-                static_matrix_shape(self, DataType::F64, |abstract_value| TraceError::CannotSynthesizeOneWitness {
-                    value_kind: std::any::type_name::<Array2<f64>>(),
-                    abstract_value: abstract_value.clone(),
-                })?;
-            Ok(Array2::from_elem((rows, cols), 1.0))
         }
     }
 

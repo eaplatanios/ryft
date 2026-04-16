@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use crate::{parameters::ParameterError, types::ArrayType};
+use crate::parameters::ParameterError;
 
 pub(crate) mod batch;
 #[cfg(feature = "benchmarking")]
@@ -84,14 +84,6 @@ pub enum TraceError {
     /// Abstract evaluation detected incompatible operand metadata for a primitive application.
     #[error("incompatible abstract values while tracing operation '{op}'")]
     IncompatibleAbstractValues { op: &'static str },
-
-    /// A transform could not synthesize one zero witness from abstract metadata alone.
-    #[error("cannot synthesize zero witness of kind '{value_kind}' from abstract value '{abstract_value}'")]
-    CannotSynthesizeZeroWitness { value_kind: &'static str, abstract_value: ArrayType },
-
-    /// A transform could not synthesize one one-valued witness from abstract metadata alone.
-    #[error("cannot synthesize one witness of kind '{value_kind}' from abstract value '{abstract_value}'")]
-    CannotSynthesizeOneWitness { value_kind: &'static str, abstract_value: ArrayType },
 
     /// A custom primitive was used by a transform without registering the required rule.
     #[error("custom primitive '{op}' does not provide a '{transform}' rule")]
