@@ -8,6 +8,7 @@ use std::{
 use crate::tracing_v2::{
     TraceError, Traceable, ZeroLike,
     batch::Batch,
+    engine::Engine,
     forward::{JvpTracer, TangentSpace},
     linear::LinearTerm,
     ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
@@ -71,7 +72,11 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOp<ArrayType, V
 impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T>
     for NegOp
 {
-    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+    fn jvp(
+        &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        inputs: &[JvpTracer<V, T>],
+    ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: T::neg(inputs[0].tangent.clone()) }])
     }

@@ -5,6 +5,7 @@ use std::fmt::{Debug, Display};
 use crate::tracing_v2::{
     FloatExt, TraceError, Traceable,
     batch::Batch,
+    engine::Engine,
     forward::{JvpTracer, TangentSpace},
     ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
@@ -46,7 +47,11 @@ impl<V: Traceable<ArrayType> + FloatExt> InterpretableOp<ArrayType, V> for CosOp
 }
 
 impl<V: Traceable<ArrayType> + FloatExt, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for CosOp {
-    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+    fn jvp(
+        &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        inputs: &[JvpTracer<V, T>],
+    ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
         Ok(vec![JvpTracer {

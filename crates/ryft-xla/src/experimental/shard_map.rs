@@ -342,6 +342,34 @@ impl OneLike for ShardMapTensor {
     }
 }
 
+/// Stateless [`ryft_core::tracing_v2::engine::Engine`] for synthesizing [`ShardMapTensor`] values from
+/// abstract [`ArrayType`] metadata.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ShardMapTensorEngine;
+
+impl ShardMapTensorEngine {
+    /// Returns a new [`ShardMapTensorEngine`]. This is a no-op at runtime since the engine is zero-sized.
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+}
+
+impl ryft_core::tracing_v2::engine::Engine for ShardMapTensorEngine {
+    type Type = ArrayType;
+    type Value = ShardMapTensor;
+
+    #[inline]
+    fn zero(&self, r#type: &ArrayType) -> ShardMapTensor {
+        ShardMapTensor::constant(without_varying_manual_axes(r#type), ShardMapConstantKind::Zero)
+    }
+
+    #[inline]
+    fn one(&self, r#type: &ArrayType) -> ShardMapTensor {
+        ShardMapTensor::constant(without_varying_manual_axes(r#type), ShardMapConstantKind::One)
+    }
+}
+
 impl Add for ShardMapTensor {
     type Output = Self;
 
@@ -3011,8 +3039,12 @@ mod tests {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x: ShardMapTracer| {
-                let gradient: ShardMapTracer =
-                    grad(|y: ShardMapTracer| y.sin(), x.clone()).expect("gradient inside shard_map should succeed");
+                let gradient: ShardMapTracer = grad(
+                    &crate::experimental::shard_map::ShardMapTensorEngine::new(),
+                    |y: ShardMapTracer| y.sin(),
+                    x.clone(),
+                )
+                .expect("gradient inside shard_map should succeed");
                 let lanes: Vec<ShardMapTracer> = vmap(
                     |y: ryft_core::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
                     vec![gradient.clone(), gradient],
@@ -3178,6 +3210,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     grad(
+                        &crate::experimental::shard_map::ShardMapTensorEngine::new(),
                         {
                             let mesh = mesh.clone();
                             let sharding = sharding.clone();

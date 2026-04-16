@@ -31,6 +31,7 @@ use crate::{
     tracing_v2::{
         FloatExt, MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
         batch::Batch,
+        engine::Engine,
         forward::JvpTracer,
         jit::JitTracer,
         linear::{LinearTerm, Linearized},
@@ -165,7 +166,15 @@ pub trait LinearOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter>: 
 /// [`MatrixTangentSpace`]: crate::tracing_v2::MatrixTangentSpace
 pub trait DifferentiableOp<T: Type + Clone, V: Typed<T>, Tangent>: Op<T> {
     /// Applies the forward-mode JVP rule.
-    fn jvp(&self, inputs: &[JvpTracer<V, Tangent>]) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError>;
+    ///
+    /// The `engine` argument carries the context needed to synthesize zero values for higher-order
+    /// ops that replay staged sub-programs (such as [`RematerializeOp`](crate::tracing_v2::operations::RematerializeOp)
+    /// and [`VMapOp`](crate::tracing_v2::operations::VMapOp)). Pure arithmetic ops ignore it.
+    fn jvp(
+        &self,
+        engine: &dyn Engine<Type = T, Value = V>,
+        inputs: &[JvpTracer<V, Tangent>],
+    ) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError>;
 }
 
 /// Primitive operation with a batching rule used by `vmap`.
@@ -391,9 +400,10 @@ impl<V: Traceable<ArrayType>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayTyp
 {
     fn jvp(
         &self,
+        engine: &dyn Engine<Type = ArrayType, Value = V>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
-        self.jvp_rule()?.jvp(inputs)
+        self.jvp_rule()?.jvp(engine, inputs)
     }
 }
 
@@ -678,8 +688,12 @@ impl<O: DifferentiableOp<T, V, Tangent> + ?Sized, T: Type + Clone, V: Traceable<
     DifferentiableOp<T, V, Tangent> for Arc<O>
 {
     #[inline]
-    fn jvp(&self, inputs: &[JvpTracer<V, Tangent>]) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError> {
-        (**self).jvp(inputs)
+    fn jvp(
+        &self,
+        engine: &dyn Engine<Type = T, Value = V>,
+        inputs: &[JvpTracer<V, Tangent>],
+    ) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError> {
+        (**self).jvp(engine, inputs)
     }
 }
 
@@ -1075,35 +1089,43 @@ where
 {
     fn jvp(
         &self,
+        engine: &dyn Engine<Type = ArrayType, Value = V>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         match self {
-            Self::Add => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&AddOp, inputs),
-            Self::Mul => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MulOp, inputs),
-            Self::Neg => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&NegOp, inputs),
-            Self::Sin => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&SinOp, inputs),
-            Self::Cos => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&CosOp, inputs),
-            Self::Scale { factor } => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&ScaleOp::new(factor.clone()), inputs)
-            }
-            Self::MatMul => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MatMulOp, inputs),
+            Self::Add => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&AddOp, engine, inputs),
+            Self::Mul => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MulOp, engine, inputs),
+            Self::Neg => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&NegOp, engine, inputs),
+            Self::Sin => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&SinOp, engine, inputs),
+            Self::Cos => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&CosOp, engine, inputs),
+            Self::Scale { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+                &ScaleOp::new(factor.clone()),
+                engine,
+                inputs,
+            ),
+            Self::MatMul => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MatMulOp, engine, inputs),
             Self::MatrixTranspose => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MatrixTransposeOp, inputs)
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MatrixTransposeOp, engine, inputs)
             }
-            Self::LinearMatrixTranspose => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&LinearMatrixTransposeOp, inputs)
-            }
+            Self::LinearMatrixTranspose => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+                &LinearMatrixTransposeOp,
+                engine,
+                inputs,
+            ),
             Self::LeftMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
                 &LeftMatMulOp::new(factor.clone()),
+                engine,
                 inputs,
             ),
             Self::RightMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
                 &RightMatMulOp::new(factor.clone()),
+                engine,
                 inputs,
             ),
             Self::Reshape { input_type, output_type } => {
                 DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
                     &ReshapeOp::new(input_type.clone(), output_type.clone()),
+                    engine,
                     inputs,
                 )
             }
@@ -1112,9 +1134,9 @@ where
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
             Self::Rematerialize(remat) => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(remat.as_ref(), inputs)
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(remat.as_ref(), engine, inputs)
             }
-            Self::Custom(op) => op.jvp(inputs),
+            Self::Custom(op) => op.jvp(engine, inputs),
         }
     }
 }
@@ -1146,7 +1168,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{Batch, CompiledFunction, LinearProgramBuilder, TraceError, grad, jvp, try_jit, vmap};
+    use crate::tracing_v2::{
+        Batch, CompiledFunction, LinearProgramBuilder, TraceError, engine::ArrayScalarEngine, grad, jvp, try_jit, vmap,
+    };
     use crate::types::{ArrayType, DataType, Shape};
 
     use super::*;
@@ -1207,6 +1231,7 @@ mod tests {
     impl DifferentiableOp<ArrayType, f64, LinearTerm<ArrayType, f64>> for ShiftOp {
         fn jvp(
             &self,
+            _engine: &dyn Engine<Type = ArrayType, Value = f64>,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TraceError> {
             if inputs.len() != 1 {
@@ -1322,8 +1347,10 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_missing_jvp_rule_reports_targeted_error() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
         let result: Result<(f64, f64), TraceError> = jvp(
+            &engine,
             {
                 let primitive = primitive.clone();
                 move |x: JitTracer<ArrayType, f64>| stage_custom_traced_unary(x, primitive.clone())
@@ -1337,12 +1364,14 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
         let result: Result<(f64, CompiledFunction<ArrayType, f64, f64, f64>), TraceError> = try_jit(
             {
                 let primitive = primitive.clone();
                 move |x: JitTracer<ArrayType, f64>| {
                     let (primal, tangent) = jvp(
+                        &engine,
                         {
                             let primitive = primitive.clone();
                             move |inner: JitTracer<ArrayType, f64>| stage_custom_traced_unary(inner, primitive.clone())
@@ -1364,12 +1393,14 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_jvp_rule_participates_in_grad_and_linearized_jit_replay() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
             .with_jvp_rule(ShiftOp::new(2.0))
             .with_linearized_jit_rule(ShiftOp::new(2.0));
 
         assert_eq!(
             grad(
+                &engine,
                 {
                     let primitive = primitive.clone();
                     move |x: JitTracer<ArrayType, f64>| stage_custom_traced_unary(x, primitive.clone())
@@ -1384,6 +1415,7 @@ mod tests {
                 let primitive = primitive.clone();
                 move |x: JitTracer<ArrayType, f64>| {
                     let (primal, tangent) = jvp(
+                        &engine,
                         {
                             let primitive = primitive.clone();
                             move |inner: JitTracer<ArrayType, f64>| stage_custom_traced_unary(inner, primitive.clone())

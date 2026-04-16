@@ -255,17 +255,74 @@ impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<
 }
 
 #[cfg(any(feature = "ndarray", test))]
-mod ndarray_support {
+pub mod ndarray_support {
     use std::borrow::Cow;
+    use std::marker::PhantomData;
 
     use ndarray::Array2;
 
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, FloatExt, OneLike, Traceable, ZeroLike},
+        tracing_v2::{CoordinateValue, FloatExt, OneLike, Traceable, ZeroLike, engine::Engine},
         types::{ArrayType, DataType, Typed},
     };
+
+    /// Stateless engine that synthesizes [`Array2`] values from [`ArrayType`] metadata.
+    ///
+    /// [`Array2Engine<V>`] is a zero-sized type used whenever a matrix pipeline needs an engine
+    /// whose [`Type`](Engine::Type) is [`ArrayType`] and whose [`Value`](Engine::Value) is an
+    /// [`Array2<V>`]. The engine reads the rank-2 shape off the supplied [`ArrayType`] metadata
+    /// and returns a uniformly filled matrix of the requested shape.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Array2Engine<V> {
+        marker: PhantomData<fn() -> V>,
+    }
+
+    impl<V> Array2Engine<V> {
+        /// Returns a new [`Array2Engine<V>`]. This is a no-op at runtime since the engine is
+        /// zero-sized.
+        #[inline]
+        pub const fn new() -> Self {
+            Self { marker: PhantomData }
+        }
+    }
+
+    fn matrix_extent(r#type: &ArrayType) -> (usize, usize) {
+        let rows = r#type.dimension(0).value().expect("Array2Engine requires a static row count");
+        let cols = r#type.dimension(1).value().expect("Array2Engine requires a static column count");
+        (rows, cols)
+    }
+
+    impl Engine for Array2Engine<f32> {
+        type Type = ArrayType;
+        type Value = Array2<f32>;
+
+        #[inline]
+        fn zero(&self, r#type: &ArrayType) -> Array2<f32> {
+            Array2::from_elem(matrix_extent(r#type), 0.0)
+        }
+
+        #[inline]
+        fn one(&self, r#type: &ArrayType) -> Array2<f32> {
+            Array2::from_elem(matrix_extent(r#type), 1.0)
+        }
+    }
+
+    impl Engine for Array2Engine<f64> {
+        type Type = ArrayType;
+        type Value = Array2<f64>;
+
+        #[inline]
+        fn zero(&self, r#type: &ArrayType) -> Array2<f64> {
+            Array2::from_elem(matrix_extent(r#type), 0.0)
+        }
+
+        #[inline]
+        fn one(&self, r#type: &ArrayType) -> Array2<f64> {
+            Array2::from_elem(matrix_extent(r#type), 1.0)
+        }
+    }
 
     impl Parameter for Array2<f32> {}
     impl Parameter for Array2<f64> {}

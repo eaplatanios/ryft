@@ -14,6 +14,7 @@ use crate::{
     tracing_v2::{
         FloatExt, MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
         batch::Batch,
+        engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
@@ -400,6 +401,7 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps>
 {
     fn jvp(
         &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -677,7 +679,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
         let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
         let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ndarray::Array2<f64>>::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input_abstract(output_value.clone());
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&output_value);
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ReshapeOp::new(
             input_type.clone(),

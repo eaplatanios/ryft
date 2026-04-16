@@ -476,9 +476,10 @@ mod tests {
     #[test]
     fn test_vmap_of_grad_computes_per_lane_gradients() {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
+        let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let gradients: Vec<f64> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::grad(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), batch)
+                crate::tracing_v2::grad(&engine, |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), batch)
                     .expect("batched grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
@@ -494,10 +495,15 @@ mod tests {
     #[test]
     fn test_vmap_of_value_and_grad_returns_batched_values_and_gradients() {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
+        let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let results: Vec<(f64, f64)> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::value_and_grad(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), batch)
-                    .expect("batched value_and_grad should succeed")
+                crate::tracing_v2::value_and_grad(
+                    &engine,
+                    |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(),
+                    batch,
+                )
+                .expect("batched value_and_grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
         )
@@ -514,9 +520,11 @@ mod tests {
     fn test_vmap_of_jvp_propagates_tangents_per_lane() {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         // jvp at x with tangent t gives (f(x), (2x + cos(x)) * t)
+        let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let results: Vec<(f64, f64)> = vmap(
             |(primals, tangents): (Batch<f64>, Batch<f64>)| {
                 crate::tracing_v2::jvp(
+                    &engine,
                     |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(),
                     primals,
                     tangents,

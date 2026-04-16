@@ -11,6 +11,7 @@ use indoc::indoc;
 use crate::tracing_v2::{
     TraceError, Traceable, ZeroLike,
     batch::Batch,
+    engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
@@ -116,7 +117,11 @@ impl<V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>>
 impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T>
     for ScaleOp<ArrayType, V>
 {
-    fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+    fn jvp(
+        &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        inputs: &[JvpTracer<V, T>],
+    ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
         Ok(vec![JvpTracer {

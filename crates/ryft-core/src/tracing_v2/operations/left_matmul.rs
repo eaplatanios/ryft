@@ -5,6 +5,7 @@ use std::fmt::{Debug, Display};
 use crate::tracing_v2::{
     FloatExt, OneLike, TraceError, Traceable, ZeroLike,
     batch::Batch as BatchedValue,
+    engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
@@ -121,6 +122,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
 {
     fn jvp(
         &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

@@ -9,6 +9,7 @@ use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp, PrimitiveOp,
     TraceError, VectorizableOp,
+    engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
     operations::{expect_input_count, unary_abstract},
@@ -135,6 +136,7 @@ impl LinearOp<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
 impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>> for WithShardingConstraintOp {
     fn jvp(
         &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor>,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -202,6 +204,7 @@ impl LinearOp<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
 impl DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>> for WithShardingConstraintOp {
     fn jvp(
         &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer>,
         inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

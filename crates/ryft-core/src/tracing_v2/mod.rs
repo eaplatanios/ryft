@@ -18,6 +18,7 @@ pub(crate) mod batch;
 pub(crate) mod benchmark_support;
 #[cfg(feature = "benchmarking")]
 pub mod benchmarking;
+pub mod engine;
 pub mod forward;
 pub mod graph;
 pub mod jit;
@@ -30,6 +31,7 @@ pub(crate) mod test_support;
 mod values;
 
 pub use batch::{Batch, stack, unstack, vmap};
+pub use engine::{Engine, ScalarEngineValue};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, Equation, Graph, GraphBuilder};
 pub use jit::try_jit;
@@ -48,7 +50,7 @@ pub use ops::{
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};
-pub use values::{FloatExt, One, OneLike, Traceable, Value, Zero, ZeroLike};
+pub use values::{FloatExt, OneLike, Traceable, Value, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

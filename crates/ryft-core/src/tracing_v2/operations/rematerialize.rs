@@ -13,6 +13,7 @@ use crate::{
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Program, TraceError, Traceable,
         ZeroLike,
+        engine::Engine,
         jit::try_trace_program,
         linear::{
             linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
@@ -211,6 +212,7 @@ where
 {
     fn jvp(
         &self,
+        engine: &dyn Engine<Type = ArrayType, Value = V>,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -218,7 +220,7 @@ where
         let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            LinearPrimitiveOp::Rematerialize(Box::new(make_linear_rematerialize(&self.body)?)),
+            LinearPrimitiveOp::Rematerialize(Box::new(make_linear_rematerialize(engine, &self.body, primal_inputs)?)),
             self.body.output_types.len(),
         )?;
         Ok(primal_outputs
@@ -339,9 +341,11 @@ where
 }
 
 /// Builds a linearized rematerialize op from its primal body by computing the pushforward and
-/// pullback programs.
+/// pullback programs at the provided primal inputs.
 pub fn make_linear_rematerialize<V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     body: &FlatTracedRematerialize<ArrayType, V>,
+    input_primals: Vec<V>,
 ) -> Result<LinearRematerializeOp<ArrayType, V>, TraceError>
 where
     V: Traceable<ArrayType>
@@ -357,10 +361,9 @@ where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    let representative_inputs = body.compiled.program().graph().representative_input_values()?;
-    let representative_outputs = body.compiled.call(representative_inputs)?;
-    let pushforward = linearize_program(body.compiled.program())?;
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, representative_outputs.as_slice())?;
+    let output_primals = body.compiled.call(input_primals.clone())?;
+    let pushforward = linearize_program(engine, body.compiled.program(), input_primals)?;
+    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOp::new(
         FlatTracedRematerialize::from_parts(
             body.input_types.clone(),
@@ -519,7 +522,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, jit,
+        CompiledFunction, FloatExt, JitTracer,
+        engine::ArrayScalarEngine,
+        jit,
         linear::{compile_grad, grad, value_and_grad},
     };
 
@@ -574,7 +579,9 @@ mod tests {
     #[test]
     fn test_rematerialize_grad_computes_correct_gradient() {
         // grad of rematerialize(sin, x) should be cos(x).
+        let engine = ArrayScalarEngine::<f64>::new();
         let gradient: f64 = grad(
+            &engine,
             |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
             2.0f64,
         )
@@ -586,7 +593,9 @@ mod tests {
     #[test]
     fn test_rematerialize_value_and_grad_returns_both() {
         // value_and_grad of rematerialize(sin, x) should give (sin(x), cos(x)).
+        let engine = ArrayScalarEngine::<f64>::new();
         let (value, gradient): (f64, f64) = value_and_grad(
+            &engine,
             |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
             2.0f64,
         )
@@ -620,7 +629,9 @@ mod tests {
     #[test]
     fn test_rematerialize_grad_of_quadratic_plus_sin() {
         // grad of rematerialize(x^2 + sin(x), x) should be 2x + cos(x).
+        let engine = ArrayScalarEngine::<f64>::new();
         let gradient: f64 = grad(
+            &engine,
             |x: JitTracer<ArrayType, f64>| {
                 rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
             },

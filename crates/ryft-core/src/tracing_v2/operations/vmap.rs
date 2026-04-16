@@ -6,6 +6,7 @@ use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
+        engine::Engine,
         linear::{linearize_program, transpose_linear_program_with_output_examples},
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
@@ -242,14 +243,17 @@ where
 {
     fn jvp(
         &self,
+        engine: &dyn Engine<Type = ArrayType, Value = V>,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
+        let lane_input_count = self.body.input_types().len();
+        let lane_primals = primal_inputs.iter().take(lane_input_count).cloned().collect::<Vec<_>>();
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            LinearPrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
+            LinearPrimitiveOp::VMap(Box::new(make_linear_vmap(engine, &self.body, lane_primals)?)),
             self.body.total_output_count(),
         )?;
         Ok(primal_outputs
@@ -373,8 +377,12 @@ where
     }
 }
 
-/// Builds one linearized staged `vmap` op from its primal body.
-pub fn make_linear_vmap<V>(body: &FlatTracedVMap<ArrayType, V>) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
+/// Builds one linearized staged `vmap` op from its primal body at the provided primal inputs.
+pub fn make_linear_vmap<V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
+    body: &FlatTracedVMap<ArrayType, V>,
+    input_primals: Vec<V>,
+) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
 where
     V: Traceable<ArrayType>
         + FloatExt
@@ -389,10 +397,9 @@ where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    let representative_inputs = body.compiled.program().graph().representative_input_values()?;
-    let representative_outputs = body.compiled.call(representative_inputs)?;
-    let pushforward = linearize_program(body.compiled.program())?;
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, representative_outputs.as_slice())?;
+    let output_primals = body.compiled.call(input_primals.clone())?;
+    let pushforward = linearize_program(engine, body.compiled.program(), input_primals)?;
+    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearVMapOp::new(
         FlatTracedVMap::from_parts(
             body.lane_count,

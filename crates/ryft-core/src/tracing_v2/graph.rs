@@ -6,8 +6,8 @@
 use std::{borrow::Cow, collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily},
-    tracing_v2::{InterpretableOp, Op, TraceError, Traceable, Zero},
+    parameters::{Parameter, Parameterized},
+    tracing_v2::{Engine, InterpretableOp, Op, TraceError, Traceable},
     types::{Type, Typed},
 };
 
@@ -28,11 +28,12 @@ pub enum Atom<T: Type + Clone, V: Typed<T>> {
         value: V,
     },
 
-    /// Graph input with a retained representative value. Inputs keep one value so later transforms
-    /// can recover representative primal values without requiring the caller to re-supply them.
+    /// Graph input carrying only its abstract type. Any builder-time representative value is kept
+    /// in the owning [`GraphBuilder`]'s side table and is discarded when the graph is finalized;
+    /// later transforms recover representatives by synthesizing zeros from the retained type.
     Input {
-        /// Representative value retained for this input.
-        value: V,
+        /// Abstract type retained for this input.
+        r#type: T,
     },
 
     /// Atom produced by evaluating an equation. Carries only the abstract type; any eagerly
@@ -47,8 +48,8 @@ pub enum Atom<T: Type + Clone, V: Typed<T>> {
 impl<T: Type + Clone, V: Typed<T>> Typed<T> for Atom<T, V> {
     fn tpe(&self) -> Cow<'_, T> {
         match self {
-            Self::Constant { value } | Self::Input { value } => value.tpe(),
-            Self::Derived { r#type } => Cow::Borrowed(r#type),
+            Self::Constant { value } => value.tpe(),
+            Self::Input { r#type } | Self::Derived { r#type } => Cow::Borrowed(r#type),
         }
     }
 }
@@ -93,41 +94,48 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>> GraphBuilder<O, T, V> {
 
     /// Returns the concrete value associated with the provided atom, if one is available.
     ///
-    /// For [`Atom::Constant`] and [`Atom::Input`] this returns the retained value. For
-    /// [`Atom::Derived`] this returns the eagerly computed intermediate if the builder has one,
-    /// otherwise `None`.
+    /// For [`Atom::Constant`] this returns the retained value. For [`Atom::Input`] and
+    /// [`Atom::Derived`] this returns the eagerly computed exemplar stored in the builder's
+    /// side table, or `None` if none is available.
     #[inline]
     pub(crate) fn stored_value(&self, id: AtomId) -> Option<&V> {
         match self.atoms.get(id)? {
-            Atom::Constant { value } | Atom::Input { value } => Some(value),
-            Atom::Derived { .. } => self.intermediates.get(id).and_then(Option::as_ref),
+            Atom::Constant { value } => Some(value),
+            Atom::Input { .. } | Atom::Derived { .. } => self.intermediates.get(id).and_then(Option::as_ref),
         }
     }
 
-    /// Adds a new input atom with the supplied example value.
+    /// Adds a new input atom retaining only its abstract type, without recording any exemplar in
+    /// the builder's side table.
+    ///
+    /// Intended for graph transforms that rebuild structure without needing intermediate values
+    /// (for example [`Graph::simplify`]). Callers that later need a representative value for this
+    /// atom should obtain it from an [`Engine`](crate::tracing_v2::Engine) via
+    /// [`Graph::representative_input_values`].
     #[inline]
-    pub fn add_input_abstract(&mut self, example_value: V) -> AtomId {
+    pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
         let id = self.atoms.len();
-        self.atoms.push(Atom::Input { value: example_value });
+        self.atoms.push(Atom::Input { r#type: abstract_value });
         self.intermediates.push(None);
         self.input_atoms.push(id);
         id
     }
 
-    /// Adds a new input atom from abstract metadata alone, synthesizing one zero witness internally.
-    #[inline]
-    pub fn add_input_abstract_zero(&mut self, abstract_value: T) -> AtomId
-    where
-        T: Parameter + Zero<T, V, To<V> = V>,
-        T::Family: ParameterizedFamily<V>,
-    {
-        self.add_input_abstract(abstract_value.zero())
-    }
-
-    /// Adds a new input atom using the abstract value of `example`.
+    /// Adds a new input atom using the abstract type and value of `example`.
     #[inline]
     pub fn add_input(&mut self, example: &V) -> AtomId {
-        self.add_input_abstract(example.clone())
+        let abstract_value = <V as Typed<T>>::tpe(example).into_owned();
+        self.add_input_with_example(abstract_value, example.clone())
+    }
+
+    /// Adds a new input atom with the supplied abstract type and a caller-supplied exemplar value.
+    #[inline]
+    fn add_input_with_example(&mut self, abstract_value: T, example_value: V) -> AtomId {
+        let id = self.atoms.len();
+        self.atoms.push(Atom::Input { r#type: abstract_value });
+        self.intermediates.push(Some(example_value));
+        self.input_atoms.push(id);
+        id
     }
 
     /// Adds a constant atom to the graph.
@@ -364,16 +372,18 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output
         &self.output_structure
     }
 
-    /// Returns the representative concrete inputs retained by this graph.
-    pub fn representative_input_values(&self) -> Result<Vec<V>, TraceError> {
+    /// Returns representative concrete inputs for this graph, synthesized as zero values from the
+    /// retained input types using the provided [`Engine`].
+    pub fn representative_input_values<E>(&self, engine: &E) -> Result<Vec<V>, TraceError>
+    where
+        E: Engine<Type = T, Value = V> + ?Sized,
+    {
         self.input_atoms
             .iter()
             .copied()
             .map(|atom_id| match self.atom(atom_id) {
-                Some(Atom::Input { value }) => Ok(value.clone()),
-                _ => Err(TraceError::InternalInvariantViolation(
-                    "staged graph input atom did not retain an exemplar value",
-                )),
+                Some(Atom::Input { r#type }) => Ok(engine.zero(r#type)),
+                _ => Err(TraceError::InternalInvariantViolation("staged graph input atom did not retain a type")),
             })
             .collect()
     }
@@ -421,12 +431,14 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output
             .collect()
     }
 
-    /// Evaluates every atom in the graph on its retained representative input exemplars.
-    pub fn representative_atom_values(&self) -> Result<Vec<V>, TraceError>
+    /// Evaluates every atom in the graph on its representative input exemplars, synthesized as
+    /// zero values from the retained input types using the provided [`Engine`].
+    pub fn representative_atom_values<E>(&self, engine: &E) -> Result<Vec<V>, TraceError>
     where
         O: InterpretableOp<T, V>,
+        E: Engine<Type = T, Value = V> + ?Sized,
     {
-        self.evaluate_atom_values(self.representative_input_values()?)
+        self.evaluate_atom_values(self.representative_input_values(engine)?)
     }
 
     /// Clones this graph while replacing only the typed input/output structures.
@@ -517,7 +529,7 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output
 
             let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom {
-                Atom::Input { value } => builder.add_input_abstract(value.clone()),
+                Atom::Input { r#type } => builder.add_input_abstract(r#type.clone()),
                 Atom::Constant { value } => builder.add_constant(value.clone()),
                 Atom::Derived { .. } => {
                     let equation_index = equation_by_output[atom_id]
@@ -580,12 +592,10 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_atoms.iter().copied() {
             let input = self.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
-            let Atom::Input { value } = input else {
-                return Err(TraceError::InternalInvariantViolation(
-                    "staged graph input atom did not retain an exemplar value",
-                ));
+            let Atom::Input { r#type } = input else {
+                return Err(TraceError::InternalInvariantViolation("staged graph input atom did not retain a type"));
             };
-            let mapped = builder.add_input_abstract(value.clone());
+            let mapped = builder.add_input_abstract(r#type.clone());
             atom_mapping.insert(input_atom, mapped);
         }
 
@@ -668,9 +678,7 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{
-            FloatExt, MatrixOps, One, OneLike, TraceError, Value, Zero, ZeroLike, ops::PrimitiveOp, test_support,
-        },
+        tracing_v2::{FloatExt, MatrixOps, OneLike, TraceError, Value, ZeroLike, ops::PrimitiveOp, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 
@@ -790,16 +798,22 @@ mod tests {
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
 
-        assert!(matches!(builder.atom(x).unwrap(), Atom::Input { value } if *value == 2.0));
+        assert!(
+            matches!(builder.atom(x).unwrap(), Atom::Input { r#type } if *r#type == ArrayType::scalar(DataType::F64))
+        );
         assert!(matches!(builder.atom(three).unwrap(), Atom::Constant { value } if *value == 3.0));
         assert!(matches!(builder.atom(sum).unwrap(), Atom::Derived { .. }));
+        assert_eq!(builder.stored_value(x), Some(&2.0));
         assert_eq!(builder.stored_value(sum), Some(&5.0));
 
         let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
-        assert!(matches!(graph.atom(x).unwrap(), Atom::Input { value } if *value == 2.0));
+        let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
+        assert!(
+            matches!(graph.atom(x).unwrap(), Atom::Input { r#type } if *r#type == ArrayType::scalar(DataType::F64))
+        );
         assert!(matches!(graph.atom(three).unwrap(), Atom::Constant { value } if *value == 3.0));
         assert!(matches!(graph.atom(sum).unwrap(), Atom::Derived { .. }));
-        assert_eq!(graph.representative_atom_values().unwrap(), vec![2.0, 3.0, 5.0]);
+        assert_eq!(graph.representative_atom_values(&engine).unwrap(), vec![0.0, 3.0, 3.0]);
         assert_eq!(graph.call(4.0).unwrap(), 7.0);
     }
 
@@ -875,21 +889,9 @@ mod tests {
             }
         }
 
-        impl Zero<ArrayType, TestIdentityValue> for ArrayType {
-            fn zero(&self) -> TestIdentityValue {
-                TestIdentityValue { r#type: self.clone(), value: 0.0 }
-            }
-        }
-
         impl OneLike for TestIdentityValue {
             fn one_like(&self) -> Self {
                 Self::scalar(1.0)
-            }
-        }
-
-        impl One<ArrayType, TestIdentityValue> for ArrayType {
-            fn one(&self) -> TestIdentityValue {
-                TestIdentityValue { r#type: self.clone(), value: 1.0 }
             }
         }
 

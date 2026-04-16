@@ -14,10 +14,9 @@ use crate::{
     tracing_v2::{
         FloatExt, MatrixOps, TraceError, Traceable, ZeroLike,
         batch::{Batch, stack, unstack},
+        engine::Engine,
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         linear::{LinearProgram, jvp_program, try_jvp_traced, try_linearize_traced_program},
-        operations::{AddOp, CosOp, MulOp, NegOp, SinOp},
-        ops::DifferentiableOp,
         program::Program,
     },
     types::{ArrayType, Type, Typed},
@@ -124,18 +123,14 @@ pub trait JvpInvocationLeaf<
     type FunctionOutput;
 
     /// Invokes [`jvp`] for one leaf regime.
-    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    fn invoke<F>(
+        engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput;
-}
-
-fn single_output<V, T>(mut outputs: Vec<JvpTracer<V, T>>, op: &'static str) -> JvpTracer<V, T>
-where
-    V: Traceable<ArrayType>,
-    T: TangentSpace<ArrayType, V>,
-{
-    debug_assert_eq!(outputs.len(), 1, "{op} should produce a single JVP output");
-    outputs.pop().expect("single-output primitive should return one JVP output")
 }
 
 impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Add for JvpTracer<V, T> {
@@ -143,7 +138,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<Array
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        single_output(AddOp.jvp(&[self, rhs]).expect("add JVP rule should succeed"), "add")
+        Self { primal: self.primal + rhs.primal, tangent: T::add(self.tangent, rhs.tangent) }
     }
 }
 
@@ -152,7 +147,10 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike, T: TangentSpace<Array
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        single_output(MulOp.jvp(&[self, rhs]).expect("mul JVP rule should succeed"), "mul")
+        Self {
+            primal: self.primal.clone() * rhs.primal.clone(),
+            tangent: T::add(T::scale(rhs.primal, self.tangent), T::scale(self.primal, rhs.tangent)),
+        }
     }
 }
 
@@ -161,19 +159,19 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<Array
 
     #[inline]
     fn neg(self) -> Self::Output {
-        single_output(NegOp.jvp(&[self]).expect("neg JVP rule should succeed"), "neg")
+        Self { primal: -self.primal, tangent: T::neg(self.tangent) }
     }
 }
 
 impl<V: Traceable<ArrayType> + FloatExt + ZeroLike, T: TangentSpace<ArrayType, V>> FloatExt for JvpTracer<V, T> {
     #[inline]
     fn sin(self) -> Self {
-        single_output(SinOp.jvp(&[self]).expect("sin JVP rule should succeed"), "sin")
+        Self { primal: self.primal.clone().sin(), tangent: T::scale(self.primal.cos(), self.tangent) }
     }
 
     #[inline]
     fn cos(self) -> Self {
-        single_output(CosOp.jvp(&[self]).expect("cos JVP rule should succeed"), "cos")
+        Self { primal: self.primal.clone().cos(), tangent: T::neg(T::scale(self.primal.sin(), self.tangent)) }
     }
 }
 
@@ -192,7 +190,7 @@ impl<
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > JvpInvocationLeaf<Input, Output> for V
 where
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     V::ParameterStructure: Clone + PartialEq,
 {
@@ -200,7 +198,12 @@ where
     type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
     type FunctionOutput = Output::To<JitTracer<ArrayType, V>>;
 
-    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    fn invoke<F>(
+        engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
@@ -209,7 +212,7 @@ where
         }
 
         let (primal_output, tangent_program): (Output, LinearProgram<ArrayType, V, Input, Output>) =
-            jvp_program(function, primals)?;
+            jvp_program(engine, function, primals)?;
         let tangent_output = tangent_program.call(tangents)?;
         Ok((primal_output, tangent_output))
     }
@@ -247,7 +250,12 @@ where
     type FunctionInput = Input;
     type FunctionOutput = Output;
 
-    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    fn invoke<F>(
+        _engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
@@ -306,7 +314,12 @@ where
     type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
     type FunctionOutput = Output::To<JitTracer<ArrayType, V>>;
 
-    fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    fn invoke<F>(
+        _engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
@@ -396,7 +409,12 @@ where
 ///
 /// The returned pair is `(primal_output, tangent_output)`.
 #[allow(private_bounds, private_interfaces)]
-pub fn jvp<F, Input, Output, Leaf>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+pub fn jvp<F, Input, Output, Leaf>(
+    engine: &dyn Engine<Type = ArrayType, Value = <Leaf as JvpInvocationLeaf<Input, Output>>::Base>,
+    function: F,
+    primals: Input,
+    tangents: Input,
+) -> Result<(Output, Output), TraceError>
 where
     Leaf: JvpInvocationLeaf<Input, Output>,
     Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
@@ -405,12 +423,12 @@ where
         <Leaf as JvpInvocationLeaf<Input, Output>>::FunctionInput,
     ) -> <Leaf as JvpInvocationLeaf<Input, Output>>::FunctionOutput,
 {
-    Leaf::invoke(function, primals, tangents)
+    Leaf::invoke(engine, function, primals, tangents)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::{OneLike, test_support};
+    use crate::tracing_v2::{OneLike, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -429,8 +447,9 @@ mod tests {
 
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let result: Result<(f64, f64), TraceError> =
-            jvp(|xs: Vec<JitTracer<ArrayType, f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
+            jvp(&engine, |xs: Vec<JitTracer<ArrayType, f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
         test_support::assert_quadratic_pushforward_rendering();
     }

@@ -15,8 +15,10 @@
 //!   [`ArrayShard::buffer`] identifying the addressable local subset.
 //! - [`ExecuteArguments`] marshals distributed arrays into per-device execution inputs for PJRT.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use half::{bf16, f16};
 use thiserror::Error;
@@ -33,7 +35,7 @@ use ryft_core::sharding::{
     ShardingError,
 };
 use ryft_core::types::data_types::{DataType, DataTypeError};
-use ryft_core::types::{ArrayType, Shape, Size};
+use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::mlir::ToMlir;
 use crate::pjrt::{FromPjrt, ToPjrt};
@@ -726,7 +728,7 @@ fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
                     device_id: send_plan.source_device_id,
                 })?
                 .buffer
-                .as_ref()
+                .as_deref()
                 .expect("addressable shard lookups should always return a local buffer");
             send_buffers.push(source_buffer);
             destination_devices.push(cross_host_global_device_id(send_plan.destination_device_id)?);
@@ -748,7 +750,7 @@ fn copy_addressable_destination_shards_from_exact_source_shards<'o>(
                 device_id: local_copy_plan.source_device_id,
             })?
             .buffer
-            .as_ref()
+            .as_deref()
             .expect("addressable shard lookups should always return a local buffer");
         let destination_device = addressable_device_by_id.get(&local_copy_plan.destination_device_id).ok_or(
             ArrayError::MissingClientDeviceForLocalMeshDevice {
@@ -816,7 +818,7 @@ fn materialize_dense_array_bytes(array: &Array<'_>) -> Result<Vec<u8>, ArrayErro
     let mut written = vec![false; total_byte_count];
 
     for shard in array.shards() {
-        let buffer = shard.buffer.as_ref().ok_or(ArrayError::MissingAddressableShardForMove {
+        let buffer = shard.buffer.as_deref().ok_or(ArrayError::MissingAddressableShardForMove {
             shard_index: shard.index,
             device_id: shard.device.id,
         })?;
@@ -1032,6 +1034,12 @@ fn compute_shard_descriptors<'o>(
 /// array that that device holds. When [`buffer`](Self::buffer) is `Some(_)`, the shard is
 /// addressable from the current process and corresponds to one entry in JAX's
 /// `array.addressable_shards`.
+///
+/// [`ArrayShard`] holds its [`Buffer`] inside an [`Arc`] so that [`Array::clone`] can cheaply
+/// share addressable PJRT handles with other [`Array`] instances. The last [`Arc`] dropped
+/// releases the underlying PJRT buffer via [`Buffer`]'s [`Drop`] implementation. This mirrors
+/// the reference-counted array pattern that IFRT uses above PJRT.
+#[derive(Clone)]
 pub struct ArrayShard<'o> {
     /// Global (ordinal) index of this shard in a row-major device mesh ordering.
     pub index: usize,
@@ -1048,8 +1056,10 @@ pub struct ArrayShard<'o> {
     /// dimension, the slice covers the partition assigned to a specific device based on its mesh coordinates.
     pub slice: Vec<Range<usize>>,
 
-    /// Local PJRT buffer for this shard, or `None` if the shard is not addressable from the current process.
-    pub buffer: Option<Buffer<'o>>,
+    /// Reference-counted local PJRT buffer for this shard, or `None` if the shard is not
+    /// addressable from the current process. Cloning an [`ArrayShard`] bumps the [`Arc`]
+    /// refcount rather than copying device memory.
+    pub buffer: Option<Arc<Buffer<'o>>>,
 }
 
 impl<'o> ArrayShard<'o> {
@@ -1082,6 +1092,12 @@ impl std::fmt::Debug for ArrayShard<'_> {
 /// In JAX terminology, this is the runtime pairing of:
 /// - mesh-bound global array metadata, and
 /// - addressable device buffers (the local portion of an IFRT array).
+///
+/// [`Array`] is cheap to clone: every shard's [`Buffer`] lives behind an [`Arc`], so
+/// [`Array::clone`] is O(shards) refcount bumps and does not copy device memory. This mirrors the
+/// reference-counted array pattern that IFRT uses above PJRT and JAX's Python-level refcounting
+/// over `ArrayImpl`.
+#[derive(Clone)]
 pub struct Array<'o> {
     array_type: ArrayType,
     shards: Vec<ArrayShard<'o>>,
@@ -1090,6 +1106,12 @@ pub struct Array<'o> {
 }
 
 impl Parameter for Array<'_> {}
+
+impl Typed<ArrayType> for Array<'_> {
+    fn tpe(&self) -> Cow<'_, ArrayType> {
+        Cow::Borrowed(&self.array_type)
+    }
+}
 
 impl<'o> Array<'o> {
     /// Creates an [`Array`] from global array metadata, a concrete mesh, and local addressable buffers.
@@ -1158,7 +1180,7 @@ impl<'o> Array<'o> {
                 return Err(ArrayError::BufferShapeMismatch { device_id, shard_index, expected_shape, actual_shape });
             }
 
-            buffers_by_device.insert(device_id, buffer);
+            buffers_by_device.insert(device_id, Arc::new(buffer));
         }
 
         let mut addressable_shard_indices = Vec::with_capacity(buffers_by_device.len());
@@ -1419,7 +1441,7 @@ impl<'o> Array<'o> {
         ExecuteArguments::from_arrays_with_donation(arrays, addressable_device_ids, donation_flags)
     }
 
-    fn into_addressable_buffers_by_device(self) -> HashMap<DeviceId, Buffer<'o>> {
+    fn into_addressable_buffers_by_device(self) -> HashMap<DeviceId, Arc<Buffer<'o>>> {
         self.shards
             .into_iter()
             .filter_map(|shard| shard.buffer.map(|buffer| (shard.device.id, buffer)))

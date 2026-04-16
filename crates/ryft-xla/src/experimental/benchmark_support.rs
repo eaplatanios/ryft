@@ -6,7 +6,7 @@
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing_v2::{
-    FloatExt, MatrixOps, One, PrimitiveOp, Program,
+    FloatExt, MatrixOps, OneLike, PrimitiveOp, Program,
     benchmarking::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
         record, summarize_graph,
@@ -235,6 +235,7 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             let mesh = mesh.clone();
             move |x: ShardMapTracer| {
                 grad(
+                    &crate::experimental::shard_map::ShardMapTensorEngine::new(),
                     {
                         let mesh = mesh.clone();
                         let sharding = sharding.clone();
@@ -274,7 +275,12 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
-                        grad(|y| y.sin(), local_x).unwrap_or_else(|error| {
+                        grad(
+                            &crate::experimental::shard_map::ShardMapTensorEngine::new(),
+                            |y: ShardMapTracer| y.sin(),
+                            local_x,
+                        )
+                        .unwrap_or_else(|error| {
                             panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
                         })
                     },
@@ -348,11 +354,16 @@ fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, Benc
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
-                        let gradient = grad(|y| y.sin(), local_x.clone()).unwrap_or_else(|error| {
+                        let gradient: ShardMapTracer = grad(
+                            &crate::experimental::shard_map::ShardMapTensorEngine::new(),
+                            |y: ShardMapTracer| y.sin(),
+                            local_x.clone(),
+                        )
+                        .unwrap_or_else(|error| {
                             panic!("shard_map grad+vmap IR benchmark should trace the inner gradient: {error}")
                         });
                         let lanes: Vec<ShardMapTracer> = vmap(
-                            |batch| batch.clone() + batch.one_like(),
+                            |batch: ryft_core::tracing_v2::Batch<ShardMapTracer>| batch.clone() + batch.one_like(),
                             vec![gradient.clone(), gradient],
                         )
                         .unwrap_or_else(|error| {

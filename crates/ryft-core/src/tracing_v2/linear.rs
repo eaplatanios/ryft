@@ -18,6 +18,7 @@ use crate::{
     tracing_v2::{
         FloatExt, MatrixOps, OneLike, TraceError, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
+        engine::Engine,
         forward::{JvpTracer, TangentSpace},
         graph::{Atom, AtomId, Equation, Graph, GraphBuilder},
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
@@ -294,7 +295,9 @@ where
 }
 
 pub fn linearize_program<V, Input, Output>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     program: &Program<ArrayType, V, Input, Output>,
+    input_primals: Vec<V>,
 ) -> Result<LinearProgram<ArrayType, V, Input, Output>, TraceError>
 where
     V: Traceable<ArrayType>
@@ -334,20 +337,17 @@ where
     }
 
     let graph = program.graph();
-    let representative_inputs = graph.representative_input_values()?;
-    let zero = graph
-        .input_atoms()
-        .first()
-        .and_then(|_| representative_inputs.first())
-        .map(ZeroLike::zero_like)
-        .ok_or(TraceError::EmptyParameterizedValue)?;
+    if input_primals.len() != graph.input_atoms().len() {
+        return Err(TraceError::InvalidInputCount { expected: graph.input_atoms().len(), got: input_primals.len() });
+    }
+    let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::new()));
     let mut primals = vec![None; graph.atom_count()];
     let mut tangents = vec![None; graph.atom_count()];
-    for (input_atom, representative_input) in graph.input_atoms().iter().copied().zip(representative_inputs.iter()) {
-        primals[input_atom] = Some(representative_input.clone());
-        let tangent_atom = builder.borrow_mut().add_input_abstract(representative_input.zero_like());
+    for (input_atom, input_primal) in graph.input_atoms().iter().copied().zip(input_primals.into_iter()) {
+        let tangent_atom = builder.borrow_mut().add_input(&input_primal.zero_like());
         tangents[input_atom] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
+        primals[input_atom] = Some(input_primal);
     }
     for (atom_id, atom) in graph.atoms_iter() {
         if let Atom::Constant { value } = atom {
@@ -373,8 +373,11 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TraceError>>()?;
-        let output_duals =
-            DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&equation.op, input_duals.as_slice())?;
+        let output_duals = DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+            &equation.op,
+            engine,
+            input_duals.as_slice(),
+        )?;
         if output_duals.len() != equation.outputs.len() {
             return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
         }
@@ -429,7 +432,7 @@ where
 {
     let zero = program.zero.zero_like();
     transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V>, _, _| {
-        Ok(builder.add_input_abstract(zero.clone()))
+        Ok(builder.add_input(&zero))
     })
 }
 
@@ -542,12 +545,9 @@ where
     if output_examples.len() != expected_output_count {
         return Err(TraceError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }
-    transpose_linear_program_with_output_inputs(
-        program,
-        |builder: &mut LinearProgramBuilder<V>, _, output_index| {
-            Ok(builder.add_input_abstract(output_examples[output_index].zero_like()))
-        },
-    )
+    transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V>, _, output_index| {
+        Ok(builder.add_input(&output_examples[output_index].zero_like()))
+    })
 }
 
 fn lift_traced_constant<V>(
@@ -711,6 +711,7 @@ where
 }
 
 pub fn try_jvp_program<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
@@ -723,8 +724,11 @@ where
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
 {
-    let (primal_output, program) = try_trace_program(function, primals)?;
-    Ok((primal_output, linearize_program(&program)?))
+    let input_structure = primals.parameter_structure();
+    let input_primals: Vec<V> = primals.into_parameters().collect();
+    let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
+    let (primal_output, program) = try_trace_program(function, reconstructed_primals)?;
+    Ok((primal_output, linearize_program(engine, &program, input_primals)?))
 }
 
 /// Runs JVP for already traced inputs by staging the inner function once over base values and
@@ -793,6 +797,7 @@ where
 /// Runs a forward trace and returns both the primal output and the staged pushforward.
 #[allow(private_bounds)]
 pub fn jvp_program<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
@@ -805,12 +810,13 @@ where
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
 {
-    try_jvp_program(|input| Ok(function(input)), primals)
+    try_jvp_program(engine, |input| Ok(function(input)), primals)
 }
 
 /// Alias for [`jvp_program`] that emphasizes the returned linear map.
 #[allow(private_bounds)]
 pub fn linearize<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
@@ -823,10 +829,11 @@ where
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
 {
-    jvp_program(function, primals)
+    jvp_program(engine, function, primals)
 }
 
 pub fn try_vjp<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input>), TraceError>
@@ -834,12 +841,12 @@ where
     V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
 {
-    let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(function, primals)?;
+    let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
     let pullback = transpose_linear_program_with_output_examples(&pushforward, output_examples.as_slice())?;
     Ok((output, pullback))
@@ -848,6 +855,7 @@ where
 /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
 #[allow(private_bounds)]
 pub fn vjp<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input>), TraceError>
@@ -855,15 +863,19 @@ where
     V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
 {
-    try_vjp(|input| Ok(function(input)), primals)
+    try_vjp(engine, |input| Ok(function(input)), primals)
 }
 
-fn try_grad<F, Input, V>(function: F, primals: Input) -> Result<Input, TraceError>
+fn try_grad<F, Input, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
+    function: F,
+    primals: Input,
+) -> Result<Input, TraceError>
 where
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
@@ -875,10 +887,10 @@ where
         + Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<JitTracer<ArrayType, V>, TraceError>,
 {
-    let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input>) = try_vjp(function, primals)?;
+    let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input>) = try_vjp(engine, function, primals)?;
     pullback.call(output.one_like())
 }
 
@@ -897,7 +909,11 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
     type FunctionInput;
 
     /// Invokes [`grad`] for one concrete leaf regime.
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>;
 }
@@ -916,7 +932,7 @@ impl<
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > GradInvocationLeaf<Input> for V
 where
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
 {
@@ -924,11 +940,15 @@ where
     type Return = Input;
     type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
 
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        engine: &dyn Engine<Type = ArrayType, Value = V>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>,
     {
-        try_grad(|input| Ok(function(input)), primals)
+        try_grad(engine, |input| Ok(function(input)), primals)
     }
 }
 
@@ -960,7 +980,11 @@ where
     type Return = Input;
     type FunctionInput = Input;
 
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>,
     {
@@ -1036,7 +1060,11 @@ where
     type Return = Input;
     type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
 
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>,
     {
@@ -1093,6 +1121,7 @@ where
 /// Computes the reverse-mode gradient of a scalar-output function.
 #[allow(private_bounds, private_interfaces)]
 pub fn grad<F, Input, Leaf>(
+    engine: &dyn Engine<Type = ArrayType, Value = <Leaf as GradInvocationLeaf<Input>>::Base>,
     function: F,
     primals: Input,
 ) -> Result<<Leaf as GradInvocationLeaf<Input>>::Return, TraceError>
@@ -1103,7 +1132,7 @@ where
         <Leaf as GradInvocationLeaf<Input>>::FunctionInput,
     ) -> JitTracer<ArrayType, <Leaf as GradInvocationLeaf<Input>>::Base>,
 {
-    Leaf::invoke(function, primals)
+    Leaf::invoke(engine, function, primals)
 }
 
 /// Dispatch trait used by [`value_and_grad`] so it can operate both on concrete values and on already traced values.
@@ -1121,7 +1150,11 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
     type FunctionInput;
 
     /// Invokes [`value_and_grad`] for one concrete leaf regime.
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>;
 }
@@ -1140,7 +1173,7 @@ impl<
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > ValueAndGradInvocationLeaf<Input> for V
 where
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
 {
@@ -1148,11 +1181,15 @@ where
     type Return = (V, Input);
     type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
 
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        engine: &dyn Engine<Type = ArrayType, Value = V>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>,
     {
-        let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input>) = vjp(function, primals)?;
+        let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input>) = vjp(engine, function, primals)?;
         let gradient = pullback.call(output.one_like())?;
         Ok((output, gradient))
     }
@@ -1187,7 +1224,11 @@ where
     type Return = (JitTracer<ArrayType, V>, Input);
     type FunctionInput = Input;
 
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>,
     {
@@ -1264,7 +1305,11 @@ where
     type Return = (Batch<V>, Input);
     type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
 
-    fn invoke<F>(function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(
+        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        function: F,
+        primals: Input,
+    ) -> Result<Self::Return, TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> JitTracer<ArrayType, Self::Base>,
     {
@@ -1329,6 +1374,7 @@ where
 /// Computes both the primal scalar output and its reverse-mode gradient.
 #[allow(private_bounds, private_interfaces)]
 pub fn value_and_grad<F, Input, Leaf>(
+    engine: &dyn Engine<Type = ArrayType, Value = <Leaf as ValueAndGradInvocationLeaf<Input>>::Base>,
     function: F,
     primals: Input,
 ) -> Result<<Leaf as ValueAndGradInvocationLeaf<Input>>::Return, TraceError>
@@ -1339,7 +1385,7 @@ where
         <Leaf as ValueAndGradInvocationLeaf<Input>>::FunctionInput,
     ) -> JitTracer<ArrayType, <Leaf as ValueAndGradInvocationLeaf<Input>>::Base>,
 {
-    Leaf::invoke(function, primals)
+    Leaf::invoke(engine, function, primals)
 }
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
@@ -1566,6 +1612,7 @@ where
 }
 
 fn try_jacfwd<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -1573,7 +1620,7 @@ where
     V: CoordinateValue + Parameterized<V> + FloatExt + MatrixOps + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
@@ -1583,7 +1630,7 @@ where
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let basis_inputs = standard_basis::<Input, V>(&input_structure, input_parameters.as_slice())?;
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(function, primals)?;
+    let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(engine, function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
@@ -1605,6 +1652,7 @@ where
 /// Materializes a dense Jacobian using forward-mode differentiation.
 #[allow(private_bounds)]
 pub fn jacfwd<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -1612,15 +1660,16 @@ where
     V: CoordinateValue + Parameterized<V> + FloatExt + MatrixOps + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
 {
-    try_jacfwd::<_, Input, Output, V>(|input| Ok(function(input)), primals)
+    try_jacfwd::<_, Input, Output, V>(engine, |input| Ok(function(input)), primals)
 }
 
 fn try_jacrev<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -1628,7 +1677,7 @@ where
     V: CoordinateValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + MatrixOps + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
@@ -1637,7 +1686,7 @@ where
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pullback) = try_vjp::<F, Input, Output, V>(function, primals)?;
+    let (output, pullback) = try_vjp::<F, Input, Output, V>(engine, function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
@@ -1654,6 +1703,7 @@ where
 /// Materializes a dense Jacobian using reverse-mode differentiation.
 #[allow(private_bounds)]
 pub fn jacrev<F, Input, Output, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -1661,12 +1711,12 @@ where
     V: CoordinateValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + MatrixOps + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
 {
-    try_jacrev::<_, Input, Output, V>(|input| Ok(function(input)), primals)
+    try_jacrev::<_, Input, Output, V>(engine, |input| Ok(function(input)), primals)
 }
 
 /// Materializes a dense Hessian by applying `jacfwd` to a gradient helper.
@@ -1675,6 +1725,7 @@ where
 /// because Rust does not yet let this API re-instantiate an arbitrary closure at a deeper trace level.
 #[allow(private_bounds)]
 pub fn hessian<F, Input, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     gradient_function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
@@ -1682,10 +1733,10 @@ where
     V: CoordinateValue + Parameterized<V> + FloatExt + MatrixOps + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Input::To<JitTracer<ArrayType, V>>,
 {
-    jacfwd::<F, Input, Input, V>(gradient_function, primals)
+    jacfwd::<F, Input, Input, V>(engine, gradient_function, primals)
 }
 
 // ---------------------------------------------------------------------------
@@ -1799,6 +1850,7 @@ pub enum RematerializationPolicy {
 ///     `segment_size` equations, each wrapped in its own [`rematerialize`] boundary. Intermediates at segment
 ///     boundaries are saved while within-segment intermediates are recomputed.
 pub fn compile_grad_with_policy<F, Input, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     example_primals: Input,
     policy: RematerializationPolicy,
@@ -1813,7 +1865,7 @@ where
         + ReshapeOps
         + Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Vec<V>: Parameterized<
             V,
@@ -1825,12 +1877,12 @@ where
 {
     match policy {
         RematerializationPolicy::SaveAll => compile_grad(&function, example_primals),
-        RematerializationPolicy::RecomputeAll => compile_grad_segmented(&function, example_primals, None),
+        RematerializationPolicy::RecomputeAll => compile_grad_segmented(engine, &function, example_primals, None),
         RematerializationPolicy::Checkpoint { segment_size } => {
             if segment_size <= 1 {
                 return compile_grad(&function, example_primals);
             }
-            compile_grad_segmented(&function, example_primals, Some(segment_size))
+            compile_grad_segmented(engine, &function, example_primals, Some(segment_size))
         }
     }
 }
@@ -1845,6 +1897,7 @@ where
 /// transpose, stage pullback — but inserts a segmentation step between tracing and linearization so
 /// that the differentiation transform sees and respects the rematerialization boundaries.
 fn compile_grad_segmented<F, Input, V>(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: &F,
     example_primals: Input,
     segment_size: Option<usize>,
@@ -1858,7 +1911,7 @@ where
         + MatrixOps
         + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Vec<V>: Parameterized<
@@ -1897,8 +1950,8 @@ where
 
             // Step 2: Segment the traced program to insert rematerialization boundaries.
             let segmented_program = match segment_size {
-                None => wrap_program_in_rematerialize(&traced_program)?,
-                Some(size) => segment_program(&traced_program, size)?,
+                None => wrap_program_in_rematerialize(engine, &traced_program)?,
+                Some(size) => segment_program(engine, &traced_program, size)?,
             };
 
             // Step 3: Linearize and transpose the segmented program to produce the pullback.
@@ -1938,6 +1991,7 @@ fn segment_program<
         + MatrixOps
         + ReshapeOps,
 >(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     program: &Program<ArrayType, V, Vec<V>, Vec<V>>,
     segment_size: usize,
 ) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>>, TraceError>
@@ -1945,14 +1999,14 @@ where
     V::ParameterStructure: Clone + PartialEq,
 {
     let graph = program.graph();
-    let representative_values = graph.representative_atom_values()?;
-    let representative_inputs = graph.representative_input_values()?;
+    let representative_values = graph.representative_atom_values(engine)?;
+    let representative_inputs = graph.representative_input_values(engine)?;
     let equations = graph.equations();
 
     // If the program has fewer equations than a single segment, no segmentation is needed — wrap the
     // whole thing in a single RematerializeOp.
     if equations.len() <= segment_size {
-        return wrap_program_in_rematerialize(program);
+        return wrap_program_in_rematerialize(engine, program);
     }
 
     // Divide equations into segments.
@@ -1989,7 +2043,7 @@ where
 
     // Register program inputs in the outer builder.
     for (&input_atom, representative_input) in input_atoms.iter().zip(representative_inputs.iter()) {
-        let outer_atom = outer_builder.add_input_abstract(representative_input.clone());
+        let outer_atom = outer_builder.add_input(representative_input);
         atom_mapping[input_atom] = Some(outer_atom);
     }
 
@@ -2117,13 +2171,14 @@ fn wrap_program_in_rematerialize<
         + MatrixOps
         + ReshapeOps,
 >(
+    engine: &dyn Engine<Type = ArrayType, Value = V>,
     program: &Program<ArrayType, V, Vec<V>, Vec<V>>,
 ) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>>, TraceError>
 where
     V::ParameterStructure: Clone + PartialEq,
 {
     let graph = program.graph();
-    let representative_inputs = graph.representative_input_values()?;
+    let representative_inputs = graph.representative_input_values(engine)?;
     let input_types: Vec<_> = graph
         .input_atoms()
         .iter()
@@ -2155,7 +2210,7 @@ where
     let mut outer_builder: ProgramBuilder<V> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> = representative_inputs
         .iter()
-        .map(|representative_input| outer_builder.add_input_abstract(representative_input.clone()))
+        .map(|representative_input| outer_builder.add_input(representative_input))
         .collect();
 
     let outer_outputs = outer_builder.add_equation_prevalidated(
@@ -2202,7 +2257,7 @@ where
 
     // Register boundary inputs as sub-program inputs.
     for &input_atom in boundary_input_atoms {
-        let sub_atom = sub_builder.add_input_abstract(representative_values[input_atom].clone());
+        let sub_atom = sub_builder.add_input(&representative_values[input_atom]);
         sub_atom_mapping.insert(input_atom, sub_atom);
     }
 
@@ -2275,7 +2330,7 @@ mod tests {
         parameters::Placeholder,
         tracing_v2::{
             CustomPrimitive, DifferentiableOp, FloatExt, GraphBuilder, InterpretableOp, LinearOp, LinearPrimitiveOp,
-            Op, test_support,
+            Op, engine::ArrayScalarEngine, test_support,
         },
         types::{ArrayType, DataType},
     };
@@ -2350,6 +2405,7 @@ mod tests {
     impl DifferentiableOp<ArrayType, f64, LinearTerm<ArrayType, f64>> for PanicReplayOp {
         fn jvp(
             &self,
+            _engine: &dyn Engine<Type = ArrayType, Value = f64>,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TraceError> {
             if inputs.len() != 1 {
@@ -2361,7 +2417,8 @@ mod tests {
 
     #[test]
     fn linearize_returns_the_primal_output_and_pushforward() {
-        let (primal, pushforward) = linearize(quadratic_plus_sin, 2.0f64).unwrap();
+        let engine = ArrayScalarEngine::<f64>::new();
+        let (primal, pushforward) = linearize(&engine, quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.call(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
@@ -2382,8 +2439,9 @@ mod tests {
 
     #[test]
     fn jvp_program_and_linearize_stage_the_same_pushforward() {
-        let (_, from_jvp_program) = jvp_program(quadratic_plus_sin, 2.0f64).unwrap();
-        let (_, from_linearize) = linearize(quadratic_plus_sin, 2.0f64).unwrap();
+        let engine = ArrayScalarEngine::<f64>::new();
+        let (_, from_jvp_program) = jvp_program(&engine, quadratic_plus_sin, 2.0f64).unwrap();
+        let (_, from_linearize) = linearize(&engine, quadratic_plus_sin, 2.0f64).unwrap();
 
         approx_eq(from_jvp_program.call(1.0f64).unwrap(), from_linearize.call(1.0f64).unwrap());
         assert_eq!(
@@ -2404,7 +2462,8 @@ mod tests {
 
     #[test]
     fn transposed_linear_program_matches_the_reverse_mode_pullback() {
-        let (primal, pushforward) = linearize(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let engine = ArrayScalarEngine::<f64>::new();
+        let (primal, pushforward) = linearize(&engine, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
         let pullback = pushforward.transpose().unwrap();
         let cotangent = pullback.call(1.0f64).unwrap();
 
@@ -2437,7 +2496,8 @@ mod tests {
         );
         let program = Program::from_graph(builder.build::<f64, f64>(output, Placeholder, Placeholder));
 
-        let pushforward = linearize_program(&program).unwrap();
+        let engine = ArrayScalarEngine::<f64>::new();
+        let pushforward = linearize_program(&engine, &program, vec![3.0f64]).unwrap();
         approx_eq(pushforward.call(2.5f64).unwrap(), 2.5);
     }
 
@@ -2459,8 +2519,9 @@ mod tests {
 
     #[test]
     fn linear_program_display_delegates_to_the_underlying_graph() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) =
-            linearize(quadratic_plus_sin, 2.0f64).unwrap();
+            linearize(&engine, quadratic_plus_sin, 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),
@@ -2523,9 +2584,10 @@ mod tests {
     #[test]
     fn test_compile_grad_save_all_matches_compile_grad() {
         // SaveAll should produce the same gradient as the plain compile_grad.
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled_plain = compile_grad(quadratic_plus_sin, 2.0f64).unwrap();
         let compiled_save_all =
-            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
+            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
 
         let grad_plain = compiled_plain.call(2.0f64).unwrap();
         let grad_save_all = compiled_save_all.call(2.0f64).unwrap();
@@ -2540,8 +2602,10 @@ mod tests {
     #[test]
     fn test_compile_grad_recompute_all_gives_correct_gradient() {
         // RecomputeAll should give d/dx(x^2 + sin(x)) = 2x + cos(x).
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled =
-            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll).unwrap();
+            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll)
+                .unwrap();
 
         approx_eq(compiled.call(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
         approx_eq(compiled.call(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
@@ -2554,9 +2618,11 @@ mod tests {
     #[test]
     fn test_compile_grad_recompute_all_matches_compile_grad() {
         // RecomputeAll should give the same numerical gradient as compile_grad.
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled_plain = compile_grad(quadratic_plus_sin, 2.0f64).unwrap();
         let compiled_recompute =
-            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll).unwrap();
+            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll)
+                .unwrap();
 
         for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
             let grad_plain = compiled_plain.call(x).unwrap();
@@ -2569,7 +2635,9 @@ mod tests {
     fn test_compile_grad_checkpoint_gives_correct_gradient() {
         // Checkpoint with segment_size=2 should give the correct gradient for a function with
         // ~4 equations: x*x, sin(x), x*x + sin(x).
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled = compile_grad_with_policy(
+            &engine,
             quadratic_plus_sin,
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 2 },
@@ -2583,7 +2651,9 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_is_reusable_at_different_primals() {
         // The compiled gradient with Checkpoint can be called at multiple primal points.
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled = compile_grad_with_policy(
+            &engine,
             quadratic_plus_sin,
             1.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 2 },
@@ -2599,8 +2669,10 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_matches_compile_grad() {
         // Checkpoint should give the same numerical gradient as compile_grad.
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled_plain = compile_grad(quadratic_plus_sin, 2.0f64).unwrap();
         let compiled_checkpoint = compile_grad_with_policy(
+            &engine,
             quadratic_plus_sin,
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 2 },
@@ -2617,9 +2689,11 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_segment_size_one_matches_save_all() {
         // Checkpoint with segment_size=1 should degenerate to SaveAll.
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled_save_all =
-            compile_grad_with_policy(quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
+            compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
         let compiled_checkpoint = compile_grad_with_policy(
+            &engine,
             quadratic_plus_sin,
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 1 },
@@ -2635,7 +2709,9 @@ mod tests {
     fn test_compile_grad_checkpoint_large_segment_wraps_whole_program() {
         // Checkpoint with a segment_size larger than the number of equations should wrap
         // the entire program in a single RematerializeOp, equivalent to RecomputeAll.
+        let engine = ArrayScalarEngine::<f64>::new();
         let compiled = compile_grad_with_policy(
+            &engine,
             quadratic_plus_sin,
             2.0f64,
             RematerializationPolicy::Checkpoint { segment_size: 100 },

@@ -221,7 +221,7 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
 ///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
 ///     staged op.
 pub fn summarize_graph<V, Input, Output, O, F>(
-    graph: &Graph<O, V, Input, Output>,
+    graph: &Graph<O, ArrayType, V, Input, Output>,
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where

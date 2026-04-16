@@ -23,7 +23,7 @@ use std::ops::{Add, Mul, Neg};
 use half::{bf16, f16};
 
 use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily},
+    parameters::Parameter,
     types::{ArrayType, Type, Typed},
 };
 
@@ -36,24 +36,6 @@ pub trait ZeroLike {
     fn zero_like(&self) -> Self;
 }
 
-/// Synthesizes a zero value from abstract type metadata alone.
-///
-/// Unlike [`ZeroLike`], which produces a zero from an existing exemplar value, this trait is implemented on the
-/// _type-metadata_ side: `Self` is a type parameterized by some [`Type`] `T` (e.g., [`ArrayType`] for backend array
-/// leaves, or `Pair<ArrayType>` for compound structures), and [`Zero::zero`] produces the corresponding concrete value
-/// by reparameterizing from `T` to `P`.
-///
-/// The target value type `P` must be capable of representing any shape described by the metadata. This makes the
-/// conversion infallible — the trait should only be implemented when every metadata value maps to a valid zero of type
-/// `P`. For value types that cannot represent arbitrary shapes (e.g., `f32` can only represent scalar metadata), use
-/// [`ZeroLike`] instead, which produces a zero from an existing exemplar value.
-pub trait Zero<T: Parameter + Type + Clone, P: Parameter + Typed<T>>: Parameterized<T> {
-    /// Constructs one zero value from the abstract metadata in `self`.
-    fn zero(&self) -> Self::To<P>
-    where
-        Self::Family: ParameterizedFamily<P>;
-}
-
 /// Returns a one value with the same structure as an existing value.
 ///
 /// This mirrors [`ZeroLike`] for the multiplicative identity.
@@ -62,23 +44,10 @@ pub trait OneLike {
     fn one_like(&self) -> Self;
 }
 
-/// Synthesizes a one value from abstract type metadata alone.
-///
-/// This mirrors [`Zero`] for the multiplicative identity. `Self` is a type parameterized by some [`Type`] `T`, and
-/// [`One::one`] produces the corresponding concrete value by reparameterizing from `T` to `P`. Like [`Zero`], this
-/// trait should only be implemented when every metadata value maps to a valid one of type `P`.
-pub trait One<T: Parameter + Type + Clone, P: Parameter + Typed<T>>: Parameterized<T> {
-    /// Constructs one one-valued value from the abstract metadata in `self`.
-    fn one(&self) -> Self::To<P>
-    where
-        Self::Family: ParameterizedFamily<P>;
-}
-
-/// Implements [`Type`], [`Typed<Self>`](Typed), [`Zero<Self, Self>`](Zero), and [`One<Self, Self>`](One) for a scalar
-/// type that serves as its own type metadata. Since a scalar type describes exactly one shape (a single value), every
-/// instance of the type is type-compatible and the zero/one synthesis is infallible.
-macro_rules! impl_scalar_self_typed_zero_one {
-    ($ty:ty, $zero:expr, $one:expr) => {
+/// Implements [`Type`] and [`Typed<Self>`](Typed) for a scalar type that serves as its own type metadata. Since a
+/// scalar type describes exactly one shape (a single value), every instance is type-compatible.
+macro_rules! impl_scalar_self_typed {
+    ($ty:ty) => {
         impl Type for $ty {
             #[inline]
             fn is_compatible_with(&self, _other: &Self) -> bool {
@@ -92,36 +61,22 @@ macro_rules! impl_scalar_self_typed_zero_one {
                 std::borrow::Cow::Owned(*self)
             }
         }
-
-        impl Zero<$ty, $ty> for $ty {
-            #[inline]
-            fn zero(&self) -> $ty {
-                $zero
-            }
-        }
-
-        impl One<$ty, $ty> for $ty {
-            #[inline]
-            fn one(&self) -> $ty {
-                $one
-            }
-        }
     };
 }
 
-impl_scalar_self_typed_zero_one!(bool, false, true);
-impl_scalar_self_typed_zero_one!(i8, 0, 1);
-impl_scalar_self_typed_zero_one!(i16, 0, 1);
-impl_scalar_self_typed_zero_one!(i32, 0, 1);
-impl_scalar_self_typed_zero_one!(i64, 0, 1);
-impl_scalar_self_typed_zero_one!(u8, 0, 1);
-impl_scalar_self_typed_zero_one!(u16, 0, 1);
-impl_scalar_self_typed_zero_one!(u32, 0, 1);
-impl_scalar_self_typed_zero_one!(u64, 0, 1);
-impl_scalar_self_typed_zero_one!(bf16, bf16::ZERO, bf16::ONE);
-impl_scalar_self_typed_zero_one!(f16, f16::ZERO, f16::ONE);
-impl_scalar_self_typed_zero_one!(f32, 0.0, 1.0);
-impl_scalar_self_typed_zero_one!(f64, 0.0, 1.0);
+impl_scalar_self_typed!(bool);
+impl_scalar_self_typed!(i8);
+impl_scalar_self_typed!(i16);
+impl_scalar_self_typed!(i32);
+impl_scalar_self_typed!(i64);
+impl_scalar_self_typed!(u8);
+impl_scalar_self_typed!(u16);
+impl_scalar_self_typed!(u32);
+impl_scalar_self_typed!(u64);
+impl_scalar_self_typed!(bf16);
+impl_scalar_self_typed!(f16);
+impl_scalar_self_typed!(f32);
+impl_scalar_self_typed!(f64);
 
 /// Marker trait that identifies concrete, non-tracer leaves.
 ///

@@ -2875,7 +2875,11 @@ mod tests {
         let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, f64, f64>) =
             ryft_core::tracing_v2::try_jit(
                 |x: ryft_core::tracing_v2::JitTracer<ArrayType, f64>| {
-                    Ok(ryft_core::tracing_v2::grad(scalar_quartic_plus_sin, x)?)
+                    Ok(ryft_core::tracing_v2::grad(
+                        &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
+                        scalar_quartic_plus_sin,
+                        x,
+                    )?)
                 },
                 2.0f64,
             )
@@ -2899,7 +2903,12 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
         // Standalone pullback — specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
         let (_, pullback): (f64, ryft_core::tracing_v2::LinearProgram<ArrayType, f64, f64, (f64, f64)>) =
-            ryft_core::tracing_v2::vjp(scalar_bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+            ryft_core::tracing_v2::vjp(
+                &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
+                scalar_bilinear_sin,
+                (2.0f64, 3.0f64),
+            )
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_graph(pullback.program().graph(), "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
@@ -2921,7 +2930,13 @@ mod tests {
             |inputs: (
                 ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
                 ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
-            )| { Ok(ryft_core::tracing_v2::grad(scalar_bilinear_sin, inputs)?) },
+            )| {
+                Ok(ryft_core::tracing_v2::grad(
+                    &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
+                    scalar_bilinear_sin,
+                    inputs,
+                )?)
+            },
             (2.0f64, 3.0f64),
         )
         .unwrap();
@@ -2944,8 +2959,13 @@ mod tests {
         let right = arr2(&[[5.0f64, 6.0], [7.0, 8.0]]);
         let (_, pullback): (
             Array2<f64>,
-            ryft_core::tracing_v2::LinearProgram<Array2<f64>, Array2<f64>, (Array2<f64>, Array2<f64>)>,
-        ) = ryft_core::tracing_v2::vjp(bilinear_matmul, (left, right)).unwrap();
+            ryft_core::tracing_v2::LinearProgram<ArrayType, Array2<f64>, Array2<f64>, (Array2<f64>, Array2<f64>)>,
+        ) = ryft_core::tracing_v2::vjp(
+            &ryft_core::tracing_v2::operations::matrix::ndarray_support::Array2Engine::<f64>::new(),
+            bilinear_matmul,
+            (left, right),
+        )
+        .unwrap();
 
         assert_eq!(
             to_mlir_module_for_plain_graph(pullback.program().graph(), "main").unwrap(),

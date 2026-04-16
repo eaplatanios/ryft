@@ -13,7 +13,7 @@ use ryft_core::{
     tracing_v2::{
         AtomId, CustomPrimitive, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp,
         LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
-        Traceable, ZeroLike, forward::JvpTracer,
+        Traceable, ZeroLike, engine::Engine, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -316,6 +316,7 @@ impl LinearOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>> for ShardMapOp<ShardMapTensor> {
     fn jvp(
         &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor>,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         if self.has_linear_state() {
@@ -451,6 +452,7 @@ impl LinearOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
 impl DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>> for ShardMapOp<ShardMapTracer> {
     fn jvp(
         &self,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer>,
         _inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
@@ -689,11 +691,12 @@ fn project_flat_shard_map_graph(
     }
 
     let equation_by_output = equation_by_output(graph);
-    let representative_values = graph.representative_atom_values()?;
+    let engine = crate::experimental::shard_map::ShardMapTensorEngine::new();
+    let representative_values = graph.representative_atom_values(&engine)?;
     let mut builder = ProgramBuilder::<ShardMapTensor>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input_abstract(representative_values[atom_id].clone());
+        let mapped_atom = builder.add_input(&representative_values[atom_id]);
         input_mapping.insert(atom_id, mapped_atom);
     }
 
@@ -799,7 +802,8 @@ fn build_factorized_apply_graph(
     }
 
     let graph = body.compiled.graph();
-    let representative_values = graph.representative_atom_values()?;
+    let engine = crate::experimental::shard_map::ShardMapTensorEngine::new();
+    let representative_values = graph.representative_atom_values(&engine)?;
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = graph.input_atoms()[primal_input_count..].to_vec();
     let equation_by_output = equation_by_output(graph);
@@ -807,11 +811,11 @@ fn build_factorized_apply_graph(
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input_abstract(representative_values[atom_id].clone());
+        let mapped_atom = builder.add_input(&representative_values[atom_id]);
         replacement_inputs.insert(atom_id, mapped_atom);
     }
     for atom_id in residual_atoms.iter().copied() {
-        let mapped_atom = builder.add_input_abstract(representative_values[atom_id].clone());
+        let mapped_atom = builder.add_input(&representative_values[atom_id]);
         replacement_inputs.insert(atom_id, mapped_atom);
     }
 

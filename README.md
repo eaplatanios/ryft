@@ -42,6 +42,8 @@ or months.
 > with `load_cuda_13_plugin()` in the example code below.
 
 ```rust
+use std::sync::Arc;
+
 use ryft::mlir::*;
 use ryft::pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft::pjrt::*;
@@ -114,8 +116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lhs_buffer = client.buffer(lhs_bytes.as_slice(), BufferType::F32, &[2, 3], None, device.clone(), None)?;
     let rhs_buffer = client.buffer(rhs_bytes.as_slice(), BufferType::F32, &[3, 2], None, device, None)?;
     let inputs = [
-        ExecutionInput { buffer: lhs_buffer, donatable: false },
-        ExecutionInput { buffer: rhs_buffer, donatable: false },
+        ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false },
+        ExecutionInput { buffer: Arc::new(rhs_buffer), donatable: false },
     ];
     let inputs = vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }];
 

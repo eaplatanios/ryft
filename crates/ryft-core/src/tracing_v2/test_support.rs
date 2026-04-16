@@ -4,7 +4,7 @@ use indoc::indoc;
 
 use crate::{
     parameters::Placeholder,
-    tracing_v2::{ops::PrimitiveOp, *},
+    tracing_v2::{engine::ArrayScalarEngine, ops::PrimitiveOp, *},
     types::ArrayType,
 };
 
@@ -57,8 +57,9 @@ where
 }
 
 pub(crate) fn assert_bilinear_pushforward_rendering() {
+    let engine = ArrayScalarEngine::<f64>::new();
     let (_, pushforward): (f64, LinearProgram<ArrayType, f64, (f64, f64), f64>) =
-        linearize(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        linearize(&engine, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
@@ -93,8 +94,9 @@ pub(crate) fn assert_bilinear_jit_rendering() {
 }
 
 pub(crate) fn assert_quadratic_pushforward_rendering() {
+    let engine = ArrayScalarEngine::<f64>::new();
     let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) =
-        linearize(quadratic_plus_sin, 2.0f64).unwrap();
+        linearize(&engine, quadratic_plus_sin, 2.0f64).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
