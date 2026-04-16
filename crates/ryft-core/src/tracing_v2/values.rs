@@ -20,8 +20,6 @@
 
 use std::ops::{Add, Mul, Neg};
 
-use half::{bf16, f16};
-
 use crate::{
     parameters::Parameter,
     types::{ArrayType, Type, Typed},
@@ -43,40 +41,6 @@ pub trait OneLike {
     /// Returns a one value with the same shape as `self`.
     fn one_like(&self) -> Self;
 }
-
-/// Implements [`Type`] and [`Typed<Self>`](Typed) for a scalar type that serves as its own type metadata. Since a
-/// scalar type describes exactly one shape (a single value), every instance is type-compatible.
-macro_rules! impl_scalar_self_typed {
-    ($ty:ty) => {
-        impl Type for $ty {
-            #[inline]
-            fn is_compatible_with(&self, _other: &Self) -> bool {
-                true
-            }
-        }
-
-        impl Typed<$ty> for $ty {
-            #[inline]
-            fn tpe(&self) -> std::borrow::Cow<'_, $ty> {
-                std::borrow::Cow::Owned(*self)
-            }
-        }
-    };
-}
-
-impl_scalar_self_typed!(bool);
-impl_scalar_self_typed!(i8);
-impl_scalar_self_typed!(i16);
-impl_scalar_self_typed!(i32);
-impl_scalar_self_typed!(i64);
-impl_scalar_self_typed!(u8);
-impl_scalar_self_typed!(u16);
-impl_scalar_self_typed!(u32);
-impl_scalar_self_typed!(u64);
-impl_scalar_self_typed!(bf16);
-impl_scalar_self_typed!(f16);
-impl_scalar_self_typed!(f32);
-impl_scalar_self_typed!(f64);
 
 /// Marker trait that identifies concrete, non-tracer leaves.
 ///

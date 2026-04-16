@@ -63,7 +63,7 @@ pub trait Engine {
 ///
 /// Implemented for every scalar in `ryft-core` via [`impl_scalar_engine_value!`] and used as the
 /// value bound for [`ArrayScalarEngine<V>`].
-pub trait ScalarEngineValue: Typed<Self> + Parameter + Clone + Type + Sized {
+pub trait ScalarEngineValue: Parameter + Clone + Sized {
     /// Returns the canonical additive-identity value for this scalar.
     fn engine_zero() -> Self;
 
