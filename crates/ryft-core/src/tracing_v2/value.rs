@@ -11,21 +11,12 @@
 
 use std::ops::{Add, Mul, Neg};
 
+use half::{bf16, f16};
+
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     types::{ArrayType, Type, Typed},
 };
-
-/// Minimal floating-point surface used by the scalar tracing primitives.
-///
-/// Later backends can extend tracing to richer value types by implementing these operations on their leaf type.
-pub trait FloatExt: Clone + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> {
-    /// Computes the elementwise sine.
-    fn sin(self) -> Self;
-
-    /// Computes the elementwise cosine.
-    fn cos(self) -> Self;
-}
 
 /// Returns a zero value with the same structure as an existing value.
 ///
@@ -74,6 +65,55 @@ pub trait One<T: Type + Parameter, P: Parameter + Typed<T>>: Parameterized<T> {
         Self::Family: ParameterizedFamily<P>;
 }
 
+/// Implements [`Type`], [`Typed<Self>`](Typed), [`Zero<Self, Self>`](Zero), and [`One<Self, Self>`](One) for a scalar
+/// type that serves as its own type metadata. Since a scalar type describes exactly one shape (a single value), every
+/// instance of the type is type-compatible and the zero/one synthesis is infallible.
+macro_rules! impl_scalar_self_typed_zero_one {
+    ($ty:ty, $zero:expr, $one:expr) => {
+        impl Type for $ty {
+            #[inline]
+            fn is_compatible_with(&self, _other: &Self) -> bool {
+                true
+            }
+        }
+
+        impl Typed<$ty> for $ty {
+            #[inline]
+            fn tpe(&self) -> $ty {
+                *self
+            }
+        }
+
+        impl Zero<$ty, $ty> for $ty {
+            #[inline]
+            fn zero(&self) -> $ty {
+                $zero
+            }
+        }
+
+        impl One<$ty, $ty> for $ty {
+            #[inline]
+            fn one(&self) -> $ty {
+                $one
+            }
+        }
+    };
+}
+
+impl_scalar_self_typed_zero_one!(bool, false, true);
+impl_scalar_self_typed_zero_one!(i8, 0, 1);
+impl_scalar_self_typed_zero_one!(i16, 0, 1);
+impl_scalar_self_typed_zero_one!(i32, 0, 1);
+impl_scalar_self_typed_zero_one!(i64, 0, 1);
+impl_scalar_self_typed_zero_one!(u8, 0, 1);
+impl_scalar_self_typed_zero_one!(u16, 0, 1);
+impl_scalar_self_typed_zero_one!(u32, 0, 1);
+impl_scalar_self_typed_zero_one!(u64, 0, 1);
+impl_scalar_self_typed_zero_one!(bf16, bf16::ZERO, bf16::ONE);
+impl_scalar_self_typed_zero_one!(f16, f16::ZERO, f16::ONE);
+impl_scalar_self_typed_zero_one!(f32, 0.0, 1.0);
+impl_scalar_self_typed_zero_one!(f64, 0.0, 1.0);
+
 /// Marker trait for concrete tracing leaves that participate in eager transform dispatch.
 ///
 /// Exact identity detection itself lives on [`TraceValue`]. This marker exists only to partition the blanket impls
@@ -104,6 +144,21 @@ pub trait TraceValue: Clone + Parameter + Typed<ArrayType> + 'static {
     fn is_one(&self) -> bool {
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// f32/f64 tracing support
+// ---------------------------------------------------------------------------
+
+/// Minimal floating-point surface used by the scalar tracing primitives.
+///
+/// Later backends can extend tracing to richer value types by implementing these operations on their leaf type.
+pub trait FloatExt: Clone + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> {
+    /// Computes the elementwise sine.
+    fn sin(self) -> Self;
+
+    /// Computes the elementwise cosine.
+    fn cos(self) -> Self;
 }
 
 impl FloatExt for f32 {
