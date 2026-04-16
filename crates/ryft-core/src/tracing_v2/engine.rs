@@ -59,18 +59,6 @@ pub trait Engine {
     fn one(&self, r#type: &Self::Type) -> Self::Value;
 }
 
-/// Scalar value types whose canonical zero and one can be produced without additional context.
-///
-/// Implemented for every scalar in `ryft-core` via [`impl_scalar_engine_value!`] and used as the
-/// value bound for [`ArrayScalarEngine<V>`].
-pub trait ScalarEngineValue: Parameter + Clone + Sized {
-    /// Returns the canonical additive-identity value for this scalar.
-    fn engine_zero() -> Self;
-
-    /// Returns the canonical multiplicative-identity value for this scalar.
-    fn engine_one() -> Self;
-}
-
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
 ///
 /// [`ArrayScalarEngine<V>`] is a zero-sized type used whenever a test or scalar-only pipeline needs
@@ -92,50 +80,38 @@ impl<V> ArrayScalarEngine<V> {
     }
 }
 
-impl<V: ScalarEngineValue + Typed<ArrayType>> Engine for ArrayScalarEngine<V> {
-    type Type = ArrayType;
-    type Value = V;
-
-    #[inline]
-    fn zero(&self, _type: &ArrayType) -> V {
-        V::engine_zero()
-    }
-
-    #[inline]
-    fn one(&self, _type: &ArrayType) -> V {
-        V::engine_one()
-    }
-}
-
-macro_rules! impl_scalar_engine_value {
+macro_rules! impl_engine_for_array_scalar_engine {
     ($ty:ty, $zero:expr, $one:expr) => {
-        impl ScalarEngineValue for $ty {
+        impl Engine for ArrayScalarEngine<$ty> {
+            type Type = ArrayType;
+            type Value = $ty;
+
             #[inline]
-            fn engine_zero() -> Self {
+            fn zero(&self, _type: &ArrayType) -> $ty {
                 $zero
             }
 
             #[inline]
-            fn engine_one() -> Self {
+            fn one(&self, _type: &ArrayType) -> $ty {
                 $one
             }
         }
     };
 }
 
-impl_scalar_engine_value!(bool, false, true);
-impl_scalar_engine_value!(i8, 0, 1);
-impl_scalar_engine_value!(i16, 0, 1);
-impl_scalar_engine_value!(i32, 0, 1);
-impl_scalar_engine_value!(i64, 0, 1);
-impl_scalar_engine_value!(u8, 0, 1);
-impl_scalar_engine_value!(u16, 0, 1);
-impl_scalar_engine_value!(u32, 0, 1);
-impl_scalar_engine_value!(u64, 0, 1);
-impl_scalar_engine_value!(bf16, bf16::ZERO, bf16::ONE);
-impl_scalar_engine_value!(f16, f16::ZERO, f16::ONE);
-impl_scalar_engine_value!(f32, 0.0, 1.0);
-impl_scalar_engine_value!(f64, 0.0, 1.0);
+impl_engine_for_array_scalar_engine!(bool, false, true);
+impl_engine_for_array_scalar_engine!(i8, 0, 1);
+impl_engine_for_array_scalar_engine!(i16, 0, 1);
+impl_engine_for_array_scalar_engine!(i32, 0, 1);
+impl_engine_for_array_scalar_engine!(i64, 0, 1);
+impl_engine_for_array_scalar_engine!(u8, 0, 1);
+impl_engine_for_array_scalar_engine!(u16, 0, 1);
+impl_engine_for_array_scalar_engine!(u32, 0, 1);
+impl_engine_for_array_scalar_engine!(u64, 0, 1);
+impl_engine_for_array_scalar_engine!(bf16, bf16::ZERO, bf16::ONE);
+impl_engine_for_array_scalar_engine!(f16, f16::ZERO, f16::ONE);
+impl_engine_for_array_scalar_engine!(f32, 0.0, 1.0);
+impl_engine_for_array_scalar_engine!(f64, 0.0, 1.0);
 
 #[cfg(test)]
 mod tests {

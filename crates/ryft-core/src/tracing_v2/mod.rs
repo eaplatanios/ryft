@@ -31,7 +31,7 @@ pub(crate) mod test_support;
 mod values;
 
 pub use batch::{Batch, stack, unstack, vmap};
-pub use engine::{Engine, ScalarEngineValue};
+pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, Equation, Graph, GraphBuilder};
 pub use jit::try_jit;
