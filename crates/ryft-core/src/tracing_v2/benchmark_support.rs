@@ -9,7 +9,7 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::tracing_v2::{
-    Batch, CompiledFunction, FloatExt, JitTracer, LinearProgram, OneLike, Program, TraceValue,
+    Batch, CompiledFunction, FloatExt, JitTracer, LinearProgram, OneLike, Program, Traceable,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_graph},
     grad, jit, jvp, jvp_program, linearize, stack, try_jit, unstack, value_and_grad, vjp, vmap,
 };
@@ -66,7 +66,7 @@ fn summarize_program<V, Input, Output, O>(
     program: &Program<V, Input, Output, O>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
-    V: TraceValue,
+    V: Traceable,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
     O: Clone + std::fmt::Display + crate::tracing_v2::Op,
@@ -87,7 +87,7 @@ fn tracing_record<V, Input, Output, O>(
     program: &Program<V, Input, Output, O>,
 ) -> Result<IrBenchmarkRecord, BenchmarkError>
 where
-    V: TraceValue
+    V: Traceable
         + crate::tracing_v2::FloatExt
         + crate::tracing_v2::ZeroLike
         + crate::tracing_v2::OneLike

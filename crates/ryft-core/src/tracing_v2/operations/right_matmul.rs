@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
+    FloatExt, OneLike, TraceError, Traceable, ZeroLike,
     batch::Batch as BatchedValue,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
@@ -99,7 +99,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps>
+impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps>
     InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RightMatMulOp<V>
 {
     fn interpret(

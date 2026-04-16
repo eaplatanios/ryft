@@ -1,13 +1,22 @@
 //! Foundational leaf-value traits used by `tracing_v2`.
 //!
-//! The tracing prototype distinguishes between two related concepts:
+//! This module defines two closely related but distinct traits that together govern which types can participate in
+//! the tracing system:
 //!
-//! - a concrete leaf value such as `f64` or an `ndarray::Array2<f64>`;
-//! - the [`ArrayType`](crate::types::ArrayType) metadata that tracing needs in order to stage programs without
-//!   inspecting full values.
+//! - [`Traceable`] — the base trait for **any** type that can appear as a leaf in a traced computation, whether it
+//!   holds concrete data (like `f64`) or is itself a tracing wrapper (like [`JitTracer<V>`](crate::tracing_v2::JitTracer)).
+//!   Every leaf in a staged graph implements this trait.
 //!
-//! The traits in this module capture that boundary. They are intentionally small so that future tensor-like leaf
-//! types, including PJRT-backed arrays, can adopt the tracing machinery by implementing a compact set of behaviors.
+//! - [`Value`] — a marker subtrait of [`Traceable`] that identifies **concrete, non-tracer** leaves. Types like `f32`,
+//!   `f64`, or backend-backed arrays implement [`Value`]; tracing wrappers like
+//!   [`JitTracer`](crate::tracing_v2::JitTracer) deliberately do **not**. This distinction exists to resolve Rust
+//!   trait-coherence conflicts: transforms such as `jvp`, `grad`, and `vmap` each provide two blanket implementations
+//!   of their dispatch trait — one for concrete leaves (`V: Value`) that performs eager evaluation, and one for
+//!   `JitTracer<V>` that stages the operation symbolically. Without the [`Value`] marker, both impls would match
+//!   `JitTracer<V>` (since it implements [`Traceable`]), and the compiler would reject the overlap.
+//!
+//! The traits are intentionally small so that future tensor-like leaf types, including PJRT-backed arrays, can adopt
+//! the tracing machinery by implementing a compact set of behaviors.
 
 use std::ops::{Add, Mul, Neg};
 
@@ -18,6 +27,7 @@ use crate::{
     types::{ArrayType, Type, Typed},
 };
 
+// TODO(eaplatanios): This should not require `Clone`.
 /// Returns a zero value with the same structure as an existing value.
 ///
 /// This is the universal "zero-like" capability: every type that participates in differentiation or batching can
@@ -38,13 +48,14 @@ pub trait ZeroLike: Clone {
 /// conversion infallible — the trait should only be implemented when every metadata value maps to a valid zero of type
 /// `P`. For value types that cannot represent arbitrary shapes (e.g., `f32` can only represent scalar metadata), use
 /// [`ZeroLike`] instead, which produces a zero from an existing exemplar value.
-pub trait Zero<T: Type + Parameter, P: Parameter + Typed<T>>: Parameterized<T> {
+pub trait Zero<T: Parameter + Type, P: Parameter + Typed<T>>: Parameterized<T> {
     /// Constructs one zero value from the abstract metadata in `self`.
     fn zero(&self) -> Self::To<P>
     where
         Self::Family: ParameterizedFamily<P>;
 }
 
+// TODO(eaplatanios): This should not require `Clone`.
 /// Returns a one value with the same structure as an existing value.
 ///
 /// This mirrors [`ZeroLike`] for the multiplicative identity.
@@ -58,7 +69,7 @@ pub trait OneLike: Clone {
 /// This mirrors [`Zero`] for the multiplicative identity. `Self` is a type parameterized by some [`Type`] `T`, and
 /// [`One::one`] produces the corresponding concrete value by reparameterizing from `T` to `P`. Like [`Zero`], this
 /// trait should only be implemented when every metadata value maps to a valid one of type `P`.
-pub trait One<T: Type + Parameter, P: Parameter + Typed<T>>: Parameterized<T> {
+pub trait One<T: Parameter + Type, P: Parameter + Typed<T>>: Parameterized<T> {
     /// Constructs one one-valued value from the abstract metadata in `self`.
     fn one(&self) -> Self::To<P>
     where
@@ -114,25 +125,36 @@ impl_scalar_self_typed_zero_one!(f16, f16::ZERO, f16::ONE);
 impl_scalar_self_typed_zero_one!(f32, 0.0, 1.0);
 impl_scalar_self_typed_zero_one!(f64, 0.0, 1.0);
 
-/// Marker trait for concrete tracing leaves that participate in eager transform dispatch.
+/// Marker trait that identifies concrete, non-tracer leaves.
 ///
-/// Exact identity detection itself lives on [`TraceValue`]. This marker exists only to partition the blanket impls
-/// for concrete leaf regimes from the corresponding traced-leaf impls for
-/// [`JitTracer`](crate::tracing_v2::JitTracer).
-pub trait ConcreteTraceValue: TraceValue {}
+/// [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real data — scalars like `f32`, dense
+/// arrays, backend-backed tensors, etc. Tracing wrappers such as [`JitTracer`](crate::tracing_v2::JitTracer) must
+/// **not** implement this trait.
+///
+/// The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket impls apart.
+/// Each composable transform (e.g., `jvp`, `grad`, `vmap`) provides:
+///
+/// 1. an impl for `V: Value` — eager dispatch that evaluates the transform on concrete data, and
+/// 2. an impl for `JitTracer<V>` — symbolic dispatch that stages the transform into the enclosing traced graph.
+///
+/// Because `JitTracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
+pub trait Value: Traceable {}
 
-/// Convenience trait for stageable leaves used by `tracing_v2`.
+/// Base trait for any leaf type that can participate in traced computations.
 ///
-/// [`TraceValue`] identifies leaf values that can appear in staged graphs and participate in abstract evaluation. It
-/// ties each runtime leaf to the shared [`ArrayType`](crate::types::ArrayType) descriptor used by `tracing_v2`
-/// via [`Typed`], while deliberately not implying eager numeric operations such as [`FloatExt`] or
-/// differentiation-specific capabilities such as [`ZeroLike`]. Those requirements live on the primitive operations
-/// and transforms that actually use them.
+/// [`Traceable`] is implemented by **every** type that can appear as a leaf in a staged graph — both concrete data
+/// types (e.g., `f32`, `f64`, backend arrays) and tracing wrappers (e.g.,
+/// [`JitTracer`](crate::tracing_v2::JitTracer)). It ties each leaf to the shared
+/// [`ArrayType`](crate::types::ArrayType) descriptor used by the tracing infrastructure via [`Typed`], while
+/// deliberately not implying eager numeric operations such as [`FloatExt`] or differentiation-specific capabilities
+/// such as [`ZeroLike`]. Those requirements live on the primitive operations and transforms that actually need them.
 ///
-/// Leaf types that support exact algebraic identity detection should override [`TraceValue::is_zero`] and
-/// [`TraceValue::is_one`]. The default implementations return `false`, which keeps purely abstract leaves valid while
-/// opting them out of constant-identity simplification.
-pub trait TraceValue: Clone + Parameter + Typed<ArrayType> + 'static {
+/// Concrete leaves that support exact algebraic identity detection should override [`Traceable::is_zero`] and
+/// [`Traceable::is_one`]. The default implementations return `false`, which keeps purely abstract or traced leaves
+/// valid while opting them out of constant-identity simplification.
+///
+/// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
+pub trait Traceable: Clone + Parameter + Typed<ArrayType> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
     #[inline]
     fn is_zero(&self) -> bool {
@@ -173,7 +195,7 @@ impl FloatExt for f32 {
     }
 }
 
-impl TraceValue for f32 {
+impl Traceable for f32 {
     #[inline]
     fn is_zero(&self) -> bool {
         *self == 0.0
@@ -185,7 +207,7 @@ impl TraceValue for f32 {
     }
 }
 
-impl ConcreteTraceValue for f32 {}
+impl Value for f32 {}
 
 impl ZeroLike for f32 {
     #[inline]
@@ -213,7 +235,7 @@ impl FloatExt for f64 {
     }
 }
 
-impl TraceValue for f64 {
+impl Traceable for f64 {
     #[inline]
     fn is_zero(&self) -> bool {
         *self == 0.0
@@ -225,7 +247,7 @@ impl TraceValue for f64 {
     }
 }
 
-impl ConcreteTraceValue for f64 {}
+impl Value for f64 {}
 
 impl ZeroLike for f64 {
     #[inline]

@@ -9,7 +9,7 @@ use std::{fmt::Display, marker::PhantomData};
 use crate::{
     parameters::Parameterized,
     tracing_v2::{
-        Graph, GraphBuilder, InterpretableOp, Op, TraceError, TraceValue,
+        Graph, GraphBuilder, InterpretableOp, Op, TraceError, Traceable,
         ops::{LinearPrimitiveOp, PrimitiveOp},
     },
 };
@@ -27,13 +27,13 @@ pub type LinearProgramOpRef<V> = LinearPrimitiveOp<V>;
 pub type LinearProgramBuilder<V> = GraphBuilder<LinearProgramOpRef<V>, V>;
 
 /// Canonical staged program used by `tracing_v2`.
-pub struct Program<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone = ProgramOpRef<V>> {
+pub struct Program<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone = ProgramOpRef<V>> {
     graph: Graph<O, V, Input, Output>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
 impl<
-    V: TraceValue,
+    V: Traceable,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: Clone,
@@ -44,7 +44,7 @@ impl<
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> Program<V, Input, Output, O> {
+impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> Program<V, Input, Output, O> {
     /// Creates a program from an existing staged graph.
     #[inline]
     pub fn from_graph(graph: Graph<O, V, Input, Output>) -> Self {
@@ -79,7 +79,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
     }
 }
 
-impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
+impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
     for Program<V, Input, Output, O>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

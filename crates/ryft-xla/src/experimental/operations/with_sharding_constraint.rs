@@ -44,7 +44,7 @@ impl WithShardingConstraintOp {
 
     fn base_custom_primitive<V>(&self) -> CustomPrimitive<V>
     where
-        V: ryft_core::tracing_v2::TraceValue,
+        V: ryft_core::tracing_v2::Traceable,
         Self: InterpretableOp<V>
             + LinearOp<V>
             + DifferentiableOp<V, LinearTerm<V>>
@@ -217,7 +217,7 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for WithShardi
     }
 }
 
-impl<V: ryft_core::tracing_v2::TraceValue> VectorizableOp<V> for WithShardingConstraintOp {
+impl<V: ryft_core::tracing_v2::Traceable> VectorizableOp<V> for WithShardingConstraintOp {
     fn batch(
         &self,
         inputs: &[ryft_core::tracing_v2::Batch<V>],

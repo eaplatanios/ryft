@@ -68,7 +68,7 @@ use thiserror::Error;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::{
-    CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
+    CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, Traceable, ZeroLike, jit,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -309,7 +309,7 @@ impl Typed<ArrayType> for ShardMapTensor {
     }
 }
 
-impl TraceValue for ShardMapTensor {
+impl Traceable for ShardMapTensor {
     fn is_zero(&self) -> bool {
         false
     }
@@ -319,7 +319,7 @@ impl TraceValue for ShardMapTensor {
     }
 }
 
-impl ryft_core::tracing_v2::ConcreteTraceValue for ShardMapTensor {}
+impl ryft_core::tracing_v2::Value for ShardMapTensor {}
 
 fn without_varying_manual_axes(r#type: &ArrayType) -> ArrayType {
     let mut r#type = r#type.clone();

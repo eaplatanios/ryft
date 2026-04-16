@@ -13,7 +13,7 @@ use ryft_core::{
     tracing_v2::{
         AtomId, CustomPrimitive, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp,
         LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
-        TraceValue, ZeroLike, forward::JvpTracer,
+        Traceable, ZeroLike, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -77,7 +77,7 @@ struct LinearShardMapState {
 
 /// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering.
 #[derive(Clone)]
-pub struct ShardMapOp<V: TraceValue> {
+pub struct ShardMapOp<V: Traceable> {
     body: FlatTracedShardMap,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
@@ -85,7 +85,7 @@ pub struct ShardMapOp<V: TraceValue> {
     marker: PhantomData<fn() -> V>,
 }
 
-impl<V: TraceValue> ShardMapOp<V> {
+impl<V: Traceable> ShardMapOp<V> {
     /// Creates one ordinary staged shard-map op from its erased body payload.
     #[inline]
     pub fn new(body: FlatTracedShardMap) -> Self {
@@ -218,13 +218,13 @@ impl ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl<V: TraceValue> Debug for ShardMapOp<V> {
+impl<V: Traceable> Debug for ShardMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.has_linear_state() { write!(formatter, "LinearShardMap") } else { write!(formatter, "ShardMap") }
     }
 }
 
-impl<V: TraceValue> Display for ShardMapOp<V> {
+impl<V: Traceable> Display for ShardMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.has_linear_state() { write!(formatter, "linear_shard_map") } else { write!(formatter, "shard_map") }
     }
@@ -500,7 +500,7 @@ impl StableHloCustomLowering<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 }
 
 trait ReplayShardMapValue:
-    Clone + TraceValue + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> + FloatExt + MatrixOps + ZeroLike + OneLike
+    Clone + Traceable + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> + FloatExt + MatrixOps + ZeroLike + OneLike
 {
     fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TraceError>;
 

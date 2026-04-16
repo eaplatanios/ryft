@@ -7,7 +7,7 @@ use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{InterpretableOp, Op, TraceError, TraceValue, Zero},
+    tracing_v2::{InterpretableOp, Op, TraceError, Traceable, Zero},
     types::{ArrayType, Typed},
 };
 
@@ -27,7 +27,7 @@ pub enum AtomSource {
 
 /// Staged atom carrying abstract metadata and provenance.
 #[derive(Clone, Debug)]
-pub struct Atom<V: TraceValue> {
+pub struct Atom<V: Traceable> {
     /// Array type used for validation and shape propagation.
     pub abstract_value: ArrayType,
     /// Stored concrete value when this atom semantically owns one.
@@ -41,7 +41,7 @@ pub struct Atom<V: TraceValue> {
     pub source: AtomSource,
 }
 
-impl<V: TraceValue> Atom<V> {
+impl<V: Traceable> Atom<V> {
     #[inline]
     fn input(abstract_value: ArrayType, exemplar_value: V) -> Self {
         Self { abstract_value, stored_value: Some(exemplar_value), source: AtomSource::Input }
@@ -97,13 +97,13 @@ pub struct Equation<O> {
 
 /// Builder for staged graphs.
 #[derive(Clone, Debug)]
-pub struct GraphBuilder<O: Clone, V: TraceValue> {
+pub struct GraphBuilder<O: Clone, V: Traceable> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
 }
 
-impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
+impl<O: Clone, V: Traceable> GraphBuilder<O, V> {
     /// Creates an empty builder.
     #[inline]
     pub fn new() -> Self {
@@ -279,7 +279,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     }
 }
 
-impl<O: Clone, V: TraceValue> Default for GraphBuilder<O, V> {
+impl<O: Clone, V: Traceable> Default for GraphBuilder<O, V> {
     fn default() -> Self {
         Self::new()
     }
@@ -289,18 +289,18 @@ impl<O: Clone, V: TraceValue> Default for GraphBuilder<O, V> {
 // Algebraic identity elimination helpers
 // ---------------------------------------------------------------------------
 
-/// Checks if a value is a constant zero through [`TraceValue::is_zero`].
-pub(crate) fn is_identity_zero<V: TraceValue>(value: &V) -> bool {
+/// Checks if a value is a constant zero through [`Traceable::is_zero`].
+pub(crate) fn is_identity_zero<V: Traceable>(value: &V) -> bool {
     value.is_zero()
 }
 
-/// Checks if a value is a constant one through [`TraceValue::is_one`].
-pub(crate) fn is_identity_one<V: TraceValue>(value: &V) -> bool {
+/// Checks if a value is a constant one through [`Traceable::is_one`].
+pub(crate) fn is_identity_one<V: Traceable>(value: &V) -> bool {
     value.is_one()
 }
 
 /// Executable staged graph over an open operation set.
-pub struct Graph<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
+pub struct Graph<O: Clone, V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>> {
     atoms: Vec<Atom<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
@@ -312,7 +312,7 @@ pub struct Graph<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Param
 
 impl<
     O: Clone,
-    V: TraceValue,
+    V: Traceable,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > Clone for Graph<O, V, Input, Output>
@@ -330,7 +330,7 @@ impl<
     }
 }
 
-impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Graph<O, V, Input, Output> {
+impl<O: Clone, V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>> Graph<O, V, Input, Output> {
     /// Returns the number of atoms in the graph.
     #[inline]
     pub fn atom_count(&self) -> usize {
@@ -487,7 +487,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>(
+        fn mark_live<O: Clone, V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>>(
             graph: &Graph<O, V, Input, Output>,
             atom_id: usize,
             live_atoms: &mut [bool],
@@ -520,7 +520,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
         ) -> Result<usize, TraceError>
         where
             O: Clone + Op,
-            V: TraceValue,
+            V: Traceable,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
         {
@@ -629,7 +629,7 @@ impl<O: Clone, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>>
     }
 }
 
-impl<O: Clone + Display, V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display
+impl<O: Clone + Display, V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>> Display
     for Graph<O, V, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -689,7 +689,7 @@ mod tests {
     use crate::{
         parameters::{Parameter, Placeholder},
         tracing_v2::{
-            ConcreteTraceValue, FloatExt, MatrixOps, One, OneLike, TraceError, Zero, ZeroLike, ops::PrimitiveOp,
+            Value, FloatExt, MatrixOps, One, OneLike, TraceError, Zero, ZeroLike, ops::PrimitiveOp,
             test_support,
         },
         types::{ArrayType, DataType, Shape, Typed},
@@ -843,7 +843,7 @@ mod tests {
             }
         }
 
-        impl TraceValue for TestIdentityValue {
+        impl Traceable for TestIdentityValue {
             fn is_zero(&self) -> bool {
                 self.value == 0.0
             }
@@ -853,7 +853,7 @@ mod tests {
             }
         }
 
-        impl ConcreteTraceValue for TestIdentityValue {}
+        impl Value for TestIdentityValue {}
 
         impl Add for TestIdentityValue {
             type Output = Self;

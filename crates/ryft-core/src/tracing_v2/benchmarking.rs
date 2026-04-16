@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::parameters::Parameterized;
 
-use super::{AtomSource, Graph, Op, TraceError, TraceValue};
+use super::{AtomSource, Graph, Op, TraceError, Traceable};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -224,7 +224,7 @@ pub fn summarize_graph<V, Input, Output, O, F>(
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
-    V: TraceValue,
+    V: Traceable,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Clone + Display + Op,

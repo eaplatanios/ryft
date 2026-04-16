@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, TraceValue,
+    FloatExt, TraceError, Traceable,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
@@ -38,14 +38,14 @@ impl Op for CosOp {
     }
 }
 
-impl<V: TraceValue + FloatExt> InterpretableOp<V> for CosOp {
+impl<V: Traceable + FloatExt> InterpretableOp<V> for CosOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().cos()])
     }
 }
 
-impl<V: TraceValue + FloatExt, T: TangentSpace<V>> DifferentiableOp<V, T> for CosOp {
+impl<V: Traceable + FloatExt, T: TangentSpace<V>> DifferentiableOp<V, T> for CosOp {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
@@ -56,7 +56,7 @@ impl<V: TraceValue + FloatExt, T: TangentSpace<V>> DifferentiableOp<V, T> for Co
     }
 }
 
-impl<V: TraceValue + FloatExt> VectorizableOp<V> for CosOp {
+impl<V: Traceable + FloatExt> VectorizableOp<V> for CosOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.cos()).collect())])

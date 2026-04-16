@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, TraceError, TraceValue, ZeroLike,
+        FloatExt, TraceError, Traceable, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
@@ -34,9 +34,9 @@ pub trait MatrixOps: Sized {
 ///
 /// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in this module expect
 /// those array types to describe rank-2 matrices with static dimensions and floating-point element types.
-pub trait MatrixValue: TraceValue + MatrixOps {}
+pub trait MatrixValue: Traceable + MatrixOps {}
 
-impl<T: TraceValue + MatrixOps> MatrixValue for T {}
+impl<T: Traceable + MatrixOps> MatrixValue for T {}
 
 impl MatrixOps for f32 {
     #[inline]
@@ -204,7 +204,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     }
 }
 
-impl<V: TraceValue + MatrixOps> MatrixOps for JitTracer<V> {
+impl<V: Traceable + MatrixOps> MatrixOps for JitTracer<V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
         self.binary(rhs, PrimitiveOp::MatMul, MatrixOps::matmul)
@@ -261,7 +261,7 @@ mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, FloatExt, OneLike, TraceValue, ZeroLike},
+        tracing_v2::{CoordinateValue, FloatExt, OneLike, Traceable, ZeroLike},
         types::{ArrayType, DataType, Typed},
     };
 
@@ -299,7 +299,7 @@ mod ndarray_support {
         }
     }
 
-    impl TraceValue for Array2<f32> {
+    impl Traceable for Array2<f32> {
         fn is_zero(&self) -> bool {
             self.iter().all(|&x| x == 0.0)
         }
@@ -309,7 +309,7 @@ mod ndarray_support {
         }
     }
 
-    impl crate::tracing_v2::ConcreteTraceValue for Array2<f32> {}
+    impl crate::tracing_v2::Value for Array2<f32> {}
 
     impl Typed<ArrayType> for Array2<f64> {
         #[inline]
@@ -318,7 +318,7 @@ mod ndarray_support {
         }
     }
 
-    impl TraceValue for Array2<f64> {
+    impl Traceable for Array2<f64> {
         fn is_zero(&self) -> bool {
             self.iter().all(|&x| x == 0.0)
         }
@@ -328,7 +328,7 @@ mod ndarray_support {
         }
     }
 
-    impl crate::tracing_v2::ConcreteTraceValue for Array2<f64> {}
+    impl crate::tracing_v2::Value for Array2<f64> {}
 
     impl ZeroLike for Array2<f32> {
         #[inline]

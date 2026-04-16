@@ -11,7 +11,7 @@ use std::fmt::{Debug, Display};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Program, TraceError, TraceValue,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Program, TraceError, Traceable,
         ZeroLike,
         jit::try_trace_program,
         linear::{
@@ -26,7 +26,7 @@ use crate::{
 
 /// Erased traced body for a rematerialization boundary.
 #[derive(Clone)]
-pub struct FlatTracedRematerialize<V: TraceValue, O: Clone = ProgramOpRef<V>> {
+pub struct FlatTracedRematerialize<V: Traceable, O: Clone = ProgramOpRef<V>> {
     /// Canonical input types of the body.
     input_types: Vec<ArrayType>,
 
@@ -37,7 +37,7 @@ pub struct FlatTracedRematerialize<V: TraceValue, O: Clone = ProgramOpRef<V>> {
     compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
 }
 
-impl<V: TraceValue, O: Clone> FlatTracedRematerialize<V, O> {
+impl<V: Traceable, O: Clone> FlatTracedRematerialize<V, O> {
     /// Builds one erased traced rematerialize body from explicit staged parts.
     #[inline]
     pub fn from_parts(
@@ -73,12 +73,12 @@ impl<V: TraceValue, O: Clone> FlatTracedRematerialize<V, O> {
 /// is computed and staged so that the tangent program recomputes forward intermediates from the
 /// inputs rather than storing them as constants.
 #[derive(Clone)]
-pub struct RematerializeOp<V: TraceValue> {
+pub struct RematerializeOp<V: Traceable> {
     /// The forward body sub-program.
     body: FlatTracedRematerialize<V>,
 }
 
-impl<V: TraceValue> RematerializeOp<V> {
+impl<V: Traceable> RematerializeOp<V> {
     /// Builds one ordinary (non-linear) rematerialize op wrapping the given body.
     #[inline]
     pub fn new(body: FlatTracedRematerialize<V>) -> Self {
@@ -92,19 +92,19 @@ impl<V: TraceValue> RematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue> Debug for RematerializeOp<V> {
+impl<V: Traceable> Debug for RematerializeOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Rematerialize")
     }
 }
 
-impl<V: TraceValue> Display for RematerializeOp<V> {
+impl<V: Traceable> Display for RematerializeOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
 }
 
-impl<V: TraceValue> Op for RematerializeOp<V> {
+impl<V: Traceable> Op for RematerializeOp<V> {
     fn name(&self) -> &'static str {
         "rematerialize"
     }
@@ -120,7 +120,7 @@ impl<V: TraceValue> Op for RematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for RematerializeOp<V>
+impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for RematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -132,7 +132,7 @@ where
 }
 
 impl<
-    V: TraceValue
+    V: Traceable
         + FloatExt
         + ZeroLike
         + OneLike
@@ -175,7 +175,7 @@ where
 }
 
 impl<
-    V: TraceValue
+    V: Traceable
         + FloatExt
         + ZeroLike
         + OneLike
@@ -210,7 +210,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
+impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
     for RematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -224,7 +224,7 @@ where
 
 /// Linear-only rematerialization boundary that always carries both the linear body and its transpose body.
 #[derive(Clone)]
-pub struct LinearRematerializeOp<V: TraceValue> {
+pub struct LinearRematerializeOp<V: Traceable> {
     /// The forward linear body sub-program.
     body: FlatTracedRematerialize<V, LinearProgramOpRef<V>>,
 
@@ -232,7 +232,7 @@ pub struct LinearRematerializeOp<V: TraceValue> {
     transpose_body: FlatTracedRematerialize<V, LinearProgramOpRef<V>>,
 }
 
-impl<V: TraceValue> LinearRematerializeOp<V> {
+impl<V: Traceable> LinearRematerializeOp<V> {
     /// Builds one linear rematerialize op with an explicit transpose body.
     #[inline]
     pub fn new(
@@ -253,19 +253,19 @@ impl<V: TraceValue> LinearRematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue> Debug for LinearRematerializeOp<V> {
+impl<V: Traceable> Debug for LinearRematerializeOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearRematerialize")
     }
 }
 
-impl<V: TraceValue> Display for LinearRematerializeOp<V> {
+impl<V: Traceable> Display for LinearRematerializeOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
 }
 
-impl<V: TraceValue> Op for LinearRematerializeOp<V> {
+impl<V: Traceable> Op for LinearRematerializeOp<V> {
     fn name(&self) -> &'static str {
         "rematerialize"
     }
@@ -281,7 +281,7 @@ impl<V: TraceValue> Op for LinearRematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearRematerializeOp<V>
+impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearRematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -292,7 +292,7 @@ where
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V>
+impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -313,7 +313,7 @@ where
 /// pullback programs.
 pub fn make_linear_rematerialize<V>(body: &FlatTracedRematerialize<V>) -> Result<LinearRematerializeOp<V>, TraceError>
 where
-    V: TraceValue
+    V: Traceable
         + FloatExt
         + ZeroLike
         + OneLike
@@ -364,12 +364,12 @@ pub(crate) trait RematerializeInvocationLeaf<
 /// Concrete-value dispatch for [`rematerialize`]: the rematerialization boundary is a no-op during
 /// eager execution and simply applies the body function directly.
 impl<
-    V: TraceValue
+    V: Traceable
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + ZeroLike
         + OneLike
-        + crate::tracing_v2::ConcreteTraceValue
+        + crate::tracing_v2::Value
         + MatrixOps
         + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -388,7 +388,7 @@ impl<
 /// stages a [`RematerializeOp`] in the enclosing [`JitTracer`] scope. The sub-program is traced
 /// once over exemplar values and compiled into a [`CompiledFunction`] that lowering can later handle.
 impl<
-    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for JitTracer<V>

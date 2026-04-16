@@ -27,7 +27,7 @@ pub mod ops;
 pub mod program;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod value;
+mod values;
 
 pub use batch::{Batch, stack, unstack, vmap};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
@@ -48,7 +48,7 @@ pub use ops::{
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};
-pub use value::{ConcreteTraceValue, FloatExt, One, OneLike, TraceValue, Zero, ZeroLike};
+pub use values::{FloatExt, One, OneLike, Traceable, Value, Zero, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
