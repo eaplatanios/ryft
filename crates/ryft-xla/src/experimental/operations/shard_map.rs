@@ -12,8 +12,8 @@ use ryft_core::{
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
         AtomId, CustomPrimitive, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp,
-        LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, One, Op, PrimitiveOp, ProgramBuilder, TraceError,
-        TraceValue, Zero, forward::JvpTracer,
+        LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
+        TraceValue, ZeroLike, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -500,7 +500,7 @@ impl StableHloCustomLowering<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 }
 
 trait ReplayShardMapValue:
-    Clone + TraceValue + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> + FloatExt + MatrixOps + Zero + One
+    Clone + TraceValue + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> + FloatExt + MatrixOps + ZeroLike + OneLike
 {
     fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TraceError>;
 
@@ -990,7 +990,7 @@ fn try_linearize_traced_shard_map_body<
     ),
     TraceError,
 > {
-    let zero = primals.first().map(Zero::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
+    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_structure = vec![ryft_core::parameters::Placeholder; primals.len()];
     let builder = std::rc::Rc::new(std::cell::RefCell::new(LinearProgramBuilder::new()));
     let traced_input = primals
