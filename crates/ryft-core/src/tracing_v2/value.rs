@@ -13,7 +13,7 @@ use std::ops::{Add, Mul, Neg};
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
-    types::{ArrayType, Typed},
+    types::{ArrayType, Type, Typed},
 };
 
 /// Minimal floating-point surface used by the scalar tracing primitives.
@@ -36,18 +36,18 @@ pub trait ZeroLike: Clone {
     fn zero_like(&self) -> Self;
 }
 
-/// Synthesizes a zero value from abstract [`ArrayType`] metadata alone.
+/// Synthesizes a zero value from abstract type metadata alone.
 ///
 /// Unlike [`ZeroLike`], which produces a zero from an existing exemplar value, this trait is implemented on the
-/// _type-metadata_ side: `Self` is a type parameterized by [`ArrayType`] (e.g., [`ArrayType`] itself for backend
-/// array leaves, or `Pair<ArrayType>` for compound structures), and [`Zero::zero`] produces the corresponding
-/// concrete value by reparameterizing from [`ArrayType`] to `P`.
+/// _type-metadata_ side: `Self` is a type parameterized by some [`Type`] `T` (e.g., [`ArrayType`] for backend array
+/// leaves, or `Pair<ArrayType>` for compound structures), and [`Zero::zero`] produces the corresponding concrete value
+/// by reparameterizing from `T` to `P`.
 ///
 /// The target value type `P` must be capable of representing any shape described by the metadata. This makes the
 /// conversion infallible — the trait should only be implemented when every metadata value maps to a valid zero of type
 /// `P`. For value types that cannot represent arbitrary shapes (e.g., `f32` can only represent scalar metadata), use
 /// [`ZeroLike`] instead, which produces a zero from an existing exemplar value.
-pub trait Zero<P: Parameter>: Parameterized<ArrayType> {
+pub trait Zero<T: Type + Parameter, P: Parameter + Typed<T>>: Parameterized<T> {
     /// Constructs one zero value from the abstract metadata in `self`.
     fn zero(&self) -> Self::To<P>
     where
@@ -62,12 +62,12 @@ pub trait OneLike: Clone {
     fn one_like(&self) -> Self;
 }
 
-/// Synthesizes a one value from abstract [`ArrayType`] metadata alone.
+/// Synthesizes a one value from abstract type metadata alone.
 ///
-/// This mirrors [`Zero`] for the multiplicative identity. `Self` is a type parameterized by [`ArrayType`], and
-/// [`One::one`] produces the corresponding concrete value by reparameterizing from [`ArrayType`] to `P`. Like
-/// [`Zero`], this trait should only be implemented when every metadata value maps to a valid one of type `P`.
-pub trait One<P: Parameter>: Parameterized<ArrayType> {
+/// This mirrors [`Zero`] for the multiplicative identity. `Self` is a type parameterized by some [`Type`] `T`, and
+/// [`One::one`] produces the corresponding concrete value by reparameterizing from `T` to `P`. Like [`Zero`], this
+/// trait should only be implemented when every metadata value maps to a valid one of type `P`.
+pub trait One<T: Type + Parameter, P: Parameter + Typed<T>>: Parameterized<T> {
     /// Constructs one one-valued value from the abstract metadata in `self`.
     fn one(&self) -> Self::To<P>
     where

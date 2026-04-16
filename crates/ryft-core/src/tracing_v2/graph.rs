@@ -130,7 +130,7 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
     #[inline]
     pub fn add_input_abstract_zero(&mut self, abstract_value: ArrayType) -> AtomId
     where
-        ArrayType: Zero<V>,
+        ArrayType: Zero<ArrayType, V>,
     {
         let example_value = abstract_value.zero();
         self.add_input_abstract(abstract_value, example_value)
@@ -895,7 +895,7 @@ mod tests {
             }
         }
 
-        impl Zero<TestIdentityValue> for ArrayType {
+        impl Zero<ArrayType, TestIdentityValue> for ArrayType {
             fn zero(&self) -> TestIdentityValue {
                 TestIdentityValue { r#type: self.clone(), value: 0.0 }
             }
@@ -907,7 +907,7 @@ mod tests {
             }
         }
 
-        impl One<TestIdentityValue> for ArrayType {
+        impl One<ArrayType, TestIdentityValue> for ArrayType {
             fn one(&self) -> TestIdentityValue {
                 TestIdentityValue { r#type: self.clone(), value: 1.0 }
             }
