@@ -63,7 +63,7 @@ impl MatrixOps for f64 {
 }
 
 /// Tangent representation for matrix-valued primals.
-pub trait MatrixTangentSpace<V: MatrixValue>: TangentSpace<V> {
+pub trait MatrixTangentSpace<V: MatrixValue>: TangentSpace<ArrayType, V> {
     /// Applies the linear map `tangent -> factor @ tangent`.
     fn matmul_left(factor: V, tangent: Self) -> Self;
 
@@ -204,7 +204,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     }
 }
 
-impl<V: Traceable<ArrayType> + MatrixOps> MatrixOps for JitTracer<V> {
+impl<V: Traceable<ArrayType> + MatrixOps> MatrixOps for JitTracer<ArrayType, V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
         self.binary(rhs, PrimitiveOp::MatMul, MatrixOps::matmul)
@@ -237,7 +237,7 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<V> {
+impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<ArrayType, V> {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
         tangent.apply_linear_op(LinearPrimitiveOp::LeftMatMul { factor })

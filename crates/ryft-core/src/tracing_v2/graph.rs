@@ -1,14 +1,14 @@
 //! Shared graph representation used by staged transforms.
 //!
-//! `Graph<O, V, Input, Output>` stores a linear sequence of equations over an open set of operation objects `O`.
+//! `Graph<O, T, V, Input, Output>` stores a linear sequence of equations over an open set of operation objects `O`.
 //! This common representation is reused for JIT graphs and for linear programs produced during differentiation.
 
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
-    parameters::Parameterized,
+    parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{InterpretableOp, Op, TraceError, Traceable, Zero},
-    types::{ArrayType, Typed},
+    types::{Type, Typed},
 };
 
 /// Identifier for an atom within a staged graph.
@@ -27,9 +27,9 @@ pub enum AtomSource {
 
 /// Staged atom carrying abstract metadata and provenance.
 #[derive(Clone, Debug)]
-pub struct Atom<V: Traceable<ArrayType>> {
+pub struct Atom<T: Type + Clone, V: Typed<T>> {
     /// Array type used for validation and shape propagation.
-    pub abstract_value: ArrayType,
+    pub abstract_value: T,
     /// Stored concrete value when this atom semantically owns one.
     ///
     /// Inputs retain one exemplar so later transforms can recover representative primal values without
@@ -41,19 +41,19 @@ pub struct Atom<V: Traceable<ArrayType>> {
     pub source: AtomSource,
 }
 
-impl<V: Traceable<ArrayType>> Atom<V> {
+impl<T: Type + Clone, V: Traceable<T>> Atom<T, V> {
     #[inline]
-    fn input(abstract_value: ArrayType, exemplar_value: V) -> Self {
+    fn input(abstract_value: T, exemplar_value: V) -> Self {
         Self { abstract_value, stored_value: Some(exemplar_value), source: AtomSource::Input }
     }
 
     #[inline]
-    fn constant(abstract_value: ArrayType, value: V) -> Self {
+    fn constant(abstract_value: T, value: V) -> Self {
         Self { abstract_value, stored_value: Some(value), source: AtomSource::Constant }
     }
 
     #[inline]
-    fn derived(abstract_value: ArrayType, stored_value: Option<V>) -> Self {
+    fn derived(abstract_value: T, stored_value: Option<V>) -> Self {
         Self { abstract_value, stored_value, source: AtomSource::Derived }
     }
 
@@ -97,13 +97,13 @@ pub struct Equation<O> {
 
 /// Builder for staged graphs.
 #[derive(Clone, Debug)]
-pub struct GraphBuilder<O: Clone, V: Traceable<ArrayType>> {
-    atoms: Vec<Atom<V>>,
+pub struct GraphBuilder<O, T: Type + Clone, V: Typed<T>> {
+    atoms: Vec<Atom<T, V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
 }
 
-impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
+impl<O: Clone, T: Type + Clone, V: Traceable<T>> GraphBuilder<O, T, V> {
     /// Creates an empty builder.
     #[inline]
     pub fn new() -> Self {
@@ -113,13 +113,13 @@ impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
     /// Returns the number of atoms allocated so far.
     /// Returns the atom with the provided identifier.
     #[inline]
-    pub fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
+    pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
         self.atoms.get(id)
     }
 
     /// Adds a new input atom with the supplied abstract value.
     #[inline]
-    pub fn add_input_abstract(&mut self, abstract_value: ArrayType, example_value: V) -> AtomId {
+    pub fn add_input_abstract(&mut self, abstract_value: T, example_value: V) -> AtomId {
         let id = self.atoms.len();
         self.atoms.push(Atom::input(abstract_value, example_value));
         self.input_atoms.push(id);
@@ -128,9 +128,10 @@ impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
 
     /// Adds a new input atom from abstract metadata alone, synthesizing one zero witness internally.
     #[inline]
-    pub fn add_input_abstract_zero(&mut self, abstract_value: ArrayType) -> AtomId
+    pub fn add_input_abstract_zero(&mut self, abstract_value: T) -> AtomId
     where
-        ArrayType: Zero<ArrayType, V>,
+        T: Parameter + Zero<T, V, To<V> = V>,
+        T::Family: ParameterizedFamily<V>,
     {
         let example_value = abstract_value.zero();
         self.add_input_abstract(abstract_value, example_value)
@@ -139,26 +140,21 @@ impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
     /// Adds a new input atom using the abstract value of `example`.
     #[inline]
     pub fn add_input(&mut self, example: &V) -> AtomId {
-        self.add_input_abstract(<V as Typed<ArrayType>>::tpe(example), example.clone())
+        self.add_input_abstract(<V as Typed<T>>::tpe(example), example.clone())
     }
 
     /// Adds a constant atom to the graph.
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = self.atoms.len();
-        self.atoms.push(Atom::constant(<V as Typed<ArrayType>>::tpe(&value), value));
+        self.atoms.push(Atom::constant(<V as Typed<T>>::tpe(&value), value));
         id
     }
 
     /// Adds a staged equation without running abstract or concrete evaluation.
     ///
     /// This is intended for linear program construction where the output types are already known.
-    pub fn add_equation_prevalidated(
-        &mut self,
-        op: O,
-        inputs: Vec<AtomId>,
-        output_abstracts: Vec<ArrayType>,
-    ) -> Vec<AtomId> {
+    pub fn add_equation_prevalidated(&mut self, op: O, inputs: Vec<AtomId>, output_abstracts: Vec<T>) -> Vec<AtomId> {
         let outputs = output_abstracts
             .into_iter()
             .map(|abstract_value| {
@@ -191,7 +187,7 @@ impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
         output_values: Vec<V>,
     ) -> Result<Vec<AtomId>, TraceError>
     where
-        O: Op,
+        O: Op<T>,
     {
         let input_abstracts = inputs
             .iter()
@@ -242,7 +238,7 @@ impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
     /// output atoms are recorded as constants and no equation is added to the graph.
     pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
     where
-        O: InterpretableOp<V>,
+        O: InterpretableOp<T, V>,
     {
         let input_examples = inputs
             .iter()
@@ -262,7 +258,7 @@ impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
         outputs: Vec<AtomId>,
         input_structure: Input::ParameterStructure,
         output_structure: Output::ParameterStructure,
-    ) -> Graph<O, V, Input, Output>
+    ) -> Graph<O, T, V, Input, Output>
     where
         Input: Parameterized<V>,
         Output: Parameterized<V>,
@@ -279,7 +275,7 @@ impl<O: Clone, V: Traceable<ArrayType>> GraphBuilder<O, V> {
     }
 }
 
-impl<O: Clone, V: Traceable<ArrayType>> Default for GraphBuilder<O, V> {
+impl<O: Clone, T: Type + Clone, V: Traceable<T>> Default for GraphBuilder<O, T, V> {
     fn default() -> Self {
         Self::new()
     }
@@ -290,18 +286,18 @@ impl<O: Clone, V: Traceable<ArrayType>> Default for GraphBuilder<O, V> {
 // ---------------------------------------------------------------------------
 
 /// Checks if a value is a constant zero through [`Traceable::is_zero`].
-pub(crate) fn is_identity_zero<V: Traceable<ArrayType>>(value: &V) -> bool {
+pub(crate) fn is_identity_zero<T: Type + Clone, V: Traceable<T>>(value: &V) -> bool {
     value.is_zero()
 }
 
 /// Checks if a value is a constant one through [`Traceable::is_one`].
-pub(crate) fn is_identity_one<V: Traceable<ArrayType>>(value: &V) -> bool {
+pub(crate) fn is_identity_one<T: Type + Clone, V: Traceable<T>>(value: &V) -> bool {
     value.is_one()
 }
 
 /// Executable staged graph over an open operation set.
-pub struct Graph<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>> {
-    atoms: Vec<Atom<V>>,
+pub struct Graph<O, T: Type + Clone, V: Typed<T> + Parameter, Input: Parameterized<V>, Output: Parameterized<V>> {
+    atoms: Vec<Atom<T, V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
     outputs: Vec<AtomId>,
@@ -312,10 +308,11 @@ pub struct Graph<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Out
 
 impl<
     O: Clone,
-    V: Traceable<ArrayType>,
+    T: Type + Clone,
+    V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-> Clone for Graph<O, V, Input, Output>
+> Clone for Graph<O, T, V, Input, Output>
 {
     fn clone(&self) -> Self {
         Self {
@@ -330,7 +327,9 @@ impl<
     }
 }
 
-impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>> Graph<O, V, Input, Output> {
+impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Graph<O, T, V, Input, Output>
+{
     /// Returns the number of atoms in the graph.
     #[inline]
     pub fn atom_count(&self) -> usize {
@@ -339,13 +338,13 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
 
     /// Returns the atom with the provided identifier.
     #[inline]
-    pub fn atom(&self, id: AtomId) -> Option<&Atom<V>> {
+    pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
         self.atoms.get(id)
     }
 
-    /// Returns an iterator over all atoms in the graph, yielding `(atom_id, &Atom<V>)` pairs.
+    /// Returns an iterator over all atoms in the graph, yielding `(atom_id, &Atom<T, V>)` pairs.
     #[inline]
-    pub fn atoms_iter(&self) -> impl Iterator<Item = (AtomId, &Atom<V>)> {
+    pub fn atoms_iter(&self) -> impl Iterator<Item = (AtomId, &Atom<T, V>)> {
         self.atoms.iter().enumerate()
     }
 
@@ -395,7 +394,7 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
     /// Evaluates every atom in the graph on the supplied flat input values.
     pub fn evaluate_atom_values(&self, input_values: Vec<V>) -> Result<Vec<V>, TraceError>
     where
-        O: InterpretableOp<V>,
+        O: InterpretableOp<T, V>,
     {
         if input_values.len() != self.input_atoms.len() {
             return Err(TraceError::InvalidInputCount { expected: self.input_atoms.len(), got: input_values.len() });
@@ -438,7 +437,7 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
     /// Evaluates every atom in the graph on its retained representative input exemplars.
     pub fn representative_atom_values(&self) -> Result<Vec<V>, TraceError>
     where
-        O: InterpretableOp<V>,
+        O: InterpretableOp<T, V>,
     {
         self.evaluate_atom_values(self.representative_input_values()?)
     }
@@ -448,7 +447,7 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
         &self,
         input_structure: NewInput::ParameterStructure,
         output_structure: NewOutput::ParameterStructure,
-    ) -> Graph<O, V, NewInput, NewOutput>
+    ) -> Graph<O, T, V, NewInput, NewOutput>
     where
         NewInput: Parameterized<V>,
         NewOutput: Parameterized<V>,
@@ -467,7 +466,7 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
     /// Interprets the staged graph on concrete input values.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
-        O: InterpretableOp<V>,
+        O: InterpretableOp<T, V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -483,12 +482,12 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
     /// Eliminates dead constants and equations that do not contribute to the graph outputs.
     pub fn simplify(&self) -> Result<Self, TraceError>
     where
-        O: Op,
+        O: Op<T>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>>(
-            graph: &Graph<O, V, Input, Output>,
+        fn mark_live<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
+            graph: &Graph<O, T, V, Input, Output>,
             atom_id: usize,
             live_atoms: &mut [bool],
             live_equations: &mut [bool],
@@ -510,17 +509,18 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
             }
         }
 
-        fn remap_atom<O, V, Input, Output>(
+        fn remap_atom<O, T, V, Input, Output>(
             atom_id: usize,
-            graph: &Graph<O, V, Input, Output>,
-            builder: &mut GraphBuilder<O, V>,
+            graph: &Graph<O, T, V, Input, Output>,
+            builder: &mut GraphBuilder<O, T, V>,
             atom_mapping: &mut HashMap<usize, usize>,
             live_equations: &[bool],
             equation_by_output: &[Option<usize>],
         ) -> Result<usize, TraceError>
         where
-            O: Clone + Op,
-            V: Traceable<ArrayType>,
+            O: Clone + Op<T>,
+            T: Type + Clone,
+            V: Traceable<T>,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
         {
@@ -596,7 +596,7 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
             );
         }
 
-        let mut builder = GraphBuilder::<O, V>::new();
+        let mut builder = GraphBuilder::<O, T, V>::new();
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_atoms.iter().copied() {
             let input = self.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
@@ -629,8 +629,8 @@ impl<O: Clone, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Paramet
     }
 }
 
-impl<O: Clone + Display, V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for Graph<O, V, Input, Output>
+impl<O: Clone + Display, T: Type + Clone + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Display for Graph<O, T, V, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");
@@ -689,8 +689,7 @@ mod tests {
     use crate::{
         parameters::{Parameter, Placeholder},
         tracing_v2::{
-            Value, FloatExt, MatrixOps, One, OneLike, TraceError, Zero, ZeroLike, ops::PrimitiveOp,
-            test_support,
+            FloatExt, MatrixOps, One, OneLike, TraceError, Value, Zero, ZeroLike, ops::PrimitiveOp, test_support,
         },
         types::{ArrayType, DataType, Shape, Typed},
     };
@@ -699,7 +698,7 @@ mod tests {
 
     #[test]
     fn graph_builder_tracks_atom_sources_and_executes() {
-        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
@@ -725,7 +724,7 @@ mod tests {
 
     #[test]
     fn graph_display_uses_typed_jaxpr_like_rendering() {
-        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
@@ -745,7 +744,7 @@ mod tests {
 
     #[test]
     fn graph_builder_rejects_unbound_inputs() {
-        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let result = builder.add_equation(PrimitiveOp::Add, vec![42, 99]);
         assert!(matches!(result, Err(TraceError::UnboundAtomId { id: 42 })));
         test_support::assert_reference_graph_rendering();
@@ -753,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_constant_folding_eliminates_equations() {
-        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
 
@@ -789,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_constant_folding_graph_call_produces_correct_results() {
-        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
         let folded_sum = builder.add_equation(PrimitiveOp::Add, vec![a, b]).unwrap()[0];
@@ -806,7 +805,7 @@ mod tests {
 
     #[test]
     fn built_graph_drops_derived_stored_values_but_reconstructs_representatives() {
-        let mut builder = GraphBuilder::<PrimitiveOp<f64>, f64>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&2.0f64);
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
@@ -929,7 +928,7 @@ mod tests {
             }
         }
 
-        let mut builder = GraphBuilder::<PrimitiveOp<TestIdentityValue>, TestIdentityValue>::new();
+        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, TestIdentityValue>, ArrayType, TestIdentityValue>::new();
         let x = builder.add_input(&TestIdentityValue::scalar(5.0));
         let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
 

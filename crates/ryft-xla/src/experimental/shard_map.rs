@@ -422,7 +422,7 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging shard-map bodies.
-pub(crate) type ShardMapTracer = JitTracer<ShardMapTensor>;
+pub(crate) type ShardMapTracer = JitTracer<ArrayType, ShardMapTensor>;
 
 pub(crate) type ShardMapLocalTraceInput<Input> =
     <<Input as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
@@ -659,7 +659,7 @@ where
     local_input_types: Input,
     global_output_types: Output,
     local_output_types: Output,
-    compiled: CompiledFunction<ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
+    compiled: CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
 }
 
 /// Traced XLA program backed by a staged `tracing_v2` graph.
@@ -671,7 +671,7 @@ where
 {
     global_input_types: Input,
     global_output_types: Output,
-    compiled: CompiledFunction<ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
+    compiled: CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
 }
 
 /// Metadata describing one manual SPMD computation over a mesh.
@@ -953,7 +953,7 @@ where
     #[cfg(feature = "benchmarking")]
     pub(crate) fn compiled(
         &self,
-    ) -> &CompiledFunction<ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>> {
+    ) -> &CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>> {
         &self.compiled
     }
 
@@ -992,7 +992,7 @@ pub struct FlatTracedShardMap {
     pub(crate) local_input_types: Vec<ArrayType>,
     pub(crate) global_output_types: Vec<ArrayType>,
     pub(crate) local_output_types: Vec<ArrayType>,
-    pub(crate) compiled: CompiledFunction<ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+    pub(crate) compiled: CompiledFunction<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
 }
 
 impl FlatTracedShardMap {
@@ -1003,7 +1003,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        compiled: CompiledFunction<ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+        compiled: CompiledFunction<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
     ) -> Self {
         Self { shard_map, global_input_types, local_input_types, global_output_types, local_output_types, compiled }
     }
@@ -1209,7 +1209,7 @@ fn trace_xla_function<
     function: F,
     input_types: &Input,
 ) -> Result<
-    (Output, CompiledFunction<ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>),
+    (Output, CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>),
     ShardMapTraceError,
 >
 where

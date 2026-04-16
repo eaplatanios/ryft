@@ -309,8 +309,8 @@ mod tests {
     /// Summarizes a small scalar graph and verifies the structural metrics.
     #[test]
     fn test_summarize_graph_counts_constants_and_depth() {
-        let (_, compiled): (f64, CompiledFunction<f64, f64, f64>) = jit(
-            |x: JitTracer<f64>| {
+        let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            |x: JitTracer<ArrayType, f64>| {
                 let with_constant = x.clone() + x.one_like();
                 with_constant.sin()
             },

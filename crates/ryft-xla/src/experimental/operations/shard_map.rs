@@ -28,7 +28,8 @@ use crate::experimental::shard_map::{
 
 /// Shared graph type used by erased shard-map bodies.
 type FlatShardMapGraph = ryft_core::tracing_v2::Graph<
-    ryft_core::tracing_v2::PrimitiveOp<ShardMapTensor>,
+    ryft_core::tracing_v2::PrimitiveOp<ArrayType, ShardMapTensor>,
+    ArrayType,
     ShardMapTensor,
     Vec<ShardMapTensor>,
     Vec<ShardMapTensor>,
@@ -143,9 +144,9 @@ impl<V: Traceable<ArrayType>> ShardMapOp<V> {
     }
 
     /// Returns the shared custom-primitive registration used by this shard-map variant.
-    fn base_custom_primitive(&self) -> CustomPrimitive<V>
+    fn base_custom_primitive(&self) -> CustomPrimitive<ArrayType, V>
     where
-        Self: InterpretableOp<V> + LinearOp<V> + Clone + Send + Sync + 'static,
+        Self: InterpretableOp<ArrayType, V> + LinearOp<ArrayType, V> + Clone + Send + Sync + 'static,
     {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
     }
@@ -168,7 +169,7 @@ impl<V: Traceable<ArrayType>> ShardMapOp<V> {
 
 impl ShardMapOp<ShardMapTensor> {
     /// Returns the tensor-leaf custom-primitive registration for this shard-map op.
-    pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ShardMapTensor> {
+    pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive()
             .with_jvp_rule(self.clone())
             .with_linearized_jit_rule(self.clone())
@@ -213,7 +214,7 @@ impl ShardMapOp<ShardMapTensor> {
 
 impl ShardMapOp<ShardMapTracer> {
     /// Returns the traced-leaf custom-primitive registration for this shard-map op.
-    pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ShardMapTracer> {
+    pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTracer> {
         self.base_custom_primitive().with_jvp_rule(self.clone()).with_linearized_jit_rule(self.clone())
     }
 }
@@ -278,7 +279,7 @@ impl Op for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl InterpretableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
+impl InterpretableOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -286,11 +287,11 @@ impl InterpretableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
+impl LinearOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn transpose(
         &self,
-        output_cotangents: &[LinearTerm<ShardMapTensor>],
-    ) -> Result<Vec<Option<LinearTerm<ShardMapTensor>>>, TraceError> {
+        output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         if !self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
@@ -312,11 +313,11 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp<ShardMapTensor> {
+impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>> for ShardMapOp<ShardMapTensor> {
     fn jvp(
         &self,
-        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
+        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         if self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "linearize_program",
@@ -343,7 +344,7 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for ShardMapOp
     }
 }
 
-impl InterpretableOp<Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
+impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
     fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_values = primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
@@ -391,7 +392,7 @@ impl Op for ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl InterpretableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
+impl InterpretableOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -421,11 +422,11 @@ impl InterpretableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
+impl LinearOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn transpose(
         &self,
-        output_cotangents: &[LinearTerm<ShardMapTracer>],
-    ) -> Result<Vec<Option<LinearTerm<ShardMapTracer>>>, TraceError> {
+        output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         if !self.has_linear_state() {
             return Err(TraceError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
@@ -447,11 +448,11 @@ impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for ShardMapOp<ShardMapTracer> {
+impl DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>> for ShardMapOp<ShardMapTracer> {
     fn jvp(
         &self,
-        _inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>>, TraceError> {
+        _inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "jvp",
             message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
@@ -459,11 +460,11 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for ShardMapOp
     }
 }
 
-impl InterpretableOp<Linearized<JitTracer<ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
+impl InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
     fn interpret(
         &self,
-        _inputs: &[Linearized<JitTracer<ShardMapTracer>>],
-    ) -> Result<Vec<Linearized<JitTracer<ShardMapTracer>>>, TraceError> {
+        _inputs: &[Linearized<JitTracer<ArrayType, ShardMapTracer>>],
+    ) -> Result<Vec<Linearized<JitTracer<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: format!(
@@ -477,7 +478,7 @@ impl InterpretableOp<Linearized<JitTracer<ShardMapTracer>>> for ShardMapOp<Shard
 impl StableHloCustomLowering<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        _op: &CustomPrimitive<ShardMapTensor>,
+        _op: &CustomPrimitive<ArrayType, ShardMapTensor>,
         input_values: &[ryft_mlir::ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
@@ -986,7 +987,7 @@ fn try_linearize_traced_shard_map_body<
 ) -> Result<
     (
         Vec<ShardMapTracer>,
-        ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+        ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
     ),
     TraceError,
 > {
@@ -1026,7 +1027,7 @@ fn try_transpose_traced_shard_map_body<
 ) -> Result<
     (
         Vec<ShardMapTracer>,
-        ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+        ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
     ),
     TraceError,
 > {
@@ -1053,7 +1054,7 @@ fn replay_traced_xla_graph<
     GraphOutput: ryft_core::parameters::Parameterized<ShardMapTensor>,
     V: ReplayShardMapValue,
 >(
-    graph: &ryft_core::tracing_v2::Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &ryft_core::tracing_v2::Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     inputs: Vec<V>,
 ) -> Result<Vec<V>, ShardMapTraceError> {
     let mut values = vec![None; graph.atom_count()];
@@ -1231,7 +1232,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let (_, pushforward_compiled): (
         Vec<ShardMapTensor>,
-        ryft_core::tracing_v2::CompiledFunction<ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+        ryft_core::tracing_v2::CompiledFunction<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
     ) = ryft_core::tracing_v2::try_jit(
         {
             let body = body.clone();
@@ -1240,7 +1241,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                 let local_tangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pushforward_program): (
                     Vec<ShardMapTracer>,
-                    ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+                    ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
                 ) = try_linearize_traced_shard_map_body(
                     {
                         let body = body.clone();
@@ -1258,7 +1259,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let (_, pullback_compiled): (
         Vec<ShardMapTensor>,
-        ryft_core::tracing_v2::CompiledFunction<ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+        ryft_core::tracing_v2::CompiledFunction<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
     ) = ryft_core::tracing_v2::try_jit(
         {
             let body = body.clone();
@@ -1267,7 +1268,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                 let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pullback_program): (
                     Vec<ShardMapTracer>,
-                    ryft_core::tracing_v2::LinearProgram<ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+                    ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
                 ) = try_transpose_traced_shard_map_body(
                     {
                         let body = body.clone();

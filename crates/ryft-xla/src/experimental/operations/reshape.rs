@@ -51,7 +51,7 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-            |x: JitTracer<crate::experimental::shard_map::ShardMapTensor>| {
+            |x: JitTracer<ArrayType, crate::experimental::shard_map::ShardMapTensor>| {
                 x.reshape(Shape::new(vec![Size::Static(3), Size::Static(2)])).unwrap()
             },
             input_type.clone(),
@@ -80,7 +80,7 @@ mod tests {
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: JitTracer<crate::experimental::shard_map::ShardMapTensor>| {
+                move |x: JitTracer<ArrayType, crate::experimental::shard_map::ShardMapTensor>| {
                     with_sharding_constraint(x, sharding.clone())
                         .expect("with_sharding_constraint should stage before reshape")
                         .reshape(Shape::new(vec![Size::Static(1), Size::Static(8), Size::Static(1)]))

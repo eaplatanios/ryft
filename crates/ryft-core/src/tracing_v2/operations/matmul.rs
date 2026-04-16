@@ -42,21 +42,23 @@ impl Op for MatMulOp {
     }
 }
 
-impl<V: MatrixValue> InterpretableOp<V> for MatMulOp {
+impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatMulOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V, T> for MatMulOp {
+impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>>
+    DifferentiableOp<ArrayType, V, T> for MatMulOp
+{
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
 }
 
-impl<V: MatrixValue> VectorizableOp<V> for MatMulOp {
+impl<V: MatrixValue> VectorizableOp<ArrayType, V> for MatMulOp {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

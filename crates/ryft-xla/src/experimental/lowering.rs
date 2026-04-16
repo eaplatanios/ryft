@@ -136,7 +136,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested `vmap` op inside this lowering context.
     pub(crate) fn lower_vmap<V>(
         &mut self,
-        vmap_op: &VMapOp<V>,
+        vmap_op: &VMapOp<ArrayType, V>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -161,7 +161,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// block.
     pub(crate) fn lower_rematerialize<V>(
         &mut self,
-        remat_op: &RematerializeOp<V>,
+        remat_op: &RematerializeOp<ArrayType, V>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -187,7 +187,7 @@ pub(crate) trait StableHloCustomLowering<V: Traceable<ArrayType>>: Send + Sync {
     /// Lowers one custom primitive to StableHLO/Shardy operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        op: &CustomPrimitive<V>,
+        op: &CustomPrimitive<ArrayType, V>,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
@@ -209,7 +209,7 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
     /// Lowers one custom primitive through the registered StableHLO lowering rule.
     pub(crate) fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        op: &CustomPrimitive<V>,
+        op: &CustomPrimitive<ArrayType, V>,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
@@ -385,7 +385,7 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for MatMulOp {
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for ScaleOp<V> {
+impl<V: Traceable<ArrayType>> XlaOp<V> for ScaleOp<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -522,7 +522,7 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for VMapOp<V>
+> XlaOp<V> for VMapOp<ArrayType, V>
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -545,7 +545,7 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for LinearVMapOp<V>
+> XlaOp<V> for LinearVMapOp<ArrayType, V>
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -575,7 +575,7 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for LinearRematerializeOp<V>
+> XlaOp<V> for LinearRematerializeOp<ArrayType, V>
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -604,7 +604,7 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for PrimitiveOp<V>
+> XlaOp<V> for PrimitiveOp<ArrayType, V>
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -639,7 +639,7 @@ impl<
             PrimitiveOp::MatMul => {
                 <MatMulOp as XlaOp<V>>::lower_to_mlir(&MatMulOp, input_values, output_types, mode, lowerer)
             }
-            PrimitiveOp::Scale { factor } => <ScaleOp<V> as XlaOp<V>>::lower_to_mlir(
+            PrimitiveOp::Scale { factor } => <ScaleOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(
                 &ScaleOp::new(factor.clone()),
                 input_values,
                 output_types,
@@ -668,7 +668,7 @@ impl<
                 lowerer,
             ),
             PrimitiveOp::VMap(vmap) => {
-                <VMapOp<V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
+                <VMapOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
             }
             PrimitiveOp::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
             PrimitiveOp::Custom(_) => {
@@ -685,7 +685,7 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for LinearPrimitiveOp<V>
+> XlaOp<V> for LinearPrimitiveOp<ArrayType, V>
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -718,7 +718,7 @@ impl<
                 mode,
                 lowerer,
             ),
-            LinearPrimitiveOp::Scale { factor } => <ScaleOp<V> as XlaOp<V>>::lower_to_mlir(
+            LinearPrimitiveOp::Scale { factor } => <ScaleOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(
                 &ScaleOp::new(factor.clone()),
                 input_values,
                 output_types,
@@ -747,10 +747,10 @@ impl<
                 lowerer,
             ),
             LinearPrimitiveOp::VMap(vmap) => {
-                <LinearVMapOp<V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
+                <LinearVMapOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
             }
             LinearPrimitiveOp::Rematerialize(remat) => {
-                <LinearRematerializeOp<V> as XlaOp<V>>::lower_to_mlir(remat, input_values, output_types, mode, lowerer)
+                <LinearRematerializeOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(remat, input_values, output_types, mode, lowerer)
             }
             LinearPrimitiveOp::Custom(_) => {
                 Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
@@ -783,7 +783,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested `vmap` op inside this lowering context.
     pub(crate) fn lower_vmap<V>(
         &mut self,
-        vmap_op: &VMapOp<V>,
+        vmap_op: &VMapOp<ArrayType, V>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -808,7 +808,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// block.
     pub(crate) fn lower_rematerialize<V>(
         &mut self,
-        remat_op: &RematerializeOp<V>,
+        remat_op: &RematerializeOp<ArrayType, V>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -833,7 +833,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         &mut self,
         outer_inputs: &[ValueRef<'b, 'c, 't>],
         shard_map: &ShardMap,
-        graph: &Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+        graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
         local_input_types: &[ArrayType],
         global_output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
@@ -866,7 +866,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
 pub(crate) fn to_mlir_module<Input, Output, GraphInput, GraphOutput, S>(
     shard_map: &ShardMap,
-    graph: &Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     global_input_types: &Input,
     local_input_types: &Input,
     global_output_types: &Output,
@@ -964,7 +964,7 @@ where
 
 /// Lowers an arbitrary traced XLA graph to a textual StableHLO/Shardy MLIR module.
 pub(crate) fn to_mlir_module_for_graph<Input, Output, GraphInput, GraphOutput, S>(
-    graph: &Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
@@ -1131,7 +1131,7 @@ impl MlirLowerableValue for ShardMapTensor {
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
 pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, O, S>(
-    graph: &Graph<O, V, Input, Output>,
+    graph: &Graph<O, ArrayType, V, Input, Output>,
     function_name: S,
 ) -> Result<String, LoweringError>
 where
@@ -1203,7 +1203,7 @@ where
 }
 
 fn collect_nested_sharding_mesh<GraphInput, GraphOutput>(
-    graph: &Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, LoweringError>
 where
@@ -1283,7 +1283,7 @@ enum VMapLoweringMode {
 }
 
 /// Maps the canonical traced `vmap` op to the lowering-specific packing mode.
-fn lower_vmap_mode<V>(_vmap_op: &VMapOp<V>) -> VMapLoweringMode
+fn lower_vmap_mode<V>(_vmap_op: &VMapOp<ArrayType, V>) -> VMapLoweringMode
 where
     V: Traceable<ArrayType>,
 {
@@ -1606,7 +1606,7 @@ where
 
 /// Lowers one packed `vmap` body graph whose inputs and outputs already carry a leading batch axis.
 fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-    graph: &Graph<O, V, Vec<V>, Vec<V>>,
+    graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
     packed_inputs: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
     block: &mut B,
@@ -1625,7 +1625,7 @@ where
     L: Location<'c, 't> + Copy,
 {
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-        graph: &Graph<O, V, Vec<V>, Vec<V>>,
+        graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
         atom_values: &[Option<ValueRef<'b, 'c, 't>>],
         atom_id: usize,
         lane_count: usize,
@@ -1721,7 +1721,7 @@ where
 
 /// Lowers one higher-order `vmap` op by explicitly packing inputs, lowering the packed body, and unpacking outputs.
 fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-    body: &FlatTracedVMap<V, O>,
+    body: &FlatTracedVMap<ArrayType, V, O>,
     mode: VMapLoweringMode,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut B,
@@ -1802,7 +1802,7 @@ where
 /// MLIR values to the body's input atoms, lowering constants and equations in topological order,
 /// and returning the MLIR values corresponding to the body's output atoms.
 fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
-    graph: &Graph<O, V, Vec<V>, Vec<V>>,
+    graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -1881,7 +1881,7 @@ where
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
 fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    graph: &Graph<O, V, Input, Output>,
+    graph: &Graph<O, ArrayType, V, Input, Output>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1949,7 +1949,7 @@ where
 
 /// Lowers one traced graph to values inside a block.
 fn lower_graph_outputs<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
-    graph: &Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -2014,7 +2014,7 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     shard_map: &ShardMap,
-    graph: &Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
@@ -2197,7 +2197,7 @@ where
 
 /// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
 fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
-    op: &PrimitiveOp<ShardMapTensor>,
+    op: &PrimitiveOp<ArrayType, ShardMapTensor>,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
@@ -2329,7 +2329,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
 fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    graph: &Graph<O, V, Input, Output>,
+    graph: &Graph<O, ArrayType, V, Input, Output>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2361,7 +2361,7 @@ where
 
 /// Lowers one equation inside a packed `vmap` body graph.
 fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
-    graph: &Graph<O, V, Vec<V>, Vec<V>>,
+    graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
@@ -2397,7 +2397,7 @@ where
 
 /// Lowers one traced equation to the corresponding StableHLO operation and returns its result value.
 fn lower_equation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
-    graph: &Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2699,7 +2699,7 @@ mod tests {
         }
     }
 
-    impl InterpretableOp<ShardMapTensor> for TestCustomLoweredOp {
+    impl InterpretableOp<ArrayType, ShardMapTensor> for TestCustomLoweredOp {
         fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
             if inputs.len() != 1 {
                 return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
@@ -2713,7 +2713,7 @@ mod tests {
     impl StableHloCustomLowering<ShardMapTensor> for TestCustomLowering {
         fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
             &self,
-            _op: &CustomPrimitive<ShardMapTensor>,
+            _op: &CustomPrimitive<ArrayType, ShardMapTensor>,
             input_values: &[ValueRef<'b, 'c, 't>],
             _output_types: &[ArrayType],
             lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
@@ -2724,8 +2724,8 @@ mod tests {
     }
 
     fn custom_graph(
-        op: PrimitiveOp<ShardMapTensor>,
-    ) -> Graph<PrimitiveOp<ShardMapTensor>, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
+        op: PrimitiveOp<ArrayType, ShardMapTensor>,
+    ) -> Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
         let mut builder = ProgramBuilder::<ShardMapTensor>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
@@ -2867,7 +2867,7 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
-        let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<f64, (f64, f64), f64>) =
+        let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
             ryft_core::tracing_v2::jit(scalar_bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_graph(compiled.program().graph(), "main").unwrap();
@@ -2888,9 +2888,9 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
-        let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<f64, f64, f64>) =
+        let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, f64, f64>) =
             ryft_core::tracing_v2::try_jit(
-                |x: ryft_core::tracing_v2::JitTracer<f64>| Ok(ryft_core::tracing_v2::grad(scalar_quartic_plus_sin, x)?),
+                |x: ryft_core::tracing_v2::JitTracer<ArrayType, f64>| Ok(ryft_core::tracing_v2::grad(scalar_quartic_plus_sin, x)?),
                 2.0f64,
             )
             .unwrap();
@@ -2912,7 +2912,7 @@ mod tests {
     #[test]
     fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
         // Standalone pullback — specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
-        let (_, pullback): (f64, ryft_core::tracing_v2::LinearProgram<f64, f64, (f64, f64)>) =
+        let (_, pullback): (f64, ryft_core::tracing_v2::LinearProgram<ArrayType, f64, f64, (f64, f64)>) =
             ryft_core::tracing_v2::vjp(scalar_bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_graph(pullback.program().graph(), "main").unwrap();
@@ -2928,9 +2928,9 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT — symbolic, like JAX's jit(grad(f)).
         // Uses the GradInvocationLeaf<JitTracer<V>> dispatch that traces through vjp+pullback.
-        let (_, compiled): ((f64, f64), ryft_core::tracing_v2::CompiledFunction<f64, (f64, f64), (f64, f64)>) =
+        let (_, compiled): ((f64, f64), ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), (f64, f64)>) =
             ryft_core::tracing_v2::try_jit(
-                |inputs: (ryft_core::tracing_v2::JitTracer<f64>, ryft_core::tracing_v2::JitTracer<f64>)| {
+                |inputs: (ryft_core::tracing_v2::JitTracer<ArrayType, f64>, ryft_core::tracing_v2::JitTracer<ArrayType, f64>)| {
                     Ok(ryft_core::tracing_v2::grad(scalar_bilinear_sin, inputs)?)
                 },
                 (2.0f64, 3.0f64),

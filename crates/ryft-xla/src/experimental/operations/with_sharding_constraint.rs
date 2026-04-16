@@ -42,13 +42,13 @@ impl WithShardingConstraintOp {
         &self.sharding
     }
 
-    fn base_custom_primitive<V>(&self) -> CustomPrimitive<V>
+    fn base_custom_primitive<V>(&self) -> CustomPrimitive<ArrayType, V>
     where
         V: ryft_core::tracing_v2::Traceable<ArrayType>,
-        Self: InterpretableOp<V>
-            + LinearOp<V>
-            + DifferentiableOp<V, LinearTerm<V>>
-            + VectorizableOp<V>
+        Self: InterpretableOp<ArrayType, V>
+            + LinearOp<ArrayType, V>
+            + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
+            + VectorizableOp<ArrayType, V>
             + Clone
             + Send
             + Sync
@@ -61,7 +61,7 @@ impl WithShardingConstraintOp {
     }
 
     /// Returns the tensor-leaf custom primitive registration for this op.
-    pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ShardMapTensor> {
+    pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive::<ShardMapTensor>()
             .with_linearized_jit_rule(self.clone())
             .with_extension(self.clone())
@@ -69,7 +69,7 @@ impl WithShardingConstraintOp {
     }
 
     /// Returns the traced-leaf custom primitive registration for this op.
-    pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ShardMapTracer> {
+    pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTracer> {
         self.base_custom_primitive::<ShardMapTracer>().with_linearized_jit_rule(self.clone())
     }
 }
@@ -107,18 +107,18 @@ impl Op for WithShardingConstraintOp {
     }
 }
 
-impl InterpretableOp<ShardMapTensor> for WithShardingConstraintOp {
+impl InterpretableOp<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
 }
 
-impl LinearOp<ShardMapTensor> for WithShardingConstraintOp {
+impl LinearOp<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
     fn transpose(
         &self,
-        output_cotangents: &[LinearTerm<ShardMapTensor>],
-    ) -> Result<Vec<Option<LinearTerm<ShardMapTensor>>>, TraceError> {
+        output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
@@ -132,11 +132,11 @@ impl LinearOp<ShardMapTensor> for WithShardingConstraintOp {
     }
 }
 
-impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for WithShardingConstraintOp {
+impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>> for WithShardingConstraintOp {
     fn jvp(
         &self,
-        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ShardMapTensor>>>, TraceError> {
+        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
@@ -150,7 +150,7 @@ impl DifferentiableOp<ShardMapTensor, LinearTerm<ShardMapTensor>> for WithShardi
     }
 }
 
-impl InterpretableOp<Linearized<ShardMapTracer>> for WithShardingConstraintOp {
+impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingConstraintOp {
     fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
@@ -174,18 +174,18 @@ impl InterpretableOp<Linearized<ShardMapTracer>> for WithShardingConstraintOp {
     }
 }
 
-impl InterpretableOp<ShardMapTracer> for WithShardingConstraintOp {
+impl InterpretableOp<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
 }
 
-impl LinearOp<ShardMapTracer> for WithShardingConstraintOp {
+impl LinearOp<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
     fn transpose(
         &self,
-        output_cotangents: &[LinearTerm<ShardMapTracer>],
-    ) -> Result<Vec<Option<LinearTerm<ShardMapTracer>>>, TraceError> {
+        output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
@@ -199,11 +199,11 @@ impl LinearOp<ShardMapTracer> for WithShardingConstraintOp {
     }
 }
 
-impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for WithShardingConstraintOp {
+impl DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>> for WithShardingConstraintOp {
     fn jvp(
         &self,
-        inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ShardMapTracer>>>, TraceError> {
+        inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
@@ -217,7 +217,7 @@ impl DifferentiableOp<ShardMapTracer, LinearTerm<ShardMapTracer>> for WithShardi
     }
 }
 
-impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<V> for WithShardingConstraintOp {
+impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<ArrayType, V> for WithShardingConstraintOp {
     fn batch(
         &self,
         inputs: &[ryft_core::tracing_v2::Batch<V>],
@@ -227,11 +227,11 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<V> for WithS
     }
 }
 
-impl InterpretableOp<Linearized<JitTracer<ShardMapTracer>>> for WithShardingConstraintOp {
+impl InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, ShardMapTracer>>> for WithShardingConstraintOp {
     fn interpret(
         &self,
-        _inputs: &[Linearized<JitTracer<ShardMapTracer>>],
-    ) -> Result<Vec<Linearized<JitTracer<ShardMapTracer>>>, TraceError> {
+        _inputs: &[Linearized<JitTracer<ArrayType, ShardMapTracer>>],
+    ) -> Result<Vec<Linearized<JitTracer<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: "linearized JIT evaluation for 'with_sharding_constraint' at the JIT-tracer level is not \
@@ -244,7 +244,7 @@ impl InterpretableOp<Linearized<JitTracer<ShardMapTracer>>> for WithShardingCons
 impl StableHloCustomLowering<ShardMapTensor> for WithShardingConstraintOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        _op: &CustomPrimitive<ShardMapTensor>,
+        _op: &CustomPrimitive<ArrayType, ShardMapTensor>,
         input_values: &[ryft_mlir::ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,

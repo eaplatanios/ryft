@@ -61,21 +61,21 @@ impl Op for AddOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOp<V> for AddOp {
+impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOp<ArrayType, V> for AddOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOp<V> for AddOp {
-    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOp<ArrayType, V> for AddOp {
+    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone()), Some(output_cotangents[0].clone())])
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for AddOp {
+impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for AddOp {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![JvpTracer {
@@ -85,7 +85,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<V>> Differentiab
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>> VectorizableOp<V> for AddOp {
+impl<V: Traceable<ArrayType> + Add<Output = V>> VectorizableOp<ArrayType, V> for AddOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

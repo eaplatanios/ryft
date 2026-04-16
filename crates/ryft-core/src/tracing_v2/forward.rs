@@ -17,14 +17,14 @@ use crate::{
         ops::DifferentiableOp,
         program::Program,
     },
-    types::{ArrayType, Typed},
+    types::{ArrayType, Type, Typed},
 };
 
 /// Tangent representation for a traced primal value.
 ///
 /// The default implementation is the primal type itself, but transforms such as `linearize` replace tangents with a
 /// staged linear representation like [`crate::tracing_v2::LinearTerm`].
-pub trait TangentSpace<V: Traceable<ArrayType>>: Clone + Parameter {
+pub trait TangentSpace<T: Type + Clone, V: Typed<T>>: Clone + Parameter {
     /// Adds two tangent values.
     fn add(lhs: Self, rhs: Self) -> Self;
 
@@ -38,7 +38,7 @@ pub trait TangentSpace<V: Traceable<ArrayType>>: Clone + Parameter {
     fn zero_like(primal: &V, tangent: &Self) -> Self;
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike> TangentSpace<V> for V {
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike> TangentSpace<ArrayType, V> for V {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
         lhs + rhs
@@ -74,25 +74,25 @@ pub struct JvpTracer<V, T> {
     pub tangent: T,
 }
 
-impl<V: Traceable<ArrayType>, T: TangentSpace<V>> Parameter for JvpTracer<V, T> {}
+impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V>> Parameter for JvpTracer<V, T> {}
 
-impl<V: Traceable<ArrayType>, T: TangentSpace<V> + 'static> Typed<ArrayType> for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V> + 'static> Typed<ArrayType> for JvpTracer<V, T> {
     #[inline]
     fn tpe(&self) -> ArrayType {
         <V as Typed<ArrayType>>::tpe(&self.primal)
     }
 }
 
-impl<V: Traceable<ArrayType>, T: TangentSpace<V> + 'static> Traceable<ArrayType> for JvpTracer<V, T> {}
+impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V> + 'static> Traceable<ArrayType> for JvpTracer<V, T> {}
 
-impl<V: Traceable<ArrayType> + ZeroLike, T: TangentSpace<V>> ZeroLike for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + ZeroLike, T: TangentSpace<ArrayType, V>> ZeroLike for JvpTracer<V, T> {
     #[inline]
     fn zero_like(&self) -> Self {
         Self { primal: self.primal.zero_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
     }
 }
 
-impl<V: Traceable<ArrayType> + crate::tracing_v2::OneLike, T: TangentSpace<V>> crate::tracing_v2::OneLike
+impl<V: Traceable<ArrayType> + crate::tracing_v2::OneLike, T: TangentSpace<ArrayType, V>> crate::tracing_v2::OneLike
     for JvpTracer<V, T>
 {
     #[inline]
@@ -129,13 +129,13 @@ pub trait JvpInvocationLeaf<
 fn single_output<V, T>(mut outputs: Vec<JvpTracer<V, T>>, op: &'static str) -> JvpTracer<V, T>
 where
     V: Traceable<ArrayType>,
-    T: TangentSpace<V>,
+    T: TangentSpace<ArrayType, V>,
 {
     debug_assert_eq!(outputs.len(), 1, "{op} should produce a single JVP output");
     outputs.pop().expect("single-output primitive should return one JVP output")
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<V>> Add for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Add for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -144,7 +144,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<V>> A
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> Mul for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Mul for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -153,7 +153,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> M
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> Neg for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Neg for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -162,7 +162,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> N
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike, T: TangentSpace<ArrayType, V>> FloatExt for JvpTracer<V, T> {
     #[inline]
     fn sin(self) -> Self {
         single_output(SinOp.jvp(&[self]).expect("sin JVP rule should succeed"), "sin")
@@ -189,13 +189,13 @@ impl<
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > JvpInvocationLeaf<Input, Output> for V
 where
-    Input::Family: ParameterizedFamily<JitTracer<V>>,
-    Output::Family: ParameterizedFamily<JitTracer<V>>,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     V::ParameterStructure: Clone + PartialEq,
 {
     type Base = V;
-    type FunctionInput = Input::To<JitTracer<V>>;
-    type FunctionOutput = Output::To<JitTracer<V>>;
+    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
+    type FunctionOutput = Output::To<JitTracer<ArrayType, V>>;
 
     fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
     where
@@ -205,7 +205,7 @@ where
             return Err(TraceError::MismatchedParameterStructure);
         }
 
-        let (primal_output, tangent_program): (Output, LinearProgram<V, Input, Output>) =
+        let (primal_output, tangent_program): (Output, LinearProgram<ArrayType, V, Input, Output>) =
             jvp_program(function, primals)?;
         let tangent_output = tangent_program.call(tangents)?;
         Ok((primal_output, tangent_output))
@@ -225,16 +225,16 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
-> JvpInvocationLeaf<Input, Output> for JitTracer<V>
+> JvpInvocationLeaf<Input, Output> for JitTracer<ArrayType, V>
 where
     Input::Family: ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<V>,
-    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<V>>,
-    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
-    Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
-    Output::To<V>: Parameterized<V, To<JitTracer<V>> = Output>,
+    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Input>,
+    Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Output>,
 {
     type Base = V;
     type FunctionInput = Input;
@@ -267,31 +267,31 @@ impl<
     Output: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
 > JvpInvocationLeaf<Input, Output> for Batch<V>
 where
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     V::ParameterStructure: Clone + PartialEq,
-    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Input::To<V>: Clone
         + Parameterized<
             V,
             ParameterStructure: Clone + PartialEq,
             To<Batch<V>> = Input,
-            To<JitTracer<V>> = Input::To<JitTracer<V>>,
+            To<JitTracer<ArrayType, V>> = Input::To<JitTracer<ArrayType, V>>,
         >,
     Output::To<V>: Clone
         + Parameterized<
             V,
             ParameterStructure: Clone + PartialEq,
             To<Batch<V>> = Output,
-            To<JitTracer<V>> = Output::To<JitTracer<V>>,
+            To<JitTracer<ArrayType, V>> = Output::To<JitTracer<ArrayType, V>>,
         >,
-    <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
-    <Output::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
+    <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
+    <Output::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
 {
     type Base = V;
-    type FunctionInput = Input::To<JitTracer<V>>;
-    type FunctionOutput = Output::To<JitTracer<V>>;
+    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
+    type FunctionOutput = Output::To<JitTracer<ArrayType, V>>;
 
     fn invoke<F>(function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
     where
@@ -312,7 +312,7 @@ where
         let input_parameter_count = input_structure.parameter_count();
 
         // Trace the function once at lane 0 primals, consuming the FnOnce closure.
-        let (primal_output_0, traced_program): (Output::To<V>, Program<V, Input::To<V>, Output::To<V>>) =
+        let (primal_output_0, traced_program): (Output::To<V>, Program<ArrayType, V, Input::To<V>, Output::To<V>>) =
             try_trace_program(|staged_input| Ok(function(staged_input)), lane0_primals)?;
 
         let output_structure = primal_output_0.parameter_structure();
@@ -331,8 +331,8 @@ where
         let combined_input_count = input_parameter_count * 2;
         let combined_output_count = output_parameter_count * 2;
 
-        let (_, compiled_jvp): (Vec<V>, CompiledFunction<V, Vec<V>, Vec<V>>) = try_jit(
-            |jit_combined: Vec<JitTracer<V>>| {
+        let (_, compiled_jvp): (Vec<V>, CompiledFunction<ArrayType, V, Vec<V>, Vec<V>>) = try_jit(
+            |jit_combined: Vec<JitTracer<ArrayType, V>>| {
                 let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
 
                 // Replay the forward pass symbolically and linearize at the symbolic primals.
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
         let result: Result<(f64, f64), TraceError> =
-            jvp(|xs: Vec<JitTracer<f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
+            jvp(|xs: Vec<JitTracer<ArrayType, f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
         test_support::assert_quadratic_pushforward_rendering();
     }

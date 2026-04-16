@@ -232,21 +232,21 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
-> VMapInvocationLeaf<Input, Output> for JitTracer<V>
+> VMapInvocationLeaf<Input, Output> for JitTracer<ArrayType, V>
 where
     Input::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<Self> + ParameterizedFamily<V>,
-    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<V>>,
-    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
+    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
     where
         F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>,
     {
         type LaneOutput<Output, Value> =
-            <<Output as Parameterized<JitTracer<Value>>>::To<Value> as Parameterized<Value>>::To<JitTracer<Value>>;
+            <<Output as Parameterized<JitTracer<ArrayType, Value>>>::To<Value> as Parameterized<Value>>::To<JitTracer<ArrayType, Value>>;
 
         let mut inputs = inputs.into_iter();
         let first_input = inputs.next().ok_or(TraceError::EmptyBatch)?;
@@ -266,10 +266,10 @@ where
             traced_inputs[0].iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
         )?;
 
-        let (exemplar_outputs, body_program): (Output::To<V>, Program<V, Input::To<V>, Output::To<V>>) =
+        let (exemplar_outputs, body_program): (Output::To<V>, Program<ArrayType, V, Input::To<V>, Output::To<V>>) =
             crate::tracing_v2::jit::try_trace_program(
                 |lane_inputs| {
-                    let batched_inputs = Input::To::<Batch<JitTracer<V>>>::from_parameters(
+                    let batched_inputs = Input::To::<Batch<JitTracer<ArrayType, V>>>::from_parameters(
                         lane_inputs.parameter_structure(),
                         lane_inputs.into_parameters().map(|input| Batch::new(vec![input])),
                     )?;
@@ -436,10 +436,10 @@ mod tests {
 
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
-        let (output, compiled): (f64, CompiledFunction<f64, f64, f64>) = crate::tracing_v2::jit::try_jit(
-            |x: JitTracer<f64>| {
-                let outputs: Vec<JitTracer<f64>> =
-                    vmap(|batch: Batch<JitTracer<f64>>| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
+        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::try_jit(
+            |x: JitTracer<ArrayType, f64>| {
+                let outputs: Vec<JitTracer<ArrayType, f64>> =
+                    vmap(|batch: Batch<JitTracer<ArrayType, f64>>| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
                 Ok(outputs[0].clone() + outputs[1].clone())
             },
             2.0f64,
@@ -470,7 +470,7 @@ mod tests {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         let gradients: Vec<f64> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::grad(|x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), batch)
+                crate::tracing_v2::grad(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), batch)
                     .expect("batched grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
@@ -488,7 +488,7 @@ mod tests {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         let results: Vec<(f64, f64)> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::value_and_grad(|x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), batch)
+                crate::tracing_v2::value_and_grad(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), batch)
                     .expect("batched value_and_grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
@@ -508,7 +508,7 @@ mod tests {
         // jvp at x with tangent t gives (f(x), (2x + cos(x)) * t)
         let results: Vec<(f64, f64)> = vmap(
             |(primals, tangents): (Batch<f64>, Batch<f64>)| {
-                crate::tracing_v2::jvp(|x: JitTracer<f64>| x.clone() * x.clone() + x.sin(), primals, tangents)
+                crate::tracing_v2::jvp(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), primals, tangents)
                     .expect("batched jvp should succeed")
             },
             vec![(1.0f64, 1.0f64), (2.0, 0.5), (3.0, 2.0)],

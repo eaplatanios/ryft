@@ -43,15 +43,15 @@ impl Op for LinearMatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue> InterpretableOp<V> for LinearMatrixTransposeOp {
+impl<V: MatrixValue> InterpretableOp<ArrayType, V> for LinearMatrixTransposeOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
 
-impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
-    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+impl<V: MatrixValue> LinearOp<ArrayType, V> for LinearMatrixTransposeOp {
+    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
@@ -66,14 +66,16 @@ impl<V: MatrixValue> LinearOp<V> for LinearMatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<V, T> for LinearMatrixTransposeOp {
+impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<ArrayType, V, T>
+    for LinearMatrixTransposeOp
+{
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
 
-impl<V: MatrixValue> VectorizableOp<V> for LinearMatrixTransposeOp {
+impl<V: MatrixValue> VectorizableOp<ArrayType, V> for LinearMatrixTransposeOp {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])

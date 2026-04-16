@@ -74,17 +74,17 @@ impl<V: MatrixValue> Op for LeftMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue> InterpretableOp<V> for LeftMatMulOp<V> {
+impl<V: MatrixValue> InterpretableOp<ArrayType, V> for LeftMatMulOp<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor.clone().matmul(inputs[0].clone())])
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
-    for LeftMatMulOp<V>
+impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
+    LinearOp<ArrayType, V> for LeftMatMulOp<V>
 {
-    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
@@ -100,12 +100,12 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
 }
 
 impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps>
-    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for LeftMatMulOp<V>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>> for LeftMatMulOp<V>
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };
@@ -114,9 +114,9 @@ impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps>
 }
 
 impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
-    DifferentiableOp<V, LinearTerm<V>> for LeftMatMulOp<V>
+    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for LeftMatMulOp<V>
 {
-    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
+    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = JvpTracer {
             primal: self.factor().clone(),
@@ -126,7 +126,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
     }
 }
 
-impl<V: MatrixValue> VectorizableOp<V> for LeftMatMulOp<V> {
+impl<V: MatrixValue> VectorizableOp<ArrayType, V> for LeftMatMulOp<V> {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(

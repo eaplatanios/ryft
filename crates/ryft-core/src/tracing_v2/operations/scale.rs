@@ -16,21 +16,22 @@ use crate::tracing_v2::{
     linear::LinearTerm,
     ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Type, Typed};
 
 use super::{expect_input_count, lift_jit_constant, unary_abstract};
 
 /// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]
-pub struct ScaleOp<V: Traceable<ArrayType>> {
+pub struct ScaleOp<T: Type + Clone, V: Typed<T>> {
     factor: V,
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl<V: Traceable<ArrayType>> ScaleOp<V> {
+impl<T: Type + Clone, V: Traceable<T>> ScaleOp<T, V> {
     /// Creates a new scale operation capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
-        Self { factor }
+        Self { factor, _marker: std::marker::PhantomData }
     }
 
     /// Returns the captured scale factor.
@@ -38,26 +39,28 @@ impl<V: Traceable<ArrayType>> ScaleOp<V> {
     pub fn factor(&self) -> &V {
         &self.factor
     }
+}
 
+impl<V: Traceable<ArrayType>> ScaleOp<ArrayType, V> {
     /// Validates abstract inputs without needing a concrete instance.
     pub fn abstract_eval_static(inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract(inputs)?])
     }
 }
 
-impl<V: Traceable<ArrayType>> Debug for ScaleOp<V> {
+impl<T: Type + Clone, V: Traceable<T>> Debug for ScaleOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Scale")
     }
 }
 
-impl<V: Traceable<ArrayType>> Display for ScaleOp<V> {
+impl<T: Type + Clone, V: Traceable<T>> Display for ScaleOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "scale")
     }
 }
 
-impl<V: Traceable<ArrayType>> Op for ScaleOp<V> {
+impl<V: Traceable<ArrayType>> Op for ScaleOp<ArrayType, V> {
     fn name(&self) -> &'static str {
         "scale"
     }
@@ -76,27 +79,27 @@ impl<V: Traceable<ArrayType>> Op for ScaleOp<V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<V> for ScaleOp<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> for ScaleOp<ArrayType, V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
-    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOp<ArrayType, V> for ScaleOp<ArrayType, V> {
+    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone().scale(self.factor().clone()))])
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
-    for ScaleOp<V>
+impl<V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>> for ScaleOp<ArrayType, V>
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         Ok(vec![JvpTracer {
@@ -106,7 +109,7 @@ impl<V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>> InterpretableOp<crate
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for ScaleOp<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for ScaleOp<ArrayType, V> {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
@@ -117,7 +120,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<V>> Differentiab
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOp<V> for ScaleOp<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOp<ArrayType, V> for ScaleOp<ArrayType, V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| self.factor().clone() * lane).collect())])

@@ -3,34 +3,51 @@
 use std::fmt::{Debug, Display};
 
 use crate::{
-    parameters::Parameterized,
+    parameters::{Parameter, Parameterized},
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
         linear::{linearize_program, transpose_linear_program_with_output_examples},
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
-        program::{LinearProgramOpRef, ProgramOpRef},
+        program::ProgramOpRef,
     },
-    types::{ArrayType, Typed},
+    types::{ArrayType, Type, Typed},
 };
 
 /// Erased traced `vmap` body used by the staged higher-order op.
-#[derive(Clone)]
-pub struct FlatTracedVMap<V: Traceable<ArrayType>, O: Clone = ProgramOpRef<V>> {
+pub struct FlatTracedVMap<T: Type + Clone, V: Typed<T> + Clone + Parameter, O = ProgramOpRef<V>> {
     lane_count: usize,
-    input_types: Vec<ArrayType>,
-    output_types: Vec<ArrayType>,
-    compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
+    input_types: Vec<T>,
+    output_types: Vec<T>,
+    compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
 }
 
-impl<V: Traceable<ArrayType>, O: Clone> FlatTracedVMap<V, O> {
+impl<
+    T: Type + Clone,
+    V: Traceable<T>,
+    O: Clone,
+> Clone for FlatTracedVMap<T, V, O>
+where
+    <Vec<V> as Parameterized<V>>::ParameterStructure: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            lane_count: self.lane_count,
+            input_types: self.input_types.clone(),
+            output_types: self.output_types.clone(),
+            compiled: self.compiled.clone(),
+        }
+    }
+}
+
+impl<T: Type + Clone, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
     /// Builds one erased traced `vmap` body from explicit staged parts.
     #[inline]
     pub fn from_parts(
         lane_count: usize,
-        input_types: Vec<ArrayType>,
-        output_types: Vec<ArrayType>,
-        compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
+        input_types: Vec<T>,
+        output_types: Vec<T>,
+        compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
     ) -> Self {
         Self { lane_count, input_types, output_types, compiled }
     }
@@ -43,19 +60,19 @@ impl<V: Traceable<ArrayType>, O: Clone> FlatTracedVMap<V, O> {
 
     /// Returns the canonical per-lane input types.
     #[inline]
-    pub fn input_types(&self) -> &[ArrayType] {
+    pub fn input_types(&self) -> &[T] {
         self.input_types.as_slice()
     }
 
     /// Returns the canonical per-lane output types.
     #[inline]
-    pub fn output_types(&self) -> &[ArrayType] {
+    pub fn output_types(&self) -> &[T] {
         self.output_types.as_slice()
     }
 
     /// Returns the compiled flat body.
     #[inline]
-    pub fn compiled(&self) -> &CompiledFunction<V, Vec<V>, Vec<V>, O> {
+    pub fn compiled(&self) -> &CompiledFunction<T, V, Vec<V>, Vec<V>, O> {
         &self.compiled
     }
 
@@ -71,17 +88,17 @@ impl<V: Traceable<ArrayType>, O: Clone> FlatTracedVMap<V, O> {
         self.lane_count * self.output_types.len()
     }
 
-    pub(crate) fn repeated_input_types(&self) -> Vec<ArrayType> {
+    pub(crate) fn repeated_input_types(&self) -> Vec<T> {
         (0..self.lane_count).flat_map(|_| self.input_types.iter().cloned()).collect::<Vec<_>>()
     }
 
-    pub(crate) fn repeated_output_types(&self) -> Vec<ArrayType> {
+    pub(crate) fn repeated_output_types(&self) -> Vec<T> {
         (0..self.lane_count).flat_map(|_| self.output_types.iter().cloned()).collect::<Vec<_>>()
     }
 
     pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
     where
-        O: InterpretableOp<V>,
+        O: InterpretableOp<T, V>,
         V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
         Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     {
@@ -99,38 +116,43 @@ impl<V: Traceable<ArrayType>, O: Clone> FlatTracedVMap<V, O> {
 }
 
 /// Higher-order `vmap` op that carries one canonical forward program payload.
-#[derive(Clone)]
-pub struct VMapOp<V: Traceable<ArrayType>> {
-    body: FlatTracedVMap<V>,
+pub struct VMapOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+    body: FlatTracedVMap<T, V, PrimitiveOp<T, V>>,
 }
 
-impl<V: Traceable<ArrayType>> VMapOp<V> {
+impl<T: Type + Clone + Display, V: Traceable<T>> Clone for VMapOp<T, V> {
+    fn clone(&self) -> Self {
+        Self { body: self.body.clone() }
+    }
+}
+
+impl<T: Type + Clone + Display, V: Traceable<T>> VMapOp<T, V> {
     /// Builds one ordinary traced `vmap` op.
     #[inline]
-    pub fn new(body: FlatTracedVMap<V>) -> Self {
+    pub fn new(body: FlatTracedVMap<T, V, PrimitiveOp<T, V>>) -> Self {
         Self { body }
     }
 
     /// Returns the canonical traced body.
     #[inline]
-    pub fn body(&self) -> &FlatTracedVMap<V> {
+    pub fn body(&self) -> &FlatTracedVMap<T, V, PrimitiveOp<T, V>> {
         &self.body
     }
 }
 
-impl<V: Traceable<ArrayType>> Debug for VMapOp<V> {
+impl<T: Type + Clone + Display, V: Traceable<T>> Debug for VMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "VMap")
     }
 }
 
-impl<V: Traceable<ArrayType>> Display for VMapOp<V> {
+impl<T: Type + Clone + Display, V: Traceable<T>> Display for VMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
 }
 
-impl<V: Traceable<ArrayType>> Op for VMapOp<V> {
+impl<V: Traceable<ArrayType>> Op for VMapOp<ArrayType, V> {
     fn name(&self) -> &'static str {
         "vmap"
     }
@@ -147,7 +169,8 @@ impl<V: Traceable<ArrayType>> Op for VMapOp<V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<ArrayType, V>
+    for VMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -169,17 +192,17 @@ impl<
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
-> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V>
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>> for VMapOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<V>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<V>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_output_values = <Self as InterpretableOp<V>>::interpret(
+        let primal_output_values = <Self as InterpretableOp<ArrayType, V>>::interpret(
             self,
             primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice(),
         )?;
@@ -216,18 +239,18 @@ impl<
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
-> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V>
+> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for VMapOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn jvp(
         &self,
-        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<V>>>, TraceError> {
+        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>],
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let primal_outputs = <Self as InterpretableOp<V>>::interpret(self, primal_inputs.as_slice())?;
+        let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
             LinearPrimitiveOp::VMap(Box::new(make_linear_vmap(&self.body)?)),
@@ -241,37 +264,43 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
+    InterpretableOp<ArrayType, JitTracer<ArrayType, V>> for VMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    fn interpret(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
+    fn interpret(&self, inputs: &[JitTracer<ArrayType, V>]) -> Result<Vec<JitTracer<ArrayType, V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let output_values = <Self as InterpretableOp<V>>::interpret(self, concrete_inputs.as_slice())?;
+        let output_values = <Self as InterpretableOp<ArrayType, V>>::interpret(self, concrete_inputs.as_slice())?;
         JitTracer::apply_staged_op(inputs, PrimitiveOp::VMap(Box::new(self.clone())), output_values)
     }
 }
 
 /// Linear-only `vmap` op that always carries both the linear body and its transpose body.
-#[derive(Clone)]
-pub struct LinearVMapOp<V: Traceable<ArrayType>> {
-    body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
-    transpose_body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
+pub struct LinearVMapOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+    body: FlatTracedVMap<T, V, LinearPrimitiveOp<T, V>>,
+    transpose_body: FlatTracedVMap<T, V, LinearPrimitiveOp<T, V>>,
 }
 
-impl<V: Traceable<ArrayType>> LinearVMapOp<V> {
+impl<T: Type + Clone + Display, V: Traceable<T>> Clone for LinearVMapOp<T, V> {
+    fn clone(&self) -> Self {
+        Self { body: self.body.clone(), transpose_body: self.transpose_body.clone() }
+    }
+}
+
+impl<T: Type + Clone + Display, V: Traceable<T>> LinearVMapOp<T, V> {
     /// Builds one linear traced `vmap` op with its transpose body.
     #[inline]
     pub fn new(
-        body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
-        transpose_body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
+        body: FlatTracedVMap<T, V, LinearPrimitiveOp<T, V>>,
+        transpose_body: FlatTracedVMap<T, V, LinearPrimitiveOp<T, V>>,
     ) -> Self {
         Self { body, transpose_body }
     }
 
     /// Returns the canonical traced body.
     #[inline]
-    pub fn body(&self) -> &FlatTracedVMap<V, LinearProgramOpRef<V>> {
+    pub fn body(&self) -> &FlatTracedVMap<T, V, LinearPrimitiveOp<T, V>> {
         &self.body
     }
 
@@ -280,19 +309,19 @@ impl<V: Traceable<ArrayType>> LinearVMapOp<V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Debug for LinearVMapOp<V> {
+impl<T: Type + Clone + Display, V: Traceable<T>> Debug for LinearVMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearVMap")
     }
 }
 
-impl<V: Traceable<ArrayType>> Display for LinearVMapOp<V> {
+impl<T: Type + Clone + Display, V: Traceable<T>> Display for LinearVMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
 }
 
-impl<V: Traceable<ArrayType>> Op for LinearVMapOp<V> {
+impl<V: Traceable<ArrayType>> Op for LinearVMapOp<ArrayType, V> {
     fn name(&self) -> &'static str {
         "vmap"
     }
@@ -309,7 +338,8 @@ impl<V: Traceable<ArrayType>> Op for LinearVMapOp<V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<ArrayType, V>
+    for LinearVMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -320,11 +350,12 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<ArrayType, V>
+    for LinearVMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         if output_cotangents.len() != self.body.total_output_count() {
             return Err(TraceError::InvalidInputCount {
                 expected: self.body.total_output_count(),
@@ -344,7 +375,7 @@ where
 }
 
 /// Builds one linearized staged `vmap` op from its primal body.
-pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<LinearVMapOp<V>, TraceError>
+pub fn make_linear_vmap<V>(body: &FlatTracedVMap<ArrayType, V>) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
 where
     V: Traceable<ArrayType>
         + FloatExt
