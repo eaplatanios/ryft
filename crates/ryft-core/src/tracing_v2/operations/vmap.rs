@@ -3,9 +3,10 @@
 use std::fmt::{Debug, Display};
 
 use crate::{
+    parameters::Parameterized,
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, One, TraceError, TraceValue, Zero,
-        linear::{linearize_program, transpose_linear_program},
+        linear::{linearize_program, transpose_linear_program_with_output_examples},
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
         program::{LinearProgramOpRef, ProgramOpRef},
@@ -82,6 +83,7 @@ impl<V: TraceValue, O: Clone> FlatTracedVMap<V, O> {
     where
         O: InterpretableOp<V>,
         V: FloatExt + Zero + One + MatrixOps + ReshapeOps,
+        Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     {
         if inputs.len() != self.total_input_count() {
             return Err(TraceError::InvalidInputCount { expected: self.total_input_count(), got: inputs.len() });
@@ -145,7 +147,10 @@ impl<V: TraceValue> Op for VMapOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -153,8 +158,20 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> Interpretab
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps>
-    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V>
+impl<
+    V: TraceValue
+        + FloatExt
+        + Zero
+        + One
+        + MatrixOps
+        + ReshapeOps
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>,
+> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V>
+where
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(
         &self,
@@ -187,7 +204,21 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps>
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V> {
+impl<
+    V: TraceValue
+        + FloatExt
+        + Zero
+        + One
+        + MatrixOps
+        + ReshapeOps
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>,
+> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V>
+where
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn jvp(
         &self,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
@@ -208,7 +239,10 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> Differentia
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn interpret(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let output_values = <Self as InterpretableOp<V>>::interpret(self, concrete_inputs.as_slice())?;
@@ -273,7 +307,10 @@ impl<V: TraceValue> Op for LinearVMapOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -281,7 +318,10 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> Interpretab
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         if output_cotangents.len() != self.body.total_output_count() {
             return Err(TraceError::InvalidInputCount {
@@ -306,7 +346,6 @@ pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<LinearVMapOp<V>, 
 where
     V: TraceValue
         + FloatExt
-        + crate::tracing_v2::Zero
         + Zero
         + One
         + MatrixOps
@@ -314,9 +353,13 @@ where
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
+    let representative_inputs = body.compiled.program().graph().representative_input_values()?;
+    let representative_outputs = body.compiled.call(representative_inputs)?;
     let pushforward = linearize_program(body.compiled.program())?;
-    let pullback = transpose_linear_program(&pushforward)?;
+    let pullback = transpose_linear_program_with_output_examples(&pushforward, representative_outputs.as_slice())?;
     Ok(LinearVMapOp::new(
         FlatTracedVMap::from_parts(
             body.lane_count,

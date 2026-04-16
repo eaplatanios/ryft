@@ -87,12 +87,28 @@ impl<V: TraceValue, T: TangentSpace<V> + 'static> TraceValue for JvpTracer<V, T>
 
 impl<V: TraceValue + Zero, T: TangentSpace<V>> Zero for JvpTracer<V, T> {
     #[inline]
+    fn zero(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
+        Err(TraceError::CannotSynthesizeZeroWitness {
+            value_kind: std::any::type_name::<Self>(),
+            abstract_value: r#type,
+        })
+    }
+
+    #[inline]
     fn zero_like(&self) -> Self {
         Self { primal: self.primal.zero_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
     }
 }
 
 impl<V: TraceValue + crate::tracing_v2::One, T: TangentSpace<V>> crate::tracing_v2::One for JvpTracer<V, T> {
+    #[inline]
+    fn one(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
+        Err(TraceError::CannotSynthesizeOneWitness {
+            value_kind: std::any::type_name::<Self>(),
+            abstract_value: r#type,
+        })
+    }
+
     #[inline]
     fn one_like(&self) -> Self {
         Self { primal: self.primal.one_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
@@ -176,6 +192,7 @@ impl<V: TraceValue + FloatExt + Zero, T: TangentSpace<V>> FloatExt for JvpTracer
 /// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
     V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + Zero
         + crate::tracing_v2::One
@@ -188,6 +205,7 @@ impl<
 where
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output::Family: ParameterizedFamily<JitTracer<V>>,
+    V::ParameterStructure: Clone + PartialEq,
 {
     type Base = V;
     type FunctionInput = Input::To<JitTracer<V>>;
@@ -213,6 +231,7 @@ where
 /// tangent propagation as part of the outer compiled graph.
 impl<
     V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + Zero
         + crate::tracing_v2::One
@@ -224,6 +243,10 @@ impl<
 where
     Input::Family: ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<V>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
     Output::To<V>: Parameterized<V, To<JitTracer<V>> = Output>,
 {
@@ -248,6 +271,7 @@ where
 /// [`try_jit`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
     V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + Zero
         + crate::tracing_v2::One
@@ -259,6 +283,9 @@ impl<
 where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Clone
         + Parameterized<
             V,

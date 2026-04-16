@@ -13,7 +13,9 @@ use crate::{
     tracing_v2::{
         CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, One, Program, TraceError, TraceValue, Zero,
         jit::try_trace_program,
-        linear::{linearize_program, replay_program_graph_linearized_jit, transpose_linear_program},
+        linear::{
+            linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
+        },
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
         program::{LinearProgramOpRef, ProgramOpRef},
@@ -117,7 +119,10 @@ impl<V: TraceValue> Op for RematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for RematerializeOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for RematerializeOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -125,8 +130,20 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> Interpretab
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps>
-    InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RematerializeOp<V>
+impl<
+    V: TraceValue
+        + FloatExt
+        + Zero
+        + One
+        + MatrixOps
+        + ReshapeOps
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>,
+> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RematerializeOp<V>
+where
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(
         &self,
@@ -166,6 +183,9 @@ impl<
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
 > DifferentiableOp<V, LinearTerm<V>> for RematerializeOp<V>
+where
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn jvp(
         &self,
@@ -189,6 +209,8 @@ impl<
 
 impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
     for RematerializeOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
@@ -256,7 +278,10 @@ impl<V: TraceValue> Op for LinearRematerializeOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearRematerializeOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearRematerializeOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -264,7 +289,10 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> Interpretab
     }
 }
 
-impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         let transpose = self.transpose_op();
         Ok(LinearTerm::apply_staged_op(
@@ -284,7 +312,6 @@ pub fn make_linear_rematerialize<V>(body: &FlatTracedRematerialize<V>) -> Result
 where
     V: TraceValue
         + FloatExt
-        + crate::tracing_v2::Zero
         + Zero
         + One
         + MatrixOps
@@ -292,9 +319,13 @@ where
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
+    let representative_inputs = body.compiled.program().graph().representative_input_values()?;
+    let representative_outputs = body.compiled.call(representative_inputs)?;
     let pushforward = linearize_program(body.compiled.program())?;
-    let pullback = transpose_linear_program(&pushforward)?;
+    let pullback = transpose_linear_program_with_output_examples(&pushforward, representative_outputs.as_slice())?;
     Ok(LinearRematerializeOp::new(
         FlatTracedRematerialize::from_parts(
             body.input_types.clone(),
@@ -329,7 +360,14 @@ pub(crate) trait RematerializeInvocationLeaf<
 /// Concrete-value dispatch for [`rematerialize`]: the rematerialization boundary is a no-op during
 /// eager execution and simply applies the body function directly.
 impl<
-    V: TraceValue + FloatExt + Zero + One + crate::tracing_v2::ConcreteTraceValue + MatrixOps + ReshapeOps,
+    V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
+        + FloatExt
+        + Zero
+        + One
+        + crate::tracing_v2::ConcreteTraceValue
+        + MatrixOps
+        + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for V
@@ -346,7 +384,7 @@ impl<
 /// stages a [`RematerializeOp`] in the enclosing [`JitTracer`] scope. The sub-program is traced
 /// once over exemplar values and compiled into a [`CompiledFunction`] that lowering can later handle.
 impl<
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for JitTracer<V>
@@ -355,6 +393,7 @@ where
     Output::Family: ParameterizedFamily<Self> + ParameterizedFamily<V>,
     Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
     Output::To<V>: Parameterized<V, To<JitTracer<V>> = Output>,
+    V::ParameterStructure: Clone + PartialEq,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>
     where

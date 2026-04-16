@@ -1031,7 +1031,9 @@ fn try_transpose_traced_shard_map_body<
     TraceError,
 > {
     let (outputs, pushforward) = try_linearize_traced_shard_map_body(function, primals)?;
-    Ok((outputs, pushforward.transpose()?))
+    let pullback =
+        ryft_core::tracing_v2::linear::transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+    Ok((outputs, pullback))
 }
 
 fn apply_flat_traced_shard_map(

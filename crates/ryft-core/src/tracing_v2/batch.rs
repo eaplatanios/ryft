@@ -14,7 +14,7 @@ use crate::{
         operations::{AddOp, CosOp, FlatTracedVMap, MulOp, NegOp, SinOp, VMapOp},
         ops::{PrimitiveOp, VectorizableOp},
     },
-    types::Typed,
+    types::{ArrayType, Typed},
 };
 use ryft_macros::Parameter;
 
@@ -100,14 +100,30 @@ impl<V: TraceValue + FloatExt> FloatExt for Batch<V> {
     }
 }
 
-impl<V: Zero> Zero for Batch<V> {
+impl<V: Parameter + Zero> Zero for Batch<V> {
+    #[inline]
+    fn zero(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
+        Err(TraceError::CannotSynthesizeZeroWitness {
+            value_kind: std::any::type_name::<Self>(),
+            abstract_value: r#type,
+        })
+    }
+
     #[inline]
     fn zero_like(&self) -> Self {
         Self::new(self.lanes.iter().map(Zero::zero_like).collect())
     }
 }
 
-impl<V: One> One for Batch<V> {
+impl<V: Parameter + One> One for Batch<V> {
+    #[inline]
+    fn one(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
+        Err(TraceError::CannotSynthesizeOneWitness {
+            value_kind: std::any::type_name::<Self>(),
+            abstract_value: r#type,
+        })
+    }
+
     #[inline]
     fn one_like(&self) -> Self {
         Self::new(self.lanes.iter().map(One::one_like).collect())
@@ -195,6 +211,7 @@ pub(crate) trait VMapInvocationLeaf<
 /// over the batched representation, and unstacks the result back into per-lane outputs.
 impl<
     V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + Zero
         + One
@@ -223,6 +240,7 @@ where
 /// emit as packed StableHLO.
 impl<
     V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + Zero
         + One
@@ -234,6 +252,10 @@ impl<
 where
     Input::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<Self> + ParameterizedFamily<V>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
     where
@@ -288,6 +310,8 @@ where
 
         let output_structure = exemplar_outputs.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
+        let flat_input_structure = vec![Placeholder; input_leaf_count];
+        let flat_output_structure = vec![Placeholder; output_leaf_count];
         let body = FlatTracedVMap::from_parts(
             lane_count,
             body_program
@@ -299,10 +323,11 @@ where
                 })
                 .collect::<Vec<_>>(),
             exemplar_outputs.parameters().map(Typed::tpe).collect::<Vec<_>>(),
-            CompiledFunction::from_graph(body_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-                vec![Placeholder; input_leaf_count],
-                vec![Placeholder; output_leaf_count],
-            )),
+            CompiledFunction::from_graph(
+                body_program
+                    .graph()
+                    .clone_with_structures::<Vec<V>, Vec<V>>(flat_input_structure, flat_output_structure),
+            ),
         );
 
         let output_values = traced_inputs
@@ -338,6 +363,7 @@ where
 /// concrete implementation handles each lane directly.
 impl<
     V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + Zero
         + One

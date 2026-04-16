@@ -155,12 +155,11 @@ impl<V: TraceValue> TraceValue for JitTracer<V> {}
 
 impl<V: TraceValue + Zero> Zero for JitTracer<V> {
     #[inline]
-    fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
-        let value = V::zero(r#type)?;
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let staging_error = Rc::new(RefCell::new(None));
-        let atom = builder.borrow_mut().add_input(&value);
-        Ok(Self { value, atom, builder, staging_error })
+    fn zero(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
+        Err(TraceError::CannotSynthesizeZeroWitness {
+            value_kind: std::any::type_name::<Self>(),
+            abstract_value: r#type,
+        })
     }
 
     #[inline]
@@ -173,12 +172,11 @@ impl<V: TraceValue + Zero> Zero for JitTracer<V> {
 
 impl<V: TraceValue + One> One for JitTracer<V> {
     #[inline]
-    fn one(r#type: ArrayType) -> Result<Self, TraceError> {
-        let value = V::one(r#type)?;
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let staging_error = Rc::new(RefCell::new(None));
-        let atom = builder.borrow_mut().add_input(&value);
-        Ok(Self { value, atom, builder, staging_error })
+    fn one(r#type: Self::To<ArrayType>) -> Result<Self, TraceError> {
+        Err(TraceError::CannotSynthesizeOneWitness {
+            value_kind: std::any::type_name::<Self>(),
+            abstract_value: r#type,
+        })
     }
 
     #[inline]

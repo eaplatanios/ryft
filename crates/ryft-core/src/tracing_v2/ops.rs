@@ -25,14 +25,17 @@ use std::{
     sync::Arc,
 };
 
-use crate::tracing_v2::{
-    FloatExt, MatrixOps, One, TraceError, TraceValue, Zero,
-    batch::Batch,
-    forward::JvpTracer,
-    jit::JitTracer,
-    linear::{LinearTerm, Linearized},
+use crate::{
+    parameters::Parameterized,
+    tracing_v2::{
+        FloatExt, MatrixOps, One, TraceError, TraceValue, Zero,
+        batch::Batch,
+        forward::JvpTracer,
+        jit::JitTracer,
+        linear::{LinearTerm, Linearized},
+    },
+    types::{ArrayType, Typed},
 };
-use crate::types::{ArrayType, Typed};
 
 /// Shape-level operation interface for staged graphs.
 ///
@@ -821,6 +824,8 @@ impl<V: TraceValue> Op for LinearPrimitiveOp<V> {
 /// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
 impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for PrimitiveOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         match self {
@@ -847,6 +852,8 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::oper
 
 impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for LinearPrimitiveOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         match self {
@@ -869,6 +876,8 @@ impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::oper
 
 impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
     for LinearPrimitiveOp<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         match self {
@@ -913,6 +922,9 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
 > InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for PrimitiveOp<V>
+where
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(
         &self,
@@ -942,6 +954,9 @@ impl<
 
 impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     DifferentiableOp<V, LinearTerm<V>> for PrimitiveOp<V>
+where
+    V::ParameterStructure: Clone + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         match self {

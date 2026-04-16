@@ -26,6 +26,7 @@ use crate::{
         ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
         program::{LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder, ProgramOpRef},
     },
+    types::ArrayType,
 };
 
 /// Tangent representation backed by atoms in a staged linear graph.
@@ -156,6 +157,11 @@ impl<V: TraceValue + Zero> TangentSpace<V> for LinearTerm<V> {
 /// Standard traced value used while building linear programs.
 pub type Linearized<V> = JvpTracer<V, LinearTerm<V>>;
 
+#[inline]
+fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
+    vec![Placeholder; count]
+}
+
 /// Staged linear map produced by `linearize`, `jvp_program`, or `vjp`.
 pub struct LinearProgram<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     program: Program<V, Input, Output, LinearProgramOpRef<V>>,
@@ -190,6 +196,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         V: FloatExt + Zero + One + MatrixOps + ReshapeOps,
+        V::ParameterStructure: Clone + PartialEq,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -199,7 +206,13 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearPro
     /// Transposes the linear program, turning a pushforward into a pullback.
     pub fn transpose(&self) -> Result<LinearProgram<V, Output, Input>, TraceError>
     where
-        V: FloatExt + Zero + One + MatrixOps + ReshapeOps,
+        V: Parameterized<V, To<ArrayType> = ArrayType, ParameterStructure = Placeholder>
+            + FloatExt
+            + Zero
+            + One
+            + MatrixOps
+            + ReshapeOps,
+        V::Family: ParameterizedFamily<ArrayType>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -242,6 +255,7 @@ where
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>,
+    V::ParameterStructure: Clone + PartialEq,
 {
     let cotangent_terms = output_cotangents
         .iter()
@@ -261,13 +275,13 @@ where
     V: TraceValue
         + FloatExt
         + Zero
-        + Zero
         + One
         + MatrixOps
         + ReshapeOps
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 {
@@ -380,9 +394,32 @@ pub fn transpose_linear_program<V, Input, Output>(
     program: &LinearProgram<V, Input, Output>,
 ) -> Result<LinearProgram<V, Output, Input>, TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue
+        + Parameterized<V, To<ArrayType> = ArrayType, ParameterStructure = Placeholder>
+        + FloatExt
+        + Zero
+        + One
+        + MatrixOps
+        + ReshapeOps,
+    V::Family: ParameterizedFamily<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+{
+    transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V>, abstract_value, _| {
+        builder.add_input_abstract_zero(abstract_value.clone())
+    })
+}
+
+fn transpose_linear_program_with_output_inputs<V, Input, Output, F>(
+    program: &LinearProgram<V, Input, Output>,
+    mut make_output_cotangent_input: F,
+) -> Result<LinearProgram<V, Output, Input>, TraceError>
+where
+    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    F: FnMut(&mut LinearProgramBuilder<V>, &ArrayType, usize) -> Result<AtomId, TraceError>,
 {
     fn accumulate<V>(
         builder: &Rc<RefCell<LinearProgramBuilder<V>>>,
@@ -412,9 +449,11 @@ where
     let graph = program.program.graph();
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
-    for output in graph.outputs().iter() {
+    for (output_index, output) in graph.outputs().iter().enumerate() {
         let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
-        output_cotangent_inputs.push(builder.borrow_mut().add_input_abstract_zero(output_atom.abstract_value.clone())?);
+        let cotangent_input =
+            make_output_cotangent_input(&mut builder.borrow_mut(), &output_atom.abstract_value, output_index)?;
+        output_cotangent_inputs.push(cotangent_input);
     }
 
     let mut adjoints = vec![None; graph.atom_count()];
@@ -461,6 +500,32 @@ where
         zero: program.zero.clone(),
         marker: PhantomData,
     })
+}
+
+/// Transposes a linear program using concrete output examples to seed the cotangent inputs.
+///
+/// This variant is useful when the linear program's leaf type cannot be synthesized from bare
+/// [`ArrayType`] metadata alone, but the caller still has representative output values available.
+pub fn transpose_linear_program_with_output_examples<V, Input, Output>(
+    program: &LinearProgram<V, Input, Output>,
+    output_examples: &[V],
+) -> Result<LinearProgram<V, Output, Input>, TraceError>
+where
+    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+{
+    let expected_output_count = program.program().graph().outputs().len();
+    if output_examples.len() != expected_output_count {
+        return Err(TraceError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
+    }
+    transpose_linear_program_with_output_inputs(
+        program,
+        |builder: &mut LinearProgramBuilder<V>, abstract_value, output_index| {
+            Ok(builder.add_input_abstract(abstract_value.clone(), output_examples[output_index].zero_like()))
+        },
+    )
 }
 
 fn lift_traced_constant<V>(constant: &V, inputs: &[JitTracer<V>]) -> Result<JitTracer<V>, TraceError>
@@ -569,6 +634,7 @@ where
         + Neg<Output = V>
         + MatrixOps
         + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
 {
     replay_program_graph_with(graph, inputs, lift_linearized_traced_constant, |op, values| {
         InterpretableOp::<Linearized<JitTracer<V>>>::interpret(op, &values)
@@ -580,7 +646,7 @@ pub(crate) fn try_linearize_traced_program<V>(
     primals: Vec<JitTracer<V>>,
 ) -> Result<(Vec<JitTracer<V>>, LinearProgram<JitTracer<V>, Vec<JitTracer<V>>, Vec<JitTracer<V>>>), TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
 {
     let zero = primals.first().map(Zero::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_count = primals.len();
@@ -617,8 +683,9 @@ pub fn try_jvp_program<F, Input, Output, V>(
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
     V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<JitTracer<V>>,
     F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
@@ -635,11 +702,13 @@ pub fn try_jvp_traced<F, Input, Output, V>(
     tangents: Input,
 ) -> Result<(Output, Output), TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<JitTracer<V>, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V>,
     Output: Parameterized<JitTracer<V>, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<V>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
     Output::To<V>: Parameterized<V, To<JitTracer<V>> = Output>,
     F: FnOnce(Input) -> Result<Output, TraceError>,
@@ -666,8 +735,8 @@ where
         )?;
     let output_structure = primal_output.parameter_structure();
     let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-        vec![Placeholder; traced_primals.len()],
-        vec![Placeholder; primal_output.parameter_count()],
+        flat_leaf_parameter_structure(traced_primals.len()),
+        flat_leaf_parameter_structure(primal_output.parameter_count()),
     ))
     .simplify()?;
     let (traced_primal_output, pushforward) = try_linearize_traced_program(&traced_program, traced_primals)?;
@@ -686,8 +755,9 @@ pub fn jvp_program<F, Input, Output, V>(
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
     V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<JitTracer<V>>,
     F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
@@ -703,8 +773,9 @@ pub fn linearize<F, Input, Output, V>(
 ) -> Result<(Output, LinearProgram<V, Input, Output>), TraceError>
 where
     V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<V>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Output::Family: ParameterizedFamily<JitTracer<V>>,
     F: FnOnce(Input::To<JitTracer<V>>) -> Output::To<JitTracer<V>>,
@@ -718,6 +789,7 @@ pub fn try_vjp<F, Input, Output, V>(
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
 where
     V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -725,7 +797,9 @@ where
     F: FnOnce(Input::To<JitTracer<V>>) -> Result<Output::To<JitTracer<V>>, TraceError>,
 {
     let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(function, primals)?;
-    Ok((output, pushforward.transpose()?))
+    let output_examples = output.parameters().cloned().collect::<Vec<_>>();
+    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_examples.as_slice())?;
+    Ok((output, pullback))
 }
 
 /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
@@ -736,6 +810,7 @@ pub fn vjp<F, Input, Output, V>(
 ) -> Result<(Output, LinearProgram<V, Output, Input>), TraceError>
 where
     V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -747,7 +822,15 @@ where
 
 fn try_grad<F, Input, V>(function: F, primals: Input) -> Result<Input, TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
+        + FloatExt
+        + Zero
+        + One
+        + MatrixOps
+        + ReshapeOps
+        + Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     F: FnOnce(Input::To<JitTracer<V>>) -> Result<JitTracer<V>, TraceError>,
@@ -762,7 +845,7 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
     Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: TraceValue + FloatExt + Zero + One + MatrixOps;
+    type Base: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps;
 
     /// Return type produced by [`grad`] for the corresponding input regime.
     type Return;
@@ -779,11 +862,20 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
 /// Concrete-value dispatch for [`grad`]: traces the user function with [`JitTracer`] to build a staged
 /// reverse-mode gradient and evaluates it at the supplied primals.
 impl<
-    V: TraceValue + FloatExt + Zero + One + ConcreteTraceValue + MatrixOps + ReshapeOps,
+    V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
+        + FloatExt
+        + Zero
+        + One
+        + ConcreteTraceValue
+        + MatrixOps
+        + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > GradInvocationLeaf<Input> for V
 where
     Input::Family: ParameterizedFamily<JitTracer<V>>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
 {
     type Base = V;
     type Return = Input;
@@ -801,11 +893,15 @@ where
 /// [`JitTracer`] scope, linearizes the resulting [`Program`], transposes the pushforward into a pullback,
 /// and stages the full backward pass so it becomes part of the outer compiled graph.
 impl<
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > GradInvocationLeaf<Input> for JitTracer<V>
 where
     Input::Family: ParameterizedFamily<V>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
 {
     type Base = V;
     type Return = Input;
@@ -831,17 +927,16 @@ where
             },
             staged_primals,
         )?;
-        let traced_program = Program::from_graph(
-            traced_program
-                .graph()
-                .clone_with_structures::<Vec<V>, Vec<V>>(vec![Placeholder; traced_primals.len()], vec![Placeholder; 1]),
-        )
+        let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+            flat_leaf_parameter_structure(traced_primals.len()),
+            flat_leaf_parameter_structure(1),
+        ))
         .simplify()?;
         let (outputs, pushforward) = try_linearize_traced_program(&traced_program, traced_primals)?;
         if outputs.len() != 1 {
             return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
         }
-        let pullback = pushforward.transpose()?;
+        let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
         let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
         Ok(Input::from_parameters(input_structure, traced_gradient)?)
     }
@@ -855,10 +950,12 @@ where
 /// [`CompiledFunction`] via [`try_jit`] that embeds the full forward and backward passes symbolically.
 /// The compiled gradient function is called independently for each lane.
 impl<
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
 > GradInvocationLeaf<Input> for Batch<V>
 where
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Clone
         + Parameterized<
@@ -868,6 +965,8 @@ where
             To<JitTracer<V>> = Input::To<JitTracer<V>>,
         >,
     <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
 {
     type Base = V;
     type Return = Input;
@@ -892,11 +991,10 @@ where
             try_trace_program(|staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
-        let flat_program = Program::from_graph(
-            traced_program
-                .graph()
-                .clone_with_structures::<Vec<V>, Vec<V>>(vec![Placeholder; parameter_count], vec![Placeholder; 1]),
-        )
+        let flat_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+            flat_leaf_parameter_structure(parameter_count),
+            flat_leaf_parameter_structure(1),
+        ))
         .simplify()?;
 
         // Compile the gradient into a reusable program by wrapping linearize + transpose + pullback
@@ -908,7 +1006,7 @@ where
                 if outputs.len() != 1 {
                     return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
                 }
-                let pullback = pushforward.transpose()?;
+                let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
                 pullback.call(vec![outputs[0].one_like()])
             },
             lane0_flat,
@@ -967,11 +1065,20 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
 /// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`] and
 /// pulls back a unit seed to obtain both the primal scalar output and its gradient.
 impl<
-    V: TraceValue + FloatExt + Zero + One + ConcreteTraceValue + MatrixOps + ReshapeOps,
+    V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
+        + FloatExt
+        + Zero
+        + One
+        + ConcreteTraceValue
+        + MatrixOps
+        + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > ValueAndGradInvocationLeaf<Input> for V
 where
     Input::Family: ParameterizedFamily<JitTracer<V>>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
 {
     type Base = V;
     type Return = (V, Input);
@@ -991,11 +1098,15 @@ where
 /// enclosing [`JitTracer`] scope, linearizes, transposes, and stages both the forward output and the
 /// backward gradient so they become part of the outer compiled graph.
 impl<
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > ValueAndGradInvocationLeaf<Input> for JitTracer<V>
 where
     Input::Family: ParameterizedFamily<V>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Parameterized<V, To<JitTracer<V>> = Input>,
 {
     type Base = V;
@@ -1022,18 +1133,17 @@ where
             },
             staged_primals,
         )?;
-        let traced_program = Program::from_graph(
-            traced_program
-                .graph()
-                .clone_with_structures::<Vec<V>, Vec<V>>(vec![Placeholder; traced_primals.len()], vec![Placeholder; 1]),
-        )
+        let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+            flat_leaf_parameter_structure(traced_primals.len()),
+            flat_leaf_parameter_structure(1),
+        ))
         .simplify()?;
         let (outputs, pushforward) = try_linearize_traced_program(&traced_program, traced_primals)?;
         if outputs.len() != 1 {
             return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
         }
         let traced_output = outputs[0].clone();
-        let pullback = pushforward.transpose()?;
+        let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
         let traced_gradient = pullback.call(vec![traced_output.one_like()])?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
     }
@@ -1047,10 +1157,12 @@ where
 /// traced once to a [`Program`], and a [`CompiledFunction`] that produces `(V, Input::To<V>)` per lane
 /// is compiled via [`try_jit`]. Values and gradients are collected per lane and stacked separately.
 impl<
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
 > ValueAndGradInvocationLeaf<Input> for Batch<V>
 where
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<V>>,
     Input::To<V>: Clone
         + Parameterized<
@@ -1060,6 +1172,8 @@ where
             To<JitTracer<V>> = Input::To<JitTracer<V>>,
         >,
     <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>> + ParameterizedFamily<Batch<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
 {
     type Base = V;
     type Return = (Batch<V>, Input);
@@ -1084,11 +1198,10 @@ where
             try_trace_program(|staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
-        let flat_program = Program::from_graph(
-            traced_program
-                .graph()
-                .clone_with_structures::<Vec<V>, Vec<V>>(vec![Placeholder; parameter_count], vec![Placeholder; 1]),
-        )
+        let flat_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+            flat_leaf_parameter_structure(parameter_count),
+            flat_leaf_parameter_structure(1),
+        ))
         .simplify()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
@@ -1098,7 +1211,7 @@ where
                 if outputs.len() != 1 {
                     return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
                 }
-                let pullback = pushforward.transpose()?;
+                let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
                 let gradient = pullback.call(vec![outputs[0].one_like()])?;
                 let mut result = Vec::with_capacity(1 + gradient.len());
                 result.push(outputs[0].clone());
@@ -1373,6 +1486,7 @@ fn try_jacfwd<F, Input, Output, V>(
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
     V: CoordinateValue + FloatExt + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -1411,6 +1525,7 @@ pub fn jacfwd<F, Input, Output, V>(
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
     V: CoordinateValue + FloatExt + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -1425,7 +1540,8 @@ fn try_jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + FloatExt + MatrixOps + ReshapeOps,
+    V: CoordinateValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -1457,7 +1573,8 @@ pub fn jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + FloatExt + MatrixOps + ReshapeOps,
+    V: CoordinateValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -1478,6 +1595,7 @@ pub fn hessian<F, Input, V>(
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
 where
     V: CoordinateValue + FloatExt + MatrixOps + ReshapeOps,
+    V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     F: FnOnce(Input::To<JitTracer<V>>) -> Input::To<JitTracer<V>>,
@@ -1502,12 +1620,48 @@ pub fn compile_grad<F, Input, V>(
     example_primals: Input,
 ) -> Result<CompiledFunction<V, Input, Input>, TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
     F: Fn(Input::To<JitTracer<V>>) -> JitTracer<V>,
 {
-    let (_, compiled) = try_jit(|primals| Ok(grad(|x| function(x), primals)?), example_primals)?;
+    let input_structure = example_primals.parameter_structure();
+    let (_, compiled) = try_jit(
+        |primals: Input::To<JitTracer<V>>| {
+            let traced_primals = primals.into_parameters().collect::<Vec<_>>();
+            let staged_primals = Input::To::<V>::from_parameters(
+                input_structure.clone(),
+                traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+            )?;
+            let (_, traced_program): (V, Program<V, Input::To<V>, V>) = try_trace_program(
+                |staged_input| {
+                    let adapted_input = Input::To::<JitTracer<V>>::from_parameters(
+                        input_structure.clone(),
+                        staged_input.into_parameters().collect::<Vec<_>>(),
+                    )?;
+                    Ok(function(adapted_input))
+                },
+                staged_primals,
+            )?;
+            let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+                flat_leaf_parameter_structure(traced_primals.len()),
+                flat_leaf_parameter_structure(1),
+            ))
+            .simplify()?;
+            let (outputs, pushforward) = try_linearize_traced_program(&traced_program, traced_primals)?;
+            if outputs.len() != 1 {
+                return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+            }
+            let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+            let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
+            Ok(Input::To::<JitTracer<V>>::from_parameters(input_structure.clone(), traced_gradient)?)
+        },
+        example_primals,
+    )?;
     Ok(compiled)
 }
 
@@ -1555,9 +1709,19 @@ pub fn compile_grad_with_policy<F, Input, V>(
     policy: RematerializationPolicy,
 ) -> Result<CompiledFunction<V, Input, Input>, TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue
+        + Parameterized<V, ParameterStructure = Placeholder>
+        + FloatExt
+        + Zero
+        + One
+        + MatrixOps
+        + ReshapeOps
+        + Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
     F: Fn(Input::To<JitTracer<V>>) -> JitTracer<V>,
 {
     match policy {
@@ -1587,9 +1751,13 @@ fn compile_grad_segmented<F, Input, V>(
     segment_size: Option<usize>,
 ) -> Result<CompiledFunction<V, Input, Input>, TraceError>
 where
-    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
+    V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
+    V: Parameterized<V, To<JitTracer<V>> = JitTracer<V>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<JitTracer<V>>,
+    Vec<V>: Parameterized<V, To<JitTracer<V>> = Vec<JitTracer<V>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<V>>,
     F: Fn(Input::To<JitTracer<V>>) -> JitTracer<V>,
 {
     let input_structure = example_primals.parameter_structure();
@@ -1613,8 +1781,8 @@ where
                 staged_primals,
             )?;
             let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-                vec![Placeholder; traced_primals.len()],
-                vec![Placeholder; 1],
+                flat_leaf_parameter_structure(traced_primals.len()),
+                flat_leaf_parameter_structure(1),
             ))
             .simplify()?;
 
@@ -1632,7 +1800,7 @@ where
             if outputs.len() != 1 {
                 return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
             }
-            let pullback = pushforward.transpose()?;
+            let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
             let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
             Ok(Input::To::<JitTracer<V>>::from_parameters(input_structure.clone(), traced_gradient)?)
         },
@@ -1652,10 +1820,13 @@ where
 /// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
 /// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOp`]
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
-fn segment_program<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
+fn segment_program<V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
     program: &Program<V, Vec<V>, Vec<V>>,
     segment_size: usize,
-) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
+) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError>
+where
+    V::ParameterStructure: Clone + PartialEq,
+{
     let graph = program.graph();
     let representative_values = graph.representative_atom_values()?;
     let representative_inputs = graph.representative_input_values()?;
@@ -1816,16 +1987,19 @@ fn segment_program<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOp
 
     let outer_graph = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
-        vec![Placeholder; input_atoms.len()],
-        vec![Placeholder; graph.outputs().len()],
+        flat_leaf_parameter_structure(input_atoms.len()),
+        flat_leaf_parameter_structure(graph.outputs().len()),
     );
     Ok(Program::from_graph(outer_graph))
 }
 
 /// Wraps an entire program in a single [`RematerializeOp`] boundary.
-fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
+fn wrap_program_in_rematerialize<V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
     program: &Program<V, Vec<V>, Vec<V>>,
-) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
+) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError>
+where
+    V::ParameterStructure: Clone + PartialEq,
+{
     let graph = program.graph();
     let representative_inputs = graph.representative_input_values()?;
     let input_types: Vec<_> = graph
@@ -1875,8 +2049,8 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + Zero + One + MatrixO
 
     let outer_graph = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
-        vec![Placeholder; outer_inputs.len()],
-        vec![Placeholder; graph.outputs().len()],
+        flat_leaf_parameter_structure(outer_inputs.len()),
+        flat_leaf_parameter_structure(graph.outputs().len()),
     );
     Ok(Program::from_graph(outer_graph))
 }
@@ -1886,13 +2060,16 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + Zero + One + MatrixO
 /// The sub-program takes the boundary input atoms as its inputs and produces the boundary output atoms as its
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
 /// and equations within the sub-program.
-fn build_segment_sub_program<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
+fn build_segment_sub_program<V: TraceValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + Zero + One + MatrixOps + ReshapeOps>(
     graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
     representative_values: &[V],
     segment_equations: &[Equation<ProgramOpRef<V>>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
-) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
+) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError>
+where
+    V::ParameterStructure: Clone + PartialEq,
+{
     let mut sub_builder: ProgramBuilder<V> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.
@@ -1957,8 +2134,8 @@ fn build_segment_sub_program<V: TraceValue + FloatExt + Zero + One + MatrixOps +
 
     let sub_graph = sub_builder.build::<Vec<V>, Vec<V>>(
         sub_outputs,
-        vec![Placeholder; boundary_input_atoms.len()],
-        vec![Placeholder; boundary_output_atoms.len()],
+        flat_leaf_parameter_structure(boundary_input_atoms.len()),
+        flat_leaf_parameter_structure(boundary_output_atoms.len()),
     );
     Ok(Program::from_graph(sub_graph))
 }
