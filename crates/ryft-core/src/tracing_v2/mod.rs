@@ -31,7 +31,7 @@ mod values;
 
 pub use batch::{Batch, stack, unstack, vmap};
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub use graph::{AtomId, AtomSource, Equation, Graph, GraphBuilder};
+pub use graph::{Atom, AtomId, Equation, Graph, GraphBuilder};
 pub use jit::try_jit;
 pub use jit::{CompiledFunction, JitTracer, jit};
 pub use linear::{

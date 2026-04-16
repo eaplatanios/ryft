@@ -281,7 +281,7 @@ impl Op for ShardMapOp<ShardMapTensor> {
 
 impl InterpretableOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
-        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         Ok(self.output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>())
     }
@@ -394,7 +394,7 @@ impl Op for ShardMapOp<ShardMapTracer> {
 
 impl InterpretableOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
-        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         match &self.linear_state {
             None => apply_flat_traced_shard_map(self.body.clone(), inputs.to_vec()).map_err(trace_error_from_shard_map),
@@ -501,7 +501,15 @@ impl StableHloCustomLowering<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 }
 
 trait ReplayShardMapValue:
-    Clone + Traceable<ArrayType> + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> + FloatExt + MatrixOps + ZeroLike + OneLike
+    Clone
+    + Traceable<ArrayType>
+    + Add<Output = Self>
+    + Mul<Output = Self>
+    + Neg<Output = Self>
+    + FloatExt
+    + MatrixOps
+    + ZeroLike
+    + OneLike
 {
     fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TraceError>;
 
@@ -635,14 +643,12 @@ fn project_flat_shard_map_graph(
         }
 
         let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom = match atom.source {
-            ryft_core::tracing_v2::AtomSource::Input => *kept_input_atoms.get(&atom_id).ok_or(
+        let mapped_atom = match atom {
+            ryft_core::tracing_v2::Atom::Input { .. } => *kept_input_atoms.get(&atom_id).ok_or(
                 TraceError::InternalInvariantViolation("projected flat shard-map graph referenced a removed input"),
             )?,
-            ryft_core::tracing_v2::AtomSource::Constant => builder.add_constant(atom.constant_value().cloned().ok_or(
-                TraceError::InternalInvariantViolation("staged graph constant atom did not retain a literal value"),
-            )?),
-            ryft_core::tracing_v2::AtomSource::Derived => {
+            ryft_core::tracing_v2::Atom::Constant { value } => builder.add_constant(value.clone()),
+            ryft_core::tracing_v2::Atom::Derived { .. } => {
                 let equation_index = equation_by_output[atom_id]
                     .ok_or(TraceError::InternalInvariantViolation("derived atom had no owning equation"))?;
                 let equation = &graph.equations()[equation_index];
@@ -665,9 +671,7 @@ fn project_flat_shard_map_graph(
                 let output_abstracts = equation
                     .outputs
                     .iter()
-                    .map(|output| {
-                        graph.atom(*output).expect("equation output atom should exist").abstract_value.clone()
-                    })
+                    .map(|output| graph.atom(*output).expect("equation output atom should exist").tpe().into_owned())
                     .collect::<Vec<_>>();
                 let remapped_outputs =
                     builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
@@ -689,9 +693,7 @@ fn project_flat_shard_map_graph(
     let mut builder = ProgramBuilder::<ShardMapTensor>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
-        let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom =
-            builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone());
+        let mapped_atom = builder.add_input_abstract(representative_values[atom_id].clone());
         input_mapping.insert(atom_id, mapped_atom);
     }
 
@@ -743,16 +745,14 @@ fn build_factorized_apply_graph(
         }
 
         let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom = match atom.source {
-            ryft_core::tracing_v2::AtomSource::Input => {
+        let mapped_atom = match atom {
+            ryft_core::tracing_v2::Atom::Input { .. } => {
                 return Err(TraceError::InternalInvariantViolation(
                     "factorized apply graph referenced a primal input that was not materialized as a residual",
                 ));
             }
-            ryft_core::tracing_v2::AtomSource::Constant => builder.add_constant(atom.constant_value().cloned().ok_or(
-                TraceError::InternalInvariantViolation("staged graph constant atom did not retain a literal value"),
-            )?),
-            ryft_core::tracing_v2::AtomSource::Derived => {
+            ryft_core::tracing_v2::Atom::Constant { value } => builder.add_constant(value.clone()),
+            ryft_core::tracing_v2::Atom::Derived { .. } => {
                 if !depends_on_cotangent[atom_id] {
                     return Err(TraceError::InternalInvariantViolation(
                         "factorized apply graph referenced a cotangent-independent atom that was not materialized as a residual",
@@ -781,9 +781,7 @@ fn build_factorized_apply_graph(
                 let output_abstracts = equation
                     .outputs
                     .iter()
-                    .map(|output| {
-                        graph.atom(*output).expect("equation output atom should exist").abstract_value.clone()
-                    })
+                    .map(|output| graph.atom(*output).expect("equation output atom should exist").tpe().into_owned())
                     .collect::<Vec<_>>();
                 let remapped_outputs =
                     builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
@@ -809,15 +807,11 @@ fn build_factorized_apply_graph(
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {
-        let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom =
-            builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone());
+        let mapped_atom = builder.add_input_abstract(representative_values[atom_id].clone());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
     for atom_id in residual_atoms.iter().copied() {
-        let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
-        let mapped_atom =
-            builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone());
+        let mapped_atom = builder.add_input_abstract(representative_values[atom_id].clone());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
 
@@ -885,7 +879,7 @@ fn factorize_transpose_shard_map_body(
 
     let residual_out_shardings = residual_atoms
         .iter()
-        .map(|atom_id| graph.atom(*atom_id).expect("residual atoms should exist").abstract_value.sharding.clone())
+        .map(|atom_id| graph.atom(*atom_id).expect("residual atoms should exist").tpe().sharding.clone())
         .collect::<Option<Vec<_>>>();
     let Some(residual_out_shardings) = residual_out_shardings else {
         return Ok(None);
@@ -900,7 +894,7 @@ fn factorize_transpose_shard_map_body(
     .simplify()?;
     let residual_local_output_types = residual_atoms
         .iter()
-        .map(|atom_id| graph.atom(*atom_id).expect("residual atoms should exist").abstract_value.clone())
+        .map(|atom_id| graph.atom(*atom_id).expect("residual atoms should exist").tpe().into_owned())
         .collect::<Vec<_>>();
     let residual_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
         simplified_body.shard_map.mesh().clone(),
@@ -1054,7 +1048,13 @@ fn replay_traced_xla_graph<
     GraphOutput: ryft_core::parameters::Parameterized<ShardMapTensor>,
     V: ReplayShardMapValue,
 >(
-    graph: &ryft_core::tracing_v2::Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &ryft_core::tracing_v2::Graph<
+        PrimitiveOp<ArrayType, ShardMapTensor>,
+        ArrayType,
+        ShardMapTensor,
+        GraphInput,
+        GraphOutput,
+    >,
     inputs: Vec<V>,
 ) -> Result<Vec<V>, ShardMapTraceError> {
     let mut values = vec![None; graph.atom_count()];
@@ -1071,21 +1071,16 @@ fn replay_traced_xla_graph<
 
     for atom_id in 0..graph.atom_count() {
         let atom = graph.atom(atom_id).expect("atom IDs should be dense");
-        match &atom.source {
-            ryft_core::tracing_v2::AtomSource::Input => {}
-            ryft_core::tracing_v2::AtomSource::Constant => {
+        match atom {
+            ryft_core::tracing_v2::Atom::Input { .. } => {}
+            ryft_core::tracing_v2::Atom::Constant { value } => {
                 let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
                 if seed_inputs.is_empty() {
                     return Err(ShardMapTraceError::TraceError(TraceError::EmptyParameterizedValue));
                 }
-                values[atom_id] = Some(V::lift_constant(
-                    atom.constant_value().ok_or(TraceError::InternalInvariantViolation(
-                        "staged graph constant atom did not retain a literal value",
-                    ))?,
-                    seed_inputs.as_slice(),
-                )?);
+                values[atom_id] = Some(V::lift_constant(value, seed_inputs.as_slice())?);
             }
-            ryft_core::tracing_v2::AtomSource::Derived => {
+            ryft_core::tracing_v2::Atom::Derived { .. } => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
@@ -1241,7 +1236,12 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                 let local_tangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pushforward_program): (
                     Vec<ShardMapTracer>,
-                    ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+                    ryft_core::tracing_v2::LinearProgram<
+                        ArrayType,
+                        ShardMapTracer,
+                        Vec<ShardMapTracer>,
+                        Vec<ShardMapTracer>,
+                    >,
                 ) = try_linearize_traced_shard_map_body(
                     {
                         let body = body.clone();
@@ -1268,7 +1268,12 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                 let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pullback_program): (
                     Vec<ShardMapTracer>,
-                    ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+                    ryft_core::tracing_v2::LinearProgram<
+                        ArrayType,
+                        ShardMapTracer,
+                        Vec<ShardMapTracer>,
+                        Vec<ShardMapTracer>,
+                    >,
                 ) = try_transpose_traced_shard_map_body(
                     {
                         let body = body.clone();
@@ -1415,7 +1420,7 @@ where
 {
     Ok(Input::To::<ArrayType>::from_parameters(
         traced_inputs.parameter_structure(),
-        traced_inputs.parameters().map(Typed::tpe).collect::<Vec<_>>(),
+        traced_inputs.parameters().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
     )?)
 }
 
@@ -1590,7 +1595,7 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
         )?;
         let global_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure,
-            global_input_primals.parameters().map(Typed::tpe).collect::<Vec<_>>(),
+            global_input_primals.parameters().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
         let global_in_specs = reparameterize_shardings::<
             Input::To<Sharding>,

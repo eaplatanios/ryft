@@ -5,6 +5,7 @@
 //! to test in pure Rust.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     fmt::Display,
     marker::PhantomData,
@@ -161,7 +162,7 @@ impl<T: Type + Clone + Display, V: Traceable<T>> JitTracer<T, V> {
 
 impl<V: Traceable<ArrayType>> Typed<ArrayType> for JitTracer<ArrayType, V> {
     #[inline]
-    fn tpe(&self) -> ArrayType {
+    fn tpe(&self) -> Cow<'_, ArrayType> {
         <V as Typed<ArrayType>>::tpe(&self.value)
     }
 }
@@ -474,8 +475,8 @@ mod tests {
         }
 
         impl Typed<ArrayType> for TestAbstractValue {
-            fn tpe(&self) -> ArrayType {
-                self.r#type.clone()
+            fn tpe(&self) -> Cow<'_, ArrayType> {
+                Cow::Borrowed(&self.r#type)
             }
         }
 
@@ -556,11 +557,18 @@ mod tests {
         let result: Result<
             (
                 TestAbstractValue,
-                CompiledFunction<ArrayType, TestAbstractValue, (TestAbstractValue, TestAbstractValue), TestAbstractValue>,
+                CompiledFunction<
+                    ArrayType,
+                    TestAbstractValue,
+                    (TestAbstractValue, TestAbstractValue),
+                    TestAbstractValue,
+                >,
             ),
             TraceError,
         > = jit(
-            |inputs: (JitTracer<ArrayType, TestAbstractValue>, JitTracer<ArrayType, TestAbstractValue>)| inputs.0 + inputs.1,
+            |inputs: (JitTracer<ArrayType, TestAbstractValue>, JitTracer<ArrayType, TestAbstractValue>)| {
+                inputs.0 + inputs.1
+            },
             (
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F32) },
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F64) },

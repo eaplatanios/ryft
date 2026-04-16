@@ -47,7 +47,7 @@ pub trait ZeroLike {
 /// conversion infallible — the trait should only be implemented when every metadata value maps to a valid zero of type
 /// `P`. For value types that cannot represent arbitrary shapes (e.g., `f32` can only represent scalar metadata), use
 /// [`ZeroLike`] instead, which produces a zero from an existing exemplar value.
-pub trait Zero<T: Parameter + Type, P: Parameter + Typed<T>>: Parameterized<T> {
+pub trait Zero<T: Parameter + Type + Clone, P: Parameter + Typed<T>>: Parameterized<T> {
     /// Constructs one zero value from the abstract metadata in `self`.
     fn zero(&self) -> Self::To<P>
     where
@@ -67,7 +67,7 @@ pub trait OneLike {
 /// This mirrors [`Zero`] for the multiplicative identity. `Self` is a type parameterized by some [`Type`] `T`, and
 /// [`One::one`] produces the corresponding concrete value by reparameterizing from `T` to `P`. Like [`Zero`], this
 /// trait should only be implemented when every metadata value maps to a valid one of type `P`.
-pub trait One<T: Parameter + Type, P: Parameter + Typed<T>>: Parameterized<T> {
+pub trait One<T: Parameter + Type + Clone, P: Parameter + Typed<T>>: Parameterized<T> {
     /// Constructs one one-valued value from the abstract metadata in `self`.
     fn one(&self) -> Self::To<P>
     where
@@ -88,8 +88,8 @@ macro_rules! impl_scalar_self_typed_zero_one {
 
         impl Typed<$ty> for $ty {
             #[inline]
-            fn tpe(&self) -> $ty {
-                *self
+            fn tpe(&self) -> std::borrow::Cow<'_, $ty> {
+                std::borrow::Cow::Owned(*self)
             }
         }
 
@@ -136,7 +136,7 @@ impl_scalar_self_typed_zero_one!(f64, 0.0, 1.0);
 /// 2. an impl for `JitTracer<V>` — symbolic dispatch that stages the transform into the enclosing traced graph.
 ///
 /// Because `JitTracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
-pub trait Value<T: Type>: Traceable<T> {}
+pub trait Value<T: Type + Clone>: Traceable<T> {}
 
 /// Base trait for any leaf type that can participate in traced computations.
 ///
@@ -154,7 +154,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// valid while opting them out of constant-identity simplification.
 ///
 /// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
-pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
+pub trait Traceable<T: Type + Clone>: Clone + Parameter + Typed<T> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
     ///
     /// The graph builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)
@@ -291,8 +291,8 @@ mod tests {
 
     #[test]
     fn test_scalar_leaf_traits_report_expected_values() {
-        assert_eq!(<f32 as Typed<ArrayType>>::tpe(&1.25f32), ArrayType::scalar(DataType::F32));
-        assert_eq!(<f64 as Typed<ArrayType>>::tpe(&2.5f64), ArrayType::scalar(DataType::F64));
+        assert_eq!(<f32 as Typed<ArrayType>>::tpe(&1.25f32).into_owned(), ArrayType::scalar(DataType::F32));
+        assert_eq!(<f64 as Typed<ArrayType>>::tpe(&2.5f64).into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(ZeroLike::zero_like(&3.0f32), 0.0);
         assert_eq!(ZeroLike::zero_like(&7.0f64), 0.0);
         assert_eq!(OneLike::one_like(&3.0f32), 1.0);

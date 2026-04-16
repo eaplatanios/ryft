@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    AtomSource, CustomPrimitive, Graph, LinearPrimitiveOp, Op, PrimitiveOp, ReshapeOps, Traceable,
+    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, Op, PrimitiveOp, ReshapeOps, Traceable,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, LinearRematerializeOp, LinearVMapOp,
         MatMulOp, MatrixTransposeOp, MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -400,7 +400,7 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for ScaleOp<ArrayType, V> {
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let factor_type = factor.tpe();
-        let factor_broadcast = if factor_type != output_types[0] {
+        let factor_broadcast = if *factor_type != output_types[0] {
             match mode {
                 PlainMlirLoweringMode::Packed { lane_count } => {
                     lowerer.lower_packed_literal_value(factor, &packed_array_type(&factor_type, lane_count))?
@@ -750,7 +750,13 @@ impl<
                 <LinearVMapOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
             }
             LinearPrimitiveOp::Rematerialize(remat) => {
-                <LinearRematerializeOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(remat, input_values, output_types, mode, lowerer)
+                <LinearRematerializeOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(
+                    remat,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
             LinearPrimitiveOp::Custom(_) => {
                 Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
@@ -1156,7 +1162,7 @@ where
         .iter()
         .map(|atom_id| {
             let input_atom = graph.atom(*atom_id).expect("graph input atoms should exist");
-            lower_tensor_type(&input_atom.abstract_value, &context, location)
+            lower_tensor_type(&input_atom.tpe(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = graph
@@ -1164,7 +1170,7 @@ where
         .iter()
         .map(|atom_id| {
             let output_atom = graph.atom(*atom_id).expect("graph output atoms should exist");
-            lower_tensor_type(&output_atom.abstract_value, &context, location)
+            lower_tensor_type(&output_atom.tpe(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1388,7 +1394,7 @@ where
     L: Location<'c, 't> + Copy,
 {
     let lowered_value = lower_literal_value(value, block, context, location)?;
-    if value.tpe() == *packed_type {
+    if *value.tpe() == *packed_type {
         return Ok(lowered_value);
     }
 
@@ -1644,14 +1650,10 @@ where
         }
 
         let atom = graph.atom(atom_id).ok_or(LoweringError::MissingAtomValue { atom_id })?;
-        match &atom.source {
-            AtomSource::Constant => lower_packed_literal_value(
-                atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
-                &packed_array_type(&atom.abstract_value, lane_count),
-                block,
-                context,
-                location,
-            ),
+        match atom {
+            Atom::Constant { value } => {
+                lower_packed_literal_value(value, &packed_array_type(&atom.tpe(), lane_count), block, context, location)
+            }
             _ => Err(LoweringError::MissingAtomValue { atom_id }),
         }
     }
@@ -1670,10 +1672,10 @@ where
 
     for atom_id in 0..graph.atom_count() {
         let atom = graph.atom(atom_id).expect("atom IDs should be dense");
-        match &atom.source {
-            AtomSource::Input => {}
-            AtomSource::Constant => {}
-            AtomSource::Derived => {
+        match atom {
+            Atom::Input { .. } => {}
+            Atom::Constant { .. } => {}
+            Atom::Derived { .. } => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
@@ -1831,17 +1833,12 @@ where
 
     for atom_id in 0..graph.atom_count() {
         let atom = graph.atom(atom_id).expect("atom IDs should be dense");
-        match &atom.source {
-            AtomSource::Input => {}
-            AtomSource::Constant => {
-                atom_values[atom_id] = Some(lower_literal_value(
-                    atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
-                    block,
-                    context,
-                    location,
-                )?);
+        match atom {
+            Atom::Input { .. } => {}
+            Atom::Constant { value } => {
+                atom_values[atom_id] = Some(lower_literal_value(value, block, context, location)?);
             }
-            AtomSource::Derived => {
+            Atom::Derived { .. } => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
@@ -1854,7 +1851,7 @@ where
                 let output_types = equation
                     .outputs
                     .iter()
-                    .map(|output| graph.atom(*output).expect("equation output should exist").abstract_value.clone())
+                    .map(|output| graph.atom(*output).expect("equation output should exist").tpe().into_owned())
                     .collect::<Vec<_>>();
                 let mut lowerer = PlainMlirLowerer { block: *block, context, location };
                 let lowered_outputs = equation.op.lower_to_mlir(
@@ -1911,17 +1908,12 @@ where
 
     for atom_id in 0..graph.atom_count() {
         let atom = graph.atom(atom_id).expect("atom IDs should be dense");
-        match &atom.source {
-            AtomSource::Input => {}
-            AtomSource::Constant => {
-                atom_values[atom_id] = Some(lower_literal_value(
-                    atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
-                    block,
-                    context,
-                    location,
-                )?);
+        match atom {
+            Atom::Input { .. } => {}
+            Atom::Constant { value } => {
+                atom_values[atom_id] = Some(lower_literal_value(value, block, context, location)?);
             }
-            AtomSource::Derived => {
+            Atom::Derived { .. } => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
@@ -1972,18 +1964,12 @@ where
 
     for atom_id in 0..graph.atom_count() {
         let atom = graph.atom(atom_id).expect("atom IDs should be dense");
-        match &atom.source {
-            AtomSource::Input => {}
-            AtomSource::Constant => {
-                atom_values[atom_id] = Some(lower_constant(
-                    atom_id,
-                    atom.constant_value().ok_or(LoweringError::MissingAtomValue { atom_id })?,
-                    block,
-                    context,
-                    location,
-                )?);
+        match atom {
+            Atom::Input { .. } => {}
+            Atom::Constant { value } => {
+                atom_values[atom_id] = Some(lower_constant(atom_id, value, block, context, location)?);
             }
-            AtomSource::Derived => {
+            Atom::Derived { .. } => {
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
@@ -2258,7 +2244,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let factor_type = factor.tpe();
-            let factor_broadcast = if factor_type != output_types[0] {
+            let factor_broadcast = if *factor_type != output_types[0] {
                 let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
                     factor_value,
                     output_tensor_type,
@@ -2351,7 +2337,7 @@ where
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| graph.atom(*output).expect("equation output should exist").abstract_value.clone())
+        .map(|output| graph.atom(*output).expect("equation output should exist").tpe().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
     equation
@@ -2382,9 +2368,7 @@ where
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| {
-            packed_array_type(&graph.atom(*output).expect("equation output should exist").abstract_value, lane_count)
-        })
+        .map(|output| packed_array_type(&graph.atom(*output).expect("equation output should exist").tpe(), lane_count))
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
     equation.op.lower_to_mlir(
@@ -2412,7 +2396,7 @@ where
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| graph.atom(*output).expect("equation output should exist").abstract_value.clone())
+        .map(|output| graph.atom(*output).expect("equation output should exist").tpe().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
     dispatch_lower_shard_map_mlir(&equation.op, input_values, output_types.as_slice(), &mut lowerer)
@@ -2890,7 +2874,9 @@ mod tests {
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
         let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, f64, f64>) =
             ryft_core::tracing_v2::try_jit(
-                |x: ryft_core::tracing_v2::JitTracer<ArrayType, f64>| Ok(ryft_core::tracing_v2::grad(scalar_quartic_plus_sin, x)?),
+                |x: ryft_core::tracing_v2::JitTracer<ArrayType, f64>| {
+                    Ok(ryft_core::tracing_v2::grad(scalar_quartic_plus_sin, x)?)
+                },
                 2.0f64,
             )
             .unwrap();
@@ -2928,14 +2914,17 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT — symbolic, like JAX's jit(grad(f)).
         // Uses the GradInvocationLeaf<JitTracer<V>> dispatch that traces through vjp+pullback.
-        let (_, compiled): ((f64, f64), ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), (f64, f64)>) =
-            ryft_core::tracing_v2::try_jit(
-                |inputs: (ryft_core::tracing_v2::JitTracer<ArrayType, f64>, ryft_core::tracing_v2::JitTracer<ArrayType, f64>)| {
-                    Ok(ryft_core::tracing_v2::grad(scalar_bilinear_sin, inputs)?)
-                },
-                (2.0f64, 3.0f64),
-            )
-            .unwrap();
+        let (_, compiled): (
+            (f64, f64),
+            ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), (f64, f64)>,
+        ) = ryft_core::tracing_v2::try_jit(
+            |inputs: (
+                ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
+                ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
+            )| { Ok(ryft_core::tracing_v2::grad(scalar_bilinear_sin, inputs)?) },
+            (2.0f64, 3.0f64),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_graph(compiled.program().graph(), "main").unwrap();
         println!("=== ryft jit(grad(bilinear_sin)) StableHLO ===\n{stablehlo}");

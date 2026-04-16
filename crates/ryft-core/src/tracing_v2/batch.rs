@@ -238,7 +238,11 @@ where
     Output::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<Self> + ParameterizedFamily<V>,
     V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Vec<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>, ParameterStructure = Vec<Placeholder>>,
+    Vec<V>: Parameterized<
+            V,
+            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
+            ParameterStructure = Vec<Placeholder>,
+        >,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
@@ -246,7 +250,9 @@ where
         F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>,
     {
         type LaneOutput<Output, Value> =
-            <<Output as Parameterized<JitTracer<ArrayType, Value>>>::To<Value> as Parameterized<Value>>::To<JitTracer<ArrayType, Value>>;
+            <<Output as Parameterized<JitTracer<ArrayType, Value>>>::To<Value> as Parameterized<Value>>::To<
+                JitTracer<ArrayType, Value>,
+            >;
 
         let mut inputs = inputs.into_iter();
         let first_input = inputs.next().ok_or(TraceError::EmptyBatch)?;
@@ -303,10 +309,10 @@ where
                 .input_atoms()
                 .iter()
                 .map(|input| {
-                    body_program.graph().atom(*input).expect("body input atoms should exist").abstract_value.clone()
+                    body_program.graph().atom(*input).expect("body input atoms should exist").tpe().into_owned()
                 })
                 .collect::<Vec<_>>(),
-            exemplar_outputs.parameters().map(Typed::tpe).collect::<Vec<_>>(),
+            exemplar_outputs.parameters().map(|x| x.tpe().into_owned()).collect::<Vec<_>>(),
             CompiledFunction::from_graph(
                 body_program
                     .graph()
@@ -438,8 +444,10 @@ mod tests {
     fn traced_vmap_stages_one_higher_order_op() {
         let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::try_jit(
             |x: JitTracer<ArrayType, f64>| {
-                let outputs: Vec<JitTracer<ArrayType, f64>> =
-                    vmap(|batch: Batch<JitTracer<ArrayType, f64>>| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
+                let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
+                    |batch: Batch<JitTracer<ArrayType, f64>>| batch.clone() + batch.one_like(),
+                    vec![x.clone(), x],
+                )?;
                 Ok(outputs[0].clone() + outputs[1].clone())
             },
             2.0f64,
@@ -508,8 +516,12 @@ mod tests {
         // jvp at x with tangent t gives (f(x), (2x + cos(x)) * t)
         let results: Vec<(f64, f64)> = vmap(
             |(primals, tangents): (Batch<f64>, Batch<f64>)| {
-                crate::tracing_v2::jvp(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), primals, tangents)
-                    .expect("batched jvp should succeed")
+                crate::tracing_v2::jvp(
+                    |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(),
+                    primals,
+                    tangents,
+                )
+                .expect("batched jvp should succeed")
             },
             vec![(1.0f64, 1.0f64), (2.0, 0.5), (3.0, 2.0)],
         )

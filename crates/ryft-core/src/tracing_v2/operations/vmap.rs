@@ -22,11 +22,7 @@ pub struct FlatTracedVMap<T: Type + Clone, V: Typed<T> + Clone + Parameter, O = 
     compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
 }
 
-impl<
-    T: Type + Clone,
-    V: Traceable<T>,
-    O: Clone,
-> Clone for FlatTracedVMap<T, V, O>
+impl<T: Type + Clone, V: Traceable<T>, O: Clone> Clone for FlatTracedVMap<T, V, O>
 where
     <Vec<V> as Parameterized<V>>::ParameterStructure: Clone,
 {
@@ -175,7 +171,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
-        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }
@@ -344,7 +340,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
-        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }
@@ -355,7 +351,10 @@ impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + Resha
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         if output_cotangents.len() != self.body.total_output_count() {
             return Err(TraceError::InvalidInputCount {
                 expected: self.body.total_output_count(),

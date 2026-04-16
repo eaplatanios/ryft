@@ -49,8 +49,8 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatMulOp {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>>
-    DifferentiableOp<ArrayType, V, T> for MatMulOp
+impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<ArrayType, V, T>
+    for MatMulOp
 {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;

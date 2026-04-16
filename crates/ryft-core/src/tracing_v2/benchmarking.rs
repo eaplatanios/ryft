@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::parameters::Parameterized;
 use crate::types::ArrayType;
 
-use super::{AtomSource, Graph, Op, TraceError, Traceable};
+use super::{Atom, Graph, Op, TraceError, Traceable};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -237,7 +237,7 @@ where
 
     for (atom_id, atom) in (0..graph.atom_count()).filter_map(|atom_id| graph.atom(atom_id).map(|atom| (atom_id, atom)))
     {
-        if matches!(atom.source, AtomSource::Input | AtomSource::Constant) {
+        if matches!(atom, Atom::Input { .. } | Atom::Constant { .. }) {
             depth_by_atom[atom_id] = 0;
         }
     }
@@ -264,7 +264,7 @@ where
         equation_count: graph.equations().len(),
         constant_count: (0..graph.atom_count())
             .filter_map(|atom_id| graph.atom(atom_id))
-            .filter(|atom| matches!(atom.source, AtomSource::Constant))
+            .filter(|atom| matches!(atom, Atom::Constant { .. }))
             .count(),
         op_histogram,
         nested_region_count,

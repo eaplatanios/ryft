@@ -36,11 +36,7 @@ pub struct FlatTracedRematerialize<T: Type + Clone, V: Typed<T> + Clone + Parame
     compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
 }
 
-impl<
-    T: Type + Clone,
-    V: Traceable<T>,
-    O: Clone,
-> Clone for FlatTracedRematerialize<T, V, O>
+impl<T: Type + Clone, V: Traceable<T>, O: Clone> Clone for FlatTracedRematerialize<T, V, O>
 where
     <Vec<V> as Parameterized<V>>::ParameterStructure: Clone,
 {
@@ -147,7 +143,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
-        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.compiled.call(inputs.to_vec())
     }
@@ -164,7 +160,8 @@ impl<
         + std::ops::Add<Output = V>
         + std::ops::Mul<Output = V>
         + std::ops::Neg<Output = V>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>> for RematerializeOp<ArrayType, V>
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>
+    for RematerializeOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -314,7 +311,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
-        let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.compiled.call(inputs.to_vec())
     }
@@ -325,7 +322,10 @@ impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + Resha
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         let transpose = self.transpose_op();
         Ok(LinearTerm::apply_staged_op(
             output_cotangents,
@@ -464,9 +464,9 @@ where
             .graph()
             .input_atoms()
             .iter()
-            .map(|id| body_program.graph().atom(*id).expect("body input atom should exist").abstract_value.clone())
+            .map(|id| body_program.graph().atom(*id).expect("body input atom should exist").tpe().into_owned())
             .collect::<Vec<_>>();
-        let output_types = exemplar_outputs.parameters().map(Typed::tpe).collect::<Vec<_>>();
+        let output_types = exemplar_outputs.parameters().map(|x| x.tpe().into_owned()).collect::<Vec<_>>();
         let body = FlatTracedRematerialize::from_parts(
             input_types,
             output_types,
@@ -540,8 +540,11 @@ mod tests {
     #[test]
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the graph.
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-            jit(|x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(), 2.0f64).unwrap();
+        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
+            2.0f64,
+        )
+        .unwrap();
 
         approx_eq(output, 2.0f64.sin());
         let ir = compiled.to_string();
@@ -551,8 +554,11 @@ mod tests {
     #[test]
     fn test_rematerialize_jit_graph_rendering() {
         // Check the exact rendering of the jit-traced graph containing a rematerialize op.
-        let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-            jit(|x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(), 2.0f64).unwrap();
+        let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
+            2.0f64,
+        )
+        .unwrap();
 
         assert_eq!(
             compiled.to_string(),
@@ -568,8 +574,11 @@ mod tests {
     #[test]
     fn test_rematerialize_grad_computes_correct_gradient() {
         // grad of rematerialize(sin, x) should be cos(x).
-        let gradient: f64 =
-            grad(|x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(), 2.0f64).unwrap();
+        let gradient: f64 = grad(
+            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
+            2.0f64,
+        )
+        .unwrap();
 
         approx_eq(gradient, 2.0f64.cos());
     }
@@ -577,8 +586,11 @@ mod tests {
     #[test]
     fn test_rematerialize_value_and_grad_returns_both() {
         // value_and_grad of rematerialize(sin, x) should give (sin(x), cos(x)).
-        let (value, gradient): (f64, f64) =
-            value_and_grad(|x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(), 2.0f64).unwrap();
+        let (value, gradient): (f64, f64) = value_and_grad(
+            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
+            2.0f64,
+        )
+        .unwrap();
 
         approx_eq(value, 2.0f64.sin());
         approx_eq(gradient, 2.0f64.cos());
@@ -587,8 +599,11 @@ mod tests {
     #[test]
     fn test_rematerialize_compile_grad_produces_reusable_gradient() {
         // compile_grad with rematerialize should produce a symbolic gradient program.
-        let compiled =
-            compile_grad(|x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(), 2.0f64).unwrap();
+        let compiled = compile_grad(
+            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
+            2.0f64,
+        )
+        .unwrap();
 
         // Verify at the original primal point: d/dx sin(x) = cos(x).
         let grad_at_2 = compiled.call(2.0f64).unwrap();
@@ -606,7 +621,9 @@ mod tests {
     fn test_rematerialize_grad_of_quadratic_plus_sin() {
         // grad of rematerialize(x^2 + sin(x), x) should be 2x + cos(x).
         let gradient: f64 = grad(
-            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap(),
+            |x: JitTracer<ArrayType, f64>| {
+                rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
+            },
             2.0f64,
         )
         .unwrap();
@@ -618,7 +635,9 @@ mod tests {
     fn test_rematerialize_compile_grad_quadratic_plus_sin() {
         // compile_grad with rematerialize wrapping a multi-op body.
         let compiled = compile_grad(
-            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap(),
+            |x: JitTracer<ArrayType, f64>| {
+                rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
+            },
             2.0f64,
         )
         .unwrap();
@@ -641,7 +660,9 @@ mod tests {
         };
         let with: f64 = {
             let (output, _): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
-                |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap(),
+                |x: JitTracer<ArrayType, f64>| {
+                    rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
+                },
                 3.0f64,
             )
             .unwrap();

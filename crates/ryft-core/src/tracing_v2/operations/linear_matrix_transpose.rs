@@ -51,7 +51,10 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for LinearMatrixTransposeOp {
 }
 
 impl<V: MatrixValue> LinearOp<ArrayType, V> for LinearMatrixTransposeOp {
-    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(
             LinearTerm::apply_staged_op(

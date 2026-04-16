@@ -71,7 +71,9 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> fo
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for MulOp {
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T>
+    for MulOp
+{
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         let left = &inputs[0];

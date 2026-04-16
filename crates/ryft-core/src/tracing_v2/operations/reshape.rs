@@ -219,7 +219,7 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> ReshapeTangent
 
 impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
-        let input_type = self.primal.tpe();
+        let input_type = self.primal.tpe().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
         if input_type == output_type {
             return Ok(self);
@@ -231,7 +231,7 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
 
 impl<V: Traceable<ArrayType> + ReshapeOps> ReshapeOps for JitTracer<ArrayType, V> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
-        let input_type = self.tpe();
+        let input_type = self.tpe().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
         if input_type == output_type {
             return Ok(self);
@@ -288,7 +288,7 @@ mod ndarray_support {
 
     impl ReshapeOps for Array2<f32> {
         fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
-            let input_type = self.tpe();
+            let input_type = self.tpe().into_owned();
             let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
             if input_type == output_type {
                 return Ok(self);
@@ -304,7 +304,7 @@ mod ndarray_support {
 
     impl ReshapeOps for Array2<f64> {
         fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
-            let input_type = self.tpe();
+            let input_type = self.tpe().into_owned();
             let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
             if input_type == output_type {
                 return Ok(self);
@@ -379,7 +379,10 @@ impl<V: ReshapeValue> InterpretableOp<ArrayType, V> for ReshapeOp {
 }
 
 impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<ArrayType, V> for ReshapeOp {
-    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         if self.input_type() == self.output_type() {
             return Ok(vec![Some(output_cotangents[0].clone())]);
@@ -392,10 +395,13 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<Array
     }
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
-    for ReshapeOp
+impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps>
+    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for ReshapeOp
 {
-    fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
+    fn jvp(
+        &self,
+        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
@@ -647,7 +653,9 @@ mod tests {
             ndarray::Array2<f64>,
             CompiledFunction<ArrayType, ndarray::Array2<f64>, ndarray::Array2<f64>, ndarray::Array2<f64>>,
         ) = try_jit(
-            |x: JitTracer<ArrayType, ndarray::Array2<f64>>| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])),
+            |x: JitTracer<ArrayType, ndarray::Array2<f64>>| {
+                x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)]))
+            },
             input,
         )
         .unwrap();
@@ -667,12 +675,9 @@ mod tests {
     fn test_reshape_transpose_restores_the_input_shape() {
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
-        let output_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap();
         let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
         let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ndarray::Array2<f64>>::new()));
-        let output_cotangent_atom =
-            transpose_builder.borrow_mut().add_input_abstract(output_type.clone(), output_value.clone());
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input_abstract(output_value.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ReshapeOp::new(
             input_type.clone(),

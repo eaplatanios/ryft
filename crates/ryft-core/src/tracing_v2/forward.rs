@@ -4,7 +4,10 @@
 //! operations implement their JVP rules in [`crate::tracing_v2::ops`], while this module provides the user-facing
 //! wrapper type and the `jvp` transform itself.
 
-use std::ops::{Add, Mul, Neg};
+use std::{
+    borrow::Cow,
+    ops::{Add, Mul, Neg},
+};
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
@@ -78,7 +81,7 @@ impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V>> Parameter for JvpTr
 
 impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V> + 'static> Typed<ArrayType> for JvpTracer<V, T> {
     #[inline]
-    fn tpe(&self) -> ArrayType {
+    fn tpe(&self) -> Cow<'_, ArrayType> {
         <V as Typed<ArrayType>>::tpe(&self.primal)
     }
 }
@@ -231,7 +234,11 @@ where
     Output::Family: ParameterizedFamily<V>,
     V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Vec<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>, ParameterStructure = Vec<Placeholder>>,
+    Vec<V>: Parameterized<
+            V,
+            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
+            ParameterStructure = Vec<Placeholder>,
+        >,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Input>,
     Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Output>,
@@ -270,7 +277,11 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
     V::ParameterStructure: Clone + PartialEq,
-    Vec<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>, ParameterStructure = Vec<Placeholder>>,
+    Vec<V>: Parameterized<
+            V,
+            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
+            ParameterStructure = Vec<Placeholder>,
+        >,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Input::To<V>: Clone
         + Parameterized<
@@ -286,8 +297,10 @@ where
             To<Batch<V>> = Output,
             To<JitTracer<ArrayType, V>> = Output::To<JitTracer<ArrayType, V>>,
         >,
-    <Input::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
-    <Output::To<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
+    <Input::To<V> as Parameterized<V>>::Family:
+        ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
+    <Output::To<V> as Parameterized<V>>::Family:
+        ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
 {
     type Base = V;
     type FunctionInput = Input::To<JitTracer<ArrayType, V>>;

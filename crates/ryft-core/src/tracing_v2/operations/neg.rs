@@ -59,13 +59,18 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>> InterpretableOp<ArrayType, V> fo
 }
 
 impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOp<ArrayType, V> for NegOp {
-    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone().neg())])
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for NegOp {
+impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T>
+    for NegOp
+{
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: T::neg(inputs[0].tangent.clone()) }])

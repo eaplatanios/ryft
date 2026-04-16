@@ -9,7 +9,8 @@ use crate::{
 };
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(|x: JitTracer<ArrayType, f64>| x.sin(), 2.0f64).unwrap();
+    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
+        jit(|x: JitTracer<ArrayType, f64>| x.sin(), 2.0f64).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -75,7 +76,8 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
 }
 
 pub(crate) fn assert_bilinear_jit_rendering() {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, (f64, f64), f64>) = jit(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
+        jit(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -91,7 +93,8 @@ pub(crate) fn assert_bilinear_jit_rendering() {
 }
 
 pub(crate) fn assert_quadratic_pushforward_rendering() {
-    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) = linearize(quadratic_plus_sin, 2.0f64).unwrap();
+    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) =
+        linearize(quadratic_plus_sin, 2.0f64).unwrap();
 
     assert_eq!(
         pushforward.to_string(),

@@ -220,7 +220,6 @@ trait CustomBaseOp<T: Type + Clone, V: Typed<T>>: Op<T> + InterpretableOp<T, V> 
 
 impl<Ty: Type + Clone, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V> + Send + Sync> CustomBaseOp<Ty, V> for O {}
 
-
 /// Rule-based registration object used by [`PrimitiveOp::Custom`].
 ///
 /// The base op always supplies shape metadata and eager interpretation. Optional transform rules are
@@ -387,7 +386,9 @@ impl<V: Traceable<ArrayType>> VectorizableOp<ArrayType, V> for CustomPrimitive<A
     }
 }
 
-impl<V: Traceable<ArrayType>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for CustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
+    for CustomPrimitive<ArrayType, V>
+{
     fn jvp(
         &self,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
@@ -396,8 +397,8 @@ impl<V: Traceable<ArrayType>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayTyp
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike>
-    InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>> for CustomPrimitive<ArrayType, V>
+impl<V: Traceable<ArrayType> + ZeroLike> InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>>
+    for CustomPrimitive<ArrayType, V>
 where
     Linearized<JitTracer<ArrayType, V>>: Traceable<ArrayType>,
 {
@@ -1027,7 +1028,8 @@ impl<
         + Neg<Output = V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>> for PrimitiveOp<ArrayType, V>
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>
+    for PrimitiveOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -1091,22 +1093,20 @@ where
             Self::LinearMatrixTranspose => {
                 DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&LinearMatrixTransposeOp, inputs)
             }
-            Self::LeftMatMul { factor } => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
-                    &LeftMatMulOp::new(factor.clone()),
-                    inputs,
-                )
-            }
-            Self::RightMatMul { factor } => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
-                    &RightMatMulOp::new(factor.clone()),
-                    inputs,
-                )
-            }
-            Self::Reshape { input_type, output_type } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
-                &ReshapeOp::new(input_type.clone(), output_type.clone()),
+            Self::LeftMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+                &LeftMatMulOp::new(factor.clone()),
                 inputs,
             ),
+            Self::RightMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+                &RightMatMulOp::new(factor.clone()),
+                inputs,
+            ),
+            Self::Reshape { input_type, output_type } => {
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+                    &ReshapeOp::new(input_type.clone(), output_type.clone()),
+                    inputs,
+                )
+            }
             Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
                 op: "linearize_program",
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
@@ -1193,7 +1193,10 @@ mod tests {
     }
 
     impl LinearOp<ArrayType, f64> for ShiftOp {
-        fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, f64>]) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TraceError> {
+        fn transpose(
+            &self,
+            output_cotangents: &[LinearTerm<ArrayType, f64>],
+        ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TraceError> {
             if output_cotangents.len() != 1 {
                 return Err(TraceError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
             }
@@ -1230,8 +1233,10 @@ mod tests {
             if inputs.len() != 1 {
                 return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
-            let primal =
-                apply_custom_traced_unary(inputs[0].primal.clone(), CustomPrimitive::<ArrayType, f64>::new(self.clone()))?;
+            let primal = apply_custom_traced_unary(
+                inputs[0].primal.clone(),
+                CustomPrimitive::<ArrayType, f64>::new(self.clone()),
+            )?;
             Ok(vec![Linearized { primal, tangent: inputs[0].tangent.clone() }])
         }
     }
@@ -1253,7 +1258,10 @@ mod tests {
     }
 
     /// Applies one unary custom primitive to one traced scalar and expects staging to succeed.
-    fn stage_custom_traced_unary(input: JitTracer<ArrayType, f64>, primitive: CustomPrimitive<ArrayType, f64>) -> JitTracer<ArrayType, f64> {
+    fn stage_custom_traced_unary(
+        input: JitTracer<ArrayType, f64>,
+        primitive: CustomPrimitive<ArrayType, f64>,
+    ) -> JitTracer<ArrayType, f64> {
         apply_custom_traced_unary(input, primitive).expect("custom primitive staging should succeed")
     }
 
@@ -1406,7 +1414,8 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_batch_rule_participates_in_vmap() {
-        let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_vectorization_rule(ShiftOp::new(2.0));
+        let primitive =
+            CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_vectorization_rule(ShiftOp::new(2.0));
 
         assert_eq!(
             vmap(

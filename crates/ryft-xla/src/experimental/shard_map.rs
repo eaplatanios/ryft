@@ -51,6 +51,7 @@
 
 use std::ops::{Add, Mul, Neg};
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashSet},
     fmt::Debug,
 };
@@ -304,8 +305,8 @@ impl ShardMapTensor {
 }
 
 impl Typed<ArrayType> for ShardMapTensor {
-    fn tpe(&self) -> ArrayType {
-        self.r#type.clone()
+    fn tpe(&self) -> Cow<'_, ArrayType> {
+        Cow::Borrowed(&self.r#type)
     }
 }
 
@@ -534,7 +535,7 @@ where
             }
             .into());
         }
-        let mut output_type = input.value.tpe();
+        let mut output_type = input.value.tpe().into_owned();
         output_type.sharding =
             Some(sharding_with_varying_manual_axes(&sharding, varying_axes(output_type.sharding.as_ref())));
         let output_value = input.value.with_type(output_type);
@@ -1221,7 +1222,7 @@ where
         jit::<_, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>, ShardMapTensor>(function, traced_inputs)?;
     let output_types = Output::from_parameters(
         output_tensors.parameter_structure(),
-        output_tensors.into_parameters().map(|tensor| tensor.tpe()).collect::<Vec<_>>(),
+        output_tensors.into_parameters().map(|tensor| tensor.tpe().into_owned()).collect::<Vec<_>>(),
     )?;
     Ok((output_types, compiled))
 }
@@ -2491,13 +2492,20 @@ mod tests {
         );
 
         assert_eq!(
-            tensor.zero_like().tpe().sharding.expect("zero_like should keep sharding metadata").unreduced_axes,
+            tensor
+                .zero_like()
+                .tpe()
+                .into_owned()
+                .sharding
+                .expect("zero_like should keep sharding metadata")
+                .unreduced_axes,
             BTreeSet::from(["y".to_string()])
         );
         assert_eq!(
             tensor
                 .zero_like()
                 .tpe()
+                .into_owned()
                 .sharding
                 .expect("zero_like should keep sharding metadata")
                 .reduced_manual_axes,
@@ -2507,19 +2515,27 @@ mod tests {
             tensor
                 .zero_like()
                 .tpe()
+                .into_owned()
                 .sharding
                 .expect("zero_like should keep sharding metadata")
                 .varying_manual_axes,
             BTreeSet::<String>::new()
         );
         assert_eq!(
-            tensor.one_like().tpe().sharding.expect("one_like should keep sharding metadata").unreduced_axes,
+            tensor
+                .one_like()
+                .tpe()
+                .into_owned()
+                .sharding
+                .expect("one_like should keep sharding metadata")
+                .unreduced_axes,
             BTreeSet::from(["y".to_string()])
         );
         assert_eq!(
             tensor
                 .one_like()
                 .tpe()
+                .into_owned()
                 .sharding
                 .expect("one_like should keep sharding metadata")
                 .reduced_manual_axes,
@@ -2529,6 +2545,7 @@ mod tests {
             tensor
                 .one_like()
                 .tpe()
+                .into_owned()
                 .sharding
                 .expect("one_like should keep sharding metadata")
                 .varying_manual_axes,

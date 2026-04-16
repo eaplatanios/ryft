@@ -114,7 +114,10 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
 }
 
 /// Lifts one concrete value into the staged graph owned by a JIT tracer.
-pub fn lift_jit_constant<V: Traceable<ArrayType>>(constant: &V, exemplar: &JitTracer<ArrayType, V>) -> JitTracer<ArrayType, V> {
+pub fn lift_jit_constant<V: Traceable<ArrayType>>(
+    constant: &V,
+    exemplar: &JitTracer<ArrayType, V>,
+) -> JitTracer<ArrayType, V> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
     JitTracer::from_staged_parts(constant.clone(), atom, builder, exemplar.staging_error_handle())

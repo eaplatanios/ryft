@@ -256,6 +256,8 @@ impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<
 
 #[cfg(any(feature = "ndarray", test))]
 mod ndarray_support {
+    use std::borrow::Cow;
+
     use ndarray::Array2;
 
     use super::{MatrixOps, matrix_array_type};
@@ -294,8 +296,8 @@ mod ndarray_support {
 
     impl Typed<ArrayType> for Array2<f32> {
         #[inline]
-        fn tpe(&self) -> ArrayType {
-            matrix_array_type(DataType::F32, self.nrows(), self.ncols(), None)
+        fn tpe(&self) -> Cow<'_, ArrayType> {
+            Cow::Owned(matrix_array_type(DataType::F32, self.nrows(), self.ncols(), None))
         }
     }
 
@@ -313,8 +315,8 @@ mod ndarray_support {
 
     impl Typed<ArrayType> for Array2<f64> {
         #[inline]
-        fn tpe(&self) -> ArrayType {
-            matrix_array_type(DataType::F64, self.nrows(), self.ncols(), None)
+        fn tpe(&self) -> Cow<'_, ArrayType> {
+            Cow::Owned(matrix_array_type(DataType::F64, self.nrows(), self.ncols(), None))
         }
     }
 

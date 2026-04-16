@@ -51,7 +51,10 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatrixTransposeOp {
 }
 
 impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<ArrayType, V> for MatrixTransposeOp {
-    fn transpose(&self, output_cotangents: &[LinearTerm<ArrayType, V>]) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
@@ -66,8 +69,8 @@ impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<ArrayType, V> for MatrixTran
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>>
-    DifferentiableOp<ArrayType, V, T> for MatrixTransposeOp
+impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<ArrayType, V, T>
+    for MatrixTransposeOp
 {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
