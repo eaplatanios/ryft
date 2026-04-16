@@ -7,7 +7,7 @@ use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::Parameterized,
-    tracing_v2::{InterpretableOp, Op, TraceError, TraceValue},
+    tracing_v2::{InterpretableOp, Op, TraceError, TraceValue, Zero},
     types::{ArrayType, Typed},
 };
 
@@ -124,6 +124,16 @@ impl<O: Clone, V: TraceValue> GraphBuilder<O, V> {
         self.atoms.push(Atom::input(abstract_value, example_value));
         self.input_atoms.push(id);
         id
+    }
+
+    /// Adds a new input atom from abstract metadata alone, synthesizing one zero witness internally.
+    #[inline]
+    pub fn add_input_abstract_zero(&mut self, abstract_value: ArrayType) -> Result<AtomId, TraceError>
+    where
+        V: Zero,
+    {
+        let example_value = V::zero(abstract_value.clone())?;
+        Ok(self.add_input_abstract(abstract_value, example_value))
     }
 
     /// Adds a new input atom using the abstract value of `example`.
@@ -678,9 +688,7 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{
-            ConcreteTraceValue, FloatExt, MatrixOps, OneLike, TraceError, ZeroLike, ops::PrimitiveOp, test_support,
-        },
+        tracing_v2::{ConcreteTraceValue, FloatExt, MatrixOps, One, TraceError, Zero, ops::PrimitiveOp, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 
@@ -878,13 +886,17 @@ mod tests {
             }
         }
 
-        impl ZeroLike for TestIdentityValue {
+        impl Zero for TestIdentityValue {
+            fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
+                Ok(Self { r#type, value: 0.0 })
+            }
+
             fn zero_like(&self) -> Self {
                 Self::scalar(0.0)
             }
         }
 
-        impl OneLike for TestIdentityValue {
+        impl One for TestIdentityValue {
             fn one_like(&self) -> Self {
                 Self::scalar(1.0)
             }

@@ -301,7 +301,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{CompiledFunction, FloatExt, JitTracer, OneLike, jit};
+    use crate::tracing_v2::{CompiledFunction, FloatExt, JitTracer, One, jit};
 
     use super::*;
 

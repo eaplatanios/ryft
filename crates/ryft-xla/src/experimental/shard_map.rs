@@ -68,7 +68,7 @@ use thiserror::Error;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::{
-    CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike, jit,
+    CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, One, TraceError, TraceValue, Zero, jit,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -329,13 +329,21 @@ fn without_varying_manual_axes(r#type: &ArrayType) -> ArrayType {
     r#type
 }
 
-impl ZeroLike for ShardMapTensor {
+impl Zero for ShardMapTensor {
+    fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
+        Ok(Self::constant(without_varying_manual_axes(&r#type), ShardMapConstantKind::Zero))
+    }
+
     fn zero_like(&self) -> Self {
         Self::constant(without_varying_manual_axes(&self.r#type), ShardMapConstantKind::Zero)
     }
 }
 
-impl OneLike for ShardMapTensor {
+impl One for ShardMapTensor {
+    fn one(r#type: ArrayType) -> Result<Self, TraceError> {
+        Ok(Self::constant(without_varying_manual_axes(&r#type), ShardMapConstantKind::One))
+    }
+
     fn one_like(&self) -> Self {
         Self::constant(without_varying_manual_axes(&self.r#type), ShardMapConstantKind::One)
     }
@@ -1744,7 +1752,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{FloatExt, OneLike, grad, vmap};
+    use ryft_core::tracing_v2::{FloatExt, One, grad, vmap};
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;

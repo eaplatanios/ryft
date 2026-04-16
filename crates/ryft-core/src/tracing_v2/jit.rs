@@ -17,7 +17,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, InterpretableOp, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
+        FloatExt, InterpretableOp, MatrixOps, One, TraceError, TraceValue, Zero,
         graph::AtomId,
         operations::reshape::ReshapeOps,
         ops::PrimitiveOp,
@@ -153,7 +153,16 @@ impl<V: TraceValue> Typed<ArrayType> for JitTracer<V> {
 
 impl<V: TraceValue> TraceValue for JitTracer<V> {}
 
-impl<V: TraceValue + ZeroLike> ZeroLike for JitTracer<V> {
+impl<V: TraceValue + Zero> Zero for JitTracer<V> {
+    #[inline]
+    fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
+        let value = V::zero(r#type)?;
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let staging_error = Rc::new(RefCell::new(None));
+        let atom = builder.borrow_mut().add_input(&value);
+        Ok(Self { value, atom, builder, staging_error })
+    }
+
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.value.zero_like();
@@ -162,7 +171,16 @@ impl<V: TraceValue + ZeroLike> ZeroLike for JitTracer<V> {
     }
 }
 
-impl<V: TraceValue + OneLike> OneLike for JitTracer<V> {
+impl<V: TraceValue + One> One for JitTracer<V> {
+    #[inline]
+    fn one(r#type: ArrayType) -> Result<Self, TraceError> {
+        let value = V::one(r#type)?;
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let staging_error = Rc::new(RefCell::new(None));
+        let atom = builder.borrow_mut().add_input(&value);
+        Ok(Self { value, atom, builder, staging_error })
+    }
+
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.value.one_like();
@@ -264,7 +282,7 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         O: InterpretableOp<V>,
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+        V: FloatExt + Zero + One + MatrixOps + ReshapeOps,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -286,7 +304,7 @@ fn try_trace_program_with_options<F, Input, Output, V>(
     simplify_program: bool,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -333,7 +351,7 @@ pub fn try_trace_program<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -348,7 +366,7 @@ pub fn try_jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -368,7 +386,7 @@ pub fn jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -445,7 +463,7 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike, operations::reshape::ReshapeOps},
+            tracing_v2::{FloatExt, MatrixOps, One, Zero, operations::reshape::ReshapeOps},
             types::{ArrayType, DataType, Typed},
         };
 
@@ -506,13 +524,21 @@ mod tests {
             }
         }
 
-        impl ZeroLike for TestAbstractValue {
+        impl Zero for TestAbstractValue {
+            fn zero(r#type: ArrayType) -> Result<Self, TraceError> {
+                Ok(Self { r#type })
+            }
+
             fn zero_like(&self) -> Self {
                 self.clone()
             }
         }
 
-        impl OneLike for TestAbstractValue {
+        impl One for TestAbstractValue {
+            fn one(r#type: ArrayType) -> Result<Self, TraceError> {
+                Ok(Self { r#type })
+            }
+
             fn one_like(&self) -> Self {
                 self.clone()
             }

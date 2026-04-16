@@ -142,8 +142,8 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     where
         V: MlirLowerableValue
             + ryft_core::tracing_v2::FloatExt
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
+            + ryft_core::tracing_v2::Zero
+            + ryft_core::tracing_v2::One
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
     {
@@ -167,8 +167,8 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     where
         V: MlirLowerableValue
             + ryft_core::tracing_v2::FloatExt
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
+            + ryft_core::tracing_v2::Zero
+            + ryft_core::tracing_v2::One
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
     {
@@ -518,8 +518,8 @@ impl<V: TraceValue> XlaOp<V> for ReshapeOp {
 impl<
     V: TraceValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
 > XlaOp<V> for VMapOp<V>
@@ -541,8 +541,8 @@ impl<
 impl<
     V: TraceValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
 > XlaOp<V> for LinearVMapOp<V>
@@ -571,8 +571,8 @@ impl<
 impl<
     V: TraceValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
 > XlaOp<V> for LinearRematerializeOp<V>
@@ -600,8 +600,8 @@ impl<
 impl<
     V: TraceValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
 > XlaOp<V> for PrimitiveOp<V>
@@ -681,8 +681,8 @@ impl<
 impl<
     V: TraceValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
 > XlaOp<V> for LinearPrimitiveOp<V>
@@ -789,8 +789,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     where
         V: MlirLowerableValue
             + ryft_core::tracing_v2::FloatExt
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
+            + ryft_core::tracing_v2::Zero
+            + ryft_core::tracing_v2::One
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
     {
@@ -814,8 +814,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     where
         V: MlirLowerableValue
             + ryft_core::tracing_v2::FloatExt
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
+            + ryft_core::tracing_v2::Zero
+            + ryft_core::tracing_v2::One
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
     {
@@ -1137,8 +1137,8 @@ pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, O, S>(
 where
     V: MlirLowerableValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
@@ -1617,8 +1617,8 @@ where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
@@ -1732,8 +1732,8 @@ where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
@@ -1811,8 +1811,8 @@ fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
 where
     V: MlirLowerableValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
@@ -1889,8 +1889,8 @@ fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 where
     V: MlirLowerableValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
@@ -2339,8 +2339,8 @@ fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 where
     V: MlirLowerableValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
@@ -2372,8 +2372,8 @@ fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
 where
     V: MlirLowerableValue
         + ryft_core::tracing_v2::FloatExt
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
+        + ryft_core::tracing_v2::Zero
+        + ryft_core::tracing_v2::One
         + ryft_core::tracing_v2::MatrixOps
         + ryft_core::tracing_v2::ReshapeOps,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
@@ -2650,8 +2650,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{
-        CustomPrimitive, FloatExt, InterpretableOp, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
-        ZeroLike,
+        CustomPrimitive, FloatExt, InterpretableOp, MatrixOps, One, Op, PrimitiveOp, ProgramBuilder, TraceError, Zero,
     };
     use ryft_core::types::Shape;
 

@@ -9,7 +9,7 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        FloatExt, MatrixOps, TraceError, TraceValue, ZeroLike,
+        FloatExt, MatrixOps, TraceError, TraceValue, Zero,
         batch::{Batch, stack, unstack},
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         linear::{LinearProgram, jvp_program, try_jvp_traced, try_linearize_traced_program},
@@ -38,7 +38,7 @@ pub trait TangentSpace<V: TraceValue>: Clone + Parameter {
     fn zero_like(primal: &V, tangent: &Self) -> Self;
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike> TangentSpace<V> for V {
+impl<V: TraceValue + FloatExt + Zero> TangentSpace<V> for V {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
         lhs + rhs
@@ -85,14 +85,14 @@ impl<V: TraceValue, T: TangentSpace<V> + 'static> Typed<ArrayType> for JvpTracer
 
 impl<V: TraceValue, T: TangentSpace<V> + 'static> TraceValue for JvpTracer<V, T> {}
 
-impl<V: TraceValue + ZeroLike, T: TangentSpace<V>> ZeroLike for JvpTracer<V, T> {
+impl<V: TraceValue + Zero, T: TangentSpace<V>> Zero for JvpTracer<V, T> {
     #[inline]
     fn zero_like(&self) -> Self {
         Self { primal: self.primal.zero_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
     }
 }
 
-impl<V: TraceValue + crate::tracing_v2::OneLike, T: TangentSpace<V>> crate::tracing_v2::OneLike for JvpTracer<V, T> {
+impl<V: TraceValue + crate::tracing_v2::One, T: TangentSpace<V>> crate::tracing_v2::One for JvpTracer<V, T> {
     #[inline]
     fn one_like(&self) -> Self {
         Self { primal: self.primal.one_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
@@ -110,7 +110,7 @@ pub trait JvpInvocationLeaf<
 >: Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: TraceValue + FloatExt + ZeroLike + MatrixOps;
+    type Base: TraceValue + FloatExt + Zero + MatrixOps;
 
     /// Input type expected by the user-provided function.
     type FunctionInput;
@@ -133,7 +133,7 @@ where
     outputs.pop().expect("single-output primitive should return one JVP output")
 }
 
-impl<V: TraceValue + Add<Output = V> + ZeroLike, T: TangentSpace<V>> Add for JvpTracer<V, T> {
+impl<V: TraceValue + Add<Output = V> + Zero, T: TangentSpace<V>> Add for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -142,7 +142,7 @@ impl<V: TraceValue + Add<Output = V> + ZeroLike, T: TangentSpace<V>> Add for Jvp
     }
 }
 
-impl<V: TraceValue + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> Mul for JvpTracer<V, T> {
+impl<V: TraceValue + Mul<Output = V> + Zero, T: TangentSpace<V>> Mul for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -151,7 +151,7 @@ impl<V: TraceValue + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> Mul for Jvp
     }
 }
 
-impl<V: TraceValue + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> Neg for JvpTracer<V, T> {
+impl<V: TraceValue + Neg<Output = V> + Zero, T: TangentSpace<V>> Neg for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -160,7 +160,7 @@ impl<V: TraceValue + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> Neg for Jvp
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> {
+impl<V: TraceValue + FloatExt + Zero, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> {
     #[inline]
     fn sin(self) -> Self {
         single_output(SinOp.jvp(&[self]).expect("sin JVP rule should succeed"), "sin")
@@ -177,8 +177,8 @@ impl<V: TraceValue + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTr
 impl<
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + crate::tracing_v2::OneLike
+        + Zero
+        + crate::tracing_v2::One
         + crate::tracing_v2::ConcreteTraceValue
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
@@ -214,8 +214,8 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + crate::tracing_v2::OneLike
+        + Zero
+        + crate::tracing_v2::One
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
@@ -249,8 +249,8 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + crate::tracing_v2::OneLike
+        + Zero
+        + crate::tracing_v2::One
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
@@ -384,7 +384,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::tracing_v2::{OneLike, test_support};
+    use crate::tracing_v2::{One, test_support};
 
     use super::*;
 

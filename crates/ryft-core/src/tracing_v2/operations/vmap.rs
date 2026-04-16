@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 
 use crate::{
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
+        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, One, TraceError, TraceValue, Zero,
         linear::{linearize_program, transpose_linear_program},
         operations::reshape::ReshapeOps,
         ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp},
@@ -81,7 +81,7 @@ impl<V: TraceValue, O: Clone> FlatTracedVMap<V, O> {
     pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
     where
         O: InterpretableOp<V>,
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+        V: FloatExt + Zero + One + MatrixOps + ReshapeOps,
     {
         if inputs.len() != self.total_input_count() {
             return Err(TraceError::InvalidInputCount { expected: self.total_input_count(), got: inputs.len() });
@@ -145,7 +145,7 @@ impl<V: TraceValue> Op for VMapOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -153,7 +153,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps>
     InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for VMapOp<V>
 {
     fn interpret(
@@ -187,9 +187,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>>
-    for VMapOp<V>
-{
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> DifferentiableOp<V, LinearTerm<V>> for VMapOp<V> {
     fn jvp(
         &self,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<V>>],
@@ -210,9 +208,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Dif
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>>
-    for VMapOp<V>
-{
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V> {
     fn interpret(&self, inputs: &[JitTracer<V>]) -> Result<Vec<JitTracer<V>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
         let output_values = <Self as InterpretableOp<V>>::interpret(self, concrete_inputs.as_slice())?;
@@ -277,7 +273,7 @@ impl<V: TraceValue> Op for LinearVMapOp<V> {
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(Typed::tpe).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
@@ -285,7 +281,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V> {
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V> {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         if output_cotangents.len() != self.body.total_output_count() {
             return Err(TraceError::InvalidInputCount {
@@ -310,8 +306,9 @@ pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<LinearVMapOp<V>, 
 where
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + OneLike
+        + crate::tracing_v2::Zero
+        + Zero
+        + One
         + MatrixOps
         + ReshapeOps
         + std::ops::Add<Output = V>

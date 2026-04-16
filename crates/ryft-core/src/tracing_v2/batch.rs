@@ -10,7 +10,7 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, OneLike, Program, TraceError, TraceValue, ZeroLike,
+        CompiledFunction, FloatExt, JitTracer, One, Program, TraceError, TraceValue, Zero,
         operations::{AddOp, CosOp, FlatTracedVMap, MulOp, NegOp, SinOp, VMapOp},
         ops::{PrimitiveOp, VectorizableOp},
     },
@@ -100,17 +100,17 @@ impl<V: TraceValue + FloatExt> FloatExt for Batch<V> {
     }
 }
 
-impl<V: ZeroLike> ZeroLike for Batch<V> {
+impl<V: Zero> Zero for Batch<V> {
     #[inline]
     fn zero_like(&self) -> Self {
-        Self::new(self.lanes.iter().map(ZeroLike::zero_like).collect())
+        Self::new(self.lanes.iter().map(Zero::zero_like).collect())
     }
 }
 
-impl<V: OneLike> OneLike for Batch<V> {
+impl<V: One> One for Batch<V> {
     #[inline]
     fn one_like(&self) -> Self {
-        Self::new(self.lanes.iter().map(OneLike::one_like).collect())
+        Self::new(self.lanes.iter().map(One::one_like).collect())
     }
 }
 
@@ -196,8 +196,8 @@ pub(crate) trait VMapInvocationLeaf<
 impl<
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + OneLike
+        + Zero
+        + One
         + crate::tracing_v2::ConcreteTraceValue
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
@@ -224,8 +224,8 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + OneLike
+        + Zero
+        + One
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
@@ -339,8 +339,8 @@ where
 impl<
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + OneLike
+        + Zero
+        + One
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,

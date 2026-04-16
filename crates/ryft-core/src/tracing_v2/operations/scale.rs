@@ -9,7 +9,7 @@ use std::{
 use indoc::indoc;
 
 use crate::tracing_v2::{
-    TraceError, TraceValue, ZeroLike,
+    TraceError, TraceValue, Zero,
     batch::Batch,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
@@ -83,14 +83,14 @@ impl<V: TraceValue + Mul<Output = V>> InterpretableOp<V> for ScaleOp<V> {
     }
 }
 
-impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
+impl<V: TraceValue + Mul<Output = V> + Zero> LinearOp<V> for ScaleOp<V> {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone().scale(self.factor().clone()))])
     }
 }
 
-impl<V: TraceValue + ZeroLike + Mul<Output = V>> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
+impl<V: TraceValue + Zero + Mul<Output = V>> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
     for ScaleOp<V>
 {
     fn interpret(

@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, OneLike, TraceError, TraceValue, ZeroLike,
+    FloatExt, One, TraceError, TraceValue, Zero,
     batch::Batch as BatchedValue,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
@@ -81,7 +81,7 @@ impl<V: MatrixValue> InterpretableOp<V> for LeftMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
+impl<V: MatrixValue + FloatExt + Zero + One + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
     for LeftMatMulOp<V>
 {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
@@ -99,7 +99,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps>
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps>
     InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for LeftMatMulOp<V>
 {
     fn interpret(
@@ -113,7 +113,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps>
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: MatrixValue + FloatExt + Zero + One + crate::tracing_v2::operations::reshape::ReshapeOps>
     DifferentiableOp<V, LinearTerm<V>> for LeftMatMulOp<V>
 {
     fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {

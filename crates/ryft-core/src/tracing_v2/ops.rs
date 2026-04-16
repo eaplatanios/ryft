@@ -26,7 +26,7 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, TraceError, TraceValue, ZeroLike,
+    FloatExt, MatrixOps, One, TraceError, TraceValue, Zero,
     batch::Batch,
     forward::JvpTracer,
     jit::JitTracer,
@@ -819,7 +819,7 @@ impl<V: TraceValue> Op for LinearPrimitiveOp<V> {
 }
 
 /// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for PrimitiveOp<V>
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
@@ -845,7 +845,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for LinearPrimitiveOp<V>
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
@@ -867,8 +867,8 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
-    LinearOp<V> for LinearPrimitiveOp<V>
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
+    for LinearPrimitiveOp<V>
 {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         match self {
@@ -905,8 +905,8 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 impl<
     V: TraceValue
         + FloatExt
-        + ZeroLike
-        + OneLike
+        + Zero
+        + One
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -940,7 +940,7 @@ impl<
     }
 }
 
-impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: TraceValue + FloatExt + Zero + One + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     DifferentiableOp<V, LinearTerm<V>> for PrimitiveOp<V>
 {
     fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {

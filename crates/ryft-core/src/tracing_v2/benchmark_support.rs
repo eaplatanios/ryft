@@ -9,12 +9,12 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::tracing_v2::{
-    Batch, CompiledFunction, FloatExt, JitTracer, LinearProgram, OneLike, Program, TraceValue,
+    Batch, CompiledFunction, FloatExt, JitTracer, LinearProgram, One, Program, TraceValue,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_graph},
     grad, jit, jvp, jvp_program, linearize, stack, try_jit, unstack, value_and_grad, vjp, vmap,
 };
 #[cfg(feature = "ndarray")]
-use crate::tracing_v2::{MatrixOps, ZeroLike};
+use crate::tracing_v2::{MatrixOps, Zero};
 
 /// Returns the tracing-only IR benchmark cases.
 pub(crate) fn cases() -> Vec<BenchmarkCase> {
@@ -89,8 +89,8 @@ fn tracing_record<V, Input, Output, O>(
 where
     V: TraceValue
         + crate::tracing_v2::FloatExt
-        + crate::tracing_v2::ZeroLike
-        + crate::tracing_v2::OneLike
+        + crate::tracing_v2::Zero
+        + crate::tracing_v2::One
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: crate::parameters::Parameterized<V>,
