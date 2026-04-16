@@ -84,14 +84,7 @@ impl<V: TraceValue + Mul<Output = V>> InterpretableOp<V> for ScaleOp<V> {
 }
 
 impl<V: TraceValue + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone().scale(self.factor().clone()))])
     }
@@ -152,7 +145,7 @@ mod tests {
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ScaleOp::new(3.0f64)
-            .transpose(&[1.0f64], &[3.0f64], &[output_cotangent])
+            .transpose(&[output_cotangent])
             .unwrap()
             .into_iter()
             .next()

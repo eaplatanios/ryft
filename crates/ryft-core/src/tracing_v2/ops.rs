@@ -70,19 +70,80 @@ pub trait InterpretableOp<V: TraceValue>: Op {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
 }
 
-/// Operations that can appear in tangent/cotangent programs and support reverse-mode transposition.
+/// Represents [`Op`]s that can appear in tangent/cotangent programs and support reverse-mode transposition.
 ///
-/// The `inputs` and `outputs` are the representative concrete values recorded while staging the
-/// forward program. The `output_cotangents` are staged cotangents in the transpose program and can
-/// be transformed with existing [`LinearTerm`] helpers such as [`LinearTerm::apply_staged_op`].
+/// For one linear operation `y = L(x)`, the transpose rule builds the reverse linear map `L^T`
+/// that pulls cotangents on `y` back to cotangents on `x`.
+///
+/// In other words, this trait models the adjoint used by reverse-mode differentiation once one
+/// primal program has already been linearized. The rule does not receive concrete primal witnesses
+/// because those are not part of the transpose trace. Instead, it operates directly on staged
+/// output cotangents and emits staged cotangent contributions for the op inputs.
+///
+/// A few concrete examples:
+///
+/// - For [`ScaleOp`], `y = a * x`, the transpose stages one new [`LinearTerm`] representing
+///   `a * c`, where `c` is the output cotangent:
+///   ```rust,ignore
+///   use std::{cell::RefCell, rc::Rc};
+///
+///   use ryft_core::tracing_v2::{LinearOp, LinearProgramBuilder, LinearTerm, ScaleOp};
+///
+///   let builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
+///   let cotangent_atom = builder.borrow_mut().add_input(&1.0f64);
+///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
+///
+///   let contributions = ScaleOp::new(3.0f64).transpose(&[cotangent]).unwrap();
+///   let dx = contributions[0].clone().expect("scale contributes one cotangent");
+///   // `dx` is a staged `LinearTerm` representing `3.0 * cotangent`.
+///   ```
+/// - For [`AddOp`], `y = x0 + x1`, the transpose duplicates the same staged cotangent for both
+///   inputs:
+///   ```rust,ignore
+///   use std::{cell::RefCell, rc::Rc};
+///
+///   use ryft_core::tracing_v2::{AddOp, LinearOp, LinearProgramBuilder, LinearTerm};
+///
+///   let builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
+///   let cotangent_atom = builder.borrow_mut().add_input(&1.0f64);
+///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
+///
+///   let contributions = AddOp.transpose(&[cotangent]).unwrap();
+///   let dx0 = contributions[0].clone().expect("add contributes to lhs");
+///   let dx1 = contributions[1].clone().expect("add contributes to rhs");
+///   // `dx0` and `dx1` are staged `LinearTerm`s representing the same cotangent.
+///   ```
+/// - For [`MatrixTransposeOp`], `Y = X^T`, the transpose stages another transpose on the output
+///   cotangent:
+///   ```rust,ignore
+///   use std::{cell::RefCell, rc::Rc};
+///
+///   use ndarray::arr2;
+///   use ryft_core::tracing_v2::{LinearOp, LinearProgramBuilder, LinearTerm, MatrixTransposeOp};
+///
+///   let builder = Rc::new(RefCell::new(LinearProgramBuilder::<ndarray::Array2<f64>>::new()));
+///   let cotangent_atom = builder.borrow_mut().add_input(&arr2(&[[1.0, 2.0], [3.0, 4.0]]));
+///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
+///
+///   let contributions = MatrixTransposeOp.transpose(&[cotangent]).unwrap();
+///   let dx = contributions[0].clone().expect("transpose contributes one cotangent");
+///   // `dx` is a staged `LinearTerm` representing `cotangent.transpose()`.
+///   ```
+/// - For [`ReshapeOp`], the transpose reshapes the output cotangent back to the input shape because
+///   reshape only changes layout metadata.
+///
+/// Structural validation happens when the forward linear program is built and when any staged ops
+/// emitted by the rule are added to the transpose program.
 pub trait LinearOp<V: TraceValue>: Op {
     /// Applies the transpose rule for reverse-mode differentiation.
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError>;
+    ///
+    /// `output_cotangents` is aligned with the op outputs in forward order. The returned vector
+    /// must be aligned with the op inputs in forward order.
+    ///
+    /// Returning `Some(term)` means that input receives the staged cotangent contribution `term`.
+    /// Returning `None` means the contribution is structurally zero and the transpose pass does not
+    /// need to materialize an explicit zero term for that input.
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError>;
 }
 
 /// Forward-mode differentiation rule, generic over the tangent type `T`.
@@ -279,17 +340,11 @@ impl<V: TraceValue> InterpretableOp<V> for CustomPrimitive<V> {
 }
 
 impl<V: TraceValue> LinearOp<V> for CustomPrimitive<V> {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        self.transpose_rule.as_deref().ok_or_else(|| self.missing_rule("transpose"))?.transpose(
-            inputs,
-            outputs,
-            output_cotangents,
-        )
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        self.transpose_rule
+            .as_deref()
+            .ok_or_else(|| self.missing_rule("transpose"))?
+            .transpose(output_cotangents)
     }
 }
 
@@ -379,17 +434,12 @@ impl<V: TraceValue> InterpretableOp<V> for LinearCustomPrimitive<V> {
 }
 
 impl<V: TraceValue> LinearOp<V> for LinearCustomPrimitive<V> {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         self.primitive
             .transpose_rule
             .as_deref()
             .expect("linear custom primitives must carry a transpose rule")
-            .transpose(inputs, outputs, output_cotangents)
+            .transpose(output_cotangents)
     }
 }
 
@@ -533,13 +583,8 @@ impl<T: InterpretableOp<V> + ?Sized, V: TraceValue> InterpretableOp<V> for Arc<T
 
 impl<T: LinearOp<V> + ?Sized, V: TraceValue> LinearOp<V> for Arc<T> {
     #[inline]
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        (**self).transpose(inputs, outputs, output_cotangents)
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+        (**self).transpose(output_cotangents)
     }
 }
 
@@ -825,30 +870,21 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     LinearOp<V> for LinearPrimitiveOp<V>
 {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         match self {
-            Self::Add => AddOp.transpose(inputs, outputs, output_cotangents),
-            Self::Neg => NegOp.transpose(inputs, outputs, output_cotangents),
-            Self::MatrixTranspose => MatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.transpose(inputs, outputs, output_cotangents),
-            Self::Scale { factor } => ScaleOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents),
-            Self::LeftMatMul { factor } => {
-                LeftMatMulOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents)
-            }
-            Self::RightMatMul { factor } => {
-                RightMatMulOp::new(factor.clone()).transpose(inputs, outputs, output_cotangents)
-            }
+            Self::Add => AddOp.transpose(output_cotangents),
+            Self::Neg => NegOp.transpose(output_cotangents),
+            Self::MatrixTranspose => MatrixTransposeOp.transpose(output_cotangents),
+            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.transpose(output_cotangents),
+            Self::Scale { factor } => ScaleOp::new(factor.clone()).transpose(output_cotangents),
+            Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).transpose(output_cotangents),
+            Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).transpose(output_cotangents),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOp::new(input_type.clone(), output_type.clone()).transpose(inputs, outputs, output_cotangents)
+                ReshapeOp::new(input_type.clone(), output_type.clone()).transpose(output_cotangents)
             }
-            Self::VMap(vmap) => vmap.transpose(inputs, outputs, output_cotangents),
-            Self::Rematerialize(remat) => remat.transpose(inputs, outputs, output_cotangents),
-            Self::Custom(op) => op.transpose(inputs, outputs, output_cotangents),
+            Self::VMap(vmap) => vmap.transpose(output_cotangents),
+            Self::Rematerialize(remat) => remat.transpose(output_cotangents),
+            Self::Custom(op) => op.transpose(output_cotangents),
         }
     }
 }
@@ -1012,18 +1048,7 @@ mod tests {
     }
 
     impl LinearOp<f64> for ShiftOp {
-        fn transpose(
-            &self,
-            inputs: &[f64],
-            outputs: &[f64],
-            output_cotangents: &[LinearTerm<f64>],
-        ) -> Result<Vec<Option<LinearTerm<f64>>>, TraceError> {
-            if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
-            if outputs.len() != 1 {
-                return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
-            }
+        fn transpose(&self, output_cotangents: &[LinearTerm<f64>]) -> Result<Vec<Option<LinearTerm<f64>>>, TraceError> {
             if output_cotangents.len() != 1 {
                 return Err(TraceError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
             }
@@ -1137,7 +1162,7 @@ mod tests {
         let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder);
 
         assert!(matches!(
-            primitive.transpose(&[3.0f64], &[5.0f64], &[cotangent]),
+            primitive.transpose(&[cotangent]),
             Err(TraceError::MissingCustomRule { op: "test_shift", transform: "transpose" })
         ));
     }

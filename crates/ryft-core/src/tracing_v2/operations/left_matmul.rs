@@ -84,14 +84,7 @@ impl<V: MatrixValue> InterpretableOp<V> for LeftMatMulOp<V> {
 impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
     for LeftMatMulOp<V>
 {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(
             LinearTerm::apply_staged_op(

@@ -69,14 +69,7 @@ impl<V: TraceValue + Add<Output = V>> InterpretableOp<V> for AddOp {
 }
 
 impl<V: TraceValue + Add<Output = V> + ZeroLike> LinearOp<V> for AddOp {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        expect_input_count(inputs.len(), 2)?;
-        expect_input_count(outputs.len(), 1)?;
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone()), Some(output_cotangents[0].clone())])
     }

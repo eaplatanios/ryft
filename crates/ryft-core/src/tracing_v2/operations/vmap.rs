@@ -286,21 +286,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V> {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        if inputs.len() != self.body.total_input_count() {
-            return Err(TraceError::InvalidInputCount { expected: self.body.total_input_count(), got: inputs.len() });
-        }
-        if outputs.len() != self.body.total_output_count() {
-            return Err(TraceError::InvalidOutputCount {
-                expected: self.body.total_output_count(),
-                got: outputs.len(),
-            });
-        }
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         if output_cotangents.len() != self.body.total_output_count() {
             return Err(TraceError::InvalidInputCount {
                 expected: self.body.total_output_count(),

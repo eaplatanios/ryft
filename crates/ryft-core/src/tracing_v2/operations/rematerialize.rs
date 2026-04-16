@@ -268,12 +268,7 @@ impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> Int
 }
 
 impl<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearRematerializeOp<V> {
-    fn transpose(
-        &self,
-        _inputs: &[V],
-        _outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         let transpose = self.transpose_op();
         Ok(LinearTerm::apply_staged_op(
             output_cotangents,

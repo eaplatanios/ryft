@@ -379,14 +379,7 @@ impl<V: ReshapeValue> InterpretableOp<V> for ReshapeOp {
 }
 
 impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<V> for ReshapeOp {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         if self.input_type() == self.output_type() {
             return Ok(vec![Some(output_cotangents[0].clone())]);
@@ -674,7 +667,6 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap();
-        let input_value = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
         let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
         let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ndarray::Array2<f64>>::new()));
         let output_cotangent_atom =
@@ -684,7 +676,7 @@ mod tests {
             input_type.clone(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap(),
         )
-        .transpose(std::slice::from_ref(&input_value), std::slice::from_ref(&output_value), &[output_cotangent])
+        .transpose(&[output_cotangent])
         .unwrap()
         .into_iter()
         .next()

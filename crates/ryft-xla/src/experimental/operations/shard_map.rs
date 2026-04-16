@@ -289,8 +289,6 @@ impl InterpretableOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
 impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn transpose(
         &self,
-        inputs: &[ShardMapTensor],
-        outputs: &[ShardMapTensor],
         output_cotangents: &[LinearTerm<ShardMapTensor>],
     ) -> Result<Vec<Option<LinearTerm<ShardMapTensor>>>, TraceError> {
         if !self.has_linear_state() {
@@ -298,12 +296,6 @@ impl LinearOp<ShardMapTensor> for ShardMapOp<ShardMapTensor> {
                 op: "transpose_linear_program",
                 message: "transpose rule for staged op 'shard_map' is not implemented".to_string(),
             });
-        }
-        if inputs.len() != self.input_types.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
-        }
-        if outputs.len() != self.output_types.len() {
-            return Err(TraceError::InvalidOutputCount { expected: self.output_types.len(), got: outputs.len() });
         }
         if output_cotangents.len() != self.output_types.len() {
             return Err(TraceError::InvalidInputCount {
@@ -432,8 +424,6 @@ impl InterpretableOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
 impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn transpose(
         &self,
-        inputs: &[ShardMapTracer],
-        outputs: &[ShardMapTracer],
         output_cotangents: &[LinearTerm<ShardMapTracer>],
     ) -> Result<Vec<Option<LinearTerm<ShardMapTracer>>>, TraceError> {
         if !self.has_linear_state() {
@@ -441,12 +431,6 @@ impl LinearOp<ShardMapTracer> for ShardMapOp<ShardMapTracer> {
                 op: "transpose_linear_program",
                 message: "transpose rule for staged op 'shard_map' is not implemented".to_string(),
             });
-        }
-        if inputs.len() != self.input_types.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
-        }
-        if outputs.len() != self.output_types.len() {
-            return Err(TraceError::InvalidOutputCount { expected: self.output_types.len(), got: outputs.len() });
         }
         if output_cotangents.len() != self.output_types.len() {
             return Err(TraceError::InvalidInputCount {
@@ -1039,7 +1023,7 @@ fn try_linearize_traced_shard_map_body<
         builder.build::<Vec<ShardMapTracer>, Vec<ShardMapTracer>>(tangent_outputs, input_structure, output_structure),
     )
     .simplify()?;
-    Ok((primal_outputs, ryft_core::tracing_v2::LinearProgram::from_program(program, zero)))
+    Ok((primal_outputs.clone(), ryft_core::tracing_v2::LinearProgram::from_program(program, zero, primal_outputs)))
 }
 
 fn try_transpose_traced_shard_map_body<

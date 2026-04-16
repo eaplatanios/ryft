@@ -117,12 +117,8 @@ impl InterpretableOp<ShardMapTensor> for WithShardingConstraintOp {
 impl LinearOp<ShardMapTensor> for WithShardingConstraintOp {
     fn transpose(
         &self,
-        inputs: &[ShardMapTensor],
-        outputs: &[ShardMapTensor],
         output_cotangents: &[LinearTerm<ShardMapTensor>],
     ) -> Result<Vec<Option<LinearTerm<ShardMapTensor>>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
@@ -188,12 +184,8 @@ impl InterpretableOp<ShardMapTracer> for WithShardingConstraintOp {
 impl LinearOp<ShardMapTracer> for WithShardingConstraintOp {
     fn transpose(
         &self,
-        inputs: &[ShardMapTracer],
-        outputs: &[ShardMapTracer],
         output_cotangents: &[LinearTerm<ShardMapTracer>],
     ) -> Result<Vec<Option<LinearTerm<ShardMapTracer>>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
@@ -411,23 +403,16 @@ mod tests {
         let mesh = test_mesh();
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
-        let input_value = ShardMapTensor::new(input_type.clone());
-        let output_value = input_value.clone();
 
         let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ShardMapTensor>::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&ShardMapTensor::new(input_type));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&ShardMapTensor::new(input_type.clone()));
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let contribution = LinearOp::transpose(
-            &WithShardingConstraintOp::new(sharding.clone()),
-            &[input_value],
-            &[output_value],
-            &[output_cotangent],
-        )
-        .unwrap()
-        .into_iter()
-        .next()
-        .expect("transpose should return one contribution")
-        .expect("transpose should produce one cotangent contribution");
+        let contribution = LinearOp::transpose(&WithShardingConstraintOp::new(sharding.clone()), &[output_cotangent])
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("transpose should return one contribution")
+            .expect("transpose should produce one cotangent contribution");
         let contribution_atom = contribution.atom();
         drop(contribution);
 

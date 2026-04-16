@@ -160,6 +160,7 @@ pub type Linearized<V> = JvpTracer<V, LinearTerm<V>>;
 pub struct LinearProgram<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> {
     program: Program<V, Input, Output, LinearProgramOpRef<V>>,
     zero: V,
+    output_examples: Vec<V>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
@@ -170,14 +171,23 @@ impl<
 > Clone for LinearProgram<V, Input, Output>
 {
     fn clone(&self) -> Self {
-        Self { program: self.program.clone(), zero: self.zero.clone(), marker: PhantomData }
+        Self {
+            program: self.program.clone(),
+            zero: self.zero.clone(),
+            output_examples: self.output_examples.clone(),
+            marker: PhantomData,
+        }
     }
 }
 
 impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> LinearProgram<V, Input, Output> {
     #[inline]
-    pub fn from_program(program: Program<V, Input, Output, LinearProgramOpRef<V>>, zero: V) -> Self {
-        Self { program, zero, marker: PhantomData }
+    pub fn from_program(
+        program: Program<V, Input, Output, LinearProgramOpRef<V>>,
+        zero: V,
+        output_examples: Vec<V>,
+    ) -> Self {
+        Self { program, zero, output_examples, marker: PhantomData }
     }
 
     /// Returns the staged graph backing this linear program.
@@ -215,46 +225,21 @@ impl<V: TraceValue, Input: Parameterized<V>, Output: Parameterized<V>> Display f
 
 /// Applies one primitive's semantic transpose rule while transposing a staged linear program.
 ///
-/// [`LinearOp::transpose`] is intentionally expressed in semantic terms: representative primal
-/// inputs and outputs of type `V`, plus staged output cotangents as [`LinearTerm<V>`]. The
-/// transpose pass, however, walks the already-built forward graph in terms of atom ids. This
-/// helper bridges those two views by reconstructing the primitive's representative primals from the
-/// original graph and wrapping the transpose builder's cotangent atoms as [`LinearTerm<V>`].
-///
-/// The `representative_values` slice is the per-atom exemplar data returned by
-/// `graph.representative_atom_values()` for the original forward graph. It is indexed by the
-/// forward graph's atom ids, not by atoms in the transpose builder. The values are not re-executed
-/// or differentiated here. They serve as concrete witnesses for the staged atoms so semantic
-/// transpose rules can recover any primal-dependent information they need, such as shapes,
-/// dimensions, broadcast structure, or stored scalar/matrix factors.
-///
-/// Without this slice, reverse-mode transposition would have to expose the internal
-/// `ProgramBuilder<V>` / `AtomId` API directly to every primitive transpose implementation. Keeping
-/// the representative values here lets [`LinearOp`] stay at the right abstraction level while the
-/// transpose pass remains responsible for adapting between graph atoms and semantic rule inputs.
+/// The transpose builder's cotangent atoms are wrapped as [`LinearTerm<V>`] so primitive rules can
+/// emit staged cotangent contributions directly.
 ///
 /// The returned atom ids are staged cotangent contributions in the transpose builder, aligned with
-/// `inputs`.
+/// the forward primitive inputs.
 ///
 /// # Parameters
 ///   - `op`: primitive whose transpose rule should be applied.
-///   - `representative_values`: concrete exemplar value for every atom in the original forward
-///     graph, indexed by forward-graph atom id. Used to reconstruct the primitive's primal inputs
-///     and outputs for semantic transpose dispatch.
 ///   - `builder`: transpose-program builder that owns the staged cotangent atoms created while
 ///     constructing the pullback program.
-///   - `inputs`: forward-graph atom ids for the primitive inputs whose cotangent contributions this
-///     helper returns.
-///   - `outputs`: forward-graph atom ids for the primitive outputs, used to reconstruct the
-///     representative output values expected by [`LinearOp::transpose`].
 ///   - `output_cotangents`: transpose-builder atom ids for the already-staged cotangents of
-///     `outputs`.
+///     the primitive outputs.
 fn transpose<V>(
     op: &LinearProgramOpRef<V>,
-    representative_values: &[V],
     builder: &Rc<RefCell<LinearProgramBuilder<V>>>,
-    inputs: &[AtomId],
-    outputs: &[AtomId],
     output_cotangents: &[AtomId],
 ) -> Result<Vec<Option<AtomId>>, TraceError>
 where
@@ -268,17 +253,15 @@ where
         + Mul<Output = V>
         + Neg<Output = V>,
 {
-    let input_values = inputs.iter().map(|input| representative_values[*input].clone()).collect::<Vec<_>>();
-    let output_values = outputs.iter().map(|output| representative_values[*output].clone()).collect::<Vec<_>>();
     let cotangent_terms = output_cotangents
         .iter()
         .map(|cotangent| LinearTerm::from_staged_parts(*cotangent, builder.clone()))
         .collect::<Vec<_>>();
     Ok(op
-        .transpose(input_values.as_slice(), output_values.as_slice(), cotangent_terms.as_slice())?
+        .transpose(cotangent_terms.as_slice())?
         .into_iter()
         .map(|term| term.map(|term| term.atom()))
-        .collect::<Vec<_>>())
+        .collect())
 }
 
 pub fn linearize_program<V, Input, Output>(
@@ -299,7 +282,7 @@ where
 {
     fn tangent_for_atom<V, Input, Output>(
         _graph: &Graph<ProgramOpRef<V>, V, Input, Output>,
-        representative_values: &[V],
+        primal_values: &[Option<V>],
         builder: &Rc<RefCell<LinearProgramBuilder<V>>>,
         tangents: &mut [Option<LinearTerm<V>>],
         atom_id: AtomId,
@@ -312,27 +295,38 @@ where
         if let Some(term) = tangents[atom_id].clone() {
             return Ok(term);
         }
-        let tangent_atom = builder.borrow_mut().add_constant(representative_values[atom_id].zero_like());
+        let primal = primal_values[atom_id].as_ref().ok_or(TraceError::UnboundAtomId { id: atom_id })?;
+        let tangent_atom = builder.borrow_mut().add_constant(primal.zero_like());
         let tangent = LinearTerm::from_staged_parts(tangent_atom, builder.clone());
         tangents[atom_id] = Some(tangent.clone());
         Ok(tangent)
     }
 
     let graph = program.graph();
-    let representative_values = graph.representative_atom_values()?;
+    let representative_inputs = graph.representative_input_values()?;
     let zero = graph
         .input_atoms()
         .first()
-        .map(|input_atom| representative_values[*input_atom].zero_like())
+        .and_then(|_| representative_inputs.first())
+        .map(ZeroLike::zero_like)
         .ok_or(TraceError::EmptyParameterizedValue)?;
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::new()));
+    let mut primals = vec![None; graph.atom_count()];
     let mut tangents = vec![None; graph.atom_count()];
-    for input_atom in graph.input_atoms().iter().copied() {
+    for (input_atom, representative_input) in graph.input_atoms().iter().copied().zip(representative_inputs.iter()) {
         let input = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+        primals[input_atom] = Some(representative_input.clone());
         let tangent_atom = builder
             .borrow_mut()
-            .add_input_abstract(input.abstract_value.clone(), representative_values[input_atom].zero_like());
+            .add_input_abstract(input.abstract_value.clone(), representative_input.zero_like());
         tangents[input_atom] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
+    }
+    for (atom_id, atom) in graph.atoms_iter() {
+        if matches!(atom.source, AtomSource::Constant) {
+            primals[atom_id] = Some(atom.constant_value().cloned().ok_or(TraceError::InternalInvariantViolation(
+                "staged graph constant atom did not retain a literal value",
+            ))?);
+        }
     }
 
     for equation in graph.equations() {
@@ -342,10 +336,10 @@ where
             .copied()
             .map(|input_atom| {
                 Ok(JvpTracer {
-                    primal: representative_values[input_atom].clone(),
+                    primal: primals[input_atom].clone().ok_or(TraceError::UnboundAtomId { id: input_atom })?,
                     tangent: tangent_for_atom(
                         graph,
-                        representative_values.as_slice(),
+                        primals.as_slice(),
                         &builder,
                         tangents.as_mut_slice(),
                         input_atom,
@@ -358,16 +352,24 @@ where
             return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
         }
         for (output_atom, output_dual) in equation.outputs.iter().copied().zip(output_duals.into_iter()) {
+            primals[output_atom] = Some(output_dual.primal);
             tangents[output_atom] = Some(output_dual.tangent);
         }
     }
+
+    let output_examples = graph
+        .outputs()
+        .iter()
+        .copied()
+        .map(|output_atom| primals[output_atom].clone().ok_or(TraceError::UnboundAtomId { id: output_atom }))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let output_tangents = graph
         .outputs()
         .iter()
         .copied()
         .map(|output_atom| {
-            tangent_for_atom(graph, representative_values.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
+            tangent_for_atom(graph, primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
                 .map(|term| term.atom)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -386,6 +388,7 @@ where
         ))
         .simplify()?,
         zero,
+        output_examples,
         marker: PhantomData,
     })
 }
@@ -424,15 +427,20 @@ where
     }
 
     let graph = program.program.graph();
-    let representative_values = graph.representative_atom_values()?;
+    if program.output_examples.len() != graph.outputs().len() {
+        return Err(TraceError::InternalInvariantViolation(
+            "linear program output examples must align with the linear graph outputs",
+        ));
+    }
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
-    for output in graph.outputs() {
+    for (output_index, output) in graph.outputs().iter().enumerate() {
         let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
         output_cotangent_inputs.push(
-            builder
-                .borrow_mut()
-                .add_input_abstract(output_atom.abstract_value.clone(), representative_values[*output].zero_like()),
+            builder.borrow_mut().add_input_abstract(
+                output_atom.abstract_value.clone(),
+                program.output_examples[output_index].zero_like(),
+            ),
         );
     }
 
@@ -447,14 +455,7 @@ where
         let Some(equation_output_cotangents) = equation_output_cotangents else {
             continue;
         };
-        let input_cotangents = transpose(
-            &equation.op,
-            representative_values.as_slice(),
-            &builder,
-            equation.inputs.as_slice(),
-            equation.outputs.as_slice(),
-            equation_output_cotangents.as_slice(),
-        )?;
+        let input_cotangents = transpose(&equation.op, &builder, equation_output_cotangents.as_slice())?;
         for (input, contribution) in equation.inputs.iter().copied().zip(input_cotangents) {
             if let Some(contribution) = contribution {
                 accumulate(&builder, adjoints.as_mut_slice(), input, contribution)?;
@@ -485,6 +486,18 @@ where
         ))
         .simplify()?,
         zero: program.zero.clone(),
+        output_examples: graph
+            .input_atoms()
+            .iter()
+            .copied()
+            .map(|input| {
+                graph.atom(input).and_then(|atom| atom.input_exemplar().cloned()).ok_or(
+                    TraceError::InternalInvariantViolation(
+                        "linear program input atom did not retain an exemplar value",
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         marker: PhantomData,
     })
 }
@@ -634,7 +647,7 @@ where
         vec![Placeholder; primal_outputs.len()],
     ))
     .simplify()?;
-    Ok((primal_outputs, LinearProgram::from_program(program, zero)))
+    Ok((primal_outputs.clone(), LinearProgram::from_program(program, zero, primal_outputs)))
 }
 
 pub fn try_jvp_program<F, Input, Output, V>(
@@ -1684,6 +1697,7 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
     let graph = program.graph();
     let representative_values = graph.representative_atom_values()?;
+    let representative_inputs = graph.representative_input_values()?;
     let equations = graph.equations();
 
     // If the program has fewer equations than a single segment, no segmentation is needed — wrap the
@@ -1725,10 +1739,9 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
     let mut atom_mapping: Vec<Option<AtomId>> = vec![None; graph.atom_count()];
 
     // Register program inputs in the outer builder.
-    for &input_atom in input_atoms {
+    for (&input_atom, representative_input) in input_atoms.iter().zip(representative_inputs.iter()) {
         let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
-        let outer_atom =
-            outer_builder.add_input_abstract(atom.abstract_value.clone(), representative_values[input_atom].clone());
+        let outer_atom = outer_builder.add_input_abstract(atom.abstract_value.clone(), representative_input.clone());
         atom_mapping[input_atom] = Some(outer_atom);
     }
 
@@ -1779,7 +1792,13 @@ fn segment_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + R
         }
 
         // Build the sub-program for this segment.
-        let sub_program = build_segment_sub_program(graph, *segment, &boundary_input_atoms, &boundary_output_atoms)?;
+        let sub_program = build_segment_sub_program(
+            graph,
+            representative_values.as_slice(),
+            *segment,
+            &boundary_input_atoms,
+            &boundary_output_atoms,
+        )?;
 
         // Build the RematerializeOp.
         let input_types: Vec<_> = boundary_input_atoms
@@ -1847,7 +1866,7 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + ZeroLike + OneLike +
     program: &Program<V, Vec<V>, Vec<V>>,
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
     let graph = program.graph();
-    let representative_values = graph.representative_atom_values()?;
+    let representative_inputs = graph.representative_input_values()?;
     let input_types: Vec<_> = graph
         .input_atoms()
         .iter()
@@ -1880,9 +1899,10 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + ZeroLike + OneLike +
     let outer_inputs: Vec<AtomId> = graph
         .input_atoms()
         .iter()
-        .map(|&atom_id| {
+        .zip(representative_inputs.iter())
+        .map(|(&atom_id, representative_input)| {
             let atom = graph.atom(atom_id).expect("input atom should exist");
-            outer_builder.add_input_abstract(atom.abstract_value.clone(), representative_values[atom_id].clone())
+            outer_builder.add_input_abstract(atom.abstract_value.clone(), representative_input.clone())
         })
         .collect();
 
@@ -1907,12 +1927,12 @@ fn wrap_program_in_rematerialize<V: TraceValue + FloatExt + ZeroLike + OneLike +
 /// and equations within the sub-program.
 fn build_segment_sub_program<V: TraceValue + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>(
     graph: &Graph<ProgramOpRef<V>, V, Vec<V>, Vec<V>>,
+    representative_values: &[V],
     segment_equations: &[Equation<ProgramOpRef<V>>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
 ) -> Result<Program<V, Vec<V>, Vec<V>>, TraceError> {
     let mut sub_builder: ProgramBuilder<V> = ProgramBuilder::new();
-    let representative_values = graph.representative_atom_values()?;
 
     // Map from original atom IDs to sub-program atom IDs.
     let mut sub_atom_mapping: std::collections::HashMap<AtomId, AtomId> = std::collections::HashMap::new();
@@ -1985,10 +2005,21 @@ fn build_segment_sub_program<V: TraceValue + FloatExt + ZeroLike + OneLike + Mat
 #[cfg(test)]
 mod tests {
     use std::ops::{Add, Mul, Neg};
+    use std::{
+        fmt::{Debug, Display},
+        sync::Arc,
+    };
 
     use indoc::indoc;
 
-    use crate::tracing_v2::{FloatExt, test_support};
+    use crate::{
+        parameters::Placeholder,
+        tracing_v2::{
+            CustomPrimitive, DifferentiableOp, FloatExt, GraphBuilder, InterpretableOp, LinearOp, LinearPrimitiveOp,
+            Op, test_support,
+        },
+        types::{ArrayType, DataType},
+    };
 
     use super::*;
 
@@ -2009,6 +2040,61 @@ mod tests {
         T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin()
+    }
+
+    #[derive(Clone, Default)]
+    struct PanicReplayOp;
+
+    impl Debug for PanicReplayOp {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "PanicReplay")
+        }
+    }
+
+    impl Display for PanicReplayOp {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "panic_replay")
+        }
+    }
+
+    impl Op for PanicReplayOp {
+        fn name(&self) -> &'static str {
+            "panic_replay"
+        }
+
+        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![inputs[0].clone()])
+        }
+    }
+
+    impl InterpretableOp<f64> for PanicReplayOp {
+        fn interpret(&self, _inputs: &[f64]) -> Result<Vec<f64>, TraceError> {
+            panic!("panic_replay interpret should not run during this transform")
+        }
+    }
+
+    impl LinearOp<f64> for PanicReplayOp {
+        fn transpose(&self, output_cotangents: &[LinearTerm<f64>]) -> Result<Vec<Option<LinearTerm<f64>>>, TraceError> {
+            if output_cotangents.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+            }
+            Ok(vec![Some(output_cotangents[0].clone())])
+        }
+    }
+
+    impl DifferentiableOp<f64, LinearTerm<f64>> for PanicReplayOp {
+        fn jvp(
+            &self,
+            inputs: &[JvpTracer<f64, LinearTerm<f64>>],
+        ) -> Result<Vec<JvpTracer<f64, LinearTerm<f64>>>, TraceError> {
+            if inputs.len() != 1 {
+                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+            }
+            Ok(vec![inputs[0].clone()])
+        }
     }
 
     #[test]
@@ -2075,6 +2161,37 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn linearize_program_does_not_replay_the_forward_graph_to_recover_representatives() {
+        let primitive = CustomPrimitive::<f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
+        let mut builder = GraphBuilder::<ProgramOpRef<f64>, f64>::new();
+        let input = builder.add_input(&3.0f64);
+        let output = builder.add_equation_prevalidated(
+            PrimitiveOp::Custom(Arc::new(primitive)),
+            vec![input],
+            vec![ArrayType::scalar(DataType::F64)],
+        );
+        let program = Program::from_graph(builder.build::<f64, f64>(output, Placeholder, Placeholder));
+
+        let pushforward = linearize_program(&program).unwrap();
+        approx_eq(pushforward.call(2.5f64).unwrap(), 2.5);
+    }
+
+    #[test]
+    fn transpose_linear_program_does_not_replay_the_forward_linear_graph_to_recover_representatives() {
+        let primitive =
+            LinearPrimitiveOp::custom(CustomPrimitive::<f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp))
+                .unwrap();
+        let mut builder = GraphBuilder::<LinearProgramOpRef<f64>, f64>::new();
+        let input = builder.add_input(&0.0f64);
+        let output = builder.add_equation_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
+        let program = Program::from_graph(builder.build::<f64, f64>(output, Placeholder, Placeholder));
+        let pushforward = LinearProgram::from_program(program, 0.0f64, vec![7.0f64]);
+
+        let pullback = transpose_linear_program(&pushforward).unwrap();
+        approx_eq(pullback.call(4.0f64).unwrap(), 4.0);
     }
 
     #[test]

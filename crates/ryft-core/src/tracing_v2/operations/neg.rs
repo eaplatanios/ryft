@@ -59,14 +59,7 @@ impl<V: TraceValue + Neg<Output = V>> InterpretableOp<V> for NegOp {
 }
 
 impl<V: TraceValue + Neg<Output = V> + ZeroLike> LinearOp<V> for NegOp {
-    fn transpose(
-        &self,
-        inputs: &[V],
-        outputs: &[V],
-        output_cotangents: &[LinearTerm<V>],
-    ) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
-        expect_input_count(inputs.len(), 1)?;
-        expect_input_count(outputs.len(), 1)?;
+    fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone().neg())])
     }
