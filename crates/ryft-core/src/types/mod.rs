@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 pub mod array_types;
 pub mod data_types;
 pub mod layouts;
@@ -21,10 +23,13 @@ pub trait Type {
 /// is the value-level counterpart to [`Type`]. While [`Type`] models relationships between abstract type descriptors,
 /// [`Typed`] lets a concrete value produce the descriptor that should represent it during tracing, staging, type
 /// checking, and other forms of abstract reasoning.
-pub trait Typed<T: Type> {
+pub trait Typed<T: Type + Clone> {
     /// Returns the [`Type`] description of this value. The returned [`Type`] should capture the structural information
-    /// that Ryft needs to reason about the value without having to inspect its contents.
-    fn tpe(&self) -> T;
+    /// that Ryft needs to reason about the value without having to inspect its contents. Note that returning a [`Cow`]
+    /// lets implementors lend out a stored [`Type`] by borrow when one is cached on the value, while still supporting
+    /// values that compute their [`Type`] on the fly (and return [`Cow::Owned`]). Callers that need ownership can call
+    /// [`Cow::into_owned`] to clone on demand.
+    fn tpe(&self) -> Cow<'_, T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -34,8 +39,8 @@ pub trait Typed<T: Type> {
 macro_rules! impl_typed_for_scalar {
     ($ty:ty, $data_type:path) => {
         impl Typed<ArrayType> for $ty {
-            fn tpe(&self) -> ArrayType {
-                ArrayType::scalar($data_type)
+            fn tpe(&self) -> Cow<'_, ArrayType> {
+                Cow::Owned(ArrayType::scalar($data_type))
             }
         }
     };
