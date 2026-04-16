@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Expanded executable compiled-memory statistics support to include total allocator bytes, indefinite allocations,
   and peak unpadded heap bytes.
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
+- Changed `ExecutionInput::buffer` to an `Arc<Buffer<'o>>` instead of a `Buffer<'o>`.
 
 ## [0.0.2] - 2026-03-02
 

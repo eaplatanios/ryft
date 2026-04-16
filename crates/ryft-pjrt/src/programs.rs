@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use prost::Message;
 
@@ -997,13 +997,18 @@ impl Drop for LoadedExecutable<'_> {
 
 /// Represents a [`Buffer`] that is used as input in a [`LoadedExecutable::execute`] invocation.
 pub struct ExecutionInput<'o> {
-    /// [`Buffer`] to use as the input value.
-    pub buffer: Buffer<'o>,
+    /// Reference-counted [`Buffer`] to use as the input value. [`ExecutionInput`] holds an [`Arc<Buffer>`] rather than
+    /// an owned [`Buffer`] so that callers can share a single PJRT handle across multiple concurrent executions and across
+    /// long-lived array containers, without a per-execute PJRT-level copy.
+    pub buffer: Arc<Buffer<'o>>,
 
     /// Boolean flag indicating whether `buffer` should be treated as _donatable_, meaning that the runtime would be
     /// allowed to reuse the [`Buffer`]'s storage for output values and force treating the `buffer` as invalid after
     /// the execution completes. Note that, when executing on multiple [`Device`]s, this flag must be set to the same
     /// value for all corresponding [`ExecutionInput`]s on its [`Device`] (i.e., inputs at the same position).
+    ///
+    /// Donation is only meaningful when the caller holds the unique [`Arc`] clone for `buffer`; otherwise, other clones
+    /// would observe an invalidated PJRT handle after execution completes.
     ///
     /// # Copy Protection
     ///
@@ -1020,6 +1025,12 @@ pub struct ExecutionInput<'o> {
 
 impl<'o> From<Buffer<'o>> for ExecutionInput<'o> {
     fn from(buffer: Buffer<'o>) -> Self {
+        Self { buffer: Arc::new(buffer), donatable: false }
+    }
+}
+
+impl<'o> From<Arc<Buffer<'o>>> for ExecutionInput<'o> {
+    fn from(buffer: Arc<Buffer<'o>>) -> Self {
         Self { buffer, donatable: false }
     }
 }
@@ -2802,8 +2813,8 @@ mod tests {
             // Construct the execution device inputs that consist of our two tensors.
             let inputs = ExecutionDeviceInputs {
                 inputs: &[
-                    ExecutionInput { buffer: lhs_buffer, donatable: false },
-                    ExecutionInput { buffer: rhs_buffer, donatable: false },
+                    ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false },
+                    ExecutionInput { buffer: Arc::new(rhs_buffer), donatable: false },
                 ],
                 ..Default::default()
             };
@@ -2920,7 +2931,9 @@ mod tests {
         // and the `donatable` flag for each input at the same index must be the same across all devices.
         let device_1_inputs: Vec<ExecutionInput> = vec![
             ExecutionInput {
-                buffer: client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap(),
+                buffer: Arc::new(
+                    client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap(),
+                ),
                 donatable: true,
             },
             client.buffer(&[0u8; 4], BufferType::I32, &[], None, devices[1].clone(), None).unwrap().into(),
@@ -2986,8 +2999,8 @@ mod tests {
                     // Construct the execution device inputs that consist of our two tensors and send callback.
                     let inputs = ExecutionDeviceInputs {
                         inputs: &[
-                            ExecutionInput { buffer: lhs_buffer, donatable: false },
-                            ExecutionInput { buffer: rhs_buffer, donatable: false },
+                            ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false },
+                            ExecutionInput { buffer: Arc::new(rhs_buffer), donatable: false },
                         ],
                         send_callbacks: vec![send_callback],
                         ..Default::default()
@@ -3080,7 +3093,7 @@ mod tests {
 
                     // Construct the execution device inputs that consist of our input tensor and receive callback.
                     let inputs = ExecutionDeviceInputs {
-                        inputs: &[ExecutionInput { buffer: lhs_buffer, donatable: false }],
+                        inputs: &[ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false }],
                         receive_callbacks: vec![receive_callback],
                         ..Default::default()
                     };
@@ -3184,7 +3197,7 @@ mod tests {
 
                     // Construct the execution device inputs that consist of our input tensor and callbacks.
                     let inputs = ExecutionDeviceInputs {
-                        inputs: &[ExecutionInput { buffer: lhs_buffer, donatable: false }],
+                        inputs: &[ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false }],
                         send_callbacks: vec![send_callback],
                         receive_callbacks: vec![receive_callback],
                         ..Default::default()

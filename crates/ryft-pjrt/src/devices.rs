@@ -1180,6 +1180,7 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use indoc::indoc;
 
@@ -1301,29 +1302,33 @@ mod tests {
                 vec![ExecutionDeviceInputs {
                     inputs: &[
                         ExecutionInput {
-                            buffer: client
-                                .buffer(
-                                    &[0u8; 4096 * 4096 * size_of::<f32>()],
-                                    BufferType::F32,
-                                    [4096u64, 4096u64],
-                                    None,
-                                    device.clone(),
-                                    None,
-                                )
-                                .unwrap(),
+                            buffer: Arc::new(
+                                client
+                                    .buffer(
+                                        &[0u8; 4096 * 4096 * size_of::<f32>()],
+                                        BufferType::F32,
+                                        [4096u64, 4096u64],
+                                        None,
+                                        device.clone(),
+                                        None,
+                                    )
+                                    .unwrap(),
+                            ),
                             donatable: false,
                         },
                         ExecutionInput {
-                            buffer: client
-                                .buffer(
-                                    &[0u8; 4096 * 4096 * size_of::<f32>()],
-                                    BufferType::F32,
-                                    [4096u64, 4096u64],
-                                    None,
-                                    device.clone(),
-                                    None,
-                                )
-                                .unwrap(),
+                            buffer: Arc::new(
+                                client
+                                    .buffer(
+                                        &[0u8; 4096 * 4096 * size_of::<f32>()],
+                                        BufferType::F32,
+                                        [4096u64, 4096u64],
+                                        None,
+                                        device.clone(),
+                                        None,
+                                    )
+                                    .unwrap(),
+                            ),
                             donatable: false,
                         },
                     ],

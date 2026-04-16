@@ -53,6 +53,8 @@ At a high-level, a typical workflow for working with `ryft-pjrt` looks as follow
 The following is an example that shows how you can compile and execute a simple StableHLO program:
 
 ```rust
+use std::sync::Arc;
+
 use ryft_pjrt::protos::*;
 use ryft_pjrt::*;
 
@@ -89,8 +91,8 @@ fn main() {
     let rhs_buffer = client.buffer(&rhs, BufferType::I32, &[2, 1], None, device, None)?;
     let inputs = ExecutionDeviceInputs {
         inputs: &[
-            ExecutionInput { buffer: lhs_buffer, donatable: false },
-            ExecutionInput { buffer: rhs_buffer, donatable: false },
+            ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false },
+            ExecutionInput { buffer: Arc::new(rhs_buffer), donatable: false },
         ],
         ..Default::default()
     };

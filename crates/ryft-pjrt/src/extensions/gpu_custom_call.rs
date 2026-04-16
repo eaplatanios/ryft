@@ -422,6 +422,7 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
@@ -475,15 +476,19 @@ mod tests {
         let inputs = ExecutionDeviceInputs {
             inputs: &[
                 ExecutionInput {
-                    buffer: client
-                        .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
-                        .unwrap(),
+                    buffer: Arc::new(
+                        client
+                            .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .unwrap(),
+                    ),
                     donatable: false,
                 },
                 ExecutionInput {
-                    buffer: client
-                        .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
-                        .unwrap(),
+                    buffer: Arc::new(
+                        client
+                            .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+                            .unwrap(),
+                    ),
                     donatable: false,
                 },
             ],

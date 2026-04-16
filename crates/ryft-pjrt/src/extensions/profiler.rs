@@ -525,6 +525,7 @@ pub(crate) mod ffi {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use indoc::indoc;
 
@@ -612,8 +613,8 @@ mod tests {
                         .unwrap();
                     let inputs = ExecutionDeviceInputs {
                         inputs: &[
-                            ExecutionInput { buffer: lhs_buffer, donatable: false },
-                            ExecutionInput { buffer: rhs_buffer, donatable: false },
+                            ExecutionInput { buffer: Arc::new(lhs_buffer), donatable: false },
+                            ExecutionInput { buffer: Arc::new(rhs_buffer), donatable: false },
                         ],
                         ..Default::default()
                     };
