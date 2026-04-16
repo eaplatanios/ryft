@@ -183,7 +183,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 }
 
 /// StableHLO lowering hook carried by one [`CustomPrimitive`].
-pub(crate) trait StableHloCustomLowering<V: Traceable>: Send + Sync {
+pub(crate) trait StableHloCustomLowering<V: Traceable<ArrayType>>: Send + Sync {
     /// Lowers one custom primitive to StableHLO/Shardy operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -196,11 +196,11 @@ pub(crate) trait StableHloCustomLowering<V: Traceable>: Send + Sync {
 
 /// Typed StableHLO lowering extension stored inside one [`CustomPrimitive`].
 #[derive(Clone)]
-pub(crate) struct StableHloCustomLoweringExtension<V: Traceable> {
+pub(crate) struct StableHloCustomLoweringExtension<V: Traceable<ArrayType>> {
     lowering: std::sync::Arc<dyn StableHloCustomLowering<V>>,
 }
 
-impl<V: Traceable> StableHloCustomLoweringExtension<V> {
+impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
     /// Creates one StableHLO lowering extension from a registered lowering rule.
     pub(crate) fn new(lowering: std::sync::Arc<dyn StableHloCustomLowering<V>>) -> Self {
         Self { lowering }
@@ -224,7 +224,7 @@ impl<V: Traceable> StableHloCustomLoweringExtension<V> {
 /// [`to_mlir_module_for_plain_graph`] and related entry points. The [`PrimitiveOp`] and
 /// [`LinearPrimitiveOp`] enums provide blanket implementations covering the built-in forward and
 /// linear op universes respectively.
-pub(crate) trait XlaOp<V: Traceable>: ryft_core::tracing_v2::ops::Op {
+pub(crate) trait XlaOp<V: Traceable<ArrayType>>: ryft_core::tracing_v2::ops::Op {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -237,7 +237,7 @@ pub(crate) trait XlaOp<V: Traceable>: ryft_core::tracing_v2::ops::Op {
         V: MlirLowerableValue;
 }
 
-impl<V: Traceable> XlaOp<V> for AddOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for AddOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -254,7 +254,7 @@ impl<V: Traceable> XlaOp<V> for AddOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for MulOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for MulOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -273,7 +273,7 @@ impl<V: Traceable> XlaOp<V> for MulOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for NegOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for NegOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -289,7 +289,7 @@ impl<V: Traceable> XlaOp<V> for NegOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for SinOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for SinOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -308,7 +308,7 @@ impl<V: Traceable> XlaOp<V> for SinOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for CosOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for CosOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -327,7 +327,7 @@ impl<V: Traceable> XlaOp<V> for CosOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for MatrixTransposeOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for MatrixTransposeOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -343,7 +343,7 @@ impl<V: Traceable> XlaOp<V> for MatrixTransposeOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for LinearMatrixTransposeOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for LinearMatrixTransposeOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -359,7 +359,7 @@ impl<V: Traceable> XlaOp<V> for LinearMatrixTransposeOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for MatMulOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for MatMulOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -385,7 +385,7 @@ impl<V: Traceable> XlaOp<V> for MatMulOp {
     }
 }
 
-impl<V: Traceable> XlaOp<V> for ScaleOp<V> {
+impl<V: Traceable<ArrayType>> XlaOp<V> for ScaleOp<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -426,7 +426,7 @@ impl<V: Traceable> XlaOp<V> for ScaleOp<V> {
     }
 }
 
-impl<V: Traceable + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for LeftMatMulOp<V> {
+impl<V: Traceable<ArrayType> + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for LeftMatMulOp<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -460,7 +460,7 @@ impl<V: Traceable + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for LeftMatMulOp<
     }
 }
 
-impl<V: Traceable + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for RightMatMulOp<V> {
+impl<V: Traceable<ArrayType> + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for RightMatMulOp<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -494,7 +494,7 @@ impl<V: Traceable + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for RightMatMulOp
     }
 }
 
-impl<V: Traceable> XlaOp<V> for ReshapeOp {
+impl<V: Traceable<ArrayType>> XlaOp<V> for ReshapeOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -516,7 +516,7 @@ impl<V: Traceable> XlaOp<V> for ReshapeOp {
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + ryft_core::tracing_v2::FloatExt
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
@@ -539,7 +539,7 @@ impl<
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + ryft_core::tracing_v2::FloatExt
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
@@ -569,7 +569,7 @@ impl<
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + ryft_core::tracing_v2::FloatExt
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
@@ -598,7 +598,7 @@ impl<
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + ryft_core::tracing_v2::FloatExt
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
@@ -679,7 +679,7 @@ impl<
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + ryft_core::tracing_v2::FloatExt
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
@@ -1034,7 +1034,7 @@ where
 }
 
 /// Value type that can be materialized as a StableHLO dense constant during benchmark lowering.
-pub(crate) trait MlirLowerableValue: Traceable + Typed<ArrayType> + Clone + 'static {
+pub(crate) trait MlirLowerableValue: Traceable<ArrayType> + Typed<ArrayType> + Clone + 'static {
     /// Builds a dense-elements attribute containing this value.
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -1285,7 +1285,7 @@ enum VMapLoweringMode {
 /// Maps the canonical traced `vmap` op to the lowering-specific packing mode.
 fn lower_vmap_mode<V>(_vmap_op: &VMapOp<V>) -> VMapLoweringMode
 where
-    V: Traceable,
+    V: Traceable<ArrayType>,
 {
     VMapLoweringMode::Forward
 }

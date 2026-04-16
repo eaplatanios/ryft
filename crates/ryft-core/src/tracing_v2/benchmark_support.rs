@@ -13,6 +13,7 @@ use crate::tracing_v2::{
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_graph},
     grad, jit, jvp, jvp_program, linearize, stack, try_jit, unstack, value_and_grad, vjp, vmap,
 };
+use crate::types::ArrayType;
 #[cfg(feature = "ndarray")]
 use crate::tracing_v2::{MatrixOps, ZeroLike};
 
@@ -66,7 +67,7 @@ fn summarize_program<V, Input, Output, O>(
     program: &Program<V, Input, Output, O>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
-    V: Traceable,
+    V: Traceable<ArrayType>,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
     O: Clone + std::fmt::Display + crate::tracing_v2::Op,
@@ -87,7 +88,7 @@ fn tracing_record<V, Input, Output, O>(
     program: &Program<V, Input, Output, O>,
 ) -> Result<IrBenchmarkRecord, BenchmarkError>
 where
-    V: Traceable
+    V: Traceable<ArrayType>
         + crate::tracing_v2::FloatExt
         + crate::tracing_v2::ZeroLike
         + crate::tracing_v2::OneLike

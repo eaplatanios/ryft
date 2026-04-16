@@ -24,7 +24,7 @@ use crate::{
 ///
 /// The default implementation is the primal type itself, but transforms such as `linearize` replace tangents with a
 /// staged linear representation like [`crate::tracing_v2::LinearTerm`].
-pub trait TangentSpace<V: Traceable>: Clone + Parameter {
+pub trait TangentSpace<V: Traceable<ArrayType>>: Clone + Parameter {
     /// Adds two tangent values.
     fn add(lhs: Self, rhs: Self) -> Self;
 
@@ -38,7 +38,7 @@ pub trait TangentSpace<V: Traceable>: Clone + Parameter {
     fn zero_like(primal: &V, tangent: &Self) -> Self;
 }
 
-impl<V: Traceable + FloatExt + ZeroLike> TangentSpace<V> for V {
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike> TangentSpace<V> for V {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
         lhs + rhs
@@ -74,25 +74,25 @@ pub struct JvpTracer<V, T> {
     pub tangent: T,
 }
 
-impl<V: Traceable, T: TangentSpace<V>> Parameter for JvpTracer<V, T> {}
+impl<V: Traceable<ArrayType>, T: TangentSpace<V>> Parameter for JvpTracer<V, T> {}
 
-impl<V: Traceable, T: TangentSpace<V> + 'static> Typed<ArrayType> for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType>, T: TangentSpace<V> + 'static> Typed<ArrayType> for JvpTracer<V, T> {
     #[inline]
     fn tpe(&self) -> ArrayType {
         <V as Typed<ArrayType>>::tpe(&self.primal)
     }
 }
 
-impl<V: Traceable, T: TangentSpace<V> + 'static> Traceable for JvpTracer<V, T> {}
+impl<V: Traceable<ArrayType>, T: TangentSpace<V> + 'static> Traceable<ArrayType> for JvpTracer<V, T> {}
 
-impl<V: Traceable + ZeroLike, T: TangentSpace<V>> ZeroLike for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + ZeroLike, T: TangentSpace<V>> ZeroLike for JvpTracer<V, T> {
     #[inline]
     fn zero_like(&self) -> Self {
         Self { primal: self.primal.zero_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
     }
 }
 
-impl<V: Traceable + crate::tracing_v2::OneLike, T: TangentSpace<V>> crate::tracing_v2::OneLike
+impl<V: Traceable<ArrayType> + crate::tracing_v2::OneLike, T: TangentSpace<V>> crate::tracing_v2::OneLike
     for JvpTracer<V, T>
 {
     #[inline]
@@ -112,7 +112,7 @@ pub trait JvpInvocationLeaf<
 >: Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: Traceable + FloatExt + ZeroLike + MatrixOps;
+    type Base: Traceable<ArrayType> + FloatExt + ZeroLike + MatrixOps;
 
     /// Input type expected by the user-provided function.
     type FunctionInput;
@@ -128,14 +128,14 @@ pub trait JvpInvocationLeaf<
 
 fn single_output<V, T>(mut outputs: Vec<JvpTracer<V, T>>, op: &'static str) -> JvpTracer<V, T>
 where
-    V: Traceable,
+    V: Traceable<ArrayType>,
     T: TangentSpace<V>,
 {
     debug_assert_eq!(outputs.len(), 1, "{op} should produce a single JVP output");
     outputs.pop().expect("single-output primitive should return one JVP output")
 }
 
-impl<V: Traceable + Add<Output = V> + ZeroLike, T: TangentSpace<V>> Add for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<V>> Add for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -144,7 +144,7 @@ impl<V: Traceable + Add<Output = V> + ZeroLike, T: TangentSpace<V>> Add for JvpT
     }
 }
 
-impl<V: Traceable + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> Mul for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> Mul for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -153,7 +153,7 @@ impl<V: Traceable + Mul<Output = V> + ZeroLike, T: TangentSpace<V>> Mul for JvpT
     }
 }
 
-impl<V: Traceable + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> Neg for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> Neg for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -162,7 +162,7 @@ impl<V: Traceable + Neg<Output = V> + ZeroLike, T: TangentSpace<V>> Neg for JvpT
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> {
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTracer<V, T> {
     #[inline]
     fn sin(self) -> Self {
         single_output(SinOp.jvp(&[self]).expect("sin JVP rule should succeed"), "sin")
@@ -177,12 +177,12 @@ impl<V: Traceable + FloatExt + ZeroLike, T: TangentSpace<V>> FloatExt for JvpTra
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`JitTracer`] to build a staged
 /// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + ZeroLike
         + crate::tracing_v2::OneLike
-        + crate::tracing_v2::Value
+        + crate::tracing_v2::Value<ArrayType>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
@@ -216,7 +216,7 @@ where
 /// symbolically inside an enclosing [`JitTracer`] scope, staging both the primal output and the
 /// tangent propagation as part of the outer compiled graph.
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + ZeroLike
@@ -256,7 +256,7 @@ where
 /// takes primals and tangents and returns `(primal_output, tangent_output)` per lane is compiled via
 /// [`try_jit`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + ZeroLike

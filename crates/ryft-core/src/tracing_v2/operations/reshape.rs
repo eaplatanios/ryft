@@ -185,9 +185,9 @@ pub trait ReshapeOps: Sized {
 }
 
 /// Convenience trait for traceable leaves that can serve as the concrete values of a staged reshape.
-pub trait ReshapeValue: Traceable + ReshapeOps {}
+pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
 
-impl<T: Traceable + ReshapeOps> ReshapeValue for T {}
+impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 /// Tangent-space reshape capability used by [`JvpTracer`].
 pub trait ReshapeTangentSpace<V: ReshapeValue>: TangentSpace<V> {
@@ -229,7 +229,7 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<V: Traceable + ReshapeOps> ReshapeOps for JitTracer<V> {
+impl<V: Traceable<ArrayType> + ReshapeOps> ReshapeOps for JitTracer<V> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
         let input_type = self.tpe();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;

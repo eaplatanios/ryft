@@ -34,9 +34,9 @@ pub trait MatrixOps: Sized {
 ///
 /// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in this module expect
 /// those array types to describe rank-2 matrices with static dimensions and floating-point element types.
-pub trait MatrixValue: Traceable + MatrixOps {}
+pub trait MatrixValue: Traceable<ArrayType> + MatrixOps {}
 
-impl<T: Traceable + MatrixOps> MatrixValue for T {}
+impl<T: Traceable<ArrayType> + MatrixOps> MatrixValue for T {}
 
 impl MatrixOps for f32 {
     #[inline]
@@ -204,7 +204,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     }
 }
 
-impl<V: Traceable + MatrixOps> MatrixOps for JitTracer<V> {
+impl<V: Traceable<ArrayType> + MatrixOps> MatrixOps for JitTracer<V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
         self.binary(rhs, PrimitiveOp::MatMul, MatrixOps::matmul)
@@ -299,7 +299,7 @@ mod ndarray_support {
         }
     }
 
-    impl Traceable for Array2<f32> {
+    impl Traceable<ArrayType> for Array2<f32> {
         fn is_zero(&self) -> bool {
             self.iter().all(|&x| x == 0.0)
         }
@@ -309,7 +309,7 @@ mod ndarray_support {
         }
     }
 
-    impl crate::tracing_v2::Value for Array2<f32> {}
+    impl crate::tracing_v2::Value<ArrayType> for Array2<f32> {}
 
     impl Typed<ArrayType> for Array2<f64> {
         #[inline]
@@ -318,7 +318,7 @@ mod ndarray_support {
         }
     }
 
-    impl Traceable for Array2<f64> {
+    impl Traceable<ArrayType> for Array2<f64> {
         fn is_zero(&self) -> bool {
             self.iter().all(|&x| x == 0.0)
         }
@@ -328,7 +328,7 @@ mod ndarray_support {
         }
     }
 
-    impl crate::tracing_v2::Value for Array2<f64> {}
+    impl crate::tracing_v2::Value<ArrayType> for Array2<f64> {}
 
     impl ZeroLike for Array2<f32> {
         #[inline]

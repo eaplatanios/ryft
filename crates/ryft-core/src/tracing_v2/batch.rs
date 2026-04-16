@@ -14,7 +14,7 @@ use crate::{
         operations::{AddOp, CosOp, FlatTracedVMap, MulOp, NegOp, SinOp, VMapOp},
         ops::{PrimitiveOp, VectorizableOp},
     },
-    types::Typed,
+    types::{ArrayType, Typed},
 };
 use ryft_macros::Parameter;
 
@@ -61,7 +61,7 @@ fn single_output<V>(mut outputs: Vec<Batch<V>>, op: &'static str) -> Batch<V> {
     outputs.pop().expect("single-output primitive should return one batched output")
 }
 
-impl<V: Traceable + Add<Output = V>> Add for Batch<V> {
+impl<V: Traceable<ArrayType> + Add<Output = V>> Add for Batch<V> {
     type Output = Self;
 
     #[inline]
@@ -70,7 +70,7 @@ impl<V: Traceable + Add<Output = V>> Add for Batch<V> {
     }
 }
 
-impl<V: Traceable + Mul<Output = V>> Mul for Batch<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> Mul for Batch<V> {
     type Output = Self;
 
     #[inline]
@@ -79,7 +79,7 @@ impl<V: Traceable + Mul<Output = V>> Mul for Batch<V> {
     }
 }
 
-impl<V: Traceable + Neg<Output = V>> Neg for Batch<V> {
+impl<V: Traceable<ArrayType> + Neg<Output = V>> Neg for Batch<V> {
     type Output = Self;
 
     #[inline]
@@ -88,7 +88,7 @@ impl<V: Traceable + Neg<Output = V>> Neg for Batch<V> {
     }
 }
 
-impl<V: Traceable + FloatExt> FloatExt for Batch<V> {
+impl<V: Traceable<ArrayType> + FloatExt> FloatExt for Batch<V> {
     #[inline]
     fn sin(self) -> Self {
         single_output(SinOp.batch(&[self]).expect("sin batching rule should succeed"), "sin")
@@ -194,12 +194,12 @@ pub(crate) trait VMapInvocationLeaf<
 /// Concrete-value dispatch for [`vmap`]: stacks inputs into [`Batch`] leaves, applies the user function
 /// over the batched representation, and unstacks the result back into per-lane outputs.
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + ZeroLike
         + OneLike
-        + crate::tracing_v2::Value
+        + crate::tracing_v2::Value<ArrayType>
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -223,7 +223,7 @@ where
 /// once at a single-lane exemplar and compiled into a [`CompiledFunction`] that lowering can later
 /// emit as packed StableHLO.
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + ZeroLike
@@ -346,7 +346,7 @@ where
 /// results are stacked back. No trace-once pattern is needed here because the delegation to the
 /// concrete implementation handles each lane directly.
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
         + FloatExt
         + ZeroLike

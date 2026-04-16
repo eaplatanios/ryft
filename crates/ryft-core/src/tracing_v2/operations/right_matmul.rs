@@ -99,7 +99,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps>
     InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>> for RightMatMulOp<V>
 {
     fn interpret(

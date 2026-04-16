@@ -22,11 +22,11 @@ use super::{expect_input_count, lift_jit_constant, unary_abstract};
 
 /// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]
-pub struct ScaleOp<V: Traceable> {
+pub struct ScaleOp<V: Traceable<ArrayType>> {
     factor: V,
 }
 
-impl<V: Traceable> ScaleOp<V> {
+impl<V: Traceable<ArrayType>> ScaleOp<V> {
     /// Creates a new scale operation capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
@@ -45,19 +45,19 @@ impl<V: Traceable> ScaleOp<V> {
     }
 }
 
-impl<V: Traceable> Debug for ScaleOp<V> {
+impl<V: Traceable<ArrayType>> Debug for ScaleOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Scale")
     }
 }
 
-impl<V: Traceable> Display for ScaleOp<V> {
+impl<V: Traceable<ArrayType>> Display for ScaleOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "scale")
     }
 }
 
-impl<V: Traceable> Op for ScaleOp<V> {
+impl<V: Traceable<ArrayType>> Op for ScaleOp<V> {
     fn name(&self) -> &'static str {
         "scale"
     }
@@ -76,21 +76,21 @@ impl<V: Traceable> Op for ScaleOp<V> {
     }
 }
 
-impl<V: Traceable + Mul<Output = V>> InterpretableOp<V> for ScaleOp<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<V> for ScaleOp<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
 }
 
-impl<V: Traceable + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOp<V> for ScaleOp<V> {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone().scale(self.factor().clone()))])
     }
 }
 
-impl<V: Traceable + ZeroLike + Mul<Output = V>> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
+impl<V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>> InterpretableOp<crate::tracing_v2::linear::Linearized<JitTracer<V>>>
     for ScaleOp<V>
 {
     fn interpret(
@@ -106,7 +106,7 @@ impl<V: Traceable + ZeroLike + Mul<Output = V>> InterpretableOp<crate::tracing_v
     }
 }
 
-impl<V: Traceable + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for ScaleOp<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for ScaleOp<V> {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
@@ -117,7 +117,7 @@ impl<V: Traceable + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> 
     }
 }
 
-impl<V: Traceable + Mul<Output = V>> VectorizableOp<V> for ScaleOp<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOp<V> for ScaleOp<V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| self.factor().clone() * lane).collect())])

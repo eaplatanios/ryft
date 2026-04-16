@@ -12,6 +12,7 @@ use crate::{
         Graph, GraphBuilder, InterpretableOp, Op, TraceError, Traceable,
         ops::{LinearPrimitiveOp, PrimitiveOp},
     },
+    types::ArrayType,
 };
 
 /// Canonical operation type used by the staged program IR.
@@ -27,13 +28,13 @@ pub type LinearProgramOpRef<V> = LinearPrimitiveOp<V>;
 pub type LinearProgramBuilder<V> = GraphBuilder<LinearProgramOpRef<V>, V>;
 
 /// Canonical staged program used by `tracing_v2`.
-pub struct Program<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone = ProgramOpRef<V>> {
+pub struct Program<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone = ProgramOpRef<V>> {
     graph: Graph<O, V, Input, Output>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
 impl<
-    V: Traceable,
+    V: Traceable<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: Clone,
@@ -44,7 +45,7 @@ impl<
     }
 }
 
-impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> Program<V, Input, Output, O> {
+impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> Program<V, Input, Output, O> {
     /// Creates a program from an existing staged graph.
     #[inline]
     pub fn from_graph(graph: Graph<O, V, Input, Output>) -> Self {
@@ -79,7 +80,7 @@ impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> 
     }
 }
 
-impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
+impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
     for Program<V, Input, Output, O>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

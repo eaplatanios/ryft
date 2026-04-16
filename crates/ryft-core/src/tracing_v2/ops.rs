@@ -68,7 +68,7 @@ pub trait Op: Debug + Display {
 ///
 /// Separated from [`Op`] so that graph construction, display, and simplification can work without value-type bounds.
 /// Only code paths that actually execute operations (graph replay, JIT example propagation) require this trait.
-pub trait InterpretableOp<V: Traceable>: Op {
+pub trait InterpretableOp<V: Traceable<ArrayType>>: Op {
     /// Executes the operation on concrete values.
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
 }
@@ -137,7 +137,7 @@ pub trait InterpretableOp<V: Traceable>: Op {
 ///
 /// Structural validation happens when the forward linear program is built and when any staged ops
 /// emitted by the rule are added to the transpose program.
-pub trait LinearOp<V: Traceable>: Op {
+pub trait LinearOp<V: Traceable<ArrayType>>: Op {
     /// Applies the transpose rule for reverse-mode differentiation.
     ///
     /// `output_cotangents` is aligned with the op outputs in forward order. The returned vector
@@ -158,13 +158,13 @@ pub trait LinearOp<V: Traceable>: Op {
 ///
 /// [`TangentSpace`]: crate::tracing_v2::forward::TangentSpace
 /// [`MatrixTangentSpace`]: crate::tracing_v2::MatrixTangentSpace
-pub trait DifferentiableOp<V: Traceable, T>: Op {
+pub trait DifferentiableOp<V: Traceable<ArrayType>, T>: Op {
     /// Applies the forward-mode JVP rule.
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError>;
 }
 
 /// Primitive operation with a batching rule used by `vmap`.
-pub trait VectorizableOp<V: Traceable>: Op {
+pub trait VectorizableOp<V: Traceable<ArrayType>>: Op {
     /// Applies the primitive's batching rule to batched inputs.
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
@@ -193,9 +193,9 @@ impl CustomPrimitiveExtensions {
     }
 }
 
-trait CustomBaseOp<V: Traceable>: Op + InterpretableOp<V> + Send + Sync {}
+trait CustomBaseOp<V: Traceable<ArrayType>>: Op + InterpretableOp<V> + Send + Sync {}
 
-impl<V: Traceable, T: Op + InterpretableOp<V> + Send + Sync> CustomBaseOp<V> for T {}
+impl<V: Traceable<ArrayType>, T: Op + InterpretableOp<V> + Send + Sync> CustomBaseOp<V> for T {}
 
 /// Rule-based registration object used by [`PrimitiveOp::Custom`].
 ///
@@ -207,7 +207,7 @@ impl<V: Traceable, T: Op + InterpretableOp<V> + Send + Sync> CustomBaseOp<V> for
 /// - [`VectorizableOp<V>`] for `vmap`, and
 /// - [`InterpretableOp<Linearized<JitTracer<V>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
-pub struct CustomPrimitive<V: Traceable> {
+pub struct CustomPrimitive<V: Traceable<ArrayType>> {
     base: Arc<dyn CustomBaseOp<V>>,
     transpose_rule: Option<Arc<dyn LinearOp<V> + Send + Sync>>,
     jvp_rule: Option<Arc<dyn DifferentiableOp<V, LinearTerm<V>> + Send + Sync>>,
@@ -216,7 +216,7 @@ pub struct CustomPrimitive<V: Traceable> {
     extensions: CustomPrimitiveExtensions,
 }
 
-impl<V: Traceable> CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> CustomPrimitive<V> {
     /// Creates one custom primitive from its required base operation.
     pub fn new<Base>(base: Base) -> Self
     where
@@ -264,7 +264,7 @@ impl<V: Traceable> CustomPrimitive<V> {
     pub fn with_linearized_jit_rule<Rule>(mut self, rule: Rule) -> Self
     where
         Rule: InterpretableOp<Linearized<JitTracer<V>>> + Send + Sync + 'static,
-        Linearized<JitTracer<V>>: Traceable,
+        Linearized<JitTracer<V>>: Traceable<ArrayType>,
     {
         self.linearized_jit_rule = Some(Arc::new(rule));
         self
@@ -301,19 +301,19 @@ impl<V: Traceable> CustomPrimitive<V> {
     }
 }
 
-impl<V: Traceable> Debug for CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> Debug for CustomPrimitive<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.base.as_ref(), formatter)
     }
 }
 
-impl<V: Traceable> Display for CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> Display for CustomPrimitive<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self.base.as_ref(), formatter)
     }
 }
 
-impl<V: Traceable> Op for CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> Op for CustomPrimitive<V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.base.name()
@@ -335,14 +335,14 @@ impl<V: Traceable> Op for CustomPrimitive<V> {
     }
 }
 
-impl<V: Traceable> InterpretableOp<V> for CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> InterpretableOp<V> for CustomPrimitive<V> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         self.base.interpret(inputs)
     }
 }
 
-impl<V: Traceable> LinearOp<V> for CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> LinearOp<V> for CustomPrimitive<V> {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         self.transpose_rule
             .as_deref()
@@ -351,21 +351,21 @@ impl<V: Traceable> LinearOp<V> for CustomPrimitive<V> {
     }
 }
 
-impl<V: Traceable> VectorizableOp<V> for CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> VectorizableOp<V> for CustomPrimitive<V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         self.vectorization_rule.as_deref().ok_or_else(|| self.missing_rule("vectorize"))?.batch(inputs)
     }
 }
 
-impl<V: Traceable> DifferentiableOp<V, LinearTerm<V>> for CustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> DifferentiableOp<V, LinearTerm<V>> for CustomPrimitive<V> {
     fn jvp(&self, inputs: &[JvpTracer<V, LinearTerm<V>>]) -> Result<Vec<JvpTracer<V, LinearTerm<V>>>, TraceError> {
         self.jvp_rule()?.jvp(inputs)
     }
 }
 
-impl<V: Traceable> InterpretableOp<Linearized<JitTracer<V>>> for CustomPrimitive<V>
+impl<V: Traceable<ArrayType>> InterpretableOp<Linearized<JitTracer<V>>> for CustomPrimitive<V>
 where
-    Linearized<JitTracer<V>>: Traceable,
+    Linearized<JitTracer<V>>: Traceable<ArrayType>,
 {
     fn interpret(&self, inputs: &[Linearized<JitTracer<V>>]) -> Result<Vec<Linearized<JitTracer<V>>>, TraceError> {
         self.linearized_jit_rule
@@ -377,11 +377,11 @@ where
 
 /// Linear-only wrapper around one [`CustomPrimitive`] that guarantees a transpose rule is present.
 #[derive(Clone)]
-pub struct LinearCustomPrimitive<V: Traceable> {
+pub struct LinearCustomPrimitive<V: Traceable<ArrayType>> {
     primitive: Arc<CustomPrimitive<V>>,
 }
 
-impl<V: Traceable> LinearCustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> LinearCustomPrimitive<V> {
     /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
     pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<V>>) -> Result<Self, TraceError> {
         primitive.transpose_rule.as_ref().ok_or_else(|| primitive.missing_rule("transpose"))?;
@@ -395,19 +395,19 @@ impl<V: Traceable> LinearCustomPrimitive<V> {
     }
 }
 
-impl<V: Traceable> Debug for LinearCustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> Debug for LinearCustomPrimitive<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.primitive.as_ref(), formatter)
     }
 }
 
-impl<V: Traceable> Display for LinearCustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> Display for LinearCustomPrimitive<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self.primitive.as_ref(), formatter)
     }
 }
 
-impl<V: Traceable> Op for LinearCustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> Op for LinearCustomPrimitive<V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.primitive.name()
@@ -429,14 +429,14 @@ impl<V: Traceable> Op for LinearCustomPrimitive<V> {
     }
 }
 
-impl<V: Traceable> InterpretableOp<V> for LinearCustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> InterpretableOp<V> for LinearCustomPrimitive<V> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         self.primitive.interpret(inputs)
     }
 }
 
-impl<V: Traceable> LinearOp<V> for LinearCustomPrimitive<V> {
+impl<V: Traceable<ArrayType>> LinearOp<V> for LinearCustomPrimitive<V> {
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         self.primitive
             .transpose_rule
@@ -452,7 +452,7 @@ impl<V: Traceable> LinearOp<V> for LinearCustomPrimitive<V> {
 /// `ryft-core` (e.g., shard-map ops in `ryft-xla`) go through the [`Custom`](PrimitiveOp::Custom) escape
 /// hatch, which still uses dynamic dispatch.
 #[derive(Clone)]
-pub enum PrimitiveOp<V: Traceable> {
+pub enum PrimitiveOp<V: Traceable<ArrayType>> {
     /// Elementwise addition.
     Add,
 
@@ -504,7 +504,7 @@ pub type PrimitiveOpRef<V> = PrimitiveOp<V>;
 
 /// Closed set of operations that may appear in staged linear programs.
 #[derive(Clone)]
-pub enum LinearPrimitiveOp<V: Traceable> {
+pub enum LinearPrimitiveOp<V: Traceable<ArrayType>> {
     /// Elementwise addition.
     Add,
 
@@ -539,7 +539,7 @@ pub enum LinearPrimitiveOp<V: Traceable> {
     Custom(Arc<LinearCustomPrimitive<V>>),
 }
 
-impl<V: Traceable> LinearPrimitiveOp<V> {
+impl<V: Traceable<ArrayType>> LinearPrimitiveOp<V> {
     /// Wraps one custom primitive in the linear-only operation universe after verifying transpose support.
     pub fn custom(primitive: CustomPrimitive<V>) -> Result<Self, TraceError> {
         Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
@@ -577,28 +577,28 @@ impl<T: Op + ?Sized> Op for Arc<T> {
     }
 }
 
-impl<T: InterpretableOp<V> + ?Sized, V: Traceable> InterpretableOp<V> for Arc<T> {
+impl<T: InterpretableOp<V> + ?Sized, V: Traceable<ArrayType>> InterpretableOp<V> for Arc<T> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         (**self).interpret(inputs)
     }
 }
 
-impl<T: LinearOp<V> + ?Sized, V: Traceable> LinearOp<V> for Arc<T> {
+impl<T: LinearOp<V> + ?Sized, V: Traceable<ArrayType>> LinearOp<V> for Arc<T> {
     #[inline]
     fn transpose(&self, output_cotangents: &[LinearTerm<V>]) -> Result<Vec<Option<LinearTerm<V>>>, TraceError> {
         (**self).transpose(output_cotangents)
     }
 }
 
-impl<T: DifferentiableOp<V, U> + ?Sized, V: Traceable, U> DifferentiableOp<V, U> for Arc<T> {
+impl<T: DifferentiableOp<V, U> + ?Sized, V: Traceable<ArrayType>, U> DifferentiableOp<V, U> for Arc<T> {
     #[inline]
     fn jvp(&self, inputs: &[JvpTracer<V, U>]) -> Result<Vec<JvpTracer<V, U>>, TraceError> {
         (**self).jvp(inputs)
     }
 }
 
-impl<T: VectorizableOp<V> + ?Sized, V: Traceable> VectorizableOp<V> for Arc<T> {
+impl<T: VectorizableOp<V> + ?Sized, V: Traceable<ArrayType>> VectorizableOp<V> for Arc<T> {
     #[inline]
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         (**self).batch(inputs)
@@ -614,7 +614,7 @@ use crate::tracing_v2::operations::{
     RightMatMulOp, ScaleOp, SinOp, left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
 };
 
-impl<V: Traceable> Debug for PrimitiveOp<V> {
+impl<V: Traceable<ArrayType>> Debug for PrimitiveOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Add => write!(formatter, "Add"),
@@ -638,7 +638,7 @@ impl<V: Traceable> Debug for PrimitiveOp<V> {
     }
 }
 
-impl<V: Traceable> Display for PrimitiveOp<V> {
+impl<V: Traceable<ArrayType>> Display for PrimitiveOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
@@ -647,7 +647,7 @@ impl<V: Traceable> Display for PrimitiveOp<V> {
     }
 }
 
-impl<V: Traceable> Debug for LinearPrimitiveOp<V> {
+impl<V: Traceable<ArrayType>> Debug for LinearPrimitiveOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Add => write!(formatter, "Add"),
@@ -667,7 +667,7 @@ impl<V: Traceable> Debug for LinearPrimitiveOp<V> {
     }
 }
 
-impl<V: Traceable> Display for LinearPrimitiveOp<V> {
+impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
@@ -676,8 +676,8 @@ impl<V: Traceable> Display for LinearPrimitiveOp<V> {
     }
 }
 
-/// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: Traceable`.
-impl<V: Traceable> Op for PrimitiveOp<V> {
+/// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: Traceable<ArrayType>`.
+impl<V: Traceable<ArrayType>> Op for PrimitiveOp<V> {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -753,8 +753,8 @@ impl<V: Traceable> Op for PrimitiveOp<V> {
     }
 }
 
-/// [`Op`] for [`LinearPrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: Traceable`.
-impl<V: Traceable> Op for LinearPrimitiveOp<V> {
+/// [`Op`] for [`LinearPrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: Traceable<ArrayType>`.
+impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<V> {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -822,7 +822,7 @@ impl<V: Traceable> Op for LinearPrimitiveOp<V> {
 }
 
 /// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for PrimitiveOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -850,7 +850,7 @@ where
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps>
     InterpretableOp<V> for LinearPrimitiveOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -874,7 +874,7 @@ where
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + crate::tracing_v2::operations::reshape::ReshapeOps> LinearOp<V>
     for LinearPrimitiveOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -912,7 +912,7 @@ where
 /// [`LeftMatMulOp`]: crate::tracing_v2::operations::LeftMatMulOp
 /// [`RightMatMulOp`]: crate::tracing_v2::operations::RightMatMulOp
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + FloatExt
         + ZeroLike
         + OneLike
@@ -954,7 +954,7 @@ where
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + FloatExt
         + ZeroLike
         + OneLike
@@ -997,7 +997,7 @@ where
     }
 }
 
-impl<V: Traceable + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + FloatExt + MatrixOps> VectorizableOp<V>
+impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + FloatExt + MatrixOps> VectorizableOp<V>
     for PrimitiveOp<V>
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {

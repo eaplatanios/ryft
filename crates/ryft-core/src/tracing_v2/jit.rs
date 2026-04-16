@@ -28,7 +28,7 @@ use crate::{
 
 /// Tracer used while staging JIT programs.
 #[derive(Clone, Debug, Parameter)]
-pub struct JitTracer<V: Traceable> {
+pub struct JitTracer<V: Traceable<ArrayType>> {
     /// Concrete value obtained during eager execution of the staged computation.
     pub value: V,
     atom: AtomId,
@@ -36,7 +36,7 @@ pub struct JitTracer<V: Traceable> {
     staging_error: Rc<RefCell<Option<TraceError>>>,
 }
 
-impl<V: Traceable> JitTracer<V> {
+impl<V: Traceable<ArrayType>> JitTracer<V> {
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -144,16 +144,16 @@ impl<V: Traceable> JitTracer<V> {
     }
 }
 
-impl<V: Traceable> Typed<ArrayType> for JitTracer<V> {
+impl<V: Traceable<ArrayType>> Typed<ArrayType> for JitTracer<V> {
     #[inline]
     fn tpe(&self) -> ArrayType {
         <V as Typed<ArrayType>>::tpe(&self.value)
     }
 }
 
-impl<V: Traceable> Traceable for JitTracer<V> {}
+impl<V: Traceable<ArrayType>> Traceable<ArrayType> for JitTracer<V> {}
 
-impl<V: Traceable + ZeroLike> ZeroLike for JitTracer<V> {
+impl<V: Traceable<ArrayType> + ZeroLike> ZeroLike for JitTracer<V> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.value.zero_like();
@@ -162,7 +162,7 @@ impl<V: Traceable + ZeroLike> ZeroLike for JitTracer<V> {
     }
 }
 
-impl<V: Traceable + OneLike> OneLike for JitTracer<V> {
+impl<V: Traceable<ArrayType> + OneLike> OneLike for JitTracer<V> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.value.one_like();
@@ -171,7 +171,7 @@ impl<V: Traceable + OneLike> OneLike for JitTracer<V> {
     }
 }
 
-impl<V: Traceable + Add<Output = V>> Add for JitTracer<V> {
+impl<V: Traceable<ArrayType> + Add<Output = V>> Add for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -180,7 +180,7 @@ impl<V: Traceable + Add<Output = V>> Add for JitTracer<V> {
     }
 }
 
-impl<V: Traceable + Mul<Output = V>> Mul for JitTracer<V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> Mul for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -189,7 +189,7 @@ impl<V: Traceable + Mul<Output = V>> Mul for JitTracer<V> {
     }
 }
 
-impl<V: Traceable + Neg<Output = V>> Neg for JitTracer<V> {
+impl<V: Traceable<ArrayType> + Neg<Output = V>> Neg for JitTracer<V> {
     type Output = Self;
 
     #[inline]
@@ -198,7 +198,7 @@ impl<V: Traceable + Neg<Output = V>> Neg for JitTracer<V> {
     }
 }
 
-impl<V: Traceable + FloatExt> FloatExt for JitTracer<V> {
+impl<V: Traceable<ArrayType> + FloatExt> FloatExt for JitTracer<V> {
     #[inline]
     fn sin(self) -> Self {
         self.unary(PrimitiveOp::Sin, FloatExt::sin)
@@ -216,7 +216,7 @@ impl<V: Traceable + FloatExt> FloatExt for JitTracer<V> {
 /// Later, once a concrete backend exists, it can grow additional fields that hold backend-specific compiled artifacts
 /// while keeping the same high-level API shape.
 pub struct CompiledFunction<
-    V: Traceable,
+    V: Traceable<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Clone = ProgramOpRef<V>,
@@ -226,7 +226,7 @@ pub struct CompiledFunction<
 }
 
 impl<
-    V: Traceable,
+    V: Traceable<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: Clone,
@@ -237,7 +237,7 @@ impl<
     }
 }
 
-impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> CompiledFunction<V, Input, Output, O> {
+impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> CompiledFunction<V, Input, Output, O> {
     #[inline]
     pub fn from_graph(graph: crate::tracing_v2::Graph<O, V, Input, Output>) -> Self {
         Self::from_program(Program::from_graph(graph))
@@ -272,7 +272,7 @@ impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> 
     }
 }
 
-impl<V: Traceable, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
+impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
     for CompiledFunction<V, Input, Output, O>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -286,7 +286,7 @@ fn try_trace_program_with_options<F, Input, Output, V>(
     simplify_program: bool,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -333,7 +333,7 @@ pub fn try_trace_program<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, Program<V, Input, Output>), TraceError>
 where
-    V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -348,7 +348,7 @@ pub fn try_jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -368,7 +368,7 @@ pub fn jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<V, Input, Output>), TraceError>
 where
-    V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -460,7 +460,7 @@ mod tests {
             }
         }
 
-        impl Traceable for TestAbstractValue {
+        impl Traceable<ArrayType> for TestAbstractValue {
             fn is_zero(&self) -> bool {
                 false
             }
@@ -470,7 +470,7 @@ mod tests {
             }
         }
 
-        impl crate::tracing_v2::Value for TestAbstractValue {}
+        impl crate::tracing_v2::Value<ArrayType> for TestAbstractValue {}
 
         impl Add for TestAbstractValue {
             type Output = Self;

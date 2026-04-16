@@ -27,12 +27,11 @@ use crate::{
     types::{ArrayType, Type, Typed},
 };
 
-// TODO(eaplatanios): This should not require `Clone`.
 /// Returns a zero value with the same structure as an existing value.
 ///
 /// This is the universal "zero-like" capability: every type that participates in differentiation or batching can
 /// produce a zero from an exemplar, including tracer wrappers that cannot be synthesized from abstract metadata alone.
-pub trait ZeroLike: Clone {
+pub trait ZeroLike {
     /// Returns a zero value with the same shape as `self`.
     fn zero_like(&self) -> Self;
 }
@@ -55,11 +54,10 @@ pub trait Zero<T: Parameter + Type, P: Parameter + Typed<T>>: Parameterized<T> {
         Self::Family: ParameterizedFamily<P>;
 }
 
-// TODO(eaplatanios): This should not require `Clone`.
 /// Returns a one value with the same structure as an existing value.
 ///
 /// This mirrors [`ZeroLike`] for the multiplicative identity.
-pub trait OneLike: Clone {
+pub trait OneLike {
     /// Returns a one value with the same shape as `self`.
     fn one_like(&self) -> Self;
 }
@@ -134,27 +132,29 @@ impl_scalar_self_typed_zero_one!(f64, 0.0, 1.0);
 /// The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket impls apart.
 /// Each composable transform (e.g., `jvp`, `grad`, `vmap`) provides:
 ///
-/// 1. an impl for `V: Value` — eager dispatch that evaluates the transform on concrete data, and
+/// 1. an impl for `V: Value<T>` — eager dispatch that evaluates the transform on concrete data, and
 /// 2. an impl for `JitTracer<V>` — symbolic dispatch that stages the transform into the enclosing traced graph.
 ///
 /// Because `JitTracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
-pub trait Value: Traceable {}
+pub trait Value<T: Type>: Traceable<T> {}
 
 /// Base trait for any leaf type that can participate in traced computations.
 ///
 /// [`Traceable`] is implemented by **every** type that can appear as a leaf in a staged graph — both concrete data
 /// types (e.g., `f32`, `f64`, backend arrays) and tracing wrappers (e.g.,
-/// [`JitTracer`](crate::tracing_v2::JitTracer)). It ties each leaf to the shared
-/// [`ArrayType`](crate::types::ArrayType) descriptor used by the tracing infrastructure via [`Typed`], while
+/// [`JitTracer`](crate::tracing_v2::JitTracer)). It ties each leaf to a type descriptor `T` via [`Typed`], while
 /// deliberately not implying eager numeric operations such as [`FloatExt`] or differentiation-specific capabilities
 /// such as [`ZeroLike`]. Those requirements live on the primitive operations and transforms that actually need them.
+///
+/// The type parameter `T` determines the abstract metadata used to describe leaf shapes and element types. The
+/// primary instantiation is [`ArrayType`](crate::types::ArrayType), used throughout the core tracing infrastructure.
 ///
 /// Concrete leaves that support exact algebraic identity detection should override [`Traceable::is_zero`] and
 /// [`Traceable::is_one`]. The default implementations return `false`, which keeps purely abstract or traced leaves
 /// valid while opting them out of constant-identity simplification.
 ///
 /// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
-pub trait Traceable: Clone + Parameter + Typed<ArrayType> + 'static {
+pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
     ///
     /// The graph builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)
@@ -211,7 +211,7 @@ impl FloatExt for f32 {
     }
 }
 
-impl Traceable for f32 {
+impl Traceable<ArrayType> for f32 {
     #[inline]
     fn is_zero(&self) -> bool {
         *self == 0.0
@@ -223,7 +223,7 @@ impl Traceable for f32 {
     }
 }
 
-impl Value for f32 {}
+impl Value<ArrayType> for f32 {}
 
 impl ZeroLike for f32 {
     #[inline]
@@ -251,7 +251,7 @@ impl FloatExt for f64 {
     }
 }
 
-impl Traceable for f64 {
+impl Traceable<ArrayType> for f64 {
     #[inline]
     fn is_zero(&self) -> bool {
         *self == 0.0
@@ -263,7 +263,7 @@ impl Traceable for f64 {
     }
 }
 
-impl Value for f64 {}
+impl Value<ArrayType> for f64 {}
 
 impl ZeroLike for f64 {
     #[inline]

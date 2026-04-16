@@ -16,14 +16,14 @@ use crate::{
 
 /// Erased traced `vmap` body used by the staged higher-order op.
 #[derive(Clone)]
-pub struct FlatTracedVMap<V: Traceable, O: Clone = ProgramOpRef<V>> {
+pub struct FlatTracedVMap<V: Traceable<ArrayType>, O: Clone = ProgramOpRef<V>> {
     lane_count: usize,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
     compiled: CompiledFunction<V, Vec<V>, Vec<V>, O>,
 }
 
-impl<V: Traceable, O: Clone> FlatTracedVMap<V, O> {
+impl<V: Traceable<ArrayType>, O: Clone> FlatTracedVMap<V, O> {
     /// Builds one erased traced `vmap` body from explicit staged parts.
     #[inline]
     pub fn from_parts(
@@ -100,11 +100,11 @@ impl<V: Traceable, O: Clone> FlatTracedVMap<V, O> {
 
 /// Higher-order `vmap` op that carries one canonical forward program payload.
 #[derive(Clone)]
-pub struct VMapOp<V: Traceable> {
+pub struct VMapOp<V: Traceable<ArrayType>> {
     body: FlatTracedVMap<V>,
 }
 
-impl<V: Traceable> VMapOp<V> {
+impl<V: Traceable<ArrayType>> VMapOp<V> {
     /// Builds one ordinary traced `vmap` op.
     #[inline]
     pub fn new(body: FlatTracedVMap<V>) -> Self {
@@ -118,19 +118,19 @@ impl<V: Traceable> VMapOp<V> {
     }
 }
 
-impl<V: Traceable> Debug for VMapOp<V> {
+impl<V: Traceable<ArrayType>> Debug for VMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "VMap")
     }
 }
 
-impl<V: Traceable> Display for VMapOp<V> {
+impl<V: Traceable<ArrayType>> Display for VMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
 }
 
-impl<V: Traceable> Op for VMapOp<V> {
+impl<V: Traceable<ArrayType>> Op for VMapOp<V> {
     fn name(&self) -> &'static str {
         "vmap"
     }
@@ -147,7 +147,7 @@ impl<V: Traceable> Op for VMapOp<V> {
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for VMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -159,7 +159,7 @@ where
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + FloatExt
         + ZeroLike
         + OneLike
@@ -206,7 +206,7 @@ where
 }
 
 impl<
-    V: Traceable
+    V: Traceable<ArrayType>
         + FloatExt
         + ZeroLike
         + OneLike
@@ -241,7 +241,7 @@ where
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<JitTracer<V>> for VMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -254,12 +254,12 @@ where
 
 /// Linear-only `vmap` op that always carries both the linear body and its transpose body.
 #[derive(Clone)]
-pub struct LinearVMapOp<V: Traceable> {
+pub struct LinearVMapOp<V: Traceable<ArrayType>> {
     body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
     transpose_body: FlatTracedVMap<V, LinearProgramOpRef<V>>,
 }
 
-impl<V: Traceable> LinearVMapOp<V> {
+impl<V: Traceable<ArrayType>> LinearVMapOp<V> {
     /// Builds one linear traced `vmap` op with its transpose body.
     #[inline]
     pub fn new(
@@ -280,19 +280,19 @@ impl<V: Traceable> LinearVMapOp<V> {
     }
 }
 
-impl<V: Traceable> Debug for LinearVMapOp<V> {
+impl<V: Traceable<ArrayType>> Debug for LinearVMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearVMap")
     }
 }
 
-impl<V: Traceable> Display for LinearVMapOp<V> {
+impl<V: Traceable<ArrayType>> Display for LinearVMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
 }
 
-impl<V: Traceable> Op for LinearVMapOp<V> {
+impl<V: Traceable<ArrayType>> Op for LinearVMapOp<V> {
     fn name(&self) -> &'static str {
         "vmap"
     }
@@ -309,7 +309,7 @@ impl<V: Traceable> Op for LinearVMapOp<V> {
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<V> for LinearVMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -320,7 +320,7 @@ where
     }
 }
 
-impl<V: Traceable + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V>
+impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<V> for LinearVMapOp<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -346,7 +346,7 @@ where
 /// Builds one linearized staged `vmap` op from its primal body.
 pub fn make_linear_vmap<V>(body: &FlatTracedVMap<V>) -> Result<LinearVMapOp<V>, TraceError>
 where
-    V: Traceable
+    V: Traceable<ArrayType>
         + FloatExt
         + ZeroLike
         + OneLike

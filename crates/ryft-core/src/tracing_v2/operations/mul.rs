@@ -64,14 +64,14 @@ impl Op for MulOp {
     }
 }
 
-impl<V: Traceable + Mul<Output = V>> InterpretableOp<V> for MulOp {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<V> for MulOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
 
-impl<V: Traceable + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for MulOp {
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> for MulOp {
     fn jvp(&self, inputs: &[JvpTracer<V, T>]) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         let left = &inputs[0];
@@ -86,7 +86,7 @@ impl<V: Traceable + Mul<Output = V>, T: TangentSpace<V>> DifferentiableOp<V, T> 
     }
 }
 
-impl<V: Traceable + Mul<Output = V>> VectorizableOp<V> for MulOp {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOp<V> for MulOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;
