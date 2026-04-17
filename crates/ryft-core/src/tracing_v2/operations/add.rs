@@ -11,7 +11,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, OpSet, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -79,12 +79,12 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOp<ArrayType, V
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T>
-    for AddOp
+impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, S: OpSet<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, T, S> for AddOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;

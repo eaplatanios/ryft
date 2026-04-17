@@ -19,6 +19,7 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
         GraphBuilder, InterpretableOp, OneLike, TraceError, Traceable, ZeroLike,
+        engine::Engine,
         graph::AtomId,
         ops::{CoreOpSet, Op, OpSet, SupportsAdd, SupportsMul, SupportsNeg},
         program::{Program, ProgramBuilderFor, ProgramOpRef},
@@ -371,7 +372,7 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 }
 
-fn try_trace_program_with_options_in<F, Input, Output, V, S>(
+fn try_trace_program_with_options<F, Input, Output, V, S>(
     function: F,
     input: Input,
     simplify_program: bool,
@@ -408,22 +409,29 @@ where
     Ok((output_value, program))
 }
 
-/// Stages `function` using the default core op set.
-pub fn try_trace_program<F, Input, Output, V>(
+/// Stages `function` using the staged op set selected by `engine`.
+pub fn try_trace_program<E, F, Input, Output, V>(
+    _engine: &E,
     function: F,
     input: Input,
-) -> Result<(Output, Program<ArrayType, V, Input, Output>), TraceError>
+) -> Result<
+    (Output, Program<ArrayType, V, Input, Output, <<E as Engine>::OpSet as OpSet<ArrayType, V>>::JitOp>),
+    TraceError,
+>
 where
+    E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, CoreOpSet>,
-    Output: TraceOutput<V, CoreOpSet>,
+    Input: TraceInput<V, E::OpSet>,
+    Output: TraceOutput<V, E::OpSet>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    E::OpSet: OpSet<ArrayType, V>,
+    <E::OpSet as OpSet<ArrayType, V>>::JitOp: Op<ArrayType>,
 {
-    try_trace_program_in::<_, _, _, _, CoreOpSet>(function, input)
+    try_trace_program_for_op_set::<_, _, _, _, E::OpSet>(function, input)
 }
 
 /// Stages `function` using one explicit backend-owned op set.
-pub fn try_trace_program_in<F, Input, Output, V, S>(
+pub(crate) fn try_trace_program_for_op_set<F, Input, Output, V, S>(
     function: F,
     input: Input,
 ) -> Result<(Output, Program<ArrayType, V, Input, Output, S::JitOp>), TraceError>
@@ -435,25 +443,29 @@ where
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     S::JitOp: Op<ArrayType>,
 {
-    try_trace_program_with_options_in::<_, _, _, _, S>(function, input, true)
+    try_trace_program_with_options::<_, _, _, _, S>(function, input, true)
 }
 
-/// Stages `function` as a graph using the default core op set and returns the eager output plus compiled graph.
-pub fn try_jit<F, Input, Output, V>(
+/// Stages `function` as a graph using the staged op set selected by `engine`.
+pub fn try_jit<E, F, Input, Output, V>(
+    _engine: &E,
     function: F,
     input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output>), TraceError>
+) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, <E::OpSet as OpSet<ArrayType, V>>::JitOp>), TraceError>
 where
+    E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, CoreOpSet>,
-    Output: TraceOutput<V, CoreOpSet>,
+    Input: TraceInput<V, E::OpSet>,
+    Output: TraceOutput<V, E::OpSet>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    E::OpSet: OpSet<ArrayType, V>,
+    <E::OpSet as OpSet<ArrayType, V>>::JitOp: Op<ArrayType>,
 {
-    try_jit_in::<_, _, _, _, CoreOpSet>(function, input)
+    try_jit_for_op_set::<_, _, _, _, E::OpSet>(function, input)
 }
 
 /// Stages `function` as a graph using one explicit backend-owned op set.
-pub fn try_jit_in<F, Input, Output, V, S>(
+pub(crate) fn try_jit_for_op_set<F, Input, Output, V, S>(
     function: F,
     input: Input,
 ) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, S::JitOp>), TraceError>
@@ -465,42 +477,30 @@ where
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     S::JitOp: Op<ArrayType>,
 {
-    let (output, program) = try_trace_program_in::<_, _, _, _, S>(function, input)?;
+    let (output, program) = try_trace_program_for_op_set::<_, _, _, _, S>(function, input)?;
     Ok((output, CompiledFunction::from_program(program)))
 }
 
-/// Stages `function` as a graph and returns both the eager output and the staged program.
+/// Stages `function` as a graph and returns both the eager output and the staged program selected
+/// by `engine`.
 ///
 /// The returned [`CompiledFunction`] currently stores only the staged graph. Later, once a concrete backend exists,
 /// this type can be extended to carry backend-specific compilation artifacts alongside that graph.
-pub fn jit<F, Input, Output, V>(
+pub fn jit<E, F, Input, Output, V>(
+    engine: &E,
     function: F,
     input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output>), TraceError>
+) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, <E::OpSet as OpSet<ArrayType, V>>::JitOp>), TraceError>
 where
+    E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, CoreOpSet>,
-    Output: TraceOutput<V, CoreOpSet>,
+    Input: TraceInput<V, E::OpSet>,
+    Output: TraceOutput<V, E::OpSet>,
     F: FnOnce(Input::Traced) -> Output::Traced,
+    E::OpSet: OpSet<ArrayType, V>,
+    <E::OpSet as OpSet<ArrayType, V>>::JitOp: Op<ArrayType>,
 {
-    try_jit(|traced_input| Ok(function(traced_input)), input)
-}
-
-/// Stages `function` as a graph using one explicit backend-owned op set and returns both the eager output and the
-/// compiled staged program.
-pub fn jit_in<F, Input, Output, V, S>(
-    function: F,
-    input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, S::JitOp>), TraceError>
-where
-    V: Traceable<ArrayType>,
-    S: OpSet<ArrayType, V>,
-    Input: TraceInput<V, S>,
-    Output: TraceOutput<V, S>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
-    S::JitOp: Op<ArrayType>,
-{
-    try_jit_in::<_, _, _, _, S>(|traced_input| Ok(function(traced_input)), input)
+    try_jit(engine, |traced_input| Ok(function(traced_input)), input)
 }
 
 #[cfg(test)]
@@ -511,7 +511,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{CoreOpSet, ProgramBuilder, Sin, test_support},
+        tracing_v2::{CoreOpSet, ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
     };
 
     use super::*;
@@ -540,7 +540,9 @@ mod tests {
 
     #[test]
     fn compiled_function_replays_staged_graphs() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let squared = x.clone() * x.clone();
                 squared + x.sin()
@@ -661,6 +663,22 @@ mod tests {
             }
         }
 
+        struct TestEngine;
+
+        impl crate::tracing_v2::engine::Engine for TestEngine {
+            type Type = ArrayType;
+            type Value = TestAbstractValue;
+            type OpSet = CoreOpSet;
+
+            fn zero(&self, r#type: &ArrayType) -> TestAbstractValue {
+                TestAbstractValue { r#type: r#type.clone() }
+            }
+
+            fn one(&self, r#type: &ArrayType) -> TestAbstractValue {
+                TestAbstractValue { r#type: r#type.clone() }
+            }
+        }
+
         let result: Result<
             (
                 TestAbstractValue,
@@ -673,6 +691,7 @@ mod tests {
             ),
             TraceError,
         > = jit(
+            &TestEngine,
             |inputs: (JitTracer<ArrayType, TestAbstractValue>, JitTracer<ArrayType, TestAbstractValue>)| {
                 inputs.0 + inputs.1
             },
@@ -687,8 +706,9 @@ mod tests {
 
     #[test]
     fn compiled_function_display_delegates_to_the_underlying_graph() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-            jit(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
+            jit(&engine, |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
 
         assert_eq!(
             compiled.to_string(),

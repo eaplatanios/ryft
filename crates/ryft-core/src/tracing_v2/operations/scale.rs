@@ -118,12 +118,12 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T>
-    for ScaleOp<ArrayType, V>
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, S: OpSet<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, T, S> for ScaleOp<ArrayType, V>
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

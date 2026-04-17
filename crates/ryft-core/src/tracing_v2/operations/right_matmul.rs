@@ -122,10 +122,12 @@ where
     }
 }
 
-impl<V: MatrixValue + ZeroLike> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for RightMatMulOp<V> {
+impl<V: MatrixValue + ZeroLike, S: OpSet<ArrayType, V>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>
+    for RightMatMulOp<V>
+{
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

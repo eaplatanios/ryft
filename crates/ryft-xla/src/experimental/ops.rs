@@ -31,8 +31,9 @@ use crate::experimental::{
 };
 
 /// Closed ordinary staged-op universe owned by the XLA backend.
+#[allow(private_interfaces)]
 #[derive(Clone)]
-pub(crate) enum XlaPrimitiveOp {
+pub enum XlaPrimitiveOp {
     /// Elementwise addition.
     Add,
 
@@ -84,7 +85,7 @@ pub(crate) enum XlaPrimitiveOp {
 
 /// Op-set marker selecting [`XlaPrimitiveOp`] for ordinary traced XLA programs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct XlaOpSet;
+pub struct XlaOpSet;
 
 impl Debug for XlaPrimitiveOp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -209,10 +210,10 @@ impl InterpretableOp<ArrayType, ShardMapTensor> for XlaPrimitiveOp {
     }
 }
 
-impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>> for XlaPrimitiveOp {
+impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>, XlaOpSet> for XlaPrimitiveOp {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor>,
+        engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor, OpSet = XlaOpSet>,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         match self {

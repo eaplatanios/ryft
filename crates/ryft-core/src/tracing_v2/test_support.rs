@@ -9,8 +9,9 @@ use crate::{
 };
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
+    let engine = ArrayScalarEngine::<f64>::new();
     let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-        jit(|x: JitTracer<ArrayType, f64>| x.sin(), 2.0f64).unwrap();
+        jit(&engine, |x: JitTracer<ArrayType, f64>| x.sin(), 2.0f64).unwrap();
 
     assert_eq!(
         compiled.to_string(),
@@ -77,8 +78,9 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
 }
 
 pub(crate) fn assert_bilinear_jit_rendering() {
+    let engine = ArrayScalarEngine::<f64>::new();
     let (_, compiled): (f64, CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
-        jit(bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        jit(&engine, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         compiled.to_string(),

@@ -50,7 +50,6 @@ impl WithShardingConstraintOp {
         Self: Clone
             + InterpretableOp<ArrayType, V>
             + LinearOp<ArrayType, V>
-            + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
             + VectorizableOp<ArrayType, V>
             + Send
             + Sync
@@ -58,13 +57,13 @@ impl WithShardingConstraintOp {
     {
         CustomPrimitive::new(self.clone())
             .with_transpose_rule(self.clone())
-            .with_jvp_rule(self.clone())
             .with_vectorization_rule(self.clone())
     }
 
     /// Returns the tensor-leaf custom primitive registration for this op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive::<ShardMapTensor>()
+            .with_jvp_rule_for::<XlaOpSet, _>(self.clone())
             .with_linearized_jit_rule_for::<XlaOpSet, _>(self.clone())
             .with_extension(self.clone())
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
@@ -72,7 +71,9 @@ impl WithShardingConstraintOp {
 
     /// Returns the traced-leaf custom primitive registration for this op.
     pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTracer> {
-        self.base_custom_primitive::<ShardMapTracer>().with_linearized_jit_rule(self.clone())
+        self.base_custom_primitive::<ShardMapTracer>()
+            .with_jvp_rule(self.clone())
+            .with_linearized_jit_rule(self.clone())
     }
 }
 
@@ -134,10 +135,12 @@ impl LinearOp<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
     }
 }
 
-impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>> for WithShardingConstraintOp {
+impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>, XlaOpSet>
+    for WithShardingConstraintOp
+{
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor>,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor, OpSet = XlaOpSet>,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -202,10 +205,13 @@ impl LinearOp<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
     }
 }
 
-impl DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>> for WithShardingConstraintOp {
+impl
+    DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>, ryft_core::tracing_v2::CoreOpSet>
+    for WithShardingConstraintOp
+{
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer>,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer, OpSet = ryft_core::tracing_v2::CoreOpSet>,
         inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

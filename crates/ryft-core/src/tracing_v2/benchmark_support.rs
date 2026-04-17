@@ -151,7 +151,8 @@ fn hessian_style_second_derivative_traced(x: JitTracer<ArrayType, f64>) -> JitTr
 
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, (f64, f64), f64>) = jit(bilinear_sin, (2.0f64, 3.0f64))?;
+    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
+        jit(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", compiled.program())?])
 }
 
@@ -172,6 +173,7 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Ben
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = try_jit(
+        &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let gradient: JitTracer<ArrayType, f64> = grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
             Ok(gradient)
@@ -184,6 +186,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): ((f64, f64), CompiledFunction<ArrayType, f64, f64, (f64, f64)>) = try_jit(
+        &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let value_and_gradient: (JitTracer<ArrayType, f64>, JitTracer<ArrayType, f64>) =
                 value_and_grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
@@ -208,13 +211,14 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmar
 /// Emits the staged forward-over-reverse scalar benchmark.
 fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-        jit(hessian_style_second_derivative_traced, 2.0f64)?;
+        jit(&ArrayScalarEngine::<f64>::new(), hessian_style_second_derivative_traced, 2.0f64)?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", compiled.program())?])
 }
 
 /// Emits the staged reverse-over-batching scalar benchmark.
 fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = try_jit(
+        &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let gradient: JitTracer<ArrayType, f64> = grad(
                 &ArrayScalarEngine::<f64>::new(),
@@ -240,6 +244,7 @@ fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
 /// Emits the staged batching-over-reverse scalar benchmark.
 fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = try_jit(
+        &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
                 |batch: Batch<JitTracer<ArrayType, f64>>| {
@@ -336,7 +341,7 @@ fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (
         Array2<f64>,
         CompiledFunction<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>), Array2<f64>>,
-    ) = jit(bilinear_matmul, matrix_inputs())?;
+    ) = jit(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
     Ok(vec![tracing_record("matrix_matmul_jit", "jit", compiled.program())?])
 }
 
@@ -354,7 +359,7 @@ fn emit_matrix_three_matmul_sine_hessian_style() -> Result<Vec<IrBenchmarkRecord
     let (_, compiled): (
         Array2<f64>,
         CompiledFunction<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), Array2<f64>>,
-    ) = jit(matrix_hessian_style_second_derivative, hessian_style_matrix_inputs())?;
+    ) = jit(&Array2Engine::<f64>::new(), matrix_hessian_style_second_derivative, hessian_style_matrix_inputs())?;
     Ok(vec![tracing_record("matrix_three_matmul_sine_hessian_style", "hessian_style", compiled.program())?])
 }
 

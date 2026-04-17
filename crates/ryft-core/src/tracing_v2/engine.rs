@@ -14,10 +14,11 @@
 //!   need additional context (a mesh handle, a device, a PJRT client) to construct a valid
 //!   concrete value. These leaves use stateful engines that carry the required handles.
 //!
-//! Engines are intentionally kept small: they only expose the capabilities that the transforms
-//! actually need from metadata-only synthesis (zero and one). Per-equation evaluation paths
-//! (`InterpretableOp::interpret`, `abstract_eval`, and similar) remain engine-free so that the
-//! common fast path is never forced through a dispatch layer.
+//! Engines are intentionally kept small: they expose metadata-only synthesis (zero and one) and
+//! also select the staged [`OpSet`](crate::tracing_v2::OpSet) used by user-facing tracing
+//! transforms. Per-equation evaluation paths (`InterpretableOp::interpret`, `abstract_eval`, and
+//! similar) remain engine-free so that the common fast path is never forced through a dispatch
+//! layer.
 //!
 //! ## Performance
 //!
@@ -26,31 +27,39 @@
 //! engine method is marked `#[inline]` so the compiler can fully elide the call at monomorphized
 //! call sites.
 
-use std::marker::PhantomData;
+use std::{fmt::Display, marker::PhantomData};
 
 use half::{bf16, f16};
 
 use crate::{
-    parameters::Parameter,
-    types::{ArrayType, Type, Typed},
+    tracing_v2::CoreOpSet,
+    types::{ArrayType, Type},
 };
 
 /// Synthesizes concrete leaf values from abstract type metadata.
 ///
 /// An [`Engine`] carries whatever context is required to construct a value of
 /// [`Value`](Engine::Value) from a [`Type`](Engine::Type) descriptor. The sole responsibility
-/// of the trait is metadata-driven zero/one construction — the hot evaluation paths do not use
-/// it, so engine dispatch is restricted to the few call sites that genuinely need it (graph
-/// representative synthesis, higher-order differentiation helpers, etc.).
+/// of the trait is metadata-driven zero/one construction plus staged-op-set selection for the
+/// user-facing tracing transforms. The hot evaluation paths do not use it, so engine dispatch is
+/// restricted to the few call sites that genuinely need representative synthesis or an explicit
+/// backend token.
 ///
 /// Implementations should be cheap to clone (the common case is a [`Copy`] zero-sized type) and
 /// must return values whose [`Typed::tpe`] matches the input type metadata.
 pub trait Engine {
     /// Abstract type metadata interpreted by this engine.
-    type Type: Type;
+    type Type: Type + Display;
 
     /// Concrete leaf value produced by this engine.
-    type Value: Typed<Self::Type> + Parameter;
+    type Value;
+
+    /// Closed staged-op universe selected by this engine for public tracing transforms.
+    ///
+    /// Engines that are used only for metadata synthesis may still set this to a tracing op-set
+    /// type that is never exercised. Public tracing APIs add the stronger bound
+    /// `Self::OpSet: OpSet<Self::Type, Self::Value>` only when they actually stage a program.
+    type OpSet;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
     fn zero(&self, r#type: &Self::Type) -> Self::Value;
@@ -85,6 +94,7 @@ macro_rules! impl_engine_for_array_scalar_engine {
         impl Engine for ArrayScalarEngine<$ty> {
             type Type = ArrayType;
             type Value = $ty;
+            type OpSet = CoreOpSet;
 
             #[inline]
             fn zero(&self, _type: &ArrayType) -> $ty {
@@ -128,7 +138,7 @@ mod tests {
     fn test_array_scalar_engine_produces_canonical_zero_and_one() {
         let engine = ArrayScalarEngine::<f64>::new();
         let r#type = ArrayType::scalar(DataType::F64);
-        assert_eq!(engine.zero(&r#type), 0.0);
-        assert_eq!(engine.one(&r#type), 1.0);
+        assert_eq!(Engine::zero(&engine, &r#type), 0.0);
+        assert_eq!(Engine::one(&engine, &r#type), 1.0);
     }
 }

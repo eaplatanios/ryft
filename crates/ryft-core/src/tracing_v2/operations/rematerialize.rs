@@ -14,9 +14,9 @@ use crate::{
         CompiledFunction, JitTracer, LinearTerm, Program, TraceError, TraceInput, TraceOutput, Traceable, Value,
         ZeroLike,
         engine::Engine,
-        jit::try_trace_program_in,
+        jit::try_trace_program_for_op_set,
         linear::{
-            linearize_program_in, replay_program_graph_linearized_jit_in, transpose_linear_program_with_output_examples,
+            linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
         },
         ops::{
             CoreLinearProgramOp, CoreOpSet, DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet,
@@ -175,7 +175,7 @@ where
             S::rematerialize_op(self.clone()),
             primal_output_values,
         )?;
-        let tangent_outputs = replay_program_graph_linearized_jit_in::<_, _, _, S>(
+        let tangent_outputs = replay_program_graph_linearized_jit::<_, _, _, S>(
             self.body().compiled().program().graph(),
             inputs.to_vec(),
         )?;
@@ -188,17 +188,17 @@ where
 }
 
 impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for RematerializeOp<ArrayType, V, S>
+    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S> for RematerializeOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     S::JitOp: InterpretableOp<ArrayType, V>,
-    S::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
+    S::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>,
     S::JitOp: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = V>,
+        engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -206,7 +206,7 @@ where
         let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
-            LinearPrimitiveOp::Rematerialize(Box::new(make_linear_rematerialize_in::<_, S>(
+            LinearPrimitiveOp::Rematerialize(Box::new(make_linear_rematerialize::<_, S>(
                 engine,
                 &self.body,
                 primal_inputs,
@@ -332,26 +332,8 @@ impl<V: Traceable<ArrayType>> LinearOp<ArrayType, V> for LinearRematerializeOp<A
 /// Builds a linearized rematerialize op from its primal body by computing the pushforward and
 /// pullback programs at the provided primal inputs.
 #[allow(private_bounds)]
-pub fn make_linear_rematerialize<V>(
-    engine: &dyn Engine<Type = ArrayType, Value = V>,
-    body: &FlatTracedRematerialize<ArrayType, V>,
-    input_primals: Vec<V>,
-) -> Result<LinearRematerializeOp<ArrayType, V>, TraceError>
-where
-    V: Traceable<ArrayType> + ZeroLike,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    ProgramOpRef<V>: InterpretableOp<ArrayType, V>,
-    ProgramOpRef<V>: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
-    ProgramOpRef<V>: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>,
-    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-{
-    make_linear_rematerialize_in::<_, CoreOpSet>(engine, body, input_primals)
-}
-
-/// Builds a linearized rematerialize op from its primal body for one explicit ordinary op set.
-#[allow(private_bounds)]
-pub fn make_linear_rematerialize_in<V, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>(
-    engine: &dyn Engine<Type = ArrayType, Value = V>,
+pub(crate) fn make_linear_rematerialize<V, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>(
+    engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
     body: &FlatTracedRematerialize<ArrayType, V, <S as OpSet<ArrayType, V>>::JitOp>,
     input_primals: Vec<V>,
 ) -> Result<LinearRematerializeOp<ArrayType, V>, TraceError>
@@ -360,13 +342,13 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     <S as OpSet<ArrayType, V>>::JitOp: Op<ArrayType>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, V>,
-    <S as OpSet<ArrayType, V>>::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
+    <S as OpSet<ArrayType, V>>::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>,
     <S as OpSet<ArrayType, V>>::JitOp:
         InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     let output_primals = body.compiled.call(input_primals.clone())?;
-    let pushforward = linearize_program_in::<_, _, _, S>(engine, body.compiled.program(), input_primals)?;
+    let pushforward = linearize_program::<_, _, _, S>(engine, body.compiled.program(), input_primals)?;
     let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOp::new(
         FlatTracedRematerialize::from_parts(
@@ -447,7 +429,7 @@ where
         let (exemplar_outputs, body_program): (
             Output::To<V>,
             Program<ArrayType, V, Input::To<V>, Output::To<V>, <S as OpSet<ArrayType, V>>::JitOp>,
-        ) = try_trace_program_in::<_, Input::To<V>, Output::To<V>, V, S>(
+        ) = try_trace_program_for_op_set::<_, Input::To<V>, Output::To<V>, V, S>(
             move |staged_input| {
                 let adapted_input =
                     Input::from_parameters(input_structure, staged_input.into_parameters().collect::<Vec<_>>())?;
@@ -540,7 +522,9 @@ mod tests {
     #[test]
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the graph.
+        let engine = ArrayScalarEngine::<f64>::new();
         let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            &engine,
             |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
             2.0f64,
         )
@@ -554,7 +538,9 @@ mod tests {
     #[test]
     fn test_rematerialize_jit_graph_rendering() {
         // Check the exact rendering of the jit-traced graph containing a rematerialize op.
+        let engine = ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            &engine,
             |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
             2.0f64,
         )
@@ -660,12 +646,15 @@ mod tests {
     fn test_rematerialize_does_not_affect_forward_result() {
         // The forward result with rematerialize should match the result without it.
         let without: f64 = {
+            let engine = ArrayScalarEngine::<f64>::new();
             let (output, _): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-                jit(|x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), 3.0f64).unwrap();
+                jit(&engine, |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
+            let engine = ArrayScalarEngine::<f64>::new();
             let (output, _): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+                &engine,
                 |x: JitTracer<ArrayType, f64>| {
                     rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
                 },

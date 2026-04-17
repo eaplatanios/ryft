@@ -22,7 +22,7 @@ use crate::{
         jit::JitTracer,
         linear::LinearTerm,
         ops::{
-            DifferentiableOp, InterpretableOp, LinearOp, Op, SupportsLinearAdd, SupportsLinearNeg,
+            DifferentiableOp, InterpretableOp, LinearOp, Op, OpSet, SupportsLinearAdd, SupportsLinearNeg,
             SupportsLinearReshape, SupportsLinearScale, SupportsReshape, VectorizableOp,
         },
     },
@@ -414,12 +414,12 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOp<ArrayType, V> fo
     }
 }
 
-impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
-    for ReshapeOp
+impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps, S: OpSet<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S> for ReshapeOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -444,7 +444,10 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
-        tracing_v2::{CompiledFunction, JitTracer, LinearProgramBuilder, jit::try_jit},
+        tracing_v2::{
+            CompiledFunction, JitTracer, LinearProgramBuilder, jit::try_jit,
+            operations::matrix::ndarray_support::Array2Engine,
+        },
         types::{DataType, Shape},
     };
 
@@ -669,10 +672,12 @@ mod tests {
     #[test]
     fn test_reshape_jit_rendering_includes_target_shape() {
         let input = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
+        let engine = Array2Engine::<f64>::new();
         let (_, compiled): (
             ndarray::Array2<f64>,
             CompiledFunction<ArrayType, ndarray::Array2<f64>, ndarray::Array2<f64>, ndarray::Array2<f64>>,
         ) = try_jit(
+            &engine,
             |x: JitTracer<ArrayType, ndarray::Array2<f64>>| {
                 x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)]))
             },

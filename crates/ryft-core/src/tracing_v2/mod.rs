@@ -34,13 +34,10 @@ pub use batch::{Batch, stack, unstack, vmap};
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, Equation, Graph, GraphBuilder};
-pub use jit::{
-    CompiledFunction, JitTracer, TraceInput, TraceOutput, jit, jit_in, try_jit, try_jit_in, try_trace_program,
-    try_trace_program_in,
-};
+pub use jit::{CompiledFunction, JitTracer, TraceInput, TraceOutput, jit, try_jit, try_trace_program};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
-    grad, hessian, jacfwd, jacrev, jvp_program, linearize, value_and_grad, vjp,
+    grad, hessian, jacfwd, jacrev, jvp_program, linearize, try_jvp_program, try_vjp, value_and_grad, vjp,
 };
 pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};

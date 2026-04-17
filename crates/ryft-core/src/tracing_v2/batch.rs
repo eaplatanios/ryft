@@ -257,7 +257,7 @@ where
         let (exemplar_outputs, body_program): (
             Output::To<V>,
             Program<ArrayType, V, Input::To<V>, Output::To<V>, <S as OpSet<ArrayType, V>>::JitOp>,
-        ) = crate::tracing_v2::jit::try_trace_program_in::<_, Input::To<V>, Output::To<V>, V, S>(
+        ) = crate::tracing_v2::jit::try_trace_program_for_op_set::<_, Input::To<V>, Output::To<V>, V, S>(
             |lane_inputs| {
                 let batched_inputs = Input::To::<Batch<JitTracer<ArrayType, V, S>>>::from_parameters(
                     lane_inputs.parameter_structure(),
@@ -377,7 +377,7 @@ where
 mod tests {
     use indoc::indoc;
 
-    use crate::tracing_v2::{JitTracer, Sin, test_support};
+    use crate::tracing_v2::{JitTracer, Sin, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -423,7 +423,9 @@ mod tests {
 
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::try_jit(
+            &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
                     |batch: Batch<JitTracer<ArrayType, f64>>| batch.clone() + batch.one_like(),

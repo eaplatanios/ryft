@@ -24,7 +24,7 @@ use crate::experimental::lowering::{
 use crate::experimental::ops::{XlaOpSet, XlaPrimitiveOp};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
-    ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap,
+    ShardMapTensor, ShardMapTensorEngine, ShardMapTraceError, ShardMapTracer, TracedShardMap,
 };
 
 /// Shared graph type used by erased shard-map bodies.
@@ -167,7 +167,7 @@ impl ShardMapOp<ShardMapTensor> {
     /// Returns the tensor-leaf custom-primitive registration for this shard-map op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive()
-            .with_jvp_rule(self.clone())
+            .with_jvp_rule_for::<XlaOpSet, _>(self.clone())
             .with_linearized_jit_rule_for::<XlaOpSet, _>(self.clone())
             .with_extension(self.clone())
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
@@ -309,10 +309,12 @@ impl LinearOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>> for ShardMapOp<ShardMapTensor> {
+impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>, XlaOpSet>
+    for ShardMapOp<ShardMapTensor>
+{
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor>,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor, OpSet = XlaOpSet>,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         if self.has_linear_state() {
@@ -445,10 +447,13 @@ impl LinearOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>> for ShardMapOp<ShardMapTracer> {
+impl
+    DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>, ryft_core::tracing_v2::CoreOpSet>
+    for ShardMapOp<ShardMapTracer>
+{
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer>,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer, OpSet = ryft_core::tracing_v2::CoreOpSet>,
         _inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
@@ -1239,7 +1244,8 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             Vec<ShardMapTensor>,
             XlaPrimitiveOp,
         >,
-    ) = ryft_core::tracing_v2::try_jit_in::<_, Vec<ShardMapTensor>, Vec<ShardMapTensor>, ShardMapTensor, XlaOpSet>(
+    ) = ryft_core::tracing_v2::try_jit(
+        &ShardMapTensorEngine::new(),
         {
             let body = body.clone();
             move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TraceError> {
@@ -1277,7 +1283,8 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             Vec<ShardMapTensor>,
             XlaPrimitiveOp,
         >,
-    ) = ryft_core::tracing_v2::try_jit_in::<_, Vec<ShardMapTensor>, Vec<ShardMapTensor>, ShardMapTensor, XlaOpSet>(
+    ) = ryft_core::tracing_v2::try_jit(
+        &ShardMapTensorEngine::new(),
         {
             let body = body.clone();
             move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TraceError> {

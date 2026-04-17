@@ -155,7 +155,7 @@ pub trait LinearOp<T: Type + Display, V: Traceable<T> + Parameter>: Op<T> {
     fn transpose(&self, output_cotangents: &[LinearTerm<T, V>]) -> Result<Vec<Option<LinearTerm<T, V>>>, TraceError>;
 }
 
-/// Forward-mode differentiation rule, generic over the tangent type `T`.
+/// Forward-mode differentiation rule, generic over the tangent type `T` and staged op set `S`.
 ///
 /// Each operation implements this trait with the exact bounds on `T` that its JVP rule requires.
 /// For example, [`AddOp`](crate::tracing_v2::operations::AddOp) only needs `T: TangentSpace<V>`,
@@ -164,7 +164,7 @@ pub trait LinearOp<T: Type + Display, V: Traceable<T> + Parameter>: Op<T> {
 ///
 /// [`TangentSpace`]: crate::tracing_v2::forward::TangentSpace
 /// [`MatrixTangentSpace`]: crate::tracing_v2::MatrixTangentSpace
-pub trait DifferentiableOp<T: Type, V: Typed<T>, Tangent>: Op<T> {
+pub trait DifferentiableOp<T: Type + Display, V: Traceable<T>, Tangent, S: OpSet<T, V> = CoreOpSet>: Op<T> {
     /// Applies the forward-mode JVP rule.
     ///
     /// The `engine` argument carries the context needed to synthesize zero values for higher-order
@@ -172,7 +172,7 @@ pub trait DifferentiableOp<T: Type, V: Typed<T>, Tangent>: Op<T> {
     /// and [`VMapOp`](crate::tracing_v2::operations::VMapOp)). Pure arithmetic ops ignore it.
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = T, Value = V>,
+        engine: &dyn Engine<Type = T, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, Tangent>],
     ) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError>;
 }
@@ -195,12 +195,12 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
 /// concrete ops while `vmap` traces through a Rust closure, never on ops stored in a staged JIT
 /// graph, so pinning it here would unnecessarily restrict which op types can satisfy the bundle.
 pub trait JitOp<T: Type + Display, V: Traceable<T>>:
-    Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync
+    Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>, CoreOpSet> + Send + Sync
 {
 }
 
 impl<T: Type + Display, V: Traceable<T>, O> JitOp<T, V> for O where
-    O: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync
+    O: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>, CoreOpSet> + Send + Sync
 {
 }
 
@@ -232,17 +232,6 @@ impl<V: Traceable<ArrayType>, O> CoreProgramReplayOp<V> for O
 where
     O: Op<ArrayType> + InterpretableOp<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-{
-}
-
-/// Default ordinary-op carrier capability: eager replay plus JVP staging.
-pub(crate) trait CoreProgramForwardOp<V: Traceable<ArrayType>>:
-    CoreProgramReplayOp<V> + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
-{
-}
-
-impl<V: Traceable<ArrayType>, O> CoreProgramForwardOp<V> for O where
-    O: CoreProgramReplayOp<V> + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
 {
 }
 
@@ -284,99 +273,14 @@ pub(crate) trait CoreLinearProgramOp<V: Traceable<ArrayType>>:
 
 impl<V: Traceable<ArrayType>, O> CoreLinearProgramOp<V> for O where O: CoreLinearReplayOp<V> + LinearOp<ArrayType, V> {}
 
-/// Value capability set required by the closed default ordinary-op carrier.
-pub(crate) trait CoreProgramInterpretValue:
-    Traceable<ArrayType>
-    + Add<Output = Self>
-    + Mul<Output = Self>
-    + Neg<Output = Self>
-    + Sin
-    + Cos
-    + ZeroLike
-    + OneLike
-    + MatrixOps
-    + crate::tracing_v2::operations::reshape::ReshapeOps
-{
-}
-
-impl<V> CoreProgramInterpretValue for V where
-    V: Traceable<ArrayType>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-{
-}
-
-/// Value capability set required for JVP staging through the closed default ordinary-op carrier.
-pub(crate) trait CoreProgramDifferentiableValue:
-    CoreProgramInterpretValue + Parameterized<Self, ParameterStructure: Clone + PartialEq>
-{
-}
-
-impl<V> CoreProgramDifferentiableValue for V where
-    V: CoreProgramInterpretValue + Parameterized<V, ParameterStructure: Clone + PartialEq>
-{
-}
-
-/// Value capability set required to replay the closed default ordinary-op carrier on linearized
-/// JIT values.
-pub(crate) trait CoreProgramLinearizedJitValue:
-    CoreProgramInterpretValue + Parameterized<Self, ParameterStructure: Clone + PartialEq>
-{
-}
-
-impl<V> CoreProgramLinearizedJitValue for V where
-    V: CoreProgramInterpretValue + Parameterized<V, ParameterStructure: Clone + PartialEq>
-{
-}
-
-/// Value capability set required by the closed default linear carrier.
-pub(crate) trait CoreLinearInterpretValue:
-    Traceable<ArrayType>
-    + Add<Output = Self>
-    + Mul<Output = Self>
-    + Neg<Output = Self>
-    + ZeroLike
-    + MatrixOps
-    + crate::tracing_v2::operations::reshape::ReshapeOps
-{
-}
-
-impl<V> CoreLinearInterpretValue for V where
-    V: Traceable<ArrayType>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + ZeroLike
-        + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-{
-}
-
-/// Value capability set required to transpose the closed default linear carrier.
-pub(crate) trait CoreLinearTransposeValue: CoreLinearInterpretValue + OneLike {}
-
-impl<V> CoreLinearTransposeValue for V where V: CoreLinearInterpretValue + OneLike {}
-
-/// Value capability set required to both replay and transpose the closed default linear carrier.
-pub(crate) trait CoreLinearProgramValue: CoreLinearTransposeValue {}
-
-impl<V> CoreLinearProgramValue for V where V: CoreLinearTransposeValue {}
-
 /// Capability bundle for operations that can appear in a staged JIT graph for one specific op set.
 pub trait StagedJitOp<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>>:
-    Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, S>> + Send + Sync
+    Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>, S> + Send + Sync
 {
 }
 
 impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>, O> StagedJitOp<T, V, S> for O where
-    O: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, S>> + Send + Sync
+    O: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>, S> + Send + Sync
 {
 }
 
@@ -616,6 +520,17 @@ impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V>> LinearizedJitRu
     }
 }
 
+/// Type-erased wrapper for an op-set-specific JVP rule stored inside [`CustomPrimitiveExtensions`].
+struct JvpRule<T: Type + Display, V: Traceable<T> + Parameter, S: OpSet<T, V>>(
+    Arc<dyn DifferentiableOp<T, V, LinearTerm<T, V>, S> + Send + Sync>,
+);
+
+impl<T: Type + Display, V: Traceable<T> + Parameter, S: OpSet<T, V>> JvpRule<T, V, S> {
+    fn rule(&self) -> &(dyn DifferentiableOp<T, V, LinearTerm<T, V>, S> + Send + Sync) {
+        self.0.as_ref()
+    }
+}
+
 trait CustomBaseOp<T: Type, V: Typed<T>>: Op<T> + InterpretableOp<T, V> + Send + Sync {}
 
 impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V> + Send + Sync> CustomBaseOp<Ty, V> for O {}
@@ -633,12 +548,11 @@ impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V> + Send + Syn
 pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
     base: Arc<dyn CustomBaseOp<T, V>>,
     transpose_rule: Option<Arc<dyn LinearOp<T, V> + Send + Sync>>,
-    jvp_rule: Option<Arc<dyn DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync>>,
     vectorization_rule: Option<Arc<dyn VectorizableOp<T, V> + Send + Sync>>,
     extensions: CustomPrimitiveExtensions<T, V>,
 }
 
-impl<T: Type + Display, V: Traceable<T>> CustomPrimitive<T, V> {
+impl<T: Type + Display + 'static, V: Traceable<T> + 'static> CustomPrimitive<T, V> {
     /// Creates one custom primitive from its required base operation.
     pub fn new<Base>(base: Base) -> Self
     where
@@ -647,7 +561,6 @@ impl<T: Type + Display, V: Traceable<T>> CustomPrimitive<T, V> {
         Self {
             base: Arc::new(base),
             transpose_rule: None,
-            jvp_rule: None,
             vectorization_rule: None,
             extensions: CustomPrimitiveExtensions { entries: HashMap::new(), _marker: std::marker::PhantomData },
         }
@@ -663,11 +576,20 @@ impl<T: Type + Display, V: Traceable<T>> CustomPrimitive<T, V> {
     }
 
     /// Registers one forward-mode JVP rule.
-    pub fn with_jvp_rule<Rule>(mut self, rule: Rule) -> Self
+    pub fn with_jvp_rule<Rule>(self, rule: Rule) -> Self
     where
-        Rule: DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync + 'static,
+        Rule: DifferentiableOp<T, V, LinearTerm<T, V>, CoreOpSet> + Send + Sync + 'static,
     {
-        self.jvp_rule = Some(Arc::new(rule));
+        self.with_jvp_rule_for::<CoreOpSet, _>(rule)
+    }
+
+    /// Registers one op-set-specific forward-mode JVP rule.
+    pub fn with_jvp_rule_for<S, Rule>(mut self, rule: Rule) -> Self
+    where
+        S: OpSet<T, V>,
+        Rule: DifferentiableOp<T, V, LinearTerm<T, V>, S> + Send + Sync + 'static,
+    {
+        self.extensions.insert(JvpRule::<T, V, S>(Arc::new(rule)));
         self
     }
 
@@ -734,8 +656,10 @@ impl<T: Type + Display, V: Traceable<T>> CustomPrimitive<T, V> {
         TraceError::MissingCustomRule { op: self.base.name(), transform }
     }
 
-    fn jvp_rule(&self) -> Result<&(dyn DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync), TraceError> {
-        self.jvp_rule.as_deref().ok_or_else(|| self.missing_rule("jvp"))
+    fn jvp_rule<S: OpSet<T, V>>(
+        &self,
+    ) -> Result<&(dyn DifferentiableOp<T, V, LinearTerm<T, V>, S> + Send + Sync), TraceError> {
+        self.extensions.get::<JvpRule<T, V, S>>().map(JvpRule::rule).ok_or_else(|| self.missing_rule("jvp"))
     }
 }
 
@@ -798,15 +722,15 @@ impl<V: Traceable<ArrayType>> VectorizableOp<ArrayType, V> for CustomPrimitive<A
     }
 }
 
-impl<V: Traceable<ArrayType>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>
     for CustomPrimitive<ArrayType, V>
 {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = V>,
+        engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
-        self.jvp_rule()?.jvp(engine, inputs)
+        self.jvp_rule::<S>()?.jvp(engine, inputs)
     }
 }
 
@@ -832,7 +756,7 @@ pub struct LinearCustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter>
     primitive: Arc<CustomPrimitive<T, V>>,
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearCustomPrimitive<T, V> {
+impl<T: Type + Display + 'static, V: Traceable<T>> LinearCustomPrimitive<T, V> {
     /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
     pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TraceError> {
         primitive.transpose_rule.as_ref().ok_or_else(|| primitive.missing_rule("transpose"))?;
@@ -1213,7 +1137,7 @@ impl<T: Type + Display, V: Traceable<T>> SupportsLinearRematerialize<T, V> for C
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> SupportsLinearCustom<T, V> for CoreOpSet {
+impl<T: Type + Display + 'static, V: Traceable<T>> SupportsLinearCustom<T, V> for CoreOpSet {
     #[inline]
     fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self::LinearOp, TraceError> {
         Ok(LinearPrimitiveOp::Custom(Arc::new(primitive.into_linear()?)))
@@ -1265,13 +1189,13 @@ impl<O: LinearOp<T, V> + ?Sized, T: Type + Display, V: Traceable<T>> LinearOp<T,
     }
 }
 
-impl<O: DifferentiableOp<T, V, Tangent> + ?Sized, T: Type, V: Traceable<T>, Tangent> DifferentiableOp<T, V, Tangent>
-    for Arc<O>
+impl<O: DifferentiableOp<T, V, Tangent, S> + ?Sized, T: Type + Display, V: Traceable<T>, Tangent, S: OpSet<T, V>>
+    DifferentiableOp<T, V, Tangent, S> for Arc<O>
 {
     #[inline]
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = T, Value = V>,
+        engine: &dyn Engine<Type = T, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, Tangent>],
     ) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError> {
         (**self).jvp(engine, inputs)
@@ -1680,48 +1604,62 @@ impl<
         + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
-> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for PrimitiveOp<ArrayType, V>
+> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet> for PrimitiveOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = V>,
+        engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = CoreOpSet>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         match self {
-            Self::Add => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&AddOp, engine, inputs),
-            Self::Mul => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MulOp, engine, inputs),
-            Self::Neg => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&NegOp, engine, inputs),
-            Self::Sin => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&SinOp, engine, inputs),
-            Self::Cos => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&CosOp, engine, inputs),
-            Self::Scale { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+            Self::Add => {
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(&AddOp, engine, inputs)
+            }
+            Self::Mul => {
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(&MulOp, engine, inputs)
+            }
+            Self::Neg => {
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(&NegOp, engine, inputs)
+            }
+            Self::Sin => {
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(&SinOp, engine, inputs)
+            }
+            Self::Cos => {
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(&CosOp, engine, inputs)
+            }
+            Self::Scale { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(
                 &ScaleOp::new(factor.clone()),
                 engine,
                 inputs,
             ),
-            Self::MatMul => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MatMulOp, engine, inputs),
-            Self::MatrixTranspose => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(&MatrixTransposeOp, engine, inputs)
+            Self::MatMul => {
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(&MatMulOp, engine, inputs)
             }
-            Self::LinearMatrixTranspose => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+            Self::MatrixTranspose => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(
+                &MatrixTransposeOp,
+                engine,
+                inputs,
+            ),
+            Self::LinearMatrixTranspose => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(
                 &LinearMatrixTransposeOp,
                 engine,
                 inputs,
             ),
-            Self::LeftMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+            Self::LeftMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(
                 &LeftMatMulOp::new(factor.clone()),
                 engine,
                 inputs,
             ),
-            Self::RightMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+            Self::RightMatMul { factor } => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(
                 &RightMatMulOp::new(factor.clone()),
                 engine,
                 inputs,
             ),
             Self::Reshape { input_type, output_type } => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(
+                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(
                     &ReshapeOp::new(input_type.clone(), output_type.clone()),
                     engine,
                     inputs,
@@ -1731,9 +1669,11 @@ where
                 op: "linearize_program",
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
-            Self::Rematerialize(remat) => {
-                DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>>::jvp(remat.as_ref(), engine, inputs)
-            }
+            Self::Rematerialize(remat) => DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V>, CoreOpSet>::jvp(
+                remat.as_ref(),
+                engine,
+                inputs,
+            ),
             Self::Custom(op) => op.jvp(engine, inputs),
         }
     }
@@ -1826,10 +1766,10 @@ mod tests {
         }
     }
 
-    impl DifferentiableOp<ArrayType, f64, LinearTerm<ArrayType, f64>> for ShiftOp {
+    impl DifferentiableOp<ArrayType, f64, LinearTerm<ArrayType, f64>, CoreOpSet> for ShiftOp {
         fn jvp(
             &self,
-            _engine: &dyn Engine<Type = ArrayType, Value = f64>,
+            _engine: &dyn Engine<Type = ArrayType, Value = f64, OpSet = CoreOpSet>,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TraceError> {
             if inputs.len() != 1 {
@@ -1916,8 +1856,10 @@ mod tests {
 
     #[test]
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
         let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = try_jit(
+            &engine,
             {
                 let primitive = primitive.clone();
                 move |x: JitTracer<ArrayType, f64>| Ok(stage_custom_traced_unary(x, primitive.clone()))
@@ -1965,6 +1907,7 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
         let result: Result<(f64, CompiledFunction<ArrayType, f64, f64, f64>), TraceError> = try_jit(
+            &engine,
             {
                 let primitive = primitive.clone();
                 move |x: JitTracer<ArrayType, f64>| {
@@ -2009,6 +1952,7 @@ mod tests {
         );
 
         let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = try_jit(
+            &engine,
             {
                 let primitive = primitive.clone();
                 move |x: JitTracer<ArrayType, f64>| {

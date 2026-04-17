@@ -302,14 +302,16 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{CompiledFunction, JitTracer, OneLike, Sin, jit};
+    use crate::tracing_v2::{CompiledFunction, JitTracer, OneLike, Sin, engine::ArrayScalarEngine, jit};
 
     use super::*;
 
     /// Summarizes a small scalar graph and verifies the structural metrics.
     #[test]
     fn test_summarize_graph_counts_constants_and_depth() {
+        let engine = ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let with_constant = x.clone() + x.one_like();
                 with_constant.sin()

@@ -2936,8 +2936,9 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
+        let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
-            ryft_core::tracing_v2::jit(scalar_bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+            ryft_core::tracing_v2::jit(&engine, scalar_bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         let stablehlo = to_mlir_module_for_plain_graph(compiled.program().graph(), "main").unwrap();
         assert_eq!(
@@ -2957,8 +2958,10 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
+        let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, f64, f64>) =
             ryft_core::tracing_v2::try_jit(
+                &engine,
                 |x: ryft_core::tracing_v2::JitTracer<ArrayType, f64>| {
                     Ok(ryft_core::tracing_v2::grad(
                         &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
@@ -3008,10 +3011,12 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_grad_jitted_stablehlo() {
         // grad(f) wrapped in JIT — symbolic, like JAX's jit(grad(f)).
         // Uses the GradInvocationLeaf<JitTracer<V>> dispatch that traces through vjp+pullback.
+        let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             (f64, f64),
             ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), (f64, f64)>,
         ) = ryft_core::tracing_v2::try_jit(
+            &engine,
             |inputs: (
                 ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
                 ryft_core::tracing_v2::JitTracer<ArrayType, f64>,

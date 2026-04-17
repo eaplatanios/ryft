@@ -283,7 +283,7 @@ pub mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, Cos, OneLike, Sin, Traceable, ZeroLike, engine::Engine},
+        tracing_v2::{CoordinateValue, CoreOpSet, Cos, OneLike, Sin, Traceable, ZeroLike, engine::Engine},
         types::{ArrayType, DataType, Typed},
     };
 
@@ -316,6 +316,7 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f32> {
         type Type = ArrayType;
         type Value = Array2<f32>;
+        type OpSet = CoreOpSet;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f32> {
@@ -331,6 +332,7 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f64> {
         type Type = ArrayType;
         type Value = Array2<f64>;
+        type OpSet = CoreOpSet;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f64> {

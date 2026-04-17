@@ -69,7 +69,7 @@ use thiserror::Error;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::{
-    CompiledFunction, Cos, JitTracer, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike, jit_in,
+    CompiledFunction, Cos, JitTracer, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike, jit,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -359,6 +359,7 @@ impl ShardMapTensorEngine {
 impl ryft_core::tracing_v2::engine::Engine for ShardMapTensorEngine {
     type Type = ArrayType;
     type Value = ShardMapTensor;
+    type OpSet = XlaOpSet;
 
     #[inline]
     fn zero(&self, r#type: &ArrayType) -> ShardMapTensor {
@@ -1248,13 +1249,11 @@ where
     Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
 {
     let traced_inputs = traced_input_tensors(input_types)?;
+    let engine = ShardMapTensorEngine::new();
     let (output_tensors, compiled): (
         Output::To<ShardMapTensor>,
         XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
-    ) = jit_in::<_, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>, ShardMapTensor, XlaOpSet>(
-        function,
-        traced_inputs,
-    )?;
+    ) = jit(&engine, function, traced_inputs)?;
     let output_types = Output::from_parameters(
         output_tensors.parameter_structure(),
         output_tensors.into_parameters().map(|tensor| tensor.tpe().into_owned()).collect::<Vec<_>>(),

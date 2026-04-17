@@ -8,7 +8,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
-    ops::{DifferentiableOp, InterpretableOp, Op, SupportsSin, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, OpSet, SupportsSin, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -67,10 +67,12 @@ impl<V: Traceable<ArrayType> + Sin> InterpretableOp<ArrayType, V> for SinOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for SinOp {
+impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, S: OpSet<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, T, S> for SinOp
+{
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

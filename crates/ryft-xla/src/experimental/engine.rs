@@ -28,6 +28,7 @@ use ryft_core::types::{ArrayType, Size};
 use crate::pjrt::ToPjrt;
 
 use super::arrays::{Array, ArrayError};
+use super::ops::XlaOpSet;
 use super::shard_map::{ShardMapTraceError, TracedXlaProgram};
 
 /// Error type returned by [`XlaEngine`] orchestration helpers.
@@ -111,6 +112,7 @@ impl<'c> XlaEngine<'c> {
 impl<'c> Engine for XlaEngine<'c> {
     type Type = ArrayType;
     type Value = Array<'c>;
+    type OpSet = XlaOpSet;
 
     fn zero(&self, array_type: &ArrayType) -> Array<'c> {
         self.constant(array_type, ConstantKind::Zero)
