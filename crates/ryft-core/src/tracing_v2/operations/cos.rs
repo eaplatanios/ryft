@@ -11,8 +11,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
-    ops::PrimitiveOp,
-    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, SupportsCos, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -102,10 +101,13 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
     }
 }
 
-impl<V: Traceable<ArrayType> + Cos> Cos for JitTracer<ArrayType, V> {
+impl<V: Traceable<ArrayType> + Cos, S: SupportsCos<ArrayType, V>> Cos for JitTracer<ArrayType, V, S>
+where
+    S::JitOp: Op<ArrayType>,
+{
     #[inline]
     fn cos(self) -> Self {
-        self.unary(PrimitiveOp::Cos, Cos::cos)
+        self.unary(S::cos_op(), Cos::cos)
     }
 }
 

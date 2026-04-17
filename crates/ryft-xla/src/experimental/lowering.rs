@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, Op, PrimitiveOp, ReshapeOps, Traceable,
+    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, Op, OpSet, PrimitiveOp, ReshapeOps, Traceable,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, LinearRematerializeOp, LinearVMapOp,
         MatMulOp, MatrixTransposeOp, MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -22,6 +22,7 @@ use ryft_core::tracing_v2::{
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
 use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp, WithShardingConstraintOp};
+use crate::experimental::ops::XlaPrimitiveOp;
 use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
@@ -134,9 +135,9 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V>(
+    pub(crate) fn lower_vmap<V, S>(
         &mut self,
-        vmap_op: &VMapOp<ArrayType, V>,
+        vmap_op: &VMapOp<ArrayType, V, S>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -150,6 +151,8 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
+        S: OpSet<ArrayType, V>,
+        S::JitOp: Clone + Op + XlaOp<V>,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -163,9 +166,9 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V>(
+    pub(crate) fn lower_rematerialize<V, S>(
         &mut self,
-        remat_op: &RematerializeOp<ArrayType, V>,
+        remat_op: &RematerializeOp<ArrayType, V, S>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -179,6 +182,8 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
+        S: OpSet<ArrayType, V>,
+        S::JitOp: Clone + Op + XlaOp<V>,
     {
         lower_rematerialize_inline(
             remat_op.body().compiled().program().graph(),
@@ -229,9 +234,9 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Implementing this trait makes an operation eligible for MLIR lowering via
-/// [`to_mlir_module_for_plain_graph`] and related entry points. The [`PrimitiveOp`] and
-/// [`LinearPrimitiveOp`] enums provide blanket implementations covering the built-in forward and
-/// linear op universes respectively.
+/// [`to_mlir_module_for_plain_graph`] and related entry points. The core [`PrimitiveOp`] and
+/// [`LinearPrimitiveOp`] enums provide the default blanket implementations, and backends can add
+/// their own closed op carriers by implementing this trait for those enums.
 pub(crate) trait XlaOp<V: Traceable<ArrayType>>: ryft_core::tracing_v2::ops::Op {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -534,7 +539,10 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for VMapOp<ArrayType, V>
+    S: OpSet<ArrayType, V>,
+> XlaOp<V> for VMapOp<ArrayType, V, S>
+where
+    S::JitOp: Clone + Op + XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -550,6 +558,119 @@ impl<
     }
 }
 
+impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+    where
+        ShardMapTensor: MlirLowerableValue,
+    {
+        match self {
+            Self::Add => {
+                <AddOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer)
+            }
+            Self::Mul => {
+                <MulOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&MulOp, input_values, output_types, mode, lowerer)
+            }
+            Self::Neg => {
+                <NegOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&NegOp, input_values, output_types, mode, lowerer)
+            }
+            Self::Sin => {
+                <SinOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&SinOp, input_values, output_types, mode, lowerer)
+            }
+            Self::Cos => {
+                <CosOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&CosOp, input_values, output_types, mode, lowerer)
+            }
+            Self::MatMul => {
+                <MatMulOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&MatMulOp, input_values, output_types, mode, lowerer)
+            }
+            Self::MatrixTranspose => <MatrixTransposeOp as XlaOp<ShardMapTensor>>::lower_to_mlir(
+                &MatrixTransposeOp,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Scale { factor } => <ScaleOp<ArrayType, ShardMapTensor> as XlaOp<ShardMapTensor>>::lower_to_mlir(
+                &ScaleOp::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::LeftMatMul { factor } => <LeftMatMulOp<ShardMapTensor> as XlaOp<ShardMapTensor>>::lower_to_mlir(
+                &LeftMatMulOp::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::RightMatMul { factor } => <RightMatMulOp<ShardMapTensor> as XlaOp<ShardMapTensor>>::lower_to_mlir(
+                &RightMatMulOp::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Reshape { input_type, output_type } => <ReshapeOp as XlaOp<ShardMapTensor>>::lower_to_mlir(
+                &ReshapeOp::new(input_type.clone(), output_type.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::VMap(vmap) => lowerer.lower_vmap(vmap.as_ref(), input_values),
+            Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
+            Self::ShardMap(shard_map_op) => {
+                if let Some(eval_mode) = shard_map_op.eval_mode() {
+                    return lower_linear_shard_map_eval_mode(
+                        eval_mode,
+                        input_values,
+                        &mut lowerer.block,
+                        lowerer.context,
+                        lowerer.location,
+                    );
+                }
+                let simplified_body = shard_map_op
+                    .body()
+                    .simplified()
+                    .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+                lower_manual_computation(
+                    &mut lowerer.block,
+                    input_values,
+                    &simplified_body.shard_map,
+                    simplified_body.compiled.graph(),
+                    simplified_body.local_input_types.as_slice(),
+                    simplified_body.global_output_types.as_slice(),
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
+            Self::WithShardingConstraint(op) => {
+                let operation = lowerer.block.append_operation(shardy::sharding_constraint(
+                    input_values[0],
+                    op.sharding().to_mlir(lowerer.location),
+                    lowerer.location,
+                ));
+                Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
+            }
+            Self::Custom(custom_op) => {
+                let mut shard_map_lowerer =
+                    ShardMapMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+                custom_op
+                    .extensions()
+                    .get::<StableHloCustomLoweringExtension<ShardMapTensor>>()
+                    .ok_or_else(|| LoweringError::MissingCustomLowering { op: self.name().to_string() })?
+                    .lower_to_mlir(custom_op.as_ref(), input_values, output_types, &mut shard_map_lowerer)
+            }
+        }
+    }
+}
+
 impl<
     V: Traceable<ArrayType>
         + std::ops::Add<Output = V>
@@ -561,7 +682,10 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for LinearVMapOp<ArrayType, V>
+    S: OpSet<ArrayType, V>,
+> XlaOp<V> for LinearVMapOp<ArrayType, V, S>
+where
+    S::LinearOp: Clone + Op + XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -595,7 +719,10 @@ impl<
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
         + ReshapeOps,
-> XlaOp<V> for LinearRematerializeOp<ArrayType, V>
+    S: OpSet<ArrayType, V>,
+> XlaOp<V> for LinearRematerializeOp<ArrayType, V, S>
+where
+    S::LinearOp: Clone + Op + XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -815,9 +942,9 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V>(
+    pub(crate) fn lower_vmap<V, S>(
         &mut self,
-        vmap_op: &VMapOp<ArrayType, V>,
+        vmap_op: &VMapOp<ArrayType, V, S>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -831,6 +958,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
+        S: OpSet<ArrayType, V>,
+        S::JitOp: Clone + Op + XlaOp<V>,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -844,9 +973,9 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V>(
+    pub(crate) fn lower_rematerialize<V, S>(
         &mut self,
-        remat_op: &RematerializeOp<ArrayType, V>,
+        remat_op: &RematerializeOp<ArrayType, V, S>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -860,6 +989,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
             + ryft_core::tracing_v2::ReshapeOps,
+        S: OpSet<ArrayType, V>,
+        S::JitOp: Clone + Op + XlaOp<V>,
     {
         lower_rematerialize_inline(
             remat_op.body().compiled().program().graph(),
@@ -875,7 +1006,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         &mut self,
         outer_inputs: &[ValueRef<'b, 'c, 't>],
         shard_map: &ShardMap,
-        graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+        graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
         local_input_types: &[ArrayType],
         global_output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
@@ -908,7 +1039,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
 pub(crate) fn to_mlir_module<Input, Output, GraphInput, GraphOutput, S>(
     shard_map: &ShardMap,
-    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     global_input_types: &Input,
     local_input_types: &Input,
     global_output_types: &Output,
@@ -1006,7 +1137,7 @@ where
 
 /// Lowers an arbitrary traced XLA graph to a textual StableHLO/Shardy MLIR module.
 pub(crate) fn to_mlir_module_for_graph<Input, Output, GraphInput, GraphOutput, S>(
-    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
@@ -1249,7 +1380,7 @@ where
 }
 
 fn collect_nested_sharding_mesh<GraphInput, GraphOutput>(
-    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, LoweringError>
 where
@@ -1258,8 +1389,8 @@ where
 {
     let mut mesh = existing;
     for equation in graph.equations() {
-        if let PrimitiveOp::Custom(ref custom_op) = equation.op {
-            if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
+        match &equation.op {
+            XlaPrimitiveOp::ShardMap(shard_map_op) => {
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
                     mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
                 } else {
@@ -1271,7 +1402,8 @@ where
                     });
                     mesh = collect_nested_sharding_mesh(shard_map_op.body().compiled.graph(), mesh)?;
                 }
-            } else if let Some(sharding_constraint_op) = custom_op.extensions().get::<WithShardingConstraintOp>() {
+            }
+            XlaPrimitiveOp::WithShardingConstraint(sharding_constraint_op) => {
                 mesh = Some(match mesh.take() {
                     Some(existing_mesh) => {
                         merge_logical_meshes(&existing_mesh, &sharding_constraint_op.sharding().mesh)?
@@ -1279,6 +1411,29 @@ where
                     None => sharding_constraint_op.sharding().mesh.clone(),
                 });
             }
+            XlaPrimitiveOp::Custom(custom_op) => {
+                if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
+                    if let Some(eval_mode) = shard_map_op.eval_mode() {
+                        mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
+                    } else {
+                        mesh = Some(match mesh.take() {
+                            Some(existing_mesh) => {
+                                merge_logical_meshes(&existing_mesh, shard_map_op.body().shard_map.mesh())?
+                            }
+                            None => shard_map_op.body().shard_map.mesh().clone(),
+                        });
+                        mesh = collect_nested_sharding_mesh(shard_map_op.body().compiled.graph(), mesh)?;
+                    }
+                } else if let Some(sharding_constraint_op) = custom_op.extensions().get::<WithShardingConstraintOp>() {
+                    mesh = Some(match mesh.take() {
+                        Some(existing_mesh) => {
+                            merge_logical_meshes(&existing_mesh, &sharding_constraint_op.sharding().mesh)?
+                        }
+                        None => sharding_constraint_op.sharding().mesh.clone(),
+                    });
+                }
+            }
+            _ => {}
         }
     }
     Ok(mesh)
@@ -1329,9 +1484,10 @@ enum VMapLoweringMode {
 }
 
 /// Maps the canonical traced `vmap` op to the lowering-specific packing mode.
-fn lower_vmap_mode<V>(_vmap_op: &VMapOp<ArrayType, V>) -> VMapLoweringMode
+fn lower_vmap_mode<V, S>(_vmap_op: &VMapOp<ArrayType, V, S>) -> VMapLoweringMode
 where
     V: Traceable<ArrayType>,
+    S: OpSet<ArrayType, V>,
 {
     VMapLoweringMode::Forward
 }
@@ -1997,7 +2153,7 @@ where
 
 /// Lowers one traced graph to values inside a block.
 fn lower_graph_outputs<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
-    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -2056,7 +2212,7 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     shard_map: &ShardMap,
-    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
@@ -2239,18 +2395,18 @@ where
 
 /// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
 fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
-    op: &PrimitiveOp<ArrayType, ShardMapTensor>,
+    op: &XlaPrimitiveOp,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     match op {
-        PrimitiveOp::Add => {
+        XlaPrimitiveOp::Add => {
             let result =
                 lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
         }
-        PrimitiveOp::Mul => {
+        XlaPrimitiveOp::Mul => {
             let result = lowerer.block.append_operation(stable_hlo::multiply(
                 input_values[0],
                 input_values[1],
@@ -2258,18 +2414,18 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
-        PrimitiveOp::Neg => {
+        XlaPrimitiveOp::Neg => {
             let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
         }
-        PrimitiveOp::Sin => {
+        XlaPrimitiveOp::Sin => {
             let result =
                 lowerer
                     .block
                     .append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
         }
-        PrimitiveOp::Cos => {
+        XlaPrimitiveOp::Cos => {
             let result = lowerer.block.append_operation(stable_hlo::cosine(
                 input_values[0],
                 Accuracy::Default,
@@ -2277,7 +2433,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
-        PrimitiveOp::MatMul => {
+        XlaPrimitiveOp::MatMul => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
@@ -2291,12 +2447,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        PrimitiveOp::MatrixTranspose | PrimitiveOp::LinearMatrixTranspose => {
+        XlaPrimitiveOp::MatrixTranspose => {
             let result =
                 lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
         }
-        PrimitiveOp::Scale { factor } => {
+        XlaPrimitiveOp::Scale { factor } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let factor_type = factor.tpe();
@@ -2318,7 +2474,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
-        PrimitiveOp::LeftMatMul { factor } => {
+        XlaPrimitiveOp::LeftMatMul { factor } => {
             let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
@@ -2333,7 +2489,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        PrimitiveOp::RightMatMul { factor } => {
+        XlaPrimitiveOp::RightMatMul { factor } => {
             let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
@@ -2348,7 +2504,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        PrimitiveOp::Reshape { output_type, .. } => {
+        XlaPrimitiveOp::Reshape { output_type, .. } => {
             let output_shape = static_dimensions(output_type)?;
             let result = lowerer.block.append_operation(stable_hlo::reshape(
                 input_values[0],
@@ -2357,9 +2513,33 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
-        PrimitiveOp::VMap(vmap_op) => lowerer.lower_vmap(vmap_op, input_values),
-        PrimitiveOp::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op, input_values),
-        PrimitiveOp::Custom(custom_op) => custom_op
+        XlaPrimitiveOp::VMap(vmap_op) => lowerer.lower_vmap(vmap_op.as_ref(), input_values),
+        XlaPrimitiveOp::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
+        XlaPrimitiveOp::ShardMap(shard_map_op) => {
+            if let Some(eval_mode) = shard_map_op.eval_mode() {
+                return lowerer.lower_linear_shard_map_eval_mode(eval_mode, input_values);
+            }
+            let simplified_body = shard_map_op
+                .body()
+                .simplified()
+                .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+            lowerer.lower_manual_computation(
+                input_values,
+                &simplified_body.shard_map,
+                simplified_body.compiled.graph(),
+                simplified_body.local_input_types.as_slice(),
+                simplified_body.global_output_types.as_slice(),
+            )
+        }
+        XlaPrimitiveOp::WithShardingConstraint(op) => {
+            let operation = lowerer.block.append_operation(shardy::sharding_constraint(
+                input_values[0],
+                op.sharding().to_mlir(lowerer.location),
+                lowerer.location,
+            ));
+            Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
+        }
+        XlaPrimitiveOp::Custom(custom_op) => custom_op
             .extensions()
             .get::<StableHloCustomLoweringExtension<ShardMapTensor>>()
             .ok_or_else(|| LoweringError::MissingCustomLowering { op: op.name().to_string() })?
@@ -2445,7 +2625,7 @@ where
 
 /// Lowers one traced equation to the corresponding StableHLO operation and returns its result value.
 fn lower_equation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
-    graph: &Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2698,8 +2878,8 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, Sin, TraceError,
-        ZeroLike,
+        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, Sin, TraceError, ZeroLike,
+        program::ProgramBuilderFor,
     };
     use ryft_core::types::Shape;
 
@@ -2772,10 +2952,10 @@ mod tests {
     }
 
     fn custom_graph(
-        op: PrimitiveOp<ArrayType, ShardMapTensor>,
-    ) -> Graph<PrimitiveOp<ArrayType, ShardMapTensor>, ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
+        op: XlaPrimitiveOp,
+    ) -> Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilder::<ShardMapTensor>::new();
+        let mut builder = ProgramBuilderFor::<crate::experimental::ops::XlaOpSet, ShardMapTensor>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
         let output = builder.add_equation(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)
@@ -2868,7 +3048,7 @@ mod tests {
     fn test_to_mlir_module_for_graph_uses_registered_custom_lowering() {
         let primitive = CustomPrimitive::new(TestCustomLoweredOp)
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(TestCustomLowering)));
-        let graph = custom_graph(PrimitiveOp::Custom(Arc::new(primitive)));
+        let graph = custom_graph(XlaPrimitiveOp::Custom(Arc::new(primitive)));
         let input_type = test_vector_type(4);
 
         assert_eq!(
@@ -2886,7 +3066,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_graph_reports_missing_custom_lowering() {
-        let graph = custom_graph(PrimitiveOp::Custom(Arc::new(CustomPrimitive::new(TestCustomLoweredOp))));
+        let graph = custom_graph(XlaPrimitiveOp::Custom(Arc::new(CustomPrimitive::new(TestCustomLoweredOp))));
         let input_type = test_vector_type(4);
 
         assert_eq!(

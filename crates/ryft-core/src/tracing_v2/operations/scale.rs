@@ -15,7 +15,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, OpSet, SupportsMul, SupportsScale, VectorizableOp},
 };
 use crate::types::{ArrayType, Type, Typed};
 
@@ -97,14 +97,18 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOp<ArrayType, V
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>>
-    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>
+impl<
+    V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>,
+    S: OpSet<ArrayType, V> + SupportsMul<ArrayType, V> + SupportsScale<ArrayType, V>,
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
     for ScaleOp<ArrayType, V>
+where
+    S::JitOp: Op<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         Ok(vec![JvpTracer {

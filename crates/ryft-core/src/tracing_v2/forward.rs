@@ -16,7 +16,8 @@ use crate::{
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
-        linear::{LinearProgram, jvp_program, try_jvp_traced, try_linearize_traced_program},
+        linear::{LinearProgram, jvp_program, try_jvp_traced_in, try_linearize_traced_program},
+        ops::{InterpretableOp, Op, OpSet, SupportsCoreSyntax},
         program::Program,
     },
     types::{ArrayType, Type, Typed},
@@ -236,20 +237,27 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
-> JvpInvocationLeaf<Input, Output> for JitTracer<ArrayType, V>
+    S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
+> JvpInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, S>
 where
     Input::Family: ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<V>,
-    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    V: Parameterized<
+            V,
+            To<JitTracer<ArrayType, V, S>> = JitTracer<ArrayType, V, S>,
+            ParameterStructure: Clone + PartialEq,
+        >,
+    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
     Vec<V>: Parameterized<
             V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
+            To<JitTracer<ArrayType, V, S>> = Vec<JitTracer<ArrayType, V, S>>,
             ParameterStructure = Vec<Placeholder>,
         >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Input>,
-    Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Output>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
+    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Input>,
+    Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Output>,
+    S::JitOp: Clone + Op<ArrayType>,
+    S::JitOp: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
 {
     type Base = V;
     type FunctionInput = Input;
@@ -264,7 +272,7 @@ where
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
-        try_jvp_traced(|input| Ok(function(input)), primals, tangents)
+        try_jvp_traced_in::<_, _, _, V, S>(|input| Ok(function(input)), primals, tangents)
     }
 }
 

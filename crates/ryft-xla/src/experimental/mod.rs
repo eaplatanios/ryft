@@ -4,6 +4,7 @@ pub mod benchmark_support;
 pub mod engine;
 pub mod lowering;
 pub mod operations;
+pub mod ops;
 pub mod shard_map;
 
 pub use arrays::{

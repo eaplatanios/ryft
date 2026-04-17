@@ -17,7 +17,10 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{LinearPrimitiveOp, PrimitiveOp, VectorizableOp},
+        ops::{
+            Op, SupportsLinearAdd, SupportsLinearLeftMatMul, SupportsLinearMatrixTranspose, SupportsLinearNeg,
+            SupportsLinearRightMatMul, SupportsLinearScale, SupportsMatMul, SupportsMatrixTranspose, VectorizableOp,
+        },
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
 };
@@ -207,10 +210,14 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     }
 }
 
-impl<V: Traceable<ArrayType> + MatrixOps> MatrixOps for JitTracer<ArrayType, V> {
+impl<V: Traceable<ArrayType> + MatrixOps, S: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>>
+    MatrixOps for JitTracer<ArrayType, V, S>
+where
+    S::JitOp: Op<ArrayType>,
+{
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, PrimitiveOp::MatMul, MatrixOps::matmul)
+        self.binary(rhs, S::matmul_op(), MatrixOps::matmul)
     }
 
     #[inline]
@@ -218,7 +225,7 @@ impl<V: Traceable<ArrayType> + MatrixOps> MatrixOps for JitTracer<ArrayType, V> 
         if matrix_transpose_is_identity_type(&self.tpe()) {
             return self;
         }
-        self.unary(PrimitiveOp::MatrixTranspose, MatrixOps::transpose_matrix)
+        self.unary(S::matrix_transpose_op(), MatrixOps::transpose_matrix)
     }
 }
 
@@ -240,20 +247,29 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
     }
 }
 
-impl<V: MatrixValue + ZeroLike> MatrixTangentSpace<V> for LinearTerm<ArrayType, V> {
+impl<
+    V: MatrixValue + ZeroLike,
+    S: SupportsLinearLeftMatMul<ArrayType, V>
+        + SupportsLinearAdd<ArrayType, V>
+        + SupportsLinearNeg<ArrayType, V>
+        + SupportsLinearRightMatMul<ArrayType, V>
+        + SupportsLinearScale<ArrayType, V>
+        + SupportsLinearMatrixTranspose<ArrayType, V>,
+> MatrixTangentSpace<V> for LinearTerm<ArrayType, V, S>
+{
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
-        tangent.apply_linear_op(LinearPrimitiveOp::LeftMatMul { factor })
+        tangent.apply_linear_op(S::linear_left_matmul_op(factor))
     }
 
     #[inline]
     fn matmul_right(tangent: Self, factor: V) -> Self {
-        tangent.apply_linear_op(LinearPrimitiveOp::RightMatMul { factor })
+        tangent.apply_linear_op(S::linear_right_matmul_op(factor))
     }
 
     #[inline]
     fn transpose_matrix(value: Self) -> Self {
-        value.apply_linear_op(LinearPrimitiveOp::LinearMatrixTranspose)
+        value.apply_linear_op(S::linear_matrix_transpose_op())
     }
 }
 

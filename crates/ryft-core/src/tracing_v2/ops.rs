@@ -143,7 +143,7 @@ pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
 ///
 /// Structural validation happens when the forward linear program is built and when any staged ops
 /// emitted by the rule are added to the transpose program.
-pub trait LinearOp<T: Type + Display, V: Typed<T> + Parameter>: Op<T> {
+pub trait LinearOp<T: Type + Display, V: Traceable<T> + Parameter>: Op<T> {
     /// Applies the transpose rule for reverse-mode differentiation.
     ///
     /// `output_cotangents` is aligned with the op outputs in forward order. The returned vector
@@ -220,6 +220,211 @@ impl<T: Type + Display, V: Traceable<T>, O> LinearProgramOp<T, V> for O where
 {
 }
 
+/// Capability bundle for operations that can appear in a staged JIT graph for one specific op set.
+pub trait StagedJitOp<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>>:
+    Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, S>> + Send + Sync
+{
+}
+
+impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>, O> StagedJitOp<T, V, S> for O where
+    O: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, S>> + Send + Sync
+{
+}
+
+/// Closed staged-op universe owned by one tracing backend.
+pub trait OpSet<T: Type + Display, V: Traceable<T>>: Clone + Copy + Debug + Send + Sync + 'static {
+    /// Ordinary staged op type used by JIT programs.
+    type JitOp: Clone;
+
+    /// Linear staged op type used by tangent and cotangent programs.
+    type LinearOp: Clone;
+}
+
+/// Convenience alias for the ordinary op type selected by `S`.
+pub type JitOpFor<S, T, V> = <S as OpSet<T, V>>::JitOp;
+
+/// Convenience alias for the linear op type selected by `S`.
+pub type LinearOpFor<S, T, V> = <S as OpSet<T, V>>::LinearOp;
+
+/// Default `ryft-core` staged-op universe.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoreOpSet;
+
+/// Constructor capability for elementwise addition.
+pub trait SupportsAdd<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged addition op.
+    fn add_op() -> Self::JitOp;
+}
+
+/// Constructor capability for elementwise multiplication.
+pub trait SupportsMul<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged multiplication op.
+    fn mul_op() -> Self::JitOp;
+}
+
+/// Constructor capability for elementwise negation.
+pub trait SupportsNeg<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged negation op.
+    fn neg_op() -> Self::JitOp;
+}
+
+/// Constructor capability for sine.
+pub trait SupportsSin<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged sine op.
+    fn sin_op() -> Self::JitOp;
+}
+
+/// Constructor capability for cosine.
+pub trait SupportsCos<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged cosine op.
+    fn cos_op() -> Self::JitOp;
+}
+
+/// Constructor capability for matrix multiplication.
+pub trait SupportsMatMul<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged matrix-multiplication op.
+    fn matmul_op() -> Self::JitOp;
+}
+
+/// Constructor capability for matrix transpose.
+pub trait SupportsMatrixTranspose<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged matrix-transpose op.
+    fn matrix_transpose_op() -> Self::JitOp;
+}
+
+/// Constructor capability for scaling by one captured factor.
+pub trait SupportsScale<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged scale op.
+    fn scale_op(factor: V) -> Self::JitOp;
+}
+
+/// Constructor capability for left matrix multiplication by one captured factor.
+pub trait SupportsLeftMatMul<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged left-matmul op.
+    fn left_matmul_op(factor: V) -> Self::JitOp;
+}
+
+/// Constructor capability for right matrix multiplication by one captured factor.
+pub trait SupportsRightMatMul<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged right-matmul op.
+    fn right_matmul_op(factor: V) -> Self::JitOp;
+}
+
+/// Constructor capability for reshape.
+pub trait SupportsReshape<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged reshape op.
+    fn reshape_op(input_type: T, output_type: T) -> Self::JitOp;
+}
+
+/// Convenience bundle for op sets whose traced values support the built-in `ryft-core` syntax.
+///
+/// This keeps higher-order transforms from repeating the same constructor-capability bounds every
+/// time they need to replay a linear program over traced values.
+pub trait SupportsCoreSyntax<T: Type + Display, V: Traceable<T>>:
+    SupportsAdd<T, V>
+    + SupportsMul<T, V>
+    + SupportsNeg<T, V>
+    + SupportsSin<T, V>
+    + SupportsCos<T, V>
+    + SupportsMatMul<T, V>
+    + SupportsMatrixTranspose<T, V>
+    + SupportsReshape<T, V>
+{
+}
+
+impl<T: Type + Display, V: Traceable<T>, S> SupportsCoreSyntax<T, V> for S where
+    S: SupportsAdd<T, V>
+        + SupportsMul<T, V>
+        + SupportsNeg<T, V>
+        + SupportsSin<T, V>
+        + SupportsCos<T, V>
+        + SupportsMatMul<T, V>
+        + SupportsMatrixTranspose<T, V>
+        + SupportsReshape<T, V>
+{
+}
+
+/// Constructor capability for higher-order `vmap`.
+pub trait SupportsVMap<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged `vmap` op.
+    fn vmap_op(op: crate::tracing_v2::operations::VMapOp<T, V, Self>) -> Self::JitOp;
+}
+
+/// Constructor capability for higher-order rematerialization.
+pub trait SupportsRematerialize<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged rematerialize op.
+    fn rematerialize_op(op: crate::tracing_v2::operations::RematerializeOp<T, V, Self>) -> Self::JitOp;
+}
+
+/// Constructor capability for custom ordinary ops.
+pub trait SupportsCustom<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Wraps one custom primitive in this op set's ordinary op universe.
+    fn custom_op(primitive: Arc<CustomPrimitive<T, V>>) -> Self::JitOp;
+}
+
+/// Constructor capability for linear addition.
+pub trait SupportsLinearAdd<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear-add op.
+    fn linear_add_op() -> Self::LinearOp;
+}
+
+/// Constructor capability for linear negation.
+pub trait SupportsLinearNeg<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear-negation op.
+    fn linear_neg_op() -> Self::LinearOp;
+}
+
+/// Constructor capability for linear matrix transpose.
+pub trait SupportsLinearMatrixTranspose<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear matrix-transpose op.
+    fn linear_matrix_transpose_op() -> Self::LinearOp;
+}
+
+/// Constructor capability for linear scaling by one captured factor.
+pub trait SupportsLinearScale<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear-scale op.
+    fn linear_scale_op(factor: V) -> Self::LinearOp;
+}
+
+/// Constructor capability for linear left matrix multiplication by one captured factor.
+pub trait SupportsLinearLeftMatMul<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear left-matmul op.
+    fn linear_left_matmul_op(factor: V) -> Self::LinearOp;
+}
+
+/// Constructor capability for linear right matrix multiplication by one captured factor.
+pub trait SupportsLinearRightMatMul<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear right-matmul op.
+    fn linear_right_matmul_op(factor: V) -> Self::LinearOp;
+}
+
+/// Constructor capability for linear reshape.
+pub trait SupportsLinearReshape<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear reshape op.
+    fn linear_reshape_op(input_type: T, output_type: T) -> Self::LinearOp;
+}
+
+/// Constructor capability for linear `vmap`.
+pub trait SupportsLinearVMap<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear `vmap` op.
+    fn linear_vmap_op(op: crate::tracing_v2::operations::LinearVMapOp<T, V, Self>) -> Self::LinearOp;
+}
+
+/// Constructor capability for linear rematerialization.
+pub trait SupportsLinearRematerialize<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Returns the staged linear rematerialize op.
+    fn linear_rematerialize_op(op: crate::tracing_v2::operations::LinearRematerializeOp<T, V, Self>) -> Self::LinearOp;
+}
+
+/// Constructor capability for custom linear ops.
+pub trait SupportsLinearCustom<T: Type + Display, V: Traceable<T>>: OpSet<T, V> {
+    /// Wraps one custom primitive in this op set's linear op universe.
+    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self::LinearOp, TraceError>;
+
+    /// Wraps one shared custom primitive in this op set's linear op universe.
+    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self::LinearOp, TraceError>;
+}
+
 /// Typed extension registry carried by one [`CustomPrimitive`].
 #[derive(Clone, Default)]
 pub struct CustomPrimitiveExtensions<T: Type, V: Typed<T>> {
@@ -249,15 +454,15 @@ impl<T: Type, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
 ///
 /// This wrapper is `Send + Sync + 'static` so it can live inside the extension registry. The `V: Traceable<ArrayType>`
 /// bound is required at construction time but does not appear on the outer [`CustomPrimitive`] struct.
-struct LinearizedJitRule<V: Traceable<ArrayType> + ZeroLike>(
-    Arc<dyn InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>> + Send + Sync>,
+struct LinearizedJitRule<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V>>(
+    Arc<dyn InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>> + Send + Sync>,
 );
 
-impl<V: Traceable<ArrayType> + ZeroLike> LinearizedJitRule<V> {
+impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V>> LinearizedJitRule<V, S> {
     fn interpret(
         &self,
-        inputs: &[Linearized<JitTracer<ArrayType, V>>],
-    ) -> Result<Vec<Linearized<JitTracer<ArrayType, V>>>, TraceError> {
+        inputs: &[Linearized<JitTracer<ArrayType, V, S>>],
+    ) -> Result<Vec<Linearized<JitTracer<ArrayType, V, S>>>, TraceError> {
         self.0.interpret(inputs)
     }
 }
@@ -276,7 +481,7 @@ impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V> + Send + Syn
 /// - [`VectorizableOp<ArrayType, V>`] for `vmap`, and
 /// - [`InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
-pub struct CustomPrimitive<T: Type + Display, V: Typed<T> + Parameter> {
+pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
     base: Arc<dyn CustomBaseOp<T, V>>,
     transpose_rule: Option<Arc<dyn LinearOp<T, V> + Send + Sync>>,
     jvp_rule: Option<Arc<dyn DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync>>,
@@ -332,13 +537,25 @@ impl<T: Type + Display, V: Traceable<T>> CustomPrimitive<T, V> {
     /// require `V: Traceable<ArrayType>` on its struct definition. The concrete rule is recovered
     /// via the extensions in the `InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>> for CustomPrimitive<ArrayType, V>` impl.
     #[doc(hidden)]
-    pub fn with_linearized_jit_rule<Rule>(mut self, rule: Rule) -> Self
+    pub fn with_linearized_jit_rule<Rule>(self, rule: Rule) -> Self
     where
         Rule: InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>> + Send + Sync + 'static,
         Linearized<JitTracer<ArrayType, V>>: Traceable<ArrayType>,
         V: Traceable<ArrayType> + ZeroLike,
     {
-        self.extensions.insert(LinearizedJitRule::<V>(Arc::new(rule)));
+        self.with_linearized_jit_rule_for::<CoreOpSet, _>(rule)
+    }
+
+    /// Registers one op-set-specific linearized-JIT replay rule for nested custom primitives.
+    #[doc(hidden)]
+    pub fn with_linearized_jit_rule_for<S, Rule>(mut self, rule: Rule) -> Self
+    where
+        S: OpSet<ArrayType, V>,
+        Rule: InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>> + Send + Sync + 'static,
+        Linearized<JitTracer<ArrayType, V, S>>: Traceable<ArrayType>,
+        V: Traceable<ArrayType> + ZeroLike,
+    {
+        self.extensions.insert(LinearizedJitRule::<V, S>(Arc::new(rule)));
         self
     }
 
@@ -444,17 +661,17 @@ impl<V: Traceable<ArrayType>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayTyp
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike> InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>>
-    for CustomPrimitive<ArrayType, V>
+impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V>>
+    InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>> for CustomPrimitive<ArrayType, V>
 where
-    Linearized<JitTracer<ArrayType, V>>: Traceable<ArrayType>,
+    Linearized<JitTracer<ArrayType, V, S>>: Traceable<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[Linearized<JitTracer<ArrayType, V>>],
-    ) -> Result<Vec<Linearized<JitTracer<ArrayType, V>>>, TraceError> {
+        inputs: &[Linearized<JitTracer<ArrayType, V, S>>],
+    ) -> Result<Vec<Linearized<JitTracer<ArrayType, V, S>>>, TraceError> {
         self.extensions
-            .get::<LinearizedJitRule<V>>()
+            .get::<LinearizedJitRule<V, S>>()
             .ok_or_else(|| self.missing_rule("linearized JIT replay"))?
             .interpret(inputs)
     }
@@ -462,7 +679,7 @@ where
 
 /// Linear-only wrapper around one [`CustomPrimitive`] that guarantees a transpose rule is present.
 #[derive(Clone)]
-pub struct LinearCustomPrimitive<T: Type + Display, V: Typed<T> + Parameter> {
+pub struct LinearCustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
     primitive: Arc<CustomPrimitive<T, V>>,
 }
 
@@ -539,7 +756,7 @@ impl<V: Traceable<ArrayType>> LinearOp<ArrayType, V> for LinearCustomPrimitive<A
 /// Every known primitive is a zero-cost enum variant. Operations originating outside
 /// `ryft-core` (e.g., shard-map ops in `ryft-xla`) go through the [`Custom`](PrimitiveOp::Custom) escape
 /// hatch, which still uses dynamic dispatch.
-pub enum PrimitiveOp<T: Type + Display, V: Typed<T> + Parameter> {
+pub enum PrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Elementwise addition.
     Add,
 
@@ -577,10 +794,10 @@ pub enum PrimitiveOp<T: Type + Display, V: Typed<T> + Parameter> {
     Reshape { input_type: T, output_type: T },
 
     /// Higher-order `vmap` carrying a compiled per-lane body and optional transpose body.
-    VMap(Box<crate::tracing_v2::operations::VMapOp<T, V>>),
+    VMap(Box<crate::tracing_v2::operations::VMapOp<T, V, CoreOpSet>>),
 
     /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
-    Rematerialize(Box<crate::tracing_v2::operations::RematerializeOp<T, V>>),
+    Rematerialize(Box<crate::tracing_v2::operations::RematerializeOp<T, V, CoreOpSet>>),
 
     /// Escape hatch for user- or crate-defined operations outside `ryft-core`.
     Custom(Arc<CustomPrimitive<T, V>>),
@@ -614,7 +831,7 @@ impl<T: Type + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
 pub type PrimitiveOpRef<T, V> = PrimitiveOp<T, V>;
 
 /// Closed set of operations that may appear in staged linear programs.
-pub enum LinearPrimitiveOp<T: Type + Display, V: Typed<T> + Parameter> {
+pub enum LinearPrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Elementwise addition.
     Add,
 
@@ -640,10 +857,10 @@ pub enum LinearPrimitiveOp<T: Type + Display, V: Typed<T> + Parameter> {
     Reshape { input_type: T, output_type: T },
 
     /// Higher-order `vmap` restricted to linear bodies and linear transpose bodies.
-    VMap(Box<crate::tracing_v2::operations::LinearVMapOp<T, V>>),
+    VMap(Box<crate::tracing_v2::operations::LinearVMapOp<T, V, CoreOpSet>>),
 
     /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
-    Rematerialize(Box<crate::tracing_v2::operations::LinearRematerializeOp<T, V>>),
+    Rematerialize(Box<crate::tracing_v2::operations::LinearRematerializeOp<T, V, CoreOpSet>>),
 
     /// Escape hatch for user- or crate-defined linear custom operations.
     Custom(Arc<LinearCustomPrimitive<T, V>>),
@@ -678,6 +895,184 @@ impl<V: Traceable<ArrayType>> LinearPrimitiveOp<ArrayType, V> {
     /// Wraps one shared custom primitive in the linear-only operation universe after verifying transpose support.
     pub fn custom_arc(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Result<Self, TraceError> {
         Ok(Self::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> OpSet<T, V> for CoreOpSet {
+    type JitOp = PrimitiveOp<T, V>;
+    type LinearOp = LinearPrimitiveOp<T, V>;
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsAdd<T, V> for CoreOpSet {
+    #[inline]
+    fn add_op() -> Self::JitOp {
+        PrimitiveOp::Add
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsMul<T, V> for CoreOpSet {
+    #[inline]
+    fn mul_op() -> Self::JitOp {
+        PrimitiveOp::Mul
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsNeg<T, V> for CoreOpSet {
+    #[inline]
+    fn neg_op() -> Self::JitOp {
+        PrimitiveOp::Neg
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsSin<T, V> for CoreOpSet {
+    #[inline]
+    fn sin_op() -> Self::JitOp {
+        PrimitiveOp::Sin
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsCos<T, V> for CoreOpSet {
+    #[inline]
+    fn cos_op() -> Self::JitOp {
+        PrimitiveOp::Cos
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsMatMul<T, V> for CoreOpSet {
+    #[inline]
+    fn matmul_op() -> Self::JitOp {
+        PrimitiveOp::MatMul
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsMatrixTranspose<T, V> for CoreOpSet {
+    #[inline]
+    fn matrix_transpose_op() -> Self::JitOp {
+        PrimitiveOp::MatrixTranspose
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsScale<T, V> for CoreOpSet {
+    #[inline]
+    fn scale_op(factor: V) -> Self::JitOp {
+        PrimitiveOp::Scale { factor }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLeftMatMul<T, V> for CoreOpSet {
+    #[inline]
+    fn left_matmul_op(factor: V) -> Self::JitOp {
+        PrimitiveOp::LeftMatMul { factor }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsRightMatMul<T, V> for CoreOpSet {
+    #[inline]
+    fn right_matmul_op(factor: V) -> Self::JitOp {
+        PrimitiveOp::RightMatMul { factor }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsReshape<T, V> for CoreOpSet {
+    #[inline]
+    fn reshape_op(input_type: T, output_type: T) -> Self::JitOp {
+        PrimitiveOp::Reshape { input_type, output_type }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsVMap<T, V> for CoreOpSet {
+    #[inline]
+    fn vmap_op(op: crate::tracing_v2::operations::VMapOp<T, V, Self>) -> Self::JitOp {
+        PrimitiveOp::VMap(Box::new(op))
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsRematerialize<T, V> for CoreOpSet {
+    #[inline]
+    fn rematerialize_op(op: crate::tracing_v2::operations::RematerializeOp<T, V, Self>) -> Self::JitOp {
+        PrimitiveOp::Rematerialize(Box::new(op))
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsCustom<T, V> for CoreOpSet {
+    #[inline]
+    fn custom_op(primitive: Arc<CustomPrimitive<T, V>>) -> Self::JitOp {
+        PrimitiveOp::Custom(primitive)
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearAdd<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_add_op() -> Self::LinearOp {
+        LinearPrimitiveOp::Add
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearNeg<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_neg_op() -> Self::LinearOp {
+        LinearPrimitiveOp::Neg
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearMatrixTranspose<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_matrix_transpose_op() -> Self::LinearOp {
+        LinearPrimitiveOp::LinearMatrixTranspose
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearScale<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_scale_op(factor: V) -> Self::LinearOp {
+        LinearPrimitiveOp::Scale { factor }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearLeftMatMul<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_left_matmul_op(factor: V) -> Self::LinearOp {
+        LinearPrimitiveOp::LeftMatMul { factor }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearRightMatMul<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_right_matmul_op(factor: V) -> Self::LinearOp {
+        LinearPrimitiveOp::RightMatMul { factor }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearReshape<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_reshape_op(input_type: T, output_type: T) -> Self::LinearOp {
+        LinearPrimitiveOp::Reshape { input_type, output_type }
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearVMap<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_vmap_op(op: crate::tracing_v2::operations::LinearVMapOp<T, V, Self>) -> Self::LinearOp {
+        LinearPrimitiveOp::VMap(Box::new(op))
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearRematerialize<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_rematerialize_op(op: crate::tracing_v2::operations::LinearRematerializeOp<T, V, Self>) -> Self::LinearOp {
+        LinearPrimitiveOp::Rematerialize(Box::new(op))
+    }
+}
+
+impl<T: Type + Display, V: Traceable<T>> SupportsLinearCustom<T, V> for CoreOpSet {
+    #[inline]
+    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self::LinearOp, TraceError> {
+        Ok(LinearPrimitiveOp::Custom(Arc::new(primitive.into_linear()?)))
+    }
+
+    #[inline]
+    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self::LinearOp, TraceError> {
+        Ok(LinearPrimitiveOp::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
     }
 }
 

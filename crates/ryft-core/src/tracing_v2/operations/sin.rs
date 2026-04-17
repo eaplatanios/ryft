@@ -8,8 +8,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
-    ops::PrimitiveOp,
-    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, SupportsSin, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -97,10 +96,13 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin> Sin for JitTracer<ArrayType, V> {
+impl<V: Traceable<ArrayType> + Sin, S: SupportsSin<ArrayType, V>> Sin for JitTracer<ArrayType, V, S>
+where
+    S::JitOp: Op<ArrayType>,
+{
     #[inline]
     fn sin(self) -> Self {
-        self.unary(PrimitiveOp::Sin, Sin::sin)
+        self.unary(S::sin_op(), Sin::sin)
     }
 }
 

@@ -18,7 +18,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::JitTracer;
     use ryft_core::tracing_v2::operations::reshape::ReshapeOps;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
@@ -51,9 +50,7 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap();
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-            |x: JitTracer<ArrayType, crate::experimental::shard_map::ShardMapTensor>| {
-                x.reshape(Shape::new(vec![Size::Static(3), Size::Static(2)])).unwrap()
-            },
+            |x: ShardMapTracer| x.reshape(Shape::new(vec![Size::Static(3), Size::Static(2)])).unwrap(),
             input_type.clone(),
         )
         .unwrap();
@@ -80,7 +77,7 @@ mod tests {
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let sharding = sharding.clone();
-                move |x: JitTracer<ArrayType, crate::experimental::shard_map::ShardMapTensor>| {
+                move |x: ShardMapTracer| {
                     with_sharding_constraint(x, sharding.clone())
                         .expect("with_sharding_constraint should stage before reshape")
                         .reshape(Shape::new(vec![Size::Static(1), Size::Static(8), Size::Static(1)]))

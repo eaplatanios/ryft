@@ -34,8 +34,10 @@ pub use batch::{Batch, stack, unstack, vmap};
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, Equation, Graph, GraphBuilder};
-pub use jit::try_jit;
-pub use jit::{CompiledFunction, JitTracer, jit};
+pub use jit::{
+    CompiledFunction, JitTracer, TraceInput, TraceOutput, jit, jit_in, try_jit, try_jit_in, try_trace_program,
+    try_trace_program_in,
+};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
     grad, hessian, jacfwd, jacrev, jvp_program, linearize, value_and_grad, vjp,
@@ -46,8 +48,13 @@ pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{Cos, Sin};
 pub use ops::{
-    CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive, LinearOp,
-    LinearPrimitiveOp, Op, PrimitiveOp, VectorizableOp,
+    CoreOpSet, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
+    LinearOp, LinearPrimitiveOp, Op, OpSet, PrimitiveOp, SupportsAdd, SupportsCos, SupportsCustom, SupportsLeftMatMul,
+    SupportsLinearAdd, SupportsLinearCustom, SupportsLinearLeftMatMul, SupportsLinearMatrixTranspose,
+    SupportsLinearNeg, SupportsLinearRematerialize, SupportsLinearReshape, SupportsLinearRightMatMul,
+    SupportsLinearScale, SupportsLinearVMap, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg,
+    SupportsRematerialize, SupportsReshape, SupportsRightMatMul, SupportsScale, SupportsSin, SupportsVMap,
+    VectorizableOp,
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};

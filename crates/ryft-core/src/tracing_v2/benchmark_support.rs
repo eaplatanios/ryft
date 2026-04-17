@@ -9,7 +9,7 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::tracing_v2::{
-    Batch, CompiledFunction, Cos, JitTracer, LinearProgram, OneLike, Program, Sin, Traceable,
+    Batch, CompiledFunction, JitTracer, LinearProgram, OneLike, Program, Sin, Traceable,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_graph},
     engine::ArrayScalarEngine,
     grad, jit, jvp, jvp_program, linearize, stack, try_jit, unstack, value_and_grad, vjp, vmap,

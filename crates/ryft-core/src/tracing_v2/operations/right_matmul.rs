@@ -9,7 +9,10 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, VectorizableOp},
+    ops::{
+        DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet, SupportsMatMul,
+        SupportsMatrixTranspose, VectorizableOp,
+    },
 };
 use crate::types::{ArrayType, Typed};
 
@@ -101,13 +104,17 @@ impl<V: MatrixValue> LinearOp<ArrayType, V> for RightMatMulOp<V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + MatrixOps + ZeroLike>
-    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>> for RightMatMulOp<V>
+impl<
+    V: Traceable<ArrayType> + MatrixOps + ZeroLike,
+    S: OpSet<ArrayType, V> + SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>> for RightMatMulOp<V>
+where
+    S::JitOp: Op<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };

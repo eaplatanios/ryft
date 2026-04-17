@@ -6,7 +6,7 @@
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing_v2::{
-    MatrixOps, OneLike, PrimitiveOp, Program, Sin,
+    MatrixOps, OneLike, Program, Sin,
     benchmarking::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
         record, summarize_graph,
@@ -18,6 +18,7 @@ use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_graph;
+use crate::experimental::ops::XlaPrimitiveOp;
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace,
 };
@@ -113,7 +114,7 @@ fn summarize_nested_body(
 ///
 ///   - `program`: Program to summarize.
 fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
-    program: &Program<ArrayType, ShardMapTensor, Input, Output>,
+    program: &Program<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
@@ -129,7 +130,18 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
     }
 
     summarize_graph(program.graph(), |op| {
-        if let PrimitiveOp::Custom(custom_op) = op {
+        if let XlaPrimitiveOp::ShardMap(shard_map_op) = op {
+            let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
+            if let Some(eval_mode) = shard_map_op.eval_mode() {
+                nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);
+            }
+            if let Some(transpose_mode) = shard_map_op.transpose_mode() {
+                nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.transpose_body", transpose_mode)?);
+            }
+            return Ok(nested_regions);
+        }
+
+        if let XlaPrimitiveOp::Custom(custom_op) = op {
             if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
                 let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
                 if let Some(eval_mode) = shard_map_op.eval_mode() {

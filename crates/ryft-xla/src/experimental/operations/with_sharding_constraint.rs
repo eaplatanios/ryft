@@ -7,8 +7,8 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp, PrimitiveOp,
-    TraceError, VectorizableOp,
+    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp, TraceError,
+    VectorizableOp,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -21,6 +21,7 @@ use ryft_mlir::{Block, Operation, Value};
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
+use crate::experimental::ops::{XlaOpSet, XlaPrimitiveOp};
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 use crate::mlir::ToMlir;
 
@@ -64,7 +65,7 @@ impl WithShardingConstraintOp {
     /// Returns the tensor-leaf custom primitive registration for this op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive::<ShardMapTensor>()
-            .with_linearized_jit_rule(self.clone())
+            .with_linearized_jit_rule_for::<XlaOpSet, _>(self.clone())
             .with_extension(self.clone())
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
     }
@@ -158,7 +159,7 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingCons
         let input = &inputs[0];
         let primal = JitTracer::apply_staged_op(
             std::slice::from_ref(&input.primal),
-            PrimitiveOp::Custom(Arc::new(self.to_tensor_custom_primitive())),
+            XlaPrimitiveOp::WithShardingConstraint(self.clone()),
             vec![input.primal.value.clone()],
         )?
         .into_iter()

@@ -21,7 +21,10 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, PrimitiveOp, VectorizableOp},
+        ops::{
+            DifferentiableOp, InterpretableOp, LinearOp, Op, SupportsLinearAdd, SupportsLinearNeg,
+            SupportsLinearReshape, SupportsLinearScale, SupportsReshape, VectorizableOp,
+        },
     },
     types::{ArrayType, Shape, Size, Typed},
 };
@@ -205,14 +208,23 @@ impl<V: ReshapeValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Zer
     }
 }
 
-impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> ReshapeTangentSpace<V> for LinearTerm<ArrayType, V> {
+impl<
+    V: ReshapeValue + ZeroLike + OneLike + MatrixOps,
+    S: SupportsLinearAdd<ArrayType, V>
+        + SupportsLinearNeg<ArrayType, V>
+        + SupportsLinearReshape<ArrayType, V>
+        + SupportsLinearScale<ArrayType, V>,
+> ReshapeTangentSpace<V> for LinearTerm<ArrayType, V, S>
+where
+    S::LinearOp: Op<ArrayType>,
+{
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         if input_type == output_type {
             return Ok(tangent);
         }
         Ok(LinearTerm::apply_staged_op(
             std::slice::from_ref(&tangent),
-            LinearPrimitiveOp::Reshape { input_type: input_type.clone(), output_type: output_type.clone() },
+            S::linear_reshape_op(input_type.clone(), output_type.clone()),
             1,
         )?
         .into_iter()
@@ -233,7 +245,10 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<V: Traceable<ArrayType> + ReshapeOps> ReshapeOps for JitTracer<ArrayType, V> {
+impl<V: Traceable<ArrayType> + ReshapeOps, S: SupportsReshape<ArrayType, V>> ReshapeOps for JitTracer<ArrayType, V, S>
+where
+    S::JitOp: Op<ArrayType>,
+{
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
         let input_type = self.tpe().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
@@ -243,7 +258,7 @@ impl<V: Traceable<ArrayType> + ReshapeOps> ReshapeOps for JitTracer<ArrayType, V
         let output_value = self.value.clone().reshape(target_shape)?;
         Ok(JitTracer::apply_staged_op(
             std::slice::from_ref(&self),
-            PrimitiveOp::Reshape { input_type, output_type },
+            S::reshape_op(input_type, output_type),
             vec![output_value],
         )?
         .into_iter()

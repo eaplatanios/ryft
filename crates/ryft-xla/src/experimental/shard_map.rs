@@ -69,10 +69,11 @@ use thiserror::Error;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::{
-    CompiledFunction, Cos, JitTracer, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike, jit,
+    CompiledFunction, Cos, JitTracer, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike, jit_in,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
+use crate::experimental::ops::{XlaOpSet, XlaPrimitiveOp};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
@@ -453,7 +454,11 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging shard-map bodies.
-pub(crate) type ShardMapTracer = JitTracer<ArrayType, ShardMapTensor>;
+pub(crate) type ShardMapTracer = JitTracer<ArrayType, ShardMapTensor, XlaOpSet>;
+
+/// Compiled staged XLA function specialized to the backend-owned XLA op universe.
+pub(crate) type XlaCompiledFunction<Input, Output> =
+    CompiledFunction<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>;
 
 pub(crate) type ShardMapLocalTraceInput<Input> =
     <<Input as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
@@ -571,7 +576,7 @@ where
         let output_value = input.value.with_type(output_type);
         Ok(JitTracer::apply_staged_op(
             std::slice::from_ref(&input),
-            ryft_core::tracing_v2::PrimitiveOp::Custom(std::sync::Arc::new(op.to_tensor_custom_primitive())),
+            XlaPrimitiveOp::WithShardingConstraint(op),
             vec![output_value],
         )?
         .into_iter()
@@ -690,7 +695,7 @@ where
     local_input_types: Input,
     global_output_types: Output,
     local_output_types: Output,
-    compiled: CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
+    compiled: XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
 }
 
 /// Traced XLA program backed by a staged `tracing_v2` graph.
@@ -702,7 +707,7 @@ where
 {
     global_input_types: Input,
     global_output_types: Output,
-    compiled: CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
+    compiled: XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
 }
 
 /// Metadata describing one manual SPMD computation over a mesh.
@@ -982,9 +987,7 @@ where
 {
     /// Returns the staged traced XLA program backing this handle.
     #[cfg(feature = "benchmarking")]
-    pub(crate) fn compiled(
-        &self,
-    ) -> &CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>> {
+    pub(crate) fn compiled(&self) -> &XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>> {
         &self.compiled
     }
 
@@ -1023,7 +1026,7 @@ pub struct FlatTracedShardMap {
     pub(crate) local_input_types: Vec<ArrayType>,
     pub(crate) global_output_types: Vec<ArrayType>,
     pub(crate) local_output_types: Vec<ArrayType>,
-    pub(crate) compiled: CompiledFunction<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+    pub(crate) compiled: XlaCompiledFunction<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
 }
 
 impl FlatTracedShardMap {
@@ -1034,7 +1037,7 @@ impl FlatTracedShardMap {
         local_input_types: Vec<ArrayType>,
         global_output_types: Vec<ArrayType>,
         local_output_types: Vec<ArrayType>,
-        compiled: CompiledFunction<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+        compiled: XlaCompiledFunction<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
     ) -> Self {
         Self { shard_map, global_input_types, local_input_types, global_output_types, local_output_types, compiled }
     }
@@ -1239,17 +1242,19 @@ fn trace_xla_function<
 >(
     function: F,
     input_types: &Input,
-) -> Result<
-    (Output, CompiledFunction<ArrayType, ShardMapTensor, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>),
-    ShardMapTraceError,
->
+) -> Result<(Output, XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>), ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
 {
     let traced_inputs = traced_input_tensors(input_types)?;
-    let (output_tensors, compiled) =
-        jit::<_, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>, ShardMapTensor>(function, traced_inputs)?;
+    let (output_tensors, compiled): (
+        Output::To<ShardMapTensor>,
+        XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
+    ) = jit_in::<_, Input::To<ShardMapTensor>, Output::To<ShardMapTensor>, ShardMapTensor, XlaOpSet>(
+        function,
+        traced_inputs,
+    )?;
     let output_types = Output::from_parameters(
         output_tensors.parameter_structure(),
         output_tensors.into_parameters().map(|tensor| tensor.tpe().into_owned()).collect::<Vec<_>>(),
