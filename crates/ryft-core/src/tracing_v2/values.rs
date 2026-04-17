@@ -72,6 +72,31 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// [`Traceable::is_one`]. The default implementations return `false`, which keeps purely abstract or traced leaves
 /// valid while opting them out of constant-identity simplification.
 ///
+/// # Why the `'static` bound?
+///
+/// Tracing a closure produces a [`Program`](crate::tracing_v2::Program) (and, downstream, a
+/// [`CompiledFunction`](crate::tracing_v2::CompiledFunction)) whose lifetime is intentionally decoupled from the
+/// trace scope: the whole point of staging is to return the traced artifact, store it, and replay it later on fresh
+/// inputs. Constants of type `V` captured during tracing get baked directly into that staged output, so `V` cannot
+/// borrow from the tracing closure's local state without dragging its lifetime along. The `'static` bound enforces
+/// exactly this invariant structurally. As a side benefit, it also enables the [`TypeId`](std::any::TypeId)-keyed
+/// extension registry that [`CustomPrimitive`](crate::tracing_v2::CustomPrimitive) uses to dispatch optional
+/// transform rules (`Any`-based downcasting fundamentally requires `'static`).
+///
+/// # Implementing [`Traceable`] for new leaf types
+///
+/// The bound is rarely a real constraint — in practice, the rule is simply "own your data":
+///
+/// - Small [`Copy`] scalars (`f32`, `i32`, `half::bf16`, ...) satisfy `'static` trivially and can implement
+///   [`Traceable`] directly, as the built-in `f32`/`f64` impls below illustrate.
+/// - Heavier payloads (array buffers, tensors, device allocations) should wrap the underlying handle in
+///   [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded cases). This keeps the leaf cheaply
+///   cloneable — which the [`Clone`] supertrait also demands — and severs any tie to a caller's scope. PJRT-backed
+///   arrays, shard-map tensors, and similar backend values all take this shape.
+///
+/// Avoid leaf types that borrow from external state: a reference-carrying wrapper cannot be baked into a staged
+/// graph that outlives the trace, and it will not satisfy `'static` either.
+///
 /// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
