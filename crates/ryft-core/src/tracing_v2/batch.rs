@@ -193,15 +193,13 @@ pub(crate) trait VMapInvocationLeaf<
 
 /// Concrete-value dispatch for [`vmap`]: stacks inputs into [`Batch`] leaves, applies the user function
 /// over the batched representation, and unstacks the result back into per-lane outputs.
+///
+/// No ext-trait (`FloatExt` / `MatrixOps` / `ReshapeOps`) bounds on `V` are required here because the body
+/// of `invoke` never exercises them — it stacks / unstacks / invokes the user's closure on
+/// `Batch<V>` values, and any capability the closure actually uses is enforced at the call site
+/// through the conditional `impl<V: …> FloatExt for Batch<V>` (and siblings) blanket impls.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
-        + ZeroLike
-        + OneLike
-        + crate::tracing_v2::Value<ArrayType>
-        + crate::tracing_v2::MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: Traceable<ArrayType> + crate::tracing_v2::Value<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > VMapInvocationLeaf<Input, Output> for V
@@ -351,14 +349,12 @@ where
 /// the inner [`vmap`] runs per outer lane using the existing [`VMapInvocationLeaf`] for `V`, and
 /// results are stacked back. No trace-once pattern is needed here because the delegation to the
 /// concrete implementation handles each lane directly.
+///
+/// Ext-trait bounds (`FloatExt` / `MatrixOps` / `ReshapeOps`) on `V` are deliberately omitted: the
+/// body only stacks, unstacks, and invokes the user's closure — any capability the closure uses on
+/// `Batch<Batch<V>>` is enforced through the conditional blanket impls on `Batch<_>`.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
-        + ZeroLike
-        + OneLike
-        + crate::tracing_v2::MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: Traceable<ArrayType>,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Batch<V>, ParameterStructure: Clone>,
 > VMapInvocationLeaf<Input, Output> for Batch<V>
@@ -540,5 +536,59 @@ mod tests {
             approx_eq(results[i].1, (2.0 * x + x.cos()) * t);
         }
         test_support::assert_reference_scalar_sine_jit_rendering();
+    }
+
+    /// Pins the user-facing property the quick-win in this module delivers: a concrete leaf type
+    /// that implements only `Traceable + Value + Add + ZeroLike + OneLike` — without `FloatExt`,
+    /// `MatrixOps`, or `ReshapeOps` — must still be usable through [`vmap`] for programs that only
+    /// exercise `Add`. Previously, the concrete [`VMapInvocationLeaf`] impl carried the full
+    /// `FloatExt + MatrixOps + ReshapeOps` union and rejected this case at compile time. The impl
+    /// now only requires `Traceable + Value`, so callers pay exactly the capabilities their closure
+    /// uses. The closure here exercises `Add` (via `Batch<Int64>::Add`, which delegates to
+    /// `Int64::Add`), and any attempt to call e.g. `.sin()` on `Batch<Int64>` would still fail to
+    /// compile because the `impl<V: FloatExt> FloatExt for Batch<V>` blanket would demand
+    /// `Int64: FloatExt`.
+    #[test]
+    fn test_vmap_compiles_for_leaf_without_float_matrix_or_reshape_ext_traits() {
+        use std::borrow::Cow;
+        use std::ops::Add;
+
+        use crate::types::{ArrayType, DataType, Typed};
+
+        #[derive(Clone, Debug, PartialEq, Parameter)]
+        struct Int64(i64);
+
+        impl Typed<ArrayType> for Int64 {
+            fn tpe(&self) -> Cow<'_, ArrayType> {
+                Cow::Owned(ArrayType::scalar(DataType::I64))
+            }
+        }
+
+        impl Traceable<ArrayType> for Int64 {}
+        impl crate::tracing_v2::Value<ArrayType> for Int64 {}
+
+        impl Add for Int64 {
+            type Output = Self;
+
+            fn add(self, rhs: Self) -> Self::Output {
+                Self(self.0 + rhs.0)
+            }
+        }
+
+        impl ZeroLike for Int64 {
+            fn zero_like(&self) -> Self {
+                Self(0)
+            }
+        }
+
+        impl OneLike for Int64 {
+            fn one_like(&self) -> Self {
+                Self(1)
+            }
+        }
+
+        let outputs: Vec<Int64> =
+            vmap(|batch: Batch<Int64>| batch.clone() + batch, vec![Int64(1), Int64(2), Int64(3)]).unwrap();
+        assert_eq!(outputs, vec![Int64(2), Int64(4), Int64(6)]);
     }
 }

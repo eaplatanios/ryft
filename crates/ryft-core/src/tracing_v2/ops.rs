@@ -183,6 +183,43 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
 
+/// Capability bundle for operations that can appear in a staged JIT graph.
+///
+/// This is a purely additive convenience trait: any op that already implements the three listed
+/// supertraits automatically implements [`JitOp`] via the blanket impl below. The trait exists so
+/// that future consumers (for example a ryft-xla MLIR lowering path or a trait-object graph
+/// variant) can name the bundle in a single place instead of repeating the three bounds at every
+/// site.
+///
+/// [`VectorizableOp`] is intentionally **not** part of the bundle: `batch()` is only invoked on
+/// concrete ops while `vmap` traces through a Rust closure, never on ops stored in a staged JIT
+/// graph, so pinning it here would unnecessarily restrict which op types can satisfy the bundle.
+pub trait JitOp<T: Type + Display, V: Traceable<T>>:
+    Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync
+{
+}
+
+impl<T: Type + Display, V: Traceable<T>, O> JitOp<T, V> for O where
+    O: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync
+{
+}
+
+/// Capability bundle for operations that can appear in a staged linear program.
+///
+/// Like [`JitOp`], this is additive — any op that already satisfies the three supertraits
+/// automatically satisfies [`LinearProgramOp`]. The bundle lists what a linear program needs from
+/// each stored op: shape metadata ([`Op`]), concrete interpretation for replay
+/// ([`InterpretableOp`]), and the reverse-mode transpose rule ([`LinearOp`]).
+pub trait LinearProgramOp<T: Type + Display, V: Traceable<T>>:
+    Op<T> + InterpretableOp<T, V> + LinearOp<T, V> + Send + Sync
+{
+}
+
+impl<T: Type + Display, V: Traceable<T>, O> LinearProgramOp<T, V> for O where
+    O: Op<T> + InterpretableOp<T, V> + LinearOp<T, V> + Send + Sync
+{
+}
+
 /// Typed extension registry carried by one [`CustomPrimitive`].
 #[derive(Clone, Default)]
 pub struct CustomPrimitiveExtensions<T: Type, V: Typed<T>> {
