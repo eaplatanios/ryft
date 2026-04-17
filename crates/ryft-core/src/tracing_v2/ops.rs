@@ -29,7 +29,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        FloatExt, MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
+        Cos, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
@@ -960,7 +960,11 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
 /// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -994,7 +998,11 @@ where
 
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Add<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1024,7 +1032,11 @@ where
 
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Add<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1070,13 +1082,14 @@ where
 /// [`RightMatMulOp`]: crate::tracing_v2::operations::RightMatMulOp
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
-        + ZeroLike
-        + OneLike
-        + Parameterized<V>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
 > InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>
@@ -1113,7 +1126,11 @@ where
 
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Parameterized<V>
@@ -1178,7 +1195,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + FloatExt + MatrixOps>
+impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Sin + Cos + MatrixOps>
     VectorizableOp<ArrayType, V> for PrimitiveOp<ArrayType, V>
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {

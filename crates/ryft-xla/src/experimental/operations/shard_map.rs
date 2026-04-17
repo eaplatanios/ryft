@@ -11,9 +11,9 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, CustomPrimitive, DifferentiableOp, FloatExt, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp,
-        LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
-        Traceable, ZeroLike, engine::Engine, forward::JvpTracer,
+        AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp,
+        LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, Sin,
+        TraceError, Traceable, ZeroLike, engine::Engine, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -508,7 +508,8 @@ trait ReplayShardMapValue:
     + Add<Output = Self>
     + Mul<Output = Self>
     + Neg<Output = Self>
-    + FloatExt
+    + Sin
+    + Cos
     + MatrixOps
     + ZeroLike
     + OneLike

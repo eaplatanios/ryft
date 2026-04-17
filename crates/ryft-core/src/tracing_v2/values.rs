@@ -18,8 +18,6 @@
 //! The traits are intentionally small so that future tensor-like leaf types, including PJRT-backed arrays, can adopt
 //! the tracing machinery by implementing a compact set of behaviors.
 
-use std::ops::{Add, Mul, Neg};
-
 use crate::{
     parameters::Parameter,
     types::{ArrayType, Type, Typed},
@@ -62,7 +60,8 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// [`Traceable`] is implemented by **every** type that can appear as a leaf in a staged graph — both concrete data
 /// types (e.g., `f32`, `f64`, backend arrays) and tracing wrappers (e.g.,
 /// [`JitTracer`](crate::tracing_v2::JitTracer)). It ties each leaf to a type descriptor `T` via [`Typed`], while
-/// deliberately not implying eager numeric operations such as [`FloatExt`] or differentiation-specific capabilities
+/// deliberately not implying eager numeric operations such as [`Sin`](crate::tracing_v2::Sin) or
+/// differentiation-specific capabilities
 /// such as [`ZeroLike`]. Those requirements live on the primitive operations and transforms that actually need them.
 ///
 /// The type parameter `T` determines the abstract metadata used to describe leaf shapes and element types. The
@@ -128,33 +127,6 @@ pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
     }
 }
 
-// ---------------------------------------------------------------------------
-// f32/f64 tracing support
-// ---------------------------------------------------------------------------
-
-/// Minimal floating-point surface used by the scalar tracing primitives.
-///
-/// Later backends can extend tracing to richer value types by implementing these operations on their leaf type.
-pub trait FloatExt: Clone + Add<Output = Self> + Mul<Output = Self> + Neg<Output = Self> {
-    /// Computes the elementwise sine.
-    fn sin(self) -> Self;
-
-    /// Computes the elementwise cosine.
-    fn cos(self) -> Self;
-}
-
-impl FloatExt for f32 {
-    #[inline]
-    fn sin(self) -> Self {
-        self.sin()
-    }
-
-    #[inline]
-    fn cos(self) -> Self {
-        self.cos()
-    }
-}
-
 impl Traceable<ArrayType> for f32 {
     #[inline]
     fn is_zero(&self) -> bool {
@@ -180,18 +152,6 @@ impl OneLike for f32 {
     #[inline]
     fn one_like(&self) -> Self {
         1.0
-    }
-}
-
-impl FloatExt for f64 {
-    #[inline]
-    fn sin(self) -> Self {
-        self.sin()
-    }
-
-    #[inline]
-    fn cos(self) -> Self {
-        self.cos()
     }
 }
 
@@ -226,7 +186,7 @@ impl OneLike for f64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        tracing_v2::test_support,
+        tracing_v2::{Cos, Sin, test_support},
         types::ArrayType,
         types::{DataType, Typed},
     };
@@ -247,8 +207,8 @@ mod tests {
     #[test]
     fn float_ext_matches_scalar_intrinsics() {
         let angle = 0.75f64;
-        assert_eq!(FloatExt::sin(angle), angle.sin());
-        assert_eq!(FloatExt::cos(angle), angle.cos());
+        assert_eq!(Sin::sin(angle), angle.sin());
+        assert_eq!(Cos::cos(angle), angle.cos());
         test_support::assert_reference_scalar_sine_jit_rendering();
     }
 }

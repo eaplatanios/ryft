@@ -5,7 +5,7 @@ use std::fmt::{Debug, Display};
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
+        CompiledFunction, Cos, JitTracer, LinearTerm, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike,
         engine::Engine,
         linear::{linearize_program, transpose_linear_program_with_output_examples},
         operations::reshape::ReshapeOps,
@@ -96,7 +96,15 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
     pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
     where
         O: InterpretableOp<T, V>,
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+        V: std::ops::Add<Output = V>
+            + std::ops::Mul<Output = V>
+            + std::ops::Neg<Output = V>
+            + Sin
+            + Cos
+            + ZeroLike
+            + OneLike
+            + MatrixOps
+            + ReshapeOps,
         Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     {
         if inputs.len() != self.total_input_count() {
@@ -166,8 +174,18 @@ impl<V: Traceable<ArrayType>> Op for VMapOp<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<ArrayType, V>
-    for VMapOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> InterpretableOp<ArrayType, V> for VMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -180,7 +198,8 @@ where
 
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Parameterized<V>
@@ -227,7 +246,8 @@ where
 
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Parameterized<V>
@@ -264,8 +284,18 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
-    InterpretableOp<ArrayType, JitTracer<ArrayType, V>> for VMapOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> InterpretableOp<ArrayType, JitTracer<ArrayType, V>> for VMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -338,8 +368,18 @@ impl<V: Traceable<ArrayType>> Op for LinearVMapOp<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<ArrayType, V>
-    for LinearVMapOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> InterpretableOp<ArrayType, V> for LinearVMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -350,8 +390,18 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<ArrayType, V>
-    for LinearVMapOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> LinearOp<ArrayType, V> for LinearVMapOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -385,7 +435,8 @@ pub fn make_linear_vmap<V>(
 ) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
 where
     V: Traceable<ArrayType>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Parameterized<V>

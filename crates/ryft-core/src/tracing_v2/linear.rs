@@ -16,7 +16,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        FloatExt, MatrixOps, OneLike, TraceError, Traceable, Value, ZeroLike,
+        Cos, MatrixOps, OneLike, Sin, TraceError, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
@@ -210,7 +210,14 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         LinearPrimitiveOp<T, V>: InterpretableOp<T, V>,
-        V: Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+        V: Parameterized<V>
+            + Add<Output = V>
+            + Mul<Output = V>
+            + Neg<Output = V>
+            + ZeroLike
+            + OneLike
+            + MatrixOps
+            + ReshapeOps,
         V::ParameterStructure: Clone + PartialEq,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
@@ -226,7 +233,11 @@ impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>>
     pub fn transpose(&self) -> Result<LinearProgram<ArrayType, V, Output, Input>, TraceError>
     where
         V: Parameterized<V, To<ArrayType> = ArrayType, ParameterStructure = Placeholder>
-            + FloatExt
+            + Add<Output = V>
+            + Mul<Output = V>
+            + Neg<Output = V>
+            + Sin
+            + Cos
             + ZeroLike
             + OneLike
             + MatrixOps
@@ -269,7 +280,8 @@ fn transpose<V>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -298,7 +310,11 @@ pub fn linearize_program<V, Input, Output>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -318,7 +334,7 @@ where
         atom_id: AtomId,
     ) -> Result<LinearTerm<ArrayType, V>, TraceError>
     where
-        V: Traceable<ArrayType> + FloatExt + ZeroLike,
+        V: Traceable<ArrayType> + ZeroLike,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
     {
@@ -417,7 +433,11 @@ pub fn transpose_linear_program<V, Input, Output>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V, To<ArrayType> = ArrayType, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -437,7 +457,17 @@ fn transpose_linear_program_with_output_inputs<V, Input, Output, F>(
     mut make_output_cotangent_input: F,
 ) -> Result<LinearProgram<ArrayType, V, Output, Input>, TraceError>
 where
-    V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -450,7 +480,7 @@ where
         contribution: AtomId,
     ) -> Result<(), TraceError>
     where
-        V: Traceable<ArrayType> + FloatExt,
+        V: Traceable<ArrayType>,
     {
         adjoints[atom] = Some(match adjoints[atom] {
             Some(existing) => {
@@ -532,7 +562,17 @@ pub fn transpose_linear_program_with_output_examples<V, Input, Output>(
     output_examples: &[V],
 ) -> Result<LinearProgram<ArrayType, V, Output, Input>, TraceError>
 where
-    V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -563,7 +603,7 @@ fn lift_linearized_traced_constant<V>(
     inputs: &[Linearized<JitTracer<ArrayType, V>>],
 ) -> Result<Linearized<JitTracer<ArrayType, V>>, TraceError>
 where
-    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType> + ZeroLike + OneLike + MatrixOps + ReshapeOps,
 {
     let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
     let primal = lift_traced_constant(constant, std::slice::from_ref(&exemplar.primal))?;
@@ -643,7 +683,8 @@ where
     GraphOutput: Parameterized<V>,
     V: Traceable<ArrayType>
         + Parameterized<V>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Add<Output = V>
@@ -671,7 +712,11 @@ pub(crate) fn try_linearize_traced_program<V>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -712,7 +757,17 @@ pub fn try_jvp_program<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -737,7 +792,11 @@ pub fn try_jvp_traced<F, Input, Output, V>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -798,7 +857,17 @@ pub fn jvp_program<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -817,7 +886,17 @@ pub fn linearize<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -834,7 +913,17 @@ pub fn try_vjp<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input>), TraceError>
 where
-    V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -856,7 +945,17 @@ pub fn vjp<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input>), TraceError>
 where
-    V: Traceable<ArrayType> + Parameterized<V> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -875,7 +974,11 @@ fn try_grad<F, Input, V>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -896,7 +999,16 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
     Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps;
+    type Base: Traceable<ArrayType>
+        + Add<Output = Self::Base>
+        + Mul<Output = Self::Base>
+        + Neg<Output = Self::Base>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps;
 
     /// Return type produced by [`grad`] for the corresponding input regime.
     type Return;
@@ -919,7 +1031,11 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Value<ArrayType>
@@ -954,7 +1070,11 @@ where
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1025,7 +1145,11 @@ where
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1137,7 +1261,16 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
     Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps;
+    type Base: Traceable<ArrayType>
+        + Add<Output = Self::Base>
+        + Mul<Output = Self::Base>
+        + Neg<Output = Self::Base>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps;
 
     /// Return type produced by [`value_and_grad`] for the corresponding input regime.
     type Return;
@@ -1160,7 +1293,11 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Value<ArrayType>
@@ -1197,7 +1334,11 @@ where
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1270,7 +1411,11 @@ where
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1613,7 +1758,15 @@ fn try_jacfwd<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + Parameterized<V> + FloatExt + MatrixOps + ReshapeOps,
+    V: CoordinateValue
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -1653,7 +1806,15 @@ pub fn jacfwd<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + Parameterized<V> + FloatExt + MatrixOps + ReshapeOps,
+    V: CoordinateValue
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -1670,7 +1831,15 @@ fn try_jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + MatrixOps + ReshapeOps,
+    V: CoordinateValue
+        + Parameterized<V, ParameterStructure = Placeholder>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -1704,7 +1873,15 @@ pub fn jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + Parameterized<V, ParameterStructure = Placeholder> + FloatExt + MatrixOps + ReshapeOps,
+    V: CoordinateValue
+        + Parameterized<V, ParameterStructure = Placeholder>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -1726,7 +1903,15 @@ pub fn hessian<F, Input, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue + Parameterized<V> + FloatExt + MatrixOps + ReshapeOps,
+    V: CoordinateValue
+        + Parameterized<V>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + MatrixOps
+        + ReshapeOps,
     V::ParameterStructure: Clone + PartialEq,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
@@ -1754,7 +1939,11 @@ pub fn compile_grad<F, Input, V>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1854,7 +2043,11 @@ pub fn compile_grad_with_policy<F, Input, V>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1901,7 +2094,11 @@ fn compile_grad_segmented<F, Input, V>(
 where
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -1981,7 +2178,11 @@ where
 fn segment_program<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -2161,7 +2362,11 @@ where
 fn wrap_program_in_rematerialize<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -2231,7 +2436,11 @@ where
 fn build_segment_sub_program<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -2325,8 +2534,8 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing_v2::{
-            CustomPrimitive, DifferentiableOp, FloatExt, GraphBuilder, InterpretableOp, LinearOp, LinearPrimitiveOp,
-            Op, engine::ArrayScalarEngine, test_support,
+            CustomPrimitive, DifferentiableOp, GraphBuilder, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, Sin,
+            engine::ArrayScalarEngine, test_support,
         },
         types::{ArrayType, DataType},
     };
@@ -2340,14 +2549,14 @@ mod tests {
 
     fn quadratic_plus_sin<T>(x: T) -> T
     where
-        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+        T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         x.clone() * x.clone() + x.sin()
     }
 
     fn bilinear_sin<T>(inputs: (T, T)) -> T
     where
-        T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+        T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin()
     }

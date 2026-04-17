@@ -44,13 +44,14 @@ pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
+pub use operations::{Cos, Sin};
 pub use ops::{
     CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive, LinearOp,
     LinearPrimitiveOp, Op, PrimitiveOp, VectorizableOp,
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};
-pub use values::{FloatExt, OneLike, Traceable, Value, ZeroLike};
+pub use values::{OneLike, Traceable, Value, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

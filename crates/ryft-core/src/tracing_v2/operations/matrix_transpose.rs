@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, ZeroLike,
+    TraceError,
     batch::Batch as BatchedValue,
     engine::Engine,
     forward::JvpTracer,
@@ -51,7 +51,7 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<ArrayType, V> for MatrixTransposeOp {
+impl<V: MatrixValue> LinearOp<ArrayType, V> for MatrixTransposeOp {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -70,9 +70,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike> LinearOp<ArrayType, V> for MatrixTran
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<ArrayType, V, T>
-    for MatrixTransposeOp
-{
+impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<ArrayType, V, T> for MatrixTransposeOp {
     fn jvp(
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V>,

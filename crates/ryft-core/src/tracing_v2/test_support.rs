@@ -44,14 +44,14 @@ pub(crate) fn assert_reference_graph_rendering() {
 
 fn bilinear_sin<T>(inputs: (T, T)) -> T
 where
-    T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+    T: Clone + Sin + Cos + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
 {
     inputs.0.clone() * inputs.1 + inputs.0.sin()
 }
 
 fn quadratic_plus_sin<T>(x: T) -> T
 where
-    T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+    T: Clone + Sin + Cos + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
 {
     x.clone() * x.clone() + x.sin()
 }

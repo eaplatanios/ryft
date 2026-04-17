@@ -3,15 +3,37 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, Traceable,
+    TraceError, Traceable,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
+    jit::JitTracer,
+    ops::PrimitiveOp,
     ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
-use super::{expect_input_count, unary_abstract};
+use super::{cos::Cos, expect_input_count, unary_abstract};
+
+/// Elementwise sine capability.
+pub trait Sin: Sized {
+    /// Computes the elementwise sine.
+    fn sin(self) -> Self;
+}
+
+impl Sin for f32 {
+    #[inline]
+    fn sin(self) -> Self {
+        self.sin()
+    }
+}
+
+impl Sin for f64 {
+    #[inline]
+    fn sin(self) -> Self {
+        self.sin()
+    }
+}
 
 /// Elementwise sine primitive.
 #[derive(Clone, Default)]
@@ -39,14 +61,14 @@ impl Op for SinOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt> InterpretableOp<ArrayType, V> for SinOp {
+impl<V: Traceable<ArrayType> + Sin> InterpretableOp<ArrayType, V> for SinOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().sin()])
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for SinOp {
+impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for SinOp {
     fn jvp(
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V>,
@@ -61,9 +83,32 @@ impl<V: Traceable<ArrayType> + FloatExt, T: TangentSpace<ArrayType, V>> Differen
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt> VectorizableOp<ArrayType, V> for SinOp {
+impl<V: Traceable<ArrayType> + Sin> VectorizableOp<ArrayType, V> for SinOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.sin()).collect())])
+    }
+}
+
+impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for JvpTracer<V, T> {
+    #[inline]
+    fn sin(self) -> Self {
+        Self { primal: self.primal.clone().sin(), tangent: T::scale(self.primal.cos(), self.tangent) }
+    }
+}
+
+impl<V: Traceable<ArrayType> + Sin> Sin for JitTracer<ArrayType, V> {
+    #[inline]
+    fn sin(self) -> Self {
+        self.unary(PrimitiveOp::Sin, Sin::sin)
+    }
+}
+
+impl<V: Traceable<ArrayType> + Sin> Sin for Batch<V> {
+    #[inline]
+    fn sin(self) -> Self {
+        let outputs = SinOp.batch(&[self]).expect("sin batching rule should succeed");
+        debug_assert_eq!(outputs.len(), 1, "sin should produce one batched output");
+        outputs.into_iter().next().expect("sin batching should return one output")
     }
 }

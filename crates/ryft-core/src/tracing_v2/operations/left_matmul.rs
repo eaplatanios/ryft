@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, OneLike, TraceError, Traceable, ZeroLike,
+    TraceError, Traceable, ZeroLike,
     batch::Batch as BatchedValue,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -82,9 +82,7 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for LeftMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
-    LinearOp<ArrayType, V> for LeftMatMulOp<V>
-{
+impl<V: MatrixValue> LinearOp<ArrayType, V> for LeftMatMulOp<V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -103,7 +101,7 @@ impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operati
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps>
+impl<V: Traceable<ArrayType> + MatrixOps + ZeroLike>
     InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>> for LeftMatMulOp<V>
 {
     fn interpret(
@@ -117,9 +115,7 @@ impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps>
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike + OneLike + crate::tracing_v2::operations::reshape::ReshapeOps>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for LeftMatMulOp<V>
-{
+impl<V: MatrixValue + ZeroLike> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for LeftMatMulOp<V> {
     fn jvp(
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V>,

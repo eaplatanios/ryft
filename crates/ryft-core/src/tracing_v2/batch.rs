@@ -10,8 +10,8 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
-        operations::{AddOp, CosOp, FlatTracedVMap, MulOp, NegOp, SinOp, VMapOp},
+        CompiledFunction, JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
+        operations::{AddOp, FlatTracedVMap, MulOp, NegOp, VMapOp},
         ops::{PrimitiveOp, VectorizableOp},
     },
     types::{ArrayType, Typed},
@@ -85,18 +85,6 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>> Neg for Batch<V> {
     #[inline]
     fn neg(self) -> Self::Output {
         single_output(NegOp.batch(&[self]).expect("neg batching rule should succeed"), "neg")
-    }
-}
-
-impl<V: Traceable<ArrayType> + FloatExt> FloatExt for Batch<V> {
-    #[inline]
-    fn sin(self) -> Self {
-        single_output(SinOp.batch(&[self]).expect("sin batching rule should succeed"), "sin")
-    }
-
-    #[inline]
-    fn cos(self) -> Self {
-        single_output(CosOp.batch(&[self]).expect("cos batching rule should succeed"), "cos")
     }
 }
 
@@ -194,10 +182,10 @@ pub(crate) trait VMapInvocationLeaf<
 /// Concrete-value dispatch for [`vmap`]: stacks inputs into [`Batch`] leaves, applies the user function
 /// over the batched representation, and unstacks the result back into per-lane outputs.
 ///
-/// No ext-trait (`FloatExt` / `MatrixOps` / `ReshapeOps`) bounds on `V` are required here because the body
+/// No op-capability (`Sin` / `Cos` / `MatrixOps` / `ReshapeOps`) bounds on `V` are required here because the body
 /// of `invoke` never exercises them — it stacks / unstacks / invokes the user's closure on
 /// `Batch<V>` values, and any capability the closure actually uses is enforced at the call site
-/// through the conditional `impl<V: …> FloatExt for Batch<V>` (and siblings) blanket impls.
+/// through the conditional op-local trait impls on [`Batch`].
 impl<
     V: Traceable<ArrayType> + crate::tracing_v2::Value<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -223,7 +211,11 @@ where
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + crate::tracing_v2::Sin
+        + crate::tracing_v2::Cos
         + ZeroLike
         + OneLike
         + crate::tracing_v2::MatrixOps
@@ -350,7 +342,7 @@ where
 /// results are stacked back. No trace-once pattern is needed here because the delegation to the
 /// concrete implementation handles each lane directly.
 ///
-/// Ext-trait bounds (`FloatExt` / `MatrixOps` / `ReshapeOps`) on `V` are deliberately omitted: the
+/// Capability-trait bounds (`Sin` / `Cos` / `MatrixOps` / `ReshapeOps`) on `V` are deliberately omitted: the
 /// body only stacks, unstacks, and invokes the user's closure — any capability the closure uses on
 /// `Batch<Batch<V>>` is enforced through the conditional blanket impls on `Batch<_>`.
 impl<
@@ -392,7 +384,7 @@ where
 mod tests {
     use indoc::indoc;
 
-    use crate::tracing_v2::{JitTracer, test_support};
+    use crate::tracing_v2::{JitTracer, Sin, test_support};
 
     use super::*;
 
@@ -539,15 +531,16 @@ mod tests {
     }
 
     /// Pins the user-facing property the quick-win in this module delivers: a concrete leaf type
-    /// that implements only `Traceable + Value + Add + ZeroLike + OneLike` — without `FloatExt`,
+    /// that implements only `Traceable + Value + Add + ZeroLike + OneLike` — without `Sin`,
+    /// `Cos`,
     /// `MatrixOps`, or `ReshapeOps` — must still be usable through [`vmap`] for programs that only
     /// exercise `Add`. Previously, the concrete [`VMapInvocationLeaf`] impl carried the full
-    /// `FloatExt + MatrixOps + ReshapeOps` union and rejected this case at compile time. The impl
+    /// `Add + Mul + Neg + Sin + Cos + MatrixOps + ReshapeOps` union and rejected this case at
+    /// compile time. The impl
     /// now only requires `Traceable + Value`, so callers pay exactly the capabilities their closure
     /// uses. The closure here exercises `Add` (via `Batch<Int64>::Add`, which delegates to
     /// `Int64::Add`), and any attempt to call e.g. `.sin()` on `Batch<Int64>` would still fail to
-    /// compile because the `impl<V: FloatExt> FloatExt for Batch<V>` blanket would demand
-    /// `Int64: FloatExt`.
+    /// compile because the `impl<V: Sin> Sin for Batch<V>` blanket would demand `Int64: Sin`.
     #[test]
     fn test_vmap_compiles_for_leaf_without_float_matrix_or_reshape_ext_traits() {
         use std::borrow::Cow;

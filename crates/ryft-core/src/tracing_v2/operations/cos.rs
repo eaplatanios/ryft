@@ -1,17 +1,42 @@
 //! Cosine primitive for [`crate::tracing_v2`].
 
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    ops::Neg,
+};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, Traceable,
+    TraceError, Traceable,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
+    jit::JitTracer,
+    ops::PrimitiveOp,
     ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
-use super::{expect_input_count, unary_abstract};
+use super::{expect_input_count, sin::Sin, unary_abstract};
+
+/// Elementwise cosine capability.
+pub trait Cos: Sized {
+    /// Computes the elementwise cosine.
+    fn cos(self) -> Self;
+}
+
+impl Cos for f32 {
+    #[inline]
+    fn cos(self) -> Self {
+        self.cos()
+    }
+}
+
+impl Cos for f64 {
+    #[inline]
+    fn cos(self) -> Self {
+        self.cos()
+    }
+}
 
 /// Elementwise cosine primitive.
 #[derive(Clone, Default)]
@@ -39,14 +64,16 @@ impl Op for CosOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt> InterpretableOp<ArrayType, V> for CosOp {
+impl<V: Traceable<ArrayType> + Cos> InterpretableOp<ArrayType, V> for CosOp {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().cos()])
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt, T: TangentSpace<ArrayType, V>> DifferentiableOp<ArrayType, V, T> for CosOp {
+impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, T> for CosOp
+{
     fn jvp(
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V>,
@@ -61,9 +88,32 @@ impl<V: Traceable<ArrayType> + FloatExt, T: TangentSpace<ArrayType, V>> Differen
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt> VectorizableOp<ArrayType, V> for CosOp {
+impl<V: Traceable<ArrayType> + Cos> VectorizableOp<ArrayType, V> for CosOp {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.cos()).collect())])
+    }
+}
+
+impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<ArrayType, V>> Cos for JvpTracer<V, T> {
+    #[inline]
+    fn cos(self) -> Self {
+        Self { primal: self.primal.clone().cos(), tangent: T::neg(T::scale(self.primal.sin(), self.tangent)) }
+    }
+}
+
+impl<V: Traceable<ArrayType> + Cos> Cos for JitTracer<ArrayType, V> {
+    #[inline]
+    fn cos(self) -> Self {
+        self.unary(PrimitiveOp::Cos, Cos::cos)
+    }
+}
+
+impl<V: Traceable<ArrayType> + Cos> Cos for Batch<V> {
+    #[inline]
+    fn cos(self) -> Self {
+        let outputs = CosOp.batch(&[self]).expect("cos batching rule should succeed");
+        debug_assert_eq!(outputs.len(), 1, "cos should produce one batched output");
+        outputs.into_iter().next().expect("cos batching should return one output")
     }
 }

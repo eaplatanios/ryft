@@ -18,7 +18,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        FloatExt, GraphBuilder, InterpretableOp, MatrixOps, OneLike, Op, TraceError, Traceable, ZeroLike,
+        Cos, GraphBuilder, InterpretableOp, MatrixOps, OneLike, Op, Sin, TraceError, Traceable, ZeroLike,
         graph::AtomId,
         operations::reshape::ReshapeOps,
         ops::PrimitiveOp,
@@ -214,18 +214,6 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>> Neg for JitTracer<ArrayType, V> 
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt> FloatExt for JitTracer<ArrayType, V> {
-    #[inline]
-    fn sin(self) -> Self {
-        self.unary(PrimitiveOp::Sin, FloatExt::sin)
-    }
-
-    #[inline]
-    fn cos(self) -> Self {
-        self.unary(PrimitiveOp::Cos, FloatExt::cos)
-    }
-}
-
 /// Staged function returned by [`jit`].
 ///
 /// In the current prototype this type stores only the staged graph and replays it with the built-in interpreter.
@@ -284,7 +272,15 @@ impl<T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         O: InterpretableOp<T, V>,
-        V: FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+        V: Add<Output = V>
+            + Mul<Output = V>
+            + Neg<Output = V>
+            + Sin
+            + Cos
+            + ZeroLike
+            + OneLike
+            + MatrixOps
+            + ReshapeOps,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -306,7 +302,16 @@ fn try_trace_program_with_options<F, Input, Output, V>(
     simplify_program: bool,
 ) -> Result<(Output, Program<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -353,7 +358,16 @@ pub fn try_trace_program<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, Program<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -368,7 +382,16 @@ pub fn try_jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -388,7 +411,16 @@ pub fn jit<F, Input, Output, V>(
     input: Input,
 ) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -465,7 +497,7 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing_v2::{FloatExt, MatrixOps, OneLike, ZeroLike, operations::reshape::ReshapeOps},
+            tracing_v2::{Cos, MatrixOps, OneLike, Sin, ZeroLike, operations::reshape::ReshapeOps},
             types::{ArrayType, DataType, Typed},
         };
 
@@ -516,11 +548,13 @@ mod tests {
             }
         }
 
-        impl FloatExt for TestAbstractValue {
+        impl Sin for TestAbstractValue {
             fn sin(self) -> Self {
                 self
             }
+        }
 
+        impl Cos for TestAbstractValue {
             fn cos(self) -> Self {
                 self
             }

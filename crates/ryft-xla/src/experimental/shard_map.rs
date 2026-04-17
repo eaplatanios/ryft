@@ -69,7 +69,7 @@ use thiserror::Error;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::{
-    CompiledFunction, FloatExt, JitTracer, Linearized, MatrixOps, OneLike, TraceError, Traceable, ZeroLike, jit,
+    CompiledFunction, Cos, JitTracer, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike, jit,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -400,11 +400,13 @@ impl Neg for ShardMapTensor {
     }
 }
 
-impl FloatExt for ShardMapTensor {
+impl Sin for ShardMapTensor {
     fn sin(self) -> Self {
         Self::new(self.r#type)
     }
+}
 
+impl Cos for ShardMapTensor {
     fn cos(self) -> Self {
         Self::new(self.r#type)
     }
@@ -1773,7 +1775,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{FloatExt, OneLike, grad, vmap};
+    use ryft_core::tracing_v2::{OneLike, Sin, grad, vmap};
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;

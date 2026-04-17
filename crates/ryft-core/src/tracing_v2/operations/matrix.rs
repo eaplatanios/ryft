@@ -4,12 +4,15 @@
 //! right linear actions for transposition, while reusing the same JVP, batching, and JIT infrastructure as scalar
 //! values.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    ops::{Add, Mul, Neg},
+};
 
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, TraceError, Traceable, ZeroLike,
+        TraceError, Traceable, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
@@ -74,7 +77,7 @@ pub trait MatrixTangentSpace<V: MatrixValue>: TangentSpace<ArrayType, V> {
     fn transpose_matrix(value: Self) -> Self;
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for V {
+impl<V: MatrixValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike> MatrixTangentSpace<V> for V {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
         factor.matmul(tangent)
@@ -237,7 +240,7 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike> MatrixTangentSpace<V> for LinearTerm<ArrayType, V> {
+impl<V: MatrixValue + ZeroLike> MatrixTangentSpace<V> for LinearTerm<ArrayType, V> {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
         tangent.apply_linear_op(LinearPrimitiveOp::LeftMatMul { factor })
@@ -264,7 +267,7 @@ pub mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, FloatExt, OneLike, Traceable, ZeroLike, engine::Engine},
+        tracing_v2::{CoordinateValue, Cos, OneLike, Sin, Traceable, ZeroLike, engine::Engine},
         types::{ArrayType, DataType, Typed},
     };
 
@@ -327,24 +330,28 @@ pub mod ndarray_support {
     impl Parameter for Array2<f32> {}
     impl Parameter for Array2<f64> {}
 
-    impl FloatExt for Array2<f32> {
+    impl Sin for Array2<f32> {
         #[inline]
         fn sin(self) -> Self {
             self.mapv(f32::sin)
         }
+    }
 
+    impl Cos for Array2<f32> {
         #[inline]
         fn cos(self) -> Self {
             self.mapv(f32::cos)
         }
     }
 
-    impl FloatExt for Array2<f64> {
+    impl Sin for Array2<f64> {
         #[inline]
         fn sin(self) -> Self {
             self.mapv(f64::sin)
         }
+    }
 
+    impl Cos for Array2<f64> {
         #[inline]
         fn cos(self) -> Self {
             self.mapv(f64::cos)

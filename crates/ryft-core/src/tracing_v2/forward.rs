@@ -12,7 +12,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        FloatExt, MatrixOps, TraceError, Traceable, ZeroLike,
+        Cos, MatrixOps, Sin, TraceError, Traceable, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
@@ -40,7 +40,9 @@ pub trait TangentSpace<T: Type, V: Typed<T>>: Clone + Parameter {
     fn zero_like(primal: &V, tangent: &Self) -> Self;
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike> TangentSpace<ArrayType, V> for V {
+impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike>
+    TangentSpace<ArrayType, V> for V
+{
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
         lhs + rhs
@@ -114,7 +116,14 @@ pub trait JvpInvocationLeaf<
 >: Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType> + FloatExt + ZeroLike + MatrixOps;
+    type Base: Traceable<ArrayType>
+        + Add<Output = Self::Base>
+        + Mul<Output = Self::Base>
+        + Neg<Output = Self::Base>
+        + Sin
+        + Cos
+        + ZeroLike
+        + MatrixOps;
 
     /// Input type expected by the user-provided function.
     type FunctionInput;
@@ -163,24 +172,16 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<Array
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike, T: TangentSpace<ArrayType, V>> FloatExt for JvpTracer<V, T> {
-    #[inline]
-    fn sin(self) -> Self {
-        Self { primal: self.primal.clone().sin(), tangent: T::scale(self.primal.cos(), self.tangent) }
-    }
-
-    #[inline]
-    fn cos(self) -> Self {
-        Self { primal: self.primal.clone().cos(), tangent: T::neg(T::scale(self.primal.sin(), self.tangent)) }
-    }
-}
-
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`JitTracer`] to build a staged
 /// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + crate::tracing_v2::OneLike
         + crate::tracing_v2::Value<ArrayType>
@@ -224,7 +225,11 @@ where
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + crate::tracing_v2::OneLike
         + MatrixOps
@@ -273,7 +278,11 @@ where
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + crate::tracing_v2::OneLike
         + MatrixOps

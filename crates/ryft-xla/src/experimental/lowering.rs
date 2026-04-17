@@ -141,7 +141,11 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue
-            + ryft_core::tracing_v2::FloatExt
+            + std::ops::Add<Output = V>
+            + std::ops::Mul<Output = V>
+            + std::ops::Neg<Output = V>
+            + ryft_core::tracing_v2::Sin
+            + ryft_core::tracing_v2::Cos
             + ryft_core::tracing_v2::ZeroLike
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
@@ -166,7 +170,11 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue
-            + ryft_core::tracing_v2::FloatExt
+            + std::ops::Add<Output = V>
+            + std::ops::Mul<Output = V>
+            + std::ops::Neg<Output = V>
+            + ryft_core::tracing_v2::Sin
+            + ryft_core::tracing_v2::Cos
             + ryft_core::tracing_v2::ZeroLike
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
@@ -517,7 +525,11 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for ReshapeOp {
 
 impl<
     V: Traceable<ArrayType>
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -540,7 +552,11 @@ impl<
 
 impl<
     V: Traceable<ArrayType>
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -570,7 +586,11 @@ impl<
 
 impl<
     V: Traceable<ArrayType>
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -599,7 +619,11 @@ impl<
 
 impl<
     V: Traceable<ArrayType>
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -680,7 +704,11 @@ impl<
 
 impl<
     V: Traceable<ArrayType>
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -794,7 +822,11 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue
-            + ryft_core::tracing_v2::FloatExt
+            + std::ops::Add<Output = V>
+            + std::ops::Mul<Output = V>
+            + std::ops::Neg<Output = V>
+            + ryft_core::tracing_v2::Sin
+            + ryft_core::tracing_v2::Cos
             + ryft_core::tracing_v2::ZeroLike
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
@@ -819,7 +851,11 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue
-            + ryft_core::tracing_v2::FloatExt
+            + std::ops::Add<Output = V>
+            + std::ops::Mul<Output = V>
+            + std::ops::Neg<Output = V>
+            + ryft_core::tracing_v2::Sin
+            + ryft_core::tracing_v2::Cos
             + ryft_core::tracing_v2::ZeroLike
             + ryft_core::tracing_v2::OneLike
             + ryft_core::tracing_v2::MatrixOps
@@ -1142,7 +1178,11 @@ pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, O, S>(
 ) -> Result<String, LoweringError>
 where
     V: MlirLowerableValue
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -1622,7 +1662,11 @@ fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -1733,7 +1777,11 @@ fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -1812,7 +1860,11 @@ fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -1885,7 +1937,11 @@ fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -2324,7 +2380,11 @@ fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -2357,7 +2417,11 @@ fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue
-        + ryft_core::tracing_v2::FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + ryft_core::tracing_v2::Sin
+        + ryft_core::tracing_v2::Cos
         + ryft_core::tracing_v2::ZeroLike
         + ryft_core::tracing_v2::OneLike
         + ryft_core::tracing_v2::MatrixOps
@@ -2634,7 +2698,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{
-        CustomPrimitive, FloatExt, InterpretableOp, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, TraceError,
+        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, PrimitiveOp, ProgramBuilder, Sin, TraceError,
         ZeroLike,
     };
     use ryft_core::types::Shape;
@@ -2837,14 +2901,14 @@ mod tests {
 
     fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
     where
-        T: Clone + ryft_core::tracing_v2::FloatExt + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::tracing_v2::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin()
     }
 
     fn scalar_quartic_plus_sin<T>(x: T) -> T
     where
-        T: Clone + ryft_core::tracing_v2::FloatExt + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::tracing_v2::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
     }

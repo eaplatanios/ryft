@@ -4,7 +4,10 @@
 //! and element count. The public trait surface is deliberately fallible because not every traceable leaf type can
 //! represent every logical target shape with the same Rust type.
 
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    ops::{Add, Mul, Neg},
+};
 
 #[cfg(test)]
 use indoc::indoc;
@@ -12,7 +15,7 @@ use indoc::indoc;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        FloatExt, MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
+        MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
@@ -196,13 +199,13 @@ pub trait ReshapeTangentSpace<V: ReshapeValue>: TangentSpace<ArrayType, V> {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError>;
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike> ReshapeTangentSpace<V> for V {
+impl<V: ReshapeValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike> ReshapeTangentSpace<V> for V {
     fn reshape(_input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         tangent.reshape(output_type.shape.clone())
     }
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> ReshapeTangentSpace<V> for LinearTerm<ArrayType, V> {
+impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> ReshapeTangentSpace<V> for LinearTerm<ArrayType, V> {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         if input_type == output_type {
             return Ok(tangent);
@@ -379,7 +382,7 @@ impl<V: ReshapeValue> InterpretableOp<ArrayType, V> for ReshapeOp {
     }
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<ArrayType, V> for ReshapeOp {
+impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOp<ArrayType, V> for ReshapeOp {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -396,8 +399,8 @@ impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps> LinearOp<Array
     }
 }
 
-impl<V: ReshapeValue + FloatExt + ZeroLike + OneLike + MatrixOps>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for ReshapeOp
+impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
+    for ReshapeOp
 {
     fn jvp(
         &self,

@@ -89,7 +89,7 @@ pub mod rematerialize;
 pub mod vmap;
 
 pub use add::AddOp;
-pub use cos::CosOp;
+pub use cos::{Cos, CosOp};
 pub use left_matmul::LeftMatMulOp;
 pub use linear_matrix_transpose::LinearMatrixTransposeOp;
 pub use matmul::MatMulOp;
@@ -100,7 +100,7 @@ pub use rematerialize::{FlatTracedRematerialize, LinearRematerializeOp, Remateri
 pub use reshape::ReshapeOp;
 pub use right_matmul::RightMatMulOp;
 pub use scale::ScaleOp;
-pub use sin::SinOp;
+pub use sin::{Sin, SinOp};
 pub use vmap::{FlatTracedVMap, LinearVMapOp, VMapOp};
 
 /// Returns an input-count error when one staged op receives the wrong arity.

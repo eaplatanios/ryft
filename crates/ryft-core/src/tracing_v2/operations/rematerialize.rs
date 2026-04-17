@@ -11,7 +11,7 @@ use std::fmt::{Debug, Display};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer, LinearTerm, MatrixOps, OneLike, Program, TraceError, Traceable,
+        CompiledFunction, Cos, JitTracer, LinearTerm, MatrixOps, OneLike, Program, Sin, TraceError, Traceable,
         ZeroLike,
         engine::Engine,
         jit::try_trace_program,
@@ -138,8 +138,18 @@ impl<V: Traceable<ArrayType>> Op for RematerializeOp<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<ArrayType, V>
-    for RematerializeOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> InterpretableOp<ArrayType, V> for RematerializeOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -152,7 +162,8 @@ where
 
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -196,7 +207,8 @@ where
 
 impl<
     V: Traceable<ArrayType>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -231,8 +243,18 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps>
-    InterpretableOp<ArrayType, JitTracer<ArrayType, V>> for RematerializeOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> InterpretableOp<ArrayType, JitTracer<ArrayType, V>> for RematerializeOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -307,8 +329,18 @@ impl<V: Traceable<ArrayType>> Op for LinearRematerializeOp<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> InterpretableOp<ArrayType, V>
-    for LinearRematerializeOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> InterpretableOp<ArrayType, V> for LinearRematerializeOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -319,8 +351,18 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + FloatExt + ZeroLike + OneLike + MatrixOps + ReshapeOps> LinearOp<ArrayType, V>
-    for LinearRematerializeOp<ArrayType, V>
+impl<
+    V: Traceable<ArrayType>
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + ReshapeOps,
+> LinearOp<ArrayType, V> for LinearRematerializeOp<ArrayType, V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
@@ -349,7 +391,8 @@ pub fn make_linear_rematerialize<V>(
 ) -> Result<LinearRematerializeOp<ArrayType, V>, TraceError>
 where
     V: Traceable<ArrayType>
-        + FloatExt
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -400,7 +443,6 @@ pub(crate) trait RematerializeInvocationLeaf<
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
         + ZeroLike
         + OneLike
         + crate::tracing_v2::Value<ArrayType>
@@ -424,7 +466,11 @@ impl<
 impl<
     V: Traceable<ArrayType>
         + Parameterized<V, ParameterStructure = Placeholder>
-        + FloatExt
+        + std::ops::Add<Output = V>
+        + std::ops::Mul<Output = V>
+        + std::ops::Neg<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps
@@ -522,7 +568,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing_v2::{
-        CompiledFunction, FloatExt, JitTracer,
+        CompiledFunction, JitTracer, Sin,
         engine::ArrayScalarEngine,
         jit,
         linear::{compile_grad, grad, value_and_grad},

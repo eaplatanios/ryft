@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    FloatExt, TraceError, ZeroLike,
+    TraceError,
     batch::Batch as BatchedValue,
     engine::Engine,
     forward::JvpTracer,
@@ -50,9 +50,7 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatMulOp {
     }
 }
 
-impl<V: MatrixValue + FloatExt + ZeroLike, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<ArrayType, V, T>
-    for MatMulOp
-{
+impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>> DifferentiableOp<ArrayType, V, T> for MatMulOp {
     fn jvp(
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V>,

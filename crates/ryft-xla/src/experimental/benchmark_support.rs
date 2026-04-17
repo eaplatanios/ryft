@@ -6,7 +6,7 @@
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing_v2::{
-    FloatExt, MatrixOps, OneLike, PrimitiveOp, Program,
+    MatrixOps, OneLike, PrimitiveOp, Program, Sin,
     benchmarking::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
         record, summarize_graph,

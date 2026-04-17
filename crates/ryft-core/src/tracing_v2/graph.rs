@@ -678,7 +678,7 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{FloatExt, MatrixOps, OneLike, TraceError, Value, ZeroLike, ops::PrimitiveOp, test_support},
+        tracing_v2::{Cos, MatrixOps, OneLike, Sin, TraceError, Value, ZeroLike, ops::PrimitiveOp, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 
@@ -873,11 +873,13 @@ mod tests {
             }
         }
 
-        impl FloatExt for TestIdentityValue {
+        impl Sin for TestIdentityValue {
             fn sin(self) -> Self {
                 self
             }
+        }
 
+        impl Cos for TestIdentityValue {
             fn cos(self) -> Self {
                 self
             }

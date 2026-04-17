@@ -9,7 +9,7 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::tracing_v2::{
-    Batch, CompiledFunction, FloatExt, JitTracer, LinearProgram, OneLike, Program, Traceable,
+    Batch, CompiledFunction, Cos, JitTracer, LinearProgram, OneLike, Program, Sin, Traceable,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_graph},
     engine::ArrayScalarEngine,
     grad, jit, jvp, jvp_program, linearize, stack, try_jit, unstack, value_and_grad, vjp, vmap,
@@ -90,7 +90,11 @@ fn tracing_record<V, Input, Output, O>(
 ) -> Result<IrBenchmarkRecord, BenchmarkError>
 where
     V: Traceable<ArrayType>
-        + crate::tracing_v2::FloatExt
+        + crate::tracing_v2::Sin
+        + crate::tracing_v2::Cos
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
         + crate::tracing_v2::ZeroLike
         + crate::tracing_v2::OneLike
         + crate::tracing_v2::MatrixOps
@@ -118,7 +122,7 @@ fn tracing_category(case_id: &str) -> &'static str {
 ///   - `inputs`: Structured scalar inputs.
 fn bilinear_sin<T>(inputs: (T, T)) -> T
 where
-    T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+    T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
 {
     inputs.0.clone() * inputs.1 + inputs.0.sin()
 }
@@ -130,7 +134,7 @@ where
 ///   - `x`: Scalar input.
 fn quartic_plus_sin<T>(x: T) -> T
 where
-    T: Clone + FloatExt + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
+    T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Output = T>,
 {
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
 }
@@ -278,7 +282,7 @@ fn matrix_inputs() -> (Array2<f64>, Array2<f64>) {
 #[cfg(feature = "ndarray")]
 fn bilinear_matmul<M>(inputs: (M, M)) -> M
 where
-    M: Clone + FloatExt + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
+    M: Clone + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
 {
     inputs.0.matmul(inputs.1)
 }
@@ -286,7 +290,7 @@ where
 #[cfg(feature = "ndarray")]
 fn three_matmul_sine<M>(inputs: (M, M, M, M)) -> M
 where
-    M: Clone + FloatExt + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
+    M: Clone + Sin + MatrixOps + Add<Output = M> + Mul<Output = M> + Neg<Output = M>,
 {
     let (x, a, b, c) = inputs;
     x.matmul(a).sin().matmul(b).matmul(c)
