@@ -16,14 +16,14 @@ use crate::{
 };
 
 /// Erased traced `vmap` body used by the staged higher-order op.
-pub struct FlatTracedVMap<T: Type + Clone, V: Typed<T> + Clone + Parameter, O = ProgramOpRef<V>> {
+pub struct FlatTracedVMap<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {
     lane_count: usize,
     input_types: Vec<T>,
     output_types: Vec<T>,
     compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
 }
 
-impl<T: Type + Clone, V: Traceable<T>, O: Clone> Clone for FlatTracedVMap<T, V, O>
+impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedVMap<T, V, O>
 where
     <Vec<V> as Parameterized<V>>::ParameterStructure: Clone,
 {
@@ -37,7 +37,7 @@ where
     }
 }
 
-impl<T: Type + Clone, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
     /// Builds one erased traced `vmap` body from explicit staged parts.
     #[inline]
     pub fn from_parts(
@@ -113,17 +113,17 @@ impl<T: Type + Clone, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
 }
 
 /// Higher-order `vmap` op that carries one canonical forward program payload.
-pub struct VMapOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct VMapOp<T: Type + Display, V: Typed<T> + Parameter> {
     body: FlatTracedVMap<T, V, PrimitiveOp<T, V>>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Clone for VMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Clone for VMapOp<T, V> {
     fn clone(&self) -> Self {
         Self { body: self.body.clone() }
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> VMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> VMapOp<T, V> {
     /// Builds one ordinary traced `vmap` op.
     #[inline]
     pub fn new(body: FlatTracedVMap<T, V, PrimitiveOp<T, V>>) -> Self {
@@ -137,13 +137,13 @@ impl<T: Type + Clone + Display, V: Traceable<T>> VMapOp<T, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for VMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for VMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "VMap")
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Display for VMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Display for VMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
@@ -277,18 +277,18 @@ where
 }
 
 /// Linear-only `vmap` op that always carries both the linear body and its transpose body.
-pub struct LinearVMapOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct LinearVMapOp<T: Type + Display, V: Typed<T> + Parameter> {
     body: FlatTracedVMap<T, V, LinearPrimitiveOp<T, V>>,
     transpose_body: FlatTracedVMap<T, V, LinearPrimitiveOp<T, V>>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Clone for LinearVMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Clone for LinearVMapOp<T, V> {
     fn clone(&self) -> Self {
         Self { body: self.body.clone(), transpose_body: self.transpose_body.clone() }
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> LinearVMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> LinearVMapOp<T, V> {
     /// Builds one linear traced `vmap` op with its transpose body.
     #[inline]
     pub fn new(
@@ -309,13 +309,13 @@ impl<T: Type + Clone + Display, V: Traceable<T>> LinearVMapOp<T, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for LinearVMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for LinearVMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearVMap")
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Display for LinearVMapOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Display for LinearVMapOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }

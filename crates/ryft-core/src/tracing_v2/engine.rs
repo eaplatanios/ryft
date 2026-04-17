@@ -47,10 +47,10 @@ use crate::{
 /// must return values whose [`Typed::tpe`] matches the input type metadata.
 pub trait Engine {
     /// Abstract type metadata interpreted by this engine.
-    type Type: Type + Clone;
+    type Type: Type;
 
     /// Concrete leaf value produced by this engine.
-    type Value: Typed<Self::Type> + Parameter + Clone;
+    type Value: Typed<Self::Type> + Parameter;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
     fn zero(&self, r#type: &Self::Type) -> Self::Value;

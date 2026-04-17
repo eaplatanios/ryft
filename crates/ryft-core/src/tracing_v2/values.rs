@@ -55,7 +55,7 @@ pub trait OneLike {
 /// 2. an impl for `JitTracer<V>` — symbolic dispatch that stages the transform into the enclosing traced graph.
 ///
 /// Because `JitTracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
-pub trait Value<T: Type + Clone>: Traceable<T> {}
+pub trait Value<T: Type>: Traceable<T> {}
 
 /// Base trait for any leaf type that can participate in traced computations.
 ///
@@ -73,7 +73,7 @@ pub trait Value<T: Type + Clone>: Traceable<T> {}
 /// valid while opting them out of constant-identity simplification.
 ///
 /// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
-pub trait Traceable<T: Type + Clone>: Clone + Parameter + Typed<T> + 'static {
+pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
     ///
     /// The graph builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)

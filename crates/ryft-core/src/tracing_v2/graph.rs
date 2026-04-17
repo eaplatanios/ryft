@@ -20,7 +20,7 @@ pub type AtomId = usize;
 /// retains. See [`GraphBuilder`] for how builder-time intermediate values for [`Atom::Derived`]
 /// are kept separately during staging.
 #[derive(Clone, Debug)]
-pub enum Atom<T: Type + Clone, V: Typed<T>> {
+pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant folded or supplied at trace time. Constants retain their value so the
     /// interpreter and MLIR lowering can emit them.
     Constant {
@@ -45,7 +45,7 @@ pub enum Atom<T: Type + Clone, V: Typed<T>> {
     },
 }
 
-impl<T: Type + Clone, V: Typed<T>> Typed<T> for Atom<T, V> {
+impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
     fn tpe(&self) -> Cow<'_, T> {
         match self {
             Self::Constant { value } => value.tpe(),
@@ -72,14 +72,14 @@ pub struct Equation<O> {
 /// values are used for on-the-fly interpretation and algebraic-identity checks but are discarded
 /// when the graph is finalized via [`Self::build`].
 #[derive(Clone, Debug)]
-pub struct GraphBuilder<O, T: Type + Clone, V: Typed<T>> {
+pub struct GraphBuilder<O, T: Type, V: Typed<T>> {
     atoms: Vec<Atom<T, V>>,
     intermediates: Vec<Option<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
 }
 
-impl<O: Clone, T: Type + Clone, V: Traceable<T>> GraphBuilder<O, T, V> {
+impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
     /// Creates an empty builder.
     #[inline]
     pub fn new() -> Self {
@@ -269,7 +269,7 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>> GraphBuilder<O, T, V> {
     }
 }
 
-impl<O: Clone, T: Type + Clone, V: Traceable<T>> Default for GraphBuilder<O, T, V> {
+impl<O: Clone, T: Type, V: Traceable<T>> Default for GraphBuilder<O, T, V> {
     fn default() -> Self {
         Self::new()
     }
@@ -280,17 +280,17 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>> Default for GraphBuilder<O, T, 
 // ---------------------------------------------------------------------------
 
 /// Checks if a value is a constant zero through [`Traceable::is_zero`].
-pub(crate) fn is_identity_zero<T: Type + Clone, V: Traceable<T>>(value: &V) -> bool {
+pub(crate) fn is_identity_zero<T: Type, V: Traceable<T>>(value: &V) -> bool {
     value.is_zero()
 }
 
 /// Checks if a value is a constant one through [`Traceable::is_one`].
-pub(crate) fn is_identity_one<T: Type + Clone, V: Traceable<T>>(value: &V) -> bool {
+pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
     value.is_one()
 }
 
 /// Executable staged graph over an open operation set.
-pub struct Graph<O, T: Type + Clone, V: Typed<T> + Parameter, Input: Parameterized<V>, Output: Parameterized<V>> {
+pub struct Graph<O, T: Type, V: Typed<T> + Parameter, Input: Parameterized<V>, Output: Parameterized<V>> {
     atoms: Vec<Atom<T, V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
@@ -302,7 +302,7 @@ pub struct Graph<O, T: Type + Clone, V: Typed<T> + Parameter, Input: Parameteriz
 
 impl<
     O: Clone,
-    T: Type + Clone,
+    T: Type,
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -321,7 +321,7 @@ impl<
     }
 }
 
-impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Graph<O, T, V, Input, Output>
 {
     /// Returns the number of atoms in the graph.
@@ -485,7 +485,7 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
+        fn mark_live<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
             graph: &Graph<O, T, V, Input, Output>,
             atom_id: usize,
             live_atoms: &mut [bool],
@@ -518,7 +518,7 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output
         ) -> Result<usize, TraceError>
         where
             O: Clone + Op<T>,
-            T: Type + Clone,
+            T: Type,
             V: Traceable<T>,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
@@ -619,8 +619,8 @@ impl<O: Clone, T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output
     }
 }
 
-impl<O: Clone + Display, T: Type + Clone + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Display for Graph<O, T, V, Input, Output>
+impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
+    for Graph<O, T, V, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");

@@ -23,12 +23,12 @@ use super::{expect_input_count, lift_jit_constant, unary_abstract};
 
 /// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]
-pub struct ScaleOp<T: Type + Clone, V: Typed<T>> {
+pub struct ScaleOp<T: Type, V: Typed<T>> {
     factor: V,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Type + Clone, V: Traceable<T>> ScaleOp<T, V> {
+impl<T: Type, V: Traceable<T>> ScaleOp<T, V> {
     /// Creates a new scale operation capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
@@ -49,13 +49,13 @@ impl<V: Traceable<ArrayType>> ScaleOp<ArrayType, V> {
     }
 }
 
-impl<T: Type + Clone, V: Traceable<T>> Debug for ScaleOp<T, V> {
+impl<T: Type, V: Traceable<T>> Debug for ScaleOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Scale")
     }
 }
 
-impl<T: Type + Clone, V: Traceable<T>> Display for ScaleOp<T, V> {
+impl<T: Type, V: Traceable<T>> Display for ScaleOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "scale")
     }

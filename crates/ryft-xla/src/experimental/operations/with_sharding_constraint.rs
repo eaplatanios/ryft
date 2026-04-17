@@ -46,11 +46,11 @@ impl WithShardingConstraintOp {
     fn base_custom_primitive<V>(&self) -> CustomPrimitive<ArrayType, V>
     where
         V: ryft_core::tracing_v2::Traceable<ArrayType>,
-        Self: InterpretableOp<ArrayType, V>
+        Self: Clone
+            + InterpretableOp<ArrayType, V>
             + LinearOp<ArrayType, V>
             + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
             + VectorizableOp<ArrayType, V>
-            + Clone
             + Send
             + Sync
             + 'static,

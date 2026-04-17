@@ -146,7 +146,7 @@ impl<V: Traceable<ArrayType>> ShardMapOp<V> {
     /// Returns the shared custom-primitive registration used by this shard-map variant.
     fn base_custom_primitive(&self) -> CustomPrimitive<ArrayType, V>
     where
-        Self: InterpretableOp<ArrayType, V> + LinearOp<ArrayType, V> + Clone + Send + Sync + 'static,
+        Self: Clone + InterpretableOp<ArrayType, V> + LinearOp<ArrayType, V> + Send + Sync + 'static,
     {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
     }

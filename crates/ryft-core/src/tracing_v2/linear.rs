@@ -32,18 +32,18 @@ use crate::{
 
 /// Tangent representation backed by atoms in a staged linear graph.
 #[derive(Clone, Parameter)]
-pub struct LinearTerm<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct LinearTerm<T: Type + Display, V: Typed<T> + Parameter> {
     atom: AtomId,
     builder: Rc<RefCell<GraphBuilder<LinearPrimitiveOp<T, V>, T, V>>>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> std::fmt::Debug for LinearTerm<T, V> {
+impl<T: Type + Display, V: Traceable<T>> std::fmt::Debug for LinearTerm<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("LinearTerm").field("atom", &self.atom).finish()
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> LinearTerm<T, V> {
+impl<T: Type + Display, V: Traceable<T>> LinearTerm<T, V> {
     #[inline]
     pub fn atom(&self) -> AtomId {
         self.atom
@@ -140,7 +140,7 @@ impl<T: Type + Clone + Display, V: Traceable<T>> LinearTerm<T, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T> + ZeroLike> TangentSpace<T, V> for LinearTerm<T, V> {
+impl<T: Type + Display, V: Traceable<T> + ZeroLike> TangentSpace<T, V> for LinearTerm<T, V> {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
         lhs.add(rhs)
@@ -173,20 +173,16 @@ fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
 }
 
 /// Staged linear map produced by `linearize`, `jvp_program`, or `vjp`.
-pub struct LinearProgram<
-    T: Type + Clone + Display,
-    V: Typed<T> + Clone + Parameter,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> {
+pub struct LinearProgram<T: Type + Display, V: Typed<T> + Parameter, Input: Parameterized<V>, Output: Parameterized<V>>
+{
     program: Program<T, V, Input, Output, LinearPrimitiveOp<T, V>>,
     zero: V,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
 impl<
-    T: Type + Clone + Display,
-    V: Traceable<T> + Clone,
+    T: Type + Display,
+    V: Clone + Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > Clone for LinearProgram<T, V, Input, Output>
@@ -196,7 +192,7 @@ impl<
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     LinearProgram<T, V, Input, Output>
 {
     #[inline]

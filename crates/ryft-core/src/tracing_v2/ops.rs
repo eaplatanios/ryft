@@ -48,7 +48,7 @@ use crate::{
 /// The type parameter `T` determines which abstract type descriptor is used for shape-level reasoning. The default
 /// is [`ArrayType`], which covers the entire core tracing infrastructure. Future instantiations with different type
 /// descriptors can reuse the same trait without modifying existing implementations.
-pub trait Op<T: Type + Clone = ArrayType>: Debug + Display {
+pub trait Op<T: Type = ArrayType>: Debug + Display {
     /// Returns the stable primitive name used in diagnostics and pretty-printing.
     fn name(&self) -> &'static str;
 
@@ -74,7 +74,7 @@ pub trait Op<T: Type + Clone = ArrayType>: Debug + Display {
 ///
 /// Separated from [`Op`] so that graph construction, display, and simplification can work without value-type bounds.
 /// Only code paths that actually execute operations (graph replay, JIT example propagation) require this trait.
-pub trait InterpretableOp<T: Type + Clone, V: Typed<T>>: Op<T> {
+pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
     /// Executes the operation on concrete values.
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
 }
@@ -143,7 +143,7 @@ pub trait InterpretableOp<T: Type + Clone, V: Typed<T>>: Op<T> {
 ///
 /// Structural validation happens when the forward linear program is built and when any staged ops
 /// emitted by the rule are added to the transpose program.
-pub trait LinearOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter>: Op<T> {
+pub trait LinearOp<T: Type + Display, V: Typed<T> + Parameter>: Op<T> {
     /// Applies the transpose rule for reverse-mode differentiation.
     ///
     /// `output_cotangents` is aligned with the op outputs in forward order. The returned vector
@@ -164,7 +164,7 @@ pub trait LinearOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter>: 
 ///
 /// [`TangentSpace`]: crate::tracing_v2::forward::TangentSpace
 /// [`MatrixTangentSpace`]: crate::tracing_v2::MatrixTangentSpace
-pub trait DifferentiableOp<T: Type + Clone, V: Typed<T>, Tangent>: Op<T> {
+pub trait DifferentiableOp<T: Type, V: Typed<T>, Tangent>: Op<T> {
     /// Applies the forward-mode JVP rule.
     ///
     /// The `engine` argument carries the context needed to synthesize zero values for higher-order
@@ -178,25 +178,25 @@ pub trait DifferentiableOp<T: Type + Clone, V: Typed<T>, Tangent>: Op<T> {
 }
 
 /// Primitive operation with a batching rule used by `vmap`.
-pub trait VectorizableOp<T: Type + Clone, V: Typed<T>>: Op<T> {
+pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
     /// Applies the primitive's batching rule to batched inputs.
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
 }
 
 /// Typed extension registry carried by one [`CustomPrimitive`].
 #[derive(Clone, Default)]
-pub struct CustomPrimitiveExtensions<T: Type + Clone, V: Typed<T>> {
+pub struct CustomPrimitiveExtensions<T: Type, V: Typed<T>> {
     entries: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
     _marker: std::marker::PhantomData<(T, V)>,
 }
 
-impl<T: Type + Clone, V: Traceable<T>> Debug for CustomPrimitiveExtensions<T, V> {
+impl<T: Type, V: Traceable<T>> Debug for CustomPrimitiveExtensions<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("CustomPrimitiveExtensions").field("count", &self.entries.len()).finish()
     }
 }
 
-impl<T: Type + Clone, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
+impl<T: Type, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
     /// Inserts one typed extension into the registry, replacing any previous extension of the same type.
     pub fn insert<E: Send + Sync + 'static>(&mut self, extension: E) {
         self.entries.insert(TypeId::of::<E>(), Arc::new(extension));
@@ -225,9 +225,9 @@ impl<V: Traceable<ArrayType> + ZeroLike> LinearizedJitRule<V> {
     }
 }
 
-trait CustomBaseOp<T: Type + Clone, V: Typed<T>>: Op<T> + InterpretableOp<T, V> + Send + Sync {}
+trait CustomBaseOp<T: Type, V: Typed<T>>: Op<T> + InterpretableOp<T, V> + Send + Sync {}
 
-impl<Ty: Type + Clone, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V> + Send + Sync> CustomBaseOp<Ty, V> for O {}
+impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V> + Send + Sync> CustomBaseOp<Ty, V> for O {}
 
 /// Rule-based registration object used by [`PrimitiveOp::Custom`].
 ///
@@ -239,7 +239,7 @@ impl<Ty: Type + Clone, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V> + Se
 /// - [`VectorizableOp<ArrayType, V>`] for `vmap`, and
 /// - [`InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
-pub struct CustomPrimitive<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct CustomPrimitive<T: Type + Display, V: Typed<T> + Parameter> {
     base: Arc<dyn CustomBaseOp<T, V>>,
     transpose_rule: Option<Arc<dyn LinearOp<T, V> + Send + Sync>>,
     jvp_rule: Option<Arc<dyn DifferentiableOp<T, V, LinearTerm<T, V>> + Send + Sync>>,
@@ -247,7 +247,7 @@ pub struct CustomPrimitive<T: Type + Clone + Display, V: Typed<T> + Clone + Para
     extensions: CustomPrimitiveExtensions<T, V>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> CustomPrimitive<T, V> {
+impl<T: Type + Display, V: Traceable<T>> CustomPrimitive<T, V> {
     /// Creates one custom primitive from its required base operation.
     pub fn new<Base>(base: Base) -> Self
     where
@@ -336,13 +336,13 @@ impl<T: Type + Clone + Display, V: Traceable<T>> CustomPrimitive<T, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for CustomPrimitive<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for CustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.base.as_ref(), formatter)
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Display for CustomPrimitive<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Display for CustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self.base.as_ref(), formatter)
     }
@@ -425,11 +425,11 @@ where
 
 /// Linear-only wrapper around one [`CustomPrimitive`] that guarantees a transpose rule is present.
 #[derive(Clone)]
-pub struct LinearCustomPrimitive<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct LinearCustomPrimitive<T: Type + Display, V: Typed<T> + Parameter> {
     primitive: Arc<CustomPrimitive<T, V>>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> LinearCustomPrimitive<T, V> {
+impl<T: Type + Display, V: Traceable<T>> LinearCustomPrimitive<T, V> {
     /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
     pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TraceError> {
         primitive.transpose_rule.as_ref().ok_or_else(|| primitive.missing_rule("transpose"))?;
@@ -443,13 +443,13 @@ impl<T: Type + Clone + Display, V: Traceable<T>> LinearCustomPrimitive<T, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for LinearCustomPrimitive<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for LinearCustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self.primitive.as_ref(), formatter)
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Display for LinearCustomPrimitive<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Display for LinearCustomPrimitive<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self.primitive.as_ref(), formatter)
     }
@@ -502,7 +502,7 @@ impl<V: Traceable<ArrayType>> LinearOp<ArrayType, V> for LinearCustomPrimitive<A
 /// Every known primitive is a zero-cost enum variant. Operations originating outside
 /// `ryft-core` (e.g., shard-map ops in `ryft-xla`) go through the [`Custom`](PrimitiveOp::Custom) escape
 /// hatch, which still uses dynamic dispatch.
-pub enum PrimitiveOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub enum PrimitiveOp<T: Type + Display, V: Typed<T> + Parameter> {
     /// Elementwise addition.
     Add,
 
@@ -549,7 +549,7 @@ pub enum PrimitiveOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter>
     Custom(Arc<CustomPrimitive<T, V>>),
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
     fn clone(&self) -> Self {
         match self {
             Self::Add => Self::Add,
@@ -577,7 +577,7 @@ impl<T: Type + Clone + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
 pub type PrimitiveOpRef<T, V> = PrimitiveOp<T, V>;
 
 /// Closed set of operations that may appear in staged linear programs.
-pub enum LinearPrimitiveOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub enum LinearPrimitiveOp<T: Type + Display, V: Typed<T> + Parameter> {
     /// Elementwise addition.
     Add,
 
@@ -612,7 +612,7 @@ pub enum LinearPrimitiveOp<T: Type + Clone + Display, V: Typed<T> + Clone + Para
     Custom(Arc<LinearCustomPrimitive<T, V>>),
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Clone for LinearPrimitiveOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Clone for LinearPrimitiveOp<T, V> {
     fn clone(&self) -> Self {
         match self {
             Self::Add => Self::Add,
@@ -648,7 +648,7 @@ impl<V: Traceable<ArrayType>> LinearPrimitiveOp<ArrayType, V> {
 // Arc forwarding impls
 // ---------------------------------------------------------------------------
 
-impl<O: Op<T> + ?Sized, T: Type + Clone> Op<T> for Arc<O> {
+impl<O: Op<T> + ?Sized, T: Type> Op<T> for Arc<O> {
     #[inline]
     fn name(&self) -> &'static str {
         (**self).name()
@@ -670,22 +670,22 @@ impl<O: Op<T> + ?Sized, T: Type + Clone> Op<T> for Arc<O> {
     }
 }
 
-impl<O: InterpretableOp<T, V> + ?Sized, T: Type + Clone, V: Traceable<T>> InterpretableOp<T, V> for Arc<O> {
+impl<O: InterpretableOp<T, V> + ?Sized, T: Type, V: Traceable<T>> InterpretableOp<T, V> for Arc<O> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         (**self).interpret(inputs)
     }
 }
 
-impl<O: LinearOp<T, V> + ?Sized, T: Type + Clone + Display, V: Traceable<T>> LinearOp<T, V> for Arc<O> {
+impl<O: LinearOp<T, V> + ?Sized, T: Type + Display, V: Traceable<T>> LinearOp<T, V> for Arc<O> {
     #[inline]
     fn transpose(&self, output_cotangents: &[LinearTerm<T, V>]) -> Result<Vec<Option<LinearTerm<T, V>>>, TraceError> {
         (**self).transpose(output_cotangents)
     }
 }
 
-impl<O: DifferentiableOp<T, V, Tangent> + ?Sized, T: Type + Clone, V: Traceable<T>, Tangent>
-    DifferentiableOp<T, V, Tangent> for Arc<O>
+impl<O: DifferentiableOp<T, V, Tangent> + ?Sized, T: Type, V: Traceable<T>, Tangent> DifferentiableOp<T, V, Tangent>
+    for Arc<O>
 {
     #[inline]
     fn jvp(
@@ -697,7 +697,7 @@ impl<O: DifferentiableOp<T, V, Tangent> + ?Sized, T: Type + Clone, V: Traceable<
     }
 }
 
-impl<O: VectorizableOp<T, V> + ?Sized, T: Type + Clone, V: Traceable<T>> VectorizableOp<T, V> for Arc<O> {
+impl<O: VectorizableOp<T, V> + ?Sized, T: Type, V: Traceable<T>> VectorizableOp<T, V> for Arc<O> {
     #[inline]
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
         (**self).batch(inputs)
@@ -713,7 +713,7 @@ use crate::tracing_v2::operations::{
     RightMatMulOp, ScaleOp, SinOp, left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
 };
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for PrimitiveOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for PrimitiveOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Add => write!(formatter, "Add"),
@@ -746,7 +746,7 @@ impl<V: Traceable<ArrayType>> Display for PrimitiveOp<ArrayType, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for LinearPrimitiveOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for LinearPrimitiveOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Add => write!(formatter, "Add"),

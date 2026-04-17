@@ -26,7 +26,7 @@ use crate::{
 ///
 /// The default implementation is the primal type itself, but transforms such as `linearize` replace tangents with a
 /// staged linear representation like [`crate::tracing_v2::LinearTerm`].
-pub trait TangentSpace<T: Type + Clone, V: Typed<T>>: Clone + Parameter {
+pub trait TangentSpace<T: Type, V: Typed<T>>: Clone + Parameter {
     /// Adds two tangent values.
     fn add(lhs: Self, rhs: Self) -> Self;
 

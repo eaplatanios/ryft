@@ -29,8 +29,8 @@ pub type LinearProgramBuilder<V> = GraphBuilder<LinearProgramOpRef<V>, ArrayType
 
 /// Canonical staged program used by `tracing_v2`.
 pub struct Program<
-    T: Type + Clone,
-    V: Typed<T> + Clone + Parameter,
+    T: Type,
+    V: Typed<T> + Parameter,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O = ProgramOpRef<V>,
@@ -40,7 +40,7 @@ pub struct Program<
 }
 
 impl<
-    T: Type + Clone,
+    T: Type,
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -52,7 +52,7 @@ impl<
     }
 }
 
-impl<T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
+impl<T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
     Program<T, V, Input, Output, O>
 {
     /// Creates a program from an existing staged graph.
@@ -89,8 +89,8 @@ impl<T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Paramete
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display>
-    Display for Program<T, V, Input, Output, O>
+impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
+    for Program<T, V, Input, Output, O>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.graph, formatter)

@@ -245,7 +245,7 @@ impl Debug for ParameterPath {
 /// [this blog post](https://smallcultfollowing.com/babysteps/blog/2016/11/03/associated-type-constructors-part-2-family-traits/).
 /// This trait is generic over `P` (instead of using a non-generic family trait with `type To<P: Parameter>`) so
 /// that each family can constrain the parameter domain at the `impl` level. For example, a family can implement
-/// `ParameterizedFamily<P>` only for `P: Parameter + Clone`. With a generic associated type `To<P>` on a non-generic
+/// `ParameterizedFamily<P>` only for `P: Clone + Parameter`. With a generic associated type `To<P>` on a non-generic
 /// family trait, the declaration would quantify over all `P: Parameter`, and implementations would not be allowed to
 /// add stricter per-family bounds on `P`.
 pub trait ParameterizedFamily<P: Parameter>: Sized {
@@ -1960,7 +1960,7 @@ impl<
     P: Parameter,
     K: Clone + Debug + Eq + Ord + Hash,
     F: ParameterizedFamily<P> + ParameterizedFamily<Placeholder>,
-    S: BuildHasher + Clone,
+    S: Clone + BuildHasher,
 > ParameterizedFamily<P> for HashMapParameterizedFamily<K, F, S>
 {
     type To = HashMap<K, <F as ParameterizedFamily<P>>::To, S>;
@@ -1970,7 +1970,7 @@ impl<
 // The [`Parameterized`] implementation for [`HashMap`] is quite inefficient. That is because for most operations that
 // require traversal of the [`HashMap`] we end up having to perform a sort of the results that we obtain (by key) to
 // comply with the requirements of the [`Parameterized`].
-impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: BuildHasher + Clone> Parameterized<P>
+impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: Clone + BuildHasher> Parameterized<P>
     for HashMap<K, V, S>
 {
     type Family = HashMapParameterizedFamily<K, V::Family, S>;

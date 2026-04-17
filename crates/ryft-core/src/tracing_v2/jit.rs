@@ -29,7 +29,7 @@ use crate::{
 
 /// Tracer used while staging JIT programs.
 #[derive(Clone, Parameter)]
-pub struct JitTracer<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct JitTracer<T: Type + Display, V: Typed<T> + Parameter> {
     /// Concrete value obtained during eager execution of the staged computation.
     pub value: V,
     atom: AtomId,
@@ -37,13 +37,13 @@ pub struct JitTracer<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter>
     staging_error: Rc<RefCell<Option<TraceError>>>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> std::fmt::Debug for JitTracer<T, V> {
+impl<T: Type + Display, V: Traceable<T>> std::fmt::Debug for JitTracer<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("JitTracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> JitTracer<T, V> {
+impl<T: Type + Display, V: Traceable<T>> JitTracer<T, V> {
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -232,8 +232,8 @@ impl<V: Traceable<ArrayType> + FloatExt> FloatExt for JitTracer<ArrayType, V> {
 /// Later, once a concrete backend exists, it can grow additional fields that hold backend-specific compiled artifacts
 /// while keeping the same high-level API shape.
 pub struct CompiledFunction<
-    T: Type + Clone,
-    V: Typed<T> + Clone + Parameter,
+    T: Type,
+    V: Typed<T> + Parameter,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O = ProgramOpRef<V>,
@@ -243,7 +243,7 @@ pub struct CompiledFunction<
 }
 
 impl<
-    T: Type + Clone,
+    T: Type,
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
@@ -255,7 +255,7 @@ impl<
     }
 }
 
-impl<T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
+impl<T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
     CompiledFunction<T, V, Input, Output, O>
 {
     #[inline]
@@ -292,8 +292,8 @@ impl<T: Type + Clone, V: Traceable<T>, Input: Parameterized<V>, Output: Paramete
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display>
-    Display for CompiledFunction<T, V, Input, Output, O>
+impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
+    for CompiledFunction<T, V, Input, Output, O>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.program, formatter)

@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Erased traced body for a rematerialization boundary.
-pub struct FlatTracedRematerialize<T: Type + Clone, V: Typed<T> + Clone + Parameter, O = ProgramOpRef<V>> {
+pub struct FlatTracedRematerialize<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {
     /// Canonical input types of the body.
     input_types: Vec<T>,
 
@@ -37,7 +37,7 @@ pub struct FlatTracedRematerialize<T: Type + Clone, V: Typed<T> + Clone + Parame
     compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
 }
 
-impl<T: Type + Clone, V: Traceable<T>, O: Clone> Clone for FlatTracedRematerialize<T, V, O>
+impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedRematerialize<T, V, O>
 where
     <Vec<V> as Parameterized<V>>::ParameterStructure: Clone,
 {
@@ -50,7 +50,7 @@ where
     }
 }
 
-impl<T: Type + Clone, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
     /// Builds one erased traced rematerialize body from explicit staged parts.
     #[inline]
     pub fn from_parts(
@@ -85,18 +85,18 @@ impl<T: Type + Clone, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O
 /// During forward execution the body is evaluated normally. When linearized, the body's pushforward
 /// is computed and staged so that the tangent program recomputes forward intermediates from the
 /// inputs rather than storing them as constants.
-pub struct RematerializeOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct RematerializeOp<T: Type + Display, V: Typed<T> + Parameter> {
     /// The forward body sub-program.
     body: FlatTracedRematerialize<T, V, PrimitiveOp<T, V>>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Clone for RematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Clone for RematerializeOp<T, V> {
     fn clone(&self) -> Self {
         Self { body: self.body.clone() }
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> RematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> RematerializeOp<T, V> {
     /// Builds one ordinary (non-linear) rematerialize op wrapping the given body.
     #[inline]
     pub fn new(body: FlatTracedRematerialize<T, V, PrimitiveOp<T, V>>) -> Self {
@@ -110,13 +110,13 @@ impl<T: Type + Clone + Display, V: Traceable<T>> RematerializeOp<T, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for RematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for RematerializeOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Rematerialize")
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Display for RematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Display for RematerializeOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
@@ -244,7 +244,7 @@ where
 }
 
 /// Linear-only rematerialization boundary that always carries both the linear body and its transpose body.
-pub struct LinearRematerializeOp<T: Type + Clone + Display, V: Typed<T> + Clone + Parameter> {
+pub struct LinearRematerializeOp<T: Type + Display, V: Typed<T> + Parameter> {
     /// The forward linear body sub-program.
     body: FlatTracedRematerialize<T, V, LinearPrimitiveOp<T, V>>,
 
@@ -252,13 +252,13 @@ pub struct LinearRematerializeOp<T: Type + Clone + Display, V: Typed<T> + Clone 
     transpose_body: FlatTracedRematerialize<T, V, LinearPrimitiveOp<T, V>>,
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Clone for LinearRematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Clone for LinearRematerializeOp<T, V> {
     fn clone(&self) -> Self {
         Self { body: self.body.clone(), transpose_body: self.transpose_body.clone() }
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> LinearRematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> LinearRematerializeOp<T, V> {
     /// Builds one linear rematerialize op with an explicit transpose body.
     #[inline]
     pub fn new(
@@ -279,13 +279,13 @@ impl<T: Type + Clone + Display, V: Traceable<T>> LinearRematerializeOp<T, V> {
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Debug for LinearRematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Debug for LinearRematerializeOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearRematerialize")
     }
 }
 
-impl<T: Type + Clone + Display, V: Traceable<T>> Display for LinearRematerializeOp<T, V> {
+impl<T: Type + Display, V: Traceable<T>> Display for LinearRematerializeOp<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
