@@ -220,6 +220,155 @@ impl<T: Type + Display, V: Traceable<T>, O> LinearProgramOp<T, V> for O where
 {
 }
 
+/// Default ordinary-op carrier capability: eager replay on concrete values.
+pub(crate) trait CoreProgramReplayOp<V: Traceable<ArrayType>>:
+    Op<ArrayType> + InterpretableOp<ArrayType, V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
+}
+
+impl<V: Traceable<ArrayType>, O> CoreProgramReplayOp<V> for O
+where
+    O: Op<ArrayType> + InterpretableOp<ArrayType, V>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
+}
+
+/// Default ordinary-op carrier capability: eager replay plus JVP staging.
+pub(crate) trait CoreProgramForwardOp<V: Traceable<ArrayType>>:
+    CoreProgramReplayOp<V> + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
+{
+}
+
+impl<V: Traceable<ArrayType>, O> CoreProgramForwardOp<V> for O where
+    O: CoreProgramReplayOp<V> + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>
+{
+}
+
+/// Default ordinary-op carrier capability: replay on linearized JIT values.
+pub(crate) trait CoreProgramLinearizedJitReplayOp<V: Traceable<ArrayType> + ZeroLike>:
+    Op<ArrayType> + InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
+}
+
+impl<V: Traceable<ArrayType> + ZeroLike, O> CoreProgramLinearizedJitReplayOp<V> for O
+where
+    O: Op<ArrayType> + InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V>>>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
+}
+
+/// Default linear-op carrier capability: eager replay on concrete values.
+pub(crate) trait CoreLinearReplayOp<V: Traceable<ArrayType>>:
+    Op<ArrayType> + InterpretableOp<ArrayType, V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
+}
+
+impl<V: Traceable<ArrayType>, O> CoreLinearReplayOp<V> for O
+where
+    O: Op<ArrayType> + InterpretableOp<ArrayType, V>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+{
+}
+
+/// Default linear-op carrier capability: eager replay plus transpose support.
+pub(crate) trait CoreLinearProgramOp<V: Traceable<ArrayType>>:
+    CoreLinearReplayOp<V> + LinearOp<ArrayType, V>
+{
+}
+
+impl<V: Traceable<ArrayType>, O> CoreLinearProgramOp<V> for O where O: CoreLinearReplayOp<V> + LinearOp<ArrayType, V> {}
+
+/// Value capability set required by the closed default ordinary-op carrier.
+pub(crate) trait CoreProgramInterpretValue:
+    Traceable<ArrayType>
+    + Add<Output = Self>
+    + Mul<Output = Self>
+    + Neg<Output = Self>
+    + Sin
+    + Cos
+    + ZeroLike
+    + OneLike
+    + MatrixOps
+    + crate::tracing_v2::operations::reshape::ReshapeOps
+{
+}
+
+impl<V> CoreProgramInterpretValue for V where
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+{
+}
+
+/// Value capability set required for JVP staging through the closed default ordinary-op carrier.
+pub(crate) trait CoreProgramDifferentiableValue:
+    CoreProgramInterpretValue + Parameterized<Self, ParameterStructure: Clone + PartialEq>
+{
+}
+
+impl<V> CoreProgramDifferentiableValue for V where
+    V: CoreProgramInterpretValue + Parameterized<V, ParameterStructure: Clone + PartialEq>
+{
+}
+
+/// Value capability set required to replay the closed default ordinary-op carrier on linearized
+/// JIT values.
+pub(crate) trait CoreProgramLinearizedJitValue:
+    CoreProgramInterpretValue + Parameterized<Self, ParameterStructure: Clone + PartialEq>
+{
+}
+
+impl<V> CoreProgramLinearizedJitValue for V where
+    V: CoreProgramInterpretValue + Parameterized<V, ParameterStructure: Clone + PartialEq>
+{
+}
+
+/// Value capability set required by the closed default linear carrier.
+pub(crate) trait CoreLinearInterpretValue:
+    Traceable<ArrayType>
+    + Add<Output = Self>
+    + Mul<Output = Self>
+    + Neg<Output = Self>
+    + ZeroLike
+    + MatrixOps
+    + crate::tracing_v2::operations::reshape::ReshapeOps
+{
+}
+
+impl<V> CoreLinearInterpretValue for V where
+    V: Traceable<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + ZeroLike
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+{
+}
+
+/// Value capability set required to transpose the closed default linear carrier.
+pub(crate) trait CoreLinearTransposeValue: CoreLinearInterpretValue + OneLike {}
+
+impl<V> CoreLinearTransposeValue for V where V: CoreLinearInterpretValue + OneLike {}
+
+/// Value capability set required to both replay and transpose the closed default linear carrier.
+pub(crate) trait CoreLinearProgramValue: CoreLinearTransposeValue {}
+
+impl<V> CoreLinearProgramValue for V where V: CoreLinearTransposeValue {}
+
 /// Capability bundle for operations that can appear in a staged JIT graph for one specific op set.
 pub trait StagedJitOp<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>>:
     Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, S>> + Send + Sync
@@ -1352,7 +1501,12 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
     }
 }
 
-/// [`InterpretableOp`] for [`PrimitiveOp`] requires the full value capability set.
+/// [`InterpretableOp`] for [`PrimitiveOp`] requires the full union of value capabilities used by
+/// the closed default ordinary-op carrier.
+///
+/// That broad union is local to [`PrimitiveOp`] itself. The higher-level tracing APIs avoid
+/// exposing it as one public value-bundle trait and instead express their requirements through the
+/// specific staged op carrier bounds they actually exercise.
 impl<
     V: Traceable<ArrayType>
         + Add<Output = V>
@@ -1396,10 +1550,7 @@ impl<
         + Add<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
-        + Sin
-        + Cos
         + ZeroLike
-        + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
 > InterpretableOp<ArrayType, V> for LinearPrimitiveOp<ArrayType, V>
@@ -1430,8 +1581,6 @@ impl<
         + Add<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
-        + Sin
-        + Cos
         + ZeroLike
         + OneLike
         + MatrixOps

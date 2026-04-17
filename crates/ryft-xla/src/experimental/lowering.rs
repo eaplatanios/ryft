@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, Op, OpSet, PrimitiveOp, ReshapeOps, Traceable,
+    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, MatrixOps, Op, OpSet, PrimitiveOp, Traceable,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, LinearRematerializeOp, LinearVMapOp,
         MatMulOp, MatrixTransposeOp, MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -141,16 +141,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        V: MlirLowerableValue
-            + std::ops::Add<Output = V>
-            + std::ops::Mul<Output = V>
-            + std::ops::Neg<Output = V>
-            + ryft_core::tracing_v2::Sin
-            + ryft_core::tracing_v2::Cos
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
-            + ryft_core::tracing_v2::MatrixOps
-            + ryft_core::tracing_v2::ReshapeOps,
+        V: MlirLowerableValue,
         S: OpSet<ArrayType, V>,
         S::JitOp: Clone + Op + XlaOp<V>,
     {
@@ -172,16 +163,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        V: MlirLowerableValue
-            + std::ops::Add<Output = V>
-            + std::ops::Mul<Output = V>
-            + std::ops::Neg<Output = V>
-            + ryft_core::tracing_v2::Sin
-            + ryft_core::tracing_v2::Cos
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
-            + ryft_core::tracing_v2::MatrixOps
-            + ryft_core::tracing_v2::ReshapeOps,
+        V: MlirLowerableValue,
         S: OpSet<ArrayType, V>,
         S::JitOp: Clone + Op + XlaOp<V>,
     {
@@ -528,19 +510,7 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for ReshapeOp {
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V>,
-> XlaOp<V> for VMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> XlaOp<V> for VMapOp<ArrayType, V, S>
 where
     S::JitOp: Clone + Op + XlaOp<V>,
 {
@@ -671,19 +641,7 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V>,
-> XlaOp<V> for LinearVMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> XlaOp<V> for LinearVMapOp<ArrayType, V, S>
 where
     S::LinearOp: Clone + Op + XlaOp<V>,
 {
@@ -708,19 +666,7 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V>,
-> XlaOp<V> for LinearRematerializeOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, S>
 where
     S::LinearOp: Clone + Op + XlaOp<V>,
 {
@@ -744,19 +690,7 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ReshapeOps,
-> XlaOp<V> for PrimitiveOp<ArrayType, V>
-{
+impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -829,19 +763,7 @@ impl<
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ReshapeOps,
-> XlaOp<V> for LinearPrimitiveOp<ArrayType, V>
-{
+impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -948,16 +870,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        V: MlirLowerableValue
-            + std::ops::Add<Output = V>
-            + std::ops::Mul<Output = V>
-            + std::ops::Neg<Output = V>
-            + ryft_core::tracing_v2::Sin
-            + ryft_core::tracing_v2::Cos
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
-            + ryft_core::tracing_v2::MatrixOps
-            + ryft_core::tracing_v2::ReshapeOps,
+        V: MlirLowerableValue,
         S: OpSet<ArrayType, V>,
         S::JitOp: Clone + Op + XlaOp<V>,
     {
@@ -979,16 +892,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        V: MlirLowerableValue
-            + std::ops::Add<Output = V>
-            + std::ops::Mul<Output = V>
-            + std::ops::Neg<Output = V>
-            + ryft_core::tracing_v2::Sin
-            + ryft_core::tracing_v2::Cos
-            + ryft_core::tracing_v2::ZeroLike
-            + ryft_core::tracing_v2::OneLike
-            + ryft_core::tracing_v2::MatrixOps
-            + ryft_core::tracing_v2::ReshapeOps,
+        V: MlirLowerableValue,
         S: OpSet<ArrayType, V>,
         S::JitOp: Clone + Op + XlaOp<V>,
     {
@@ -1308,16 +1212,7 @@ pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, O, S>(
     function_name: S,
 ) -> Result<String, LoweringError>
 where
-    V: MlirLowerableValue
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+    V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
@@ -1817,16 +1712,7 @@ fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+    V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
@@ -1932,16 +1818,7 @@ fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+    V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
@@ -2015,16 +1892,7 @@ fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+    V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
 {
     let mut atom_values = vec![None; graph.atom_count()];
@@ -2092,16 +1960,7 @@ fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+    V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
@@ -2559,16 +2418,7 @@ fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+    V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
@@ -2596,16 +2446,7 @@ fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    V: MlirLowerableValue
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + ryft_core::tracing_v2::Sin
-        + ryft_core::tracing_v2::Cos
-        + ryft_core::tracing_v2::ZeroLike
-        + ryft_core::tracing_v2::OneLike
-        + ryft_core::tracing_v2::MatrixOps
-        + ryft_core::tracing_v2::ReshapeOps,
+    V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
 {
     let equation = &graph.equations()[equation_index];

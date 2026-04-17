@@ -12,13 +12,16 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        Cos, MatrixOps, Sin, TraceError, Traceable, ZeroLike,
+        CoreOpSet, TraceError, TraceInput, TraceOutput, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program},
         linear::{LinearProgram, jvp_program, try_jvp_traced_in, try_linearize_traced_program},
-        ops::{InterpretableOp, Op, OpSet, SupportsCoreSyntax},
-        program::Program,
+        ops::{
+            CoreLinearInterpretValue, CoreProgramDifferentiableValue, CoreProgramLinearizedJitValue, InterpretableOp,
+            Op, OpSet, SupportsCoreSyntax,
+        },
+        program::{LinearProgramOpRef, Program, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -117,14 +120,7 @@ pub trait JvpInvocationLeaf<
 >: Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType>
-        + Add<Output = Self::Base>
-        + Mul<Output = Self::Base>
-        + Neg<Output = Self::Base>
-        + Sin
-        + Cos
-        + ZeroLike
-        + MatrixOps;
+    type Base: Traceable<ArrayType>;
 
     /// Input type expected by the user-provided function.
     type FunctionInput;
@@ -176,29 +172,18 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<Array
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`JitTracer`] to build a staged
 /// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + crate::tracing_v2::OneLike
-        + crate::tracing_v2::Value<ArrayType>
-        + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: Value<ArrayType> + CoreProgramDifferentiableValue + CoreLinearInterpretValue,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 > JvpInvocationLeaf<Input, Output> for V
 where
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    V::ParameterStructure: Clone + PartialEq,
+    Input: TraceInput<V, CoreOpSet>,
+    Output: TraceOutput<V, CoreOpSet>,
+    LinearProgramOpRef<V>: InterpretableOp<ArrayType, V>,
 {
     type Base = V;
-    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
-    type FunctionOutput = Output::To<JitTracer<ArrayType, V>>;
+    type FunctionInput = Input::Traced;
+    type FunctionOutput = Output::Traced;
 
     fn invoke<F>(
         engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,
@@ -224,17 +209,7 @@ where
 /// symbolically inside an enclosing [`JitTracer`] scope, staging both the primal output and the
 /// tangent propagation as part of the outer compiled graph.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + crate::tracing_v2::OneLike
-        + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: CoreProgramLinearizedJitValue + CoreLinearInterpretValue,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
     S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
@@ -242,22 +217,11 @@ impl<
 where
     Input::Family: ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<V>,
-    V: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V, S>> = JitTracer<ArrayType, V, S>,
-            ParameterStructure: Clone + PartialEq,
-        >,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V, S>> = Vec<JitTracer<ArrayType, V, S>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Input>,
-    Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Output>,
+    Input::To<V>: TraceInput<V, S, Traced = Input>,
+    Output::To<V>: TraceOutput<V, S, Traced = Output>,
     S::JitOp: Clone + Op<ArrayType>,
     S::JitOp: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
+    LinearProgramOpRef<JitTracer<ArrayType, V, S>>: InterpretableOp<ArrayType, JitTracer<ArrayType, V, S>>,
 {
     type Base = V;
     type FunctionInput = Input;
@@ -284,52 +248,31 @@ where
 /// takes primals and tangents and returns `(primal_output, tangent_output)` per lane is compiled via
 /// [`try_jit`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + crate::tracing_v2::OneLike
-        + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: CoreProgramLinearizedJitValue + CoreLinearInterpretValue,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
 > JvpInvocationLeaf<Input, Output> for Batch<V>
 where
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    V::ParameterStructure: Clone + PartialEq,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    V: Parameterized<V, ParameterStructure = Placeholder, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>>,
+    V: TraceInput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
+    Input::Family: ParameterizedFamily<V>,
+    Output::Family: ParameterizedFamily<V>,
     Input::To<V>: Clone
-        + Parameterized<
-            V,
-            ParameterStructure: Clone + PartialEq,
-            To<Batch<V>> = Input,
-            To<JitTracer<ArrayType, V>> = Input::To<JitTracer<ArrayType, V>>,
-        >,
+        + Parameterized<V, ParameterStructure: Clone + PartialEq, To<Batch<V>> = Input>
+        + TraceInput<V, CoreOpSet>,
     Output::To<V>: Clone
-        + Parameterized<
-            V,
-            ParameterStructure: Clone + PartialEq,
-            To<Batch<V>> = Output,
-            To<JitTracer<ArrayType, V>> = Output::To<JitTracer<ArrayType, V>>,
-        >,
-    <Input::To<V> as Parameterized<V>>::Family:
-        ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
-    <Output::To<V> as Parameterized<V>>::Family:
-        ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
+        + Parameterized<V, ParameterStructure: Clone + PartialEq, To<Batch<V>> = Output>
+        + TraceOutput<V, CoreOpSet>,
+    Vec<V>: TraceInput<V, CoreOpSet, Traced = Vec<JitTracer<ArrayType, V>>>,
+    Vec<V>: TraceOutput<V, CoreOpSet, Traced = Vec<JitTracer<ArrayType, V>>>,
+    ProgramOpRef<V>: Op<ArrayType>,
+    LinearProgramOpRef<JitTracer<ArrayType, V>>: InterpretableOp<ArrayType, JitTracer<ArrayType, V>>,
 {
     type Base = V;
-    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
-    type FunctionOutput = Output::To<JitTracer<ArrayType, V>>;
+    type FunctionInput = <Input::To<V> as TraceInput<V, CoreOpSet>>::Traced;
+    type FunctionOutput = <Output::To<V> as TraceOutput<V, CoreOpSet>>::Traced;
 
     fn invoke<F>(
         _engine: &dyn Engine<Type = ArrayType, Value = Self::Base>,

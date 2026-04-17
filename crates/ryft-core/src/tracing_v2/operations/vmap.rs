@@ -5,17 +5,16 @@ use std::fmt::{Debug, Display};
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        CompiledFunction, Cos, JitTracer, LinearTerm, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike,
+        CompiledFunction, JitTracer, LinearTerm, TraceError, Traceable, ZeroLike,
         engine::Engine,
         linear::{
             linearize_program_in, replay_program_graph_linearized_jit_in, transpose_linear_program_with_output_examples,
         },
-        operations::reshape::ReshapeOps,
         ops::{
-            CoreOpSet, DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet, SupportsCoreSyntax,
-            SupportsVMap,
+            CoreLinearProgramOp, CoreOpSet, DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet,
+            SupportsCoreSyntax, SupportsVMap,
         },
-        program::ProgramOpRef,
+        program::{LinearProgramOpRef, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -101,15 +100,6 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
     pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
     where
         O: InterpretableOp<T, V>,
-        V: std::ops::Add<Output = V>
-            + std::ops::Mul<Output = V>
-            + std::ops::Neg<Output = V>
-            + Sin
-            + Cos
-            + ZeroLike
-            + OneLike
-            + MatrixOps
-            + ReshapeOps,
         Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     {
         if inputs.len() != self.total_input_count() {
@@ -179,19 +169,7 @@ impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for VMapOp<ArrayType, V
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V>,
-> InterpretableOp<ArrayType, V> for VMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> InterpretableOp<ArrayType, V> for VMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, V>,
@@ -203,23 +181,10 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Parameterized<V>
-        + MatrixOps
-        + ReshapeOps
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
+impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
     for VMapOp<ArrayType, V, S>
 where
-    V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     S::JitOp: Op<ArrayType>,
     S::JitOp: InterpretableOp<ArrayType, V>,
@@ -253,26 +218,14 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Parameterized<V>
-        + MatrixOps
-        + ReshapeOps
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
-> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for VMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for VMapOp<ArrayType, V, S>
 where
-    V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     S::JitOp: InterpretableOp<ArrayType, V>,
     S::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
     S::JitOp: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     fn jvp(
         &self,
@@ -297,19 +250,8 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>,
-> InterpretableOp<ArrayType, JitTracer<ArrayType, V, S>> for VMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>>
+    InterpretableOp<ArrayType, JitTracer<ArrayType, V, S>> for VMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     S::JitOp: Op<ArrayType>,
@@ -384,19 +326,7 @@ impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for LinearVMapOp<ArrayT
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V>,
-> InterpretableOp<ArrayType, V> for LinearVMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> InterpretableOp<ArrayType, V> for LinearVMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     <S as OpSet<ArrayType, V>>::LinearOp: InterpretableOp<ArrayType, V>,
@@ -408,21 +338,7 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-> LinearOp<ArrayType, V> for LinearVMapOp<ArrayType, V>
-where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-{
+impl<V: Traceable<ArrayType>> LinearOp<ArrayType, V> for LinearVMapOp<ArrayType, V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -446,54 +362,39 @@ where
 }
 
 /// Builds one linearized staged `vmap` op from its primal body at the provided primal inputs.
+#[allow(private_bounds)]
 pub fn make_linear_vmap<V>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     body: &FlatTracedVMap<ArrayType, V>,
     input_primals: Vec<V>,
 ) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Parameterized<V>
-        + MatrixOps
-        + ReshapeOps
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    ProgramOpRef<V>: InterpretableOp<ArrayType, V>,
+    ProgramOpRef<V>: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
+    ProgramOpRef<V>: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     make_linear_vmap_in::<_, CoreOpSet>(engine, body, input_primals)
 }
 
 /// Builds one linearized staged `vmap` op from its primal body for one explicit ordinary op set.
+#[allow(private_bounds)]
 pub fn make_linear_vmap_in<V, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     body: &FlatTracedVMap<ArrayType, V, <S as OpSet<ArrayType, V>>::JitOp>,
     input_primals: Vec<V>,
 ) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Parameterized<V>
-        + MatrixOps
-        + ReshapeOps
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     <S as OpSet<ArrayType, V>>::JitOp: Op<ArrayType>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, V>,
     <S as OpSet<ArrayType, V>>::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
     <S as OpSet<ArrayType, V>>::JitOp:
         InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     let output_primals = body.compiled.call(input_primals.clone())?;
     let pushforward = linearize_program_in::<_, _, _, S>(engine, body.compiled.program(), input_primals)?;

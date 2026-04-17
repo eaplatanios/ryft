@@ -7,7 +7,6 @@ use std::{
     cell::RefCell,
     fmt::{Debug, Display},
     marker::PhantomData,
-    ops::{Add, Mul, Neg},
     rc::Rc,
 };
 
@@ -16,17 +15,19 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        Cos, MatrixOps, OneLike, Sin, TraceError, Traceable, Value, ZeroLike,
+        OneLike, TraceError, TraceInput, TraceOutput, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         graph::{Atom, AtomId, Equation, Graph, GraphBuilder},
         jit::{CompiledFunction, JitTracer, try_jit, try_trace_program, try_trace_program_in},
         operations::rematerialize::{FlatTracedRematerialize, RematerializeOp},
-        operations::reshape::ReshapeOps,
         ops::{
-            CoreOpSet, DifferentiableOp, InterpretableOp, LinearOp, LinearOpFor, LinearPrimitiveOp, Op, OpSet,
-            PrimitiveOp, SupportsCoreSyntax, SupportsLinearAdd, SupportsLinearNeg, SupportsLinearScale,
+            CoreLinearInterpretValue, CoreLinearProgramOp, CoreLinearProgramValue, CoreLinearReplayOp,
+            CoreLinearTransposeValue, CoreOpSet, CoreProgramDifferentiableValue, CoreProgramForwardOp,
+            CoreProgramInterpretValue, CoreProgramLinearizedJitReplayOp, CoreProgramLinearizedJitValue,
+            DifferentiableOp, InterpretableOp, LinearOp, LinearOpFor, LinearPrimitiveOp, Op, OpSet, PrimitiveOp,
+            SupportsCoreSyntax, SupportsLinearAdd, SupportsLinearNeg, SupportsLinearScale,
         },
         program::{LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder, ProgramOpRef},
     },
@@ -246,19 +247,11 @@ impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>>
     LinearProgram<ArrayType, V, Input, Output>
 {
     /// Transposes the linear program, turning a pushforward into a pullback.
+    #[allow(private_bounds)]
     pub fn transpose(&self) -> Result<LinearProgram<ArrayType, V, Output, Input>, TraceError>
     where
-        V: Parameterized<V, To<ArrayType> = ArrayType, ParameterStructure = Placeholder>
-            + Add<Output = V>
-            + Mul<Output = V>
-            + Neg<Output = V>
-            + Sin
-            + Cos
-            + ZeroLike
-            + OneLike
-            + MatrixOps
-            + ReshapeOps,
-        V::Family: ParameterizedFamily<ArrayType>,
+        V: ZeroLike,
+        LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
@@ -294,18 +287,8 @@ fn transpose<V>(
     output_cotangents: &[AtomId],
 ) -> Result<Vec<Option<AtomId>>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     let cotangent_terms = output_cotangents
         .iter()
@@ -318,29 +301,17 @@ where
         .collect())
 }
 
+#[allow(private_bounds)]
 pub fn linearize_program<V, Input, Output>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     program: &Program<ArrayType, V, Input, Output>,
     input_primals: Vec<V>,
 ) -> Result<LinearProgram<ArrayType, V, Input, Output>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+    ProgramOpRef<V>: CoreProgramForwardOp<V>,
 {
     linearize_program_in::<Input, Output, V, CoreOpSet>(engine, program, input_primals)
 }
@@ -351,18 +322,7 @@ pub fn linearize_program_in<Input, Output, V, S>(
     input_primals: Vec<V>,
 ) -> Result<LinearProgram<ArrayType, V, Input, Output>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     S: OpSet<ArrayType, V>,
@@ -470,24 +430,15 @@ where
     })
 }
 
+#[allow(private_bounds)]
 pub fn transpose_linear_program<V, Input, Output>(
     program: &LinearProgram<ArrayType, V, Input, Output>,
 ) -> Result<LinearProgram<ArrayType, V, Output, Input>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, To<ArrayType> = ArrayType, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::Family: ParameterizedFamily<ArrayType>,
+    V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     let zero = program.zero.zero_like();
     transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V>, _, _| {
@@ -500,21 +451,11 @@ fn transpose_linear_program_with_output_inputs<V, Input, Output, F>(
     mut make_output_cotangent_input: F,
 ) -> Result<LinearProgram<ArrayType, V, Output, Input>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     F: FnMut(&mut LinearProgramBuilder<V>, &ArrayType, usize) -> Result<AtomId, TraceError>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     fn accumulate<V>(
         builder: &Rc<RefCell<LinearProgramBuilder<V>>>,
@@ -600,25 +541,16 @@ where
 ///
 /// This variant is useful when the linear program's leaf type cannot be synthesized from bare
 /// [`ArrayType`] metadata alone, but the caller still has representative output values available.
+#[allow(private_bounds)]
 pub fn transpose_linear_program_with_output_examples<V, Input, Output>(
     program: &LinearProgram<ArrayType, V, Input, Output>,
     output_examples: &[V],
 ) -> Result<LinearProgram<ArrayType, V, Output, Input>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     let expected_output_count = program.program().graph().outputs().len();
     if output_examples.len() != expected_output_count {
@@ -646,7 +578,7 @@ fn lift_linearized_traced_constant<V, S: OpSet<ArrayType, V>>(
     inputs: &[Linearized<JitTracer<ArrayType, V, S>>],
 ) -> Result<Linearized<JitTracer<ArrayType, V, S>>, TraceError>
 where
-    V: Traceable<ArrayType> + ZeroLike + OneLike + MatrixOps + ReshapeOps,
+    V: Traceable<ArrayType> + ZeroLike,
 {
     let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
     let primal = lift_traced_constant(constant, std::slice::from_ref(&exemplar.primal))?;
@@ -718,6 +650,7 @@ where
         .collect()
 }
 
+#[allow(private_bounds)]
 pub fn replay_program_graph_linearized_jit<GraphInput, GraphOutput, V>(
     graph: &Graph<ProgramOpRef<V>, ArrayType, V, GraphInput, GraphOutput>,
     inputs: Vec<Linearized<JitTracer<ArrayType, V>>>,
@@ -725,18 +658,8 @@ pub fn replay_program_graph_linearized_jit<GraphInput, GraphOutput, V>(
 where
     GraphInput: Parameterized<V>,
     GraphOutput: Parameterized<V>,
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
+    ProgramOpRef<V>: CoreProgramLinearizedJitReplayOp<V>,
 {
     replay_program_graph_linearized_jit_in::<_, _, _, CoreOpSet>(graph, inputs)
 }
@@ -748,18 +671,7 @@ pub fn replay_program_graph_linearized_jit_in<GraphInput, GraphOutput, V, S>(
 where
     GraphInput: Parameterized<V>,
     GraphOutput: Parameterized<V>,
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     S: OpSet<ArrayType, V>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>> + Clone,
 {
@@ -779,17 +691,8 @@ pub(crate) fn try_linearize_traced_program<V>(
     TraceError,
 >
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
+    V: Traceable<ArrayType> + ZeroLike,
+    ProgramOpRef<V>: CoreProgramLinearizedJitReplayOp<V>,
 {
     try_linearize_traced_program_in::<V, CoreOpSet>(program, primals)
 }
@@ -810,17 +713,7 @@ pub(crate) fn try_linearize_traced_program_in<V, S>(
     TraceError,
 >
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
+    V: Traceable<ArrayType> + ZeroLike,
     S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>> + Clone,
 {
@@ -854,29 +747,17 @@ where
     Ok((primal_outputs.clone(), LinearProgram::from_program(program, zero)))
 }
 
+#[allow(private_bounds)]
 pub fn try_jvp_program<F, Input, Output, V>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
+    V: CoreProgramDifferentiableValue,
+    Input: TraceInput<V, CoreOpSet>,
+    Output: TraceOutput<V, CoreOpSet>,
+    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
@@ -887,35 +768,21 @@ where
 
 /// Runs JVP for already traced inputs by staging the inner function once over base values and
 /// replaying the resulting pushforward in the surrounding trace.
+#[allow(private_bounds)]
 pub fn try_jvp_traced<F, Input, Output, V>(
     function: F,
     primals: Input,
     tangents: Input,
 ) -> Result<(Output, Output), TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
+    V: CoreProgramLinearizedJitValue,
     Input: Parameterized<JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V>,
     Output: Parameterized<JitTracer<ArrayType, V>, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<V>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Input>,
-    Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V>> = Output>,
+    Input::To<V>: TraceInput<V, CoreOpSet, Traced = Input>,
+    Output::To<V>: TraceOutput<V, CoreOpSet, Traced = Output>,
+    JitTracer<ArrayType, V>: CoreLinearInterpretValue,
     F: FnOnce(Input) -> Result<Output, TraceError>,
 {
     try_jvp_traced_in::<_, _, _, V, CoreOpSet>(function, primals, tangents)
@@ -923,38 +790,24 @@ where
 
 /// Runs JVP for already traced inputs by staging the inner function once over base values and
 /// replaying the resulting pushforward in the surrounding trace for one explicit ordinary op set.
+#[allow(private_bounds)]
 pub fn try_jvp_traced_in<F, Input, Output, V, S>(
     function: F,
     primals: Input,
     tangents: Input,
 ) -> Result<(Output, Output), TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
+    V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<JitTracer<ArrayType, V, S>, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V>,
     Output: Parameterized<JitTracer<ArrayType, V, S>, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<V>,
     S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V, S>> = Vec<JitTracer<ArrayType, V, S>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Input>,
-    Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Output>,
+    Input::Family: ParameterizedFamily<V>,
+    Output::Family: ParameterizedFamily<V>,
+    Input::To<V>: TraceInput<V, S, Traced = Input>,
+    Output::To<V>: TraceOutput<V, S, Traced = Output>,
     <S as OpSet<ArrayType, V>>::JitOp: Clone + Op<ArrayType>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>>,
+    LinearProgramOpRef<JitTracer<ArrayType, V, S>>: CoreLinearReplayOp<JitTracer<ArrayType, V, S>>,
     F: FnOnce(Input) -> Result<Output, TraceError>,
 {
     if primals.parameter_structure() != tangents.parameter_structure() {
@@ -1001,23 +854,11 @@ pub fn jvp_program<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
+    V: Traceable<ArrayType> + ZeroLike,
+    V: CoreProgramDifferentiableValue,
+    Input: TraceInput<V, CoreOpSet>,
+    Output: TraceOutput<V, CoreOpSet>,
+    F: FnOnce(Input::Traced) -> Output::Traced,
 {
     try_jvp_program(engine, |input| Ok(function(input)), primals)
 }
@@ -1030,50 +871,25 @@ pub fn linearize<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output>), TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
+    V: CoreProgramDifferentiableValue,
+    Input: TraceInput<V, CoreOpSet>,
+    Output: TraceOutput<V, CoreOpSet>,
+    F: FnOnce(Input::Traced) -> Output::Traced,
 {
     jvp_program(engine, function, primals)
 }
 
+#[allow(private_bounds)]
 pub fn try_vjp<F, Input, Output, V>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input>), TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
+    V: CoreProgramDifferentiableValue + CoreLinearTransposeValue,
+    Input: TraceInput<V, CoreOpSet>,
+    Output: TraceOutput<V, CoreOpSet>,
+    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
 {
     let (output, pushforward) = try_jvp_program::<F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
@@ -1089,23 +905,10 @@ pub fn vjp<F, Input, Output, V>(
     primals: Input,
 ) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input>), TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
+    V: CoreProgramDifferentiableValue + CoreLinearTransposeValue,
+    Input: TraceInput<V, CoreOpSet>,
+    Output: TraceOutput<V, CoreOpSet>,
+    F: FnOnce(Input::Traced) -> Output::Traced,
 {
     try_vjp(engine, |input| Ok(function(input)), primals)
 }
@@ -1116,22 +919,10 @@ fn try_grad<F, Input, V>(
     primals: Input,
 ) -> Result<Input, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<JitTracer<ArrayType, V>, TraceError>,
+    V: Value<ArrayType> + CoreProgramDifferentiableValue + CoreLinearProgramValue,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    Input: TraceInput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(Input::Traced) -> Result<JitTracer<ArrayType, V>, TraceError>,
 {
     let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input>) = try_vjp(engine, function, primals)?;
     pullback.call(output.one_like())
@@ -1143,16 +934,7 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
     Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType>
-        + Add<Output = Self::Base>
-        + Mul<Output = Self::Base>
-        + Neg<Output = Self::Base>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps;
+    type Base: Traceable<ArrayType>;
 
     /// Return type produced by [`grad`] for the corresponding input regime.
     type Return;
@@ -1176,28 +958,16 @@ pub trait GradInvocationLeaf<Input: Parameterized<Self, ParameterStructure: Clon
 /// Concrete-value dispatch for [`grad`]: traces the user function with [`JitTracer`] to build a staged
 /// reverse-mode gradient and evaluates it at the supplied primals.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Value<ArrayType>
-        + MatrixOps
-        + ReshapeOps,
+    V: Value<ArrayType> + CoreProgramDifferentiableValue + CoreLinearProgramValue,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > GradInvocationLeaf<Input> for V
 where
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    Input: TraceInput<V, CoreOpSet>,
 {
     type Base = V;
     type Return = Input;
-    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
+    type FunctionInput = Input::Traced;
     type FunctionOutput = JitTracer<ArrayType, V>;
 
     fn invoke<F>(
@@ -1216,37 +986,18 @@ where
 /// [`JitTracer`] scope, linearizes the resulting [`Program`], transposes the pushforward into a pullback,
 /// and stages the full backward pass so it becomes part of the outer compiled graph.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
+    V: CoreProgramLinearizedJitValue,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
 > GradInvocationLeaf<Input> for JitTracer<ArrayType, V, S>
 where
+    V: Parameterized<V, ParameterStructure = Placeholder>,
+    V: TraceOutput<V, S, Traced = JitTracer<ArrayType, V, S>>,
     Input::Family: ParameterizedFamily<V>,
-    V: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V, S>> = JitTracer<ArrayType, V, S>,
-            ParameterStructure: Clone + PartialEq,
-        >,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V, S>> = Vec<JitTracer<ArrayType, V, S>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Input>,
+    Input::To<V>: TraceInput<V, S, Traced = Input>,
     S::JitOp: Clone + Op<ArrayType>,
     S::JitOp: InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>>,
+    JitTracer<ArrayType, V, S>: CoreLinearProgramValue,
 {
     type Base = V;
     type Return = Input;
@@ -1287,7 +1038,10 @@ where
         if outputs.len() != 1 {
             return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
         }
-        let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+        let pullback = transpose_linear_program_with_output_examples::<JitTracer<ArrayType, V, S>, _, _>(
+            &pushforward,
+            outputs.as_slice(),
+        )?;
         let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
         Ok(Input::from_parameters(input_structure, traced_gradient)?)
     }
@@ -1300,43 +1054,26 @@ where
 /// traces the function once at the first lane's primals to obtain a [`Program`], then compiles a reusable
 /// [`CompiledFunction`] via [`try_jit`] that embeds the full forward and backward passes symbolically.
 /// The compiled gradient function is called independently for each lane.
-impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
-> GradInvocationLeaf<Input> for Batch<V>
+impl<V: CoreProgramLinearizedJitValue, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>>
+    GradInvocationLeaf<Input> for Batch<V>
 where
-    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
+    V: Parameterized<V, ParameterStructure = Placeholder, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>>,
+    V: TraceInput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
+    Input::Family: ParameterizedFamily<V>,
     Input::To<V>: Clone
-        + Parameterized<
-            V,
-            ParameterStructure: Clone + PartialEq,
-            To<Batch<V>> = Input,
-            To<JitTracer<ArrayType, V>> = Input::To<JitTracer<ArrayType, V>>,
-        >,
-    <Input::To<V> as Parameterized<V>>::Family:
-        ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+        + Parameterized<V, ParameterStructure: Clone + PartialEq, To<Batch<V>> = Input>
+        + TraceInput<V, CoreOpSet>,
+    Vec<V>: TraceInput<V, CoreOpSet, Traced = Vec<JitTracer<ArrayType, V>>>,
+    Vec<V>: TraceOutput<V, CoreOpSet, Traced = Vec<JitTracer<ArrayType, V>>>,
+    ProgramOpRef<V>: Op<ArrayType>,
+    JitTracer<ArrayType, V>: CoreLinearProgramValue,
 {
     type Base = V;
     type Return = Input;
-    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
+    type FunctionInput = <Input::To<V> as TraceInput<V, CoreOpSet>>::Traced;
     type FunctionOutput = JitTracer<ArrayType, V>;
 
     fn invoke<F>(
@@ -1377,7 +1114,10 @@ where
                 if outputs.len() != 1 {
                     return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
                 }
-                let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+                let pullback = transpose_linear_program_with_output_examples::<JitTracer<ArrayType, V>, _, _>(
+                    &pushforward,
+                    outputs.as_slice(),
+                )?;
                 pullback.call(vec![outputs[0].one_like()])
             },
             lane0_flat,
@@ -1420,16 +1160,7 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
     Parameter + Sized
 {
     /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType>
-        + Add<Output = Self::Base>
-        + Mul<Output = Self::Base>
-        + Neg<Output = Self::Base>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps;
+    type Base: Traceable<ArrayType>;
 
     /// Return type produced by [`value_and_grad`] for the corresponding input regime.
     type Return;
@@ -1453,28 +1184,16 @@ pub trait ValueAndGradInvocationLeaf<Input: Parameterized<Self, ParameterStructu
 /// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`] and
 /// pulls back a unit seed to obtain both the primal scalar output and its gradient.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Value<ArrayType>
-        + MatrixOps
-        + ReshapeOps,
+    V: Value<ArrayType> + CoreProgramDifferentiableValue + CoreLinearProgramValue,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 > ValueAndGradInvocationLeaf<Input> for V
 where
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    Input: TraceInput<V, CoreOpSet>,
 {
     type Base = V;
     type Return = (V, Input);
-    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
+    type FunctionInput = Input::Traced;
     type FunctionOutput = JitTracer<ArrayType, V>;
 
     fn invoke<F>(
@@ -1495,37 +1214,18 @@ where
 /// enclosing [`JitTracer`] scope, linearizes, transposes, and stages both the forward output and the
 /// backward gradient so they become part of the outer compiled graph.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
+    V: CoreProgramLinearizedJitValue,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
 > ValueAndGradInvocationLeaf<Input> for JitTracer<ArrayType, V, S>
 where
+    V: Parameterized<V, ParameterStructure = Placeholder>,
+    V: TraceOutput<V, S, Traced = JitTracer<ArrayType, V, S>>,
     Input::Family: ParameterizedFamily<V>,
-    V: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V, S>> = JitTracer<ArrayType, V, S>,
-            ParameterStructure: Clone + PartialEq,
-        >,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V, S>> = Vec<JitTracer<ArrayType, V, S>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Input>,
+    Input::To<V>: TraceInput<V, S, Traced = Input>,
     S::JitOp: Clone + Op<ArrayType>,
     S::JitOp: InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, V, S>>>,
+    JitTracer<ArrayType, V, S>: CoreLinearProgramValue,
 {
     type Base = V;
     type Return = (JitTracer<ArrayType, V, S>, Input);
@@ -1567,7 +1267,10 @@ where
             return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
         }
         let traced_output = outputs[0].clone();
-        let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+        let pullback = transpose_linear_program_with_output_examples::<JitTracer<ArrayType, V, S>, _, _>(
+            &pushforward,
+            outputs.as_slice(),
+        )?;
         let traced_gradient = pullback.call(vec![traced_output.one_like()])?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
     }
@@ -1580,43 +1283,26 @@ where
 /// Uses the same trace-once strategy as [`GradInvocationLeaf`] for [`Batch`]: the user function is
 /// traced once to a [`Program`], and a [`CompiledFunction`] that produces `(V, Input::To<V>)` per lane
 /// is compiled via [`try_jit`]. Values and gradients are collected per lane and stacked separately.
-impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
-> ValueAndGradInvocationLeaf<Input> for Batch<V>
+impl<V: CoreProgramLinearizedJitValue, Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>>
+    ValueAndGradInvocationLeaf<Input> for Batch<V>
 where
-    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
+    V: Parameterized<V, ParameterStructure = Placeholder, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>>,
+    V: TraceInput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
+    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
+    Input::Family: ParameterizedFamily<V>,
     Input::To<V>: Clone
-        + Parameterized<
-            V,
-            ParameterStructure: Clone + PartialEq,
-            To<Batch<V>> = Input,
-            To<JitTracer<ArrayType, V>> = Input::To<JitTracer<ArrayType, V>>,
-        >,
-    <Input::To<V> as Parameterized<V>>::Family:
-        ParameterizedFamily<JitTracer<ArrayType, V>> + ParameterizedFamily<Batch<V>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
+        + Parameterized<V, ParameterStructure: Clone + PartialEq, To<Batch<V>> = Input>
+        + TraceInput<V, CoreOpSet>,
+    Vec<V>: TraceInput<V, CoreOpSet, Traced = Vec<JitTracer<ArrayType, V>>>,
+    Vec<V>: TraceOutput<V, CoreOpSet, Traced = Vec<JitTracer<ArrayType, V>>>,
+    ProgramOpRef<V>: Op<ArrayType>,
+    JitTracer<ArrayType, V>: CoreLinearProgramValue,
 {
     type Base = V;
     type Return = (Batch<V>, Input);
-    type FunctionInput = Input::To<JitTracer<ArrayType, V>>;
+    type FunctionInput = <Input::To<V> as TraceInput<V, CoreOpSet>>::Traced;
     type FunctionOutput = JitTracer<ArrayType, V>;
 
     fn invoke<F>(
@@ -1655,7 +1341,10 @@ where
                 if outputs.len() != 1 {
                     return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
                 }
-                let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+                let pullback = transpose_linear_program_with_output_examples::<JitTracer<ArrayType, V>, _, _>(
+                    &pushforward,
+                    outputs.as_slice(),
+                )?;
                 let gradient = pullback.call(vec![outputs[0].one_like()])?;
                 let mut result = Vec::with_capacity(1 + gradient.len());
                 result.push(outputs[0].clone());
@@ -1931,21 +1620,10 @@ fn try_jacfwd<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
+    V: CoordinateValue + CoreProgramDifferentiableValue + CoreLinearInterpretValue,
+    Input: TraceInput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Output: TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -1979,21 +1657,10 @@ pub fn jacfwd<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
+    V: CoordinateValue + CoreProgramDifferentiableValue + CoreLinearInterpretValue,
+    Input: TraceInput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Output: TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(Input::Traced) -> Output::Traced,
 {
     try_jacfwd::<_, Input, Output, V>(engine, |input| Ok(function(input)), primals)
 }
@@ -2004,21 +1671,10 @@ fn try_jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Result<Output::To<JitTracer<ArrayType, V>>, TraceError>,
+    V: CoordinateValue + CoreProgramDifferentiableValue + CoreLinearProgramValue,
+    Input: TraceInput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Output: TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -2046,21 +1702,10 @@ pub fn jacrev<F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Output::To<JitTracer<ArrayType, V>>,
+    V: CoordinateValue + CoreProgramDifferentiableValue + CoreLinearProgramValue,
+    Input: TraceInput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Output: TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(Input::Traced) -> Output::Traced,
 {
     try_jacrev::<_, Input, Output, V>(engine, |input| Ok(function(input)), primals)
 }
@@ -2076,19 +1721,10 @@ pub fn hessian<F, Input, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
 where
-    V: CoordinateValue
-        + Parameterized<V>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + MatrixOps
-        + ReshapeOps,
-    V::ParameterStructure: Clone + PartialEq,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: FnOnce(Input::To<JitTracer<ArrayType, V>>) -> Input::To<JitTracer<ArrayType, V>>,
+    V: CoordinateValue + CoreProgramDifferentiableValue + CoreLinearInterpretValue,
+    Input:
+        TraceInput<V, CoreOpSet> + TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(<Input as TraceInput<V, CoreOpSet>>::Traced) -> <Input as TraceOutput<V, CoreOpSet>>::Traced,
 {
     jacfwd::<F, Input, Input, V>(engine, gradient_function, primals)
 }
@@ -2105,37 +1741,27 @@ where
 /// arbitrary primal points without re-tracing.
 ///
 /// This is analogous to JAX's `jit(grad(f))`.
+#[allow(private_bounds)]
 pub fn compile_grad<F, Input, V>(
     function: F,
     example_primals: Input,
 ) -> Result<CompiledFunction<ArrayType, V, Input, Input>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: Fn(Input::To<JitTracer<ArrayType, V>>) -> JitTracer<ArrayType, V>,
+    V: Value<ArrayType> + CoreProgramLinearizedJitValue,
+    ProgramOpRef<V>: Op<ArrayType>,
+    JitTracer<ArrayType, V>: CoreLinearProgramValue,
+    V: Parameterized<V, ParameterStructure = Placeholder>,
+    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
+    V: TraceInput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    Input:
+        TraceInput<V, CoreOpSet> + TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input::To<V>: TraceInput<V, CoreOpSet>,
+    F: Fn(<Input as TraceInput<V, CoreOpSet>>::Traced) -> JitTracer<ArrayType, V>,
 {
     let input_structure = example_primals.parameter_structure();
     let (_, compiled) = try_jit(
-        |primals: Input::To<JitTracer<ArrayType, V>>| {
+        |primals: <Input as TraceInput<V, CoreOpSet>>::Traced| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
             let staged_primals = Input::To::<V>::from_parameters(
                 input_structure.clone(),
@@ -2143,7 +1769,7 @@ where
             )?;
             let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V>) = try_trace_program(
                 |staged_input| {
-                    let adapted_input = Input::To::<JitTracer<ArrayType, V>>::from_parameters(
+                    let adapted_input = <Input as TraceInput<V, CoreOpSet>>::Traced::from_parameters(
                         input_structure.clone(),
                         staged_input.into_parameters().collect::<Vec<_>>(),
                     )?;
@@ -2160,9 +1786,12 @@ where
             if outputs.len() != 1 {
                 return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
             }
-            let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+            let pullback = transpose_linear_program_with_output_examples::<JitTracer<ArrayType, V>, _, _>(
+                &pushforward,
+                outputs.as_slice(),
+            )?;
             let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
-            Ok(Input::To::<JitTracer<ArrayType, V>>::from_parameters(input_structure.clone(), traced_gradient)?)
+            Ok(<Input as TraceOutput<V, CoreOpSet>>::Traced::from_parameters(input_structure.clone(), traced_gradient)?)
         },
         example_primals,
     )?;
@@ -2207,6 +1836,7 @@ pub enum RematerializationPolicy {
 ///   - [`RematerializationPolicy::Checkpoint`]: the forward body is partitioned into segments of at most
 ///     `segment_size` equations, each wrapped in its own [`rematerialize`] boundary. Intermediates at segment
 ///     boundaries are saved while within-segment intermediates are recomputed.
+#[allow(private_bounds)]
 pub fn compile_grad_with_policy<F, Input, V>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     function: F,
@@ -2214,28 +1844,17 @@ pub fn compile_grad_with_policy<F, Input, V>(
     policy: RematerializationPolicy,
 ) -> Result<CompiledFunction<ArrayType, V, Input, Input>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: Fn(Input::To<JitTracer<ArrayType, V>>) -> JitTracer<ArrayType, V>,
+    V: Value<ArrayType> + CoreProgramLinearizedJitValue,
+    ProgramOpRef<V>: Op<ArrayType>,
+    JitTracer<ArrayType, V>: CoreLinearProgramValue,
+    V: Parameterized<V, ParameterStructure = Placeholder>,
+    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
+    V: TraceInput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    Input:
+        TraceInput<V, CoreOpSet> + TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input::To<V>: TraceInput<V, CoreOpSet>,
+    F: Fn(<Input as TraceInput<V, CoreOpSet>>::Traced) -> JitTracer<ArrayType, V>,
 {
     match policy {
         RematerializationPolicy::SaveAll => compile_grad(&function, example_primals),
@@ -2265,32 +1884,21 @@ fn compile_grad_segmented<F, Input, V>(
     segment_size: Option<usize>,
 ) -> Result<CompiledFunction<ArrayType, V, Input, Input>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V>>,
-    V: Parameterized<V, To<JitTracer<ArrayType, V>> = JitTracer<ArrayType, V>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    Vec<V>: Parameterized<
-            V,
-            To<JitTracer<ArrayType, V>> = Vec<JitTracer<ArrayType, V>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V>>,
-    F: Fn(Input::To<JitTracer<ArrayType, V>>) -> JitTracer<ArrayType, V>,
+    V: Value<ArrayType> + CoreProgramLinearizedJitValue,
+    ProgramOpRef<V>: Op<ArrayType>,
+    JitTracer<ArrayType, V>: CoreLinearProgramValue,
+    V: Parameterized<V, ParameterStructure = Placeholder>,
+    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
+    V: TraceInput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    V: TraceOutput<V, CoreOpSet, Traced = JitTracer<ArrayType, V>>,
+    Input:
+        TraceInput<V, CoreOpSet> + TraceOutput<V, CoreOpSet> + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input::To<V>: TraceInput<V, CoreOpSet>,
+    F: Fn(<Input as TraceInput<V, CoreOpSet>>::Traced) -> JitTracer<ArrayType, V>,
 {
     let input_structure = example_primals.parameter_structure();
     let (_, compiled) = try_jit(
-        |primals: Input::To<JitTracer<ArrayType, V>>| {
+        |primals: <Input as TraceInput<V, CoreOpSet>>::Traced| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
 
             // Step 1: Trace the function at the base V level to get a program.
@@ -2300,7 +1908,7 @@ where
             )?;
             let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V>) = try_trace_program(
                 |staged_input| {
-                    let adapted_input = Input::To::<JitTracer<ArrayType, V>>::from_parameters(
+                    let adapted_input = <Input as TraceInput<V, CoreOpSet>>::Traced::from_parameters(
                         input_structure.clone(),
                         staged_input.into_parameters().collect::<Vec<_>>(),
                     )?;
@@ -2328,9 +1936,12 @@ where
             if outputs.len() != 1 {
                 return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
             }
-            let pullback = transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+            let pullback = transpose_linear_program_with_output_examples::<JitTracer<ArrayType, V>, _, _>(
+                &pushforward,
+                outputs.as_slice(),
+            )?;
             let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
-            Ok(Input::To::<JitTracer<ArrayType, V>>::from_parameters(input_structure.clone(), traced_gradient)?)
+            Ok(<Input as TraceOutput<V, CoreOpSet>>::Traced::from_parameters(input_structure.clone(), traced_gradient)?)
         },
         example_primals,
     )?;
@@ -2348,25 +1959,13 @@ where
 /// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
 /// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOp`]
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
-fn segment_program<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
->(
+fn segment_program<V: Traceable<ArrayType>>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     program: &Program<ArrayType, V, Vec<V>, Vec<V>>,
     segment_size: usize,
 ) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>>, TraceError>
 where
-    V::ParameterStructure: Clone + PartialEq,
+    V: CoreProgramInterpretValue,
 {
     let graph = program.graph();
     let representative_values = graph.representative_atom_values(engine)?;
@@ -2532,25 +2131,10 @@ where
 }
 
 /// Wraps an entire program in a single [`RematerializeOp`] boundary.
-fn wrap_program_in_rematerialize<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
->(
+fn wrap_program_in_rematerialize<V: Traceable<ArrayType>>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     program: &Program<ArrayType, V, Vec<V>, Vec<V>>,
-) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>>, TraceError>
-where
-    V::ParameterStructure: Clone + PartialEq,
-{
+) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>>, TraceError> {
     let graph = program.graph();
     let representative_inputs = graph.representative_input_values(engine)?;
     let input_types: Vec<_> = graph
@@ -2606,28 +2190,13 @@ where
 /// The sub-program takes the boundary input atoms as its inputs and produces the boundary output atoms as its
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
 /// and equations within the sub-program.
-fn build_segment_sub_program<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
->(
+fn build_segment_sub_program<V: Traceable<ArrayType>>(
     graph: &Graph<ProgramOpRef<V>, ArrayType, V, Vec<V>, Vec<V>>,
     representative_values: &[V],
     segment_equations: &[Equation<ProgramOpRef<V>>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
-) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>>, TraceError>
-where
-    V::ParameterStructure: Clone + PartialEq,
-{
+) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>>, TraceError> {
     let mut sub_builder: ProgramBuilder<V> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.

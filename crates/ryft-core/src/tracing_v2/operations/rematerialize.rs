@@ -11,19 +11,18 @@ use std::fmt::{Debug, Display};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, Cos, JitTracer, LinearTerm, MatrixOps, OneLike, Program, Sin, TraceError, Traceable,
+        CompiledFunction, JitTracer, LinearTerm, Program, TraceError, TraceInput, TraceOutput, Traceable, Value,
         ZeroLike,
         engine::Engine,
         jit::try_trace_program_in,
         linear::{
             linearize_program_in, replay_program_graph_linearized_jit_in, transpose_linear_program_with_output_examples,
         },
-        operations::reshape::ReshapeOps,
         ops::{
-            CoreOpSet, DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet, SupportsCoreSyntax,
-            SupportsRematerialize,
+            CoreLinearProgramOp, CoreOpSet, DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet,
+            SupportsCoreSyntax, SupportsRematerialize,
         },
-        program::ProgramOpRef,
+        program::{LinearProgramOpRef, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -141,19 +140,7 @@ impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for RematerializeOp<Arr
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V>,
-> InterpretableOp<ArrayType, V> for RematerializeOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> InterpretableOp<ArrayType, V> for RematerializeOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, V>,
@@ -165,23 +152,10 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Parameterized<V>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    S: OpSet<ArrayType, V> + SupportsRematerialize<ArrayType, V>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
+impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V> + SupportsRematerialize<ArrayType, V>>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
     for RematerializeOp<ArrayType, V, S>
 where
-    V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     S::JitOp: Op<ArrayType>,
     S::JitOp: InterpretableOp<ArrayType, V>,
@@ -213,26 +187,14 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Parameterized<V>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>,
-> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for RematerializeOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>> for RematerializeOp<ArrayType, V, S>
 where
-    V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     S::JitOp: InterpretableOp<ArrayType, V>,
     S::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
     S::JitOp: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     fn jvp(
         &self,
@@ -259,19 +221,8 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V> + SupportsRematerialize<ArrayType, V>,
-> InterpretableOp<ArrayType, JitTracer<ArrayType, V, S>> for RematerializeOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V> + SupportsRematerialize<ArrayType, V>>
+    InterpretableOp<ArrayType, JitTracer<ArrayType, V, S>> for RematerializeOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     S::JitOp: Op<ArrayType>,
@@ -348,19 +299,8 @@ impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for LinearRematerialize
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-    S: OpSet<ArrayType, V>,
-> InterpretableOp<ArrayType, V> for LinearRematerializeOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> InterpretableOp<ArrayType, V>
+    for LinearRematerializeOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     <S as OpSet<ArrayType, V>>::LinearOp: InterpretableOp<ArrayType, V>,
@@ -372,21 +312,7 @@ where
     }
 }
 
-impl<
-    V: Traceable<ArrayType>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
-> LinearOp<ArrayType, V> for LinearRematerializeOp<ArrayType, V>
-where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-{
+impl<V: Traceable<ArrayType>> LinearOp<ArrayType, V> for LinearRematerializeOp<ArrayType, V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -405,54 +331,39 @@ where
 
 /// Builds a linearized rematerialize op from its primal body by computing the pushforward and
 /// pullback programs at the provided primal inputs.
+#[allow(private_bounds)]
 pub fn make_linear_rematerialize<V>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     body: &FlatTracedRematerialize<ArrayType, V>,
     input_primals: Vec<V>,
 ) -> Result<LinearRematerializeOp<ArrayType, V>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Parameterized<V>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    ProgramOpRef<V>: InterpretableOp<ArrayType, V>,
+    ProgramOpRef<V>: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
+    ProgramOpRef<V>: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     make_linear_rematerialize_in::<_, CoreOpSet>(engine, body, input_primals)
 }
 
 /// Builds a linearized rematerialize op from its primal body for one explicit ordinary op set.
+#[allow(private_bounds)]
 pub fn make_linear_rematerialize_in<V, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>(
     engine: &dyn Engine<Type = ArrayType, Value = V>,
     body: &FlatTracedRematerialize<ArrayType, V, <S as OpSet<ArrayType, V>>::JitOp>,
     input_primals: Vec<V>,
 ) -> Result<LinearRematerializeOp<ArrayType, V>, TraceError>
 where
-    V: Traceable<ArrayType>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps
-        + Parameterized<V>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>,
-    V::ParameterStructure: Clone + PartialEq,
+    V: Traceable<ArrayType> + ZeroLike,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     <S as OpSet<ArrayType, V>>::JitOp: Op<ArrayType>,
     <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, V>,
     <S as OpSet<ArrayType, V>>::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>,
     <S as OpSet<ArrayType, V>>::JitOp:
         InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
+    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     let output_primals = body.compiled.call(input_primals.clone())?;
     let pushforward = linearize_program_in::<_, _, _, S>(engine, body.compiled.program(), input_primals)?;
@@ -491,13 +402,7 @@ pub(crate) trait RematerializeInvocationLeaf<
 /// Concrete-value dispatch for [`rematerialize`]: the rematerialization boundary is a no-op during
 /// eager execution and simply applies the body function directly.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + ZeroLike
-        + OneLike
-        + crate::tracing_v2::Value<ArrayType>
-        + MatrixOps
-        + ReshapeOps,
+    V: Value<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for V
@@ -514,27 +419,16 @@ impl<
 /// stages a [`RematerializeOp`] in the enclosing [`JitTracer`] scope. The sub-program is traced
 /// once over exemplar values and compiled into a [`CompiledFunction`] that lowering can later handle.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + std::ops::Add<Output = V>
-        + std::ops::Mul<Output = V>
-        + std::ops::Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + ReshapeOps,
+    V: Traceable<ArrayType>,
     Input: Parameterized<Self, ParameterStructure: Clone>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
     S: OpSet<ArrayType, V> + SupportsRematerialize<ArrayType, V>,
 > RematerializeInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, S>
 where
     Input::Family: ParameterizedFamily<V>,
-    Output::Family: ParameterizedFamily<Self> + ParameterizedFamily<V>,
-    Input::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Input>,
-    Output::To<V>: Parameterized<V, To<JitTracer<ArrayType, V, S>> = Output>,
-    V::ParameterStructure: Clone + PartialEq,
+    Output::Family: ParameterizedFamily<V>,
+    Input::To<V>: TraceInput<V, S, Traced = Input>,
+    Output::To<V>: TraceOutput<V, S, Traced = Output>,
     S::JitOp: Op<ArrayType>,
     S::JitOp: InterpretableOp<ArrayType, V>,
 {

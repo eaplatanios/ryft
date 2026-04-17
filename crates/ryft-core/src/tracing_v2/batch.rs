@@ -209,17 +209,7 @@ where
 /// once at a single-lane exemplar and compiled into a [`CompiledFunction`] that lowering can later
 /// emit as packed StableHLO.
 impl<
-    V: Traceable<ArrayType>
-        + Parameterized<V, ParameterStructure = Placeholder>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + crate::tracing_v2::Sin
-        + crate::tracing_v2::Cos
-        + ZeroLike
-        + OneLike
-        + crate::tracing_v2::MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+    V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
     S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>,
