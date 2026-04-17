@@ -22,7 +22,7 @@ use crate::{
         jit::JitTracer,
         linear::LinearTerm,
         ops::{
-            DifferentiableOp, InterpretableOp, LinearOp, Op, OpSet, SupportsLinearAdd, SupportsLinearNeg,
+            DifferentiableOp, InterpretableOp, LinearOperation, Op, OperationSet, SupportsLinearAdd, SupportsLinearNeg,
             SupportsLinearReshape, SupportsLinearScale, SupportsReshape, VectorizableOp,
         },
     },
@@ -216,7 +216,7 @@ impl<
         + SupportsLinearScale<ArrayType, V>,
 > ReshapeTangentSpace<V> for LinearTerm<ArrayType, V, S>
 where
-    S::LinearOp: Op<ArrayType>,
+    S::LinearOperation: Op<ArrayType>,
 {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         if input_type == output_type {
@@ -247,7 +247,7 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
 
 impl<V: Traceable<ArrayType> + ReshapeOps, S: SupportsReshape<ArrayType, V>> ReshapeOps for JitTracer<ArrayType, V, S>
 where
-    S::JitOp: Op<ArrayType>,
+    S::TracingOperation: Op<ArrayType>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
         let input_type = self.tpe().into_owned();
@@ -397,7 +397,7 @@ impl<V: ReshapeValue> InterpretableOp<ArrayType, V> for ReshapeOp {
     }
 }
 
-impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOp<ArrayType, V> for ReshapeOp {
+impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType, V> for ReshapeOp {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -414,12 +414,12 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOp<ArrayType, V> fo
     }
 }
 
-impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps, S: OpSet<ArrayType, V>>
+impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps, S: OperationSet<ArrayType, V>>
     DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S> for ReshapeOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

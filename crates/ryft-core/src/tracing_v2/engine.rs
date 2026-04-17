@@ -15,7 +15,7 @@
 //!   concrete value. These leaves use stateful engines that carry the required handles.
 //!
 //! Engines are intentionally kept small: they expose metadata-only synthesis (zero and one) and
-//! also select the staged [`OpSet`](crate::tracing_v2::OpSet) used by user-facing tracing
+//! also select the staged [`OperationSet`](crate::tracing_v2::OperationSet) used by user-facing tracing
 //! transforms. Per-equation evaluation paths (`InterpretableOp::interpret`, `abstract_eval`, and
 //! similar) remain engine-free so that the common fast path is never forced through a dispatch
 //! layer.
@@ -32,7 +32,7 @@ use std::{fmt::Display, marker::PhantomData};
 use half::{bf16, f16};
 
 use crate::{
-    tracing_v2::CoreOpSet,
+    tracing_v2::CoreOperationSet,
     types::{ArrayType, Type},
 };
 
@@ -58,8 +58,8 @@ pub trait Engine {
     ///
     /// Engines that are used only for metadata synthesis may still set this to a tracing op-set
     /// type that is never exercised. Public tracing APIs add the stronger bound
-    /// `Self::OpSet: OpSet<Self::Type, Self::Value>` only when they actually stage a program.
-    type OpSet;
+    /// `Self::OperationSet: OperationSet<Self::Type, Self::Value>` only when they actually stage a program.
+    type OperationSet;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
     fn zero(&self, r#type: &Self::Type) -> Self::Value;
@@ -94,7 +94,7 @@ macro_rules! impl_engine_for_array_scalar_engine {
         impl Engine for ArrayScalarEngine<$ty> {
             type Type = ArrayType;
             type Value = $ty;
-            type OpSet = CoreOpSet;
+            type OperationSet = CoreOperationSet;
 
             #[inline]
             fn zero(&self, _type: &ArrayType) -> $ty {

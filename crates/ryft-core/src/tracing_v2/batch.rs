@@ -12,7 +12,7 @@ use crate::{
     tracing_v2::{
         CompiledFunction, JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
         operations::{AddOp, FlatTracedVMap, MulOp, NegOp, VMapOp},
-        ops::{InterpretableOp, Op, OpSet, SupportsVMap, VectorizableOp},
+        ops::{InterpretableOp, Op, OperationSet, SupportsVMap, VectorizableOp},
     },
     types::{ArrayType, Typed},
 };
@@ -212,7 +212,7 @@ impl<
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
-    S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>,
+    S: OperationSet<ArrayType, V> + SupportsVMap<ArrayType, V>,
 > VMapInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, S>
 where
     Input::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<V>,
@@ -229,8 +229,8 @@ where
             ParameterStructure = Vec<Placeholder>,
         >,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    S::JitOp: Op<ArrayType>,
-    S::JitOp: InterpretableOp<ArrayType, V>,
+    S::TracingOperation: Op<ArrayType>,
+    S::TracingOperation: InterpretableOp<ArrayType, V>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
     where
@@ -256,7 +256,7 @@ where
 
         let (exemplar_outputs, body_program): (
             Output::To<V>,
-            Program<ArrayType, V, Input::To<V>, Output::To<V>, <S as OpSet<ArrayType, V>>::JitOp>,
+            Program<ArrayType, V, Input::To<V>, Output::To<V>, <S as OperationSet<ArrayType, V>>::TracingOperation>,
         ) = crate::tracing_v2::jit::try_trace_program_for_op_set::<_, Input::To<V>, Output::To<V>, V, S>(
             |lane_inputs| {
                 let batched_inputs = Input::To::<Batch<JitTracer<ArrayType, V, S>>>::from_parameters(

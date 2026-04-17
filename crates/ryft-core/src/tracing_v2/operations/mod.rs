@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::sharding::Sharding;
-use crate::tracing_v2::{TraceError, Traceable, batch::Batch, jit::JitTracer, ops::OpSet};
+use crate::tracing_v2::{TraceError, Traceable, batch::Batch, jit::JitTracer, ops::OperationSet};
 use crate::types::ArrayType;
 
 fn is_replicated_sharding(sharding: &Sharding) -> bool {
@@ -114,7 +114,7 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
 }
 
 /// Lifts one concrete value into the staged graph owned by a JIT tracer.
-pub fn lift_jit_constant<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>>(
+pub fn lift_jit_constant<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>>(
     constant: &V,
     exemplar: &JitTracer<ArrayType, V, S>,
 ) -> JitTracer<ArrayType, V, S> {

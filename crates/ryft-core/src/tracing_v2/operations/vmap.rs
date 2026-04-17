@@ -11,8 +11,8 @@ use crate::{
             linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
         },
         ops::{
-            CoreLinearProgramOp, CoreOpSet, DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet,
-            SupportsCoreSyntax, SupportsVMap,
+            CoreLinearProgramOp, CoreOperationSet, DifferentiableOp, InterpretableOp, LinearOperation,
+            LinearPrimitiveOp, Op, OperationSet, SupportsCoreSyntax, SupportsVMap,
         },
         program::{LinearProgramOpRef, ProgramOpRef},
     },
@@ -116,43 +116,43 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
 }
 
 /// Higher-order `vmap` op that carries one canonical forward program payload.
-pub struct VMapOp<T: Type + Display, V: Traceable<T> + Parameter, S: OpSet<T, V> = CoreOpSet> {
-    body: FlatTracedVMap<T, V, <S as OpSet<T, V>>::JitOp>,
+pub struct VMapOp<T: Type + Display, V: Traceable<T> + Parameter, S: OperationSet<T, V> = CoreOperationSet> {
+    body: FlatTracedVMap<T, V, <S as OperationSet<T, V>>::TracingOperation>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> Clone for VMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> Clone for VMapOp<T, V, S> {
     fn clone(&self) -> Self {
         Self { body: self.body.clone() }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> VMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> VMapOp<T, V, S> {
     /// Builds one ordinary traced `vmap` op.
     #[inline]
-    pub fn new(body: FlatTracedVMap<T, V, <S as OpSet<T, V>>::JitOp>) -> Self {
+    pub fn new(body: FlatTracedVMap<T, V, <S as OperationSet<T, V>>::TracingOperation>) -> Self {
         Self { body }
     }
 
     /// Returns the canonical traced body.
     #[inline]
-    pub fn body(&self) -> &FlatTracedVMap<T, V, <S as OpSet<T, V>>::JitOp> {
+    pub fn body(&self) -> &FlatTracedVMap<T, V, <S as OperationSet<T, V>>::TracingOperation> {
         &self.body
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> Debug for VMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> Debug for VMapOp<T, V, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "VMap")
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> Display for VMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> Display for VMapOp<T, V, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for VMapOp<ArrayType, V, S> {
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> Op for VMapOp<ArrayType, V, S> {
     fn name(&self) -> &'static str {
         "vmap"
     }
@@ -169,10 +169,10 @@ impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for VMapOp<ArrayType, V
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> InterpretableOp<ArrayType, V> for VMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> InterpretableOp<ArrayType, V> for VMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, V>,
+    <S as OperationSet<ArrayType, V>>::TracingOperation: InterpretableOp<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
@@ -181,14 +181,14 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>>
+impl<V: Traceable<ArrayType> + ZeroLike, S: OperationSet<ArrayType, V> + SupportsVMap<ArrayType, V>>
     InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
     for VMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    S::JitOp: Op<ArrayType>,
-    S::JitOp: InterpretableOp<ArrayType, V>,
-    S::JitOp: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
+    S::TracingOperation: Op<ArrayType>,
+    S::TracingOperation: InterpretableOp<ArrayType, V>,
+    S::TracingOperation: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
 {
     fn interpret(
         &self,
@@ -218,18 +218,18 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>
+impl<V: Traceable<ArrayType> + ZeroLike, S: OperationSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>
     DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S> for VMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    S::JitOp: InterpretableOp<ArrayType, V>,
-    S::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>,
-    S::JitOp: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
+    S::TracingOperation: InterpretableOp<ArrayType, V>,
+    S::TracingOperation: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>,
+    S::TracingOperation: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
+        engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -250,12 +250,12 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V> + SupportsVMap<ArrayType, V>>
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V> + SupportsVMap<ArrayType, V>>
     InterpretableOp<ArrayType, JitTracer<ArrayType, V, S>> for VMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    S::JitOp: Op<ArrayType>,
-    S::JitOp: InterpretableOp<ArrayType, V>,
+    S::TracingOperation: Op<ArrayType>,
+    S::TracingOperation: InterpretableOp<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[JitTracer<ArrayType, V, S>]) -> Result<Vec<JitTracer<ArrayType, V, S>>, TraceError> {
         let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
@@ -265,30 +265,30 @@ where
 }
 
 /// Linear-only `vmap` op that always carries both the linear body and its transpose body.
-pub struct LinearVMapOp<T: Type + Display, V: Traceable<T> + Parameter, S: OpSet<T, V> = CoreOpSet> {
-    body: FlatTracedVMap<T, V, <S as OpSet<T, V>>::LinearOp>,
-    transpose_body: FlatTracedVMap<T, V, <S as OpSet<T, V>>::LinearOp>,
+pub struct LinearVMapOp<T: Type + Display, V: Traceable<T> + Parameter, S: OperationSet<T, V> = CoreOperationSet> {
+    body: FlatTracedVMap<T, V, <S as OperationSet<T, V>>::LinearOperation>,
+    transpose_body: FlatTracedVMap<T, V, <S as OperationSet<T, V>>::LinearOperation>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> Clone for LinearVMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> Clone for LinearVMapOp<T, V, S> {
     fn clone(&self) -> Self {
         Self { body: self.body.clone(), transpose_body: self.transpose_body.clone() }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> LinearVMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> LinearVMapOp<T, V, S> {
     /// Builds one linear traced `vmap` op with its transpose body.
     #[inline]
     pub fn new(
-        body: FlatTracedVMap<T, V, <S as OpSet<T, V>>::LinearOp>,
-        transpose_body: FlatTracedVMap<T, V, <S as OpSet<T, V>>::LinearOp>,
+        body: FlatTracedVMap<T, V, <S as OperationSet<T, V>>::LinearOperation>,
+        transpose_body: FlatTracedVMap<T, V, <S as OperationSet<T, V>>::LinearOperation>,
     ) -> Self {
         Self { body, transpose_body }
     }
 
     /// Returns the canonical traced body.
     #[inline]
-    pub fn body(&self) -> &FlatTracedVMap<T, V, <S as OpSet<T, V>>::LinearOp> {
+    pub fn body(&self) -> &FlatTracedVMap<T, V, <S as OperationSet<T, V>>::LinearOperation> {
         &self.body
     }
 
@@ -297,19 +297,19 @@ impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> LinearVMapOp<T, V, S> {
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> Debug for LinearVMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> Debug for LinearVMapOp<T, V, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearVMap")
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OpSet<T, V>> Display for LinearVMapOp<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> Display for LinearVMapOp<T, V, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "vmap")
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for LinearVMapOp<ArrayType, V, S> {
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> Op for LinearVMapOp<ArrayType, V, S> {
     fn name(&self) -> &'static str {
         "vmap"
     }
@@ -326,10 +326,11 @@ impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> Op for LinearVMapOp<ArrayT
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> InterpretableOp<ArrayType, V> for LinearVMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> InterpretableOp<ArrayType, V>
+    for LinearVMapOp<ArrayType, V, S>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    <S as OpSet<ArrayType, V>>::LinearOp: InterpretableOp<ArrayType, V>,
+    <S as OperationSet<ArrayType, V>>::LinearOperation: InterpretableOp<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
@@ -338,7 +339,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearOp<ArrayType, V> for LinearVMapOp<ArrayType, V> {
+impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearVMapOp<ArrayType, V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -363,18 +364,18 @@ impl<V: Traceable<ArrayType>> LinearOp<ArrayType, V> for LinearVMapOp<ArrayType,
 
 /// Builds one linearized staged `vmap` op from its primal body at the provided primal inputs.
 #[allow(private_bounds)]
-pub(crate) fn make_linear_vmap<V, S: OpSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>(
-    engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
-    body: &FlatTracedVMap<ArrayType, V, <S as OpSet<ArrayType, V>>::JitOp>,
+pub(crate) fn make_linear_vmap<V, S: OperationSet<ArrayType, V> + SupportsCoreSyntax<ArrayType, V>>(
+    engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
+    body: &FlatTracedVMap<ArrayType, V, <S as OperationSet<ArrayType, V>>::TracingOperation>,
     input_primals: Vec<V>,
 ) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    <S as OpSet<ArrayType, V>>::JitOp: Op<ArrayType>,
-    <S as OpSet<ArrayType, V>>::JitOp: InterpretableOp<ArrayType, V>,
-    <S as OpSet<ArrayType, V>>::JitOp: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>,
-    <S as OpSet<ArrayType, V>>::JitOp:
+    <S as OperationSet<ArrayType, V>>::TracingOperation: Op<ArrayType>,
+    <S as OperationSet<ArrayType, V>>::TracingOperation: InterpretableOp<ArrayType, V>,
+    <S as OperationSet<ArrayType, V>>::TracingOperation: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>,
+    <S as OperationSet<ArrayType, V>>::TracingOperation:
         InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
 {

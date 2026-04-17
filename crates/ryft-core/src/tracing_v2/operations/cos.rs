@@ -11,7 +11,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
-    ops::{DifferentiableOp, InterpretableOp, Op, OpSet, SupportsCos, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, OperationSet, SupportsCos, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -70,12 +70,15 @@ impl<V: Traceable<ArrayType> + Cos> InterpretableOp<ArrayType, V> for CosOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<ArrayType, V>, S: OpSet<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, T, S> for CosOp
+impl<
+    V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>,
+    T: TangentSpace<ArrayType, V>,
+    S: OperationSet<ArrayType, V>,
+> DifferentiableOp<ArrayType, V, T, S> for CosOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -103,7 +106,7 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
 
 impl<V: Traceable<ArrayType> + Cos, S: SupportsCos<ArrayType, V>> Cos for JitTracer<ArrayType, V, S>
 where
-    S::JitOp: Op<ArrayType>,
+    S::TracingOperation: Op<ArrayType>,
 {
     #[inline]
     fn cos(self) -> Self {

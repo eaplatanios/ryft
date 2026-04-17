@@ -15,7 +15,10 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, OpSet, SupportsMul, SupportsScale, VectorizableOp},
+    ops::{
+        DifferentiableOp, InterpretableOp, LinearOperation, Op, OperationSet, SupportsMul, SupportsScale,
+        VectorizableOp,
+    },
 };
 use crate::types::{ArrayType, Type, Typed};
 
@@ -87,7 +90,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> fo
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOp<ArrayType, V> for ScaleOp<ArrayType, V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for ScaleOp<ArrayType, V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -99,11 +102,11 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOp<ArrayType, V
 
 impl<
     V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>,
-    S: OpSet<ArrayType, V> + SupportsMul<ArrayType, V> + SupportsScale<ArrayType, V>,
+    S: OperationSet<ArrayType, V> + SupportsMul<ArrayType, V> + SupportsScale<ArrayType, V>,
 > InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
     for ScaleOp<ArrayType, V>
 where
-    S::JitOp: Op<ArrayType>,
+    S::TracingOperation: Op<ArrayType>,
 {
     fn interpret(
         &self,
@@ -118,12 +121,12 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, S: OpSet<ArrayType, V>>
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, S: OperationSet<ArrayType, V>>
     DifferentiableOp<ArrayType, V, T, S> for ScaleOp<ArrayType, V>
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

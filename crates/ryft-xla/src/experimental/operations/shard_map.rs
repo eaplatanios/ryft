@@ -11,7 +11,7 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOp, LinearPrimitiveOp,
+        AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp,
         LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, Sin, TraceError, Traceable, ZeroLike,
         engine::Engine, forward::JvpTracer, program::ProgramBuilderFor,
     },
@@ -21,7 +21,7 @@ use ryft_core::{
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
-use crate::experimental::ops::{XlaOpSet, XlaPrimitiveOp};
+use crate::experimental::ops::{XlaOperationSet, XlaPrimitiveOp};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTensor, ShardMapTensorEngine, ShardMapTraceError, ShardMapTracer, TracedShardMap,
@@ -142,7 +142,7 @@ impl<V: Traceable<ArrayType>> ShardMapOp<V> {
     /// Returns the shared custom-primitive registration used by this shard-map variant.
     fn base_custom_primitive(&self) -> CustomPrimitive<ArrayType, V>
     where
-        Self: Clone + InterpretableOp<ArrayType, V> + LinearOp<ArrayType, V> + Send + Sync + 'static,
+        Self: Clone + InterpretableOp<ArrayType, V> + LinearOperation<ArrayType, V> + Send + Sync + 'static,
     {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
     }
@@ -167,8 +167,8 @@ impl ShardMapOp<ShardMapTensor> {
     /// Returns the tensor-leaf custom-primitive registration for this shard-map op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive()
-            .with_jvp_rule_for::<XlaOpSet, _>(self.clone())
-            .with_linearized_jit_rule_for::<XlaOpSet, _>(self.clone())
+            .with_jvp_rule_for::<XlaOperationSet, _>(self.clone())
+            .with_linearized_jit_rule_for::<XlaOperationSet, _>(self.clone())
             .with_extension(self.clone())
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
     }
@@ -283,7 +283,7 @@ impl InterpretableOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl LinearOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
+impl LinearOperation<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
@@ -309,12 +309,12 @@ impl LinearOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     }
 }
 
-impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>, XlaOpSet>
+impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>, XlaOperationSet>
     for ShardMapOp<ShardMapTensor>
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor, OpSet = XlaOpSet>,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor, OperationSet = XlaOperationSet>,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
     ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
         if self.has_linear_state() {
@@ -421,7 +421,7 @@ impl InterpretableOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl LinearOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
+impl LinearOperation<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
@@ -448,12 +448,16 @@ impl LinearOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
 }
 
 impl
-    DifferentiableOp<ArrayType, ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>, ryft_core::tracing_v2::CoreOpSet>
-    for ShardMapOp<ShardMapTracer>
+    DifferentiableOp<
+        ArrayType,
+        ShardMapTracer,
+        LinearTerm<ArrayType, ShardMapTracer>,
+        ryft_core::tracing_v2::CoreOperationSet,
+    > for ShardMapOp<ShardMapTracer>
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer, OpSet = ryft_core::tracing_v2::CoreOpSet>,
+        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer, OperationSet = ryft_core::tracing_v2::CoreOperationSet>,
         _inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
@@ -636,7 +640,7 @@ fn project_flat_shard_map_graph(
     fn remap_atom(
         atom_id: usize,
         graph: &FlatShardMapGraph,
-        builder: &mut ProgramBuilderFor<XlaOpSet, ShardMapTensor>,
+        builder: &mut ProgramBuilderFor<XlaOperationSet, ShardMapTensor>,
         atom_mapping: &mut std::collections::HashMap<usize, usize>,
         kept_input_atoms: &std::collections::HashMap<usize, usize>,
         representative_values: &[ShardMapTensor],
@@ -695,7 +699,7 @@ fn project_flat_shard_map_graph(
     let equation_by_output = equation_by_output(graph);
     let engine = crate::experimental::shard_map::ShardMapTensorEngine::new();
     let representative_values = graph.representative_atom_values(&engine)?;
-    let mut builder = ProgramBuilderFor::<XlaOpSet, ShardMapTensor>::new();
+    let mut builder = ProgramBuilderFor::<XlaOperationSet, ShardMapTensor>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
         let mapped_atom = builder.add_input(&representative_values[atom_id]);
@@ -734,7 +738,7 @@ fn build_factorized_apply_graph(
     fn remap_atom(
         atom_id: usize,
         graph: &FlatShardMapGraph,
-        builder: &mut ProgramBuilderFor<XlaOpSet, ShardMapTensor>,
+        builder: &mut ProgramBuilderFor<XlaOperationSet, ShardMapTensor>,
         atom_mapping: &mut std::collections::HashMap<usize, usize>,
         replacement_inputs: &std::collections::HashMap<usize, usize>,
         depends_on_cotangent: &[bool],
@@ -809,7 +813,7 @@ fn build_factorized_apply_graph(
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = graph.input_atoms()[primal_input_count..].to_vec();
     let equation_by_output = equation_by_output(graph);
-    let mut builder = ProgramBuilderFor::<XlaOpSet, ShardMapTensor>::new();
+    let mut builder = ProgramBuilderFor::<XlaOperationSet, ShardMapTensor>::new();
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {

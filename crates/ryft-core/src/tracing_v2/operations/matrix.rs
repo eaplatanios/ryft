@@ -213,7 +213,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
 impl<V: Traceable<ArrayType> + MatrixOps, S: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>>
     MatrixOps for JitTracer<ArrayType, V, S>
 where
-    S::JitOp: Op<ArrayType>,
+    S::TracingOperation: Op<ArrayType>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
@@ -283,7 +283,7 @@ pub mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, CoreOpSet, Cos, OneLike, Sin, Traceable, ZeroLike, engine::Engine},
+        tracing_v2::{CoordinateValue, CoreOperationSet, Cos, OneLike, Sin, Traceable, ZeroLike, engine::Engine},
         types::{ArrayType, DataType, Typed},
     };
 
@@ -316,7 +316,7 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f32> {
         type Type = ArrayType;
         type Value = Array2<f32>;
-        type OpSet = CoreOpSet;
+        type OperationSet = CoreOperationSet;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f32> {
@@ -332,7 +332,7 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f64> {
         type Type = ArrayType;
         type Value = Array2<f64>;
-        type OpSet = CoreOpSet;
+        type OperationSet = CoreOperationSet;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f64> {

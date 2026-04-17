@@ -73,7 +73,7 @@ use ryft_core::tracing_v2::{
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
-use crate::experimental::ops::{XlaOpSet, XlaPrimitiveOp};
+use crate::experimental::ops::{XlaOperationSet, XlaPrimitiveOp};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
@@ -359,7 +359,7 @@ impl ShardMapTensorEngine {
 impl ryft_core::tracing_v2::engine::Engine for ShardMapTensorEngine {
     type Type = ArrayType;
     type Value = ShardMapTensor;
-    type OpSet = XlaOpSet;
+    type OperationSet = XlaOperationSet;
 
     #[inline]
     fn zero(&self, r#type: &ArrayType) -> ShardMapTensor {
@@ -455,7 +455,7 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging shard-map bodies.
-pub(crate) type ShardMapTracer = JitTracer<ArrayType, ShardMapTensor, XlaOpSet>;
+pub(crate) type ShardMapTracer = JitTracer<ArrayType, ShardMapTensor, XlaOperationSet>;
 
 /// Compiled staged XLA function specialized to the backend-owned XLA op universe.
 pub(crate) type XlaCompiledFunction<Input, Output> =

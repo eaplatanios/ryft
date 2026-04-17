@@ -10,7 +10,7 @@ use crate::tracing_v2::{
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
-    ops::{DifferentiableOp, InterpretableOp, Op, OpSet, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, OperationSet, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -72,12 +72,12 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> fo
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, S: OpSet<ArrayType, V>>
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, S: OperationSet<ArrayType, V>>
     DifferentiableOp<ArrayType, V, T, S> for MulOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn test_mul_jvp_matches_the_product_rule() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let output = DifferentiableOp::<ArrayType, f64, f64, crate::tracing_v2::CoreOpSet>::jvp(
+        let output = DifferentiableOp::<ArrayType, f64, f64, crate::tracing_v2::CoreOperationSet>::jvp(
             &MulOp,
             &engine,
             &[JvpTracer { primal: 2.0f64, tangent: 3.0f64 }, JvpTracer { primal: 5.0f64, tangent: -1.0f64 }],

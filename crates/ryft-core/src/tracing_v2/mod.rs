@@ -45,13 +45,13 @@ pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{Cos, Sin};
 pub use ops::{
-    CoreOpSet, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
-    LinearOp, LinearPrimitiveOp, Op, OpSet, PrimitiveOp, SupportsAdd, SupportsCos, SupportsCustom, SupportsLeftMatMul,
-    SupportsLinearAdd, SupportsLinearCustom, SupportsLinearLeftMatMul, SupportsLinearMatrixTranspose,
-    SupportsLinearNeg, SupportsLinearRematerialize, SupportsLinearReshape, SupportsLinearRightMatMul,
-    SupportsLinearScale, SupportsLinearVMap, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg,
-    SupportsRematerialize, SupportsReshape, SupportsRightMatMul, SupportsScale, SupportsSin, SupportsVMap,
-    VectorizableOp,
+    CoreOperationSet, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp,
+    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOp, Op, OperationSet, PrimitiveOp, SupportsAdd, SupportsCos,
+    SupportsCustom, SupportsLeftMatMul, SupportsLinearAdd, SupportsLinearCustom, SupportsLinearLeftMatMul,
+    SupportsLinearMatrixTranspose, SupportsLinearNeg, SupportsLinearRematerialize, SupportsLinearReshape,
+    SupportsLinearRightMatMul, SupportsLinearScale, SupportsLinearVMap, SupportsMatMul, SupportsMatrixTranspose,
+    SupportsMul, SupportsNeg, SupportsRematerialize, SupportsReshape, SupportsRightMatMul, SupportsScale, SupportsSin,
+    SupportsVMap, VectorizableOp,
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};

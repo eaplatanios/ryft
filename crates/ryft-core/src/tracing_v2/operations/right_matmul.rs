@@ -10,7 +10,7 @@ use crate::tracing_v2::{
     jit::JitTracer,
     linear::LinearTerm,
     ops::{
-        DifferentiableOp, InterpretableOp, LinearOp, LinearPrimitiveOp, Op, OpSet, SupportsMatMul,
+        DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, OperationSet, SupportsMatMul,
         SupportsMatrixTranspose, VectorizableOp,
     },
 };
@@ -85,7 +85,7 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for RightMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue> LinearOp<ArrayType, V> for RightMatMulOp<V> {
+impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOp<V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -106,10 +106,10 @@ impl<V: MatrixValue> LinearOp<ArrayType, V> for RightMatMulOp<V> {
 
 impl<
     V: Traceable<ArrayType> + MatrixOps + ZeroLike,
-    S: OpSet<ArrayType, V> + SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
+    S: OperationSet<ArrayType, V> + SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
 > InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>> for RightMatMulOp<V>
 where
-    S::JitOp: Op<ArrayType>,
+    S::TracingOperation: Op<ArrayType>,
 {
     fn interpret(
         &self,
@@ -122,12 +122,12 @@ where
     }
 }
 
-impl<V: MatrixValue + ZeroLike, S: OpSet<ArrayType, V>> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S>
-    for RightMatMulOp<V>
+impl<V: MatrixValue + ZeroLike, S: OperationSet<ArrayType, V>>
+    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S> for RightMatMulOp<V>
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

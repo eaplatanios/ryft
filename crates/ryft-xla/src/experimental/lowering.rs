@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, MatrixOps, Op, OpSet, PrimitiveOp, Traceable,
+    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, MatrixOps, Op, OperationSet, PrimitiveOp, Traceable,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, LinearRematerializeOp, LinearVMapOp,
         MatMulOp, MatrixTransposeOp, MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -142,8 +142,8 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OpSet<ArrayType, V>,
-        S::JitOp: Clone + Op + XlaOp<V>,
+        S: OperationSet<ArrayType, V>,
+        S::TracingOperation: Clone + Op + XlaOp<V>,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -164,8 +164,8 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OpSet<ArrayType, V>,
-        S::JitOp: Clone + Op + XlaOp<V>,
+        S: OperationSet<ArrayType, V>,
+        S::TracingOperation: Clone + Op + XlaOp<V>,
     {
         lower_rematerialize_inline(
             remat_op.body().compiled().program().graph(),
@@ -510,9 +510,9 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for ReshapeOp {
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> XlaOp<V> for VMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> XlaOp<V> for VMapOp<ArrayType, V, S>
 where
-    S::JitOp: Clone + Op + XlaOp<V>,
+    S::TracingOperation: Clone + Op + XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -641,9 +641,9 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> XlaOp<V> for LinearVMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> XlaOp<V> for LinearVMapOp<ArrayType, V, S>
 where
-    S::LinearOp: Clone + Op + XlaOp<V>,
+    S::LinearOperation: Clone + Op + XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -666,9 +666,9 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OpSet<ArrayType, V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, S>
 where
-    S::LinearOp: Clone + Op + XlaOp<V>,
+    S::LinearOperation: Clone + Op + XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -871,8 +871,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OpSet<ArrayType, V>,
-        S::JitOp: Clone + Op + XlaOp<V>,
+        S: OperationSet<ArrayType, V>,
+        S::TracingOperation: Clone + Op + XlaOp<V>,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -893,8 +893,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OpSet<ArrayType, V>,
-        S::JitOp: Clone + Op + XlaOp<V>,
+        S: OperationSet<ArrayType, V>,
+        S::TracingOperation: Clone + Op + XlaOp<V>,
     {
         lower_rematerialize_inline(
             remat_op.body().compiled().program().graph(),
@@ -1382,7 +1382,7 @@ enum VMapLoweringMode {
 fn lower_vmap_mode<V, S>(_vmap_op: &VMapOp<ArrayType, V, S>) -> VMapLoweringMode
 where
     V: Traceable<ArrayType>,
-    S: OpSet<ArrayType, V>,
+    S: OperationSet<ArrayType, V>,
 {
     VMapLoweringMode::Forward
 }
@@ -2796,7 +2796,7 @@ mod tests {
         op: XlaPrimitiveOp,
     ) -> Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilderFor::<crate::experimental::ops::XlaOpSet, ShardMapTensor>::new();
+        let mut builder = ProgramBuilderFor::<crate::experimental::ops::XlaOperationSet, ShardMapTensor>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
         let output = builder.add_equation(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)

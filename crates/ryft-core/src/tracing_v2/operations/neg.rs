@@ -11,7 +11,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOp, Op, OpSet, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, LinearOperation, Op, OperationSet, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -59,7 +59,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>> InterpretableOp<ArrayType, V> fo
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOp<ArrayType, V> for NegOp {
+impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for NegOp {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -69,12 +69,12 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOp<ArrayType, V
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>, S: OpSet<ArrayType, V>>
+impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>, S: OperationSet<ArrayType, V>>
     DifferentiableOp<ArrayType, V, T, S> for NegOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OpSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
