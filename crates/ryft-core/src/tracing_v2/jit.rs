@@ -21,40 +21,41 @@ use crate::{
         GraphBuilder, InterpretableOp, OneLike, TraceError, Traceable, ZeroLike,
         engine::Engine,
         graph::AtomId,
-        ops::{CoreOperationSet, Op, OperationSet, SupportsAdd, SupportsMul, SupportsNeg},
+        ops::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
         program::{Program, ProgramBuilderFor, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
 
-/// Input family that can be rebuilt with traced leaves for one op set.
+/// Input family that can be rebuilt with traced leaves for one staged carrier pair.
 #[doc(hidden)]
-pub trait TraceInput<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>>:
+pub trait TraceInput<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>:
     Parameterized<V, ParameterStructure: Clone>
 {
-    /// Traced version of this input family for one op set.
-    type Traced: Parameterized<JitTracer<ArrayType, V, S>, ParameterStructure = Self::ParameterStructure>;
+    /// Traced version of this input family for one staged carrier pair.
+    type Traced: Parameterized<JitTracer<ArrayType, V, O, L>, ParameterStructure = Self::ParameterStructure>;
 
     /// Rebuilds `self` with traced leaves owned by `builder`.
     fn into_traced(
         self,
-        builder: Rc<RefCell<GraphBuilder<S::TracingOperation, ArrayType, V>>>,
+        builder: Rc<RefCell<GraphBuilder<O, ArrayType, V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
     ) -> Result<Self::Traced, TraceError>;
 }
 
-impl<T, V, S> TraceInput<V, S> for T
+impl<T, V, O, L> TraceInput<V, O, L> for T
 where
     T: Parameterized<V, ParameterStructure: Clone>,
     V: Traceable<ArrayType>,
-    S: OperationSet<ArrayType, V>,
-    T::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    T::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
 {
-    type Traced = T::To<JitTracer<ArrayType, V, S>>;
+    type Traced = T::To<JitTracer<ArrayType, V, O, L>>;
 
     fn into_traced(
         self,
-        builder: Rc<RefCell<GraphBuilder<S::TracingOperation, ArrayType, V>>>,
+        builder: Rc<RefCell<GraphBuilder<O, ArrayType, V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
     ) -> Result<Self::Traced, TraceError> {
         let structure = self.parameter_structure();
@@ -62,11 +63,12 @@ where
             structure,
             self.into_parameters().map(|value| {
                 let atom = builder.borrow_mut().add_input(&value);
-                JitTracer::<ArrayType, V, S> {
+                JitTracer::<ArrayType, V, O, L> {
                     value,
                     atom,
                     builder: builder.clone(),
                     staging_error: staging_error.clone(),
+                    marker: PhantomData,
                 }
             }),
         )
@@ -76,24 +78,25 @@ where
 
 /// Output family that can be lowered back to concrete leaves after tracing.
 #[doc(hidden)]
-pub trait TraceOutput<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>>:
+pub trait TraceOutput<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>:
     Parameterized<V, ParameterStructure: Clone>
 {
-    /// Traced version of this output family for one op set.
-    type Traced: Parameterized<JitTracer<ArrayType, V, S>, ParameterStructure = Self::ParameterStructure>;
+    /// Traced version of this output family for one staged carrier pair.
+    type Traced: Parameterized<JitTracer<ArrayType, V, O, L>, ParameterStructure = Self::ParameterStructure>;
 
     /// Lowers one traced output back to concrete values and the corresponding staged output atoms.
     fn from_traced(traced_output: Self::Traced) -> Result<(Self, Vec<AtomId>), TraceError>;
 }
 
-impl<T, V, S> TraceOutput<V, S> for T
+impl<T, V, O, L> TraceOutput<V, O, L> for T
 where
     T: Parameterized<V, ParameterStructure: Clone>,
     V: Traceable<ArrayType>,
-    S: OperationSet<ArrayType, V>,
-    T::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    T::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
 {
-    type Traced = T::To<JitTracer<ArrayType, V, S>>;
+    type Traced = T::To<JitTracer<ArrayType, V, O, L>>;
 
     fn from_traced(traced_output: Self::Traced) -> Result<(Self, Vec<AtomId>), TraceError> {
         let output_structure = traced_output.parameter_structure();
@@ -109,21 +112,29 @@ where
 
 /// Tracer used while staging JIT programs.
 #[derive(Clone, Parameter)]
-pub struct JitTracer<T: Type + Display, V: Traceable<T> + Parameter, S: OperationSet<T, V> = CoreOperationSet> {
+pub struct JitTracer<
+    T: Type + Display,
+    V: Traceable<T> + Parameter,
+    O: Clone + 'static = ProgramOpRef<V>,
+    L: Clone + 'static = crate::tracing_v2::LinearProgramOpRef<V>,
+> {
     /// Concrete value obtained during eager execution of the staged computation.
     pub value: V,
     atom: AtomId,
-    builder: Rc<RefCell<GraphBuilder<S::TracingOperation, T, V>>>,
+    builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
+    marker: PhantomData<fn() -> L>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> std::fmt::Debug for JitTracer<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> std::fmt::Debug
+    for JitTracer<T, V, O, L>
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("JitTracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> JitTracer<T, V, S> {
+impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> JitTracer<T, V, O, L> {
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -131,7 +142,7 @@ impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> JitTracer<T, V, 
     }
 
     #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<S::TracingOperation, T, V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<O, T, V>>> {
         self.builder.clone()
     }
 
@@ -144,19 +155,16 @@ impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> JitTracer<T, V, 
     pub fn from_staged_parts(
         value: V,
         atom: AtomId,
-        builder: Rc<RefCell<GraphBuilder<S::TracingOperation, T, V>>>,
+        builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
+        marker: PhantomData<fn() -> L>,
     ) -> Self {
-        Self { value, atom, builder, staging_error }
+        Self { value, atom, builder, staging_error, marker }
     }
 
-    pub fn apply_staged_op(
-        inputs: &[Self],
-        op: S::TracingOperation,
-        output_values: Vec<V>,
-    ) -> Result<Vec<Self>, TraceError>
+    pub fn apply_staged_op(inputs: &[Self], op: O, output_values: Vec<V>) -> Result<Vec<Self>, TraceError>
     where
-        S::TracingOperation: Op<T>,
+        O: Op<T>,
     {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
@@ -191,13 +199,19 @@ impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> JitTracer<T, V, 
         Ok(output_values
             .into_iter()
             .zip(output_atoms)
-            .map(|(value, atom)| Self { value, atom, builder: builder.clone(), staging_error: staging_error.clone() })
+            .map(|(value, atom)| Self {
+                value,
+                atom,
+                builder: builder.clone(),
+                staging_error: staging_error.clone(),
+                marker: PhantomData,
+            })
             .collect())
     }
 
-    pub fn unary(self, op: S::TracingOperation, apply: impl FnOnce(V) -> V) -> Self
+    pub fn unary(self, op: O, apply: impl FnOnce(V) -> V) -> Self
     where
-        S::TracingOperation: Op<T>,
+        O: Op<T>,
     {
         let value = apply(self.value);
         let atom = if self.staging_error.borrow().is_some() {
@@ -211,12 +225,12 @@ impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> JitTracer<T, V, 
                 }
             }
         };
-        Self { value, atom, builder: self.builder, staging_error: self.staging_error }
+        Self { value, atom, builder: self.builder, staging_error: self.staging_error, marker: PhantomData }
     }
 
-    pub fn binary(self, rhs: Self, op: S::TracingOperation, apply: impl FnOnce(V, V) -> V) -> Self
+    pub fn binary(self, rhs: Self, op: O, apply: impl FnOnce(V, V) -> V) -> Self
     where
-        S::TracingOperation: Op<T>,
+        O: Op<T>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         debug_assert!(Rc::ptr_eq(&self.staging_error, &rhs.staging_error));
@@ -236,70 +250,94 @@ impl<T: Type + Display, V: Traceable<T>, S: OperationSet<T, V>> JitTracer<T, V, 
                 }
             }
         };
-        Self { value, atom, builder: self.builder, staging_error: self.staging_error }
+        Self { value, atom, builder: self.builder, staging_error: self.staging_error, marker: PhantomData }
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> Typed<ArrayType> for JitTracer<ArrayType, V, S> {
+impl<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static> Typed<ArrayType>
+    for JitTracer<ArrayType, V, O, L>
+{
     #[inline]
     fn tpe(&self) -> Cow<'_, ArrayType> {
         <V as Typed<ArrayType>>::tpe(&self.value)
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> Traceable<ArrayType> for JitTracer<ArrayType, V, S> {}
+impl<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static> Traceable<ArrayType>
+    for JitTracer<ArrayType, V, O, L>
+{
+}
 
-impl<V: Traceable<ArrayType> + ZeroLike, S: OperationSet<ArrayType, V>> ZeroLike for JitTracer<ArrayType, V, S> {
+impl<V: Traceable<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + 'static> ZeroLike
+    for JitTracer<ArrayType, V, O, L>
+{
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.value.zero_like();
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { value, atom, builder: self.builder.clone(), staging_error: self.staging_error.clone() }
+        Self {
+            value,
+            atom,
+            builder: self.builder.clone(),
+            staging_error: self.staging_error.clone(),
+            marker: PhantomData,
+        }
     }
 }
 
-impl<V: Traceable<ArrayType> + OneLike, S: OperationSet<ArrayType, V>> OneLike for JitTracer<ArrayType, V, S> {
+impl<V: Traceable<ArrayType> + OneLike, O: Clone + 'static, L: Clone + 'static> OneLike
+    for JitTracer<ArrayType, V, O, L>
+{
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.value.one_like();
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { value, atom, builder: self.builder.clone(), staging_error: self.staging_error.clone() }
+        Self {
+            value,
+            atom,
+            builder: self.builder.clone(),
+            staging_error: self.staging_error.clone(),
+            marker: PhantomData,
+        }
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>, S: SupportsAdd<ArrayType, V>> Add for JitTracer<ArrayType, V, S>
+impl<V: Traceable<ArrayType> + Add<Output = V>, O: AddTracingOperation<ArrayType, V> + 'static, L: Clone + 'static> Add
+    for JitTracer<ArrayType, V, O, L>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     type Output = Self;
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, S::add_op(), |left, right| left + right)
+        self.binary(rhs, O::add_op(), |left, right| left + right)
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, S: SupportsMul<ArrayType, V>> Mul for JitTracer<ArrayType, V, S>
+impl<V: Traceable<ArrayType> + Mul<Output = V>, O: MulTracingOperation<ArrayType, V> + 'static, L: Clone + 'static> Mul
+    for JitTracer<ArrayType, V, O, L>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     type Output = Self;
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, S::mul_op(), |left, right| left * right)
+        self.binary(rhs, O::mul_op(), |left, right| left * right)
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V>, S: SupportsNeg<ArrayType, V>> Neg for JitTracer<ArrayType, V, S>
+impl<V: Traceable<ArrayType> + Neg<Output = V>, O: NegTracingOperation<ArrayType, V> + 'static, L: Clone + 'static> Neg
+    for JitTracer<ArrayType, V, O, L>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(S::neg_op(), |value| -value)
+        self.unary(O::neg_op(), |value| -value)
     }
 }
 
@@ -376,21 +414,22 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 }
 
-fn try_trace_program_with_options<F, Input, Output, V, S>(
+fn try_trace_program_with_options<F, Input, Output, V, O, L>(
     function: F,
     input: Input,
     simplify_program: bool,
-) -> Result<(Output, Program<ArrayType, V, Input, Output, S::TracingOperation>), TraceError>
+) -> Result<(Output, Program<ArrayType, V, Input, Output, O>), TraceError>
 where
     V: Traceable<ArrayType>,
-    S: OperationSet<ArrayType, V>,
-    Input: TraceInput<V, S>,
-    Output: TraceOutput<V, S>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    Input: TraceInput<V, O, L>,
+    Output: TraceOutput<V, O, L>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     let input_structure = input.parameter_structure();
-    let builder = Rc::new(RefCell::new(ProgramBuilderFor::<S, V>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilderFor::<V, O>::new()));
     let staging_error = Rc::new(RefCell::new(None));
     let traced_input = input.into_traced(builder.clone(), staging_error.clone())?;
 
@@ -418,45 +457,33 @@ pub fn try_trace_program<E, F, Input, Output, V>(
     _engine: &E,
     function: F,
     input: Input,
-) -> Result<
-    (
-        Output,
-        Program<
-            ArrayType,
-            V,
-            Input,
-            Output,
-            <<E as Engine>::OperationSet as OperationSet<ArrayType, V>>::TracingOperation,
-        >,
-    ),
-    TraceError,
->
+) -> Result<(Output, Program<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, E::OperationSet>,
-    Output: TraceOutput<V, E::OperationSet>,
+    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
+    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    E::OperationSet: OperationSet<ArrayType, V>,
-    <E::OperationSet as OperationSet<ArrayType, V>>::TracingOperation: Op<ArrayType>,
+    E::TracingOperation: Op<ArrayType>,
 {
-    try_trace_program_for_op_set::<_, _, _, _, E::OperationSet>(function, input)
+    try_trace_program_for_operation::<_, _, _, _, E::TracingOperation, E::LinearOperation>(function, input)
 }
 
-/// Stages `function` using one explicit backend-owned op set.
-pub(crate) fn try_trace_program_for_op_set<F, Input, Output, V, S>(
+/// Stages `function` using one explicit staged ordinary operation type.
+pub(crate) fn try_trace_program_for_operation<F, Input, Output, V, O, L>(
     function: F,
     input: Input,
-) -> Result<(Output, Program<ArrayType, V, Input, Output, S::TracingOperation>), TraceError>
+) -> Result<(Output, Program<ArrayType, V, Input, Output, O>), TraceError>
 where
     V: Traceable<ArrayType>,
-    S: OperationSet<ArrayType, V>,
-    Input: TraceInput<V, S>,
-    Output: TraceOutput<V, S>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    Input: TraceInput<V, O, L>,
+    Output: TraceOutput<V, O, L>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
-    try_trace_program_with_options::<_, _, _, _, S>(function, input, true)
+    try_trace_program_with_options::<_, _, _, _, O, L>(function, input, true)
 }
 
 /// Stages `function` as a graph using the staged op set selected by `engine`.
@@ -464,45 +491,33 @@ pub fn try_jit<E, F, Input, Output, V>(
     _engine: &E,
     function: F,
     input: Input,
-) -> Result<
-    (
-        Output,
-        CompiledFunction<
-            ArrayType,
-            V,
-            Input,
-            Output,
-            <E::OperationSet as OperationSet<ArrayType, V>>::TracingOperation,
-        >,
-    ),
-    TraceError,
->
+) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, E::OperationSet>,
-    Output: TraceOutput<V, E::OperationSet>,
+    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
+    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    E::OperationSet: OperationSet<ArrayType, V>,
-    <E::OperationSet as OperationSet<ArrayType, V>>::TracingOperation: Op<ArrayType>,
+    E::TracingOperation: Op<ArrayType>,
 {
-    try_jit_for_op_set::<_, _, _, _, E::OperationSet>(function, input)
+    try_jit_for_operation::<_, _, _, _, E::TracingOperation, E::LinearOperation>(function, input)
 }
 
-/// Stages `function` as a graph using one explicit backend-owned op set.
-pub(crate) fn try_jit_for_op_set<F, Input, Output, V, S>(
+/// Stages `function` as a graph using one explicit staged ordinary operation type.
+pub(crate) fn try_jit_for_operation<F, Input, Output, V, O, L>(
     function: F,
     input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, S::TracingOperation>), TraceError>
+) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, O>), TraceError>
 where
     V: Traceable<ArrayType>,
-    S: OperationSet<ArrayType, V>,
-    Input: TraceInput<V, S>,
-    Output: TraceOutput<V, S>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    Input: TraceInput<V, O, L>,
+    Output: TraceOutput<V, O, L>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
-    let (output, program) = try_trace_program_for_op_set::<_, _, _, _, S>(function, input)?;
+    let (output, program) = try_trace_program_for_operation::<_, _, _, _, O, L>(function, input)?;
     Ok((output, CompiledFunction::from_program(program)))
 }
 
@@ -515,27 +530,14 @@ pub fn jit<E, F, Input, Output, V>(
     engine: &E,
     function: F,
     input: Input,
-) -> Result<
-    (
-        Output,
-        CompiledFunction<
-            ArrayType,
-            V,
-            Input,
-            Output,
-            <E::OperationSet as OperationSet<ArrayType, V>>::TracingOperation,
-        >,
-    ),
-    TraceError,
->
+) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, E::OperationSet>,
-    Output: TraceOutput<V, E::OperationSet>,
+    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
+    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Output::Traced,
-    E::OperationSet: OperationSet<ArrayType, V>,
-    <E::OperationSet as OperationSet<ArrayType, V>>::TracingOperation: Op<ArrayType>,
+    E::TracingOperation: Op<ArrayType>,
 {
     try_jit(engine, |traced_input| Ok(function(traced_input)), input)
 }
@@ -548,7 +550,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{CoreOperationSet, ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
+        tracing_v2::{ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
     };
 
     use super::*;
@@ -558,8 +560,8 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
         let staging_error = Rc::new(RefCell::new(None));
         let atom = builder.borrow_mut().add_input(&3.0f64);
-        let tracer: JitTracer<ArrayType, f64, CoreOperationSet> =
-            JitTracer { value: 3.0, atom, builder, staging_error };
+        let tracer: JitTracer<ArrayType, f64> =
+            JitTracer { value: 3.0, atom, builder, staging_error, marker: std::marker::PhantomData };
         let zero = tracer.zero_like();
         assert_eq!(zero.value, 0.0);
         assert!(zero.atom > atom);
@@ -706,7 +708,8 @@ mod tests {
         impl crate::tracing_v2::engine::Engine for TestEngine {
             type Type = ArrayType;
             type Value = TestAbstractValue;
-            type OperationSet = CoreOperationSet;
+            type TracingOperation = crate::tracing_v2::PrimitiveOp<ArrayType, TestAbstractValue>;
+            type LinearOperation = crate::tracing_v2::LinearPrimitiveOp<ArrayType, TestAbstractValue>;
 
             fn zero(&self, r#type: &ArrayType) -> TestAbstractValue {
                 TestAbstractValue { r#type: r#type.clone() }

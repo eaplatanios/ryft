@@ -22,8 +22,8 @@ use crate::{
         jit::JitTracer,
         linear::LinearTerm,
         ops::{
-            DifferentiableOp, InterpretableOp, LinearOperation, Op, OperationSet, SupportsLinearAdd, SupportsLinearNeg,
-            SupportsLinearReshape, SupportsLinearScale, SupportsReshape, VectorizableOp,
+            DifferentiableOp, InterpretableOp, LinearAddOperation, LinearNegOperation, LinearOperation,
+            LinearReshapeOperation, LinearScaleOperation, Op, ReshapeTracingOperation, VectorizableOp,
         },
     },
     types::{ArrayType, Shape, Size, Typed},
@@ -210,13 +210,13 @@ impl<V: ReshapeValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Zer
 
 impl<
     V: ReshapeValue + ZeroLike + OneLike + MatrixOps,
-    S: SupportsLinearAdd<ArrayType, V>
-        + SupportsLinearNeg<ArrayType, V>
-        + SupportsLinearReshape<ArrayType, V>
-        + SupportsLinearScale<ArrayType, V>,
-> ReshapeTangentSpace<V> for LinearTerm<ArrayType, V, S>
+    O: LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearReshapeOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
+> ReshapeTangentSpace<V> for LinearTerm<ArrayType, V, O>
 where
-    S::LinearOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
         if input_type == output_type {
@@ -224,7 +224,7 @@ where
         }
         Ok(LinearTerm::apply_staged_op(
             std::slice::from_ref(&tangent),
-            S::linear_reshape_op(input_type.clone(), output_type.clone()),
+            O::linear_reshape_op(input_type.clone(), output_type.clone()),
             1,
         )?
         .into_iter()
@@ -245,9 +245,10 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<V: Traceable<ArrayType> + ReshapeOps, S: SupportsReshape<ArrayType, V>> ReshapeOps for JitTracer<ArrayType, V, S>
+impl<V: Traceable<ArrayType> + ReshapeOps, O: ReshapeTracingOperation<ArrayType, V>, L: Clone> ReshapeOps
+    for JitTracer<ArrayType, V, O, L>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
         let input_type = self.tpe().into_owned();
@@ -258,7 +259,7 @@ where
         let output_value = self.value.clone().reshape(target_shape)?;
         Ok(JitTracer::apply_staged_op(
             std::slice::from_ref(&self),
-            S::reshape_op(input_type, output_type),
+            O::reshape_op(input_type, output_type),
             vec![output_value],
         )?
         .into_iter()
@@ -414,14 +415,22 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType
     }
 }
 
-impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps, S: OperationSet<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S> for ReshapeOp
+impl<
+    V: ReshapeValue + ZeroLike + OneLike + MatrixOps,
+    O: Clone,
+    L: Clone
+        + Op<ArrayType>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearReshapeOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
+> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for ReshapeOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
-        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
+        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }

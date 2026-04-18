@@ -11,8 +11,9 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         CompiledFunction, JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
+        jit::{TraceInput, TraceOutput},
         operations::{AddOp, FlatTracedVMap, MulOp, NegOp, VMapOp},
-        ops::{InterpretableOp, Op, OperationSet, SupportsVMap, VectorizableOp},
+        ops::{InterpretableOp, Op, VMapTracingOperation, VectorizableOp},
     },
     types::{ArrayType, Typed},
 };
@@ -212,25 +213,27 @@ impl<
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
-    S: OperationSet<ArrayType, V> + SupportsVMap<ArrayType, V>,
-> VMapInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, S>
+    O: Clone + Op<ArrayType>,
+    L: Clone,
+> VMapInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, O, L>
 where
     Input::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<V>,
     Output::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<Self> + ParameterizedFamily<V>,
     V: Parameterized<
             V,
-            To<JitTracer<ArrayType, V, S>> = JitTracer<ArrayType, V, S>,
+            To<JitTracer<ArrayType, V, O, L>> = JitTracer<ArrayType, V, O, L>,
             ParameterStructure: Clone + PartialEq,
         >,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
+    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
     Vec<V>: Parameterized<
             V,
-            To<JitTracer<ArrayType, V, S>> = Vec<JitTracer<ArrayType, V, S>>,
+            To<JitTracer<ArrayType, V, O, L>> = Vec<JitTracer<ArrayType, V, O, L>>,
             ParameterStructure = Vec<Placeholder>,
         >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, S>>,
-    S::TracingOperation: Op<ArrayType>,
-    S::TracingOperation: InterpretableOp<ArrayType, V>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    Input::To<V>: TraceInput<V, O, L>,
+    Output::To<V>: TraceOutput<V, O, L>,
+    O: InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
     where
@@ -254,35 +257,34 @@ where
             traced_inputs[0].iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
         )?;
 
-        let (exemplar_outputs, body_program): (
-            Output::To<V>,
-            Program<ArrayType, V, Input::To<V>, Output::To<V>, <S as OperationSet<ArrayType, V>>::TracingOperation>,
-        ) = crate::tracing_v2::jit::try_trace_program_for_op_set::<_, Input::To<V>, Output::To<V>, V, S>(
-            |lane_inputs| {
-                let batched_inputs = Input::To::<Batch<JitTracer<ArrayType, V, S>>>::from_parameters(
-                    lane_inputs.parameter_structure(),
-                    lane_inputs.into_parameters().map(|input| Batch::new(vec![input])),
-                )?;
-                let batched_outputs = function(batched_inputs);
-                let output_structure = batched_outputs.parameter_structure();
-                let mut lane_outputs = Vec::new();
-                for batch in batched_outputs.into_parameters() {
-                    let mut outputs = batch.into_lanes();
-                    if outputs.len() != 1 {
-                        return Err(TraceError::HigherOrderOpFailure {
-                            op: "vmap",
-                            message: "traced vmap only supports bodies that preserve the per-lane output structure"
-                                .to_string(),
-                        });
+        let (exemplar_outputs, body_program): (Output::To<V>, Program<ArrayType, V, Input::To<V>, Output::To<V>, O>) =
+            crate::tracing_v2::jit::try_trace_program_for_operation::<_, Input::To<V>, Output::To<V>, V, O, L>(
+                |lane_inputs| {
+                    let batched_inputs = Input::To::<Batch<JitTracer<ArrayType, V, O, L>>>::from_parameters(
+                        lane_inputs.parameter_structure(),
+                        lane_inputs.into_parameters().map(|input| Batch::new(vec![input])),
+                    )?;
+                    let batched_outputs = function(batched_inputs);
+                    let output_structure = batched_outputs.parameter_structure();
+                    let mut lane_outputs = Vec::new();
+                    for batch in batched_outputs.into_parameters() {
+                        let mut outputs = batch.into_lanes();
+                        if outputs.len() != 1 {
+                            return Err(TraceError::HigherOrderOpFailure {
+                                op: "vmap",
+                                message: "traced vmap only supports bodies that preserve the per-lane output structure"
+                                    .to_string(),
+                            });
+                        }
+                        lane_outputs.push(outputs.pop().expect("single-lane batches should contain one output"));
                     }
-                    lane_outputs.push(outputs.pop().expect("single-lane batches should contain one output"));
-                }
-                Ok(<<Output as Parameterized<JitTracer<ArrayType, V, S>>>::To<V> as Parameterized<V>>::To::<
-                    JitTracer<ArrayType, V, S>,
-                >::from_parameters(output_structure, lane_outputs)?)
-            },
-            exemplar_primals,
-        )?;
+                    Ok(<Output::To<V> as TraceOutput<V, O, L>>::Traced::from_parameters(
+                        output_structure,
+                        lane_outputs,
+                    )?)
+                },
+                exemplar_primals,
+            )?;
 
         let output_structure = exemplar_outputs.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
@@ -317,7 +319,7 @@ where
             .collect::<Vec<_>>();
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
         let staged_outputs =
-            JitTracer::apply_staged_op(staged_inputs.as_slice(), S::vmap_op(VMapOp::new(body)), output_values)?;
+            JitTracer::apply_staged_op(staged_inputs.as_slice(), O::vmap_op(VMapOp::new(body)), output_values)?;
         (0..lane_count)
             .map(|lane_index| {
                 let start = lane_index * output_leaf_count;

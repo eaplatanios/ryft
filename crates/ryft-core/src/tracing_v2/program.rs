@@ -8,36 +8,33 @@ use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{
-        Graph, GraphBuilder, InterpretableOp, Op, TraceError, Traceable,
-        ops::{CoreOperationSet, OperationSet},
-    },
+    tracing_v2::{Graph, GraphBuilder, InterpretableOp, LinearPrimitiveOp, Op, PrimitiveOp, TraceError, Traceable},
     types::{ArrayType, Type, Typed},
 };
 
-/// Operation type used by the staged program IR for op set `S`.
-pub type ProgramOpFor<S, V> = <S as OperationSet<ArrayType, V>>::TracingOperation;
+/// Operation type used by the staged program IR.
+pub type ProgramOpFor<O> = O;
 
 /// Canonical operation type used by the staged program IR.
-pub type ProgramOpRef<V> = ProgramOpFor<CoreOperationSet, V>;
+pub type ProgramOpRef<V> = PrimitiveOp<ArrayType, V>;
 
-/// Shared builder used by the staged program IR for op set `S`.
-pub type ProgramBuilderFor<S, V> = GraphBuilder<ProgramOpFor<S, V>, ArrayType, V>;
+/// Shared builder used by the staged program IR.
+pub type ProgramBuilderFor<V, O> = GraphBuilder<ProgramOpFor<O>, ArrayType, V>;
 
 /// Shared builder used by the canonical staged program IR.
-pub type ProgramBuilder<V> = ProgramBuilderFor<CoreOperationSet, V>;
+pub type ProgramBuilder<V> = ProgramBuilderFor<V, ProgramOpRef<V>>;
 
-/// Operation type used by the staged linear-program IR for op set `S`.
-pub type LinearProgramOpFor<S, V> = <S as OperationSet<ArrayType, V>>::LinearOperation;
+/// Operation type used by the staged linear-program IR.
+pub type LinearProgramOpFor<O> = O;
 
 /// Canonical operation type used by the staged linear-program IR.
-pub type LinearProgramOpRef<V> = LinearProgramOpFor<CoreOperationSet, V>;
-
-/// Shared builder used by the staged linear-program IR for op set `S`.
-pub type LinearProgramBuilderFor<S, V> = GraphBuilder<LinearProgramOpFor<S, V>, ArrayType, V>;
+pub type LinearProgramOpRef<V> = LinearPrimitiveOp<ArrayType, V>;
 
 /// Shared builder used by the staged linear-program IR.
-pub type LinearProgramBuilder<V> = LinearProgramBuilderFor<CoreOperationSet, V>;
+pub type LinearProgramBuilderFor<V, O> = GraphBuilder<LinearProgramOpFor<O>, ArrayType, V>;
+
+/// Shared builder used by the staged linear-program IR.
+pub type LinearProgramBuilder<V> = LinearProgramBuilderFor<V, LinearProgramOpRef<V>>;
 
 /// Canonical staged program used by `tracing_v2`.
 pub struct Program<

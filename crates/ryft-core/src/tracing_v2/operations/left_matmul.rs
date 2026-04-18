@@ -10,8 +10,10 @@ use crate::tracing_v2::{
     jit::JitTracer,
     linear::LinearTerm,
     ops::{
-        DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, OperationSet, SupportsMatMul,
-        SupportsMatrixTranspose, VectorizableOp,
+        DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearAddOperation, LinearLeftMatMulOperation,
+        LinearMatrixTransposeOperation, LinearNegOperation, LinearOperation, LinearPrimitiveOp,
+        LinearRightMatMulOperation, LinearScaleOperation, MatMulTracingOperation, MatrixTransposeTracingOperation, Op,
+        VectorizableOp,
     },
 };
 use crate::types::{ArrayType, Typed};
@@ -106,15 +108,35 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for LeftMatMulOp<V> {
 
 impl<
     V: Traceable<ArrayType> + MatrixOps + ZeroLike,
-    S: OperationSet<ArrayType, V> + SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>> for LeftMatMulOp<V>
+    O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
+    OuterLinearOperation: Clone + 'static,
+    InnerLinearOperation: JitTracerLinearOperation<V, O, OuterLinearOperation>
+        + LinearLeftMatMulOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
+        + LinearRightMatMulOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
+        + LinearMatrixTransposeOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>,
+>
+    InterpretableOp<
+        ArrayType,
+        crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O, OuterLinearOperation>, InnerLinearOperation>,
+    > for LeftMatMulOp<V>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<
+            JitTracer<ArrayType, V, O, OuterLinearOperation>,
+            InnerLinearOperation,
+        >],
+    ) -> Result<
+        Vec<
+            crate::tracing_v2::linear::Linearized<
+                JitTracer<ArrayType, V, O, OuterLinearOperation>,
+                InnerLinearOperation,
+            >,
+        >,
+        TraceError,
+    > {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };
@@ -122,14 +144,23 @@ where
     }
 }
 
-impl<V: MatrixValue + ZeroLike, S: OperationSet<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, S> for LeftMatMulOp<V>
+impl<
+    V: MatrixValue + ZeroLike,
+    O: Clone,
+    L: Clone
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>
+        + LinearLeftMatMulOperation<ArrayType, V>
+        + LinearRightMatMulOperation<ArrayType, V>
+        + LinearMatrixTransposeOperation<ArrayType, V>,
+> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for LeftMatMulOp<V>
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
-        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
+        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = JvpTracer {
             primal: self.factor().clone(),

@@ -18,8 +18,9 @@ use crate::{
         jit::JitTracer,
         linear::LinearTerm,
         ops::{
-            Op, SupportsLinearAdd, SupportsLinearLeftMatMul, SupportsLinearMatrixTranspose, SupportsLinearNeg,
-            SupportsLinearRightMatMul, SupportsLinearScale, SupportsMatMul, SupportsMatrixTranspose, VectorizableOp,
+            LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation, LinearNegOperation,
+            LinearRightMatMulOperation, LinearScaleOperation, MatMulTracingOperation, MatrixTransposeTracingOperation,
+            Op, VectorizableOp,
         },
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
@@ -210,14 +211,17 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     }
 }
 
-impl<V: Traceable<ArrayType> + MatrixOps, S: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>>
-    MatrixOps for JitTracer<ArrayType, V, S>
+impl<
+    V: Traceable<ArrayType> + MatrixOps,
+    O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
+    L: Clone,
+> MatrixOps for JitTracer<ArrayType, V, O, L>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, S::matmul_op(), MatrixOps::matmul)
+        self.binary(rhs, O::matmul_op(), MatrixOps::matmul)
     }
 
     #[inline]
@@ -225,7 +229,7 @@ where
         if matrix_transpose_is_identity_type(&self.tpe()) {
             return self;
         }
-        self.unary(S::matrix_transpose_op(), MatrixOps::transpose_matrix)
+        self.unary(O::matrix_transpose_op(), MatrixOps::transpose_matrix)
     }
 }
 
@@ -249,27 +253,27 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
 
 impl<
     V: MatrixValue + ZeroLike,
-    S: SupportsLinearLeftMatMul<ArrayType, V>
-        + SupportsLinearAdd<ArrayType, V>
-        + SupportsLinearNeg<ArrayType, V>
-        + SupportsLinearRightMatMul<ArrayType, V>
-        + SupportsLinearScale<ArrayType, V>
-        + SupportsLinearMatrixTranspose<ArrayType, V>,
-> MatrixTangentSpace<V> for LinearTerm<ArrayType, V, S>
+    O: LinearLeftMatMulOperation<ArrayType, V>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearRightMatMulOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>
+        + LinearMatrixTransposeOperation<ArrayType, V>,
+> MatrixTangentSpace<V> for LinearTerm<ArrayType, V, O>
 {
     #[inline]
     fn matmul_left(factor: V, tangent: Self) -> Self {
-        tangent.apply_linear_op(S::linear_left_matmul_op(factor))
+        tangent.apply_linear_op(O::linear_left_matmul_op(factor))
     }
 
     #[inline]
     fn matmul_right(tangent: Self, factor: V) -> Self {
-        tangent.apply_linear_op(S::linear_right_matmul_op(factor))
+        tangent.apply_linear_op(O::linear_right_matmul_op(factor))
     }
 
     #[inline]
     fn transpose_matrix(value: Self) -> Self {
-        value.apply_linear_op(S::linear_matrix_transpose_op())
+        value.apply_linear_op(O::linear_matrix_transpose_op())
     }
 }
 
@@ -283,7 +287,9 @@ pub mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{CoordinateValue, CoreOperationSet, Cos, OneLike, Sin, Traceable, ZeroLike, engine::Engine},
+        tracing_v2::{
+            CoordinateValue, Cos, LinearPrimitiveOp, OneLike, PrimitiveOp, Sin, Traceable, ZeroLike, engine::Engine,
+        },
         types::{ArrayType, DataType, Typed},
     };
 
@@ -316,7 +322,8 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f32> {
         type Type = ArrayType;
         type Value = Array2<f32>;
-        type OperationSet = CoreOperationSet;
+        type TracingOperation = PrimitiveOp<ArrayType, Array2<f32>>;
+        type LinearOperation = LinearPrimitiveOp<ArrayType, Array2<f32>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f32> {
@@ -332,7 +339,8 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f64> {
         type Type = ArrayType;
         type Value = Array2<f64>;
-        type OperationSet = CoreOperationSet;
+        type TracingOperation = PrimitiveOp<ArrayType, Array2<f64>>;
+        type LinearOperation = LinearPrimitiveOp<ArrayType, Array2<f64>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f64> {

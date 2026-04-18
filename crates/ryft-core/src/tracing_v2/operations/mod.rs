@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 
 use crate::sharding::Sharding;
-use crate::tracing_v2::{TraceError, Traceable, batch::Batch, jit::JitTracer, ops::OperationSet};
+use std::marker::PhantomData;
+
+use crate::tracing_v2::{TraceError, Traceable, batch::Batch, jit::JitTracer};
 use crate::types::ArrayType;
 
 fn is_replicated_sharding(sharding: &Sharding) -> bool {
@@ -114,13 +116,13 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
 }
 
 /// Lifts one concrete value into the staged graph owned by a JIT tracer.
-pub fn lift_jit_constant<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>>(
+pub fn lift_jit_constant<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>(
     constant: &V,
-    exemplar: &JitTracer<ArrayType, V, S>,
-) -> JitTracer<ArrayType, V, S> {
+    exemplar: &JitTracer<ArrayType, V, O, L>,
+) -> JitTracer<ArrayType, V, O, L> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
-    JitTracer::from_staged_parts(constant.clone(), atom, builder, exemplar.staging_error_handle())
+    JitTracer::from_staged_parts(constant.clone(), atom, builder, exemplar.staging_error_handle(), PhantomData)
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.

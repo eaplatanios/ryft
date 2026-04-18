@@ -15,7 +15,7 @@
 //!   concrete value. These leaves use stateful engines that carry the required handles.
 //!
 //! Engines are intentionally kept small: they expose metadata-only synthesis (zero and one) and
-//! also select the staged [`OperationSet`](crate::tracing_v2::OperationSet) used by user-facing tracing
+//! also choose the staged ordinary and linear operation carriers used by user-facing tracing
 //! transforms. Per-equation evaluation paths (`InterpretableOp::interpret`, `abstract_eval`, and
 //! similar) remain engine-free so that the common fast path is never forced through a dispatch
 //! layer.
@@ -29,10 +29,8 @@
 
 use std::{fmt::Display, marker::PhantomData};
 
-use half::{bf16, f16};
-
 use crate::{
-    tracing_v2::CoreOperationSet,
+    tracing_v2::{LinearPrimitiveOp, PrimitiveOp},
     types::{ArrayType, Type},
 };
 
@@ -40,7 +38,7 @@ use crate::{
 ///
 /// An [`Engine`] carries whatever context is required to construct a value of
 /// [`Value`](Engine::Value) from a [`Type`](Engine::Type) descriptor. The sole responsibility
-/// of the trait is metadata-driven zero/one construction plus staged-op-set selection for the
+/// of the trait is metadata-driven zero/one construction plus staged-carrier selection for the
 /// user-facing tracing transforms. The hot evaluation paths do not use it, so engine dispatch is
 /// restricted to the few call sites that genuinely need representative synthesis or an explicit
 /// backend token.
@@ -54,12 +52,11 @@ pub trait Engine {
     /// Concrete leaf value produced by this engine.
     type Value;
 
-    /// Closed staged-op universe selected by this engine for public tracing transforms.
-    ///
-    /// Engines that are used only for metadata synthesis may still set this to a tracing op-set
-    /// type that is never exercised. Public tracing APIs add the stronger bound
-    /// `Self::OperationSet: OperationSet<Self::Type, Self::Value>` only when they actually stage a program.
-    type OperationSet;
+    /// Ordinary staged operation type selected by this engine for public tracing transforms.
+    type TracingOperation: Clone + 'static;
+
+    /// Linear staged operation type selected by this engine for tangent and cotangent programs.
+    type LinearOperation: Clone + 'static;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
     fn zero(&self, r#type: &Self::Type) -> Self::Value;
@@ -94,7 +91,8 @@ macro_rules! impl_engine_for_array_scalar_engine {
         impl Engine for ArrayScalarEngine<$ty> {
             type Type = ArrayType;
             type Value = $ty;
-            type OperationSet = CoreOperationSet;
+            type TracingOperation = PrimitiveOp<ArrayType, $ty>;
+            type LinearOperation = LinearPrimitiveOp<ArrayType, $ty>;
 
             #[inline]
             fn zero(&self, _type: &ArrayType) -> $ty {
@@ -109,17 +107,6 @@ macro_rules! impl_engine_for_array_scalar_engine {
     };
 }
 
-impl_engine_for_array_scalar_engine!(bool, false, true);
-impl_engine_for_array_scalar_engine!(i8, 0, 1);
-impl_engine_for_array_scalar_engine!(i16, 0, 1);
-impl_engine_for_array_scalar_engine!(i32, 0, 1);
-impl_engine_for_array_scalar_engine!(i64, 0, 1);
-impl_engine_for_array_scalar_engine!(u8, 0, 1);
-impl_engine_for_array_scalar_engine!(u16, 0, 1);
-impl_engine_for_array_scalar_engine!(u32, 0, 1);
-impl_engine_for_array_scalar_engine!(u64, 0, 1);
-impl_engine_for_array_scalar_engine!(bf16, bf16::ZERO, bf16::ONE);
-impl_engine_for_array_scalar_engine!(f16, f16::ZERO, f16::ONE);
 impl_engine_for_array_scalar_engine!(f32, 0.0, 1.0);
 impl_engine_for_array_scalar_engine!(f64, 0.0, 1.0);
 

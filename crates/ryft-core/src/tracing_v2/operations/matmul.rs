@@ -7,7 +7,7 @@ use crate::tracing_v2::{
     batch::Batch as BatchedValue,
     engine::Engine,
     forward::JvpTracer,
-    ops::{DifferentiableOp, InterpretableOp, Op, OperationSet, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -50,12 +50,12 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatMulOp {
     }
 }
 
-impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, S: OperationSet<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, T, S> for MatMulOp
+impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone>
+    DifferentiableOp<ArrayType, V, T, O, L> for MatMulOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 2)?;

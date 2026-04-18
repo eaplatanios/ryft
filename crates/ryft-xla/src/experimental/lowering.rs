@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, MatrixOps, Op, OperationSet, PrimitiveOp, Traceable,
+    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, MatrixOps, Op, PrimitiveOp, Traceable,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, LinearRematerializeOp, LinearVMapOp,
         MatMulOp, MatrixTransposeOp, MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -135,15 +135,15 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V, S>(
+    pub(crate) fn lower_vmap<V, O, L>(
         &mut self,
-        vmap_op: &VMapOp<ArrayType, V, S>,
+        vmap_op: &VMapOp<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OperationSet<ArrayType, V>,
-        S::TracingOperation: Clone + Op + XlaOp<V>,
+        O: Clone + Op + XlaOp<V>,
+        L: Clone,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -157,15 +157,15 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V, S>(
+    pub(crate) fn lower_rematerialize<V, O, L>(
         &mut self,
-        remat_op: &RematerializeOp<ArrayType, V, S>,
+        remat_op: &RematerializeOp<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OperationSet<ArrayType, V>,
-        S::TracingOperation: Clone + Op + XlaOp<V>,
+        O: Clone + Op + XlaOp<V>,
+        L: Clone,
     {
         lower_rematerialize_inline(
             remat_op.body().compiled().program().graph(),
@@ -178,7 +178,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 }
 
 /// StableHLO lowering hook carried by one [`CustomPrimitive`].
-pub(crate) trait StableHloCustomLowering<V: Traceable<ArrayType>>: Send + Sync {
+pub(crate) trait StableHloCustomLowering<V: Traceable<ArrayType>> {
     /// Lowers one custom primitive to StableHLO/Shardy operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -510,9 +510,9 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for ReshapeOp {
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> XlaOp<V> for VMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, O: Clone + Op + XlaOp<V>, L: Clone> XlaOp<V> for VMapOp<ArrayType, V, O, L>
 where
-    S::TracingOperation: Clone + Op + XlaOp<V>,
+    O: XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -641,9 +641,9 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> XlaOp<V> for LinearVMapOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, O: Clone + Op + XlaOp<V>> XlaOp<V> for LinearVMapOp<ArrayType, V, O>
 where
-    S::LinearOperation: Clone + Op + XlaOp<V>,
+    O: XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -666,9 +666,9 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, S: OperationSet<ArrayType, V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, S>
+impl<V: Traceable<ArrayType>, O: Clone + Op + XlaOp<V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, O>
 where
-    S::LinearOperation: Clone + Op + XlaOp<V>,
+    O: XlaOp<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -864,15 +864,15 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V, S>(
+    pub(crate) fn lower_vmap<V, O, L>(
         &mut self,
-        vmap_op: &VMapOp<ArrayType, V, S>,
+        vmap_op: &VMapOp<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OperationSet<ArrayType, V>,
-        S::TracingOperation: Clone + Op + XlaOp<V>,
+        O: Clone + Op + XlaOp<V>,
+        L: Clone,
     {
         lower_vmap_results(
             vmap_op.body(),
@@ -886,15 +886,15 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V, S>(
+    pub(crate) fn lower_rematerialize<V, O, L>(
         &mut self,
-        remat_op: &RematerializeOp<ArrayType, V, S>,
+        remat_op: &RematerializeOp<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
-        S: OperationSet<ArrayType, V>,
-        S::TracingOperation: Clone + Op + XlaOp<V>,
+        O: Clone + Op + XlaOp<V>,
+        L: Clone,
     {
         lower_rematerialize_inline(
             remat_op.body().compiled().program().graph(),
@@ -1379,10 +1379,11 @@ enum VMapLoweringMode {
 }
 
 /// Maps the canonical traced `vmap` op to the lowering-specific packing mode.
-fn lower_vmap_mode<V, S>(_vmap_op: &VMapOp<ArrayType, V, S>) -> VMapLoweringMode
+fn lower_vmap_mode<V, O, L>(_vmap_op: &VMapOp<ArrayType, V, O, L>) -> VMapLoweringMode
 where
     V: Traceable<ArrayType>,
-    S: OperationSet<ArrayType, V>,
+    O: Clone,
+    L: Clone,
 {
     VMapLoweringMode::Forward
 }
@@ -2796,7 +2797,7 @@ mod tests {
         op: XlaPrimitiveOp,
     ) -> Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilderFor::<crate::experimental::ops::XlaOperationSet, ShardMapTensor>::new();
+        let mut builder = ProgramBuilderFor::<ShardMapTensor, crate::experimental::ops::XlaPrimitiveOp>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
         let output = builder.add_equation(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)

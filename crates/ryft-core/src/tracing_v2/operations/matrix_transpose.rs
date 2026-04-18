@@ -8,7 +8,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::JvpTracer,
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, OperationSet, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -70,12 +70,12 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, S: OperationSet<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, T, S> for MatrixTransposeOp
+impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone>
+    DifferentiableOp<ArrayType, V, T, O, L> for MatrixTransposeOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

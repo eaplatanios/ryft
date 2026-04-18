@@ -8,7 +8,7 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
-    ops::{DifferentiableOp, InterpretableOp, Op, OperationSet, SupportsSin, VectorizableOp},
+    ops::{DifferentiableOp, InterpretableOp, Op, SinTracingOperation, VectorizableOp},
 };
 use crate::types::ArrayType;
 
@@ -67,12 +67,12 @@ impl<V: Traceable<ArrayType> + Sin> InterpretableOp<ArrayType, V> for SinOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, S: OperationSet<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, T, S> for SinOp
+impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
+    DifferentiableOp<ArrayType, V, T, O, L> for SinOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
@@ -98,13 +98,14 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin, S: SupportsSin<ArrayType, V>> Sin for JitTracer<ArrayType, V, S>
+impl<V: Traceable<ArrayType> + Sin, O: SinTracingOperation<ArrayType, V>, L: Clone> Sin
+    for JitTracer<ArrayType, V, O, L>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(S::sin_op(), Sin::sin)
+        self.unary(O::sin_op(), Sin::sin)
     }
 }
 

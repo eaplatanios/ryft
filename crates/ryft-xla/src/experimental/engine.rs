@@ -1,35 +1,33 @@
-//! Stateful [`Engine`] implementation that backs traced XLA programs with concrete PJRT arrays.
+//! XLA backend token used for both shard-map tracing and PJRT-backed execution.
 //!
-//! This module provides [`XlaEngine`], the single entry point for going from a traced
-//! [`TracedXlaProgram`] to a running computation against a live PJRT [`Client`]. It is the
-//! XLA-backed counterpart to the stateless
-//! [`ArrayScalarEngine`](ryft_core::tracing_v2::engine::ArrayScalarEngine) and the
-//! [`ShardMapTensorEngine`](super::shard_map::ShardMapTensorEngine) used during shard-map staging.
+//! [`XlaEngine`] is generic over its leaf value type:
 //!
-//! At the tracing layer the engine satisfies [`Engine`] with `Type = ArrayType` and
-//! `Value = Array<'c>`, so transforms such as differentiation can synthesize zero and one seed
-//! values from [`ArrayType`] metadata alone. The same handle also carries the PJRT context
-//! needed for lowering to MLIR, compilation, and execution, which keeps callers from threading
-//! those dependencies through every orchestration call.
+//! - [`XlaEngine<'c, Array<'c>>`](XlaEngine) materializes concrete PJRT-backed arrays, lowers
+//!   traced programs to MLIR, compiles them, and executes them.
+//! - [`XlaEngine<'static, ShardMapTensor>`](XlaEngine) is the tracing specialization used while
+//!   staging shard-map bodies. It shares the same backend token and XLA staged-op carrier, but it
+//!   only needs metadata-driven `zero` / `one` synthesis.
 //!
 //! Cloning [`Array<'c>`] is cheap because every shard buffer lives behind an [`Arc`]; this is what
 //! lets [`XlaEngine`] act as the engine value for transforms that require
 //! [`Clone`](Engine::Value).
+
+use std::marker::PhantomData;
 
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, MeshDeviceId, Sharding};
-use ryft_core::tracing_v2::engine::Engine;
+use ryft_core::tracing_v2::{LinearPrimitiveOp, engine::Engine};
 use ryft_core::types::data_types::DataType;
 use ryft_core::types::{ArrayType, Size};
 
 use crate::pjrt::ToPjrt;
 
 use super::arrays::{Array, ArrayError};
-use super::ops::XlaOperationSet;
-use super::shard_map::{ShardMapTraceError, TracedXlaProgram};
+use super::ops::XlaPrimitiveOp;
+use super::shard_map::{ShardMapConstantKind, ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 
 /// Error type returned by [`XlaEngine`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -61,19 +59,22 @@ pub enum XlaEngineError {
 /// methods can rebuild a replicated fallback sharding from `self.mesh.logical_mesh` when the
 /// supplied [`ArrayType`] omits one. The trait contract requires [`ArrayType::shape`] to be
 /// fully static on the types passed to `zero` / `one`; dynamic shapes panic.
-pub struct XlaEngine<'c> {
-    /// PJRT client used by this engine.
-    client: &'c Client<'c>,
+pub struct XlaEngine<'c, V = Array<'c>> {
+    /// PJRT client used by the execution specialization of this engine.
+    client: Option<&'c Client<'c>>,
 
-    /// Concrete device mesh used to resolve shard placement when an [`ArrayType`] does not
+    /// Concrete device mesh used by the execution specialization when an [`ArrayType`] does not
     /// specify a sharding.
-    mesh: DeviceMesh,
+    mesh: Option<DeviceMesh>,
 
     /// Default compilation options forwarded to [`Client::compile`].
     compilation_options: CompilationOptions,
+
+    /// Leaf-value marker selecting the tracing or execution specialization.
+    marker: PhantomData<fn() -> V>,
 }
 
-impl<'c> XlaEngine<'c> {
+impl<'c> XlaEngine<'c, Array<'c>> {
     /// Creates a new [`XlaEngine`] with default [`CompilationOptions`].
     #[inline]
     pub fn new(client: &'c Client<'c>, mesh: DeviceMesh) -> Self {
@@ -87,19 +88,19 @@ impl<'c> XlaEngine<'c> {
         mesh: DeviceMesh,
         compilation_options: CompilationOptions,
     ) -> Self {
-        Self { client, mesh, compilation_options }
+        Self { client: Some(client), mesh: Some(mesh), compilation_options, marker: PhantomData }
     }
 
     /// Returns the PJRT [`Client`] this engine was constructed with.
     #[inline]
     pub fn client(&self) -> &'c Client<'c> {
-        self.client
+        self.client.expect("execution XlaEngine should always carry a client")
     }
 
     /// Returns the concrete [`DeviceMesh`] this engine resolves shard placement against.
     #[inline]
     pub fn mesh(&self) -> &DeviceMesh {
-        &self.mesh
+        self.mesh.as_ref().expect("execution XlaEngine should always carry a device mesh")
     }
 
     /// Returns the [`CompilationOptions`] that [`XlaEngine::compile`] forwards to PJRT.
@@ -109,10 +110,19 @@ impl<'c> XlaEngine<'c> {
     }
 }
 
-impl<'c> Engine for XlaEngine<'c> {
+impl XlaEngine<'static, ShardMapTensor> {
+    /// Creates a tracing-only [`XlaEngine`] that synthesizes [`ShardMapTensor`] values.
+    #[inline]
+    pub(crate) fn tracing() -> Self {
+        Self { client: None, mesh: None, compilation_options: CompilationOptions::default(), marker: PhantomData }
+    }
+}
+
+impl<'c> Engine for XlaEngine<'c, Array<'c>> {
     type Type = ArrayType;
     type Value = Array<'c>;
-    type OperationSet = XlaOperationSet;
+    type TracingOperation = ();
+    type LinearOperation = ();
 
     fn zero(&self, array_type: &ArrayType) -> Array<'c> {
         self.constant(array_type, ConstantKind::Zero)
@@ -125,22 +135,37 @@ impl<'c> Engine for XlaEngine<'c> {
     }
 }
 
-impl<'c> XlaEngine<'c> {
+impl<'c> Engine for XlaEngine<'c, ShardMapTensor> {
+    type Type = ArrayType;
+    type Value = ShardMapTensor;
+    type TracingOperation = XlaPrimitiveOp;
+    type LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTensor>;
+
+    fn zero(&self, array_type: &ArrayType) -> ShardMapTensor {
+        ShardMapTensor::constant(array_type.clone(), ShardMapConstantKind::Zero)
+    }
+
+    fn one(&self, array_type: &ArrayType) -> ShardMapTensor {
+        ShardMapTensor::constant(array_type.clone(), ShardMapConstantKind::One)
+    }
+}
+
+impl<'c> XlaEngine<'c, Array<'c>> {
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, XlaEngineError> {
         let global_shape = static_shape_or_panic(array_type);
         let sharding = match &array_type.sharding {
             Some(sharding) => sharding.clone(),
-            None => Sharding::replicated(self.mesh.logical_mesh.clone(), global_shape.len()),
+            None => Sharding::replicated(self.mesh().logical_mesh.clone(), global_shape.len()),
         };
         let effective_type =
             ArrayType::new(array_type.data_type, array_type.shape.clone(), array_type.layout.clone(), Some(sharding))
                 .map_err(ArrayError::from)?;
-        let addressable_device_ids = addressable_mesh_device_ids(self.client, &self.mesh)?;
+        let addressable_device_ids = addressable_mesh_device_ids(self.client(), self.mesh())?;
         let element_size_in_bytes = dense_element_size_in_bytes(array_type.data_type)?;
 
         let mut addressable_buffers = Vec::with_capacity(addressable_device_ids.len());
-        for shard in shards_for_type(&effective_type, &self.mesh)? {
+        for shard in shards_for_type(&effective_type, self.mesh())? {
             if !addressable_device_ids.contains(&shard.device.id) {
                 continue;
             }
@@ -149,7 +174,7 @@ impl<'c> XlaEngine<'c> {
             let bytes = constant_bytes(array_type.data_type, kind, element_count, element_size_in_bytes);
             let dimensions = shard_shape.iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let device = self
-                .client
+                .client()
                 .addressable_devices()?
                 .into_iter()
                 .find(|device| device.id().map(|id| id == shard.device.id).unwrap_or(false))
@@ -157,7 +182,7 @@ impl<'c> XlaEngine<'c> {
                     device_id: shard.device.id,
                     process_index: shard.device.process_index,
                 })?;
-            let buffer = self.client.buffer(
+            let buffer = self.client().buffer(
                 bytes.as_slice(),
                 array_type.data_type.to_pjrt(),
                 dimensions.as_slice(),
@@ -168,7 +193,7 @@ impl<'c> XlaEngine<'c> {
             addressable_buffers.push(buffer);
         }
 
-        Array::new(effective_type, self.mesh.clone(), addressable_buffers).map_err(Into::into)
+        Array::new(effective_type, self.mesh().clone(), addressable_buffers).map_err(Into::into)
     }
 
     /// Renders a traced XLA program as a StableHLO/Shardy MLIR module.
@@ -201,7 +226,7 @@ impl<'c> XlaEngine<'c> {
     ///   - `mlir_module`: MLIR text for the module to compile.
     pub fn compile(&self, mlir_module: &str) -> Result<LoadedExecutable<'c>, XlaEngineError> {
         let program = Program::Mlir { bytecode: mlir_module.as_bytes().to_vec() };
-        self.client.compile(&program, &self.compilation_options).map_err(Into::into)
+        self.client().compile(&program, &self.compilation_options).map_err(Into::into)
     }
 
     /// Executes a compiled program against this engine's device mesh, reassembling per-device
@@ -254,13 +279,13 @@ impl<'c> XlaEngine<'c> {
                 Some(sharding) => sharding.clone(),
                 None => {
                     let rank = output_type.shape.dimensions.len();
-                    Sharding::replicated(self.mesh.logical_mesh.clone(), rank)
+                    Sharding::replicated(self.mesh().logical_mesh.clone(), rank)
                 }
             };
             let resolved_type =
                 ArrayType::new(output_type.data_type, output_type.shape, output_type.layout, Some(sharding))
                     .map_err(ArrayError::from)?;
-            outputs.push(Array::new(resolved_type, self.mesh.clone(), addressable_buffers)?);
+            outputs.push(Array::new(resolved_type, self.mesh().clone(), addressable_buffers)?);
         }
         Ok(outputs)
     }

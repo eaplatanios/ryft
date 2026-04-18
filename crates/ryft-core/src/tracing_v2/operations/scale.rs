@@ -16,8 +16,8 @@ use crate::tracing_v2::{
     jit::JitTracer,
     linear::LinearTerm,
     ops::{
-        DifferentiableOp, InterpretableOp, LinearOperation, Op, OperationSet, SupportsMul, SupportsScale,
-        VectorizableOp,
+        DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearOperation, MulTracingOperation, Op,
+        ScaleTracingOperation, VectorizableOp,
     },
 };
 use crate::types::{ArrayType, Type, Typed};
@@ -102,16 +102,32 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
 
 impl<
     V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>,
-    S: OperationSet<ArrayType, V> + SupportsMul<ArrayType, V> + SupportsScale<ArrayType, V>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>
-    for ScaleOp<ArrayType, V>
+    O: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V>,
+    OuterLinearOperation: Clone + 'static,
+    InnerLinearOperation: JitTracerLinearOperation<V, O, OuterLinearOperation>,
+>
+    InterpretableOp<
+        ArrayType,
+        crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O, OuterLinearOperation>, InnerLinearOperation>,
+    > for ScaleOp<ArrayType, V>
 where
-    S::TracingOperation: Op<ArrayType>,
+    O: Op<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, S>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<
+            JitTracer<ArrayType, V, O, OuterLinearOperation>,
+            InnerLinearOperation,
+        >],
+    ) -> Result<
+        Vec<
+            crate::tracing_v2::linear::Linearized<
+                JitTracer<ArrayType, V, O, OuterLinearOperation>,
+                InnerLinearOperation,
+            >,
+        >,
+        TraceError,
+    > {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         Ok(vec![JvpTracer {
@@ -121,12 +137,12 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, S: OperationSet<ArrayType, V>>
-    DifferentiableOp<ArrayType, V, T, S> for ScaleOp<ArrayType, V>
+impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
+    DifferentiableOp<ArrayType, V, T, O, L> for ScaleOp<ArrayType, V>
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, OperationSet = S>,
+        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;

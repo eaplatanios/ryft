@@ -69,16 +69,17 @@ use thiserror::Error;
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::{
-    CompiledFunction, Cos, JitTracer, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike, jit,
+    CompiledFunction, Cos, JitTracer, LinearPrimitiveOp, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable,
+    ZeroLike, jit,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
-use crate::experimental::ops::{XlaOperationSet, XlaPrimitiveOp};
+use crate::experimental::ops::XlaPrimitiveOp;
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
-use super::lowering::LoweringError;
+use super::{engine::XlaEngine, lowering::LoweringError};
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -285,7 +286,7 @@ impl ShardMapTensor {
         Self { r#type, constant_kind: None }
     }
 
-    fn constant(r#type: ArrayType, constant_kind: ShardMapConstantKind) -> Self {
+    pub(crate) fn constant(r#type: ArrayType, constant_kind: ShardMapConstantKind) -> Self {
         Self { r#type, constant_kind: Some(constant_kind) }
     }
 
@@ -340,35 +341,6 @@ impl ZeroLike for ShardMapTensor {
 impl OneLike for ShardMapTensor {
     fn one_like(&self) -> Self {
         Self::constant(without_varying_manual_axes(&self.r#type), ShardMapConstantKind::One)
-    }
-}
-
-/// Stateless [`ryft_core::tracing_v2::engine::Engine`] for synthesizing [`ShardMapTensor`] values from
-/// abstract [`ArrayType`] metadata.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ShardMapTensorEngine;
-
-impl ShardMapTensorEngine {
-    /// Returns a new [`ShardMapTensorEngine`]. This is a no-op at runtime since the engine is zero-sized.
-    #[inline]
-    pub(crate) const fn new() -> Self {
-        Self
-    }
-}
-
-impl ryft_core::tracing_v2::engine::Engine for ShardMapTensorEngine {
-    type Type = ArrayType;
-    type Value = ShardMapTensor;
-    type OperationSet = XlaOperationSet;
-
-    #[inline]
-    fn zero(&self, r#type: &ArrayType) -> ShardMapTensor {
-        ShardMapTensor::constant(without_varying_manual_axes(r#type), ShardMapConstantKind::Zero)
-    }
-
-    #[inline]
-    fn one(&self, r#type: &ArrayType) -> ShardMapTensor {
-        ShardMapTensor::constant(without_varying_manual_axes(r#type), ShardMapConstantKind::One)
     }
 }
 
@@ -455,7 +427,8 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging shard-map bodies.
-pub(crate) type ShardMapTracer = JitTracer<ArrayType, ShardMapTensor, XlaOperationSet>;
+pub(crate) type ShardMapTracer =
+    JitTracer<ArrayType, ShardMapTensor, XlaPrimitiveOp, LinearPrimitiveOp<ArrayType, ShardMapTensor>>;
 
 /// Compiled staged XLA function specialized to the backend-owned XLA op universe.
 pub(crate) type XlaCompiledFunction<Input, Output> =
@@ -1249,7 +1222,7 @@ where
     Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
 {
     let traced_inputs = traced_input_tensors(input_types)?;
-    let engine = ShardMapTensorEngine::new();
+    let engine = XlaEngine::tracing();
     let (output_tensors, compiled): (
         Output::To<ShardMapTensor>,
         XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
@@ -3045,12 +3018,9 @@ mod tests {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x: ShardMapTracer| {
-                let gradient: ShardMapTracer = grad(
-                    &crate::experimental::shard_map::ShardMapTensorEngine::new(),
-                    |y: ShardMapTracer| y.sin(),
-                    x.clone(),
-                )
-                .expect("gradient inside shard_map should succeed");
+                let gradient: ShardMapTracer =
+                    grad(&crate::experimental::engine::XlaEngine::tracing(), |y: ShardMapTracer| y.sin(), x.clone())
+                        .expect("gradient inside shard_map should succeed");
                 let lanes: Vec<ShardMapTracer> = vmap(
                     |y: ryft_core::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
                     vec![gradient.clone(), gradient],
@@ -3216,7 +3186,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     grad(
-                        &crate::experimental::shard_map::ShardMapTensorEngine::new(),
+                        &crate::experimental::engine::XlaEngine::tracing(),
                         {
                             let mesh = mesh.clone();
                             let sharding = sharding.clone();

@@ -7,8 +7,8 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp, TraceError,
-    VectorizableOp,
+    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp, PrimitiveOp,
+    TraceError, VectorizableOp,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -21,7 +21,7 @@ use ryft_mlir::{Block, Operation, Value};
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
-use crate::experimental::ops::{XlaOperationSet, XlaPrimitiveOp};
+use crate::experimental::ops::XlaPrimitiveOp;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 use crate::mlir::ToMlir;
 
@@ -63,8 +63,13 @@ impl WithShardingConstraintOp {
     /// Returns the tensor-leaf custom primitive registration for this op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive::<ShardMapTensor>()
-            .with_jvp_rule_for::<XlaOperationSet, _>(self.clone())
-            .with_linearized_jit_rule_for::<XlaOperationSet, _>(self.clone())
+            .with_jvp_rule_for::<XlaPrimitiveOp, LinearPrimitiveOp<ArrayType, ShardMapTensor>, _>(self.clone())
+            .with_linearized_jit_rule_for::<
+                XlaPrimitiveOp,
+                LinearPrimitiveOp<ArrayType, ShardMapTensor>,
+                LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+                _,
+            >(self.clone())
             .with_extension(self.clone())
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
     }
@@ -135,14 +140,36 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
     }
 }
 
-impl DifferentiableOp<ArrayType, ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>, XlaOperationSet>
-    for WithShardingConstraintOp
+impl
+    DifferentiableOp<
+        ArrayType,
+        ShardMapTensor,
+        LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
+        XlaPrimitiveOp,
+        LinearPrimitiveOp<ArrayType, ShardMapTensor>,
+    > for WithShardingConstraintOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTensor, OperationSet = XlaOperationSet>,
-        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
+        _engine: &dyn Engine<
+            Type = ArrayType,
+            Value = ShardMapTensor,
+            TracingOperation = XlaPrimitiveOp,
+            LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTensor>,
+        >,
+        inputs: &[JvpTracer<
+            ShardMapTensor,
+            LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
+        >],
+    ) -> Result<
+        Vec<
+            JvpTracer<
+                ShardMapTensor,
+                LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
+            >,
+        >,
+        TraceError,
+    > {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
@@ -209,15 +236,32 @@ impl
     DifferentiableOp<
         ArrayType,
         ShardMapTracer,
-        LinearTerm<ArrayType, ShardMapTracer>,
-        ryft_core::tracing_v2::CoreOperationSet,
+        LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
+        PrimitiveOp<ArrayType, ShardMapTracer>,
+        LinearPrimitiveOp<ArrayType, ShardMapTracer>,
     > for WithShardingConstraintOp
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = ShardMapTracer, OperationSet = ryft_core::tracing_v2::CoreOperationSet>,
-        inputs: &[JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
+        _engine: &dyn Engine<
+            Type = ArrayType,
+            Value = ShardMapTracer,
+            TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
+            LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+        >,
+        inputs: &[JvpTracer<
+            ShardMapTracer,
+            LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
+        >],
+    ) -> Result<
+        Vec<
+            JvpTracer<
+                ShardMapTracer,
+                LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
+            >,
+        >,
+        TraceError,
+    > {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
