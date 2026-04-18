@@ -213,10 +213,8 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
     Output::To<V>: TraceOutput<V, O, L, Traced = Output>,
-    Input::To<ArrayType>:
-        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
-    Output::To<ArrayType>:
-        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
+    Output::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,

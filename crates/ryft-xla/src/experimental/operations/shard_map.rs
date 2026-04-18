@@ -58,16 +58,13 @@ pub enum LinearShardMapEvalMode {
 }
 
 /// Linear execution state carried by one canonical traced shard-map op.
-#[derive(Clone)]
-enum CapturedGlobalPrimal {
-    Concrete(ShardMapTensor),
-    Staged { atom: AtomId },
-}
-
-/// Linear execution state carried by one canonical traced shard-map op.
+///
+/// `captured_global_primals` holds the staging-graph atom ids of the primals captured at linearization time. The
+/// vector is empty for tensor-leaf shard-map ops (where captures are never read) and populated with atom ids for
+/// tracer-leaf ops, where `ShardMapOp<ShardMapTracer>::interpret` reifies each atom back into a `JitTracer`.
 #[derive(Clone)]
 struct LinearShardMapState {
-    captured_global_primals: Vec<CapturedGlobalPrimal>,
+    captured_global_primals: Vec<AtomId>,
     eval_mode: LinearShardMapEvalMode,
     transpose_mode: LinearShardMapEvalMode,
 }
@@ -99,7 +96,7 @@ impl<V: Traceable<ArrayType>> ShardMapOp<V> {
     #[inline]
     fn new_linear(
         body: FlatTracedShardMap,
-        captured_global_primals: Vec<CapturedGlobalPrimal>,
+        captured_global_primals: Vec<AtomId>,
         input_types: Vec<ArrayType>,
         output_types: Vec<ArrayType>,
         eval_mode: LinearShardMapEvalMode,
@@ -183,13 +180,11 @@ impl ShardMapOp<ShardMapTensor> {
         &self,
         primals: &[ShardMapTracer],
     ) -> Result<ShardMapOp<ShardMapTracer>, TraceError> {
+        let captured_atoms = primals.iter().map(|primal| primal.atom()).collect::<Vec<_>>();
         match &self.linear_state {
             Some(linear_state) => Ok(ShardMapOp::new_linear(
                 self.body.clone(),
-                primals
-                    .iter()
-                    .map(|primal| CapturedGlobalPrimal::Staged { atom: primal.atom() })
-                    .collect::<Vec<_>>(),
+                captured_atoms,
                 self.input_types.clone(),
                 self.output_types.clone(),
                 linear_state.eval_mode.clone(),
@@ -199,10 +194,7 @@ impl ShardMapOp<ShardMapTensor> {
                 let linear_bodies = trace_linear_shard_map_bodies(&self.body).map_err(trace_error_from_shard_map)?;
                 Ok(ShardMapOp::new_linear(
                     self.body.clone(),
-                    primals
-                        .iter()
-                        .map(|primal| CapturedGlobalPrimal::Staged { atom: primal.atom() })
-                        .collect::<Vec<_>>(),
+                    captured_atoms,
                     self.body.global_input_types.clone(),
                     self.body.global_output_types.clone(),
                     LinearShardMapEvalMode::Body(linear_bodies.pushforward),
@@ -356,7 +348,7 @@ impl
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_inputs.as_slice(),
             LinearPrimitiveOp::custom(
-                make_linear_tensor_shard_map(self.body(), primal_inputs)
+                make_linear_tensor_shard_map(self.body())
                     .map_err(trace_error_from_shard_map)?
                     .to_tensor_custom_primitive(),
             )?,
@@ -572,23 +564,16 @@ fn trace_error_from_shard_map(error: ShardMapTraceError) -> TraceError {
 
 /// Reifies captured shard-map primals into traced values in the current staging context.
 fn reify_captured_global_primals(
-    captured_global_primals: &[CapturedGlobalPrimal],
+    captured_global_primals: &[AtomId],
     inputs: &[ShardMapTracer],
 ) -> Result<Vec<ShardMapTracer>, TraceError> {
     let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
     let builder = exemplar.builder_handle();
     let staging_error = exemplar.staging_error_handle();
-    captured_global_primals
+    Ok(captured_global_primals
         .iter()
-        .map(|primal| match primal {
-            CapturedGlobalPrimal::Concrete(value) => {
-                <ShardMapTracer as ReplayShardMapValue>::lift_constant(value, inputs)
-            }
-            CapturedGlobalPrimal::Staged { atom } => {
-                Ok(JitTracer::from_staged_parts(*atom, builder.clone(), staging_error.clone(), exemplar.engine()))
-            }
-        })
-        .collect()
+        .map(|atom| JitTracer::from_staged_parts(*atom, builder.clone(), staging_error.clone(), exemplar.engine()))
+        .collect())
 }
 
 /// Returns the number of primal inputs consumed by one transpose shard-map body.
@@ -1010,14 +995,15 @@ fn factorize_transpose_shard_map_body(
 }
 
 /// Builds one linear shard-map op over abstract tensor leaves.
-fn make_linear_tensor_shard_map(
-    body: &FlatTracedShardMap,
-    captured_global_primals: Vec<ShardMapTensor>,
-) -> Result<ShardMapOp<ShardMapTensor>, ShardMapTraceError> {
+///
+/// Tensor-leaf linear shard-map ops do not read `captured_global_primals` during interpretation or MLIR lowering —
+/// the bodies themselves already encode everything the downstream consumers need — so the capture vector is left
+/// empty here.
+fn make_linear_tensor_shard_map(body: &FlatTracedShardMap) -> Result<ShardMapOp<ShardMapTensor>, ShardMapTraceError> {
     let linear_bodies = trace_linear_shard_map_bodies(body)?;
     Ok(ShardMapOp::new_linear(
         body.clone(),
-        captured_global_primals.into_iter().map(CapturedGlobalPrimal::Concrete).collect::<Vec<_>>(),
+        Vec::new(),
         body.global_input_types.clone(),
         body.global_output_types.clone(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),
@@ -1212,10 +1198,7 @@ fn make_linear_shard_map(
     };
     Ok(ShardMapOp::new_linear(
         body.clone(),
-        captured_global_primals
-            .into_iter()
-            .map(|primal| CapturedGlobalPrimal::Staged { atom: primal.atom() })
-            .collect::<Vec<_>>(),
+        captured_global_primals.into_iter().map(|primal| primal.atom()).collect::<Vec<_>>(),
         body.global_input_types.clone(),
         body.global_output_types.clone(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),

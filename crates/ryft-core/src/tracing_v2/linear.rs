@@ -773,10 +773,8 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
     Output::To<V>: TraceOutput<V, O, L, Traced = Output>,
-    Input::To<ArrayType>:
-        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
-    Output::To<ArrayType>:
-        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
+    Output::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
@@ -1048,9 +1046,8 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
     V::To<ArrayType>:
-        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = V, Traced = JitTracer<ArrayType, V, O, L>>,
-    Input::To<ArrayType>:
-        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
+        crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = V, Traced = JitTracer<ArrayType, V, O, L>>,
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
@@ -1343,9 +1340,8 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
     V::To<ArrayType>:
-        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = V, Traced = JitTracer<ArrayType, V, O, L>>,
-    Input::To<ArrayType>:
-        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
+        crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = V, Traced = JitTracer<ArrayType, V, O, L>>,
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
@@ -2010,7 +2006,7 @@ where
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::To<V>: TraceInput<V, E::TracingOperation, E::LinearOperation>,
     Input::Family: ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: crate::tracing_v2::TypeTracingInput<
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<
             ArrayType,
             V,
             E::TracingOperation,
@@ -2018,7 +2014,7 @@ where
             Staged = Input::To<V>,
             Traced = <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
         >,
-    V::To<ArrayType>: crate::tracing_v2::TypeTracingOutput<
+    V::To<ArrayType>: crate::tracing_v2::TypeTracing<
             ArrayType,
             V,
             E::TracingOperation,
@@ -2050,7 +2046,7 @@ where
                 E::LinearOperation,
             >(
                 exemplar_engine,
-                |staged_input: <Input::To<ArrayType> as crate::tracing_v2::TypeTracingInput<
+                |staged_input: <Input::To<ArrayType> as crate::tracing_v2::TypeTracing<
                     ArrayType,
                     V,
                     E::TracingOperation,
@@ -2166,7 +2162,7 @@ where
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::To<V>: TraceInput<V, E::TracingOperation, E::LinearOperation>,
     Input::Family: ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: crate::tracing_v2::TypeTracingInput<
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<
             ArrayType,
             V,
             E::TracingOperation,
@@ -2174,7 +2170,7 @@ where
             Staged = Input::To<V>,
             Traced = <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
         >,
-    V::To<ArrayType>: crate::tracing_v2::TypeTracingOutput<
+    V::To<ArrayType>: crate::tracing_v2::TypeTracing<
             ArrayType,
             V,
             E::TracingOperation,
@@ -2243,7 +2239,7 @@ where
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::To<V>: TraceInput<V, E::TracingOperation, E::LinearOperation>,
     Input::Family: ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: crate::tracing_v2::TypeTracingInput<
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<
             ArrayType,
             V,
             E::TracingOperation,
@@ -2251,7 +2247,7 @@ where
             Staged = Input::To<V>,
             Traced = <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
         >,
-    V::To<ArrayType>: crate::tracing_v2::TypeTracingOutput<
+    V::To<ArrayType>: crate::tracing_v2::TypeTracing<
             ArrayType,
             V,
             E::TracingOperation,
@@ -2285,7 +2281,7 @@ where
                 E::LinearOperation,
             >(
                 exemplar_engine,
-                |staged_input: <Input::To<ArrayType> as crate::tracing_v2::TypeTracingInput<
+                |staged_input: <Input::To<ArrayType> as crate::tracing_v2::TypeTracing<
                     ArrayType,
                     V,
                     E::TracingOperation,

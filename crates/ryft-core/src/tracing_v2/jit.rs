@@ -99,15 +99,20 @@ where
     }
 }
 
-/// Input family that can be rebuilt with type-directed traced leaves.
+/// Type-directed tracing family for one staged carrier pair.
+///
+/// Unifies the input side (rebuilding a type exemplar with type-directed traced leaves via
+/// [`into_type_traced`](Self::into_type_traced)) and the output side (lowering a type-traced output back to type
+/// metadata and staged atoms via [`from_type_traced`](Self::from_type_traced)) into a single trait. Both
+/// directions share the same [`Staged`](Self::Staged) and [`Traced`](Self::Traced) projections.
 #[doc(hidden)]
-pub trait TypeTracingInput<T: Type + Display + Parameter, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>:
+pub trait TypeTracing<T: Type + Display + Parameter, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>:
     Parameterized<T, ParameterStructure: Clone>
 {
     /// Staged concrete leaf family used by the traced program.
     type Staged: Parameterized<V, ParameterStructure = Self::ParameterStructure>;
 
-    /// Type-traced version of this input family for one staged carrier pair.
+    /// Type-traced version of this family for one staged carrier pair.
     type Traced: Parameterized<JitTracer<T, V, O, L>, ParameterStructure = Self::ParameterStructure>;
 
     /// Rebuilds `self` with type-directed traced leaves owned by `builder`.
@@ -117,19 +122,22 @@ pub trait TypeTracingInput<T: Type + Display + Parameter, V: Traceable<T>, O: Cl
         staging_error: Rc<RefCell<Option<TraceError>>>,
         engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     ) -> Result<Self::Traced, TraceError>;
+
+    /// Lowers one type-traced output back to type metadata and output atoms.
+    fn from_type_traced(traced_output: Self::Traced) -> Result<(Self, Vec<AtomId>), TraceError>;
 }
 
-impl<Input, T, V, O, L> TypeTracingInput<T, V, O, L> for Input
+impl<Value, T, V, O, L> TypeTracing<T, V, O, L> for Value
 where
-    Input: Parameterized<T, ParameterStructure: Clone>,
+    Value: Parameterized<T, ParameterStructure: Clone>,
     T: Type + Display + Parameter,
     V: Traceable<T>,
     O: Clone + 'static,
     L: Clone + 'static,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
+    Value::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
 {
-    type Staged = Input::To<V>;
-    type Traced = Input::To<JitTracer<T, V, O, L>>;
+    type Staged = Value::To<V>;
+    type Traced = Value::To<JitTracer<T, V, O, L>>;
 
     fn into_type_traced(
         self,
@@ -147,39 +155,11 @@ where
         )
         .map_err(TraceError::from)
     }
-}
-
-/// Output family that can be lowered back to type metadata after type-directed tracing.
-#[doc(hidden)]
-pub trait TypeTracingOutput<T: Type + Display + Parameter, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>:
-    Parameterized<T, ParameterStructure: Clone>
-{
-    /// Staged concrete leaf family used by the traced program.
-    type Staged: Parameterized<V, ParameterStructure = Self::ParameterStructure>;
-
-    /// Type-traced version of this output family for one staged carrier pair.
-    type Traced: Parameterized<JitTracer<T, V, O, L>, ParameterStructure = Self::ParameterStructure>;
-
-    /// Lowers one type-traced output back to type metadata and output atoms.
-    fn from_type_traced(traced_output: Self::Traced) -> Result<(Self, Vec<AtomId>), TraceError>;
-}
-
-impl<Output, T, V, O, L> TypeTracingOutput<T, V, O, L> for Output
-where
-    Output: Parameterized<T, ParameterStructure: Clone>,
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
-{
-    type Staged = Output::To<V>;
-    type Traced = Output::To<JitTracer<T, V, O, L>>;
 
     fn from_type_traced(traced_output: Self::Traced) -> Result<(Self, Vec<AtomId>), TraceError> {
         let output_structure = traced_output.parameter_structure();
         let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
-        let output_types = Output::from_parameters(
+        let output_types = Value::from_parameters(
             output_structure,
             traced_outputs.iter().map(|output| output.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
@@ -613,8 +593,8 @@ fn try_trace_program_from_types_with_options<E: Engine<Type = T, Value = V>, F, 
 where
     T: Type + Display + Parameter,
     V: Traceable<T>,
-    Input: TypeTracingInput<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracingOutput<T, V, E::TracingOperation, E::LinearOperation>,
+    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
+    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::TracingOperation: Op<T>,
 {
@@ -654,8 +634,8 @@ where
     V: Traceable<T>,
     O: Clone + 'static + Op<T>,
     L: Clone + 'static,
-    Input: TypeTracingInput<T, V, O, L>,
-    Output: TypeTracingOutput<T, V, O, L>,
+    Input: TypeTracing<T, V, O, L>,
+    Output: TypeTracing<T, V, O, L>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
 {
     let input_structure = input_types.parameter_structure();
@@ -732,8 +712,8 @@ where
     E: Engine<Type = T, Value = V>,
     T: Type + Display + Parameter,
     V: Traceable<T>,
-    Input: TypeTracingInput<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracingOutput<T, V, E::TracingOperation, E::LinearOperation>,
+    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
+    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::TracingOperation: Op<T>,
 {
@@ -751,8 +731,8 @@ where
     V: Traceable<T>,
     O: Clone + 'static + Op<T>,
     L: Clone + 'static,
-    Input: TypeTracingInput<T, V, O, L>,
-    Output: TypeTracingOutput<T, V, O, L>,
+    Input: TypeTracing<T, V, O, L>,
+    Output: TypeTracing<T, V, O, L>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
 {
     try_trace_program_from_types_with_operation_options(engine, function, input_types, true)
@@ -809,8 +789,8 @@ where
     E: Engine<Type = T, Value = V>,
     T: Type + Display + Parameter,
     V: Traceable<T>,
-    Input: TypeTracingInput<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracingOutput<T, V, E::TracingOperation, E::LinearOperation>,
+    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
+    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::TracingOperation: Op<T>,
 {
@@ -852,8 +832,8 @@ where
     E: Engine<Type = T, Value = V>,
     T: Type + Display + Parameter,
     V: Traceable<T>,
-    Input: TypeTracingInput<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracingOutput<T, V, E::TracingOperation, E::LinearOperation>,
+    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
+    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Output::Traced,
     E::TracingOperation: Op<T>,
 {
