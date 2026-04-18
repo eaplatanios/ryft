@@ -350,8 +350,8 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
 /// Capability bundle for the ordinary staged operation type stored in traced programs.
 ///
 /// A [`TracingOperation`] is the operation flavor carried by the ordinary staged graph produced by
-/// transforms like [`try_trace_program`](crate::tracing_v2::try_trace_program) and
-/// [`try_jit`](crate::tracing_v2::try_jit). In practice this is usually one backend-owned closed
+/// transforms like [`trace_program`](crate::tracing_v2::trace_program) and
+/// [`jit`](crate::tracing_v2::jit). In practice this is usually one backend-owned closed
 /// enum such as [`PrimitiveOp`] or `XlaPrimitiveOp`, but the trait is written as an additive bundle
 /// so any type that provides the same capabilities can serve as the carrier.
 ///

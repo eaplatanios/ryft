@@ -267,7 +267,7 @@ where
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,
             Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
-        ) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+        ) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
             _,
             Input::To<ArrayType>,
             Output::To<ArrayType>,
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::try_jit(
+        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::jit(
             &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(

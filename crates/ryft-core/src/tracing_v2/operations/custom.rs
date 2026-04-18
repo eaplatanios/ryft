@@ -454,7 +454,7 @@ mod tests {
     use super::*;
     use crate::tracing_v2::{
         Batch, CompiledFunction, LinearProgramBuilder, OneLike, ProgramOpRef, TraceError, engine::ArrayScalarEngine,
-        grad, jvp, try_jit, vmap,
+        grad, jit, jvp, vmap,
     };
     use crate::types::{ArrayType, DataType, Shape};
 
@@ -605,7 +605,7 @@ mod tests {
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = try_jit(
+        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
             &engine,
             {
                 let primitive = primitive.clone();
@@ -653,7 +653,7 @@ mod tests {
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
-        let result: Result<(f64, CompiledFunction<ArrayType, f64, f64, f64>), TraceError> = try_jit(
+        let result: Result<(f64, CompiledFunction<ArrayType, f64, f64, f64>), TraceError> = jit(
             &engine,
             {
                 let primitive = primitive.clone();
@@ -698,7 +698,7 @@ mod tests {
             Ok(1.0f64),
         );
 
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = try_jit(
+        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
             &engine,
             {
                 let primitive = primitive.clone();

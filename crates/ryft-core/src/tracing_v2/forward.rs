@@ -15,8 +15,8 @@ use crate::{
         TraceError, TraceInput, TraceOutput, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
-        jit::{JitTracer, try_jit, try_trace_program},
-        linear::{LinearProgram, Linearized, jvp_program, try_jvp_traced, try_linearize_traced_program},
+        jit::{JitTracer, jit, trace_program},
+        linear::{LinearProgram, Linearized, jvp_program, jvp_traced, linearize_traced_program},
         operations::{CoreLinearReplayOp, DifferentiableOp, InterpretableOp, Op},
         program::{LinearProgramOpRef, Program},
     },
@@ -25,8 +25,10 @@ use crate::{
 
 /// Tangent representation for a traced primal value.
 ///
-/// The default implementation is the primal type itself, but transforms such as `linearize` replace tangents with a
-/// staged linear representation like [`crate::tracing_v2::LinearTerm`].
+/// The default implementation is the primal type itself, but transforms such as [`jvp_program`] replace tangents
+/// with a staged linear representation like [`crate::tracing_v2::LinearTerm`].
+///
+/// [`jvp_program`]: crate::tracing_v2::jvp_program
 pub trait TangentSpace<T: Type, V: Typed<T>>: Clone + Parameter {
     /// Adds two tangent values.
     fn add(lhs: Self, rhs: Self) -> Self;
@@ -191,13 +193,13 @@ where
         }
 
         let (primal_output, tangent_program): (Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>) =
-            jvp_program(engine, function, primals)?;
+            jvp_program(engine, |input| Ok(function(input)), primals)?;
         let tangent_output = tangent_program.call(tangents)?;
         Ok((primal_output, tangent_output))
     }
 }
 
-/// Already-traced dispatch for [`jvp`]: delegates to [`try_jvp_traced`] to replay the user function
+/// Already-traced dispatch for [`jvp`]: delegates to [`jvp_traced`] to replay the user function
 /// symbolically inside an enclosing [`JitTracer`] scope, staging both the primal output and the
 /// tangent propagation as part of the outer compiled graph.
 impl<
@@ -229,17 +231,17 @@ where
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
-        try_jvp_traced::<_, _, _, V, O, L>(|input| Ok(function(input)), primals, tangents)
+        jvp_traced::<_, _, _, V, O, L>(|input| Ok(function(input)), primals, tangents)
     }
 }
 
 /// Batched dispatch for [`jvp`], enabling standalone `vmap(|x| jvp(f, x, dx), inputs)` -- computing
 /// per-element Jacobian-vector products over a batch without requiring an outer [`jit`] wrapper.
 ///
-/// Uses the same trace-once strategy as [`GradInvocationLeaf`](crate::tracing_v2::GradInvocationLeaf)
-/// for [`Batch`]: the user function is traced once to a [`Program`], and a [`CompiledFunction`] that
+/// Uses the same trace-once strategy as the reverse-mode batched dispatch for [`Batch`]: the user
+/// function is traced once to a [`Program`], and a [`CompiledFunction`] that
 /// takes primals and tangents and returns `(primal_output, tangent_output)` per lane is compiled via
-/// [`try_jit`]. Primal and tangent outputs are collected per lane and stacked separately.
+/// [`jit`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -307,7 +309,7 @@ where
         let (primal_output_0, traced_program): (
             Output::To<V>,
             Program<ArrayType, V, Input::To<V>, Output::To<V>, E::TracingOperation>,
-        ) = try_trace_program(
+        ) = trace_program(
             engine,
             |staged_input: <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
                 let staged_input: Self::FunctionInput = staged_input;
@@ -328,7 +330,7 @@ where
         .simplify()?;
 
         // Compile the full JVP into a reusable program. Inside the JIT scope, the program is
-        // replayed symbolically with `try_linearize_traced_program`, which produces both the
+        // replayed symbolically with `linearize_traced_program`, which produces both the
         // primal outputs and a pushforward parameterized over the JIT-symbolic primals.
         let combined_input_count = input_parameter_count * 2;
         let combined_output_count = output_parameter_count * 2;
@@ -336,13 +338,13 @@ where
         let (_, compiled_jvp): (
             Vec<V>,
             crate::tracing_v2::CompiledFunction<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>,
-        ) = try_jit(
+        ) = jit(
             engine,
             |jit_combined: Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
                 let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
 
                 // Replay the forward pass symbolically and linearize at the symbolic primals.
-                let (primal_outputs, pushforward) = try_linearize_traced_program::<
+                let (primal_outputs, pushforward) = linearize_traced_program::<
                     V,
                     E::TracingOperation,
                     E::LinearOperation,

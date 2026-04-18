@@ -1269,7 +1269,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             Vec<ShardMapTensor>,
             XlaPrimitiveOp,
         >,
-    ) = ryft_core::tracing_v2::try_jit(
+    ) = ryft_core::tracing_v2::jit(
         &XlaEngine::token(),
         {
             let body = body.clone();
@@ -1308,7 +1308,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             Vec<ShardMapTensor>,
             XlaPrimitiveOp,
         >,
-    ) = ryft_core::tracing_v2::try_jit(
+    ) = ryft_core::tracing_v2::jit(
         &XlaEngine::token(),
         {
             let body = body.clone();

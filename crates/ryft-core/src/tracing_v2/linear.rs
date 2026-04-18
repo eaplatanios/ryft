@@ -20,10 +20,7 @@ use crate::{
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         graph::{Atom, AtomId, Equation, Graph, GraphBuilder},
-        jit::{
-            CompiledFunction, JitTracer, try_jit, try_jit_for_operation, try_trace_program,
-            try_trace_program_for_operation,
-        },
+        jit::{CompiledFunction, JitTracer, jit, jit_for_operation, trace_program, trace_program_for_operation},
         operations::{
             CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,
@@ -203,7 +200,7 @@ fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
     vec![Placeholder; count]
 }
 
-/// Staged linear map produced by `linearize`, `jvp_program`, or `vjp`.
+/// Staged linear map produced by [`jvp_program`] or [`vjp`].
 pub struct LinearProgram<
     T: Type + Display,
     V: Traceable<T> + Parameter,
@@ -669,7 +666,7 @@ where
     })
 }
 
-pub(crate) fn try_linearize_traced_program<V, O, L>(
+pub(crate) fn linearize_traced_program<V, O, L>(
     program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
     primals: Vec<JitTracer<ArrayType, V, O, L>>,
 ) -> Result<(Vec<JitTracer<ArrayType, V, O, L>>, TracedLinearProgram<V, O, L>), TraceError>
@@ -712,7 +709,7 @@ where
     Ok((primal_outputs.clone(), LinearProgram::from_program(program, zero)))
 }
 
-pub fn try_jvp_program<E, F, Input, Output, V>(
+pub fn jvp_program<E, F, Input, Output, V>(
     engine: &E,
     function: F,
     primals: Input,
@@ -739,7 +736,7 @@ where
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
     let (primal_output, program) =
-        try_trace_program_for_operation::<_, Input, Output, V, E::TracingOperation, E::LinearOperation>(
+        trace_program_for_operation::<_, Input, Output, V, E::TracingOperation, E::LinearOperation>(
             engine,
             function,
             reconstructed_primals,
@@ -755,7 +752,7 @@ where
 }
 
 #[allow(private_bounds)]
-pub(crate) fn try_jvp_traced<F, Input, Output, V, O, L>(
+pub(crate) fn jvp_traced<F, Input, Output, V, O, L>(
     function: F,
     primals: Input,
     tangents: Input,
@@ -794,7 +791,7 @@ where
     let (primal_output_types, traced_program): (
         Output::To<ArrayType>,
         Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
-    ) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+    ) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
         _,
         Input::To<ArrayType>,
         Output::To<ArrayType>,
@@ -817,7 +814,7 @@ where
         flat_leaf_parameter_structure(output_structure.parameter_count()),
     ))
     .simplify()?;
-    let (traced_primal_output, pushforward) = try_linearize_traced_program::<V, O, L>(&traced_program, traced_primals)?;
+    let (traced_primal_output, pushforward) = linearize_traced_program::<V, O, L>(&traced_program, traced_primals)?;
     let traced_tangent_output = pushforward.call(traced_tangents)?;
     Ok((
         Output::from_parameters(output_structure.clone(), traced_primal_output)?,
@@ -825,62 +822,9 @@ where
     ))
 }
 
-/// Runs a forward trace and returns both the primal output and the staged pushforward.
-pub fn jvp_program<E, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    primals: Input,
-) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>), TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType> + ZeroLike,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
-    E::LinearOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
-    E::TracingOperation: DifferentiableOp<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-{
-    try_jvp_program(engine, |input| Ok(function(input)), primals)
-}
-
-/// Alias for [`jvp_program`] that emphasizes the returned linear map.
-pub fn linearize<E, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    primals: Input,
-) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>), TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType> + ZeroLike,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
-    E::LinearOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
-    E::TracingOperation: DifferentiableOp<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-{
-    jvp_program(engine, function, primals)
-}
-
+/// Returns the primal output together with a pullback produced by transposing the staged pushforward.
 #[allow(private_bounds)]
-pub fn try_vjp<E, F, Input, Output, V>(
+pub fn vjp<E, F, Input, Output, V>(
     engine: &E,
     function: F,
     primals: Input,
@@ -903,369 +847,25 @@ where
         >,
     E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
 {
-    let (output, pushforward) = try_jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
+    let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
     let pullback = transpose_linear_program_with_output_examples(&pushforward, output_examples.as_slice())?;
     Ok((output, pullback))
 }
 
-/// Returns the primal output together with a pullback produced by transposing the staged pushforward.
-#[allow(private_bounds)]
-pub fn vjp<E, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    primals: Input,
-) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input, E::LinearOperation>), TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType> + ZeroLike + OneLike,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
-    E::LinearOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    Input::ParameterStructure: PartialEq,
-    E::TracingOperation: DifferentiableOp<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
-{
-    try_vjp(engine, |input| Ok(function(input)), primals)
-}
-
-fn try_grad<E, F, Input, V>(engine: &E, function: F, primals: Input) -> Result<Input, TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Value<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: PartialEq>,
-    V: TraceOutput<
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
-        >,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>
-        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    F: FnOnce(Input::Traced) -> Result<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>, TraceError>,
-    E::LinearOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
-{
-    let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input, E::LinearOperation>) =
-        try_vjp(engine, function, primals)?;
-    pullback.call(output.one_like())
-}
-
-/// Dispatch trait used by [`grad`] so it can operate both on concrete values and on already traced values.
-#[doc(hidden)]
-pub trait GradInvocationLeaf<E, Input>: Parameter + Sized
-where
-    E: Engine<Type = ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
-{
-    /// Return type produced by [`grad`] for the corresponding input regime.
-    type Return;
-
-    /// Traced input type expected by the user-provided function.
-    type FunctionInput;
-
-    /// Traced scalar output type expected from the user-provided function.
-    type FunctionOutput;
-
-    /// Invokes [`grad`] for one concrete leaf regime.
-    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
-    where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput;
-}
-
-/// Concrete-value dispatch for [`grad`]: traces the user function with [`JitTracer`] to build a staged
-/// reverse-mode gradient and evaluates it at the supplied primals.
-impl<
-    E,
-    V: Value<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq> + TraceInput<V, E::TracingOperation, E::LinearOperation>,
-> GradInvocationLeaf<E, Input> for V
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: TraceOutput<
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
-        >,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
-{
-    type Return = Input;
-    type FunctionInput = Input::Traced;
-    type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
-
-    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
-    where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
-    {
-        try_grad(engine, |input| Ok(function(input)), primals)
-    }
-}
-
-/// Already-traced dispatch for [`grad`]: replays the user function symbolically inside an enclosing
-/// [`JitTracer`] scope, linearizes the resulting [`Program`], transposes the pushforward into a pullback,
-/// and stages the full backward pass so it becomes part of the outer compiled graph.
-impl<
-    E,
-    V: Traceable<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
-    O: Clone + Op<ArrayType> + 'static,
-    L: Clone + Op<ArrayType> + 'static,
-> GradInvocationLeaf<E, Input> for JitTracer<ArrayType, V, O, L>
-where
-    E: Engine<Type = ArrayType, TracingOperation = O, LinearOperation = L>,
-    V: Parameterized<V, ParameterStructure = Placeholder>,
-    V: TraceOutput<V, O, L, Traced = JitTracer<ArrayType, V, O, L>>,
-    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<V>: TraceInput<V, O, L, Traced = Input>,
-    V::To<ArrayType>:
-        crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = V, Traced = JitTracer<ArrayType, V, O, L>>,
-    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
-    O: InterpretableOp<
-            ArrayType,
-            Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
-        >,
-    LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O, L>>,
-{
-    type Return = Input;
-    type FunctionInput = Input;
-    type FunctionOutput = JitTracer<ArrayType, V, O, L>;
-
-    fn invoke<F>(_engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
-    where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
-    {
-        let input_structure = primals.parameter_structure();
-        let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-        let staged_input_types = Input::To::<ArrayType>::from_parameters(
-            input_structure.clone(),
-            traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
-        )?;
-        let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
-        let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
-            _,
-            Input::To<ArrayType>,
-            V::To<ArrayType>,
-            ArrayType,
-            V,
-            O,
-            L,
-        >(
-            exemplar_engine,
-            |staged_input| {
-                let adapted_input = Input::from_parameters(
-                    input_structure.clone(),
-                    staged_input.into_parameters().collect::<Vec<_>>(),
-                )?;
-                Ok(function(adapted_input))
-            },
-            staged_input_types,
-        )?;
-        let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-            flat_leaf_parameter_structure(traced_primals.len()),
-            flat_leaf_parameter_structure(1),
-        ))
-        .simplify()?;
-        let (outputs, pushforward) = try_linearize_traced_program::<V, O, L>(&traced_program, traced_primals)?;
-        if outputs.len() != 1 {
-            return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
-        }
-        let pullback = transpose_linear_program_with_output_examples::<JitTracer<ArrayType, V, O, L>, _, _, _>(
-            &pushforward,
-            outputs.as_slice(),
-        )?;
-        let traced_gradient = pullback.call(vec![outputs[0].one_like()])?;
-        Ok(Input::from_parameters(input_structure, traced_gradient)?)
-    }
-}
-
-/// Batched dispatch for [`grad`], enabling standalone `vmap(|x| grad(f, x), inputs)` -- computing
-/// per-element gradients over a batch without requiring an outer [`jit`] wrapper.
+/// Dispatch trait shared by [`grad`] and [`value_and_grad`] so they can operate both on concrete
+/// values and on already traced values.
 ///
-/// Because the dispatch trait requires `F: FnOnce`, the user function can only be called once. This impl
-/// traces the function once at the first lane's primals to obtain a [`Program`], then compiles a reusable
-/// [`CompiledFunction`] via [`try_jit`] that embeds the full forward and backward passes symbolically.
-/// The compiled gradient function is called independently for each lane.
-impl<
-    E,
-    V: Traceable<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
-> GradInvocationLeaf<E, Input> for Batch<V>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    E::LinearOperation: Clone + Op<ArrayType>,
-    V: Parameterized<
-            V,
-            ParameterStructure = Placeholder,
-            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = JitTracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-            >,
-        >,
-    V: TraceInput<
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
-        >,
-    V: TraceOutput<
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
-        >,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
-    Input::Family: ParameterizedFamily<V>,
-    Input::To<V>: Clone
-        + Parameterized<V, ParameterStructure: Clone + PartialEq, To<Batch<V>> = Input>
-        + TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Vec<V>: TraceInput<
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-        >,
-    Vec<V>: TraceOutput<
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-        >,
-    E::TracingOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: InterpretableOp<
-            ArrayType,
-            Linearized<
-                JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
-                LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-            >,
-        >,
-    LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
-        CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-{
-    type Return = Input;
-    type FunctionInput = <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced;
-    type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
-
-    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
-    where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
-    {
-        let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
-        if lane_primals.is_empty() {
-            return Err(TraceError::EmptyBatch);
-        }
-
-        let lane0 = lane_primals[0].clone();
-        let input_structure = lane0.parameter_structure();
-        let parameter_count = input_structure.parameter_count();
-        let lane0_flat: Vec<V> = lane0.into_parameters().collect();
-
-        // Trace the user function once at lane 0 primals, consuming the FnOnce closure.
-        let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V, E::TracingOperation>) =
-            try_trace_program(engine, |staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
-
-        // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
-        let flat_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-            flat_leaf_parameter_structure(parameter_count),
-            flat_leaf_parameter_structure(1),
-        ))
-        .simplify()?;
-
-        // Compile the gradient into a reusable program by wrapping linearize + transpose + pullback
-        // inside a JIT scope. This stages the full backward pass symbolically so it can be replayed
-        // at arbitrary primal points.
-        let (_, compiled_grad): (Vec<V>, CompiledFunction<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) =
-            try_jit(
-                engine,
-                |jit_primals: Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
-                    let (outputs, pushforward) = try_linearize_traced_program::<
-                        V,
-                        E::TracingOperation,
-                        E::LinearOperation,
-                    >(&flat_program, jit_primals)?;
-                    if outputs.len() != 1 {
-                        return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
-                    }
-                    let pullback = transpose_linear_program_with_output_examples::<
-                        JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
-                        _,
-                        _,
-                        _,
-                    >(&pushforward, outputs.as_slice())?;
-                    pullback.call(vec![outputs[0].one_like()])
-                },
-                lane0_flat,
-            )?;
-
-        // Apply the compiled gradient per-lane and re-structure the flat results.
-        let lane_grads = lane_primals
-            .into_iter()
-            .map(|lane| {
-                let flat: Vec<V> = lane.into_parameters().collect();
-                let flat_grad = compiled_grad.call(flat)?;
-                Input::To::<V>::from_parameters(input_structure.clone(), flat_grad).map_err(TraceError::from)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        stack(lane_grads)
-    }
-}
-
-/// Computes the reverse-mode gradient of a scalar-output function.
-#[allow(private_bounds, private_interfaces)]
-pub fn grad<E, F, Input, Leaf>(
-    engine: &E,
-    function: F,
-    primals: Input,
-) -> Result<<Leaf as GradInvocationLeaf<E, Input>>::Return, TraceError>
-where
-    E: Engine<Type = ArrayType>,
-    Leaf: GradInvocationLeaf<E, Input>,
-    Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
-    F: FnOnce(
-        <Leaf as GradInvocationLeaf<E, Input>>::FunctionInput,
-    ) -> <Leaf as GradInvocationLeaf<E, Input>>::FunctionOutput,
-{
-    Leaf::invoke(engine, function, primals)
-}
-
-/// Dispatch trait used by [`value_and_grad`] so it can operate both on concrete values and on already traced values.
+/// The trait always produces `(value, gradient)`; [`grad`] is a thin wrapper that drops the primal
+/// value, while [`value_and_grad`] exposes the full pair.
 #[doc(hidden)]
 pub trait ValueAndGradInvocationLeaf<E, Input>: Parameter + Sized
 where
     E: Engine<Type = ArrayType>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 {
-    /// Return type produced by [`value_and_grad`] for the corresponding input regime.
-    type Return;
+    /// Primal scalar output value produced for the corresponding input regime.
+    type Value;
 
     /// Traced input type expected by the user-provided function.
     type FunctionInput;
@@ -1274,7 +874,7 @@ where
     type FunctionOutput;
 
     /// Invokes [`value_and_grad`] for one concrete leaf regime.
-    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput;
 }
@@ -1304,16 +904,16 @@ where
         >,
     E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
 {
-    type Return = (V, Input);
+    type Value = V;
     type FunctionInput = Input::Traced;
     type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
 
-    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
         let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input, E::LinearOperation>) =
-            vjp(engine, function, primals)?;
+            vjp(engine, |input| Ok(function(input)), primals)?;
         let gradient = pullback.call(output.one_like())?;
         Ok((output, gradient))
     }
@@ -1345,11 +945,11 @@ where
         >,
     LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O, L>>,
 {
-    type Return = (JitTracer<ArrayType, V, O, L>, Input);
+    type Value = JitTracer<ArrayType, V, O, L>;
     type FunctionInput = Input;
     type FunctionOutput = JitTracer<ArrayType, V, O, L>;
 
-    fn invoke<F>(_engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(_engine: &E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
@@ -1360,7 +960,7 @@ where
             traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
         let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
-        let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+        let (_, traced_program) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
             _,
             Input::To<ArrayType>,
             V::To<ArrayType>,
@@ -1384,7 +984,7 @@ where
             flat_leaf_parameter_structure(1),
         ))
         .simplify()?;
-        let (outputs, pushforward) = try_linearize_traced_program::<V, O, L>(&traced_program, traced_primals)?;
+        let (outputs, pushforward) = linearize_traced_program::<V, O, L>(&traced_program, traced_primals)?;
         if outputs.len() != 1 {
             return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
         }
@@ -1402,9 +1002,9 @@ where
 /// `vmap(|x| value_and_grad(f, x), inputs)` -- computing per-element function values and gradients
 /// over a batch without requiring an outer [`jit`] wrapper.
 ///
-/// Uses the same trace-once strategy as [`GradInvocationLeaf`] for [`Batch`]: the user function is
-/// traced once to a [`Program`], and a [`CompiledFunction`] that produces `(V, Input::To<V>)` per lane
-/// is compiled via [`try_jit`]. Values and gradients are collected per lane and stacked separately.
+/// Uses a trace-once strategy for [`Batch`]: the user function is traced once to a [`Program`],
+/// and a [`CompiledFunction`] that produces `(V, Input::To<V>)` per lane is compiled via [`jit`].
+/// Values and gradients are collected per lane and stacked separately.
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + OneLike,
@@ -1464,11 +1064,11 @@ where
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
 {
-    type Return = (Batch<V>, Input);
+    type Value = Batch<V>;
     type FunctionInput = <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced;
     type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
 
-    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<Self::Return, TraceError>
+    fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
     where
         F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
     {
@@ -1484,7 +1084,7 @@ where
 
         // Trace the user function once at lane 0 primals, consuming the FnOnce closure.
         let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V, E::TracingOperation>) =
-            try_trace_program(engine, |staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
+            trace_program(engine, |staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
         let flat_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
@@ -1494,13 +1094,11 @@ where
         .simplify()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
-        let (_, compiled_vg): (Vec<V>, CompiledFunction<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = try_jit(
+        let (_, compiled_vg): (Vec<V>, CompiledFunction<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = jit(
             engine,
             |jit_primals: Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
-                let (outputs, pushforward) = try_linearize_traced_program::<V, E::TracingOperation, E::LinearOperation>(
-                    &flat_program,
-                    jit_primals,
-                )?;
+                let (outputs, pushforward) =
+                    linearize_traced_program::<V, E::TracingOperation, E::LinearOperation>(&flat_program, jit_primals)?;
                 if outputs.len() != 1 {
                     return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
                 }
@@ -1545,7 +1143,7 @@ pub fn value_and_grad<E, F, Input, Leaf>(
     engine: &E,
     function: F,
     primals: Input,
-) -> Result<<Leaf as ValueAndGradInvocationLeaf<E, Input>>::Return, TraceError>
+) -> Result<(<Leaf as ValueAndGradInvocationLeaf<E, Input>>::Value, Input), TraceError>
 where
     E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,
@@ -1555,6 +1153,20 @@ where
     ) -> <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionOutput,
 {
     Leaf::invoke(engine, function, primals)
+}
+
+/// Computes the reverse-mode gradient of a scalar-output function.
+#[allow(private_bounds, private_interfaces)]
+pub fn grad<E, F, Input, Leaf>(engine: &E, function: F, primals: Input) -> Result<Input, TraceError>
+where
+    E: Engine<Type = ArrayType>,
+    Leaf: ValueAndGradInvocationLeaf<E, Input>,
+    Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
+    F: FnOnce(
+        <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionInput,
+    ) -> <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionOutput,
+{
+    Leaf::invoke(engine, function, primals).map(|(_, gradient)| gradient)
 }
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
@@ -1780,7 +1392,9 @@ where
     Ok(basis)
 }
 
-fn try_jacfwd<E, F, Input, Output, V>(
+/// Materializes a dense Jacobian using forward-mode differentiation.
+#[allow(private_bounds)]
+pub fn jacfwd<E, F, Input, Output, V>(
     engine: &E,
     function: F,
     primals: Input,
@@ -1808,7 +1422,7 @@ where
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let basis_inputs = standard_basis::<Input, V>(&input_structure, input_parameters.as_slice())?;
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pushforward) = try_jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
+    let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
@@ -1827,35 +1441,9 @@ where
     )
 }
 
-/// Materializes a dense Jacobian using forward-mode differentiation.
+/// Materializes a dense Jacobian using reverse-mode differentiation.
 #[allow(private_bounds)]
-pub fn jacfwd<E, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    primals: Input,
-) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: CoordinateValue,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>
-        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>
-        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: CoreLinearReplayOp<V>,
-{
-    try_jacfwd::<E, _, Input, Output, V>(engine, |input| Ok(function(input)), primals)
-}
-
-fn try_jacrev<E, F, Input, Output, V>(
+pub fn jacrev<E, F, Input, Output, V>(
     engine: &E,
     function: F,
     primals: Input,
@@ -1882,7 +1470,7 @@ where
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let primals = Input::from_parameters(input_structure.clone(), input_parameters.clone())?;
-    let (output, pullback) = try_vjp::<E, F, Input, Output, V>(engine, function, primals)?;
+    let (output, pullback) = vjp::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
@@ -1894,34 +1482,6 @@ where
     }
 
     DenseJacobian::from_rows(rows, input_structure, output_structure, input_coordinate_counts, output_coordinate_counts)
-}
-
-/// Materializes a dense Jacobian using reverse-mode differentiation.
-#[allow(private_bounds)]
-pub fn jacrev<E, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    primals: Input,
-) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: CoordinateValue,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>
-        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>
-        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
-{
-    try_jacrev::<E, _, Input, Output, V>(engine, |input| Ok(function(input)), primals)
 }
 
 /// Materializes a dense Hessian by applying `jacfwd` to a gradient helper.
@@ -1942,7 +1502,7 @@ where
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(
         <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
-    ) -> <Input as TraceOutput<V, E::TracingOperation, E::LinearOperation>>::Traced,
+    ) -> Result<<Input as TraceOutput<V, E::TracingOperation, E::LinearOperation>>::Traced, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -2024,7 +1584,7 @@ where
     ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = try_jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
+    let (_, compiled) = jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
         _engine,
         |primals: <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
@@ -2033,7 +1593,7 @@ where
                 traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
             )?;
             let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
-            let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+            let (_, traced_program) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
                 _,
                 Input::To<ArrayType>,
                 V::To<ArrayType>,
@@ -2063,7 +1623,7 @@ where
                 flat_leaf_parameter_structure(1),
             ))
             .simplify()?;
-            let (outputs, pushforward) = try_linearize_traced_program(&traced_program, traced_primals)?;
+            let (outputs, pushforward) = linearize_traced_program(&traced_program, traced_primals)?;
             if outputs.len() != 1 {
                 return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
             }
@@ -2257,7 +1817,7 @@ where
     ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = try_jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
+    let (_, compiled) = jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
         engine,
         |primals: <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
@@ -2268,7 +1828,7 @@ where
                 traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
             )?;
             let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
-            let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+            let (_, traced_program) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
                 _,
                 Input::To<ArrayType>,
                 V::To<ArrayType>,
@@ -2306,10 +1866,10 @@ where
             };
 
             // Step 3: Linearize and transpose the segmented program to produce the pullback.
-            // `try_linearize_traced_program` replays the graph at the JitTracer level (staging
+            // `linearize_traced_program` replays the graph at the JitTracer level (staging
             // both forward and backward equations in the outer JIT builder) and returns the
             // primal outputs alongside the linear pushforward map.
-            let (outputs, pushforward) = try_linearize_traced_program(&segmented_program, traced_primals)?;
+            let (outputs, pushforward) = linearize_traced_program(&segmented_program, traced_primals)?;
             if outputs.len() != 1 {
                 return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
             }
@@ -2760,9 +2320,9 @@ mod tests {
     }
 
     #[test]
-    fn linearize_returns_the_primal_output_and_pushforward() {
+    fn test_jvp_program_returns_the_primal_output_and_pushforward() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (primal, pushforward) = linearize(&engine, quadratic_plus_sin, 2.0f64).unwrap();
+        let (primal, pushforward) = jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
         approx_eq(pushforward.call(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
@@ -2782,32 +2342,9 @@ mod tests {
     }
 
     #[test]
-    fn jvp_program_and_linearize_stage_the_same_pushforward() {
+    fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, from_jvp_program) = jvp_program(&engine, quadratic_plus_sin, 2.0f64).unwrap();
-        let (_, from_linearize) = linearize(&engine, quadratic_plus_sin, 2.0f64).unwrap();
-
-        approx_eq(from_jvp_program.call(1.0f64).unwrap(), from_linearize.call(1.0f64).unwrap());
-        assert_eq!(
-            from_jvp_program.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = scale %0
-                    %2:f64[] = scale %0
-                    %3:f64[] = add %1 %2
-                    %4:f64[] = scale %0
-                    %5:f64[] = add %3 %4
-                in (%5)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(from_jvp_program.to_string(), from_linearize.to_string());
-    }
-
-    #[test]
-    fn transposed_linear_program_matches_the_reverse_mode_pullback() {
-        let engine = ArrayScalarEngine::<f64>::new();
-        let (primal, pushforward) = linearize(&engine, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
+        let (primal, pushforward) = jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
         let pullback = pushforward.transpose().unwrap();
         let cotangent = pullback.call(1.0f64).unwrap();
 
@@ -2865,7 +2402,7 @@ mod tests {
     fn linear_program_display_delegates_to_the_underlying_graph() {
         let engine = ArrayScalarEngine::<f64>::new();
         let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) =
-            linearize(&engine, quadratic_plus_sin, 2.0f64).unwrap();
+            jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         assert_eq!(
             pushforward.to_string(),

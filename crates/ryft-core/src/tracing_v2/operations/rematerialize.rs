@@ -441,7 +441,7 @@ where
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,
             Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
-        ) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+        ) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
             _,
             Input::To<ArrayType>,
             Output::To<ArrayType>,
@@ -543,7 +543,7 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
             &engine,
-            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
+            |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
             2.0f64,
         )
         .unwrap();
@@ -559,7 +559,7 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
             &engine,
-            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
+            |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
             2.0f64,
         )
         .unwrap();
@@ -670,7 +670,7 @@ mod tests {
         let without: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
             let (output, _): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-                jit(&engine, |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), 3.0f64).unwrap();
+                jit(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
@@ -678,7 +678,7 @@ mod tests {
             let (output, _): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
                 &engine,
                 |x: JitTracer<ArrayType, f64>| {
-                    rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
+                    Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap())
                 },
                 3.0f64,
             )

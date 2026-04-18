@@ -16,11 +16,11 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
+        GraphBuilder, InterpretableOp, OneLike, TraceError, Traceable, ZeroLike,
         engine::Engine,
         graph::AtomId,
         operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
-        program::{Program, ProgramBuilder, ProgramOpRef},
-        GraphBuilder, InterpretableOp, OneLike, TraceError, Traceable, ZeroLike,
+        program::{Program, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -447,12 +447,12 @@ pub struct CompiledFunction<
 }
 
 impl<
-        T: Type,
-        V: Traceable<T>,
-        Input: Parameterized<V, ParameterStructure: Clone>,
-        Output: Parameterized<V, ParameterStructure: Clone>,
-        O: Clone,
-    > Clone for CompiledFunction<T, V, Input, Output, O>
+    T: Type,
+    V: Traceable<T>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    O: Clone,
+> Clone for CompiledFunction<T, V, Input, Output, O>
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), marker: PhantomData }
@@ -503,47 +503,7 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 }
 
-fn try_trace_program_with_options<E: Engine<Type = ArrayType, Value = V>, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    input: Input,
-    simplify_program: bool,
-) -> Result<(Output, Program<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
-where
-    V: Traceable<ArrayType>,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
-{
-    let input_structure = input.parameter_structure();
-    let input_values = input.into_parameters().collect::<Vec<_>>();
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<V, E::TracingOperation>::new()));
-    let staging_error = Rc::new(RefCell::new(None));
-    let concrete_input = Input::from_parameters(input_structure.clone(), input_values.clone())?;
-    let traced_input = concrete_input.into_traced(builder.clone(), staging_error.clone(), engine)?;
-
-    let (output_structure, outputs) = {
-        let traced_output = function(traced_input)?;
-        Output::from_traced(traced_output)?
-    };
-
-    if let Some(error) = staging_error.borrow_mut().take() {
-        return Err(error);
-    }
-    let builder = match Rc::try_unwrap(builder) {
-        Ok(builder) => builder.into_inner(),
-        Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
-    };
-    let program = Program::from_graph(builder.build::<Input, Output>(outputs, input_structure, output_structure));
-    let program = if simplify_program { program.simplify()? } else { program };
-    let concrete_input = Input::from_parameters(program.graph().input_structure().clone(), input_values)?;
-    Ok((program.call(concrete_input)?, program))
-}
-
-fn try_trace_program_with_operation_options<F, Input, Output, V, O, L>(
+fn trace_program_with_operation_options<F, Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input: Input,
@@ -584,46 +544,7 @@ where
     Ok((program.call(concrete_input)?, program))
 }
 
-fn try_trace_program_from_types_with_options<E: Engine<Type = T, Value = V>, F, Input, Output, T, V>(
-    engine: &E,
-    function: F,
-    input_types: Input,
-    simplify_program: bool,
-) -> Result<(Output, Program<T, V, Input::Staged, Output::Staged, E::TracingOperation>), TraceError>
-where
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    E::TracingOperation: Op<T>,
-{
-    let input_structure = input_types.parameter_structure();
-    let builder = Rc::new(RefCell::new(GraphBuilder::<E::TracingOperation, T, V>::new()));
-    let staging_error = Rc::new(RefCell::new(None));
-    let traced_input = input_types.into_type_traced(builder.clone(), staging_error.clone(), engine)?;
-
-    let (output_structure, output_types, outputs) = {
-        let traced_output = function(traced_input)?;
-        let (output_types, outputs) = Output::from_type_traced(traced_output)?;
-        let output_structure = output_types.parameter_structure();
-        (output_structure, output_types, outputs)
-    };
-
-    if let Some(error) = staging_error.borrow_mut().take() {
-        return Err(error);
-    }
-    let builder = match Rc::try_unwrap(builder) {
-        Ok(builder) => builder.into_inner(),
-        Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
-    };
-    let program =
-        Program::from_graph(builder.build::<Input::Staged, Output::Staged>(outputs, input_structure, output_structure));
-    let program = if simplify_program { program.simplify()? } else { program };
-    Ok((output_types, program))
-}
-
-fn try_trace_program_from_types_with_operation_options<F, Input, Output, T, V, O, L>(
+fn trace_program_from_types_with_operation_options<F, Input, Output, T, V, O, L>(
     engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input_types: Input,
@@ -664,7 +585,7 @@ where
 }
 
 /// Stages `function` using the staged op set selected by `engine`.
-pub fn try_trace_program<E, F, Input, Output, V>(
+pub fn trace_program<E, F, Input, Output, V>(
     engine: &E,
     function: F,
     input: Input,
@@ -679,31 +600,30 @@ where
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
-    try_trace_program_with_operation_options(engine, function, input, true)
+    trace_program_with_operation_options(engine, function, input, true)
 }
 
 /// Stages `function` using one explicit staged ordinary operation type.
-pub(crate) fn try_trace_program_for_operation<F, Input, Output, V, O, L>(
+pub(crate) fn trace_program_for_operation<F, Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input: Input,
 ) -> Result<(Output, Program<ArrayType, V, Input, Output, O>), TraceError>
 where
     V: Traceable<ArrayType>,
-    O: Clone + 'static,
+    O: Clone + 'static + InterpretableOp<ArrayType, V>,
     L: Clone + 'static,
     Input: TraceInput<V, O, L>,
     Output: TraceOutput<V, O, L>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    O: InterpretableOp<ArrayType, V>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
-    try_trace_program_with_operation_options(engine, function, input, true)
+    trace_program_with_operation_options(engine, function, input, true)
 }
 
 /// Stages `function` directly from type metadata using one explicit staged ordinary operation type.
-pub fn try_trace_program_from_types<E, F, Input, Output, T, V>(
+pub fn trace_program_from_types<E, F, Input, Output, T, V>(
     engine: &E,
     function: F,
     input_types: Input,
@@ -717,11 +637,11 @@ where
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::TracingOperation: Op<T>,
 {
-    try_trace_program_from_types_with_options(engine, function, input_types, true)
+    trace_program_from_types_with_operation_options(engine, function, input_types, true)
 }
 
 /// Stages `function` directly from type metadata using one explicit staged ordinary operation type.
-pub(crate) fn try_trace_program_from_types_for_operation<F, Input, Output, T, V, O, L>(
+pub(crate) fn trace_program_from_types_for_operation<F, Input, Output, T, V, O, L>(
     engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input_types: Input,
@@ -735,74 +655,10 @@ where
     Output: TypeTracing<T, V, O, L>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
 {
-    try_trace_program_from_types_with_operation_options(engine, function, input_types, true)
+    trace_program_from_types_with_operation_options(engine, function, input_types, true)
 }
 
 /// Stages `function` as a graph using the staged op set selected by `engine`.
-pub fn try_jit<E, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType>,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
-{
-    let (output, program) = try_trace_program_with_options(engine, function, input, true)?;
-    Ok((output, CompiledFunction::from_program(program)))
-}
-
-/// Stages `function` as a graph using one explicit staged ordinary operation type.
-pub(crate) fn try_jit_for_operation<F, Input, Output, V, O, L>(
-    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-    function: F,
-    input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, O>), TraceError>
-where
-    V: Traceable<ArrayType>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    Input: TraceInput<V, O, L>,
-    Output: TraceOutput<V, O, L>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    O: InterpretableOp<ArrayType, V>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
-{
-    let (output, program) = try_trace_program_for_operation(engine, function, input)?;
-    Ok((output, CompiledFunction::from_program(program)))
-}
-
-/// Stages `function` directly from type metadata as one graph.
-pub fn try_jit_from_types<E, F, Input, Output, T, V>(
-    engine: &E,
-    function: F,
-    input_types: Input,
-) -> Result<(Output, CompiledFunction<T, V, Input::Staged, Output::Staged, E::TracingOperation>), TraceError>
-where
-    E: Engine<Type = T, Value = V>,
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
-    E::TracingOperation: Op<T>,
-{
-    let (output_types, program) = try_trace_program_from_types(engine, function, input_types)?;
-    Ok((output_types, CompiledFunction::from_program(program)))
-}
-
-/// Stages `function` as a graph and returns both the eager output and the staged program selected
-/// by `engine`.
-///
-/// The returned [`CompiledFunction`] currently stores only the staged graph. Later, once a concrete backend exists,
-/// this type can be extended to carry backend-specific compilation artifacts alongside that graph.
 pub fn jit<E, F, Input, Output, V>(
     engine: &E,
     function: F,
@@ -813,16 +669,36 @@ where
     V: Traceable<ArrayType>,
     Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
+    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
-    try_jit(engine, |traced_input| Ok(function(traced_input)), input)
+    let (output, program) = trace_program_with_operation_options(engine, function, input, true)?;
+    Ok((output, CompiledFunction::from_program(program)))
 }
 
-/// Stages `function` directly from type metadata and returns both the inferred output types and the
-/// staged program.
+/// Stages `function` as a graph using one explicit staged ordinary operation type.
+pub(crate) fn jit_for_operation<F, Input, Output, V, O, L>(
+    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+    function: F,
+    input: Input,
+) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, O>), TraceError>
+where
+    V: Traceable<ArrayType>,
+    O: Clone + 'static + InterpretableOp<ArrayType, V>,
+    L: Clone + 'static,
+    Input: TraceInput<V, O, L>,
+    Output: TraceOutput<V, O, L>,
+    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input::ParameterStructure: PartialEq,
+    Output::ParameterStructure: Clone,
+{
+    let (output, program) = trace_program_for_operation(engine, function, input)?;
+    Ok((output, CompiledFunction::from_program(program)))
+}
+
+/// Stages `function` directly from type metadata as one graph.
 pub fn jit_from_types<E, F, Input, Output, T, V>(
     engine: &E,
     function: F,
@@ -834,10 +710,11 @@ where
     V: Traceable<T>,
     Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
     Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Output::Traced,
+    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::TracingOperation: Op<T>,
 {
-    try_jit_from_types(engine, |traced_input| Ok(function(traced_input)), input_types)
+    let (output_types, program) = trace_program_from_types(engine, function, input_types)?;
+    Ok((output_types, CompiledFunction::from_program(program)))
 }
 
 #[cfg(test)]
@@ -848,7 +725,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{engine::ArrayScalarEngine, test_support, ProgramBuilder, Sin},
+        tracing_v2::{ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
     };
 
     use super::*;
@@ -883,7 +760,7 @@ mod tests {
             &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let squared = x.clone() * x.clone();
-                squared + x.sin()
+                Ok(squared + x.sin())
             },
             2.0f64,
         )
@@ -910,7 +787,7 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing_v2::{operations::reshape::ReshapeOps, Cos, MatrixOps, OneLike, Sin, ZeroLike},
+            tracing_v2::{Cos, MatrixOps, OneLike, Sin, ZeroLike, operations::reshape::ReshapeOps},
             types::{ArrayType, DataType, Typed},
         };
 
@@ -1032,7 +909,7 @@ mod tests {
         > = jit(
             &TestEngine,
             |inputs: (JitTracer<ArrayType, TestAbstractValue>, JitTracer<ArrayType, TestAbstractValue>)| {
-                inputs.0 + inputs.1
+                Ok(inputs.0 + inputs.1)
             },
             (
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F32) },
@@ -1047,7 +924,7 @@ mod tests {
     fn compiled_function_display_delegates_to_the_underlying_graph() {
         let engine = ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
-            jit(&engine, |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), 2.0f64).unwrap();
+            jit(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
             compiled.to_string(),

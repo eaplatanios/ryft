@@ -1246,7 +1246,7 @@ where
             input_types.parameter_structure(),
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
-        jit_from_types(&engine, function, cloned_input_types)?
+        jit_from_types(&engine, |input| Ok(function(input)), cloned_input_types)?
     };
     Ok((output_types, compiled))
 }
