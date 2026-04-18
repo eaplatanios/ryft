@@ -1,7 +1,7 @@
 //! Forward-mode differentiation primitives.
 //!
 //! The core value in this module is [`JvpTracer`], which carries both a primal value and a tangent value. Primitive
-//! operations implement their JVP rules in [`crate::tracing_v2::ops`], while this module provides the user-facing
+//! operations implement their JVP rules in [`crate::tracing_v2::operations`], while this module provides the user-facing
 //! wrapper type and the `jvp` transform itself.
 
 use std::{
@@ -17,7 +17,7 @@ use crate::{
         engine::Engine,
         jit::{JitTracer, try_jit, try_trace_program},
         linear::{LinearProgram, Linearized, jvp_program, try_jvp_traced, try_linearize_traced_program},
-        ops::{CoreLinearReplayOp, DifferentiableOp, InterpretableOp, Op},
+        operations::{CoreLinearReplayOp, DifferentiableOp, InterpretableOp, Op},
         program::{LinearProgramOpRef, Program},
     },
     types::{ArrayType, Type, Typed},

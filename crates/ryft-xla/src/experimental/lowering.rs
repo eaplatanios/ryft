@@ -219,7 +219,7 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
 /// [`to_mlir_module_for_plain_graph`] and related entry points. The core [`PrimitiveOp`] and
 /// [`LinearPrimitiveOp`] enums provide the default blanket implementations, and backends can add
 /// their own closed op carriers by implementing this trait for those enums.
-pub(crate) trait XlaOp<V: Traceable<ArrayType>>: ryft_core::tracing_v2::ops::Op {
+pub(crate) trait XlaOp<V: Traceable<ArrayType>>: ryft_core::tracing_v2::Op {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -734,7 +734,7 @@ impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V>
             }
             PrimitiveOp::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
             PrimitiveOp::Custom(_) => {
-                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
+                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Op::name(self).to_string() })
             }
         }
     }
@@ -806,7 +806,7 @@ impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayTy
                 )
             }
             LinearPrimitiveOp::Custom(_) => {
-                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::ops::Op::name(self).to_string() })
+                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Op::name(self).to_string() })
             }
         }
     }
@@ -1183,7 +1183,7 @@ pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, O, S>(
 ) -> Result<String, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     S: AsRef<str>,
@@ -1684,7 +1684,7 @@ fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
@@ -1698,7 +1698,7 @@ where
     ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
     where
         B: Block<'b, 'c, 't>,
-        O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+        O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
         V: MlirLowerableValue,
         L: Location<'c, 't> + Copy,
     {
@@ -1790,7 +1790,7 @@ fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
     let lane_count = body.lane_count();
@@ -1864,7 +1864,7 @@ fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
 {
     let mut atom_values = vec![None; graph.atom_count()];
     for (atom_id, mlir_value) in graph.input_atoms().iter().copied().zip(input_values.iter().copied()) {
@@ -1932,7 +1932,7 @@ fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -2390,7 +2390,7 @@ fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -2418,7 +2418,7 @@ fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::ops::Op + XlaOp<V>,
+    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
 {
     let equation = &graph.equations()[equation_index];
     let output_types = equation

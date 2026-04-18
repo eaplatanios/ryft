@@ -12,8 +12,9 @@ use crate::{
     tracing_v2::{
         CompiledFunction, JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
         jit::{TraceInput, TraceOutput},
-        operations::{AddOp, FlatTracedVMap, MulOp, NegOp, VMapOp},
-        ops::{InterpretableOp, Op, VMapTracingOperation, VectorizableOp},
+        operations::{
+            AddOp, FlatTracedVMap, InterpretableOp, MulOp, NegOp, Op, VMapOp, VMapTracingOperation, VectorizableOp,
+        },
     },
     types::{ArrayType, Typed},
 };

@@ -4,7 +4,7 @@ use indoc::indoc;
 
 use crate::{
     parameters::Placeholder,
-    tracing_v2::{engine::ArrayScalarEngine, ops::PrimitiveOp, *},
+    tracing_v2::{engine::ArrayScalarEngine, *},
     types::ArrayType,
 };
 

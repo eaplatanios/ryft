@@ -10,11 +10,20 @@ use crate::tracing_v2::{
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
-    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Type};
 
-use super::{binary_same_abstract, expect_batch_sizes_match, expect_input_count};
+use super::{
+    DifferentiableOp, InterpretableOp, Op, VectorizableOp, binary_same_abstract, expect_batch_sizes_match,
+    expect_input_count,
+};
+
+/// Hidden staging trait for the multiplication primitive.
+#[doc(hidden)]
+pub trait MulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the multiplication primitive.
+    fn mul_op() -> Self;
+}
 
 /// Elementwise multiplication primitive.
 #[derive(Clone, Default)]

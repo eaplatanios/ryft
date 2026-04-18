@@ -3,19 +3,28 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    TraceError,
-    batch::Batch as BatchedValue,
-    engine::Engine,
-    forward::JvpTracer,
-    linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, VectorizableOp},
+    TraceError, Traceable, batch::Batch as BatchedValue, engine::Engine, forward::JvpTracer, linear::LinearTerm,
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Type};
 
 use super::{
-    expect_input_count,
+    DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, VectorizableOp, expect_input_count,
     matrix::{MatrixOps, MatrixValue, transpose_abstract},
 };
+
+/// Hidden staging trait for the matrix transposition primitive.
+#[doc(hidden)]
+pub trait MatrixTransposeTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the matrix transposition primitive.
+    fn matrix_transpose_op() -> Self;
+}
+
+/// Hidden staging trait for the matrix transposition primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearMatrixTransposeOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear matrix transposition primitive.
+    fn linear_matrix_transpose_op() -> Self;
+}
 
 /// Primitive representing matrix transposition.
 #[derive(Clone, Default)]

@@ -11,11 +11,31 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp},
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Type};
 
-use super::{binary_same_abstract, expect_batch_sizes_match, expect_input_count};
+use super::{
+    DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp, binary_same_abstract,
+    expect_batch_sizes_match, expect_input_count,
+};
+
+/// Hidden staging trait for the addition primitive.
+///
+/// Backend-owned closed op carriers (such as [`PrimitiveOp`](super::PrimitiveOp) and the XLA backend's
+/// `XlaPrimitiveOp`) implement this trait so that generic transform code can stage `AddOp` without
+/// knowing which carrier is in use.
+#[doc(hidden)]
+pub trait AddTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the addition primitive.
+    fn add_op() -> Self;
+}
+
+/// Hidden staging trait for the addition primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearAddOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear addition primitive.
+    fn linear_add_op() -> Self;
+}
 
 /// Elementwise addition primitive.
 #[derive(Clone, Default)]

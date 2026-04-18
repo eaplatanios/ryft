@@ -11,14 +11,30 @@ use crate::{
         linear::{
             linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
         },
-        ops::{
-            CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op,
-            VMapTracingOperation,
-        },
         program::{LinearProgramOpRef, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
+
+use super::{
+    CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, Op, primitive::LinearPrimitiveOp,
+};
+
+/// Hidden staging trait for the `vmap` higher-order primitive.
+#[doc(hidden)]
+pub trait VMapTracingOperation<T: Type + Display, V: Traceable<T>, L: Clone>: Clone {
+    /// Constructs the carrier-specific representation of the `vmap` higher-order primitive with a
+    /// captured traced body.
+    fn vmap_op(op: VMapOp<T, V, Self, L>) -> Self;
+}
+
+/// Hidden staging trait for the `vmap` higher-order primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearVMapOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear `vmap` higher-order primitive
+    /// with a captured linear traced body.
+    fn linear_vmap_op(op: LinearVMapOp<T, V, Self>) -> Self;
+}
 
 /// Erased traced `vmap` body used by the staged higher-order op.
 pub struct FlatTracedVMap<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {

@@ -24,7 +24,6 @@ pub mod graph;
 pub mod jit;
 pub mod linear;
 pub mod operations;
-pub mod ops;
 pub mod program;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -46,10 +45,9 @@ pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
-pub use operations::{Cos, Sin};
-pub use ops::{
-    CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
-    LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, VectorizableOp,
+pub use operations::{
+    Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
+    LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, Sin, VectorizableOp,
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};

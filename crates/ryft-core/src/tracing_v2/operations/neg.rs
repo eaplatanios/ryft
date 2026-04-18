@@ -11,11 +11,26 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     linear::LinearTerm,
-    ops::{DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp},
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Type};
 
-use super::{expect_input_count, unary_abstract};
+use super::{
+    DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp, expect_input_count, unary_abstract,
+};
+
+/// Hidden staging trait for the negation primitive.
+#[doc(hidden)]
+pub trait NegTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the negation primitive.
+    fn neg_op() -> Self;
+}
+
+/// Hidden staging trait for the negation primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearNegOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear negation primitive.
+    fn linear_neg_op() -> Self;
+}
 
 /// Elementwise negation primitive.
 #[derive(Clone, Default)]

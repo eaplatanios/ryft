@@ -9,19 +9,38 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{
-        DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearAddOperation, LinearLeftMatMulOperation,
-        LinearMatrixTransposeOperation, LinearNegOperation, LinearOperation, LinearPrimitiveOp,
-        LinearRightMatMulOperation, LinearScaleOperation, MatMulTracingOperation, MatrixTransposeTracingOperation, Op,
-        VectorizableOp,
-    },
 };
-use crate::types::{ArrayType, Typed};
+use crate::types::{ArrayType, Type, Typed};
 
 use super::{
-    expect_input_count, lift_jit_constant,
+    DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearOperation, Op, VectorizableOp,
+    add::LinearAddOperation,
+    expect_input_count,
+    left_matmul::LinearLeftMatMulOperation,
+    lift_jit_constant,
+    matmul::MatMulTracingOperation,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
+    matrix_transpose::{LinearMatrixTransposeOperation, MatrixTransposeTracingOperation},
+    neg::LinearNegOperation,
+    primitive::LinearPrimitiveOp,
+    scale::LinearScaleOperation,
 };
+
+/// Hidden staging trait for the right matrix-multiplication primitive.
+#[doc(hidden)]
+pub trait RightMatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the right matrix-multiplication primitive
+    /// with a captured factor.
+    fn right_matmul_op(factor: V) -> Self;
+}
+
+/// Hidden staging trait for the right matrix-multiplication primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearRightMatMulOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear right matrix-multiplication
+    /// primitive with a captured factor.
+    fn linear_right_matmul_op(factor: V) -> Self;
+}
 
 /// Linear map `tangent -> tangent @ factor`.
 #[derive(Clone)]

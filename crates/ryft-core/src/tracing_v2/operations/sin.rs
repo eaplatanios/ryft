@@ -8,11 +8,17 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
-    ops::{DifferentiableOp, InterpretableOp, Op, SinTracingOperation, VectorizableOp},
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Type};
 
-use super::{cos::Cos, expect_input_count, unary_abstract};
+use super::{DifferentiableOp, InterpretableOp, Op, VectorizableOp, cos::Cos, expect_input_count, unary_abstract};
+
+/// Hidden staging trait for the sine primitive.
+#[doc(hidden)]
+pub trait SinTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the sine primitive.
+    fn sin_op() -> Self;
+}
 
 /// Elementwise sine capability.
 pub trait Sin: Sized {

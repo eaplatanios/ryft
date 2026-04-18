@@ -15,14 +15,27 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
     linear::LinearTerm,
-    ops::{
-        DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearOperation, MulTracingOperation, Op,
-        ScaleTracingOperation, VectorizableOp,
-    },
 };
 use crate::types::{ArrayType, Type, Typed};
 
-use super::{expect_input_count, lift_jit_constant, unary_abstract};
+use super::{
+    DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearOperation, Op, VectorizableOp,
+    expect_input_count, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
+};
+
+/// Hidden staging trait for the scaling primitive.
+#[doc(hidden)]
+pub trait ScaleTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the scaling primitive with a captured factor.
+    fn scale_op(factor: V) -> Self;
+}
+
+/// Hidden staging trait for the scaling primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearScaleOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear scaling primitive with a captured factor.
+    fn linear_scale_op(factor: V) -> Self;
+}
 
 /// Unary linear operation that multiplies its input by a captured factor.
 #[derive(Clone)]

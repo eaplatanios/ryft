@@ -705,7 +705,7 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{Cos, MatrixOps, OneLike, Sin, TraceError, Value, ZeroLike, ops::PrimitiveOp, test_support},
+        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOp, Sin, TraceError, Value, ZeroLike, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 

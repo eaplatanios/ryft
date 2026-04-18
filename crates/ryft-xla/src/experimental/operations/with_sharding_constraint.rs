@@ -7,13 +7,12 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp, PrimitiveOp,
+    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp,
     TraceError, VectorizableOp,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
     operations::{expect_input_count, unary_abstract},
-    ops::Op,
 };
 use ryft_core::types::ArrayType;
 use ryft_mlir::{Block, Operation, Value};

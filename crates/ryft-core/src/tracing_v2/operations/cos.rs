@@ -11,11 +11,17 @@ use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::JitTracer,
-    ops::{CosTracingOperation, DifferentiableOp, InterpretableOp, Op, VectorizableOp},
 };
-use crate::types::ArrayType;
+use crate::types::{ArrayType, Type};
 
-use super::{expect_input_count, sin::Sin, unary_abstract};
+use super::{DifferentiableOp, InterpretableOp, Op, VectorizableOp, expect_input_count, sin::Sin, unary_abstract};
+
+/// Hidden staging trait for the cosine primitive.
+#[doc(hidden)]
+pub trait CosTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the cosine primitive.
+    fn cos_op() -> Self;
+}
 
 /// Elementwise cosine capability.
 pub trait Cos: Sized {

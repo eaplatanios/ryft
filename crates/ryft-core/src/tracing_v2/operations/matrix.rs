@@ -17,16 +17,15 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{
-            LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation, LinearNegOperation,
-            LinearRightMatMulOperation, LinearScaleOperation, MatMulTracingOperation, MatrixTransposeTracingOperation,
-            Op, VectorizableOp,
-        },
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
 };
 
-use super::{MatMulOp, MatrixTransposeOp};
+use super::{
+    LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation, LinearNegOperation,
+    LinearRightMatMulOperation, LinearScaleOperation, MatMulOp, MatMulTracingOperation, MatrixTransposeOp,
+    MatrixTransposeTracingOperation, Op, VectorizableOp,
+};
 
 /// Matrix operations required by the tracing prototype.
 pub trait MatrixOps: Sized {

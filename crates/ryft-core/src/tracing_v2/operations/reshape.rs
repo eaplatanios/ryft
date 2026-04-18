@@ -21,15 +21,30 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::JitTracer,
         linear::LinearTerm,
-        ops::{
-            DifferentiableOp, InterpretableOp, LinearAddOperation, LinearNegOperation, LinearOperation,
-            LinearReshapeOperation, LinearScaleOperation, Op, ReshapeTracingOperation, VectorizableOp,
-        },
     },
-    types::{ArrayType, Shape, Size, Typed},
+    types::{ArrayType, Shape, Size, Type, Typed},
 };
 
-use super::expect_input_count;
+use super::{
+    DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp, add::LinearAddOperation,
+    expect_input_count, neg::LinearNegOperation, scale::LinearScaleOperation,
+};
+
+/// Hidden staging trait for the reshape primitive.
+#[doc(hidden)]
+pub trait ReshapeTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the reshape primitive with explicit input
+    /// and output abstract types.
+    fn reshape_op(input_type: T, output_type: T) -> Self;
+}
+
+/// Hidden staging trait for the reshape primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearReshapeOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear reshape primitive with explicit
+    /// input and output abstract types.
+    fn linear_reshape_op(input_type: T, output_type: T) -> Self;
+}
 
 /// Returns `true` when `dimension` is explicitly unsharded in the JAX sense.
 fn is_effectively_unsharded_dimension(dimension: &ShardingDimension) -> bool {

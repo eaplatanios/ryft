@@ -16,11 +16,11 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        GraphBuilder, InterpretableOp, OneLike, TraceError, Traceable, ZeroLike,
         engine::Engine,
         graph::AtomId,
-        ops::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
+        operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
         program::{Program, ProgramBuilder, ProgramOpRef},
+        GraphBuilder, InterpretableOp, OneLike, TraceError, Traceable, ZeroLike,
     },
     types::{ArrayType, Type, Typed},
 };
@@ -447,12 +447,12 @@ pub struct CompiledFunction<
 }
 
 impl<
-    T: Type,
-    V: Traceable<T>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    O: Clone,
-> Clone for CompiledFunction<T, V, Input, Output, O>
+        T: Type,
+        V: Traceable<T>,
+        Input: Parameterized<V, ParameterStructure: Clone>,
+        Output: Parameterized<V, ParameterStructure: Clone>,
+        O: Clone,
+    > Clone for CompiledFunction<T, V, Input, Output, O>
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), marker: PhantomData }
@@ -848,7 +848,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
+        tracing_v2::{engine::ArrayScalarEngine, test_support, ProgramBuilder, Sin},
     };
 
     use super::*;
@@ -910,7 +910,7 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing_v2::{Cos, MatrixOps, OneLike, Sin, ZeroLike, operations::reshape::ReshapeOps},
+            tracing_v2::{operations::reshape::ReshapeOps, Cos, MatrixOps, OneLike, Sin, ZeroLike},
             types::{ArrayType, DataType, Typed},
         };
 

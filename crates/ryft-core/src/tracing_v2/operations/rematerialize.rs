@@ -18,14 +18,30 @@ use crate::{
         linear::{
             linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
         },
-        ops::{
-            CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op,
-            RematerializeTracingOperation,
-        },
         program::{LinearProgramOpRef, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
+
+use super::{
+    CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, Op, primitive::LinearPrimitiveOp,
+};
+
+/// Hidden staging trait for the `rematerialize` higher-order primitive.
+#[doc(hidden)]
+pub trait RematerializeTracingOperation<T: Type + Display, V: Traceable<T>, L: Clone>: Clone {
+    /// Constructs the carrier-specific representation of the `rematerialize` higher-order primitive
+    /// with a captured traced body.
+    fn rematerialize_op(op: RematerializeOp<T, V, Self, L>) -> Self;
+}
+
+/// Hidden staging trait for the `rematerialize` higher-order primitive in linear programs.
+#[doc(hidden)]
+pub trait LinearRematerializeOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the linear `rematerialize` higher-order
+    /// primitive with a captured linear traced body.
+    fn linear_rematerialize_op(op: LinearRematerializeOp<T, V, Self>) -> Self;
+}
 
 /// Erased traced body for a rematerialization boundary.
 pub struct FlatTracedRematerialize<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {

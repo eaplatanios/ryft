@@ -24,10 +24,10 @@ use crate::{
             CompiledFunction, JitTracer, try_jit, try_jit_for_operation, try_trace_program,
             try_trace_program_for_operation,
         },
-        operations::rematerialize::{FlatTracedRematerialize, RematerializeOp},
-        ops::{
+        operations::{
             CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,
+            rematerialize::{FlatTracedRematerialize, RematerializeOp},
         },
         program::{LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder},
     },

@@ -2,19 +2,20 @@
 
 use std::fmt::{Debug, Display};
 
-use crate::tracing_v2::{
-    TraceError,
-    batch::Batch as BatchedValue,
-    engine::Engine,
-    forward::JvpTracer,
-    ops::{DifferentiableOp, InterpretableOp, Op, VectorizableOp},
-};
-use crate::types::ArrayType;
+use crate::tracing_v2::{TraceError, Traceable, batch::Batch as BatchedValue, engine::Engine, forward::JvpTracer};
+use crate::types::{ArrayType, Type};
 
 use super::{
-    expect_batch_sizes_match, expect_input_count,
+    DifferentiableOp, InterpretableOp, Op, VectorizableOp, expect_batch_sizes_match, expect_input_count,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
 };
+
+/// Hidden staging trait for the matrix multiplication primitive.
+#[doc(hidden)]
+pub trait MatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+    /// Constructs the carrier-specific representation of the matrix multiplication primitive.
+    fn matmul_op() -> Self;
+}
 
 /// Primitive representing matrix multiplication.
 #[derive(Clone, Default)]
