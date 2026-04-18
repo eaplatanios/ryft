@@ -113,13 +113,10 @@ pub type Dual<V> = JvpTracer<V, V>;
 #[doc(hidden)]
 pub trait JvpInvocationLeaf<E, Input, Output>: Parameter + Sized
 where
-    E: Engine<Type = ArrayType, Value = Self::Base>,
+    E: Engine<Type = ArrayType>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 {
-    /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType>;
-
     /// Input type expected by the user-provided function.
     type FunctionInput;
 
@@ -172,6 +169,7 @@ impl<
 > JvpInvocationLeaf<E, Input, Output> for V
 where
     E: Engine<Type = ArrayType, Value = V>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -181,7 +179,6 @@ where
         >,
     E::LinearOperation: InterpretableOp<ArrayType, V> + Op<ArrayType>,
 {
-    type Base = V;
     type FunctionInput = Input::Traced;
     type FunctionOutput = Output::Traced;
 
@@ -205,25 +202,28 @@ where
 /// tangent propagation as part of the outer compiled graph.
 impl<
     E,
-    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
-    Output: Parameterized<Self, ParameterStructure: Clone>,
-    O: Clone + Op<ArrayType>,
-    L: Clone + Op<ArrayType>,
+    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq, To<Self> = Input>,
+    Output: Parameterized<Self, ParameterStructure: Clone, To<Self> = Output>,
+    O: Clone + Op<ArrayType> + 'static,
+    L: Clone + Op<ArrayType> + 'static,
 > JvpInvocationLeaf<E, Input, Output> for JitTracer<ArrayType, V, O, L>
 where
-    Input::Family: ParameterizedFamily<V>,
-    Output::Family: ParameterizedFamily<V>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
     Output::To<V>: TraceOutput<V, O, L, Traced = Output>,
+    Input::To<ArrayType>:
+        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
+    Output::To<ArrayType>:
+        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
         >,
     LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>: CoreLinearReplayOp<JitTracer<ArrayType, V, O, L>>,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+    E: Engine<Type = ArrayType, TracingOperation = O, LinearOperation = L>,
 {
-    type Base = V;
     type FunctionInput = Input;
     type FunctionOutput = Output;
 
@@ -284,7 +284,6 @@ where
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearReplayOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
 {
-    type Base = V;
     type FunctionInput = <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced;
     type FunctionOutput = <Output::To<V> as TraceOutput<V, E::TracingOperation, E::LinearOperation>>::Traced;
 
@@ -403,7 +402,7 @@ pub fn jvp<E, F, Input, Output, Leaf>(
     tangents: Input,
 ) -> Result<(Output, Output), TraceError>
 where
-    E: Engine<Type = ArrayType, Value = <Leaf as JvpInvocationLeaf<E, Input, Output>>::Base>,
+    E: Engine<Type = ArrayType>,
     Leaf: JvpInvocationLeaf<E, Input, Output>,
     Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Leaf, ParameterStructure: Clone>,

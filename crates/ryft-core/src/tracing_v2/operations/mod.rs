@@ -3,8 +3,6 @@
 use std::collections::BTreeSet;
 
 use crate::sharding::Sharding;
-use std::marker::PhantomData;
-
 use crate::tracing_v2::{TraceError, Traceable, batch::Batch, jit::JitTracer};
 use crate::types::ArrayType;
 
@@ -122,7 +120,7 @@ pub fn lift_jit_constant<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone +
 ) -> JitTracer<ArrayType, V, O, L> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
-    JitTracer::from_staged_parts(constant.clone(), atom, builder, exemplar.staging_error_handle(), PhantomData)
+    JitTracer::from_staged_parts(atom, builder, exemplar.staging_error_handle(), exemplar.engine())
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.

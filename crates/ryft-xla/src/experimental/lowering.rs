@@ -2871,13 +2871,7 @@ mod tests {
                       %3 = stablehlo.negate %2 : tensor<4x4xf32>
                       %4 = stablehlo.cosine %3 : tensor<4x4xf32>
                       %5 = stablehlo.sine %4 : tensor<4x4xf32>
-                      %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                      %6 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
-                      %7 = stablehlo.multiply %5, %6 : tensor<4x4xf32>
-                      %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                      %8 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
-                      %9 = stablehlo.add %7, %8 : tensor<4x4xf32>
-                      sdy.return %9 : tensor<4x4xf32>
+                      sdy.return %5 : tensor<4x4xf32>
                     } : (tensor<4x4xf32>) -> tensor<8x4xf32>
                     return %0 : tensor<8x4xf32>
                   }

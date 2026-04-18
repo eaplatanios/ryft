@@ -247,7 +247,7 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             let mesh = mesh.clone();
             move |x: ShardMapTracer| {
                 grad(
-                    &crate::experimental::engine::XlaEngine::tracing(),
+                    &crate::experimental::engine::XlaEngine::token(),
                     {
                         let mesh = mesh.clone();
                         let sharding = sharding.clone();
@@ -287,7 +287,7 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
-                        grad(&crate::experimental::engine::XlaEngine::tracing(), |y: ShardMapTracer| y.sin(), local_x)
+                        grad(&crate::experimental::engine::XlaEngine::token(), |y: ShardMapTracer| y.sin(), local_x)
                             .unwrap_or_else(|error| {
                                 panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
                             })
@@ -363,7 +363,7 @@ fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, Benc
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
                         let gradient: ShardMapTracer = grad(
-                            &crate::experimental::engine::XlaEngine::tracing(),
+                            &crate::experimental::engine::XlaEngine::token(),
                             |y: ShardMapTracer| y.sin(),
                             local_x.clone(),
                         )

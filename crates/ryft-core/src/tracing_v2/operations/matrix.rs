@@ -212,7 +212,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
 }
 
 impl<
-    V: Traceable<ArrayType> + MatrixOps,
+    V: Traceable<ArrayType>,
     O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
     L: Clone,
 > MatrixOps for JitTracer<ArrayType, V, O, L>
@@ -221,7 +221,7 @@ where
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, O::matmul_op(), MatrixOps::matmul)
+        self.binary(rhs, O::matmul_op())
     }
 
     #[inline]
@@ -229,7 +229,7 @@ where
         if matrix_transpose_is_identity_type(&self.tpe()) {
             return self;
         }
-        self.unary(O::matrix_transpose_op(), MatrixOps::transpose_matrix)
+        self.unary(O::matrix_transpose_op())
     }
 }
 

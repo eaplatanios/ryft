@@ -190,7 +190,6 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingCons
         let primal = JitTracer::apply_staged_op(
             std::slice::from_ref(&input.primal),
             XlaPrimitiveOp::WithShardingConstraint(self.clone()),
-            vec![input.primal.value.clone()],
         )?
         .into_iter()
         .next()

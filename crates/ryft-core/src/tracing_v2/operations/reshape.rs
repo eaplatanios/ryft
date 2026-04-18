@@ -245,7 +245,7 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<V: Traceable<ArrayType> + ReshapeOps, O: ReshapeTracingOperation<ArrayType, V>, L: Clone> ReshapeOps
+impl<V: Traceable<ArrayType>, O: ReshapeTracingOperation<ArrayType, V>, L: Clone> ReshapeOps
     for JitTracer<ArrayType, V, O, L>
 where
     O: Op<ArrayType>,
@@ -256,15 +256,10 @@ where
         if input_type == output_type {
             return Ok(self);
         }
-        let output_value = self.value.clone().reshape(target_shape)?;
-        Ok(JitTracer::apply_staged_op(
-            std::slice::from_ref(&self),
-            O::reshape_op(input_type, output_type),
-            vec![output_value],
-        )?
-        .into_iter()
-        .next()
-        .expect("reshape should produce one traced output"))
+        Ok(JitTracer::apply_staged_op(std::slice::from_ref(&self), O::reshape_op(input_type, output_type))?
+            .into_iter()
+            .next()
+            .expect("reshape should produce one traced output"))
     }
 }
 

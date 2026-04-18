@@ -49,14 +49,13 @@
 //! the [Shardy dialect documentation](https://openxla.org/shardy/sdy_dialect) for the IR-level
 //! semantics of manual computation regions.
 
-use std::ops::{Add, Mul, Neg};
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
     fmt::Debug,
+    ops::{Add, Mul, Neg},
 };
 
-use ryft_macros::Parameter;
 #[cfg(test)]
 use ryft_mlir::Block;
 use ryft_mlir::Context as MlirContext;
@@ -68,9 +67,10 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use ryft_core::tracing_v2::operations::{AddOp, MatMulOp, MatrixTransposeOp, MulOp};
 use ryft_core::tracing_v2::{
-    CompiledFunction, Cos, JitTracer, LinearPrimitiveOp, Linearized, MatrixOps, OneLike, Sin, TraceError, Traceable,
-    ZeroLike, jit,
+    CompiledFunction, Cos, JitTracer, LinearPrimitiveOp, Linearized, MatrixOps, OneLike, Op, Sin, TraceError,
+    Traceable, Value, ZeroLike, jit_from_types,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -263,84 +263,109 @@ impl From<ShardMapError> for ShardMapTraceError {
     }
 }
 
-/// Constant kind tracked for shard-map body tracing.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub(crate) enum ShardMapConstantKind {
-    /// Zero splat constant.
+/// Constant class preserved for abstract shard-map tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardMapConstantKind {
+    /// All elements are exactly zero.
     Zero,
 
-    /// One splat constant.
+    /// All elements are exactly one.
     One,
 }
 
-/// Abstract tensor leaf used while tracing shard-map bodies.
-#[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-pub(crate) struct ShardMapTensor {
-    r#type: ArrayType,
+/// Abstract tensor leaf used while tracing XLA programs directly from [`ArrayType`] metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardMapTensor {
+    array_type: ArrayType,
     constant_kind: Option<ShardMapConstantKind>,
 }
 
+impl Parameter for ShardMapTensor {}
+
 impl ShardMapTensor {
-    /// Creates a traced shard-map tensor with the provided type.
-    pub(crate) fn new(r#type: ArrayType) -> Self {
-        Self { r#type, constant_kind: None }
+    /// Clears sharding state that cannot vary for one exact zero/one tensor constant.
+    fn normalize_constant_array_type(mut array_type: ArrayType) -> ArrayType {
+        if let Some(sharding) = &mut array_type.sharding {
+            sharding.varying_manual_axes.clear();
+        }
+        array_type
     }
 
-    pub(crate) fn constant(r#type: ArrayType, constant_kind: ShardMapConstantKind) -> Self {
-        Self { r#type, constant_kind: Some(constant_kind) }
+    #[inline]
+    /// Creates one non-constant abstract tensor from its [`ArrayType`] metadata.
+    pub fn new(array_type: ArrayType) -> Self {
+        Self { array_type, constant_kind: None }
     }
 
-    /// Returns the underlying array type.
-    pub(crate) fn r#type(&self) -> &ArrayType {
-        &self.r#type
+    #[inline]
+    /// Creates one abstract tensor known to be filled with zeros.
+    pub fn zero(array_type: ArrayType) -> Self {
+        Self {
+            array_type: Self::normalize_constant_array_type(array_type),
+            constant_kind: Some(ShardMapConstantKind::Zero),
+        }
     }
 
-    /// Returns a copy of this tensor with the provided array type.
-    pub(crate) fn with_type(&self, r#type: ArrayType) -> Self {
-        Self { r#type, constant_kind: self.constant_kind }
+    #[inline]
+    /// Creates one abstract tensor known to be filled with ones.
+    pub fn one(array_type: ArrayType) -> Self {
+        Self {
+            array_type: Self::normalize_constant_array_type(array_type),
+            constant_kind: Some(ShardMapConstantKind::One),
+        }
     }
 
-    /// Returns the tracked constant kind, if this value came from `zero_like()` or `one_like()`.
-    pub(crate) fn constant_kind(&self) -> Option<ShardMapConstantKind> {
+    #[inline]
+    /// Returns the array metadata carried by this abstract tensor.
+    pub fn r#type(&self) -> &ArrayType {
+        &self.array_type
+    }
+
+    #[inline]
+    /// Returns the preserved constant class when this tensor is known to be all zeros or all ones.
+    pub fn constant_kind(&self) -> Option<ShardMapConstantKind> {
         self.constant_kind
+    }
+
+    #[inline]
+    /// Replaces the carried [`ArrayType`] while preserving the constant classification.
+    pub fn with_type(mut self, array_type: ArrayType) -> Self {
+        self.array_type = array_type;
+        self
     }
 }
 
-impl Typed<ArrayType> for ShardMapTensor {
+impl ryft_core::types::Typed<ArrayType> for ShardMapTensor {
     fn tpe(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(&self.r#type)
+        Cow::Borrowed(&self.array_type)
     }
 }
 
 impl Traceable<ArrayType> for ShardMapTensor {
+    #[inline]
     fn is_zero(&self) -> bool {
-        false
+        matches!(self.constant_kind, Some(ShardMapConstantKind::Zero))
     }
 
+    #[inline]
     fn is_one(&self) -> bool {
-        false
+        matches!(self.constant_kind, Some(ShardMapConstantKind::One))
     }
 }
 
-impl ryft_core::tracing_v2::Value<ArrayType> for ShardMapTensor {}
-
-fn without_varying_manual_axes(r#type: &ArrayType) -> ArrayType {
-    let mut r#type = r#type.clone();
-    if let Some(sharding) = &mut r#type.sharding {
-        sharding.varying_manual_axes.clear();
-    }
-    r#type
-}
+impl Value<ArrayType> for ShardMapTensor {}
 
 impl ZeroLike for ShardMapTensor {
+    #[inline]
     fn zero_like(&self) -> Self {
-        Self::constant(without_varying_manual_axes(&self.r#type), ShardMapConstantKind::Zero)
+        Self::zero(self.array_type.clone())
     }
 }
 
 impl OneLike for ShardMapTensor {
+    #[inline]
     fn one_like(&self) -> Self {
-        Self::constant(without_varying_manual_axes(&self.r#type), ShardMapConstantKind::One)
+        Self::one(self.array_type.clone())
     }
 }
 
@@ -348,10 +373,17 @@ impl Add for ShardMapTensor {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        let output_type =
-            ryft_core::tracing_v2::operations::binary_same_abstract("add", &[self.r#type.clone(), rhs.r#type.clone()])
-                .unwrap_or(self.r#type);
-        Self::new(output_type)
+        let output_type = AddOp
+            .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
+            .expect("abstract shard-map add should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("add should produce one output type");
+        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
+            (Some(ShardMapConstantKind::Zero), Some(ShardMapConstantKind::Zero)) => Some(ShardMapConstantKind::Zero),
+            _ => None,
+        };
+        Self { array_type: output_type, constant_kind }
     }
 }
 
@@ -359,10 +391,20 @@ impl Mul for ShardMapTensor {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        let output_type =
-            ryft_core::tracing_v2::operations::binary_same_abstract("mul", &[self.r#type.clone(), rhs.r#type.clone()])
-                .unwrap_or(self.r#type);
-        Self::new(output_type)
+        let output_type = MulOp
+            .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
+            .expect("abstract shard-map mul should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("mul should produce one output type");
+        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
+            (Some(ShardMapConstantKind::Zero), _) | (_, Some(ShardMapConstantKind::Zero)) => {
+                Some(ShardMapConstantKind::Zero)
+            }
+            (Some(ShardMapConstantKind::One), Some(ShardMapConstantKind::One)) => Some(ShardMapConstantKind::One),
+            _ => None,
+        };
+        Self { array_type: output_type, constant_kind }
     }
 }
 
@@ -370,63 +412,63 @@ impl Neg for ShardMapTensor {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        Self::new(self.r#type)
+        let constant_kind = match self.constant_kind {
+            Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::Zero),
+            _ => None,
+        };
+        Self { array_type: self.array_type, constant_kind }
     }
 }
 
 impl Sin for ShardMapTensor {
     fn sin(self) -> Self {
-        Self::new(self.r#type)
+        let constant_kind = match self.constant_kind {
+            Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::Zero),
+            _ => None,
+        };
+        Self { array_type: self.array_type, constant_kind }
     }
 }
 
 impl Cos for ShardMapTensor {
     fn cos(self) -> Self {
-        Self::new(self.r#type)
+        let constant_kind = match self.constant_kind {
+            Some(ShardMapConstantKind::Zero) => Some(ShardMapConstantKind::One),
+            _ => None,
+        };
+        Self { array_type: self.array_type, constant_kind }
     }
 }
 
 impl MatrixOps for ShardMapTensor {
     fn matmul(self, rhs: Self) -> Self {
-        match (
-            self.r#type.data_type,
-            self.r#type.shape.dimensions.as_slice(),
-            rhs.r#type.data_type,
-            rhs.r#type.shape.dimensions.as_slice(),
-        ) {
-            (
-                left_data_type,
-                [Size::Static(left_rows), Size::Static(left_cols)],
-                right_data_type,
-                [Size::Static(right_rows), Size::Static(right_cols)],
-            ) if left_data_type == right_data_type && left_cols == right_rows => Self::new(
-                ryft_core::tracing_v2::operations::matrix::matmul_abstract(&self.r#type, &rhs.r#type, "matmul")
-                    .unwrap_or_else(|_| {
-                        ArrayType::new(
-                            left_data_type,
-                            Shape::new(vec![Size::Static(*left_rows), Size::Static(*right_cols)]),
-                            None,
-                            None,
-                        )
-                        .expect("unsharded matrix result fallback should always be valid")
-                    }),
-            ),
-            _ => Self::new(self.r#type),
-        }
+        let output_type = MatMulOp
+            .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
+            .expect("abstract shard-map matmul should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("matmul should produce one output type");
+        let constant_kind = match (self.constant_kind, rhs.constant_kind) {
+            (Some(ShardMapConstantKind::Zero), _) | (_, Some(ShardMapConstantKind::Zero)) => {
+                Some(ShardMapConstantKind::Zero)
+            }
+            _ => None,
+        };
+        Self { array_type: output_type, constant_kind }
     }
 
     fn transpose_matrix(self) -> Self {
-        match self.r#type.shape.dimensions.as_slice() {
-            [_, _] => Self::new(
-                ryft_core::tracing_v2::operations::matrix::transpose_abstract(&self.r#type, "matrix_transpose")
-                    .unwrap_or(self.r#type),
-            ),
-            _ => Self::new(self.r#type),
-        }
+        let output_type = MatrixTransposeOp
+            .abstract_eval(&[self.array_type.clone()])
+            .expect("abstract shard-map transpose should preserve compatible types")
+            .into_iter()
+            .next()
+            .expect("matrix transpose should produce one output type");
+        Self { array_type: output_type, constant_kind: self.constant_kind }
     }
 }
 
-/// Tracer alias used while staging shard-map bodies.
+/// Tracer alias used while staging XLA programs directly from types.
 pub(crate) type ShardMapTracer =
     JitTracer<ArrayType, ShardMapTensor, XlaPrimitiveOp, LinearPrimitiveOp<ArrayType, ShardMapTensor>>;
 
@@ -434,17 +476,13 @@ pub(crate) type ShardMapTracer =
 pub(crate) type XlaCompiledFunction<Input, Output> =
     CompiledFunction<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>;
 
-pub(crate) type ShardMapLocalTraceInput<Input> =
-    <<Input as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
+pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
-pub(crate) type ShardMapLocalTraceOutput<Output> =
-    <<Output as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
+pub(crate) type ShardMapLocalTraceOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
-type TracedXlaInput<Input> =
-    <<Input as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
+type TracedXlaInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
-type TracedXlaOutput<Output> =
-    <<Output as Parameterized<ArrayType>>::To<ShardMapTensor> as Parameterized<ShardMapTensor>>::To<ShardMapTracer>;
+type TracedXlaOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
 /// Dispatch trait used by [`shard_map`] to select the appropriate tracing regime from the input leaf type.
 #[doc(hidden)]
@@ -544,18 +582,10 @@ where
             }
             .into());
         }
-        let mut output_type = input.value.tpe().into_owned();
-        output_type.sharding =
-            Some(sharding_with_varying_manual_axes(&sharding, varying_axes(output_type.sharding.as_ref())));
-        let output_value = input.value.with_type(output_type);
-        Ok(JitTracer::apply_staged_op(
-            std::slice::from_ref(&input),
-            XlaPrimitiveOp::WithShardingConstraint(op),
-            vec![output_value],
-        )?
-        .into_iter()
-        .next()
-        .expect("with_sharding_constraint should produce one output per input leaf"))
+        Ok(JitTracer::apply_staged_op(std::slice::from_ref(&input), XlaPrimitiveOp::WithShardingConstraint(op))?
+            .into_iter()
+            .next()
+            .expect("with_sharding_constraint should produce one output per input leaf"))
     }
 
     let structure = input.parameter_structure();
@@ -1198,17 +1228,6 @@ fn derive_local_input_types<Input: Parameterized<ArrayType, ParameterStructure: 
     Ok(Input::from_parameters(structure, local_input_types)?)
 }
 
-fn traced_input_tensors<Input: Parameterized<ArrayType, ParameterStructure: Clone>>(
-    local_input_types: &Input,
-) -> Result<Input::To<ShardMapTensor>, ShardMapTraceError>
-where
-    Input::Family: ParameterizedFamily<ShardMapTensor>,
-{
-    let structure = local_input_types.parameter_structure();
-    let tensors = local_input_types.parameters().cloned().map(ShardMapTensor::new).collect::<Vec<_>>();
-    Ok(Input::To::<ShardMapTensor>::from_parameters(structure, tensors)?)
-}
-
 fn trace_xla_function<
     F: FnOnce(TracedXlaInput<Input>) -> TracedXlaOutput<Output>,
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
@@ -1221,16 +1240,14 @@ where
     Input::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
     Output::Family: ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
 {
-    let traced_inputs = traced_input_tensors(input_types)?;
-    let engine = XlaEngine::tracing();
-    let (output_tensors, compiled): (
-        Output::To<ShardMapTensor>,
-        XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
-    ) = jit(&engine, function, traced_inputs)?;
-    let output_types = Output::from_parameters(
-        output_tensors.parameter_structure(),
-        output_tensors.into_parameters().map(|tensor| tensor.tpe().into_owned()).collect::<Vec<_>>(),
-    )?;
+    let (output_types, compiled): (Output, XlaCompiledFunction<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>) = {
+        let engine = XlaEngine::token();
+        let cloned_input_types = Input::from_parameters(
+            input_types.parameter_structure(),
+            input_types.parameters().cloned().collect::<Vec<_>>(),
+        )?;
+        jit_from_types(&engine, function, cloned_input_types)?
+    };
     Ok((output_types, compiled))
 }
 
@@ -3019,7 +3036,7 @@ mod tests {
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x: ShardMapTracer| {
                 let gradient: ShardMapTracer =
-                    grad(&crate::experimental::engine::XlaEngine::tracing(), |y: ShardMapTracer| y.sin(), x.clone())
+                    grad(&crate::experimental::engine::XlaEngine::token(), |y: ShardMapTracer| y.sin(), x.clone())
                         .expect("gradient inside shard_map should succeed");
                 let lanes: Vec<ShardMapTracer> = vmap(
                     |y: ryft_core::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
@@ -3043,23 +3060,20 @@ mod tests {
                   func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
                       %1 = stablehlo.cosine %arg1 : tensor<2xf32>
+                      %2 = stablehlo.broadcast_in_dim %1, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
+                      %3 = stablehlo.broadcast_in_dim %1, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
+                      %4 = stablehlo.concatenate %2, %3, dim = 0 : (tensor<1x2xf32>, tensor<1x2xf32>) -> tensor<2x2xf32>
                       %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                      %2 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
-                      %3 = stablehlo.multiply %1, %2 : tensor<2xf32>
-                      %4 = stablehlo.broadcast_in_dim %3, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
-                      %5 = stablehlo.broadcast_in_dim %3, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
-                      %6 = stablehlo.concatenate %4, %5, dim = 0 : (tensor<1x2xf32>, tensor<1x2xf32>) -> tensor<2x2xf32>
-                      %cst_0 = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                      %7 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2xf32>
-                      %8 = stablehlo.broadcast_in_dim %7, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
-                      %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1] : (tensor<1x2xf32>) -> tensor<2x2xf32>
-                      %10 = stablehlo.add %6, %9 : tensor<2x2xf32>
-                      %11 = stablehlo.slice %10 [0:1, 0:2] : (tensor<2x2xf32>) -> tensor<1x2xf32>
+                      %5 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                      %6 = stablehlo.broadcast_in_dim %5, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
+                      %7 = stablehlo.broadcast_in_dim %6, dims = [0, 1] : (tensor<1x2xf32>) -> tensor<2x2xf32>
+                      %8 = stablehlo.add %4, %7 : tensor<2x2xf32>
+                      %9 = stablehlo.slice %8 [0:1, 0:2] : (tensor<2x2xf32>) -> tensor<1x2xf32>
+                      %10 = stablehlo.reshape %9 : (tensor<1x2xf32>) -> tensor<2xf32>
+                      %11 = stablehlo.slice %8 [1:2, 0:2] : (tensor<2x2xf32>) -> tensor<1x2xf32>
                       %12 = stablehlo.reshape %11 : (tensor<1x2xf32>) -> tensor<2xf32>
-                      %13 = stablehlo.slice %10 [1:2, 0:2] : (tensor<2x2xf32>) -> tensor<1x2xf32>
-                      %14 = stablehlo.reshape %13 : (tensor<1x2xf32>) -> tensor<2xf32>
-                      %15 = stablehlo.add %12, %14 : tensor<2xf32>
-                      sdy.return %15 : tensor<2xf32>
+                      %13 = stablehlo.add %10, %12 : tensor<2xf32>
+                      sdy.return %13 : tensor<2xf32>
                     } : (tensor<8xf32>) -> tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
@@ -3186,7 +3200,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     grad(
-                        &crate::experimental::engine::XlaEngine::tracing(),
+                        &crate::experimental::engine::XlaEngine::token(),
                         {
                             let mesh = mesh.clone();
                             let sharding = sharding.clone();

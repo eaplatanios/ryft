@@ -91,7 +91,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// - Heavier payloads (array buffers, tensors, device allocations) should wrap the underlying handle in
 ///   [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded cases). This keeps the leaf cheaply
 ///   cloneable — which the [`Clone`] supertrait also demands — and severs any tie to a caller's scope. PJRT-backed
-///   arrays, shard-map tensors, and similar backend values all take this shape.
+///   arrays and similar backend values all take this shape.
 ///
 /// Avoid leaf types that borrow from external state: a reference-carrying wrapper cannot be baked into a staged
 /// graph that outlives the trace, and it will not satisfy `'static` either.

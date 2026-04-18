@@ -572,11 +572,10 @@ where
     let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
     let atom = exemplar.builder_handle().borrow_mut().add_constant(constant.clone());
     Ok(JitTracer::from_staged_parts(
-        constant.clone(),
         atom,
         exemplar.builder_handle(),
         exemplar.staging_error_handle(),
-        PhantomData,
+        exemplar.engine(),
     ))
 }
 
@@ -728,6 +727,9 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::LinearOperation: Clone + Op<ArrayType>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
+    Input::ParameterStructure: PartialEq,
+    Output::ParameterStructure: Clone,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -741,6 +743,7 @@ where
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
     let (primal_output, program) =
         try_trace_program_for_operation::<_, Input, Output, V, E::TracingOperation, E::LinearOperation>(
+            engine,
             function,
             reconstructed_primals,
         )?;
@@ -761,15 +764,19 @@ pub(crate) fn try_jvp_traced<F, Input, Output, V, O, L>(
     tangents: Input,
 ) -> Result<(Output, Output), TraceError>
 where
-    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<JitTracer<ArrayType, V, O, L>, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<JitTracer<ArrayType, V, O, L>, ParameterStructure: Clone>,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
-    Input::Family: ParameterizedFamily<V>,
-    Output::Family: ParameterizedFamily<V>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
     Output::To<V>: TraceOutput<V, O, L, Traced = Output>,
+    Input::To<ArrayType>:
+        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
+    Output::To<ArrayType>:
+        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
@@ -784,23 +791,35 @@ where
     let input_structure = primals.parameter_structure();
     let traced_primals = primals.into_parameters().collect::<Vec<_>>();
     let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
-    let staged_primals = Input::To::<V>::from_parameters(
+    let staged_input_types = Input::To::<ArrayType>::from_parameters(
         input_structure.clone(),
-        traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+        traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (primal_output, traced_program): (Output::To<V>, Program<ArrayType, V, Input::To<V>, Output::To<V>, O>) =
-        try_trace_program_for_operation::<_, Input::To<V>, Output::To<V>, V, O, L>(
-            move |staged_input| {
-                let adapted_input =
-                    Input::from_parameters(input_structure, staged_input.into_parameters().collect::<Vec<_>>())?;
-                function(adapted_input)
-            },
-            staged_primals,
-        )?;
-    let output_structure = primal_output.parameter_structure();
+    let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+    let (primal_output_types, traced_program): (
+        Output::To<ArrayType>,
+        Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
+    ) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+        _,
+        Input::To<ArrayType>,
+        Output::To<ArrayType>,
+        ArrayType,
+        V,
+        O,
+        L,
+    >(
+        exemplar_engine,
+        move |staged_input| {
+            let adapted_input =
+                Input::from_parameters(input_structure, staged_input.into_parameters().collect::<Vec<_>>())?;
+            function(adapted_input)
+        },
+        staged_input_types,
+    )?;
+    let output_structure = primal_output_types.parameter_structure();
     let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-        traced_primals.iter().map(|primal| primal.value.parameter_structure()).collect::<Vec<_>>(),
-        primal_output.parameters().map(Parameterized::parameter_structure).collect::<Vec<_>>(),
+        flat_leaf_parameter_structure(traced_primals.len()),
+        flat_leaf_parameter_structure(output_structure.parameter_count()),
     ))
     .simplify()?;
     let (traced_primal_output, pushforward) = try_linearize_traced_program::<V, O, L>(&traced_program, traced_primals)?;
@@ -824,6 +843,9 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Output::Traced,
     E::LinearOperation: Clone + Op<ArrayType>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
+    Input::ParameterStructure: PartialEq,
+    Output::ParameterStructure: Clone,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -848,6 +870,9 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Output::Traced,
     E::LinearOperation: Clone + Op<ArrayType>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
+    Input::ParameterStructure: PartialEq,
+    Output::ParameterStructure: Clone,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -872,6 +897,8 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
     E::LinearOperation: Clone + Op<ArrayType>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
+    Input::ParameterStructure: PartialEq,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -901,6 +928,8 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
     F: FnOnce(Input::Traced) -> Output::Traced,
     E::LinearOperation: Clone + Op<ArrayType>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
+    Input::ParameterStructure: PartialEq,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -927,6 +956,7 @@ where
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(Input::Traced) -> Result<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>, TraceError>,
     E::LinearOperation: Clone + Op<ArrayType>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -945,12 +975,9 @@ where
 #[doc(hidden)]
 pub trait GradInvocationLeaf<E, Input>: Parameter + Sized
 where
-    E: Engine<Type = ArrayType, Value = Self::Base>,
+    E: Engine<Type = ArrayType>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 {
-    /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType>;
-
     /// Return type produced by [`grad`] for the corresponding input regime.
     type Return;
 
@@ -981,6 +1008,7 @@ where
             E::LinearOperation,
             Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
         >,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -990,7 +1018,6 @@ where
         >,
     E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
 {
-    type Base = V;
     type Return = Input;
     type FunctionInput = Input::Traced;
     type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
@@ -1014,18 +1041,22 @@ impl<
     L: Clone + Op<ArrayType> + 'static,
 > GradInvocationLeaf<E, Input> for JitTracer<ArrayType, V, O, L>
 where
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+    E: Engine<Type = ArrayType, TracingOperation = O, LinearOperation = L>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V: TraceOutput<V, O, L, Traced = JitTracer<ArrayType, V, O, L>>,
-    Input::Family: ParameterizedFamily<V>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
+    V::To<ArrayType>:
+        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = V, Traced = JitTracer<ArrayType, V, O, L>>,
+    Input::To<ArrayType>:
+        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
         >,
     LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O, L>>,
 {
-    type Base = V;
     type Return = Input;
     type FunctionInput = Input;
     type FunctionOutput = JitTracer<ArrayType, V, O, L>;
@@ -1036,21 +1067,30 @@ where
     {
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-        let staged_primals = Input::To::<V>::from_parameters(
+        let staged_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
-            traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+            traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
-        let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V, O>) =
-            try_trace_program_for_operation::<_, Input::To<V>, V, V, O, L>(
-                |staged_input| {
-                    let adapted_input = Input::from_parameters(
-                        input_structure.clone(),
-                        staged_input.into_parameters().collect::<Vec<_>>(),
-                    )?;
-                    Ok(function(adapted_input))
-                },
-                staged_primals,
-            )?;
+        let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+        let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+            _,
+            Input::To<ArrayType>,
+            V::To<ArrayType>,
+            ArrayType,
+            V,
+            O,
+            L,
+        >(
+            exemplar_engine,
+            |staged_input| {
+                let adapted_input = Input::from_parameters(
+                    input_structure.clone(),
+                    staged_input.into_parameters().collect::<Vec<_>>(),
+                )?;
+                Ok(function(adapted_input))
+            },
+            staged_input_types,
+        )?;
         let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
             flat_leaf_parameter_structure(traced_primals.len()),
             flat_leaf_parameter_structure(1),
@@ -1136,7 +1176,6 @@ where
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
 {
-    type Base = V;
     type Return = Input;
     type FunctionInput = <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced;
     type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
@@ -1214,7 +1253,7 @@ pub fn grad<E, F, Input, Leaf>(
     primals: Input,
 ) -> Result<<Leaf as GradInvocationLeaf<E, Input>>::Return, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = <Leaf as GradInvocationLeaf<E, Input>>::Base>,
+    E: Engine<Type = ArrayType>,
     Leaf: GradInvocationLeaf<E, Input>,
     Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(
@@ -1228,12 +1267,9 @@ where
 #[doc(hidden)]
 pub trait ValueAndGradInvocationLeaf<E, Input>: Parameter + Sized
 where
-    E: Engine<Type = ArrayType, Value = Self::Base>,
+    E: Engine<Type = ArrayType>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
 {
-    /// Base leaf value used for the staged inner program.
-    type Base: Traceable<ArrayType>;
-
     /// Return type produced by [`value_and_grad`] for the corresponding input regime.
     type Return;
 
@@ -1264,6 +1300,7 @@ where
             E::LinearOperation,
             Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
         >,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -1273,7 +1310,6 @@ where
         >,
     E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
 {
-    type Base = V;
     type Return = (V, Input);
     type FunctionInput = Input::Traced;
     type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
@@ -1300,18 +1336,22 @@ impl<
     L: Clone + Op<ArrayType> + 'static,
 > ValueAndGradInvocationLeaf<E, Input> for JitTracer<ArrayType, V, O, L>
 where
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+    E: Engine<Type = ArrayType, TracingOperation = O, LinearOperation = L>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V: TraceOutput<V, O, L, Traced = JitTracer<ArrayType, V, O, L>>,
-    Input::Family: ParameterizedFamily<V>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
+    V::To<ArrayType>:
+        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = V, Traced = JitTracer<ArrayType, V, O, L>>,
+    Input::To<ArrayType>:
+        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
         >,
     LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O, L>>,
 {
-    type Base = V;
     type Return = (JitTracer<ArrayType, V, O, L>, Input);
     type FunctionInput = Input;
     type FunctionOutput = JitTracer<ArrayType, V, O, L>;
@@ -1322,21 +1362,30 @@ where
     {
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-        let staged_primals = Input::To::<V>::from_parameters(
+        let staged_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
-            traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+            traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
-        let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V, O>) =
-            try_trace_program_for_operation::<_, Input::To<V>, V, V, O, L>(
-                |staged_input| {
-                    let adapted_input = Input::from_parameters(
-                        input_structure.clone(),
-                        staged_input.into_parameters().collect::<Vec<_>>(),
-                    )?;
-                    Ok(function(adapted_input))
-                },
-                staged_primals,
-            )?;
+        let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+        let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+            _,
+            Input::To<ArrayType>,
+            V::To<ArrayType>,
+            ArrayType,
+            V,
+            O,
+            L,
+        >(
+            exemplar_engine,
+            |staged_input| {
+                let adapted_input = Input::from_parameters(
+                    input_structure.clone(),
+                    staged_input.into_parameters().collect::<Vec<_>>(),
+                )?;
+                Ok(function(adapted_input))
+            },
+            staged_input_types,
+        )?;
         let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
             flat_leaf_parameter_structure(traced_primals.len()),
             flat_leaf_parameter_structure(1),
@@ -1422,7 +1471,6 @@ where
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
 {
-    type Base = V;
     type Return = (Batch<V>, Input);
     type FunctionInput = <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced;
     type FunctionOutput = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>;
@@ -1506,7 +1554,7 @@ pub fn value_and_grad<E, F, Input, Leaf>(
     primals: Input,
 ) -> Result<<Leaf as ValueAndGradInvocationLeaf<E, Input>>::Return, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = <Leaf as ValueAndGradInvocationLeaf<E, Input>>::Base>,
+    E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,
     Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(
@@ -1752,6 +1800,7 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -1800,6 +1849,7 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(Input::Traced) -> Output::Traced,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -1825,6 +1875,7 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -1867,6 +1918,7 @@ where
     Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     F: FnOnce(Input::Traced) -> Output::Traced,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -1898,6 +1950,7 @@ where
     F: FnOnce(
         <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
     ) -> <Input as TraceOutput<V, E::TracingOperation, E::LinearOperation>>::Traced,
+    E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
             V,
@@ -1931,11 +1984,14 @@ pub fn compile_grad<E, F, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation:
-        InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation>> + Op<ArrayType>,
+    E::TracingOperation: InterpretableOp<ArrayType, V>
+        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation>>
+        + Op<ArrayType>,
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
+    V::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     V: TraceInput<
             V,
@@ -1953,30 +2009,62 @@ where
         + TraceOutput<V, E::TracingOperation, E::LinearOperation>
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::To<V>: TraceInput<V, E::TracingOperation, E::LinearOperation>,
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracingInput<
+            ArrayType,
+            V,
+            E::TracingOperation,
+            E::LinearOperation,
+            Staged = Input::To<V>,
+            Traced = <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
+        >,
+    V::To<ArrayType>: crate::tracing_v2::TypeTracingOutput<
+            ArrayType,
+            V,
+            E::TracingOperation,
+            E::LinearOperation,
+            Staged = V,
+            Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+        >,
     F: Fn(
         <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
     ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
 {
     let input_structure = example_primals.parameter_structure();
     let (_, compiled) = try_jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
+        _engine,
         |primals: <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-            let staged_primals = Input::To::<V>::from_parameters(
+            let staged_input_types = Input::To::<ArrayType>::from_parameters(
                 input_structure.clone(),
-                traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+                traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
             )?;
-            let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V, E::TracingOperation>) =
-                try_trace_program_for_operation::<_, Input::To<V>, V, V, E::TracingOperation, E::LinearOperation>(
-                    |staged_input: <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
-                        let adapted_input =
-                            <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced::from_parameters(
-                                input_structure.clone(),
-                                staged_input.into_parameters().collect::<Vec<_>>(),
-                            )?;
-                        Ok(function(adapted_input))
-                    },
-                    staged_primals,
-                )?;
+            let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+            let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+                _,
+                Input::To<ArrayType>,
+                V::To<ArrayType>,
+                ArrayType,
+                V,
+                E::TracingOperation,
+                E::LinearOperation,
+            >(
+                exemplar_engine,
+                |staged_input: <Input::To<ArrayType> as crate::tracing_v2::TypeTracingInput<
+                    ArrayType,
+                    V,
+                    E::TracingOperation,
+                    E::LinearOperation,
+                >>::Traced| {
+                    let adapted_input =
+                        <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced::from_parameters(
+                            input_structure.clone(),
+                            staged_input.into_parameters().collect::<Vec<_>>(),
+                        )?;
+                    Ok(function(adapted_input))
+                },
+                staged_input_types,
+            )?;
             let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
                 flat_leaf_parameter_structure(traced_primals.len()),
                 flat_leaf_parameter_structure(1),
@@ -2058,6 +2146,8 @@ where
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
+    V::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     V: TraceInput<
             V,
@@ -2075,6 +2165,23 @@ where
         + TraceOutput<V, E::TracingOperation, E::LinearOperation>
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::To<V>: TraceInput<V, E::TracingOperation, E::LinearOperation>,
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracingInput<
+            ArrayType,
+            V,
+            E::TracingOperation,
+            E::LinearOperation,
+            Staged = Input::To<V>,
+            Traced = <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
+        >,
+    V::To<ArrayType>: crate::tracing_v2::TypeTracingOutput<
+            ArrayType,
+            V,
+            E::TracingOperation,
+            E::LinearOperation,
+            Staged = V,
+            Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+        >,
     F: Fn(
         <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
     ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
@@ -2116,6 +2223,8 @@ where
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
+    V::Family: ParameterizedFamily<ArrayType>
+        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     V: TraceInput<
             V,
@@ -2133,32 +2242,64 @@ where
         + TraceOutput<V, E::TracingOperation, E::LinearOperation>
         + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::To<V>: TraceInput<V, E::TracingOperation, E::LinearOperation>,
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Input::To<ArrayType>: crate::tracing_v2::TypeTracingInput<
+            ArrayType,
+            V,
+            E::TracingOperation,
+            E::LinearOperation,
+            Staged = Input::To<V>,
+            Traced = <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
+        >,
+    V::To<ArrayType>: crate::tracing_v2::TypeTracingOutput<
+            ArrayType,
+            V,
+            E::TracingOperation,
+            E::LinearOperation,
+            Staged = V,
+            Traced = JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+        >,
     F: Fn(
         <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced,
     ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
 {
     let input_structure = example_primals.parameter_structure();
     let (_, compiled) = try_jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
+        engine,
         |primals: <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
 
             // Step 1: Trace the function at the base V level to get a program.
-            let staged_primals = Input::To::<V>::from_parameters(
+            let staged_input_types = Input::To::<ArrayType>::from_parameters(
                 input_structure.clone(),
-                traced_primals.iter().map(|primal| primal.value.clone()).collect::<Vec<_>>(),
+                traced_primals.iter().map(|primal| primal.tpe().into_owned()).collect::<Vec<_>>(),
             )?;
-            let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V, E::TracingOperation>) =
-                try_trace_program_for_operation::<_, Input::To<V>, V, V, E::TracingOperation, E::LinearOperation>(
-                    |staged_input: <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
-                        let adapted_input =
-                            <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced::from_parameters(
-                                input_structure.clone(),
-                                staged_input.into_parameters().collect::<Vec<_>>(),
-                            )?;
-                        Ok(function(adapted_input))
-                    },
-                    staged_primals,
-                )?;
+            let exemplar_engine = traced_primals.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+            let (_, traced_program) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+                _,
+                Input::To<ArrayType>,
+                V::To<ArrayType>,
+                ArrayType,
+                V,
+                E::TracingOperation,
+                E::LinearOperation,
+            >(
+                exemplar_engine,
+                |staged_input: <Input::To<ArrayType> as crate::tracing_v2::TypeTracingInput<
+                    ArrayType,
+                    V,
+                    E::TracingOperation,
+                    E::LinearOperation,
+                >>::Traced| {
+                    let adapted_input =
+                        <Input as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced::from_parameters(
+                            input_structure.clone(),
+                            staged_input.into_parameters().collect::<Vec<_>>(),
+                        )?;
+                    Ok(function(adapted_input))
+                },
+                staged_input_types,
+            )?;
             let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
                 flat_leaf_parameter_structure(traced_primals.len()),
                 flat_leaf_parameter_structure(1),

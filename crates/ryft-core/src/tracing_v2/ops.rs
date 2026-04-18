@@ -2234,15 +2234,10 @@ mod tests {
         input: JitTracer<ArrayType, f64>,
         primitive: CustomPrimitive<ArrayType, f64>,
     ) -> Result<JitTracer<ArrayType, f64>, TraceError> {
-        let output_values = primitive.interpret(std::slice::from_ref(&input.value))?;
-        Ok(JitTracer::apply_staged_op(
-            std::slice::from_ref(&input),
-            PrimitiveOp::Custom(Arc::new(primitive)),
-            output_values,
-        )?
-        .into_iter()
-        .next()
-        .expect("unary custom primitive should produce one output"))
+        Ok(JitTracer::apply_staged_op(std::slice::from_ref(&input), PrimitiveOp::Custom(Arc::new(primitive)))?
+            .into_iter()
+            .next()
+            .expect("unary custom primitive should produce one output"))
     }
 
     /// Applies one unary custom primitive to one traced scalar and expects staging to succeed.

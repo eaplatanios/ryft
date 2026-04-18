@@ -108,7 +108,7 @@ where
 {
     #[inline]
     fn cos(self) -> Self {
-        self.unary(O::cos_op(), Cos::cos)
+        self.unary(O::cos_op())
     }
 }
 

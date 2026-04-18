@@ -105,7 +105,7 @@ where
 {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(O::sin_op(), Sin::sin)
+        self.unary(O::sin_op())
     }
 }
 

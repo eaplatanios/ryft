@@ -204,12 +204,7 @@ where
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_output_values = <Self as InterpretableOp<ArrayType, V>>::interpret(
-            self,
-            primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice(),
-        )?;
-        let primal_outputs =
-            JitTracer::apply_staged_op(primal_inputs.as_slice(), O::vmap_op(self.clone()), primal_output_values)?;
+        let primal_outputs = JitTracer::apply_staged_op(primal_inputs.as_slice(), O::vmap_op(self.clone()))?;
         let lane_input_count = self.body().input_types().len();
         let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
@@ -268,9 +263,7 @@ where
     O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, LinearProgramOpRef<V>>,
 {
     fn interpret(&self, inputs: &[JitTracer<ArrayType, V, O>]) -> Result<Vec<JitTracer<ArrayType, V, O>>, TraceError> {
-        let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let output_values = <Self as InterpretableOp<ArrayType, V>>::interpret(self, concrete_inputs.as_slice())?;
-        JitTracer::apply_staged_op(inputs, O::vmap_op(self.clone()), output_values)
+        JitTracer::apply_staged_op(inputs, O::vmap_op(self.clone()))
     }
 }
 

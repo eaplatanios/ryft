@@ -15,7 +15,6 @@ use crate::{
         CompiledFunction, JitTracer, LinearTerm, Program, TraceError, TraceInput, TraceOutput, Traceable, Value,
         ZeroLike,
         engine::Engine,
-        jit::try_trace_program_for_operation,
         linear::{
             linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
         },
@@ -175,15 +174,7 @@ where
         inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_output_values = <Self as InterpretableOp<ArrayType, V>>::interpret(
-            self,
-            primal_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>().as_slice(),
-        )?;
-        let primal_outputs = JitTracer::apply_staged_op(
-            primal_inputs.as_slice(),
-            O::rematerialize_op(self.clone()),
-            primal_output_values,
-        )?;
+        let primal_outputs = JitTracer::apply_staged_op(primal_inputs.as_slice(), O::rematerialize_op(self.clone()))?;
         let tangent_outputs = replay_program_graph_linearized_jit::<_, _, _, O, LinearProgramOpRef<V>>(
             self.body().compiled().program().graph(),
             inputs.to_vec(),
@@ -237,9 +228,7 @@ where
         + RematerializeTracingOperation<ArrayType, V, LinearProgramOpRef<V>>,
 {
     fn interpret(&self, inputs: &[JitTracer<ArrayType, V, O>]) -> Result<Vec<JitTracer<ArrayType, V, O>>, TraceError> {
-        let concrete_inputs = inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>();
-        let output_values = <Self as InterpretableOp<ArrayType, V>>::interpret(self, concrete_inputs.as_slice())?;
-        JitTracer::apply_staged_op(inputs, O::rematerialize_op(self.clone()), output_values)
+        JitTracer::apply_staged_op(inputs, O::rematerialize_op(self.clone()))
     }
 }
 
@@ -406,16 +395,20 @@ impl<
 /// once over exemplar values and compiled into a [`CompiledFunction`] that lowering can later handle.
 impl<
     V: Traceable<ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Clone>,
-    Output: Parameterized<Self, ParameterStructure: Clone>,
+    Input: Parameterized<Self, ParameterStructure: Clone, To<Self> = Input>,
+    Output: Parameterized<Self, ParameterStructure: Clone, To<Self> = Output>,
     O: Clone + Op<ArrayType>,
     L: Clone,
 > RematerializeInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, O, L>
 where
-    Input::Family: ParameterizedFamily<V>,
-    Output::Family: ParameterizedFamily<V>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<V>: TraceInput<V, O, L, Traced = Input>,
     Output::To<V>: TraceOutput<V, O, L, Traced = Output>,
+    Input::To<ArrayType>:
+        crate::tracing_v2::TypeTracingInput<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
+    Output::To<ArrayType>:
+        crate::tracing_v2::TypeTracingOutput<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
     O: InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>
@@ -425,22 +418,34 @@ where
         let input_structure = input.parameter_structure();
         let traced_inputs = input.into_parameters().collect::<Vec<_>>();
         let input_leaf_count = traced_inputs.len();
-        let exemplar_primals = Input::To::<V>::from_parameters(
+        let exemplar_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
-            traced_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>(),
+            traced_inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
+        )?;
+        let exemplar_engine = traced_inputs.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+
+        let (exemplar_output_types, body_program): (
+            Output::To<ArrayType>,
+            Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
+        ) = crate::tracing_v2::jit::try_trace_program_from_types_for_operation::<
+            _,
+            Input::To<ArrayType>,
+            Output::To<ArrayType>,
+            ArrayType,
+            V,
+            O,
+            L,
+        >(
+            exemplar_engine,
+            move |staged_input| {
+                let adapted_input =
+                    Input::from_parameters(input_structure, staged_input.into_parameters().collect::<Vec<_>>())?;
+                Ok(function(adapted_input))
+            },
+            exemplar_input_types,
         )?;
 
-        let (exemplar_outputs, body_program): (Output::To<V>, Program<ArrayType, V, Input::To<V>, Output::To<V>, O>) =
-            try_trace_program_for_operation::<_, Input::To<V>, Output::To<V>, V, O, L>(
-                move |staged_input| {
-                    let adapted_input =
-                        Input::from_parameters(input_structure, staged_input.into_parameters().collect::<Vec<_>>())?;
-                    Ok(function(adapted_input))
-                },
-                exemplar_primals,
-            )?;
-
-        let output_structure = exemplar_outputs.parameter_structure();
+        let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
         let input_types = body_program
             .graph()
@@ -448,7 +453,7 @@ where
             .iter()
             .map(|id| body_program.graph().atom(*id).expect("body input atom should exist").tpe().into_owned())
             .collect::<Vec<_>>();
-        let output_types = exemplar_outputs.parameters().map(|x| x.tpe().into_owned()).collect::<Vec<_>>();
+        let output_types = exemplar_output_types.parameters().cloned().collect::<Vec<_>>();
         let body = FlatTracedRematerialize::from_parts(
             input_types,
             output_types,
@@ -458,13 +463,8 @@ where
             )),
         );
 
-        let output_values =
-            body.compiled().call(traced_inputs.iter().map(|input| input.value.clone()).collect::<Vec<_>>())?;
-        let staged_outputs = JitTracer::apply_staged_op(
-            traced_inputs.as_slice(),
-            O::rematerialize_op(RematerializeOp::new(body)),
-            output_values,
-        )?;
+        let staged_outputs =
+            JitTracer::apply_staged_op(traced_inputs.as_slice(), O::rematerialize_op(RematerializeOp::new(body)))?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TraceError::from)
     }
 }

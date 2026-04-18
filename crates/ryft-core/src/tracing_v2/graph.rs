@@ -227,6 +227,33 @@ impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
         Ok(outputs)
     }
 
+    /// Adds a staged equation using only abstract evaluation.
+    ///
+    /// This is the staging path used by type-directed tracing and any traced replay that does not
+    /// have representative concrete values available for the participating atoms.
+    pub fn add_equation_abstract(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
+    where
+        O: Op<T>,
+    {
+        let input_abstracts = inputs
+            .iter()
+            .map(|input| {
+                self.atom(*input)
+                    .map(|atom| atom.tpe().into_owned())
+                    .ok_or(TraceError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
+
+        let is_zero = |id: usize| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_zero(value));
+        let is_one = |id: usize| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_one(value));
+        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
+            return Ok(simplified);
+        }
+
+        Ok(self.add_equation_prevalidated(op, inputs, output_abstracts))
+    }
+
     /// Adds a staged equation, validating its inputs through abstract evaluation first.
     ///
     /// When every input atom is an [`Atom::Constant`], the operation is folded at graph-construction
@@ -279,12 +306,12 @@ impl<O: Clone, T: Type, V: Traceable<T>> Default for GraphBuilder<O, T, V> {
 // Algebraic identity elimination helpers
 // ---------------------------------------------------------------------------
 
-/// Checks if a value is a constant zero through [`Traceable::is_zero`].
+/// Checks if one staged constant is an exact zero.
 pub(crate) fn is_identity_zero<T: Type, V: Traceable<T>>(value: &V) -> bool {
     value.is_zero()
 }
 
-/// Checks if a value is a constant one through [`Traceable::is_one`].
+/// Checks if one staged constant is an exact one.
 pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
     value.is_one()
 }
