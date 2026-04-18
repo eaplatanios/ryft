@@ -20,7 +20,7 @@ use crate::{
         engine::Engine,
         graph::AtomId,
         ops::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
-        program::{Program, ProgramBuilderFor, ProgramOpRef},
+        program::{Program, ProgramBuilder, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -520,7 +520,7 @@ where
 {
     let input_structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
-    let builder = Rc::new(RefCell::new(ProgramBuilderFor::<V, E::TracingOperation>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<V, E::TracingOperation>::new()));
     let staging_error = Rc::new(RefCell::new(None));
     let concrete_input = Input::from_parameters(input_structure.clone(), input_values.clone())?;
     let traced_input = concrete_input.into_traced(builder.clone(), staging_error.clone(), engine)?;

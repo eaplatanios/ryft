@@ -714,13 +714,6 @@ impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V>
                 mode,
                 lowerer,
             ),
-            PrimitiveOp::LinearMatrixTranspose => <LinearMatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
-                &LinearMatrixTransposeOp,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
             PrimitiveOp::MatMul => {
                 <MatMulOp as XlaOp<V>>::lower_to_mlir(&MatMulOp, input_values, output_types, mode, lowerer)
             }
@@ -2721,7 +2714,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{
         Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, Sin, TraceError, ZeroLike,
-        program::ProgramBuilderFor,
+        program::ProgramBuilder,
     };
     use ryft_core::types::Shape;
 
@@ -2797,7 +2790,7 @@ mod tests {
         op: XlaPrimitiveOp,
     ) -> Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilderFor::<ShardMapTensor, crate::experimental::ops::XlaPrimitiveOp>::new();
+        let mut builder = ProgramBuilder::<ShardMapTensor, crate::experimental::ops::XlaPrimitiveOp>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
         let output = builder.add_equation(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)

@@ -13,7 +13,7 @@ use ryft_core::{
     tracing_v2::{
         AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp,
         LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, Sin, TraceError, Traceable,
-        ZeroLike, engine::Engine, forward::JvpTracer, program::ProgramBuilderFor,
+        ZeroLike, engine::Engine, forward::JvpTracer, program::ProgramBuilder,
     },
     types::{ArrayType, Typed},
 };
@@ -667,7 +667,7 @@ fn project_flat_shard_map_graph(
     fn remap_atom(
         atom_id: usize,
         graph: &FlatShardMapGraph,
-        builder: &mut ProgramBuilderFor<ShardMapTensor, XlaPrimitiveOp>,
+        builder: &mut ProgramBuilder<ShardMapTensor, XlaPrimitiveOp>,
         atom_mapping: &mut std::collections::HashMap<usize, usize>,
         kept_input_atoms: &std::collections::HashMap<usize, usize>,
         representative_values: &[ShardMapTensor],
@@ -726,7 +726,7 @@ fn project_flat_shard_map_graph(
     let equation_by_output = equation_by_output(graph);
     let engine = crate::experimental::engine::XlaEngine::token();
     let representative_values = graph.representative_atom_values(&engine)?;
-    let mut builder = ProgramBuilderFor::<ShardMapTensor, XlaPrimitiveOp>::new();
+    let mut builder = ProgramBuilder::<ShardMapTensor, XlaPrimitiveOp>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
         let mapped_atom = builder.add_input(&representative_values[atom_id]);
@@ -765,7 +765,7 @@ fn build_factorized_apply_graph(
     fn remap_atom(
         atom_id: usize,
         graph: &FlatShardMapGraph,
-        builder: &mut ProgramBuilderFor<ShardMapTensor, XlaPrimitiveOp>,
+        builder: &mut ProgramBuilder<ShardMapTensor, XlaPrimitiveOp>,
         atom_mapping: &mut std::collections::HashMap<usize, usize>,
         replacement_inputs: &std::collections::HashMap<usize, usize>,
         depends_on_cotangent: &[bool],
@@ -840,7 +840,7 @@ fn build_factorized_apply_graph(
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = graph.input_atoms()[primal_input_count..].to_vec();
     let equation_by_output = equation_by_output(graph);
-    let mut builder = ProgramBuilderFor::<ShardMapTensor, XlaPrimitiveOp>::new();
+    let mut builder = ProgramBuilder::<ShardMapTensor, XlaPrimitiveOp>::new();
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {

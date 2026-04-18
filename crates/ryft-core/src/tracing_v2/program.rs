@@ -12,29 +12,19 @@ use crate::{
     types::{ArrayType, Type, Typed},
 };
 
-/// Operation type used by the staged program IR.
-pub type ProgramOpFor<O> = O;
-
 /// Canonical operation type used by the staged program IR.
 pub type ProgramOpRef<V> = PrimitiveOp<ArrayType, V>;
 
-/// Shared builder used by the staged program IR.
-pub type ProgramBuilderFor<V, O> = GraphBuilder<ProgramOpFor<O>, ArrayType, V>;
-
-/// Shared builder used by the canonical staged program IR.
-pub type ProgramBuilder<V> = ProgramBuilderFor<V, ProgramOpRef<V>>;
-
-/// Operation type used by the staged linear-program IR.
-pub type LinearProgramOpFor<O> = O;
+/// Shared builder used by the staged program IR. The optional `O` parameter allows callers to
+/// stage against an alternate operation carrier (for example, a backend's closed op-set).
+pub type ProgramBuilder<V, O = ProgramOpRef<V>> = GraphBuilder<O, ArrayType, V>;
 
 /// Canonical operation type used by the staged linear-program IR.
 pub type LinearProgramOpRef<V> = LinearPrimitiveOp<ArrayType, V>;
 
-/// Shared builder used by the staged linear-program IR.
-pub type LinearProgramBuilderFor<V, O> = GraphBuilder<LinearProgramOpFor<O>, ArrayType, V>;
-
-/// Shared builder used by the staged linear-program IR.
-pub type LinearProgramBuilder<V> = LinearProgramBuilderFor<V, LinearProgramOpRef<V>>;
+/// Shared builder used by the staged linear-program IR. The optional `O` parameter allows callers
+/// to stage against an alternate linear operation carrier.
+pub type LinearProgramBuilder<V, O = LinearProgramOpRef<V>> = GraphBuilder<O, ArrayType, V>;
 
 /// Canonical staged program used by `tracing_v2`.
 pub struct Program<

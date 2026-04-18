@@ -415,388 +415,6 @@ pub trait LinearCustomOperation<T: Type + Display, V: Traceable<T>>: Clone {
     fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TraceError>;
 }
 
-pub trait SupportsAdd<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn add_op() -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsAdd<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: AddTracingOperation<T, V>,
-{
-    fn add_op() -> Self::TracingOperation {
-        <E::TracingOperation as AddTracingOperation<T, V>>::add_op()
-    }
-}
-
-pub trait SupportsMul<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn mul_op() -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsMul<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: MulTracingOperation<T, V>,
-{
-    fn mul_op() -> Self::TracingOperation {
-        <E::TracingOperation as MulTracingOperation<T, V>>::mul_op()
-    }
-}
-
-pub trait SupportsNeg<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn neg_op() -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsNeg<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: NegTracingOperation<T, V>,
-{
-    fn neg_op() -> Self::TracingOperation {
-        <E::TracingOperation as NegTracingOperation<T, V>>::neg_op()
-    }
-}
-
-pub trait SupportsSin<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn sin_op() -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsSin<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: SinTracingOperation<T, V>,
-{
-    fn sin_op() -> Self::TracingOperation {
-        <E::TracingOperation as SinTracingOperation<T, V>>::sin_op()
-    }
-}
-
-pub trait SupportsCos<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn cos_op() -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsCos<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: CosTracingOperation<T, V>,
-{
-    fn cos_op() -> Self::TracingOperation {
-        <E::TracingOperation as CosTracingOperation<T, V>>::cos_op()
-    }
-}
-
-pub trait SupportsMatMul<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn matmul_op() -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsMatMul<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: MatMulTracingOperation<T, V>,
-{
-    fn matmul_op() -> Self::TracingOperation {
-        <E::TracingOperation as MatMulTracingOperation<T, V>>::matmul_op()
-    }
-}
-
-pub trait SupportsMatrixTranspose<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn matrix_transpose_op() -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsMatrixTranspose<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: MatrixTransposeTracingOperation<T, V>,
-{
-    fn matrix_transpose_op() -> Self::TracingOperation {
-        <E::TracingOperation as MatrixTransposeTracingOperation<T, V>>::matrix_transpose_op()
-    }
-}
-
-pub trait SupportsScale<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn scale_op(factor: V) -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsScale<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: ScaleTracingOperation<T, V>,
-{
-    fn scale_op(factor: V) -> Self::TracingOperation {
-        <E::TracingOperation as ScaleTracingOperation<T, V>>::scale_op(factor)
-    }
-}
-
-pub trait SupportsLeftMatMul<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn left_matmul_op(factor: V) -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLeftMatMul<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: LeftMatMulTracingOperation<T, V>,
-{
-    fn left_matmul_op(factor: V) -> Self::TracingOperation {
-        <E::TracingOperation as LeftMatMulTracingOperation<T, V>>::left_matmul_op(factor)
-    }
-}
-
-pub trait SupportsRightMatMul<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn right_matmul_op(factor: V) -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsRightMatMul<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: RightMatMulTracingOperation<T, V>,
-{
-    fn right_matmul_op(factor: V) -> Self::TracingOperation {
-        <E::TracingOperation as RightMatMulTracingOperation<T, V>>::right_matmul_op(factor)
-    }
-}
-
-pub trait SupportsReshape<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn reshape_op(input_type: T, output_type: T) -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsReshape<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: ReshapeTracingOperation<T, V>,
-{
-    fn reshape_op(input_type: T, output_type: T) -> Self::TracingOperation {
-        <E::TracingOperation as ReshapeTracingOperation<T, V>>::reshape_op(input_type, output_type)
-    }
-}
-
-pub trait SupportsCoreSyntax<T: Type + Display, V: Traceable<T>>:
-    SupportsAdd<T, V>
-    + SupportsMul<T, V>
-    + SupportsNeg<T, V>
-    + SupportsSin<T, V>
-    + SupportsCos<T, V>
-    + SupportsMatMul<T, V>
-    + SupportsMatrixTranspose<T, V>
-    + SupportsReshape<T, V>
-{
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsCoreSyntax<T, V> for E where
-    E: SupportsAdd<T, V>
-        + SupportsMul<T, V>
-        + SupportsNeg<T, V>
-        + SupportsSin<T, V>
-        + SupportsCos<T, V>
-        + SupportsMatMul<T, V>
-        + SupportsMatrixTranspose<T, V>
-        + SupportsReshape<T, V>
-{
-}
-
-pub trait SupportsVMap<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn vmap_op(
-        op: crate::tracing_v2::operations::VMapOp<T, V, Self::TracingOperation, Self::LinearOperation>,
-    ) -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsVMap<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: VMapTracingOperation<T, V, E::LinearOperation>,
-{
-    fn vmap_op(
-        op: crate::tracing_v2::operations::VMapOp<T, V, Self::TracingOperation, Self::LinearOperation>,
-    ) -> Self::TracingOperation {
-        <E::TracingOperation as VMapTracingOperation<T, V, E::LinearOperation>>::vmap_op(op)
-    }
-}
-
-pub trait SupportsRematerialize<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn rematerialize_op(
-        op: crate::tracing_v2::operations::RematerializeOp<T, V, Self::TracingOperation, Self::LinearOperation>,
-    ) -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsRematerialize<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: RematerializeTracingOperation<T, V, E::LinearOperation>,
-{
-    fn rematerialize_op(
-        op: crate::tracing_v2::operations::RematerializeOp<T, V, Self::TracingOperation, Self::LinearOperation>,
-    ) -> Self::TracingOperation {
-        <E::TracingOperation as RematerializeTracingOperation<T, V, E::LinearOperation>>::rematerialize_op(op)
-    }
-}
-
-pub trait SupportsCustom<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn custom_op(primitive: Arc<CustomPrimitive<T, V>>) -> Self::TracingOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsCustom<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::TracingOperation: CustomTracingOperation<T, V>,
-{
-    fn custom_op(primitive: Arc<CustomPrimitive<T, V>>) -> Self::TracingOperation {
-        <E::TracingOperation as CustomTracingOperation<T, V>>::custom_op(primitive)
-    }
-}
-
-pub trait SupportsLinearAdd<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_add_op() -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearAdd<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearAddOperation<T, V>,
-{
-    fn linear_add_op() -> Self::LinearOperation {
-        <E::LinearOperation as LinearAddOperation<T, V>>::linear_add_op()
-    }
-}
-
-pub trait SupportsLinearNeg<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_neg_op() -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearNeg<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearNegOperation<T, V>,
-{
-    fn linear_neg_op() -> Self::LinearOperation {
-        <E::LinearOperation as LinearNegOperation<T, V>>::linear_neg_op()
-    }
-}
-
-pub trait SupportsLinearMatrixTranspose<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_matrix_transpose_op() -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearMatrixTranspose<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearMatrixTransposeOperation<T, V>,
-{
-    fn linear_matrix_transpose_op() -> Self::LinearOperation {
-        <E::LinearOperation as LinearMatrixTransposeOperation<T, V>>::linear_matrix_transpose_op()
-    }
-}
-
-pub trait SupportsLinearScale<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_scale_op(factor: V) -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearScale<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearScaleOperation<T, V>,
-{
-    fn linear_scale_op(factor: V) -> Self::LinearOperation {
-        <E::LinearOperation as LinearScaleOperation<T, V>>::linear_scale_op(factor)
-    }
-}
-
-pub trait SupportsLinearLeftMatMul<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_left_matmul_op(factor: V) -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearLeftMatMul<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearLeftMatMulOperation<T, V>,
-{
-    fn linear_left_matmul_op(factor: V) -> Self::LinearOperation {
-        <E::LinearOperation as LinearLeftMatMulOperation<T, V>>::linear_left_matmul_op(factor)
-    }
-}
-
-pub trait SupportsLinearRightMatMul<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_right_matmul_op(factor: V) -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearRightMatMul<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearRightMatMulOperation<T, V>,
-{
-    fn linear_right_matmul_op(factor: V) -> Self::LinearOperation {
-        <E::LinearOperation as LinearRightMatMulOperation<T, V>>::linear_right_matmul_op(factor)
-    }
-}
-
-pub trait SupportsLinearReshape<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_reshape_op(input_type: T, output_type: T) -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearReshape<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearReshapeOperation<T, V>,
-{
-    fn linear_reshape_op(input_type: T, output_type: T) -> Self::LinearOperation {
-        <E::LinearOperation as LinearReshapeOperation<T, V>>::linear_reshape_op(input_type, output_type)
-    }
-}
-
-pub trait SupportsLinearVMap<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_vmap_op(
-        op: crate::tracing_v2::operations::LinearVMapOp<T, V, Self::LinearOperation>,
-    ) -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearVMap<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearVMapOperation<T, V>,
-{
-    fn linear_vmap_op(
-        op: crate::tracing_v2::operations::LinearVMapOp<T, V, Self::LinearOperation>,
-    ) -> Self::LinearOperation {
-        <E::LinearOperation as LinearVMapOperation<T, V>>::linear_vmap_op(op)
-    }
-}
-
-pub trait SupportsLinearRematerialize<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_rematerialize_op(
-        op: crate::tracing_v2::operations::LinearRematerializeOp<T, V, Self::LinearOperation>,
-    ) -> Self::LinearOperation;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearRematerialize<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearRematerializeOperation<T, V>,
-{
-    fn linear_rematerialize_op(
-        op: crate::tracing_v2::operations::LinearRematerializeOp<T, V, Self::LinearOperation>,
-    ) -> Self::LinearOperation {
-        <E::LinearOperation as LinearRematerializeOperation<T, V>>::linear_rematerialize_op(op)
-    }
-}
-
-pub trait SupportsLinearCustom<T: Type + Display, V: Traceable<T>>: Engine<Type = T, Value = V> {
-    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self::LinearOperation, TraceError>;
-
-    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self::LinearOperation, TraceError>;
-}
-
-impl<T: Type + Display, V: Traceable<T>, E> SupportsLinearCustom<T, V> for E
-where
-    E: Engine<Type = T, Value = V>,
-    E::LinearOperation: LinearCustomOperation<T, V>,
-{
-    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self::LinearOperation, TraceError> {
-        <E::LinearOperation as LinearCustomOperation<T, V>>::linear_custom_op(primitive)
-    }
-
-    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self::LinearOperation, TraceError> {
-        <E::LinearOperation as LinearCustomOperation<T, V>>::linear_custom_arc_op(primitive)
-    }
-}
-
 /// Typed extension registry carried by one [`CustomPrimitive`].
 #[derive(Clone, Default)]
 pub struct CustomPrimitiveExtensions<T: Type, V: Typed<T>> {
@@ -1216,9 +834,6 @@ pub enum PrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Matrix transposition.
     MatrixTranspose,
 
-    /// Linear matrix transposition used in cotangent programs.
-    LinearMatrixTranspose,
-
     /// Scalar or tensor scaling by a captured factor.
     Scale { factor: V },
 
@@ -1253,7 +868,6 @@ impl<T: Type + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
             Self::Cos => Self::Cos,
             Self::MatMul => Self::MatMul,
             Self::MatrixTranspose => Self::MatrixTranspose,
-            Self::LinearMatrixTranspose => Self::LinearMatrixTranspose,
             Self::Scale { factor } => Self::Scale { factor: factor.clone() },
             Self::LeftMatMul { factor } => Self::LeftMatMul { factor: factor.clone() },
             Self::RightMatMul { factor } => Self::RightMatMul { factor: factor.clone() },
@@ -1266,9 +880,6 @@ impl<T: Type + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
         }
     }
 }
-
-/// Canonical operation type used by the staged program IR.
-pub type PrimitiveOpRef<T, V> = PrimitiveOp<T, V>;
 
 /// Closed set of operations that may appear in staged linear programs.
 pub enum LinearPrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
@@ -1601,7 +1212,6 @@ impl<T: Type + Display, V: Traceable<T>> Debug for PrimitiveOp<T, V> {
             Self::Cos => write!(formatter, "Cos"),
             Self::MatMul => write!(formatter, "MatMul"),
             Self::MatrixTranspose => write!(formatter, "MatrixTranspose"),
-            Self::LinearMatrixTranspose => write!(formatter, "LinearMatrixTranspose"),
             Self::Scale { .. } => write!(formatter, "Scale"),
             Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
             Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
@@ -1664,7 +1274,6 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
             Self::Cos => "cos",
             Self::MatMul => "matmul",
             Self::MatrixTranspose => "matrix_transpose",
-            Self::LinearMatrixTranspose => "linear_matrix_transpose",
             Self::Scale { .. } => "scale",
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
@@ -1684,7 +1293,6 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
             Self::Cos => CosOp.abstract_eval(inputs),
             Self::MatMul => MatMulOp.abstract_eval(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.abstract_eval(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.abstract_eval(inputs),
             Self::Scale { .. } => ScaleOp::<ArrayType, V>::abstract_eval_static(inputs),
             Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::tpe(factor), inputs),
             Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::tpe(factor), inputs),
@@ -1828,7 +1436,6 @@ where
             Self::Cos => CosOp.interpret(inputs),
             Self::MatMul => MatMulOp.interpret(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.interpret(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.interpret(inputs),
             Self::Scale { factor } => ScaleOp::new(factor.clone()).interpret(inputs),
             Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).interpret(inputs),
             Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).interpret(inputs),
@@ -1951,7 +1558,6 @@ where
             Self::Cos => CosOp.interpret(inputs),
             Self::MatMul => MatMulOp.interpret(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.interpret(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.interpret(inputs),
             Self::Scale { factor } => ScaleOp::new(factor.clone()).interpret(inputs),
             Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).interpret(inputs),
             Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).interpret(inputs),
@@ -2050,13 +1656,6 @@ where
                 PrimitiveOp<ArrayType, V>,
                 LinearPrimitiveOp<ArrayType, V>,
             >::jvp(&MatrixTransposeOp, engine, inputs),
-            Self::LinearMatrixTranspose => DifferentiableOp::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOp<ArrayType, V>,
-                LinearPrimitiveOp<ArrayType, V>,
-            >::jvp(&LinearMatrixTransposeOp, engine, inputs),
             Self::LeftMatMul { factor } => DifferentiableOp::<
                 ArrayType,
                 V,

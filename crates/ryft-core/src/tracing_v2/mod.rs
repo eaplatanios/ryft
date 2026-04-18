@@ -49,12 +49,7 @@ pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{Cos, Sin};
 pub use ops::{
     CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
-    LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, SupportsAdd, SupportsCos, SupportsCustom, SupportsLeftMatMul,
-    SupportsLinearAdd, SupportsLinearCustom, SupportsLinearLeftMatMul, SupportsLinearMatrixTranspose,
-    SupportsLinearNeg, SupportsLinearRematerialize, SupportsLinearReshape, SupportsLinearRightMatMul,
-    SupportsLinearScale, SupportsLinearVMap, SupportsMatMul, SupportsMatrixTranspose, SupportsMul, SupportsNeg,
-    SupportsRematerialize, SupportsReshape, SupportsRightMatMul, SupportsScale, SupportsSin, SupportsVMap,
-    VectorizableOp,
+    LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, VectorizableOp,
 };
 pub use program::Program;
 pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};

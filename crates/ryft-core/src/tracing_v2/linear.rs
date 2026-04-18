@@ -29,7 +29,7 @@ use crate::{
             CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,
         },
-        program::{LinearProgramBuilderFor, LinearProgramOpRef, Program, ProgramBuilderFor},
+        program::{LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -294,7 +294,7 @@ impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>>
 ///     the primitive outputs.
 fn transpose<V, O>(
     op: &O,
-    builder: &Rc<RefCell<LinearProgramBuilderFor<V, O>>>,
+    builder: &Rc<RefCell<LinearProgramBuilder<V, O>>>,
     output_cotangents: &[AtomId],
 ) -> Result<Vec<Option<AtomId>>, TraceError>
 where
@@ -327,7 +327,7 @@ where
     fn tangent_for_atom<V, Input, Output, GraphOperation, LinearOperation>(
         _graph: &Graph<GraphOperation, ArrayType, V, Input, Output>,
         primal_values: &[Option<V>],
-        builder: &Rc<RefCell<LinearProgramBuilderFor<V, LinearOperation>>>,
+        builder: &Rc<RefCell<LinearProgramBuilder<V, LinearOperation>>>,
         tangents: &mut [Option<LinearTerm<ArrayType, V, LinearOperation>>],
         atom_id: AtomId,
     ) -> Result<LinearTerm<ArrayType, V, LinearOperation>, TraceError>
@@ -353,7 +353,7 @@ where
         return Err(TraceError::InvalidInputCount { expected: graph.input_atoms().len(), got: input_primals.len() });
     }
     let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
-    let builder = Rc::new(RefCell::new(LinearProgramBuilderFor::<V, L>::new()));
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, L>::new()));
     let mut primals: Vec<Option<V>> = vec![None; graph.atom_count()];
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; graph.atom_count()];
     for (input_atom, input_primal) in graph.input_atoms().iter().copied().zip(input_primals.into_iter()) {
@@ -438,7 +438,7 @@ where
     O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
     let zero = program.zero.zero_like();
-    transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilderFor<V, O>, _, _| {
+    transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V, O>, _, _| {
         Ok(builder.add_input(&zero))
     })
 }
@@ -451,11 +451,11 @@ where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    F: FnMut(&mut LinearProgramBuilderFor<V, O>, &ArrayType, usize) -> Result<AtomId, TraceError>,
+    F: FnMut(&mut LinearProgramBuilder<V, O>, &ArrayType, usize) -> Result<AtomId, TraceError>,
     O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
     fn accumulate<V, O>(
-        builder: &Rc<RefCell<LinearProgramBuilderFor<V, O>>>,
+        builder: &Rc<RefCell<LinearProgramBuilder<V, O>>>,
         adjoints: &mut [Option<AtomId>],
         atom: AtomId,
         contribution: AtomId,
@@ -481,7 +481,7 @@ where
     }
 
     let graph = program.program.graph();
-    let builder = Rc::new(RefCell::new(LinearProgramBuilderFor::<V, O>::new()));
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, O>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
     for (output_index, output) in graph.outputs().iter().enumerate() {
         let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
@@ -554,12 +554,9 @@ where
     if output_examples.len() != expected_output_count {
         return Err(TraceError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }
-    transpose_linear_program_with_output_inputs(
-        program,
-        |builder: &mut LinearProgramBuilderFor<V, O>, _, output_index| {
-            Ok(builder.add_input(&output_examples[output_index].zero_like()))
-        },
-    )
+    transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V, O>, _, output_index| {
+        Ok(builder.add_input(&output_examples[output_index].zero_like()))
+    })
 }
 
 fn lift_traced_constant<V, O: Clone, L: Clone>(
@@ -684,7 +681,7 @@ where
 {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_count = primals.len();
-    let builder = Rc::new(RefCell::new(LinearProgramBuilderFor::<
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<
         JitTracer<ArrayType, V, O, L>,
         LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>,
     >::new()));
@@ -2393,7 +2390,7 @@ where
 
     // Build the outer program.
     let input_atoms = graph.input_atoms();
-    let mut outer_builder: ProgramBuilderFor<V, E::TracingOperation> = ProgramBuilderFor::new();
+    let mut outer_builder: ProgramBuilder<V, E::TracingOperation> = ProgramBuilder::new();
 
     // Map from original atom IDs to outer-program atom IDs.
     let mut atom_mapping: Vec<Option<AtomId>> = vec![None; graph.atom_count()];
@@ -2558,7 +2555,7 @@ where
     );
     let remat_op = RematerializeOp::new(body);
 
-    let mut outer_builder: ProgramBuilderFor<V, E::TracingOperation> = ProgramBuilderFor::new();
+    let mut outer_builder: ProgramBuilder<V, E::TracingOperation> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> = representative_inputs
         .iter()
         .map(|representative_input| outer_builder.add_input(representative_input))
@@ -2590,7 +2587,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
 ) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>, O>, TraceError> {
-    let mut sub_builder: ProgramBuilderFor<V, O> = ProgramBuilderFor::new();
+    let mut sub_builder: ProgramBuilder<V, O> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.
     let mut sub_atom_mapping: std::collections::HashMap<AtomId, AtomId> = std::collections::HashMap::new();
