@@ -15,8 +15,8 @@ use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
     Atom, CustomPrimitive, Graph, LinearPrimitiveOp, MatrixOps, Op, PrimitiveOp, Traceable,
     operations::{
-        AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearMatrixTransposeOp, LinearRematerializeOp, LinearVMapOp,
-        MatMulOp, MatrixTransposeOp, MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
+        AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearRematerializeOp, LinearVMapOp, MatMulOp, MatrixTransposeOp,
+        MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
     },
 };
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
@@ -323,22 +323,6 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for CosOp {
 }
 
 impl<V: Traceable<ArrayType>> XlaOp<V> for MatrixTransposeOp {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
-        let result = lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
-        Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
-    }
-}
-
-impl<V: Traceable<ArrayType>> XlaOp<V> for LinearMatrixTransposeOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -776,13 +760,6 @@ impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayTy
             }
             LinearPrimitiveOp::MatrixTranspose => <MatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
                 &MatrixTransposeOp,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearPrimitiveOp::LinearMatrixTranspose => <LinearMatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
-                &LinearMatrixTransposeOp,
                 input_values,
                 output_types,
                 mode,

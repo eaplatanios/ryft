@@ -892,9 +892,6 @@ pub enum LinearPrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Matrix transposition.
     MatrixTranspose,
 
-    /// Linear matrix transposition used in cotangent programs.
-    LinearMatrixTranspose,
-
     /// Scalar or tensor scaling by a captured factor.
     Scale { factor: V },
 
@@ -923,7 +920,6 @@ impl<T: Type + Display, V: Traceable<T>> Clone for LinearPrimitiveOp<T, V> {
             Self::Add => Self::Add,
             Self::Neg => Self::Neg,
             Self::MatrixTranspose => Self::MatrixTranspose,
-            Self::LinearMatrixTranspose => Self::LinearMatrixTranspose,
             Self::Scale { factor } => Self::Scale { factor: factor.clone() },
             Self::LeftMatMul { factor } => Self::LeftMatMul { factor: factor.clone() },
             Self::RightMatMul { factor } => Self::RightMatMul { factor: factor.clone() },
@@ -1068,7 +1064,7 @@ impl<T: Type + Display, V: Traceable<T>> LinearNegOperation<T, V> for LinearPrim
 impl<T: Type + Display, V: Traceable<T>> LinearMatrixTransposeOperation<T, V> for LinearPrimitiveOp<T, V> {
     #[inline]
     fn linear_matrix_transpose_op() -> Self {
-        LinearPrimitiveOp::LinearMatrixTranspose
+        LinearPrimitiveOp::MatrixTranspose
     }
 }
 
@@ -1198,8 +1194,8 @@ impl<O: VectorizableOp<T, V> + ?Sized, T: Type, V: Traceable<T>> VectorizableOp<
 // ---------------------------------------------------------------------------
 
 use crate::tracing_v2::operations::{
-    AddOp, CosOp, LeftMatMulOp, LinearMatrixTransposeOp, MatMulOp, MatrixTransposeOp, MulOp, NegOp, ReshapeOp,
-    RightMatMulOp, ScaleOp, SinOp, left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
+    AddOp, CosOp, LeftMatMulOp, MatMulOp, MatrixTransposeOp, MulOp, NegOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp,
+    left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
 };
 
 impl<T: Type + Display, V: Traceable<T>> Debug for PrimitiveOp<T, V> {
@@ -1240,7 +1236,6 @@ impl<T: Type + Display, V: Traceable<T>> Debug for LinearPrimitiveOp<T, V> {
             Self::Add => write!(formatter, "Add"),
             Self::Neg => write!(formatter, "Neg"),
             Self::MatrixTranspose => write!(formatter, "MatrixTranspose"),
-            Self::LinearMatrixTranspose => write!(formatter, "LinearMatrixTranspose"),
             Self::Scale { .. } => write!(formatter, "Scale"),
             Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
             Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
@@ -1345,7 +1340,6 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
             Self::Add => "add",
             Self::Neg => "neg",
             Self::MatrixTranspose => "matrix_transpose",
-            Self::LinearMatrixTranspose => "linear_matrix_transpose",
             Self::Scale { .. } => "scale",
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
@@ -1361,7 +1355,6 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
             Self::Add => AddOp.abstract_eval(inputs),
             Self::Neg => NegOp.abstract_eval(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.abstract_eval(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.abstract_eval(inputs),
             Self::Scale { .. } => ScaleOp::<ArrayType, V>::abstract_eval_static(inputs),
             Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::tpe(factor), inputs),
             Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::tpe(factor), inputs),
@@ -1466,7 +1459,6 @@ where
             Self::Add => AddOp.interpret(inputs),
             Self::Neg => NegOp.interpret(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.interpret(inputs),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.interpret(inputs),
             Self::Scale { factor } => ScaleOp::new(factor.clone()).interpret(inputs),
             Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).interpret(inputs),
             Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).interpret(inputs),
@@ -1501,7 +1493,6 @@ where
             Self::Add => AddOp.transpose(output_cotangents),
             Self::Neg => NegOp.transpose(output_cotangents),
             Self::MatrixTranspose => MatrixTransposeOp.transpose(output_cotangents),
-            Self::LinearMatrixTranspose => LinearMatrixTransposeOp.transpose(output_cotangents),
             Self::Scale { factor } => ScaleOp::new(factor.clone()).transpose(output_cotangents),
             Self::LeftMatMul { factor } => LeftMatMulOp::new(factor.clone()).transpose(output_cotangents),
             Self::RightMatMul { factor } => RightMatMulOp::new(factor.clone()).transpose(output_cotangents),

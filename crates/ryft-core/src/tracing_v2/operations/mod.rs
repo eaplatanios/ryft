@@ -49,9 +49,6 @@ pub mod add;
 /// Elementwise cosine.
 pub mod cos;
 
-/// Linear matrix transposition.
-pub mod linear_matrix_transpose;
-
 /// Linear left matrix multiplication.
 pub mod left_matmul;
 
@@ -91,7 +88,6 @@ pub mod vmap;
 pub use add::AddOp;
 pub use cos::{Cos, CosOp};
 pub use left_matmul::LeftMatMulOp;
-pub use linear_matrix_transpose::LinearMatrixTransposeOp;
 pub use matmul::MatMulOp;
 pub use matrix_transpose::MatrixTransposeOp;
 pub use mul::MulOp;

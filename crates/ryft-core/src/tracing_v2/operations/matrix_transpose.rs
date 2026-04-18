@@ -60,7 +60,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOp {
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
                 std::slice::from_ref(&output_cotangents[0]),
-                LinearPrimitiveOp::LinearMatrixTranspose,
+                LinearPrimitiveOp::MatrixTranspose,
                 1,
             )?
             .into_iter()

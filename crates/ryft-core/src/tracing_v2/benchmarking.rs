@@ -205,7 +205,7 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
         "sin" => "sin".to_string(),
         "cos" => "cos".to_string(),
         "matmul" | "dot_general" | "left_matmul" | "right_matmul" => "matmul".to_string(),
-        "matrix_transpose" | "linear_matrix_transpose" | "transpose" => "transpose".to_string(),
+        "matrix_transpose" | "transpose" => "transpose".to_string(),
         "scale" => "scale".to_string(),
         "const" | "constant" => "const".to_string(),
         "shard_map" | "linear_shard_map" => "shard_map".to_string(),
