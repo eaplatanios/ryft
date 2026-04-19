@@ -522,7 +522,7 @@ where
         let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
         let input_types = body_program
-            .input_atoms()
+            .input_ids()
             .iter()
             .map(|id| body_program.atom(*id).expect("body input atom should exist").r#type().into_owned())
             .collect::<Vec<_>>();

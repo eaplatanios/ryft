@@ -267,12 +267,12 @@ where
     }
     // Also mark program outputs as "consumed" at instruction_count (sentinel for "after all instructions").
     let sentinel = instructions.len();
-    for &output_atom in program.outputs() {
+    for &output_atom in program.output_ids() {
         atom_consumers[output_atom.index].push(sentinel);
     }
 
     // Build the outer program.
-    let input_atoms = program.input_atoms();
+    let input_atoms = program.input_ids();
     let mut outer_builder: ProgramBuilder<E::TracingOperation, ArrayType, V> = ProgramBuilder::new();
 
     // Map from original atom IDs to outer-program atom IDs.
@@ -381,7 +381,7 @@ where
 
     // Wire up the program outputs.
     let outer_outputs: Vec<AtomId> = program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|&orig_atom| atom_mapping[orig_atom.index].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
         .collect::<Result<_, _>>()?;
@@ -389,7 +389,7 @@ where
     let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
         flat_leaf_parameter_structure(input_atoms.len()),
-        flat_leaf_parameter_structure(program.outputs().len()),
+        flat_leaf_parameter_structure(program.output_ids().len()),
     );
     Ok(outer_program)
 }
@@ -407,7 +407,7 @@ where
     let program = program;
     let representative_inputs = program.representative_input_values(engine)?;
     let input_types: Vec<_> = program
-        .input_atoms()
+        .input_ids()
         .iter()
         .map(|&atom_id| {
             program
@@ -417,7 +417,7 @@ where
         })
         .collect::<Result<_, _>>()?;
     let output_types: Vec<_> = program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|&atom_id| {
             program
@@ -445,7 +445,7 @@ where
     let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
         flat_leaf_parameter_structure(outer_inputs.len()),
-        flat_leaf_parameter_structure(program.outputs().len()),
+        flat_leaf_parameter_structure(program.output_ids().len()),
     );
     Ok(outer_program)
 }

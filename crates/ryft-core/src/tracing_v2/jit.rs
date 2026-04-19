@@ -424,7 +424,7 @@ mod tests {
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.call(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
-        assert_eq!(program.input_atoms().len(), 1);
+        assert_eq!(program.input_ids().len(), 1);
         assert_eq!(
             program.to_string(),
             indoc! {"

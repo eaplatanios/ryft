@@ -30,7 +30,7 @@ use crate::{
 ///
 /// The variant encodes whether the atom is a retained literal constant or an ordinary program
 /// variable. Input-vs-derived provenance for variable atoms lives in the owning [`Program`]'s
-/// [`Program::input_atoms`] list and instruction outputs rather than in the atom enum itself.
+/// [`Program::input_ids`] list and instruction outputs rather than in the atom enum itself.
 #[derive(Clone, Debug)]
 pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant folded or supplied at trace time. Constants retain their value so the
@@ -96,13 +96,13 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
     atoms: Vec<Atom<T, V>>,
 
     /// Input atom ids in the same order as the flattened input parameters.
-    input_atoms: Vec<AtomId>,
+    input_ids: Vec<AtomId>,
+
+    /// Output atom ids in the same order as the flattened output parameters.
+    output_ids: Vec<AtomId>,
 
     /// Ordered instructions that replay the staged computation.
     instructions: Vec<Instruction<O>>,
-
-    /// Output atom ids in the same order as the flattened output parameters.
-    outputs: Vec<AtomId>,
 
     /// Structured input shape used to rebuild typed inputs from flat leaves.
     input_structure: Input::ParameterStructure,
@@ -123,9 +123,9 @@ where
     fn clone(&self) -> Self {
         Self {
             atoms: self.atoms.clone(),
-            input_atoms: self.input_atoms.clone(),
+            input_ids: self.input_ids.clone(),
+            output_ids: self.output_ids.clone(),
             instructions: self.instructions.clone(),
-            outputs: self.outputs.clone(),
             input_structure: self.input_structure.clone(),
             output_structure: self.output_structure.clone(),
             marker: PhantomData,
@@ -154,10 +154,18 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.atoms.iter().enumerate().map(|(atom_index, atom)| (AtomId { index: atom_index }, atom))
     }
 
+    /// Returns the program input ids in parameter order.
+    #[inline]
+    pub fn input_ids(&self) -> &[AtomId] {
+        self.input_ids.as_slice()
+    }
+
     /// Returns the program input atoms in parameter order.
     #[inline]
-    pub fn input_atoms(&self) -> &[AtomId] {
-        self.input_atoms.as_slice()
+    pub fn inputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
+        self.input_ids
+            .iter()
+            .map(|input_id| self.atom(*input_id).expect("program input ids should refer to existing atoms"))
     }
 
     /// Returns the instructions in execution order.
@@ -166,10 +174,18 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.instructions.as_slice()
     }
 
-    /// Returns the output atoms in parameter order.
+    /// Returns the output ids in parameter order.
     #[inline]
-    pub fn outputs(&self) -> &[AtomId] {
-        self.outputs.as_slice()
+    pub fn output_ids(&self) -> &[AtomId] {
+        self.output_ids.as_slice()
+    }
+
+    /// Returns the program output atoms in parameter order.
+    #[inline]
+    pub fn outputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
+        self.output_ids
+            .iter()
+            .map(|output_id| self.atom(*output_id).expect("program output ids should refer to existing atoms"))
     }
 
     /// Returns the expected input parameter structure.
@@ -194,7 +210,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     where
         E: Engine<Type = T, Value = V> + ?Sized,
     {
-        self.input_atoms
+        self.input_ids
             .iter()
             .copied()
             .map(|atom_id| match self.atom(atom_id) {
@@ -212,12 +228,12 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     where
         O: InterpretableOp<T, V>,
     {
-        if input_values.len() != self.input_atoms.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_atoms.len(), got: input_values.len() });
+        if input_values.len() != self.input_ids.len() {
+            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: input_values.len() });
         }
 
         let mut values = vec![None; self.atoms.len()];
-        for (atom, value) in self.input_atoms.iter().copied().zip(input_values) {
+        for (atom, value) in self.input_ids.iter().copied().zip(input_values) {
             values[atom.index] = Some(value);
         }
 
@@ -279,9 +295,9 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     {
         Program {
             atoms: self.atoms.clone(),
-            input_atoms: self.input_atoms.clone(),
+            input_ids: self.input_ids.clone(),
             instructions: self.instructions.clone(),
-            outputs: self.outputs.clone(),
+            output_ids: self.output_ids.clone(),
             input_structure,
             output_structure,
             marker: PhantomData,
@@ -304,7 +320,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         }
 
         let values = self.evaluate_atom_values(input.into_parameters().collect::<Vec<_>>())?;
-        let outputs = self.outputs.iter().map(|output| values[output.index].clone()).collect::<Vec<_>>();
+        let outputs = self.output_ids.iter().map(|output| values[output.index].clone()).collect::<Vec<_>>();
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
@@ -410,7 +426,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 
         let mut live_atoms = vec![false; self.atom_count()];
         let mut live_instructions = vec![false; self.instructions.len()];
-        for output in self.outputs.iter().copied() {
+        for output in self.output_ids.iter().copied() {
             mark_live(
                 self,
                 output,
@@ -422,7 +438,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 
         let mut builder = ProgramBuilder::<O, T, V>::new();
         let mut atom_mapping = HashMap::new();
-        for input_atom in self.input_atoms.iter().copied() {
+        for input_atom in self.input_ids.iter().copied() {
             let input = self.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             let Atom::Variable(r#type) = input else {
                 return Err(TracingError::InternalInvariantViolation(
@@ -434,7 +450,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         }
 
         let outputs = self
-            .outputs
+            .output_ids
             .iter()
             .copied()
             .map(|output| {
@@ -460,7 +476,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
         let format_atom = |id: AtomId| format!("%{id}");
         let format_typed_atom = |id: AtomId| format!("%{id}:{}", self.atoms[id.index].r#type());
 
-        let inputs = self.input_atoms.iter().map(|input| format_typed_atom(*input)).collect::<Vec<_>>().join(", ");
+        let inputs = self.input_ids.iter().map(|input| format_typed_atom(*input)).collect::<Vec<_>>().join(", ");
         writeln!(formatter, "lambda {inputs} .")?;
 
         let mut instruction_by_first_output = vec![None; self.atoms.len()];
@@ -472,7 +488,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
 
         let mut binding_count = 0usize;
         let mut input_atom_flags = vec![false; self.atoms.len()];
-        for input_atom in self.input_atoms.iter().copied() {
+        for input_atom in self.input_ids.iter().copied() {
             input_atom_flags[input_atom.index] = true;
         }
         for (atom_id, atom) in self.atoms.iter().enumerate() {
@@ -507,7 +523,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
             }
         }
 
-        let outputs = self.outputs.iter().map(|output| format_atom(*output)).collect::<Vec<_>>().join(", ");
+        let outputs = self.output_ids.iter().map(|output| format_atom(*output)).collect::<Vec<_>>().join(", ");
         write!(formatter, "in ({outputs})")
     }
 }
@@ -538,7 +554,7 @@ pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
     intermediates: Vec<Option<V>>,
 
     /// Input atom ids in parameter order.
-    input_atoms: Vec<AtomId>,
+    input_ids: Vec<AtomId>,
 
     /// Instructions recorded so far in execution order.
     instructions: Vec<Instruction<O>>,
@@ -557,7 +573,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         Self {
             atoms: Vec::new(),
             intermediates: Vec::new(),
-            input_atoms: Vec::new(),
+            input_ids: Vec::new(),
             instructions: Vec::new(),
             error: None,
         }
@@ -594,7 +610,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         let id = AtomId { index: self.atoms.len() };
         self.atoms.push(Atom::Variable(abstract_value));
         self.intermediates.push(None);
-        self.input_atoms.push(id);
+        self.input_ids.push(id);
         id
     }
 
@@ -611,7 +627,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         let id = AtomId { index: self.atoms.len() };
         self.atoms.push(Atom::Variable(abstract_value));
         self.intermediates.push(Some(example_value));
-        self.input_atoms.push(id);
+        self.input_ids.push(id);
         id
     }
 
@@ -791,9 +807,9 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     {
         Program {
             atoms: self.atoms,
-            input_atoms: self.input_atoms,
+            input_ids: self.input_ids,
             instructions: self.instructions,
-            outputs,
+            output_ids: outputs,
             input_structure,
             output_structure,
             marker: PhantomData,

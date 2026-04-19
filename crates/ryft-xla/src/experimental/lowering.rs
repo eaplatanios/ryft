@@ -1093,7 +1093,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
     let module = context.module(location);
 
     let input_tensor_types = program
-        .input_atoms()
+        .input_ids()
         .iter()
         .map(|atom_id| {
             let input_atom = program.atom(*atom_id).expect("program input atoms should exist");
@@ -1101,7 +1101,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
         })
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|atom_id| {
             let output_atom = program.atom(*atom_id).expect("program output atoms should exist");
@@ -1610,7 +1610,7 @@ where
     }
 
     let mut atom_values = vec![None; program.atom_count()];
-    for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
+    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
         atom_values[atom_id.index] = Some(packed_inputs[input_index]);
     }
 
@@ -1621,7 +1621,7 @@ where
         }
     }
     let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_atoms().iter().copied() {
+    for input_atom in program.input_ids().iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
@@ -1671,7 +1671,7 @@ where
     }
 
     program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|output| {
             resolve_packed_atom_value(program, atom_values.as_slice(), *output, lane_count, block, context, location)
@@ -1763,7 +1763,7 @@ where
     O: Clone + XlaOp<V>,
 {
     let mut atom_values = vec![None; program.atom_count()];
-    for (atom_id, mlir_value) in program.input_atoms().iter().copied().zip(input_values.iter().copied()) {
+    for (atom_id, mlir_value) in program.input_ids().iter().copied().zip(input_values.iter().copied()) {
         atom_values[atom_id.index] = Some(mlir_value);
     }
 
@@ -1774,7 +1774,7 @@ where
         }
     }
     let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_atoms().iter().copied() {
+    for input_atom in program.input_ids().iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
@@ -1818,7 +1818,7 @@ where
     }
 
     program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
@@ -1840,7 +1840,7 @@ where
     Output: Parameterized<V>,
 {
     let mut atom_values = vec![None; program.atom_count()];
-    for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
+    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
         atom_values[atom_id.index] =
             Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
@@ -1852,7 +1852,7 @@ where
         }
     }
     let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_atoms().iter().copied() {
+    for input_atom in program.input_ids().iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
@@ -1886,7 +1886,7 @@ where
     }
 
     program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
@@ -1904,7 +1904,7 @@ where
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
     let mut atom_values = vec![None; program.atom_count()];
-    for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
+    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
         atom_values[atom_id.index] =
             Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
@@ -1916,7 +1916,7 @@ where
         }
     }
     let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_atoms().iter().copied() {
+    for input_atom in program.input_ids().iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
@@ -1950,7 +1950,7 @@ where
     }
 
     program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()

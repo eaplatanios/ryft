@@ -27,7 +27,7 @@ where
     ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TracingError>,
 {
     let mut values = vec![None; program.atom_count()];
-    for (atom_id, value) in program.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
+    for (atom_id, value) in program.input_ids().iter().copied().zip(inputs.iter().cloned()) {
         values[atom_id.index] = Some(value);
     }
 
@@ -38,7 +38,7 @@ where
         }
     }
     let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_atoms().iter().copied() {
+    for input_atom in program.input_ids().iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
@@ -73,7 +73,7 @@ where
     }
 
     program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|output| values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
         .collect()

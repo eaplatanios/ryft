@@ -235,7 +235,7 @@ where
     let mut nested_regions = Vec::new();
     let mut depth_by_atom = vec![0usize; program.atom_count()];
     let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_atoms().iter().copied() {
+    for input_atom in program.input_ids().iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
@@ -261,11 +261,11 @@ where
 
     let nested_region_count = nested_regions.len()
         + nested_regions.iter().map(|nested_region| nested_region.nested_region_count).sum::<usize>();
-    let max_dependency_depth = program.outputs().iter().map(|output| depth_by_atom[*output]).max().unwrap_or(0);
+    let max_dependency_depth = program.output_ids().iter().map(|output| depth_by_atom[*output]).max().unwrap_or(0);
 
     Ok(IrBenchmarkSummary {
-        input_leaf_count: program.input_atoms().len(),
-        output_leaf_count: program.outputs().len(),
+        input_leaf_count: program.input_ids().len(),
+        output_leaf_count: program.output_ids().len(),
         instruction_count: program.instructions().len(),
         constant_count: (0..program.atom_count())
             .filter_map(|atom_id| program.atom(atom_id))

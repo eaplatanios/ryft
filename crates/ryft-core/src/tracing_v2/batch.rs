@@ -330,7 +330,7 @@ where
         let body = FlatTracedVMap::from_parts(
             lane_count,
             body_program
-                .input_atoms()
+                .input_ids()
                 .iter()
                 .map(|input| body_program.atom(*input).expect("body input atoms should exist").r#type().into_owned())
                 .collect::<Vec<_>>(),

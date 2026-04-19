@@ -169,17 +169,14 @@ where
     }
 
     let program = program;
-    if input_primals.len() != program.input_atoms().len() {
-        return Err(TracingError::InvalidInputCount {
-            expected: program.input_atoms().len(),
-            got: input_primals.len(),
-        });
+    if input_primals.len() != program.input_ids().len() {
+        return Err(TracingError::InvalidInputCount { expected: program.input_ids().len(), got: input_primals.len() });
     }
     let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let builder = Rc::new(RefCell::new(ProgramBuilder::<L, ArrayType, V>::new()));
     let mut primals: Vec<Option<V>> = vec![None; program.atom_count()];
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atom_count()];
-    for (input_atom, input_primal) in program.input_atoms().iter().copied().zip(input_primals.into_iter()) {
+    for (input_atom, input_primal) in program.input_ids().iter().copied().zip(input_primals.into_iter()) {
         let tangent_atom = builder.borrow_mut().add_input(&input_primal.zero_like());
         tangents[input_atom.index] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
         primals[input_atom.index] = Some(input_primal);
@@ -226,7 +223,7 @@ where
     }
 
     let output_tangents = program
-        .outputs()
+        .output_ids()
         .iter()
         .copied()
         .map(|output_atom| {
@@ -314,8 +311,8 @@ where
 
     let linear_body = &program.program;
     let builder = Rc::new(RefCell::new(ProgramBuilder::<O, ArrayType, V>::new()));
-    let mut output_cotangent_inputs = Vec::with_capacity(linear_body.outputs().len());
-    for (output_index, output) in linear_body.outputs().iter().enumerate() {
+    let mut output_cotangent_inputs = Vec::with_capacity(linear_body.output_ids().len());
+    for (output_index, output) in linear_body.output_ids().iter().enumerate() {
         let output_atom = linear_body.atom(*output).ok_or(TracingError::UnboundAtomId { id: *output })?;
         let cotangent_input =
             make_output_cotangent_input(&mut builder.borrow_mut(), &output_atom.r#type(), output_index)?;
@@ -323,7 +320,7 @@ where
     }
 
     let mut adjoints = vec![None; linear_body.atom_count()];
-    for (cotangent, output) in output_cotangent_inputs.into_iter().zip(linear_body.outputs().iter().copied()) {
+    for (cotangent, output) in output_cotangent_inputs.into_iter().zip(linear_body.output_ids().iter().copied()) {
         accumulate(&builder, adjoints.as_mut_slice(), output, cotangent)?;
     }
 
@@ -343,7 +340,7 @@ where
 
     let zero_atom = builder.borrow_mut().add_constant(program.zero.clone());
     let outputs = linear_body
-        .input_atoms()
+        .input_ids()
         .iter()
         .copied()
         .map(|input| adjoints[input.index].unwrap_or(zero_atom))
@@ -386,7 +383,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
-    let expected_output_count = program.program().outputs().len();
+    let expected_output_count = program.program().output_ids().len();
     if output_examples.len() != expected_output_count {
         return Err(TracingError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }

@@ -673,7 +673,7 @@ fn live_sets_for_flat_program(program: &FlatShardMapProgram) -> (Vec<bool>, Vec<
     let instruction_by_output = instruction_by_output(program);
     let mut live_atoms = vec![false; program.atom_count()];
     let mut live_instructions = vec![false; program.instructions().len()];
-    for output in program.outputs().iter().copied() {
+    for output in program.output_ids().iter().copied() {
         mark_live_flat_program(
             program,
             output,
@@ -690,7 +690,7 @@ fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<b
     let program = &body.program;
     let primal_input_count = transpose_body_primal_input_count(body);
     let mut depends_on_cotangent = vec![false; program.atom_count()];
-    for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
+    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
         depends_on_cotangent[atom_id.index] = input_index >= primal_input_count;
     }
 
@@ -898,7 +898,7 @@ fn build_factorized_apply_program(
     let engine = crate::experimental::engine::XlaEngine::token();
     let representative_values = program.representative_atom_values(engine)?;
     let primal_input_count = transpose_body_primal_input_count(body);
-    let cotangent_input_atoms = program.input_atoms()[primal_input_count..].to_vec();
+    let cotangent_input_atoms = program.input_ids()[primal_input_count..].to_vec();
     let instruction_by_output = instruction_by_output(program);
     let mut builder = ProgramBuilder::<XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
     let mut replacement_inputs = std::collections::HashMap::new();
@@ -914,7 +914,7 @@ fn build_factorized_apply_program(
 
     let mut atom_mapping = replacement_inputs.clone();
     let outputs = program
-        .outputs()
+        .output_ids()
         .iter()
         .copied()
         .map(|output| {
@@ -933,7 +933,7 @@ fn build_factorized_apply_program(
     Ok(builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
         outputs,
         vec![ryft_core::parameters::Placeholder; cotangent_input_atoms.len() + residual_atoms.len()],
-        vec![ryft_core::parameters::Placeholder; program.outputs().len()],
+        vec![ryft_core::parameters::Placeholder; program.output_ids().len()],
     ))
 }
 
@@ -986,7 +986,7 @@ fn factorize_transpose_shard_map_body(
         return Ok(None);
     };
 
-    let primal_input_atoms = program.input_atoms()[..primal_input_count].to_vec();
+    let primal_input_atoms = program.input_ids()[..primal_input_count].to_vec();
     let residual_program =
         project_flat_shard_map_program(program, primal_input_atoms.as_slice(), residual_atoms.as_slice())?
             .simplify()?;
@@ -1147,7 +1147,7 @@ fn replay_traced_xla_program<
     inputs: Vec<V>,
 ) -> Result<Vec<V>, ShardMapTraceError> {
     let mut values = vec![None; program.atom_count()];
-    for (atom_id, value) in program.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
+    for (atom_id, value) in program.input_ids().iter().copied().zip(inputs.iter().cloned()) {
         values[atom_id.index] = Some(value);
     }
 
@@ -1158,7 +1158,7 @@ fn replay_traced_xla_program<
         }
     }
     let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_atoms().iter().copied() {
+    for input_atom in program.input_ids().iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
@@ -1236,7 +1236,7 @@ fn replay_traced_xla_program<
     }
 
     program
-        .outputs()
+        .output_ids()
         .iter()
         .map(|output| {
             values[output.index]
