@@ -20,7 +20,7 @@ use crate::{
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
-        jit::{ConcreteTracer, Tracer, interpret_and_trace},
+        jit::{Tracer, interpret_and_trace},
         operations::{
             CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,
@@ -48,16 +48,10 @@ pub(crate) use program::linearize_program;
 pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
 pub(crate) use reverse::jvp_traced;
 
-type LinearizedTracedValue<V, O, L, E> =
-    Linearized<Tracer<ArrayType, V, O, L, E>, LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>>;
+type LinearizedTracedValue<E> = Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>;
 
-type TracedLinearProgram<V, O, L, E> = LinearProgram<
-    ArrayType,
-    Tracer<ArrayType, V, O, L, E>,
-    Vec<Tracer<ArrayType, V, O, L, E>>,
-    Vec<Tracer<ArrayType, V, O, L, E>>,
-    LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>,
->;
+type TracedLinearProgram<E> =
+    LinearProgram<ArrayType, Tracer<E>, Vec<Tracer<E>>, Vec<Tracer<E>>, LinearProgramOpRef<Tracer<E>>>;
 
 #[inline]
 fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
@@ -72,21 +66,19 @@ fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
 /// transposition code can share one flat reverse-mode path regardless of the original structure.
 pub(crate) fn trace_flat_program_from_input_types<Input, Output, V, O, L, E, F>(
     function: F,
-    traced_inputs: &[Tracer<ArrayType, V, O, L, E>],
+    traced_inputs: &[Tracer<E>],
     input_types: Input,
 ) -> Result<(Output, Program<ArrayType, V, Vec<V>, Vec<V>, O>), TraceError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<E>>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<E>>,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    F: FnOnce(
-        Input::To<Tracer<ArrayType, V, O, L, E>>,
-    ) -> Result<Output::To<Tracer<ArrayType, V, O, L, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
 {
     let exemplar_engine = traced_inputs.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
     let (output_types, traced_program): (Output, Program<ArrayType, V, Input::To<V>, Output::To<V>, O>) =
@@ -104,28 +96,23 @@ where
 /// Linearizes one flat scalar traced program and stages its pullback with a unit cotangent seed.
 fn reverse_mode_scalar_traced_program<V, O, L, E>(
     traced_program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
-    traced_primals: Vec<Tracer<ArrayType, V, O, L, E>>,
-) -> Result<(Tracer<ArrayType, V, O, L, E>, Vec<Tracer<ArrayType, V, O, L, E>>), TraceError>
+    traced_primals: Vec<Tracer<E>>,
+) -> Result<(Tracer<E>, Vec<Tracer<E>>), TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<
-            ArrayType,
-            Linearized<Tracer<ArrayType, V, O, L, E>, LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>>,
-        >,
-    LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>: CoreLinearProgramOp<Tracer<ArrayType, V, O, L, E>>,
+    O: InterpretableOp<ArrayType, Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>>,
+    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
 {
     let (outputs, pushforward) = linearize_traced_program::<V, O, L, E>(traced_program, traced_primals)?;
     if outputs.len() != 1 {
         return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
     }
     let traced_output = outputs[0].clone();
-    let pullback = transpose_linear_program_with_output_examples::<Tracer<ArrayType, V, O, L, E>, _, _, _>(
-        &pushforward,
-        outputs.as_slice(),
-    )?;
+    let pullback =
+        transpose_linear_program_with_output_examples::<Tracer<E>, _, _, _>(&pushforward, outputs.as_slice())?;
     let traced_gradient = pullback.call(vec![traced_output.one_like()])?;
     Ok((traced_output, traced_gradient))
 }
@@ -349,7 +336,7 @@ mod tests {
         let grad_at_2 = compiled.call(2.0f64).unwrap();
         approx_eq(grad_at_2, 2.0 * 2.0 + 2.0f64.cos());
 
-        // Verify at a DIFFERENT primal point â€” this is the key test.
+        // Verify at a DIFFERENT primal point Ã¢â‚¬â€ this is the key test.
         let grad_at_half = compiled.call(0.5f64).unwrap();
         approx_eq(grad_at_half, 2.0 * 0.5 + 0.5f64.cos());
 

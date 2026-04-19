@@ -3,7 +3,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    TraceError, Traceable, ZeroLike,
+    TraceError, Traceable, Value, ZeroLike,
     batch::Batch as BatchedValue,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -126,39 +126,25 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOp<V> {
 }
 
 impl<
-    V: Traceable<ArrayType> + MatrixOps + ZeroLike,
+    V: Value<ArrayType> + MatrixOps + ZeroLike,
     O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
     OuterLinearOperation: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
     InnerLinearOperation: TracerLinearOperation<V, O, OuterLinearOperation, E>
-        + LinearLeftMatMulOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
-        + LinearRightMatMulOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
-        + LinearMatrixTransposeOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>,
->
-    InterpretableOp<
-        ArrayType,
-        crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>,
-    > for RightMatMulOp<V>
+        + LinearLeftMatMulOperation<ArrayType, Tracer<E>>
+        + LinearRightMatMulOperation<ArrayType, Tracer<E>>
+        + LinearMatrixTransposeOperation<ArrayType, Tracer<E>>,
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>>
+    for RightMatMulOp<V>
 where
     O: Op<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<
-            Tracer<ArrayType, V, O, OuterLinearOperation, E>,
-            InnerLinearOperation,
-        >],
-    ) -> Result<
-        Vec<
-            crate::tracing_v2::linear::Linearized<
-                Tracer<ArrayType, V, O, OuterLinearOperation, E>,
-                InnerLinearOperation,
-            >,
-        >,
-        TraceError,
-    > {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };

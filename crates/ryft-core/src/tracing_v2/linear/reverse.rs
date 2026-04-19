@@ -10,9 +10,9 @@ where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<ConcreteTracer<E>>,
-    Output::Family: ParameterizedFamily<ConcreteTracer<E>>,
-    F: FnOnce(Input::To<ConcreteTracer<E>>) -> Result<Output::To<ConcreteTracer<E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<E>>,
+    Output::Family: ParameterizedFamily<Tracer<E>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
     E::LinearOperation: Clone + Op<ArrayType>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
@@ -45,20 +45,17 @@ pub(crate) fn jvp_traced<F, Input, Output, V, O, L, E>(
 ) -> Result<(Output, Output), TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone + PartialEq>,
-    Output: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone>,
+    Input: Parameterized<Tracer<E>, ParameterStructure: Clone + PartialEq>,
+    Output: Parameterized<Tracer<E>, ParameterStructure: Clone>,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Input>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Output>,
-    O: InterpretableOp<
-            ArrayType,
-            Linearized<Tracer<ArrayType, V, O, L, E>, LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>>,
-        >,
-    LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>: CoreLinearReplayOp<Tracer<ArrayType, V, O, L, E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Output>,
+    O: InterpretableOp<ArrayType, Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>>,
+    LinearProgramOpRef<Tracer<E>>: CoreLinearReplayOp<Tracer<E>>,
     F: FnOnce(Input) -> Result<Output, TraceError>,
 {
     if primals.parameter_structure() != tangents.parameter_structure() {
@@ -99,9 +96,9 @@ where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<ConcreteTracer<E>>,
-    Output::Family: ParameterizedFamily<ConcreteTracer<E>>,
-    F: FnOnce(Input::To<ConcreteTracer<E>>) -> Result<Output::To<ConcreteTracer<E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<E>>,
+    Output::Family: ParameterizedFamily<Tracer<E>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
     E::LinearOperation: Clone + Op<ArrayType>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
@@ -154,18 +151,9 @@ impl<
 > ValueAndGradInvocationLeaf<E, Input> for V
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
-    V: Parameterized<
-            V,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-            >,
-        >,
-    Input::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    V::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    V: Parameterized<V, To<Tracer<E>> = Tracer<E>>,
+    Input::Family: ParameterizedFamily<Tracer<E>>,
+    V::Family: ParameterizedFamily<Tracer<E>>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -177,8 +165,8 @@ where
     E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
 {
     type Value = V;
-    type FunctionInput = Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>;
-    type FunctionOutput = Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>;
+    type FunctionInput = Input::To<Tracer<E>>;
+    type FunctionOutput = Tracer<E>;
 
     fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
     where
@@ -197,43 +185,22 @@ where
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<
-            Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
-            ParameterStructure: Clone + PartialEq,
-        >,
-> ValueAndGradInvocationLeaf<E, Input> for Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>
+    Input: Parameterized<Tracer<E>, ParameterStructure: Clone + PartialEq>,
+> ValueAndGradInvocationLeaf<E, Input> for Tracer<E>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<E>>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>:
-        Parameterized<ArrayType, To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Input>,
-    V::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-            >,
-        >,
-    E::TracingOperation: InterpretableOp<
-            ArrayType,
-            Linearized<
-                Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
-                LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-            >,
-        >,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Tracer<E>>,
+    E::TracingOperation: InterpretableOp<ArrayType, Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>>,
     E::LinearOperation: Clone + Op<ArrayType> + 'static,
-    LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>:
-        CoreLinearProgramOp<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
 {
-    type Value = Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>;
+    type Value = Tracer<E>;
     type FunctionInput = Input;
-    type FunctionOutput = Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>;
+    type FunctionOutput = Tracer<E>;
 
     fn invoke<F>(_engine: &E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
     where
@@ -282,104 +249,62 @@ where
             V,
             ParameterStructure = Placeholder,
             To<
-                Tracer<
-                    ArrayType,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    dyn Engine<
+                Tracer<dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
-                        >,
-                >,
-            > = Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                dyn Engine<
+                        >>,
+            > = Tracer<dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
                         LinearOperation = E::LinearOperation,
-                    >,
-            >,
+                    >>,
         >,
     V::Family: ParameterizedFamily<
-            Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                dyn Engine<
+            Tracer<dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
                         LinearOperation = E::LinearOperation,
-                    >,
-            >,
+                    >>,
         >,
     Vec<V>: Parameterized<
             V,
             ParameterStructure = Vec<Placeholder>,
             To<
-                Tracer<
-                    ArrayType,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    dyn Engine<
+                Tracer<dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
-                        >,
-                >,
+                        >>,
             > = Vec<
-                Tracer<
-                    ArrayType,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    dyn Engine<
+                Tracer<dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
-                        >,
-                >,
+                        >>,
             >,
         >,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<
-            Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                dyn Engine<
+            Tracer<dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
                         LinearOperation = E::LinearOperation,
-                    >,
-            >,
+                    >>,
         >,
     Input::Family: ParameterizedFamily<V>
         + ParameterizedFamily<
-            Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                dyn Engine<
+            Tracer<dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
                         LinearOperation = E::LinearOperation,
-                    >,
-            >,
+                    >>,
         >,
     Input::To<V>: Clone
         + Parameterized<
@@ -387,31 +312,19 @@ where
             ParameterStructure: Clone + PartialEq,
             To<Batch<V>> = Input,
             To<
-                Tracer<
-                    ArrayType,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    dyn Engine<
+                Tracer<dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
-                        >,
-                >,
+                        >>,
             > = Input::To<
-                Tracer<
-                    ArrayType,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    dyn Engine<
+                Tracer<dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
-                        >,
-                >,
+                        >>,
             >,
         >,
     E::TracingOperation: Clone + Op<ArrayType>,
@@ -419,89 +332,53 @@ where
     E::TracingOperation: InterpretableOp<
             ArrayType,
             Linearized<
-                Tracer<
-                    ArrayType,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    dyn Engine<
+                Tracer<dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
-                        >,
-                >,
+                        >>,
                 LinearProgramOpRef<
-                    Tracer<
-                        ArrayType,
-                        V,
-                        E::TracingOperation,
-                        E::LinearOperation,
-                        dyn Engine<
+                    Tracer<dyn Engine<
                                 Type = ArrayType,
                                 Value = V,
                                 TracingOperation = E::TracingOperation,
                                 LinearOperation = E::LinearOperation,
-                            >,
-                    >,
+                            >>,
                 >,
             >,
         >,
     LinearProgramOpRef<
-        Tracer<
-            ArrayType,
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            dyn Engine<
+        Tracer<dyn Engine<
                     Type = ArrayType,
                     Value = V,
                     TracingOperation = E::TracingOperation,
                     LinearOperation = E::LinearOperation,
-                >,
-        >,
+                >>,
     >: CoreLinearProgramOp<
-        Tracer<
-            ArrayType,
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            dyn Engine<
+        Tracer<dyn Engine<
                     Type = ArrayType,
                     Value = V,
                     TracingOperation = E::TracingOperation,
                     LinearOperation = E::LinearOperation,
-                >,
-        >,
+                >>,
     >,
 {
     type Value = Batch<V>;
     type FunctionInput = Input::To<
-        Tracer<
-            ArrayType,
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            dyn Engine<
+        Tracer<dyn Engine<
                     Type = ArrayType,
                     Value = V,
                     TracingOperation = E::TracingOperation,
                     LinearOperation = E::LinearOperation,
-                >,
-        >,
+                >>,
     >;
-    type FunctionOutput = Tracer<
-        ArrayType,
-        V,
-        E::TracingOperation,
-        E::LinearOperation,
-        dyn Engine<
+    type FunctionOutput = Tracer<dyn Engine<
                 Type = ArrayType,
                 Value = V,
                 TracingOperation = E::TracingOperation,
                 LinearOperation = E::LinearOperation,
-            >,
-    >;
+            >>;
 
     fn invoke<F>(engine: &E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
     where
@@ -541,18 +418,12 @@ where
             interpret_and_trace(
                 erased_engine,
                 |jit_primals: Vec<
-                    Tracer<
-                        ArrayType,
-                        V,
-                        E::TracingOperation,
-                        E::LinearOperation,
-                        dyn Engine<
+                    Tracer<dyn Engine<
                                 Type = ArrayType,
                                 Value = V,
                                 TracingOperation = E::TracingOperation,
                                 LinearOperation = E::LinearOperation,
-                            >,
-                    >,
+                            >>,
                 >| {
                     let (output, gradient) = reverse_mode_scalar_traced_program::<
                         V,
@@ -563,8 +434,7 @@ where
                                 Value = V,
                                 TracingOperation = E::TracingOperation,
                                 LinearOperation = E::LinearOperation,
-                            >,
-                    >(&flat_program, jit_primals)?;
+                            >>(&flat_program, jit_primals)?;
                     let mut result = Vec::with_capacity(1 + gradient.len());
                     result.push(output);
                     result.extend(gradient);

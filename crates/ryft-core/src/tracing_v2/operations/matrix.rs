@@ -215,7 +215,7 @@ impl<
     O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
     L: Clone,
     E: crate::tracing_v2::Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> MatrixOps for Tracer<ArrayType, V, O, L, E>
+> MatrixOps for Tracer<E>
 where
     O: Op<ArrayType>,
 {

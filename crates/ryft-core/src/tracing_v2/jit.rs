@@ -8,7 +8,6 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     fmt::Display,
-    marker::PhantomData,
     ops::{Add, Mul, Neg},
     rc::Rc,
 };
@@ -24,27 +23,25 @@ use crate::{
 };
 
 /// Tracer used while staging JIT programs.
-pub struct Tracer<
-    T: Type + Display,
-    V: Traceable<T> + Parameter,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> {
+pub struct Tracer<E: Engine + ?Sized>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
+{
     atom: AtomId,
-    builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
+    builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
     engine: *const E,
-    marker: PhantomData<fn() -> L>,
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Clone for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> Clone for Tracer<E>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -52,41 +49,37 @@ impl<
             builder: self.builder.clone(),
             staging_error: self.staging_error.clone(),
             engine: self.engine,
-            marker: PhantomData,
         }
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Parameter for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> Parameter for Tracer<E>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> std::fmt::Debug for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> std::fmt::Debug for Tracer<E>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> Tracer<E>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     #[doc(hidden)]
     #[inline]
@@ -95,7 +88,7 @@ impl<
     }
 
     #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<O, T, V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>> {
         self.builder.clone()
     }
 
@@ -115,7 +108,7 @@ impl<
     #[inline]
     pub fn from_engine(
         atom: AtomId,
-        builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
+        builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
         engine: &E,
     ) -> Self {
@@ -125,7 +118,7 @@ impl<
     #[inline]
     pub fn from_staged_parts(
         atom: AtomId,
-        builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
+        builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
         engine: &E,
     ) -> Self {
@@ -133,12 +126,12 @@ impl<
         // entry points require reclaiming the shared builder before they return, so no staged
         // tracer can outlive the engine reference captured here.
         let engine = engine as *const E;
-        Self { atom, builder, staging_error, engine, marker: PhantomData }
+        Self { atom, builder, staging_error, engine }
     }
 
-    pub fn apply_staged_op(inputs: &[Self], op: O) -> Result<Vec<Self>, TraceError>
+    pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TraceError>
     where
-        O: Op<T>,
+        E::TracingOperation: Op<E::Type>,
     {
         if inputs.is_empty() {
             return Err(TraceError::EmptyParameterizedValue);
@@ -197,14 +190,13 @@ impl<
                 builder: builder.clone(),
                 staging_error: staging_error.clone(),
                 engine: inputs[0].engine,
-                marker: PhantomData,
             })
             .collect())
     }
 
-    pub fn unary(self, op: O) -> Self
+    pub fn unary(self, op: E::TracingOperation) -> Self
     where
-        O: Op<T>,
+        E::TracingOperation: Op<E::Type>,
     {
         Self::apply_staged_op(std::slice::from_ref(&self), op)
             .expect("unary traced staging should preserve non-empty inputs")
@@ -213,9 +205,9 @@ impl<
             .expect("unary traced staging should produce one output")
     }
 
-    pub fn binary(self, rhs: Self, op: O) -> Self
+    pub fn binary(self, rhs: Self, op: E::TracingOperation) -> Self
     where
-        O: Op<T>,
+        E::TracingOperation: Op<E::Type>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         debug_assert!(Rc::ptr_eq(&self.staging_error, &rhs.staging_error));
@@ -227,16 +219,15 @@ impl<
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Typed<T> for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> Typed<E::Type> for Tracer<E>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     #[inline]
-    fn tpe(&self) -> Cow<'_, T> {
+    fn tpe(&self) -> Cow<'_, E::Type> {
         Cow::Owned(
             self.builder
                 .borrow()
@@ -248,121 +239,89 @@ impl<
     }
 }
 
-impl<
-    T: Type + Display + 'static,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-> Traceable<T> for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized + 'static> Traceable<E::Type> for Tracer<E>
+where
+    E::Type: Type + Display + 'static,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> ZeroLike for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> ZeroLike for Tracer<E>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self {
-            atom,
-            builder: self.builder.clone(),
-            staging_error: self.staging_error.clone(),
-            engine: self.engine,
-            marker: PhantomData,
-        }
+        Self { atom, builder: self.builder.clone(), staging_error: self.staging_error.clone(), engine: self.engine }
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> OneLike for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> OneLike for Tracer<E>
+where
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self {
-            atom,
-            builder: self.builder.clone(),
-            staging_error: self.staging_error.clone(),
-            engine: self.engine,
-            marker: PhantomData,
-        }
+        Self { atom, builder: self.builder.clone(), staging_error: self.staging_error.clone(), engine: self.engine }
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: AddTracingOperation<T, V> + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Add for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> Add for Tracer<E>
 where
-    O: Op<T>,
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: AddTracingOperation<E::Type, E::Value> + Op<E::Type> + Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     type Output = Self;
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, O::add_op())
+        self.binary(rhs, E::TracingOperation::add_op())
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: MulTracingOperation<T, V> + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Mul for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> Mul for Tracer<E>
 where
-    O: Op<T>,
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: MulTracingOperation<E::Type, E::Value> + Op<E::Type> + Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     type Output = Self;
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        self.binary(rhs, O::mul_op())
+        self.binary(rhs, E::TracingOperation::mul_op())
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: NegTracingOperation<T, V> + 'static,
-    L: Clone + 'static,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Neg for Tracer<T, V, O, L, E>
+impl<E: Engine + ?Sized> Neg for Tracer<E>
 where
-    O: Op<T>,
+    E::Type: Type + Display,
+    E::Value: Traceable<E::Type> + Parameter,
+    E::TracingOperation: NegTracingOperation<E::Type, E::Value> + Op<E::Type> + Clone + 'static,
+    E::LinearOperation: Clone + 'static,
 {
     type Output = Self;
 
     #[inline]
     fn neg(self) -> Self::Output {
-        self.unary(O::neg_op())
+        self.unary(E::TracingOperation::neg_op())
     }
 }
-
-pub(crate) type ConcreteTracer<E> = Tracer<
-    <E as Engine>::Type,
-    <E as Engine>::Value,
-    <E as Engine>::TracingOperation,
-    <E as Engine>::LinearOperation,
-    E,
->;
 
 /// Stages `function`, interprets the resulting program on the supplied concrete inputs, and returns
 /// both the interpreted output and the staged program.
@@ -379,9 +338,9 @@ where
     E::LinearOperation: Clone + 'static,
     Input: Parameterized<E::Value, ParameterStructure: Clone>,
     Output: Parameterized<E::Value, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<ConcreteTracer<E>>,
-    Output::Family: ParameterizedFamily<ConcreteTracer<E>>,
-    F: FnOnce(Input::To<ConcreteTracer<E>>) -> Result<Output::To<ConcreteTracer<E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<E>>,
+    Output::Family: ParameterizedFamily<Tracer<E>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
@@ -395,8 +354,7 @@ where
     ) = trace(
         engine,
         |flat_traced_input| {
-            let traced_input =
-                Input::To::<ConcreteTracer<E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
+            let traced_input = Input::To::<Tracer<E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
             let traced_output = function(traced_input)?;
             output_structure = Some(traced_output.parameter_structure());
             Ok(traced_output.into_parameters().collect::<Vec<_>>())
@@ -431,18 +389,18 @@ where
     E::LinearOperation: Clone + 'static,
     Input: Parameterized<E::Type, ParameterStructure: Clone>,
     Output: Parameterized<E::Type, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<ConcreteTracer<E>>,
-    Output::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<ConcreteTracer<E>>,
-    F: FnOnce(Input::To<ConcreteTracer<E>>) -> Result<Output::To<ConcreteTracer<E>>, TraceError>,
+    Input::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
+    Output::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
 {
     let input_structure = input_types.parameter_structure();
     let builder = Rc::new(RefCell::new(ProgramBuilder::<E::TracingOperation, E::Type, E::Value>::new()));
     let staging_error = Rc::new(RefCell::new(None));
-    let traced_input = Input::To::<ConcreteTracer<E>>::from_parameters(
+    let traced_input = Input::To::<Tracer<E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
             let atom = builder.borrow_mut().add_input_abstract(r#type);
-            ConcreteTracer::<E>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+            Tracer::<E>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
         }),
     )
     .map_err(TraceError::from)?;
@@ -492,8 +450,7 @@ mod tests {
         let staging_error = Rc::new(RefCell::new(None));
         let atom = builder.borrow_mut().add_input(&3.0f64);
         let engine = ArrayScalarEngine::<f64>::new();
-        let tracer: ConcreteTracer<ArrayScalarEngine<f64>> =
-            ConcreteTracer::from_engine(atom, builder, staging_error, &engine);
+        let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, staging_error, &engine);
         let zero = tracer.zero_like();
         assert_eq!(zero.tpe().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
         assert!(zero.atom > atom);
@@ -515,7 +472,7 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
             &engine,
-            |x: ConcreteTracer<ArrayScalarEngine<f64>>| {
+            |x: Tracer<ArrayScalarEngine<f64>>| {
                 let squared = x.clone() * x.clone();
                 Ok(squared + x.sin())
             },
@@ -685,7 +642,7 @@ mod tests {
         let (output, program): (TestValue, Program<TestType, TestValue, (TestValue, TestValue), TestValue, TestAddOp>) =
             interpret_and_trace(
                 &TestEngine,
-                |inputs: (ConcreteTracer<TestEngine>, ConcreteTracer<TestEngine>)| {
+                |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| {
                     let sum = inputs.0.clone() + inputs.1;
                     let stabilized = sum + inputs.0.zero_like();
                     Ok(stabilized + inputs.0.one_like())
@@ -824,7 +781,7 @@ mod tests {
             TraceError,
         > = interpret_and_trace(
             &TestEngine,
-            |inputs: (ConcreteTracer<TestEngine>, ConcreteTracer<TestEngine>)| Ok(inputs.0 + inputs.1),
+            |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| Ok(inputs.0 + inputs.1),
             (
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F32) },
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F64) },
@@ -839,7 +796,7 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
             &engine,
-            |x: ConcreteTracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
+            |x: Tracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
             2.0f64,
         )
         .unwrap();

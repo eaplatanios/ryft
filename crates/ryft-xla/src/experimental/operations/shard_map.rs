@@ -28,10 +28,6 @@ use crate::experimental::shard_map::{
 use crate::experimental::{engine::XlaEngine, ops::XlaPrimitiveOp};
 
 type JitShardMapTracer = Tracer<
-    ArrayType,
-    ShardMapTracer,
-    ProgramOpRef<ShardMapTracer>,
-    LinearProgramOpRef<ShardMapTracer>,
     dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,

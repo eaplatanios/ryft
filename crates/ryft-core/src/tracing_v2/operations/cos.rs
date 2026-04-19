@@ -112,7 +112,7 @@ impl<
     O: CosTracingOperation<ArrayType, V>,
     L: Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Cos for Tracer<ArrayType, V, O, L, E>
+> Cos for Tracer<E>
 where
     O: Op<ArrayType>,
 {

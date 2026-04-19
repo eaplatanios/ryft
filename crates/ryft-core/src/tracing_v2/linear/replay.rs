@@ -65,38 +65,35 @@ where
 
 pub(crate) fn replay_program_linearized_jit<ProgramInput, ProgramOutput, V, O, L, E>(
     program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
-    inputs: Vec<LinearizedTracedValue<V, O, L, E>>,
-) -> Result<Vec<LinearizedTracedValue<V, O, L, E>>, TraceError>
+    inputs: Vec<LinearizedTracedValue<E>>,
+) -> Result<Vec<LinearizedTracedValue<E>>, TraceError>
 where
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType> + ZeroLike,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<V, O, L, E>> + Clone,
+    O: InterpretableOp<ArrayType, LinearizedTracedValue<E>> + Clone,
 {
     replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L, E>, |op, values| {
-        InterpretableOp::<ArrayType, LinearizedTracedValue<V, O, L, E>>::interpret(op, &values)
+        InterpretableOp::<ArrayType, LinearizedTracedValue<E>>::interpret(op, &values)
     })
 }
 
 pub(crate) fn linearize_traced_program<V, O, L, E>(
     program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
-    primals: Vec<Tracer<ArrayType, V, O, L, E>>,
-) -> Result<(Vec<Tracer<ArrayType, V, O, L, E>>, TracedLinearProgram<V, O, L, E>), TraceError>
+    primals: Vec<Tracer<E>>,
+) -> Result<(Vec<Tracer<E>>, TracedLinearProgram<E>), TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<V, O, L, E>> + Clone,
+    O: InterpretableOp<ArrayType, LinearizedTracedValue<E>> + Clone,
 {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_count = primals.len();
-    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<
-        Tracer<ArrayType, V, O, L, E>,
-        LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>,
-    >::new()));
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<Tracer<E>, LinearProgramOpRef<Tracer<E>>>::new()));
     let traced_input = primals
         .into_iter()
         .map(|primal| {
@@ -115,7 +112,7 @@ where
         }
     };
     let program = builder
-        .build::<Vec<Tracer<ArrayType, V, O, L, E>>, Vec<Tracer<ArrayType, V, O, L, E>>>(
+        .build::<Vec<Tracer<E>>, Vec<Tracer<E>>>(
             tangent_outputs,
             vec![Placeholder; input_count],
             vec![Placeholder; primal_outputs.len()],

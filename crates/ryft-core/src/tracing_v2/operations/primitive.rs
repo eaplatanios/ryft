@@ -18,7 +18,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        Cos, MatrixOps, OneLike, Sin, TraceError, Traceable, ZeroLike,
+        Cos, MatrixOps, OneLike, Sin, TraceError, Traceable, Value, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
@@ -425,7 +425,7 @@ impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOp<ArrayType, V> {
     }
 }
 
-/// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds â€” shape validation works for any `V: Traceable<ArrayType>`.
+/// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds Ã¢â‚¬â€ shape validation works for any `V: Traceable<ArrayType>`.
 impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
     fn name(&self) -> &'static str {
         match self {
@@ -500,7 +500,7 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
     }
 }
 
-/// [`Op`] for [`LinearPrimitiveOp`] requires NO value-type bounds â€” shape validation works for any `V: Traceable<ArrayType>`.
+/// [`Op`] for [`LinearPrimitiveOp`] requires NO value-type bounds Ã¢â‚¬â€ shape validation works for any `V: Traceable<ArrayType>`.
 impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
     fn name(&self) -> &'static str {
         match self {
@@ -573,7 +573,7 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
 /// exposing it as one public value-bundle trait and instead express their requirements through the
 /// specific staged op carrier bounds they actually exercise.
 impl<
-    V: Traceable<ArrayType>
+    V: Value<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -687,7 +687,7 @@ where
 /// [`LeftMatMulOp`]: crate::tracing_v2::operations::LeftMatMulOp
 /// [`RightMatMulOp`]: crate::tracing_v2::operations::RightMatMulOp
 impl<
-    V: Traceable<ArrayType>
+    V: Value<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
@@ -705,30 +705,15 @@ impl<
             LinearOperation = LinearPrimitiveOp<ArrayType, V>,
         > + ?Sized
         + 'static,
->
-    InterpretableOp<
-        ArrayType,
-        crate::tracing_v2::linear::Linearized<
-            Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
-        >,
-    > for PrimitiveOp<ArrayType, V>
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>>> for PrimitiveOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<
-            Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
-        >],
-    ) -> Result<
-        Vec<
-            crate::tracing_v2::linear::Linearized<
-                Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
-            >,
-        >,
-        TraceError,
-    > {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<E>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<E>>>, TraceError> {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Mul => MulOp.interpret(inputs),
@@ -751,7 +736,7 @@ where
 }
 
 impl<
-    V: Traceable<ArrayType>
+    V: Value<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>

@@ -214,38 +214,24 @@ where
 impl<
     E,
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<
-            Tracer<ArrayType, V, O, L, E>,
-            ParameterStructure: Clone + PartialEq,
-            To<Tracer<ArrayType, V, O, L, E>> = Input,
-        >,
-    Output: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone, To<Tracer<ArrayType, V, O, L, E>> = Output>,
+    Input: Parameterized<Tracer<E>, ParameterStructure: Clone + PartialEq, To<Tracer<E>> = Input>,
+    Output: Parameterized<Tracer<E>, ParameterStructure: Clone, To<Tracer<E>> = Output>,
     O: Clone + Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
     L: Clone,
-> VMapInvocationLeaf<Input, Output> for Tracer<ArrayType, V, O, L, E>
+> VMapInvocationLeaf<Input, Output> for Tracer<E>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    Input::Family: ParameterizedFamily<Batch<Tracer<ArrayType, V, O, L, E>>>
+    Input::Family: ParameterizedFamily<Batch<Tracer<E>>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<Batch<Tracer<E>>>
+        + ParameterizedFamily<Tracer<E>>
         + ParameterizedFamily<V>
         + ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<Batch<Tracer<ArrayType, V, O, L, E>>>
-        + ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>
-        + ParameterizedFamily<V>
-        + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Input, To<V> = Input::To<V>>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Output, To<V> = Output::To<V>>,
-    V: Parameterized<
-            V,
-            To<Tracer<ArrayType, V, O, L, E>> = Tracer<ArrayType, V, O, L, E>,
-            ParameterStructure: Clone + PartialEq,
-        >,
-    V::Family: ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>,
-    Vec<V>: Parameterized<
-            V,
-            To<Tracer<ArrayType, V, O, L, E>> = Vec<Tracer<ArrayType, V, O, L, E>>,
-            ParameterStructure = Vec<Placeholder>,
-        >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input, To<V> = Input::To<V>>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Output, To<V> = Output::To<V>>,
+    V: Parameterized<V, To<Tracer<E>> = Tracer<E>, ParameterStructure: Clone + PartialEq>,
+    V::Family: ParameterizedFamily<Tracer<E>>,
+    Vec<V>: Parameterized<V, To<Tracer<E>> = Vec<Tracer<E>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<Tracer<E>>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
     where
@@ -276,7 +262,7 @@ where
         ) = crate::tracing_v2::jit::trace(
             exemplar_engine,
             |lane_inputs| {
-                let batched_inputs = Input::To::<Batch<Tracer<ArrayType, V, O, L, E>>>::from_parameters(
+                let batched_inputs = Input::To::<Batch<Tracer<E>>>::from_parameters(
                     lane_inputs.parameter_structure(),
                     lane_inputs.into_parameters().map(|input| Batch::new(vec![input])),
                 )?;
@@ -376,7 +362,7 @@ where
 mod tests {
     use indoc::indoc;
 
-    use crate::tracing_v2::{LinearPrimitiveOp, PrimitiveOp, Sin, Tracer, engine::ArrayScalarEngine, test_support};
+    use crate::tracing_v2::{Sin, Tracer, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -426,15 +412,8 @@ mod tests {
         let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = crate::tracing_v2::interpret_and_trace(
             &engine,
             |x| {
-                let outputs: Vec<
-                    Tracer<
-                        ArrayType,
-                        f64,
-                        PrimitiveOp<ArrayType, f64>,
-                        LinearPrimitiveOp<ArrayType, f64>,
-                        ArrayScalarEngine<f64>,
-                    >,
-                > = vmap(|batch| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
+                let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> =
+                    vmap(|batch| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
                 Ok(outputs[0].clone() + outputs[1].clone())
             },
             2.0f64,

@@ -358,10 +358,7 @@ where
     })
 }
 
-fn lift_traced_constant<V, O: Clone, L: Clone, E>(
-    constant: &V,
-    inputs: &[Tracer<ArrayType, V, O, L, E>],
-) -> Result<Tracer<ArrayType, V, O, L, E>, TraceError>
+fn lift_traced_constant<V, O: Clone, L: Clone, E>(constant: &V, inputs: &[Tracer<E>]) -> Result<Tracer<E>, TraceError>
 where
     V: Traceable<ArrayType>,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
@@ -373,8 +370,8 @@ where
 
 pub(crate) fn lift_linearized_traced_constant<V, O: Clone + 'static, L: Clone + 'static, E>(
     constant: &V,
-    inputs: &[LinearizedTracedValue<V, O, L, E>],
-) -> Result<LinearizedTracedValue<V, O, L, E>, TraceError>
+    inputs: &[LinearizedTracedValue<E>],
+) -> Result<LinearizedTracedValue<E>, TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,

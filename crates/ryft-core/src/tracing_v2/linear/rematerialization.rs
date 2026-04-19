@@ -17,42 +17,22 @@ pub fn compile_grad<E, F, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation, E>>
-        + Op<ArrayType>,
-    LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>:
-        CoreLinearProgramOp<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    E::TracingOperation:
+        InterpretableOp<ArrayType, V> + InterpretableOp<ArrayType, LinearizedTracedValue<E>> + Op<ArrayType>,
+    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    Input::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Input::To<
-                Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
-            >,
-        >,
-    V::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-            >,
-        >,
-    F: Fn(
-        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    ) -> Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input::To<Tracer<E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Tracer<E>>,
+    F: Fn(Input::To<Tracer<E>>) -> Tracer<E>,
 {
     let input_structure = example_primals.parameter_structure();
     let (_, compiled) = interpret_and_trace(
         _engine,
-        |primals: Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>| {
+        |primals: Input::To<Tracer<E>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
             let staged_input_types = Input::To::<ArrayType>::from_parameters(
                 input_structure.clone(),
@@ -73,11 +53,7 @@ where
                     &traced_program,
                     traced_primals,
                 )?;
-            Input::To::<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>::from_parameters(
-                input_structure.clone(),
-                traced_gradient,
-            )
-            .map_err(TraceError::from)
+            Input::To::<Tracer<E>>::from_parameters(input_structure.clone(), traced_gradient).map_err(TraceError::from)
         },
         example_primals,
     )?;
@@ -115,7 +91,7 @@ pub enum RematerializationPolicy {
 /// This generalizes [`compile_grad`] by letting the caller control how forward-pass intermediates are handled
 /// during the backward pass:
 ///
-///   - [`RematerializationPolicy::SaveAll`]: identical to [`compile_grad`] â€” no rematerialization boundaries are
+///   - [`RematerializationPolicy::SaveAll`]: identical to [`compile_grad`] Ã¢â‚¬â€ no rematerialization boundaries are
 ///     inserted, so the XLA compiler decides which intermediates to save.
 ///   - [`RematerializationPolicy::RecomputeAll`]: the entire forward body is wrapped in a single
 ///     [`rematerialize`] boundary, forcing the backward pass to recompute all intermediates from inputs.
@@ -133,37 +109,18 @@ where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation, E>>
+        + InterpretableOp<ArrayType, LinearizedTracedValue<E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Op<ArrayType>,
-    LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>:
-        CoreLinearProgramOp<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    Input::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Input::To<
-                Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
-            >,
-        >,
-    V::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-            >,
-        >,
-    F: Fn(
-        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    ) -> Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input::To<Tracer<E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Tracer<E>>,
+    F: Fn(Input::To<Tracer<E>>) -> Tracer<E>,
 {
     match policy {
         RematerializationPolicy::SaveAll => compile_grad(engine, &function, example_primals),
@@ -183,8 +140,8 @@ where
 /// (equivalent to [`RematerializationPolicy::RecomputeAll`]). When `Some(s)`, the program is
 /// partitioned into segments of at most `s` equations, each wrapped in its own [`RematerializeOp`].
 ///
-/// Internally, this replicates the flow of `grad` for [`Tracer`]-level inputs â€” trace, linearize,
-/// transpose, stage pullback â€” but inserts a segmentation step between tracing and linearization so
+/// Internally, this replicates the flow of `grad` for [`Tracer`]-level inputs Ã¢â‚¬â€ trace, linearize,
+/// transpose, stage pullback Ã¢â‚¬â€ but inserts a segmentation step between tracing and linearization so
 /// that the differentiation transform sees and respects the rematerialization boundaries.
 fn compile_grad_segmented<E, F, Input, V>(
     engine: &E,
@@ -196,42 +153,23 @@ where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation, E>>
+        + InterpretableOp<ArrayType, LinearizedTracedValue<E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Op<ArrayType>,
-    LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>:
-        CoreLinearProgramOp<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    Input::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Input::To<
-                Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
-            >,
-        >,
-    V::To<ArrayType>: Parameterized<
-            ArrayType,
-            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
-                ArrayType,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-            >,
-        >,
-    F: Fn(
-        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    ) -> Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input::To<Tracer<E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Tracer<E>>,
+    F: Fn(Input::To<Tracer<E>>) -> Tracer<E>,
 {
     let input_structure = example_primals.parameter_structure();
     let (_, compiled) = interpret_and_trace(
         engine,
-        |primals: Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>| {
+        |primals: Input::To<Tracer<E>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
 
             // Step 1: Trace the function at the base V level to get a program.
@@ -265,11 +203,7 @@ where
                     &segmented_program,
                     traced_primals,
                 )?;
-            Input::To::<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>::from_parameters(
-                input_structure.clone(),
-                traced_gradient,
-            )
-            .map_err(TraceError::from)
+            Input::To::<Tracer<E>>::from_parameters(input_structure.clone(), traced_gradient).map_err(TraceError::from)
         },
         example_primals,
     )?;
@@ -303,7 +237,7 @@ where
     let representative_inputs = program.representative_input_values(engine)?;
     let equations = program.equations();
 
-    // If the program has fewer equations than a single segment, no segmentation is needed â€” wrap the
+    // If the program has fewer equations than a single segment, no segmentation is needed Ã¢â‚¬â€ wrap the
     // whole thing in a single RematerializeOp.
     if equations.len() <= segment_size {
         return wrap_program_in_rematerialize(engine, program);

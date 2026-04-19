@@ -109,7 +109,7 @@ impl<
     O: SinTracingOperation<ArrayType, V>,
     L: Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Sin for Tracer<ArrayType, V, O, L, E>
+> Sin for Tracer<E>
 where
     O: Op<ArrayType>,
 {

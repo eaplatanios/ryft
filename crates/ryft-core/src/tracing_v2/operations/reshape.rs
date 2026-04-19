@@ -265,7 +265,7 @@ impl<
     O: ReshapeTracingOperation<ArrayType, V>,
     L: Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> ReshapeOps for Tracer<ArrayType, V, O, L, E>
+> ReshapeOps for Tracer<E>
 where
     O: Op<ArrayType>,
 {

@@ -3,13 +3,13 @@
 //! This module owns the operation universe used by `tracing_v2`. It bundles three layers:
 //!
 //! - **Core traits** ([`Op`], [`InterpretableOp`], [`LinearOperation`], [`DifferentiableOp`],
-//!   [`VectorizableOp`]) â€” the operation-neutral dispatch interfaces every staged primitive must
+//!   [`VectorizableOp`]) Ã¢â‚¬â€ the operation-neutral dispatch interfaces every staged primitive must
 //!   satisfy in order to participate in program construction, replay, and the various transforms.
-//! - **Per-primitive submodules** ([`add`], [`mul`], [`neg`], â€¦) â€” the concrete semantic op types
-//!   ([`AddOp`], [`MulOp`], â€¦) and their associated hidden staging traits
+//! - **Per-primitive submodules** ([`add`], [`mul`], [`neg`], Ã¢â‚¬Â¦) Ã¢â‚¬â€ the concrete semantic op types
+//!   ([`AddOp`], [`MulOp`], Ã¢â‚¬Â¦) and their associated hidden staging traits
 //!   ([`AddTracingOperation`](add::AddTracingOperation), [`MulTracingOperation`](mul::MulTracingOperation),
 //!   etc.) used to construct closed staged op carriers.
-//! - **Closed default carriers** ([`primitive`], [`custom`]) â€” [`PrimitiveOp`] / [`LinearPrimitiveOp`]
+//! - **Closed default carriers** ([`primitive`], [`custom`]) Ã¢â‚¬â€ [`PrimitiveOp`] / [`LinearPrimitiveOp`]
 //!   and the rule-based [`CustomPrimitive`] / [`LinearCustomPrimitive`] escape hatch.
 //!
 //! # Trait hierarchy
@@ -44,8 +44,8 @@
 //! might need" onto a single bound. Per-op staging is expressed through the small hidden
 //! capability traits that live next to each operation (for example, `add::AddTracingOperation`
 //! and `mul::MulTracingOperation`), and transform code should bound itself on the concrete
-//! engine-selected carrier or on the specific per-op capability traits it actually exercises â€”
-//! never on a catch-all faÃ§ade. The [`TracingOperation`] and [`LinearProgramOp`] bundles defined
+//! engine-selected carrier or on the specific per-op capability traits it actually exercises Ã¢â‚¬â€
+//! never on a catch-all faÃƒÂ§ade. The [`TracingOperation`] and [`LinearProgramOp`] bundles defined
 //! in this module are additive aliases used only to name the bundle locally; they are not an
 //! extension point and should not grow new "is-supported" requirements.
 
@@ -183,8 +183,8 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
 pub fn lift_jit_constant<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static, E>(
     constant: &V,
-    exemplar: &Tracer<ArrayType, V, O, L, E>,
-) -> Tracer<ArrayType, V, O, L, E>
+    exemplar: &Tracer<E>,
+) -> Tracer<E>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 {
@@ -407,7 +407,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone, Operation> TracingO
 
 /// Capability bundle for operations that can appear in a staged linear program.
 ///
-/// Like [`TracingOperation`], this is additive â€” any op that already satisfies the three supertraits
+/// Like [`TracingOperation`], this is additive Ã¢â‚¬â€ any op that already satisfies the three supertraits
 /// automatically satisfies [`LinearProgramOp`]. The bundle lists what a linear program needs from
 /// each stored op: shape metadata ([`Op`]), concrete interpretation for replay
 /// ([`InterpretableOp`]), and the reverse-mode transpose rule ([`LinearOperation`]).
@@ -470,9 +470,9 @@ pub trait TracerLinearOperation<
         >,
 >: Clone
     + 'static
-    + add::LinearAddOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
-    + neg::LinearNegOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
-    + scale::LinearScaleOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
+    + add::LinearAddOperation<ArrayType, Tracer<E>>
+    + neg::LinearNegOperation<ArrayType, Tracer<E>>
+    + scale::LinearScaleOperation<ArrayType, Tracer<E>>
 {
 }
 
@@ -488,9 +488,9 @@ impl<
 where
     InnerLinearOperation: Clone
         + 'static
-        + add::LinearAddOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
-        + neg::LinearNegOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
-        + scale::LinearScaleOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>,
+        + add::LinearAddOperation<ArrayType, Tracer<E>>
+        + neg::LinearNegOperation<ArrayType, Tracer<E>>
+        + scale::LinearScaleOperation<ArrayType, Tracer<E>>,
 {
 }
 

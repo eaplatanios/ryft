@@ -69,8 +69,8 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::operations::{AddOp, MatMulOp, MatrixTransposeOp, MulOp};
 use ryft_core::tracing_v2::{
-    Cos, LinearPrimitiveOp, Linearized, MatrixOps, OneLike, Op, Program, Sin, TraceError, Traceable, Tracer, Value,
-    ZeroLike, trace as trace_types,
+    Cos, Linearized, MatrixOps, OneLike, Op, Program, Sin, TraceError, Traceable, Tracer, Value, ZeroLike,
+    trace as trace_types,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -463,8 +463,7 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging XLA programs directly from types.
-pub(crate) type ShardMapTracer =
-    Tracer<ArrayType, ShardMapTensor, XlaPrimitiveOp, LinearPrimitiveOp<ArrayType, ShardMapTensor>, XlaEngine<'static>>;
+pub(crate) type ShardMapTracer = Tracer<XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>;

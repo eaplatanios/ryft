@@ -24,10 +24,6 @@ use crate::experimental::ops::XlaPrimitiveOp;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
 type JitShardMapTracer = Tracer<
-    ArrayType,
-    ShardMapTracer,
-    ProgramOpRef<ShardMapTracer>,
-    LinearProgramOpRef<ShardMapTracer>,
     dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
@@ -91,7 +87,18 @@ impl WithShardingConstraintOp {
     pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTracer> {
         self.base_custom_primitive::<ShardMapTracer>()
             .with_jvp_rule(self.clone())
-            .with_linearized_jit_rule(self.clone())
+            .with_linearized_jit_rule_for::<
+                ProgramOpRef<ShardMapTracer>,
+                LinearProgramOpRef<ShardMapTracer>,
+                LinearProgramOpRef<JitShardMapTracer>,
+                dyn Engine<
+                        Type = ArrayType,
+                        Value = ShardMapTracer,
+                        TracingOperation = ProgramOpRef<ShardMapTracer>,
+                        LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+                    >,
+                _,
+            >(self.clone())
     }
 }
 

@@ -169,22 +169,21 @@ where
     }
 }
 
-impl<E, V: Traceable<ArrayType> + ZeroLike, O: Clone, L: Clone>
-    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>
-    for RematerializeOp<ArrayType, V, O, L>
+impl<E, V: Value<ArrayType> + ZeroLike, O: Clone, L: Clone>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>>> for RematerializeOp<ArrayType, V, O, L>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType>,
     O: InterpretableOp<ArrayType, V>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>>>,
     O: RematerializeTracingOperation<ArrayType, V, L>,
-    LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>: CoreLinearProgramOp<Tracer<ArrayType, V, O, L, E>>,
+    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<E>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<E>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::rematerialize_op(self.clone()))?;
         let tangent_outputs =
@@ -197,7 +196,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike, O: Clone + 'static>
+impl<V: Value<ArrayType> + ZeroLike, O: Clone + 'static>
     DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>
     for RematerializeOp<ArrayType, V, O>
 where
@@ -208,10 +207,6 @@ where
             ArrayType,
             crate::tracing_v2::linear::Linearized<
                 Tracer<
-                    ArrayType,
-                    V,
-                    O,
-                    LinearProgramOpRef<V>,
                     dyn Engine<
                             Type = ArrayType,
                             Value = V,
@@ -223,21 +218,9 @@ where
         >,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
     LinearProgramOpRef<
-        Tracer<
-            ArrayType,
-            V,
-            O,
-            LinearProgramOpRef<V>,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
-        >,
+        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
     >:CoreLinearProgramOp<
-        Tracer<
-            ArrayType,
-            V,
-            O,
-            LinearProgramOpRef<V>,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
-        >,
+        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
     >,
 {
     fn jvp(
@@ -262,19 +245,16 @@ where
 }
 
 impl<
-    V: Traceable<ArrayType>,
+    V: Value<ArrayType>,
     O: Clone,
     L: Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> InterpretableOp<ArrayType, Tracer<ArrayType, V, O, L, E>> for RematerializeOp<ArrayType, V, O, L>
+> InterpretableOp<ArrayType, Tracer<E>> for RematerializeOp<ArrayType, V, O, L>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType> + InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
-    fn interpret(
-        &self,
-        inputs: &[Tracer<ArrayType, V, O, L, E>],
-    ) -> Result<Vec<Tracer<ArrayType, V, O, L, E>>, TraceError> {
+    fn interpret(&self, inputs: &[Tracer<E>]) -> Result<Vec<Tracer<E>>, TraceError> {
         Tracer::apply_staged_op(inputs, O::rematerialize_op(self.clone()))
     }
 }
@@ -387,10 +367,6 @@ where
             ArrayType,
             crate::tracing_v2::linear::Linearized<
                 Tracer<
-                    ArrayType,
-                    V,
-                    O,
-                    LinearProgramOpRef<V>,
                     dyn Engine<
                             Type = ArrayType,
                             Value = V,
@@ -402,21 +378,9 @@ where
         >,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
     LinearProgramOpRef<
-        Tracer<
-            ArrayType,
-            V,
-            O,
-            LinearProgramOpRef<V>,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
-        >,
+        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
     >:CoreLinearProgramOp<
-        Tracer<
-            ArrayType,
-            V,
-            O,
-            LinearProgramOpRef<V>,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
-        >,
+        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
     >,
 {
     let output_primals = body.program.call(input_primals.clone())?;
@@ -475,17 +439,17 @@ impl<
 impl<
     E,
     V: Traceable<ArrayType>,
-    Input: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone, To<Tracer<ArrayType, V, O, L, E>> = Input>,
-    Output: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone, To<Tracer<ArrayType, V, O, L, E>> = Output>,
+    Input: Parameterized<Tracer<E>, ParameterStructure: Clone, To<Tracer<E>> = Input>,
+    Output: Parameterized<Tracer<E>, ParameterStructure: Clone, To<Tracer<E>> = Output>,
     O: Clone + Op<ArrayType>,
     L: Clone,
-> RematerializeInvocationLeaf<Input, Output> for Tracer<ArrayType, V, O, L, E>
+> RematerializeInvocationLeaf<Input, Output> for Tracer<E>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Input, To<V> = Input::To<V>>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Output, To<V> = Output::To<V>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input, To<V> = Input::To<V>>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Output, To<V> = Output::To<V>>,
     O: InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>

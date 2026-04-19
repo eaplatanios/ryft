@@ -235,11 +235,9 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    Output::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    F: FnOnce(
-        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    ) -> Result<Output::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<E>>,
+    Output::Family: ParameterizedFamily<Tracer<E>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -286,11 +284,9 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    Output::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    F: FnOnce(
-        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    ) -> Result<Output::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<E>>,
+    Output::Family: ParameterizedFamily<Tracer<E>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -333,10 +329,8 @@ where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    F: FnOnce(
-        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
-    ) -> Result<Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<E>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Input::To<Tracer<E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,

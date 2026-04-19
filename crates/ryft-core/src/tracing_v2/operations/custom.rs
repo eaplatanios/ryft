@@ -20,7 +20,7 @@ use std::{
 use crate::{
     parameters::Parameter,
     tracing_v2::{
-        LinearProgramOpRef, TraceError, Traceable, ZeroLike,
+        LinearProgramOpRef, TraceError, Traceable, Value, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
@@ -89,14 +89,7 @@ struct LinearizedJitRule<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
->(
-    Arc<
-        dyn InterpretableOp<
-                ArrayType,
-                Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>,
-            >,
-    >,
-);
+>(Arc<dyn InterpretableOp<ArrayType, Linearized<Tracer<E>, InnerLinearOperation>>>);
 
 impl<
     V: Traceable<ArrayType> + ZeroLike,
@@ -110,9 +103,8 @@ impl<
 {
     fn interpret(
         &self,
-        inputs: &[Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>],
-    ) -> Result<Vec<Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>>, TraceError>
-    {
+        inputs: &[Linearized<Tracer<E>, InnerLinearOperation>],
+    ) -> Result<Vec<Linearized<Tracer<E>, InnerLinearOperation>>, TraceError> {
         self.0.interpret(inputs)
     }
 }
@@ -140,7 +132,7 @@ impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V>> CustomBaseO
 /// - [`LinearOperation<ArrayType, V>`] for reverse-mode transpose,
 /// - [`DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>`] for forward-mode JVP,
 /// - [`VectorizableOp<ArrayType, V>`] for `vmap`, and
-/// - [`InterpretableOp<ArrayType, Linearized<Tracer<ArrayType, V>>>`] for fully general linearized-JIT replay.
+/// - [`InterpretableOp<ArrayType, Linearized<Tracer<E>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
 pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
     base: Arc<dyn CustomBaseOp<T, V>>,
@@ -205,11 +197,8 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
             + ?Sized
             + 'static,
         InnerLinearOperation: TracerLinearOperation<V, O, OuterLinearOperation, E>,
-        Rule: InterpretableOp<
-                ArrayType,
-                Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>,
-            > + 'static,
-        Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>: Traceable<ArrayType>,
+        Rule: InterpretableOp<ArrayType, Linearized<Tracer<E>, InnerLinearOperation>> + 'static,
+        Linearized<Tracer<E>, InnerLinearOperation>: Traceable<ArrayType>,
         V: Traceable<ArrayType> + ZeroLike,
     {
         self.extensions
@@ -280,24 +269,13 @@ impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<A
                 LinearOperation = LinearPrimitiveOp<ArrayType, V>,
             > + ?Sized
             + 'static,
-        Rule: InterpretableOp<
-                ArrayType,
-                Linearized<
-                    Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
-                    LinearProgramOpRef<
-                        Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
-                    >,
-                >,
-            > + 'static,
-        Linearized<
-            Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
-            LinearProgramOpRef<Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>>,
-        >: Traceable<ArrayType>,
+        Rule: InterpretableOp<ArrayType, Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>> + 'static,
+        Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>: Traceable<ArrayType>,
     {
         self.with_linearized_jit_rule_for::<
             PrimitiveOp<ArrayType, V>,
             LinearPrimitiveOp<ArrayType, V>,
-            LinearProgramOpRef<Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>>,
+            LinearProgramOpRef<Tracer<E>>,
             E,
             _,
         >(rule)
@@ -376,23 +354,21 @@ impl<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>
 }
 
 impl<
-    V: Traceable<ArrayType> + ZeroLike,
+    V: Value<ArrayType> + ZeroLike,
     O: Clone + 'static,
     OuterLinearOperation: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
     InnerLinearOperation: TracerLinearOperation<V, O, OuterLinearOperation, E>,
-> InterpretableOp<ArrayType, Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>>
-    for CustomPrimitive<ArrayType, V>
+> InterpretableOp<ArrayType, Linearized<Tracer<E>, InnerLinearOperation>> for CustomPrimitive<ArrayType, V>
 where
-    Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>: Traceable<ArrayType>,
+    Linearized<Tracer<E>, InnerLinearOperation>: Traceable<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>],
-    ) -> Result<Vec<Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>>, TraceError>
-    {
+        inputs: &[Linearized<Tracer<E>, InnerLinearOperation>],
+    ) -> Result<Vec<Linearized<Tracer<E>, InnerLinearOperation>>, TraceError> {
         self.extensions
             .get::<LinearizedJitRule<V, O, OuterLinearOperation, InnerLinearOperation, E>>()
             .ok_or_else(|| self.missing_rule("linearized JIT replay"))?
@@ -482,8 +458,8 @@ mod tests {
 
     use super::*;
     use crate::tracing_v2::{
-        Batch, LinearProgramBuilder, OneLike, Program, ProgramOpRef, TraceError, engine::ArrayScalarEngine, grad,
-        interpret_and_trace, jvp, vmap,
+        Batch, LinearProgramBuilder, OneLike, Program, ProgramOpRef, TraceError, Tracer, engine::ArrayScalarEngine,
+        grad, interpret_and_trace, jvp, vmap,
     };
     use crate::types::{ArrayType, DataType, Shape};
 
@@ -569,11 +545,7 @@ mod tests {
         }
     }
 
-    impl<E>
-        InterpretableOp<
-            ArrayType,
-            Linearized<Tracer<ArrayType, f64, PrimitiveOp<ArrayType, f64>, LinearPrimitiveOp<ArrayType, f64>, E>>,
-        > for ShiftOp
+    impl<E> InterpretableOp<ArrayType, Linearized<Tracer<E>>> for ShiftOp
     where
         E: Engine<
                 Type = ArrayType,
@@ -583,15 +555,7 @@ mod tests {
             > + ?Sized
             + 'static,
     {
-        fn interpret(
-            &self,
-            inputs: &[Linearized<
-                Tracer<ArrayType, f64, PrimitiveOp<ArrayType, f64>, LinearPrimitiveOp<ArrayType, f64>, E>,
-            >],
-        ) -> Result<
-            Vec<Linearized<Tracer<ArrayType, f64, PrimitiveOp<ArrayType, f64>, LinearPrimitiveOp<ArrayType, f64>, E>>>,
-            TraceError,
-        > {
+        fn interpret(&self, inputs: &[Linearized<Tracer<E>>]) -> Result<Vec<Linearized<Tracer<E>>>, TraceError> {
             if inputs.len() != 1 {
                 return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
@@ -605,9 +569,9 @@ mod tests {
 
     /// Applies one unary custom primitive to one traced scalar.
     fn apply_custom_traced_unary<E>(
-        input: Tracer<ArrayType, f64, PrimitiveOp<ArrayType, f64>, LinearPrimitiveOp<ArrayType, f64>, E>,
+        input: Tracer<E>,
         primitive: CustomPrimitive<ArrayType, f64>,
-    ) -> Result<Tracer<ArrayType, f64, PrimitiveOp<ArrayType, f64>, LinearPrimitiveOp<ArrayType, f64>, E>, TraceError>
+    ) -> Result<Tracer<E>, TraceError>
     where
         E: Engine<
                 Type = ArrayType,
@@ -624,10 +588,7 @@ mod tests {
     }
 
     /// Applies one unary custom primitive to one traced scalar and expects staging to succeed.
-    fn stage_custom_traced_unary<E>(
-        input: Tracer<ArrayType, f64, PrimitiveOp<ArrayType, f64>, LinearPrimitiveOp<ArrayType, f64>, E>,
-        primitive: CustomPrimitive<ArrayType, f64>,
-    ) -> Tracer<ArrayType, f64, PrimitiveOp<ArrayType, f64>, LinearPrimitiveOp<ArrayType, f64>, E>
+    fn stage_custom_traced_unary<E>(input: Tracer<E>, primitive: CustomPrimitive<ArrayType, f64>) -> Tracer<E>
     where
         E: Engine<
                 Type = ArrayType,
@@ -722,13 +683,7 @@ mod tests {
             &engine,
             {
                 let primitive = primitive.clone();
-                move |x: Tracer<
-                    ArrayType,
-                    f64,
-                    PrimitiveOp<ArrayType, f64>,
-                    LinearPrimitiveOp<ArrayType, f64>,
-                    ArrayScalarEngine<f64>,
-                >| {
+                move |x: Tracer<ArrayScalarEngine<f64>>| {
                     let (primal, tangent) = jvp(
                         &engine,
                         {
@@ -773,13 +728,7 @@ mod tests {
             &engine,
             {
                 let primitive = primitive.clone();
-                move |x: Tracer<
-                    ArrayType,
-                    f64,
-                    PrimitiveOp<ArrayType, f64>,
-                    LinearPrimitiveOp<ArrayType, f64>,
-                    ArrayScalarEngine<f64>,
-                >| {
+                move |x: Tracer<ArrayScalarEngine<f64>>| {
                     let (primal, tangent) = jvp(
                         &engine,
                         {

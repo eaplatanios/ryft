@@ -139,11 +139,11 @@ where
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
 }
 
-fn first_derivative_traced(x: Tracer<ArrayType, f64>) -> Tracer<ArrayType, f64> {
+fn first_derivative_traced(x: Tracer<ArrayScalarEngine<f64>>) -> Tracer<ArrayScalarEngine<f64>> {
     grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x).expect("scalar first traced derivative should succeed")
 }
 
-fn hessian_style_second_derivative_traced(x: Tracer<ArrayType, f64>) -> Tracer<ArrayType, f64> {
+fn hessian_style_second_derivative_traced(x: Tracer<ArrayScalarEngine<f64>>) -> Tracer<ArrayScalarEngine<f64>> {
     jvp(&ArrayScalarEngine::<f64>::new(), first_derivative_traced, x.clone(), x.one_like())
         .expect("scalar Hessian-style benchmark should succeed")
         .1
@@ -175,7 +175,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
     let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
         |x| {
-            let gradient: Tracer<ArrayType, f64> = grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
+            let gradient: Tracer<ArrayScalarEngine<f64>> = grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
             Ok(gradient)
         },
         2.0f64,
@@ -188,7 +188,7 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
     let (_, compiled): ((f64, f64), Program<ArrayType, f64, f64, (f64, f64)>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
         |x| {
-            let value_and_gradient: (Tracer<ArrayType, f64>, Tracer<ArrayType, f64>) =
+            let value_and_gradient: (Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>) =
                 value_and_grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
             Ok(value_and_gradient)
         },
@@ -223,11 +223,11 @@ fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
     let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
         |x| {
-            let gradient: Tracer<ArrayType, f64> = grad(
+            let gradient: Tracer<ArrayScalarEngine<f64>> = grad(
                 &ArrayScalarEngine::<f64>::new(),
                 |y| {
-                    let outputs: Vec<Tracer<ArrayType, f64>> = vmap(
-                        |batch: Batch<Tracer<ArrayType, f64>>| batch.clone() * batch.clone() + batch.sin(),
+                    let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
+                        |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| batch.clone() * batch.clone() + batch.sin(),
                         vec![y.clone(), y],
                     )
                     .unwrap_or_else(|error| {
@@ -249,10 +249,10 @@ fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
     let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
         |x| {
-            let outputs: Vec<Tracer<ArrayType, f64>> = vmap(
-                |batch: Batch<Tracer<ArrayType, f64>>| {
-                    let lanes =
-                        unstack::<Tracer<ArrayType, f64>, Tracer<ArrayType, f64>>(batch).unwrap_or_else(|error| {
+            let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
+                |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| {
+                    let lanes = unstack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(batch)
+                        .unwrap_or_else(|error| {
                             panic!("scalar vmap-of-grad IR benchmark should unstack the batch: {error}")
                         });
                     let gradients = lanes
@@ -263,9 +263,9 @@ fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
                             })
                         })
                         .collect::<Vec<_>>();
-                    stack::<Tracer<ArrayType, f64>, Tracer<ArrayType, f64>>(gradients).unwrap_or_else(|error| {
-                        panic!("scalar vmap-of-grad IR benchmark should restack lane gradients: {error}")
-                    })
+                    stack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(gradients).unwrap_or_else(
+                        |error| panic!("scalar vmap-of-grad IR benchmark should restack lane gradients: {error}"),
+                    )
                 },
                 vec![x.clone(), x],
             )
@@ -313,12 +313,12 @@ fn hessian_style_matrix_inputs() -> (Array2<f64>, Array2<f64>, Array2<f64>, Arra
 #[cfg(feature = "ndarray")]
 fn first_matrix_gradient_traced(
     inputs: (
-        Tracer<ArrayType, Array2<f64>>,
-        Tracer<ArrayType, Array2<f64>>,
-        Tracer<ArrayType, Array2<f64>>,
-        Tracer<ArrayType, Array2<f64>>,
+        Tracer<Array2Engine<f64>>,
+        Tracer<Array2Engine<f64>>,
+        Tracer<Array2Engine<f64>>,
+        Tracer<Array2Engine<f64>>,
     ),
-) -> Tracer<ArrayType, Array2<f64>> {
+) -> Tracer<Array2Engine<f64>> {
     let (x_bar, _, _, _) = grad(&Array2Engine::<f64>::new(), three_matmul_sine, inputs)
         .expect("nested matrix gradient benchmark should stage");
     x_bar
@@ -327,12 +327,12 @@ fn first_matrix_gradient_traced(
 #[cfg(feature = "ndarray")]
 fn matrix_hessian_style_second_derivative(
     inputs: (
-        Tracer<ArrayType, Array2<f64>>,
-        Tracer<ArrayType, Array2<f64>>,
-        Tracer<ArrayType, Array2<f64>>,
-        Tracer<ArrayType, Array2<f64>>,
+        Tracer<Array2Engine<f64>>,
+        Tracer<Array2Engine<f64>>,
+        Tracer<Array2Engine<f64>>,
+        Tracer<Array2Engine<f64>>,
     ),
-) -> Tracer<ArrayType, Array2<f64>> {
+) -> Tracer<Array2Engine<f64>> {
     let seeds = (inputs.0.one_like(), inputs.1.zero_like(), inputs.2.zero_like(), inputs.3.zero_like());
     jvp(&Array2Engine::<f64>::new(), first_matrix_gradient_traced, inputs, seeds)
         .expect("matrix Hessian-style benchmark should succeed")

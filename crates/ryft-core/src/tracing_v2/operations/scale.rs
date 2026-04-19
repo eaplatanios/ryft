@@ -9,7 +9,7 @@ use std::{
 use indoc::indoc;
 
 use crate::tracing_v2::{
-    TraceError, Traceable, ZeroLike,
+    TraceError, Traceable, Value, ZeroLike,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -114,36 +114,22 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
 }
 
 impl<
-    V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>,
+    V: Value<ArrayType> + ZeroLike + Mul<Output = V>,
     O: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V>,
     OuterLinearOperation: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
     InnerLinearOperation: TracerLinearOperation<V, O, OuterLinearOperation, E>,
->
-    InterpretableOp<
-        ArrayType,
-        crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>,
-    > for ScaleOp<ArrayType, V>
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>>
+    for ScaleOp<ArrayType, V>
 where
     O: Op<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<
-            Tracer<ArrayType, V, O, OuterLinearOperation, E>,
-            InnerLinearOperation,
-        >],
-    ) -> Result<
-        Vec<
-            crate::tracing_v2::linear::Linearized<
-                Tracer<ArrayType, V, O, OuterLinearOperation, E>,
-                InnerLinearOperation,
-            >,
-        >,
-        TraceError,
-    > {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         Ok(vec![JvpTracer {
