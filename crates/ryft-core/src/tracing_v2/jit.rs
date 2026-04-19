@@ -18,6 +18,8 @@ use std::{
     rc::Rc,
 };
 
+use ryft_macros::Parameter;
+
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
@@ -36,6 +38,7 @@ use crate::{
 /// output atoms. This makes `Tracer` the central "big picture" type for symbolic execution in
 /// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
 /// always instances of this type.
+#[derive(Parameter)]
 pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     /// Atom id representing this traced leaf inside the shared staged program.
     atom: AtomId,
@@ -50,6 +53,12 @@ pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     engine: &'engine E,
 }
 
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
+    }
+}
+
 impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<'engine, E> {
     fn clone(&self) -> Self {
         Self {
@@ -58,14 +67,6 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<'e
             staging_error: self.staging_error.clone(),
             engine: self.engine,
         }
-    }
-}
-
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Parameter for Tracer<'engine, E> {}
-
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 

@@ -21,6 +21,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use half::{bf16, f16};
+use ryft_macros::Parameter;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -41,7 +42,7 @@ use crate::mlir::ToMlir;
 use crate::pjrt::{FromPjrt, ToPjrt};
 
 /// Concrete mesh/sharding target used by the higher-level [`device_put`] API.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub struct DevicePutSharding {
     /// Concrete destination mesh describing the device topology.
     pub mesh: DeviceMesh,
@@ -58,15 +59,13 @@ impl DevicePutSharding {
     }
 }
 
-impl Parameter for DevicePutSharding {}
-
 /// Placement leaf accepted by the higher-level [`device_put`] API.
 ///
 /// This models the current `ryft` subset of JAX's `device` / `src` arguments:
 /// - [`Self::Device`] commits one leaf to a single concrete device, represented internally as a
 ///   size-1 mesh with fully replicated sharding, and
 /// - [`Self::Sharding`] commits one leaf to an explicit mesh/sharding pair.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub enum DevicePutPlacement {
     /// Commit the value to one concrete device.
     Device(MeshDevice),
@@ -100,8 +99,6 @@ impl From<DevicePutSharding> for DevicePutPlacement {
         Self::Sharding(value)
     }
 }
-
-impl Parameter for DevicePutPlacement {}
 
 /// Options for the higher-level [`device_put`] API.
 ///
@@ -1100,7 +1097,7 @@ impl std::fmt::Debug for ArrayShard<'_> {
 /// [`Array::clone`] is O(shards) refcount bumps and does not copy device memory. This mirrors the
 /// reference-counted array pattern that IFRT uses above PJRT and JAX's Python-level refcounting
 /// over `ArrayImpl`.
-#[derive(Clone)]
+#[derive(Clone, Parameter)]
 pub struct Array<'o> {
     /// Global array metadata carried by this distributed array handle.
     array_type: ArrayType,
@@ -1114,8 +1111,6 @@ pub struct Array<'o> {
     /// Indices of the shards addressable from the current process.
     addressable_shard_indices: Vec<usize>,
 }
-
-impl Parameter for Array<'_> {}
 
 impl Typed<ArrayType> for Array<'_> {
     fn tpe(&self) -> Cow<'_, ArrayType> {

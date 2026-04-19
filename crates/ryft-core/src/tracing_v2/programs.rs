@@ -403,13 +403,11 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
     marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<
-    O: Clone,
-    T: Type,
-    V: Traceable<T>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-> Clone for Program<T, V, O, Input, Output>
+impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>> Clone
+    for Program<T, V, O, Input, Output>
+where
+    Input::ParameterStructure: Clone,
+    Output::ParameterStructure: Clone,
 {
     fn clone(&self) -> Self {
         Self {

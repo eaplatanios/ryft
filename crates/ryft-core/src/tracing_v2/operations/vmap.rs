@@ -15,7 +15,7 @@ use crate::{
         engine::Engine,
         linear::{linearize_program, replay_program_linearized_jit, transpose_linear_program_with_output_examples},
     },
-    types::{ArrayType, Type, Typed},
+    types::{ArrayType, Type},
 };
 
 use super::{
@@ -43,7 +43,8 @@ pub trait LinearVMapOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// The body is stored in a flattened, lane-agnostic form so the higher-order op can be cloned,
 /// replayed, transposed, and lowered without carrying the caller's original structured parameter
 /// types around.
-pub struct FlatTracedVMap<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {
+#[derive(Clone)]
+pub struct FlatTracedVMap<T: Type, V: Traceable<T>, O = ProgramOpRef<V>> {
     /// Number of logical lanes represented by this flattened batched body.
     lane_count: usize,
 
@@ -55,20 +56,6 @@ pub struct FlatTracedVMap<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>>
 
     /// Flattened staged program that evaluates one lane at a time during replay.
     program: Program<T, V, O, Vec<V>, Vec<V>>,
-}
-
-impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedVMap<T, V, O>
-where
-    <Vec<V> as Parameterized<V>>::ParameterStructure: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            lane_count: self.lane_count,
-            input_types: self.input_types.clone(),
-            output_types: self.output_types.clone(),
-            program: self.program.clone(),
-        }
-    }
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
@@ -149,6 +136,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
 ///
 /// Ordinary traced programs store [`VMapOp`] when vectorization is preserved symbolically instead
 /// of being unrolled into repeated scalar equations.
+#[derive(Clone)]
 pub struct VMapOp<
     T: Type + Display,
     V: Traceable<T> + Parameter,
@@ -160,12 +148,6 @@ pub struct VMapOp<
 
     /// Phantom marker tying the op to the linear carrier used by nested transforms.
     marker: PhantomData<fn() -> L>,
-}
-
-impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone> Clone for VMapOp<T, V, O, L> {
-    fn clone(&self) -> Self {
-        Self { body: self.body.clone(), marker: PhantomData }
-    }
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone> VMapOp<T, V, O, L> {
@@ -334,18 +316,13 @@ where
 ///
 /// Linear programs need slightly more structure than ordinary programs because reverse-mode
 /// transposition must know how to batch both the forward linear map and its transpose.
+#[derive(Clone)]
 pub struct LinearVMapOp<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
     /// Captured flattened forward linear body.
     body: FlatTracedVMap<T, V, O>,
 
     /// Captured flattened transpose body used for reverse-mode batching.
     transpose_body: FlatTracedVMap<T, V, O>,
-}
-
-impl<T: Type + Display, V: Traceable<T>, O: Clone> Clone for LinearVMapOp<T, V, O> {
-    fn clone(&self) -> Self {
-        Self { body: self.body.clone(), transpose_body: self.transpose_body.clone() }
-    }
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearVMapOp<T, V, O> {

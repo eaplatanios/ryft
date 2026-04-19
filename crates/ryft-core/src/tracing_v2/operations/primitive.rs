@@ -56,6 +56,7 @@ use super::{
 /// thin tag around one semantic primitive defined elsewhere in [`super`], and the carrier exists so
 /// tracing entry points can store "one of the built-in operations" without resorting to trait
 /// objects for the common case.
+#[derive(Clone)]
 pub enum PrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Elementwise addition.
     Add,
@@ -102,34 +103,12 @@ pub enum PrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     Custom(Arc<CustomPrimitive<T, V>>),
 }
 
-impl<T: Type + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Add => Self::Add,
-            Self::Mul => Self::Mul,
-            Self::Neg => Self::Neg,
-            Self::Sin => Self::Sin,
-            Self::Cos => Self::Cos,
-            Self::MatMul => Self::MatMul,
-            Self::MatrixTranspose => Self::MatrixTranspose,
-            Self::Scale { factor } => Self::Scale { factor: factor.clone() },
-            Self::LeftMatMul { factor } => Self::LeftMatMul { factor: factor.clone() },
-            Self::RightMatMul { factor } => Self::RightMatMul { factor: factor.clone() },
-            Self::Reshape { input_type, output_type } => {
-                Self::Reshape { input_type: input_type.clone(), output_type: output_type.clone() }
-            }
-            Self::VMap(vmap) => Self::VMap(vmap.clone()),
-            Self::Rematerialize(remat) => Self::Rematerialize(remat.clone()),
-            Self::Custom(op) => Self::Custom(op.clone()),
-        }
-    }
-}
-
 /// Closed set of operations that may appear in staged linear programs.
 ///
 /// [`LinearPrimitiveOp`] is the linear-program sibling of [`PrimitiveOp`]. It contains only the
 /// operations that make sense in tangent and cotangent programs plus the linearized higher-order
 /// ops needed by `vmap` and rematerialization.
+#[derive(Clone)]
 pub enum LinearPrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Elementwise addition.
     Add,
@@ -160,25 +139,6 @@ pub enum LinearPrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
 
     /// Escape hatch for user- or crate-defined linear custom operations.
     Custom(Arc<LinearCustomPrimitive<T, V>>),
-}
-
-impl<T: Type + Display, V: Traceable<T>> Clone for LinearPrimitiveOp<T, V> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Add => Self::Add,
-            Self::Neg => Self::Neg,
-            Self::MatrixTranspose => Self::MatrixTranspose,
-            Self::Scale { factor } => Self::Scale { factor: factor.clone() },
-            Self::LeftMatMul { factor } => Self::LeftMatMul { factor: factor.clone() },
-            Self::RightMatMul { factor } => Self::RightMatMul { factor: factor.clone() },
-            Self::Reshape { input_type, output_type } => {
-                Self::Reshape { input_type: input_type.clone(), output_type: output_type.clone() }
-            }
-            Self::VMap(vmap) => Self::VMap(vmap.clone()),
-            Self::Rematerialize(remat) => Self::Rematerialize(remat.clone()),
-            Self::Custom(op) => Self::Custom(op.clone()),
-        }
-    }
 }
 
 impl<V: Traceable<ArrayType> + 'static> LinearPrimitiveOp<ArrayType, V> {

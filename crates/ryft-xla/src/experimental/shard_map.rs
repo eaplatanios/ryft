@@ -56,6 +56,7 @@ use std::{
     ops::{Add, Mul, Neg},
 };
 
+use ryft_macros::Parameter;
 #[cfg(test)]
 use ryft_mlir::Block;
 use ryft_mlir::Context as MlirContext;
@@ -274,7 +275,7 @@ pub enum ShardMapConstantKind {
 }
 
 /// Abstract tensor leaf used while tracing XLA programs directly from [`ArrayType`] metadata.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub struct ShardMapTensor {
     /// Abstract array metadata carried by this traced XLA tensor leaf.
     array_type: ArrayType,
@@ -282,8 +283,6 @@ pub struct ShardMapTensor {
     /// Preserved zero/one constant classification when known exactly.
     constant_kind: Option<ShardMapConstantKind>,
 }
-
-impl Parameter for ShardMapTensor {}
 
 impl ShardMapTensor {
     /// Clears sharding state that cannot vary for one exact zero/one tensor constant.

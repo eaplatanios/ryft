@@ -14,6 +14,8 @@ use std::{
     ops::{Add, Mul, Neg},
 };
 
+use ryft_macros::Parameter;
+
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
@@ -84,7 +86,7 @@ impl<T: Type, V: Traceable<T> + Add<Output = V> + Mul<Output = V> + Neg<Output =
 /// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
 /// signatures without eagerly propagating all tangent-space requirements. The required
 /// relationship is enforced only on the impl blocks that actually manipulate the values.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Parameter)]
 pub struct JvpTracer<V, T> {
     /// The primal value.
     pub primal: V,
@@ -92,8 +94,6 @@ pub struct JvpTracer<V, T> {
     /// The tangent value associated with the primal.
     pub tangent: T,
 }
-
-impl<V, T> Parameter for JvpTracer<V, T> {}
 
 impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V>> Typed<Ty> for JvpTracer<V, T> {
     #[inline]

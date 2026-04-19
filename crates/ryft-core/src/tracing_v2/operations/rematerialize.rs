@@ -45,7 +45,8 @@ pub trait LinearRematerializeOperation<T: Type + Display, V: Traceable<T>>: Clon
 ///
 /// Like [`crate::tracing_v2::operations::FlatTracedVMap`], this stores a flattened traced body that
 /// higher-order op nodes can carry around independently of the caller's original parameter shapes.
-pub struct FlatTracedRematerialize<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {
+#[derive(Clone)]
+pub struct FlatTracedRematerialize<T: Type, V: Traceable<T>, O = ProgramOpRef<V>> {
     /// Canonical input types of the body.
     input_types: Vec<T>,
 
@@ -54,19 +55,6 @@ pub struct FlatTracedRematerialize<T: Type, V: Typed<T> + Parameter, O = Program
 
     /// The body sub-program.
     program: Program<T, V, O, Vec<V>, Vec<V>>,
-}
-
-impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedRematerialize<T, V, O>
-where
-    <Vec<V> as Parameterized<V>>::ParameterStructure: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            input_types: self.input_types.clone(),
-            output_types: self.output_types.clone(),
-            program: self.program.clone(),
-        }
-    }
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
@@ -101,6 +89,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
 /// is computed and staged so that the tangent program recomputes forward intermediates from the
 /// inputs rather than storing them as constants. This makes [`RematerializeOp`] the staged IR hook
 /// that powers the user-facing rematerialization policies in [`crate::tracing_v2::linear`].
+#[derive(Clone)]
 pub struct RematerializeOp<
     T: Type + Display,
     V: Traceable<T> + Parameter,
@@ -112,12 +101,6 @@ pub struct RematerializeOp<
 
     /// Phantom marker tying the op to the linear carrier used when the body is linearized.
     marker: PhantomData<fn() -> L>,
-}
-
-impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone> Clone for RematerializeOp<T, V, O, L> {
-    fn clone(&self) -> Self {
-        Self { body: self.body.clone(), marker: PhantomData }
-    }
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone> RematerializeOp<T, V, O, L> {
@@ -275,18 +258,13 @@ where
 }
 
 /// Linear-only rematerialization boundary that always carries both the linear body and its transpose body.
+#[derive(Clone)]
 pub struct LinearRematerializeOp<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
     /// The forward linear body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
 
     /// The transpose linear body.
     transpose_body: FlatTracedRematerialize<T, V, O>,
-}
-
-impl<T: Type + Display, V: Traceable<T>, O: Clone> Clone for LinearRematerializeOp<T, V, O> {
-    fn clone(&self) -> Self {
-        Self { body: self.body.clone(), transpose_body: self.transpose_body.clone() }
-    }
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearRematerializeOp<T, V, O> {

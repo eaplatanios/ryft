@@ -23,13 +23,11 @@ pub struct LinearProgram<
     marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<
-    T: Type + Display,
-    V: Clone + Traceable<T>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    O: Clone,
-> Clone for LinearProgram<T, V, Input, Output, O>
+impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone> Clone
+    for LinearProgram<T, V, Input, Output, O>
+where
+    Input::ParameterStructure: Clone,
+    Output::ParameterStructure: Clone,
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), zero: self.zero.clone(), marker: PhantomData }
