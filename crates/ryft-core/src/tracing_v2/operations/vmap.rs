@@ -199,7 +199,7 @@ where
     O: InterpretableOp<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }
@@ -378,7 +378,7 @@ where
     O: InterpretableOp<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }

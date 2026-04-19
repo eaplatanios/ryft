@@ -217,7 +217,7 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
 
     #[inline]
     fn transpose_matrix(self) -> Self {
-        if matrix_transpose_is_identity_type(&self.primal.tpe()) {
+        if matrix_transpose_is_identity_type(&self.primal.r#type()) {
             return self;
         }
         JvpTracer { primal: self.primal.transpose_matrix(), tangent: T::transpose_matrix(self.tangent) }
@@ -241,7 +241,7 @@ where
 
     #[inline]
     fn transpose_matrix(self) -> Self {
-        if matrix_transpose_is_identity_type(&self.tpe()) {
+        if matrix_transpose_is_identity_type(&self.r#type()) {
             return self;
         }
         self.unary(O::matrix_transpose_op())
@@ -256,7 +256,7 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
 
     #[inline]
     fn transpose_matrix(self) -> Self {
-        if self.lanes().first().map(|lane| matrix_transpose_is_identity_type(&lane.tpe())).unwrap_or(false) {
+        if self.lanes().first().map(|lane| matrix_transpose_is_identity_type(&lane.r#type())).unwrap_or(false) {
             return self;
         }
         single_batch_output(
@@ -402,7 +402,7 @@ pub mod ndarray_support {
 
     impl Typed<ArrayType> for Array2<f32> {
         #[inline]
-        fn tpe(&self) -> Cow<'_, ArrayType> {
+        fn r#type(&self) -> Cow<'_, ArrayType> {
             Cow::Owned(matrix_array_type(DataType::F32, self.nrows(), self.ncols(), None))
         }
     }
@@ -421,7 +421,7 @@ pub mod ndarray_support {
 
     impl Typed<ArrayType> for Array2<f64> {
         #[inline]
-        fn tpe(&self) -> Cow<'_, ArrayType> {
+        fn r#type(&self) -> Cow<'_, ArrayType> {
             Cow::Owned(matrix_array_type(DataType::F64, self.nrows(), self.ncols(), None))
         }
     }

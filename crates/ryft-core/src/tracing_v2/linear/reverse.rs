@@ -90,7 +90,7 @@ where
     let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
     let staged_input_types = Input::To::<ArrayType>::from_parameters(
         input_structure.clone(),
-        traced_primals.iter().map(|traced_primal| traced_primal.tpe().into_owned()).collect::<Vec<_>>(),
+        traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
     let (primal_output_types, traced_program) =
         trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
@@ -261,7 +261,7 @@ where
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
         let staged_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
-            traced_primals.iter().map(|traced_primal| traced_primal.tpe().into_owned()).collect::<Vec<_>>(),
+            traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let (_, traced_program) =
             trace_flat_program_from_input_types::<

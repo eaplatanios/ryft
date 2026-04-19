@@ -99,7 +99,7 @@ impl<V: MatrixValue> Op for RightMatMulOp<V> {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        right_matmul_abstract_eval(&<V as Typed<ArrayType>>::tpe(&self.factor), inputs)
+        right_matmul_abstract_eval(&<V as Typed<ArrayType>>::r#type(&self.factor), inputs)
     }
 
     fn try_simplify(

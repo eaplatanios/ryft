@@ -289,7 +289,7 @@ where
         let input_leaf_count = input_structure.parameter_count();
         let exemplar_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
-            traced_inputs[0].iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
+            traced_inputs[0].iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let exemplar_engine = traced_inputs[0].first().ok_or(TracingError::EmptyParameterizedValue)?.engine();
 
@@ -332,7 +332,7 @@ where
             body_program
                 .input_atoms()
                 .iter()
-                .map(|input| body_program.atom(*input).expect("body input atoms should exist").tpe().into_owned())
+                .map(|input| body_program.atom(*input).expect("body input atoms should exist").r#type().into_owned())
                 .collect::<Vec<_>>(),
             exemplar_output_types.parameters().cloned().collect::<Vec<_>>(),
             body_program.clone_with_structures::<Vec<V>, Vec<V>>(flat_input_structure, flat_output_structure),
@@ -559,7 +559,7 @@ mod tests {
         struct Int64(i64);
 
         impl Typed<ArrayType> for Int64 {
-            fn tpe(&self) -> Cow<'_, ArrayType> {
+            fn r#type(&self) -> Cow<'_, ArrayType> {
                 Cow::Owned(ArrayType::scalar(DataType::I64))
             }
         }

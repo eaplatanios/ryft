@@ -332,7 +332,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for ScaleOp<ArrayType, V> {
         let factor = self.factor();
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let factor_type = factor.tpe();
+        let factor_type = factor.r#type();
         let factor_broadcast = if *factor_type != output_types[0] {
             match mode {
                 PlainMlirLoweringMode::Packed { lane_count } => {
@@ -370,7 +370,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for Left
         let factor = self.factor();
         let factor_value = match mode {
             PlainMlirLoweringMode::Packed { lane_count } => {
-                let packed_type = packed_array_type(&factor.tpe(), lane_count);
+                let packed_type = packed_array_type(&factor.r#type(), lane_count);
                 lowerer.lower_packed_literal_value(factor, &packed_type)?
             }
             PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
@@ -401,7 +401,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for Righ
         let factor = self.factor();
         let factor_value = match mode {
             PlainMlirLoweringMode::Packed { lane_count } => {
-                let packed_type = packed_array_type(&factor.tpe(), lane_count);
+                let packed_type = packed_array_type(&factor.r#type(), lane_count);
                 lowerer.lower_packed_literal_value(factor, &packed_type)?
             }
             PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
@@ -1058,7 +1058,7 @@ impl MlirLowerableValue for ShardMapTensor {
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         let constant_kind = self.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id: 0 })?;
-        lower_constant_elements_attribute(self.tpe().data_type, tensor_type, constant_kind, context)
+        lower_constant_elements_attribute(self.r#type().data_type, tensor_type, constant_kind, context)
     }
 
     fn to_scalar_dense_elements_attribute<'c, 't>(
@@ -1069,7 +1069,7 @@ impl MlirLowerableValue for ShardMapTensor {
         let Some(constant_kind) = self.constant_kind() else {
             return Ok(None);
         };
-        Ok(Some(lower_constant_elements_attribute(self.tpe().data_type, tensor_type, constant_kind, context)?))
+        Ok(Some(lower_constant_elements_attribute(self.r#type().data_type, tensor_type, constant_kind, context)?))
     }
 }
 
@@ -1096,7 +1096,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
         .iter()
         .map(|atom_id| {
             let input_atom = program.atom(*atom_id).expect("program input atoms should exist");
-            lower_tensor_type(&input_atom.tpe(), &context, location)
+            lower_tensor_type(&input_atom.r#type(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = program
@@ -1104,7 +1104,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
         .iter()
         .map(|atom_id| {
             let output_atom = program.atom(*atom_id).expect("program output atoms should exist");
-            lower_tensor_type(&output_atom.tpe(), &context, location)
+            lower_tensor_type(&output_atom.r#type(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1344,7 +1344,7 @@ where
     L: Location<'c, 't> + Copy,
 {
     let lowered_value = lower_literal_value(value, block, context, location)?;
-    if *value.tpe() == *packed_type {
+    if *value.r#type() == *packed_type {
         return Ok(lowered_value);
     }
 
@@ -1352,16 +1352,17 @@ where
         Some(Size::Static(value)) => *value,
         _ => return Err(LoweringError::InvalidTensorType { array_type: packed_type.clone() }),
     };
-    if packed_array_type(&value.tpe(), lane_count) != *packed_type {
+    if packed_array_type(&value.r#type(), lane_count) != *packed_type {
         return Err(LoweringError::InvalidTensorType { array_type: packed_type.clone() });
     }
 
-    if !value.tpe().shape.dimensions.is_empty() {
-        let singleton_tensor_type = lower_tensor_type(&singleton_packed_array_type(&value.tpe()), context, location)?;
+    if !value.r#type().shape.dimensions.is_empty() {
+        let singleton_tensor_type =
+            lower_tensor_type(&singleton_packed_array_type(&value.r#type()), context, location)?;
         let singleton = block.append_operation(stable_hlo::broadcast(
             lowered_value,
             singleton_tensor_type,
-            leading_axis_broadcast_dimensions(value.tpe().shape.dimensions.len()).as_slice(),
+            leading_axis_broadcast_dimensions(value.r#type().shape.dimensions.len()).as_slice(),
             location,
         ));
         let singleton_value = singleton.result(0).expect("stablehlo.broadcast should return one result").as_ref();
@@ -1370,7 +1371,7 @@ where
         }
 
         let tensor_type = lower_tensor_type(packed_type, context, location)?;
-        let broadcast_dimensions = (0..=value.tpe().shape.dimensions.len()).collect::<Vec<_>>();
+        let broadcast_dimensions = (0..=value.r#type().shape.dimensions.len()).collect::<Vec<_>>();
         let packed = block.append_operation(stable_hlo::broadcast(
             singleton_value,
             tensor_type,
@@ -1384,7 +1385,7 @@ where
     let broadcast = block.append_operation(stable_hlo::broadcast(
         lowered_value,
         tensor_type,
-        leading_axis_broadcast_dimensions(value.tpe().shape.dimensions.len()).as_slice(),
+        leading_axis_broadcast_dimensions(value.r#type().shape.dimensions.len()).as_slice(),
         location,
     ));
     Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
@@ -1596,9 +1597,13 @@ where
 
         let atom = program.atom(atom_id).ok_or(LoweringError::MissingAtomValue { atom_id })?;
         match atom {
-            Atom::Constant { value } => {
-                lower_packed_literal_value(value, &packed_array_type(&atom.tpe(), lane_count), block, context, location)
-            }
+            Atom::Constant { value } => lower_packed_literal_value(
+                value,
+                &packed_array_type(&atom.r#type(), lane_count),
+                block,
+                context,
+                location,
+            ),
             _ => Err(LoweringError::MissingAtomValue { atom_id }),
         }
     }
@@ -1780,7 +1785,7 @@ where
                 let output_types = equation
                     .outputs
                     .iter()
-                    .map(|output| program.atom(*output).expect("equation output should exist").tpe().into_owned())
+                    .map(|output| program.atom(*output).expect("equation output should exist").r#type().into_owned())
                     .collect::<Vec<_>>();
                 let mut lowerer = PlainMlirLowerer { block: *block, context, location };
                 let lowered_outputs = equation.op.lower_to_mlir(
@@ -2045,7 +2050,7 @@ where
     V: MlirLowerableValue,
     L: Location<'c, 't> + Copy,
 {
-    let value_type = value.tpe();
+    let value_type = value.r#type();
     if !value_type.shape.dimensions.is_empty() {
         let scalar_tensor_type = context
             .tensor_type(lower_element_type(value_type.data_type, context)?, &[], None, location)
@@ -2082,7 +2087,7 @@ where
     L: Location<'c, 't> + Copy,
 {
     let constant_kind = value.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id })?;
-    let array_type = value.tpe();
+    let array_type = value.r#type();
     let tensor_type = lower_tensor_type(&array_type, context, location)?;
     if !array_type.shape.dimensions.is_empty() {
         let scalar_tensor_type = context
@@ -2166,7 +2171,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaPrimitiveOp::Scale { factor } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
-            let factor_type = factor.tpe();
+            let factor_type = factor.r#type();
             let factor_broadcast = if *factor_type != output_types[0] {
                 let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
                     factor_value,
@@ -2279,7 +2284,7 @@ where
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| program.atom(*output).expect("equation output should exist").tpe().into_owned())
+        .map(|output| program.atom(*output).expect("equation output should exist").r#type().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
     equation
@@ -2306,7 +2311,7 @@ where
         .outputs
         .iter()
         .map(|output| {
-            packed_array_type(&program.atom(*output).expect("equation output should exist").tpe(), lane_count)
+            packed_array_type(&program.atom(*output).expect("equation output should exist").r#type(), lane_count)
         })
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
@@ -2335,7 +2340,7 @@ where
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| program.atom(*output).expect("equation output should exist").tpe().into_owned())
+        .map(|output| program.atom(*output).expect("equation output should exist").r#type().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
     dispatch_lower_shard_map_mlir(&equation.op, input_values, output_types.as_slice(), &mut lowerer)

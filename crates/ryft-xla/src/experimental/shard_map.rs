@@ -332,7 +332,7 @@ impl ShardMapTensor {
 }
 
 impl ryft_core::types::Typed<ArrayType> for ShardMapTensor {
-    fn tpe(&self) -> Cow<'_, ArrayType> {
+    fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.array_type)
     }
 }
@@ -568,7 +568,7 @@ where
 {
     fn constrain_leaf(input: ShardMapTracer, sharding: Sharding) -> Result<ShardMapTracer, ShardMapTraceError> {
         let op = WithShardingConstraintOp::new(sharding.clone());
-        let input_type = input.tpe();
+        let input_type = input.r#type();
         if op.sharding().rank() != input_type.rank() {
             return Err(ShardingError::ShardingRankMismatch {
                 sharding_rank: op.sharding().rank(),
@@ -2549,7 +2549,7 @@ mod tests {
         assert_eq!(
             tensor
                 .zero_like()
-                .tpe()
+                .r#type()
                 .into_owned()
                 .sharding
                 .expect("zero_like should keep sharding metadata")
@@ -2559,7 +2559,7 @@ mod tests {
         assert_eq!(
             tensor
                 .zero_like()
-                .tpe()
+                .r#type()
                 .into_owned()
                 .sharding
                 .expect("zero_like should keep sharding metadata")
@@ -2569,7 +2569,7 @@ mod tests {
         assert_eq!(
             tensor
                 .zero_like()
-                .tpe()
+                .r#type()
                 .into_owned()
                 .sharding
                 .expect("zero_like should keep sharding metadata")
@@ -2579,7 +2579,7 @@ mod tests {
         assert_eq!(
             tensor
                 .one_like()
-                .tpe()
+                .r#type()
                 .into_owned()
                 .sharding
                 .expect("one_like should keep sharding metadata")
@@ -2589,7 +2589,7 @@ mod tests {
         assert_eq!(
             tensor
                 .one_like()
-                .tpe()
+                .r#type()
                 .into_owned()
                 .sharding
                 .expect("one_like should keep sharding metadata")
@@ -2599,7 +2599,7 @@ mod tests {
         assert_eq!(
             tensor
                 .one_like()
-                .tpe()
+                .r#type()
                 .into_owned()
                 .sharding
                 .expect("one_like should keep sharding metadata")

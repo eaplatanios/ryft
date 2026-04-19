@@ -421,8 +421,8 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
             Self::MatMul => MatMulOp.abstract_eval(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.abstract_eval(inputs),
             Self::Scale { .. } => ScaleOp::<ArrayType, V>::abstract_eval_static(inputs),
-            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::tpe(factor), inputs),
-            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::tpe(factor), inputs),
+            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), inputs),
+            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), inputs),
             Self::Reshape { input_type, output_type } => {
                 <ReshapeOp as Op>::abstract_eval(&ReshapeOp::new(input_type.clone(), output_type.clone()), inputs)
             }
@@ -488,8 +488,8 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
             Self::Neg => NegOp.abstract_eval(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.abstract_eval(inputs),
             Self::Scale { .. } => ScaleOp::<ArrayType, V>::abstract_eval_static(inputs),
-            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::tpe(factor), inputs),
-            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::tpe(factor), inputs),
+            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), inputs),
+            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), inputs),
             Self::Reshape { input_type, output_type } => {
                 <ReshapeOp as Op>::abstract_eval(&ReshapeOp::new(input_type.clone(), output_type.clone()), inputs)
             }

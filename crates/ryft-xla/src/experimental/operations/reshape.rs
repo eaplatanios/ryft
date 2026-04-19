@@ -8,7 +8,7 @@ use crate::experimental::shard_map::ShardMapTensor;
 
 impl ReshapeOps for ShardMapTensor {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        Ok(Self::new(reshape_abstract(&self.tpe(), &target_shape, "reshape")?))
+        Ok(Self::new(reshape_abstract(&self.r#type(), &target_shape, "reshape")?))
     }
 }
 

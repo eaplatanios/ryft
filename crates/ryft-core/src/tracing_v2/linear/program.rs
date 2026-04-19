@@ -297,7 +297,7 @@ where
             Some(existing) => {
                 let mut builder_borrow = builder.borrow_mut();
                 let abstract_value =
-                    builder_borrow.atom(existing).expect("adjoint atom should exist").tpe().into_owned();
+                    builder_borrow.atom(existing).expect("adjoint atom should exist").r#type().into_owned();
                 builder_borrow.add_equation_prevalidated(
                     O::linear_add_op(),
                     vec![existing, contribution],
@@ -314,7 +314,8 @@ where
     let mut output_cotangent_inputs = Vec::with_capacity(linear_body.outputs().len());
     for (output_index, output) in linear_body.outputs().iter().enumerate() {
         let output_atom = linear_body.atom(*output).ok_or(TracingError::UnboundAtomId { id: *output })?;
-        let cotangent_input = make_output_cotangent_input(&mut builder.borrow_mut(), &output_atom.tpe(), output_index)?;
+        let cotangent_input =
+            make_output_cotangent_input(&mut builder.borrow_mut(), &output_atom.r#type(), output_index)?;
         output_cotangent_inputs.push(cotangent_input);
     }
 

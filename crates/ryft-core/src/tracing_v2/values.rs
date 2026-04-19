@@ -187,7 +187,7 @@ mod tests {
     use super::*;
 
     fn assert_scalar_value_type<V: Value<ArrayType>>(value: V, expected_type: DataType) {
-        assert_eq!(value.tpe().into_owned(), ArrayType::scalar(expected_type));
+        assert_eq!(value.r#type().into_owned(), ArrayType::scalar(expected_type));
     }
 
     fn assert_scalar_identities<V>(value: V, zero: V, one: V)
@@ -213,8 +213,8 @@ mod tests {
         assert_scalar_value_type(1u64, DataType::U64);
         assert_scalar_value_type(bf16::from_f32(1.25), DataType::BF16);
         assert_scalar_value_type(f16::from_f32(1.25), DataType::F16);
-        assert_eq!(<f32 as Typed<ArrayType>>::tpe(&1.25f32).into_owned(), ArrayType::scalar(DataType::F32));
-        assert_eq!(<f64 as Typed<ArrayType>>::tpe(&2.5f64).into_owned(), ArrayType::scalar(DataType::F64));
+        assert_eq!(<f32 as Typed<ArrayType>>::r#type(&1.25f32).into_owned(), ArrayType::scalar(DataType::F32));
+        assert_eq!(<f64 as Typed<ArrayType>>::r#type(&2.5f64).into_owned(), ArrayType::scalar(DataType::F64));
         assert_scalar_identities(false, false, true);
         assert_scalar_identities(5i32, 0i32, 1i32);
         assert_scalar_identities(5u32, 0u32, 1u32);

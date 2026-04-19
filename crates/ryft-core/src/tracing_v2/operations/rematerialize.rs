@@ -151,7 +151,7 @@ where
     O: InterpretableOp<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.program.call(inputs.to_vec())
     }
@@ -319,7 +319,7 @@ where
     O: InterpretableOp<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.program.call(inputs.to_vec())
     }
@@ -462,7 +462,7 @@ where
         let input_leaf_count = traced_inputs.len();
         let exemplar_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
-            traced_inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
+            traced_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let (exemplar_output_types, body_program) =
             trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
@@ -476,7 +476,7 @@ where
         let input_types = body_program
             .input_atoms()
             .iter()
-            .map(|id| body_program.atom(*id).expect("body input atom should exist").tpe().into_owned())
+            .map(|id| body_program.atom(*id).expect("body input atom should exist").r#type().into_owned())
             .collect::<Vec<_>>();
         let output_types = exemplar_output_types.parameters().cloned().collect::<Vec<_>>();
         let body = FlatTracedRematerialize::from_parts(

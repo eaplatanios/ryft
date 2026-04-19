@@ -126,7 +126,9 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
             let builder_borrow = builder.borrow();
             input_atoms
                 .iter()
-                .map(|input| builder_borrow.atom(*input).expect("tracer input atoms should exist").tpe().into_owned())
+                .map(|input| {
+                    builder_borrow.atom(*input).expect("tracer input atoms should exist").r#type().into_owned()
+                })
                 .collect::<Vec<_>>()
         };
         let output_count = match op.abstract_eval(input_types.as_slice()) {
@@ -182,13 +184,13 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
 
 impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
     #[inline]
-    fn tpe(&self) -> Cow<'_, E::Type> {
+    fn r#type(&self) -> Cow<'_, E::Type> {
         Cow::Owned(
             self.builder
                 .borrow()
                 .atom(self.atom)
                 .expect("tracer atom should exist in its staging builder")
-                .tpe()
+                .r#type()
                 .into_owned(),
         )
     }
@@ -199,7 +201,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Traceable<E::Type> 
 impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer<'engine, E> {
     #[inline]
     fn zero_like(&self) -> Self {
-        let value = self.engine().zero(&self.tpe().into_owned());
+        let value = self.engine().zero(&self.r#type().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
         Self { atom, builder: self.builder.clone(), engine: self.engine }
     }
@@ -208,7 +210,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer
 impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<'engine, E> {
     #[inline]
     fn one_like(&self) -> Self {
-        let value = self.engine().one(&self.tpe().into_owned());
+        let value = self.engine().one(&self.r#type().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
         Self { atom, builder: self.builder.clone(), engine: self.engine }
     }
@@ -302,7 +304,7 @@ where
         let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
         let output_types = Output::from_parameters(
             output_structure.clone(),
-            traced_outputs.iter().map(|output| output.tpe().into_owned()).collect::<Vec<_>>(),
+            traced_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let outputs = traced_outputs.into_iter().map(|output| output.atom()).collect::<Vec<_>>();
         let output_structure = output_types.parameter_structure();
@@ -346,7 +348,7 @@ where
 {
     let input_structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
-    let input_types = input_values.iter().map(|value| value.tpe().into_owned()).collect::<Vec<_>>();
+    let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
     let mut output_structure = None;
     let (_, flat_program): (
         Vec<E::Type>,
@@ -391,7 +393,7 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, &engine);
         let zero = tracer.zero_like();
-        assert_eq!(zero.tpe().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
+        assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
         assert!(zero.atom > atom);
 
         let program = zero.builder.borrow().clone().build::<f64, f64>(vec![zero.atom], Placeholder, Placeholder);
@@ -473,7 +475,7 @@ mod tests {
         }
 
         impl Typed<TestType> for TestValue {
-            fn tpe(&self) -> Cow<'_, TestType> {
+            fn r#type(&self) -> Cow<'_, TestType> {
                 Cow::Borrowed(&self.r#type)
             }
         }
@@ -614,7 +616,7 @@ mod tests {
         }
 
         impl Typed<ArrayType> for TestAbstractValue {
-            fn tpe(&self) -> Cow<'_, ArrayType> {
+            fn r#type(&self) -> Cow<'_, ArrayType> {
                 Cow::Borrowed(&self.r#type)
             }
         }

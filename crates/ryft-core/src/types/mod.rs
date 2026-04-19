@@ -14,7 +14,8 @@ pub use layouts::*;
 /// descriptors for traced values.
 ///
 /// Note that [`Type`] requires [`Clone`] so that descriptors can be duplicated into staged graphs, returned via [`Cow`]
-/// from [`Typed::tpe`], and stored in tracing data structures without forcing every call site to name a `Clone` bound.
+/// from [`Typed::r#type`], and stored in tracing data structures without forcing every call site to name a `Clone`
+/// bound.
 pub trait Type: Clone {
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
     /// notion of compatibility is type-specific. For example, scalar data types may treat compatibility as promotion
@@ -32,7 +33,7 @@ pub trait Typed<T: Type> {
     /// lets implementors lend out a stored [`Type`] by borrow when one is cached on the value, while still supporting
     /// values that compute their [`Type`] on the fly (and return [`Cow::Owned`]). Callers that need ownership can call
     /// [`Cow::into_owned`] to clone on demand.
-    fn tpe(&self) -> Cow<'_, T>;
+    fn r#type(&self) -> Cow<'_, T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,7 +43,7 @@ pub trait Typed<T: Type> {
 macro_rules! impl_typed_for_scalar {
     ($ty:ty, $data_type:path) => {
         impl Typed<ArrayType> for $ty {
-            fn tpe(&self) -> Cow<'_, ArrayType> {
+            fn r#type(&self) -> Cow<'_, ArrayType> {
                 Cow::Owned(ArrayType::scalar($data_type))
             }
         }

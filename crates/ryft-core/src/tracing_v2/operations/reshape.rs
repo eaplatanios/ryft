@@ -261,7 +261,7 @@ where
 
 impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        let input_type = self.primal.tpe().into_owned();
+        let input_type = self.primal.r#type().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
         if input_type == output_type {
             return Ok(self);
@@ -282,7 +282,7 @@ where
     O: Op<ArrayType>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        let input_type = self.tpe().into_owned();
+        let input_type = self.r#type().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
         if input_type == output_type {
             return Ok(self);
@@ -296,7 +296,7 @@ where
 
 impl<V: ReshapeValue> ReshapeOps for Batch<V> {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        if self.lanes().iter().all(|lane| lane.tpe().shape == target_shape) {
+        if self.lanes().iter().all(|lane| lane.r#type().shape == target_shape) {
             return Ok(self);
         }
         Ok(Self::new(
@@ -310,14 +310,14 @@ impl<V: ReshapeValue> ReshapeOps for Batch<V> {
 
 impl ReshapeOps for f32 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        reshape_abstract(&self.tpe(), &target_shape, "reshape")?;
+        reshape_abstract(&self.r#type(), &target_shape, "reshape")?;
         Ok(self)
     }
 }
 
 impl ReshapeOps for f64 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        reshape_abstract(&self.tpe(), &target_shape, "reshape")?;
+        reshape_abstract(&self.r#type(), &target_shape, "reshape")?;
         Ok(self)
     }
 }
@@ -334,7 +334,7 @@ mod ndarray_support {
 
     impl ReshapeOps for Array2<f32> {
         fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-            let input_type = self.tpe().into_owned();
+            let input_type = self.r#type().into_owned();
             let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
             if input_type == output_type {
                 return Ok(self);
@@ -350,7 +350,7 @@ mod ndarray_support {
 
     impl ReshapeOps for Array2<f64> {
         fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-            let input_type = self.tpe().into_owned();
+            let input_type = self.r#type().into_owned();
             let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
             if input_type == output_type {
                 return Ok(self);

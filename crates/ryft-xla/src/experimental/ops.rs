@@ -147,8 +147,8 @@ impl Op for XlaPrimitiveOp {
             Self::MatMul => MatMulOp.abstract_eval(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.abstract_eval(inputs),
             Self::Scale { .. } => ScaleOp::<ArrayType, ShardMapTensor>::abstract_eval_static(inputs),
-            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::tpe(factor), inputs),
-            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::tpe(factor), inputs),
+            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), inputs),
+            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), inputs),
             Self::Reshape { input_type, output_type } => {
                 ReshapeOp::new(input_type.clone(), output_type.clone()).abstract_eval(inputs)
             }

@@ -1113,7 +1113,7 @@ pub struct Array<'o> {
 }
 
 impl Typed<ArrayType> for Array<'_> {
-    fn tpe(&self) -> Cow<'_, ArrayType> {
+    fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.array_type)
     }
 }

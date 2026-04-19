@@ -97,8 +97,8 @@ pub struct JvpTracer<V, T> {
 
 impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V>> Typed<Ty> for JvpTracer<V, T> {
     #[inline]
-    fn tpe(&self) -> Cow<'_, Ty> {
-        <V as Typed<Ty>>::tpe(&self.primal)
+    fn r#type(&self) -> Cow<'_, Ty> {
+        <V as Typed<Ty>>::r#type(&self.primal)
     }
 }
 
@@ -684,7 +684,7 @@ mod tests {
         }
 
         impl Typed<TestType> for TestValue {
-            fn tpe(&self) -> Cow<'_, TestType> {
+            fn r#type(&self) -> Cow<'_, TestType> {
                 Cow::Borrowed(&self.r#type)
             }
         }
@@ -728,7 +728,7 @@ mod tests {
             primal: TestValue::new(scalar_type.clone(), 3),
             tangent: TestValue::new(scalar_type.clone(), 4),
         };
-        assert_eq!(left.tpe().into_owned(), scalar_type.clone());
+        assert_eq!(left.r#type().into_owned(), scalar_type.clone());
 
         fn assert_traceable<T: Type, V: Traceable<T>>(_value: &V) {}
 

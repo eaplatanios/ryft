@@ -35,7 +35,7 @@ where
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
             let staged_input_types = Input::To::<ArrayType>::from_parameters(
                 input_structure.clone(),
-                traced_primals.iter().map(|traced_primal| traced_primal.tpe().into_owned()).collect::<Vec<_>>(),
+                traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
             )?;
             let (_, traced_program) =
                 trace_flat_program_from_input_types::<
@@ -174,7 +174,7 @@ where
             // Step 1: Trace the function at the base V level to get a program.
             let staged_input_types = Input::To::<ArrayType>::from_parameters(
                 input_structure.clone(),
-                traced_primals.iter().map(|traced_primal| traced_primal.tpe().into_owned()).collect::<Vec<_>>(),
+                traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
             )?;
             let (_, traced_program) =
                 trace_flat_program_from_input_types::<
@@ -341,7 +341,7 @@ where
                 program
                     .atom(atom_id)
                     .ok_or(TracingError::UnboundAtomId { id: atom_id })
-                    .map(|atom| atom.tpe().into_owned())
+                    .map(|atom| atom.r#type().into_owned())
             })
             .collect::<Result<_, _>>()?;
         let output_types: Vec<_> = boundary_output_atoms
@@ -350,7 +350,7 @@ where
                 program
                     .atom(atom_id)
                     .ok_or(TracingError::UnboundAtomId { id: atom_id })
-                    .map(|atom| atom.tpe().into_owned())
+                    .map(|atom| atom.r#type().into_owned())
             })
             .collect::<Result<_, _>>()?;
 
@@ -410,7 +410,7 @@ where
             program
                 .atom(atom_id)
                 .ok_or(TracingError::UnboundAtomId { id: atom_id })
-                .map(|atom| atom.tpe().into_owned())
+                .map(|atom| atom.r#type().into_owned())
         })
         .collect::<Result<_, _>>()?;
     let output_types: Vec<_> = program
@@ -420,7 +420,7 @@ where
             program
                 .atom(atom_id)
                 .ok_or(TracingError::UnboundAtomId { id: atom_id })
-                .map(|atom| atom.tpe().into_owned())
+                .map(|atom| atom.r#type().into_owned())
         })
         .collect::<Result<_, _>>()?;
 
@@ -501,7 +501,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
                 program
                     .atom(atom_id)
                     .ok_or(TracingError::UnboundAtomId { id: atom_id })
-                    .map(|atom| atom.tpe().into_owned())
+                    .map(|atom| atom.r#type().into_owned())
             })
             .collect::<Result<_, _>>()?;
         let sub_outputs = sub_builder.add_equation_prevalidated(equation.op.clone(), sub_inputs, output_abstracts);

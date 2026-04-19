@@ -62,9 +62,9 @@ pub enum Atom<T: Type, V: Typed<T>> {
 }
 
 impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
-    fn tpe(&self) -> Cow<'_, T> {
+    fn r#type(&self) -> Cow<'_, T> {
         match self {
-            Self::Constant { value } => value.tpe(),
+            Self::Constant { value } => value.r#type(),
             Self::Input { r#type } | Self::Derived { r#type } => Cow::Borrowed(r#type),
         }
     }
@@ -176,7 +176,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Adds a new input atom using the abstract type and value of `example`.
     #[inline]
     pub fn add_input(&mut self, example: &V) -> AtomId {
-        let abstract_value = <V as Typed<T>>::tpe(example).into_owned();
+        let abstract_value = <V as Typed<T>>::r#type(example).into_owned();
         self.add_input_with_example(abstract_value, example.clone())
     }
 
@@ -265,7 +265,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .iter()
             .map(|input| {
                 self.atom(*input)
-                    .map(|atom| atom.tpe().into_owned())
+                    .map(|atom| atom.r#type().into_owned())
                     .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -314,7 +314,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .iter()
             .map(|input| {
                 self.atom(*input)
-                    .map(|atom| atom.tpe().into_owned())
+                    .map(|atom| atom.r#type().into_owned())
                     .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -701,7 +701,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                     let output_abstracts = equation
                         .outputs
                         .iter()
-                        .map(|output| program.atom(*output).expect("output atom should exist").tpe().into_owned())
+                        .map(|output| program.atom(*output).expect("output atom should exist").r#type().into_owned())
                         .collect::<Vec<_>>();
                     let remapped_outputs =
                         builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
@@ -776,7 +776,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");
-        let format_typed_atom = |id: AtomId| format!("%{id}:{}", self.atoms[id].tpe());
+        let format_typed_atom = |id: AtomId| format!("%{id}:{}", self.atoms[id].r#type());
 
         let inputs = self.input_atoms.iter().map(|input| format_typed_atom(*input)).collect::<Vec<_>>().join(", ");
         writeln!(formatter, "lambda {inputs} .")?;
@@ -984,7 +984,7 @@ mod tests {
         }
 
         impl Typed<ArrayType> for TestIdentityValue {
-            fn tpe(&self) -> std::borrow::Cow<'_, ArrayType> {
+            fn r#type(&self) -> std::borrow::Cow<'_, ArrayType> {
                 std::borrow::Cow::Borrowed(&self.r#type)
             }
         }

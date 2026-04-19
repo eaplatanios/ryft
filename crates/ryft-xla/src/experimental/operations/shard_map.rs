@@ -316,7 +316,7 @@ impl Op for ShardMapOp<ShardMapTensor> {
 
 impl InterpretableOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
-        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         Ok(self.output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>())
     }
@@ -410,8 +410,10 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for ShardMapOp<Shard
         inputs: &[Linearized<ShardMapTracer>],
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_values =
-            primal_inputs.iter().map(|input| ShardMapTensor::new(input.tpe().into_owned())).collect::<Vec<_>>();
+        let primal_values = primal_inputs
+            .iter()
+            .map(|input| ShardMapTensor::new(input.r#type().into_owned()))
+            .collect::<Vec<_>>();
         let _primal_output_values = InterpretableOp::interpret(self, primal_values.as_slice())?;
         let primal_outputs =
             Tracer::apply_staged_op(primal_inputs.as_slice(), XlaPrimitiveOp::ShardMap(Box::new(self.clone())))?;
@@ -455,7 +457,7 @@ impl Op for ShardMapOp<ShardMapTracer> {
 
 impl InterpretableOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
-        let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
+        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         match &self.linear_state {
             None => apply_flat_traced_shard_map(self.body.clone(), inputs.to_vec()).map_err(trace_error_from_shard_map),
@@ -750,7 +752,9 @@ fn project_flat_shard_map_program(
                 let output_abstracts = equation
                     .outputs
                     .iter()
-                    .map(|output| program.atom(*output).expect("equation output atom should exist").tpe().into_owned())
+                    .map(|output| {
+                        program.atom(*output).expect("equation output atom should exist").r#type().into_owned()
+                    })
                     .collect::<Vec<_>>();
                 let remapped_outputs =
                     builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
@@ -861,7 +865,9 @@ fn build_factorized_apply_program(
                 let output_abstracts = equation
                     .outputs
                     .iter()
-                    .map(|output| program.atom(*output).expect("equation output atom should exist").tpe().into_owned())
+                    .map(|output| {
+                        program.atom(*output).expect("equation output atom should exist").r#type().into_owned()
+                    })
                     .collect::<Vec<_>>();
                 let remapped_outputs =
                     builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
@@ -960,7 +966,7 @@ fn factorize_transpose_shard_map_body(
 
     let residual_out_shardings = residual_atoms
         .iter()
-        .map(|atom_id| program.atom(*atom_id).expect("residual atoms should exist").tpe().sharding.clone())
+        .map(|atom_id| program.atom(*atom_id).expect("residual atoms should exist").r#type().sharding.clone())
         .collect::<Option<Vec<_>>>();
     let Some(residual_out_shardings) = residual_out_shardings else {
         return Ok(None);
@@ -972,7 +978,7 @@ fn factorize_transpose_shard_map_body(
             .simplify()?;
     let residual_local_output_types = residual_atoms
         .iter()
-        .map(|atom_id| program.atom(*atom_id).expect("residual atoms should exist").tpe().into_owned())
+        .map(|atom_id| program.atom(*atom_id).expect("residual atoms should exist").r#type().into_owned())
         .collect::<Vec<_>>();
     let residual_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
         simplified_body.shard_map.mesh().clone(),
@@ -1497,7 +1503,7 @@ where
 {
     Ok(Input::To::<ArrayType>::from_parameters(
         traced_inputs.parameter_structure(),
-        traced_inputs.parameters().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
+        traced_inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
     )?)
 }
 
@@ -1672,7 +1678,7 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
         )?;
         let global_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure,
-            global_input_primals.parameters().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
+            global_input_primals.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let global_in_specs = reparameterize_shardings::<
             Input::To<Sharding>,
