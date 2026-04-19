@@ -13,7 +13,8 @@ use ryft_core::{
     tracing_v2::{
         AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp,
         LinearProgramBuilder, LinearProgramOpRef, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, Program,
-        ProgramBuilder, ProgramOpRef, Sin, TraceError, Traceable, Tracer, ZeroLike, engine::Engine, forward::JvpTracer,
+        ProgramBuilder, ProgramOpRef, Sin, Traceable, Tracer, TracingError, ZeroLike, engine::Engine,
+        forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -171,8 +172,8 @@ impl<V> ShardMapOp<V> {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
     }
 
-    fn transpose_op(&self) -> Result<Self, TraceError> {
-        let linear_state = self.linear_state.clone().ok_or(TraceError::HigherOrderOpFailure {
+    fn transpose_op(&self) -> Result<Self, TracingError> {
+        let linear_state = self.linear_state.clone().ok_or(TracingError::HigherOrderOpFailure {
             op: "shard_map",
             message: "transpose requested for a non-linear shard_map op".to_string(),
         })?;
@@ -207,7 +208,7 @@ impl ShardMapOp<ShardMapTensor> {
     fn to_linearized_jit_tracer_op(
         &self,
         primals: &[ShardMapTracer],
-    ) -> Result<ShardMapOp<ShardMapTracer>, TraceError> {
+    ) -> Result<ShardMapOp<ShardMapTracer>, TracingError> {
         let captured_atoms = primals.iter().map(|primal| primal.atom()).collect::<Vec<_>>();
         match &self.linear_state {
             Some(linear_state) => Ok(ShardMapOp::new_linear(
@@ -298,23 +299,23 @@ impl Op for ShardMapOp<ShardMapTensor> {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         if inputs.len() != self.input_types.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
         }
         if !inputs
             .iter()
             .zip(self.input_types.iter())
             .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
         {
-            return Err(TraceError::IncompatibleAbstractValues { op: self.name() });
+            return Err(TracingError::IncompatibleAbstractValues { op: self.name() });
         }
         Ok(self.output_types.clone())
     }
 }
 
 impl InterpretableOp<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
-    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         Ok(self.output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>())
@@ -325,15 +326,15 @@ impl LinearOperation<ArrayType, ShardMapTensor> for ShardMapOp<ShardMapTensor> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TracingError> {
         if !self.has_linear_state() {
-            return Err(TraceError::HigherOrderOpFailure {
+            return Err(TracingError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
                 message: "transpose rule for staged op 'shard_map' is not implemented".to_string(),
             });
         }
         if output_cotangents.len() != self.output_types.len() {
-            return Err(TraceError::InvalidInputCount {
+            return Err(TracingError::InvalidInputCount {
                 expected: self.output_types.len(),
                 got: output_cotangents.len(),
             });
@@ -375,10 +376,10 @@ impl
                 LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
             >,
         >,
-        TraceError,
+        TracingError,
     > {
         if self.has_linear_state() {
-            return Err(TraceError::HigherOrderOpFailure {
+            return Err(TracingError::HigherOrderOpFailure {
                 op: "linearize_program",
                 message: "JVP rule for staged op 'linear_shard_map' is not implemented".to_string(),
             });
@@ -404,7 +405,10 @@ impl
 }
 
 impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for ShardMapOp<ShardMapTensor> {
-    fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+    fn interpret(
+        &self,
+        inputs: &[Linearized<ShardMapTracer>],
+    ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_values =
             primal_inputs.iter().map(|input| ShardMapTensor::new(input.tpe().into_owned())).collect::<Vec<_>>();
@@ -434,23 +438,23 @@ impl Op for ShardMapOp<ShardMapTracer> {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         if inputs.len() != self.input_types.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
         }
         if !inputs
             .iter()
             .zip(self.input_types.iter())
             .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
         {
-            return Err(TraceError::IncompatibleAbstractValues { op: self.name() });
+            return Err(TracingError::IncompatibleAbstractValues { op: self.name() });
         }
         Ok(self.output_types.clone())
     }
 }
 
 impl InterpretableOp<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
-    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
+    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         match &self.linear_state {
@@ -483,15 +487,15 @@ impl LinearOperation<ArrayType, ShardMapTracer> for ShardMapOp<ShardMapTracer> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TracingError> {
         if !self.has_linear_state() {
-            return Err(TraceError::HigherOrderOpFailure {
+            return Err(TracingError::HigherOrderOpFailure {
                 op: "transpose_linear_program",
                 message: "transpose rule for staged op 'shard_map' is not implemented".to_string(),
             });
         }
         if output_cotangents.len() != self.output_types.len() {
-            return Err(TraceError::InvalidInputCount {
+            return Err(TracingError::InvalidInputCount {
                 expected: self.output_types.len(),
                 got: output_cotangents.len(),
             });
@@ -533,9 +537,9 @@ impl
                 LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
             >,
         >,
-        TraceError,
+        TracingError,
     > {
-        Err(TraceError::HigherOrderOpFailure {
+        Err(TracingError::HigherOrderOpFailure {
             op: "jvp",
             message: format!("forward-mode rule for staged op '{}' is not implemented", self.name()),
         })
@@ -546,8 +550,8 @@ impl InterpretableOp<ArrayType, Linearized<JitShardMapTracer>> for ShardMapOp<Sh
     fn interpret(
         &self,
         _inputs: &[Linearized<JitShardMapTracer>],
-    ) -> Result<Vec<Linearized<JitShardMapTracer>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
+    ) -> Result<Vec<Linearized<JitShardMapTracer>>, TracingError> {
+        Err(TracingError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: format!(
                 "linearized JIT evaluation for staged op '{}' at the JIT-tracer level is not supported",
@@ -594,21 +598,21 @@ trait ReplayShardMapValue:
     + ZeroLike
     + OneLike
 {
-    fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TraceError>;
+    fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TracingError>;
 
     fn apply_flat_body(body: FlatTracedShardMap, inputs: Vec<Self>) -> Result<Vec<Self>, ShardMapTraceError>;
 }
 
-fn trace_error_from_shard_map(error: ShardMapTraceError) -> TraceError {
-    TraceError::HigherOrderOpFailure { op: "shard_map", message: error.to_string() }
+fn trace_error_from_shard_map(error: ShardMapTraceError) -> TracingError {
+    TracingError::HigherOrderOpFailure { op: "shard_map", message: error.to_string() }
 }
 
 /// Reifies captured shard-map primals into traced values in the current staging context.
 fn reify_captured_global_primals(
     captured_global_primals: &[AtomId],
     inputs: &[ShardMapTracer],
-) -> Result<Vec<ShardMapTracer>, TraceError> {
-    let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+) -> Result<Vec<ShardMapTracer>, TracingError> {
+    let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
     let builder = exemplar.builder_handle();
     let staging_error = exemplar.staging_error_handle();
     Ok(captured_global_primals
@@ -704,7 +708,7 @@ fn project_flat_shard_map_program(
     program: &FlatShardMapProgram,
     kept_input_atoms: &[usize],
     output_atoms: &[usize],
-) -> Result<FlatShardMapProgram, TraceError> {
+) -> Result<FlatShardMapProgram, TracingError> {
     fn remap_atom(
         atom_id: usize,
         program: &FlatShardMapProgram,
@@ -713,20 +717,20 @@ fn project_flat_shard_map_program(
         kept_input_atoms: &std::collections::HashMap<usize, usize>,
         representative_values: &[ShardMapTensor],
         equation_by_output: &[Option<usize>],
-    ) -> Result<usize, TraceError> {
+    ) -> Result<usize, TracingError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
             return Ok(*mapped_atom);
         }
 
-        let atom = program.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
+        let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
             ryft_core::tracing_v2::Atom::Input { .. } => *kept_input_atoms.get(&atom_id).ok_or(
-                TraceError::InternalInvariantViolation("projected flat shard-map program referenced a removed input"),
+                TracingError::InternalInvariantViolation("projected flat shard-map program referenced a removed input"),
             )?,
             ryft_core::tracing_v2::Atom::Constant { value } => builder.add_constant(value.clone()),
             ryft_core::tracing_v2::Atom::Derived { .. } => {
                 let equation_index = equation_by_output[atom_id]
-                    .ok_or(TraceError::InternalInvariantViolation("derived atom had no owning equation"))?;
+                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
                 let equation = &program.equations()[equation_index];
                 let remapped_inputs = equation
                     .inputs
@@ -754,7 +758,7 @@ fn project_flat_shard_map_program(
                 for (old_output, new_output) in equation.outputs.iter().copied().zip(remapped_outputs.iter().copied()) {
                     atom_mapping.insert(old_output, new_output);
                 }
-                *atom_mapping.get(&atom_id).ok_or(TraceError::InternalInvariantViolation(
+                *atom_mapping.get(&atom_id).ok_or(TracingError::InternalInvariantViolation(
                     "failed to record projected flat shard-map program outputs",
                 ))?
             }
@@ -802,7 +806,7 @@ fn build_factorized_apply_program(
     body: &FlatTracedShardMap,
     residual_atoms: &[usize],
     depends_on_cotangent: &[bool],
-) -> Result<FlatShardMapProgram, TraceError> {
+) -> Result<FlatShardMapProgram, TracingError> {
     fn remap_atom(
         atom_id: usize,
         program: &FlatShardMapProgram,
@@ -812,7 +816,7 @@ fn build_factorized_apply_program(
         depends_on_cotangent: &[bool],
         representative_values: &[ShardMapTensor],
         equation_by_output: &[Option<usize>],
-    ) -> Result<usize, TraceError> {
+    ) -> Result<usize, TracingError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
             return Ok(*mapped_atom);
         }
@@ -821,22 +825,22 @@ fn build_factorized_apply_program(
             return Ok(*mapped_input);
         }
 
-        let atom = program.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
+        let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
             ryft_core::tracing_v2::Atom::Input { .. } => {
-                return Err(TraceError::InternalInvariantViolation(
+                return Err(TracingError::InternalInvariantViolation(
                     "factorized apply program referenced a primal input that was not materialized as a residual",
                 ));
             }
             ryft_core::tracing_v2::Atom::Constant { value } => builder.add_constant(value.clone()),
             ryft_core::tracing_v2::Atom::Derived { .. } => {
                 if !depends_on_cotangent[atom_id] {
-                    return Err(TraceError::InternalInvariantViolation(
+                    return Err(TracingError::InternalInvariantViolation(
                         "factorized apply program referenced a cotangent-independent atom that was not materialized as a residual",
                     ));
                 }
                 let equation_index = equation_by_output[atom_id]
-                    .ok_or(TraceError::InternalInvariantViolation("derived atom had no owning equation"))?;
+                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
                 let equation = &program.equations()[equation_index];
                 let remapped_inputs = equation
                     .inputs
@@ -865,7 +869,7 @@ fn build_factorized_apply_program(
                 for (old_output, new_output) in equation.outputs.iter().copied().zip(remapped_outputs.iter().copied()) {
                     atom_mapping.insert(old_output, new_output);
                 }
-                *atom_mapping.get(&atom_id).ok_or(TraceError::InternalInvariantViolation(
+                *atom_mapping.get(&atom_id).ok_or(TracingError::InternalInvariantViolation(
                     "failed to record factorized apply program outputs",
                 ))?
             }
@@ -1047,7 +1051,7 @@ fn make_linear_tensor_shard_map(body: &FlatTracedShardMap) -> Result<ShardMapOp<
 }
 
 fn try_linearize_traced_shard_map_body<
-    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError>,
+    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError>,
 >(
     function: F,
     primals: Vec<ShardMapTracer>,
@@ -1056,9 +1060,9 @@ fn try_linearize_traced_shard_map_body<
         Vec<ShardMapTracer>,
         ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
     ),
-    TraceError,
+    TracingError,
 > {
-    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
+    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let input_structure = vec![ryft_core::parameters::Placeholder; primals.len()];
     let builder = std::rc::Rc::new(std::cell::RefCell::new(LinearProgramBuilder::new()));
     let traced_input = primals
@@ -1076,7 +1080,7 @@ fn try_linearize_traced_shard_map_body<
     let builder = match std::rc::Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
-            return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
+            return Err(TracingError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
         }
     };
     let program =
@@ -1086,7 +1090,7 @@ fn try_linearize_traced_shard_map_body<
 }
 
 fn try_transpose_traced_shard_map_body<
-    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError>,
+    F: FnOnce(Vec<Linearized<ShardMapTracer>>) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError>,
 >(
     function: F,
     primals: Vec<ShardMapTracer>,
@@ -1095,7 +1099,7 @@ fn try_transpose_traced_shard_map_body<
         Vec<ShardMapTracer>,
         ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
     ),
-    TraceError,
+    TracingError,
 > {
     let (outputs, pushforward) = try_linearize_traced_shard_map_body(function, primals)?;
     let pullback =
@@ -1138,7 +1142,7 @@ fn replay_traced_xla_program<
             ryft_core::tracing_v2::Atom::Constant { value } => {
                 let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
                 if seed_inputs.is_empty() {
-                    return Err(ShardMapTraceError::TraceError(TraceError::EmptyParameterizedValue));
+                    return Err(ShardMapTraceError::TracingError(TracingError::EmptyParameterizedValue));
                 }
                 values[atom_id] = Some(V::lift_constant(value, seed_inputs.as_slice())?);
             }
@@ -1150,12 +1154,12 @@ fn replay_traced_xla_program<
                 let input_values = equation
                     .inputs
                     .iter()
-                    .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
+                    .map(|input| values[*input].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let outputs = match &equation.op {
                     XlaPrimitiveOp::ShardMap(shard_map_op) => {
                         if shard_map_op.has_linear_state() {
-                            return Err(ShardMapTraceError::TraceError(TraceError::HigherOrderOpFailure {
+                            return Err(ShardMapTraceError::TracingError(TracingError::HigherOrderOpFailure {
                                 op: "shard_map",
                                 message: "replaying one linear shard_map body is not supported".to_string(),
                             }));
@@ -1166,14 +1170,14 @@ fn replay_traced_xla_program<
                     XlaPrimitiveOp::Custom(custom_op) => {
                         if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
                             if shard_map_op.has_linear_state() {
-                                return Err(ShardMapTraceError::TraceError(TraceError::HigherOrderOpFailure {
+                                return Err(ShardMapTraceError::TracingError(TracingError::HigherOrderOpFailure {
                                     op: "shard_map",
                                     message: "replaying one linear shard_map body is not supported".to_string(),
                                 }));
                             }
                             V::apply_flat_body(shard_map_op.body().clone(), input_values)?
                         } else {
-                            return Err(ShardMapTraceError::TraceError(TraceError::HigherOrderOpFailure {
+                            return Err(ShardMapTraceError::TracingError(TracingError::HigherOrderOpFailure {
                                 op: "shard_map",
                                 message: format!("replaying staged op '{}' is not supported", equation.op.name()),
                             }));
@@ -1187,7 +1191,7 @@ fn replay_traced_xla_program<
                     XlaPrimitiveOp::MatMul => vec![input_values[0].clone().matmul(input_values[1].clone())],
                     XlaPrimitiveOp::MatrixTranspose => vec![input_values[0].clone().transpose_matrix()],
                     op => {
-                        return Err(ShardMapTraceError::TraceError(TraceError::HigherOrderOpFailure {
+                        return Err(ShardMapTraceError::TracingError(TracingError::HigherOrderOpFailure {
                             op: "shard_map",
                             message: format!("replaying staged op '{}' is not supported", op.name()),
                         }));
@@ -1206,7 +1210,7 @@ fn replay_traced_xla_program<
         .map(|output| {
             values[*output]
                 .clone()
-                .ok_or(ShardMapTraceError::TraceError(TraceError::UnboundAtomId { id: *output }))
+                .ok_or(ShardMapTraceError::TracingError(TracingError::UnboundAtomId { id: *output }))
         })
         .collect()
 }
@@ -1304,7 +1308,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         XlaEngine::token(),
         {
             let body = body.clone();
-            move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TraceError> {
+            move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TracingError> {
                 let local_primals = combined_inputs[..local_input_count].to_vec();
                 let local_tangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pushforward_program): (
@@ -1343,7 +1347,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         XlaEngine::token(),
         {
             let body = body.clone();
-            move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TraceError> {
+            move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TracingError> {
                 let local_primals = combined_inputs[..local_input_count].to_vec();
                 let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pullback_program): (
@@ -1416,8 +1420,8 @@ pub(crate) fn apply_linearized_flat_shard_map(
 }
 
 impl ReplayShardMapValue for ShardMapTracer {
-    fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TraceError> {
-        let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+    fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TracingError> {
+        let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
         let builder = exemplar.builder_handle();
         let staging_error = exemplar.staging_error_handle();
         let atom = builder.borrow_mut().add_constant(constant.clone());
@@ -1430,8 +1434,8 @@ impl ReplayShardMapValue for ShardMapTracer {
 }
 
 impl ReplayShardMapValue for Linearized<ShardMapTracer> {
-    fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TraceError> {
-        let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+    fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TracingError> {
+        let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
         let primal =
             <ShardMapTracer as ReplayShardMapValue>::lift_constant(constant, std::slice::from_ref(&exemplar.primal))?;
         let zero = primal.zero_like();

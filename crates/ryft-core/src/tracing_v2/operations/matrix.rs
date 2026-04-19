@@ -13,7 +13,7 @@ use std::{
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        TraceError, Traceable, ZeroLike,
+        Traceable, TracingError, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,
@@ -110,16 +110,16 @@ fn matrix_array_type(data_type: DataType, rows: usize, cols: usize, sharding: Op
         .expect("matrix abstract evaluation should preserve rank-2 sharding")
 }
 
-fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TraceError> {
+fn matrix_parts(r#type: &ArrayType, op: &'static str) -> Result<(DataType, usize, usize), TracingError> {
     if !matches!(r#type.data_type, DataType::F32 | DataType::F64) || r#type.rank() != 2 {
-        return Err(TraceError::IncompatibleAbstractValues { op });
+        return Err(TracingError::IncompatibleAbstractValues { op });
     }
 
     let Size::Static(rows) = r#type.dimension(0) else {
-        return Err(TraceError::IncompatibleAbstractValues { op });
+        return Err(TracingError::IncompatibleAbstractValues { op });
     };
     let Size::Static(cols) = r#type.dimension(1) else {
-        return Err(TraceError::IncompatibleAbstractValues { op });
+        return Err(TracingError::IncompatibleAbstractValues { op });
     };
     Ok((r#type.data_type, rows, cols))
 }
@@ -177,11 +177,11 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
 ///
 /// This is the shared shape-and-sharding rule used by matrix multiplication across tracing,
 /// simplification, and backend wrappers.
-pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
+pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TracingError> {
     let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
     let (rhs_data_type, rhs_rows, rhs_cols) = matrix_parts(rhs, op)?;
     if lhs_data_type != rhs_data_type || lhs_cols != rhs_rows {
-        return Err(TraceError::IncompatibleAbstractValues { op });
+        return Err(TracingError::IncompatibleAbstractValues { op });
     }
     let sharding = matmul_array_sharding(lhs, rhs);
     Ok(matrix_array_type(lhs_data_type, lhs_rows, rhs_cols, sharding))
@@ -191,7 +191,7 @@ pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Re
 ///
 /// This centralizes the matrix-transpose metadata rule so both the core primitive and any backend
 /// wrappers agree on how shapes and sharding should propagate.
-pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
+pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TracingError> {
     let (data_type, rows, cols) = matrix_parts(input, op)?;
     let sharding = transpose_array_sharding(input);
     Ok(matrix_array_type(data_type, cols, rows, sharding))

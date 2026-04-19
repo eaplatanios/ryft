@@ -24,8 +24,8 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        Atom, AtomId, Equation, LinearProgramBuilder, LinearProgramOpRef, OneLike, Program, ProgramBuilder, TraceError,
-        Traceable, Value, ZeroLike,
+        Atom, AtomId, Equation, LinearProgramBuilder, LinearProgramOpRef, OneLike, Program, ProgramBuilder, Traceable,
+        TracingError, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
@@ -82,7 +82,7 @@ pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, O, 
     function: F,
     traced_inputs: &[Tracer<'engine, E>],
     input_types: Input,
-) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TraceError>
+) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TracingError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
@@ -92,9 +92,9 @@ where
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    let exemplar_engine = traced_inputs.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+    let exemplar_engine = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.engine();
     let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
         crate::tracing_v2::jit::trace(exemplar_engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
@@ -116,7 +116,7 @@ where
 fn reverse_mode_scalar_traced_program<'engine, V, O, L, E>(
     traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     traced_primals: Vec<Tracer<'engine, E>>,
-) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TraceError>
+) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
     O: Clone + Op<ArrayType> + 'static,
@@ -127,7 +127,7 @@ where
 {
     let (outputs, pushforward) = linearize_traced_program::<V, O, L, E>(traced_program, traced_primals)?;
     if outputs.len() != 1 {
-        return Err(TraceError::InvalidOutputCount { expected: 1, got: outputs.len() });
+        return Err(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
     }
     let traced_output = outputs[0].clone();
     let pullback =
@@ -196,16 +196,16 @@ mod tests {
             "panic_replay"
         }
 
-        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![inputs[0].clone()])
         }
     }
 
     impl InterpretableOp<ArrayType, f64> for PanicReplayOp {
-        fn interpret(&self, _inputs: &[f64]) -> Result<Vec<f64>, TraceError> {
+        fn interpret(&self, _inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
             panic!("panic_replay interpret should not run during this transform")
         }
     }
@@ -214,9 +214,9 @@ mod tests {
         fn transpose(
             &self,
             output_cotangents: &[LinearTerm<ArrayType, f64>],
-        ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TraceError> {
+        ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TracingError> {
             if output_cotangents.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
             }
             Ok(vec![Some(output_cotangents[0].clone())])
         }
@@ -234,9 +234,9 @@ mod tests {
                 LinearOperation = LinearProgramOpRef<f64>,
             >,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
-        ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TraceError> {
+        ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![inputs[0].clone()])
         }

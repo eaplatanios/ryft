@@ -62,7 +62,7 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// Conceptually this is no different from replaying an ordinary [`Program`], but the
     /// documentation deliberately uses linear language because these programs represent derived
     /// linear maps rather than original user functions.
-    pub fn call(&self, input: Input) -> Result<Output, TraceError>
+    pub fn call(&self, input: Input) -> Result<Output, TracingError>
     where
         O: InterpretableOp<T, V>,
         Input::ParameterStructure: PartialEq,
@@ -77,7 +77,7 @@ impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>,
 {
     /// Transposes the linear program, turning a pushforward into a pullback.
     #[allow(private_bounds)]
-    pub fn transpose(&self) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TraceError>
+    pub fn transpose(&self) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
     where
         V: ZeroLike,
         O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
@@ -113,7 +113,7 @@ fn transpose<V, O>(
     op: &O,
     builder: &Rc<RefCell<LinearProgramBuilder<V, O>>>,
     output_cotangents: &[AtomId],
-) -> Result<Vec<Option<AtomId>>, TraceError>
+) -> Result<Vec<Option<AtomId>>, TracingError>
 where
     V: Traceable<ArrayType>,
     O: CoreLinearProgramOp<V> + Clone,
@@ -138,7 +138,7 @@ pub(crate) fn linearize_program<Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     program: &Program<ArrayType, V, O, Input, Output>,
     input_primals: Vec<V>,
-) -> Result<LinearProgram<ArrayType, V, Input, Output, L>, TraceError>
+) -> Result<LinearProgram<ArrayType, V, Input, Output, L>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -152,7 +152,7 @@ where
         builder: &Rc<RefCell<LinearProgramBuilder<V, LinearOperation>>>,
         tangents: &mut [Option<LinearTerm<ArrayType, V, LinearOperation>>],
         atom_id: AtomId,
-    ) -> Result<LinearTerm<ArrayType, V, LinearOperation>, TraceError>
+    ) -> Result<LinearTerm<ArrayType, V, LinearOperation>, TracingError>
     where
         V: Traceable<ArrayType> + ZeroLike,
         Input: Parameterized<V>,
@@ -163,7 +163,7 @@ where
         if let Some(term) = tangents[atom_id].clone() {
             return Ok(term);
         }
-        let primal = primal_values[atom_id].as_ref().ok_or(TraceError::UnboundAtomId { id: atom_id })?;
+        let primal = primal_values[atom_id].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let tangent_atom = builder.borrow_mut().add_constant(primal.zero_like());
         let tangent = LinearTerm::from_staged_parts(tangent_atom, builder.clone());
         tangents[atom_id] = Some(tangent.clone());
@@ -172,9 +172,12 @@ where
 
     let program = program;
     if input_primals.len() != program.input_atoms().len() {
-        return Err(TraceError::InvalidInputCount { expected: program.input_atoms().len(), got: input_primals.len() });
+        return Err(TracingError::InvalidInputCount {
+            expected: program.input_atoms().len(),
+            got: input_primals.len(),
+        });
     }
-    let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
+    let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, L>::new()));
     let mut primals: Vec<Option<V>> = vec![None; program.atom_count()];
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atom_count()];
@@ -196,7 +199,7 @@ where
             .copied()
             .map(|input_atom| {
                 Ok(JvpTracer {
-                    primal: primals[input_atom].clone().ok_or(TraceError::UnboundAtomId { id: input_atom })?,
+                    primal: primals[input_atom].clone().ok_or(TracingError::UnboundAtomId { id: input_atom })?,
                     tangent: tangent_for_atom(
                         program,
                         primals.as_slice(),
@@ -206,14 +209,14 @@ where
                     )?,
                 })
             })
-            .collect::<Result<Vec<_>, TraceError>>()?;
+            .collect::<Result<Vec<_>, TracingError>>()?;
         let output_duals = DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L>::jvp(
             &equation.op,
             engine,
             input_duals.as_slice(),
         )?;
         if output_duals.len() != equation.outputs.len() {
-            return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
+            return Err(TracingError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
         }
         for (output_atom, output_dual) in equation.outputs.iter().copied().zip(output_duals.into_iter()) {
             primals[output_atom] = Some(output_dual.primal);
@@ -234,7 +237,7 @@ where
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
-            return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
+            return Err(TracingError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
         }
     };
     Ok(LinearProgram {
@@ -258,7 +261,7 @@ where
 #[allow(private_bounds)]
 pub fn transpose_linear_program<V, Input, Output, O>(
     program: &LinearProgram<ArrayType, V, Input, Output, O>,
-) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TraceError>
+) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -274,12 +277,12 @@ where
 fn transpose_linear_program_with_output_inputs<V, Input, Output, O, F>(
     program: &LinearProgram<ArrayType, V, Input, Output, O>,
     mut make_output_cotangent_input: F,
-) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TraceError>
+) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    F: FnMut(&mut LinearProgramBuilder<V, O>, &ArrayType, usize) -> Result<AtomId, TraceError>,
+    F: FnMut(&mut LinearProgramBuilder<V, O>, &ArrayType, usize) -> Result<AtomId, TracingError>,
     O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
     fn accumulate<V, O>(
@@ -287,7 +290,7 @@ where
         adjoints: &mut [Option<AtomId>],
         atom: AtomId,
         contribution: AtomId,
-    ) -> Result<(), TraceError>
+    ) -> Result<(), TracingError>
     where
         V: Traceable<ArrayType>,
         O: LinearAddOperation<ArrayType, V> + Op<ArrayType> + Clone,
@@ -312,7 +315,7 @@ where
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, O>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(linear_body.outputs().len());
     for (output_index, output) in linear_body.outputs().iter().enumerate() {
-        let output_atom = linear_body.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
+        let output_atom = linear_body.atom(*output).ok_or(TracingError::UnboundAtomId { id: *output })?;
         let cotangent_input = make_output_cotangent_input(&mut builder.borrow_mut(), &output_atom.tpe(), output_index)?;
         output_cotangent_inputs.push(cotangent_input);
     }
@@ -346,7 +349,7 @@ where
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
-            return Err(TraceError::InternalInvariantViolation(
+            return Err(TracingError::InternalInvariantViolation(
                 "transpose builder should not have outstanding linear terms",
             ));
         }
@@ -374,7 +377,7 @@ where
 pub fn transpose_linear_program_with_output_examples<V, Input, Output, O>(
     program: &LinearProgram<ArrayType, V, Input, Output, O>,
     output_examples: &[V],
-) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TraceError>
+) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -383,7 +386,7 @@ where
 {
     let expected_output_count = program.program().outputs().len();
     if output_examples.len() != expected_output_count {
-        return Err(TraceError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
+        return Err(TracingError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }
     transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V, O>, _, output_index| {
         Ok(builder.add_input(&output_examples[output_index].zero_like()))
@@ -393,12 +396,12 @@ where
 fn lift_traced_constant<'engine, V, O: Clone, L: Clone, E>(
     constant: &V,
     inputs: &[Tracer<'engine, E>],
-) -> Result<Tracer<'engine, E>, TraceError>
+) -> Result<Tracer<'engine, E>, TracingError>
 where
     V: Traceable<ArrayType>,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
 {
-    let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+    let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
     let atom = exemplar.builder_handle().borrow_mut().add_constant(constant.clone());
     Ok(Tracer::from_engine(atom, exemplar.builder_handle(), exemplar.staging_error_handle(), exemplar.engine()))
 }
@@ -406,12 +409,12 @@ where
 pub(crate) fn lift_linearized_traced_constant<'engine, V, O: Clone + 'static, L: Clone + 'static, E>(
     constant: &V,
     inputs: &[LinearizedTracedValue<'engine, E>],
-) -> Result<LinearizedTracedValue<'engine, E>, TraceError>
+) -> Result<LinearizedTracedValue<'engine, E>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
 {
-    let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
+    let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
     let primal = lift_traced_constant::<V, O, L, E>(constant, std::slice::from_ref(&exemplar.primal))?;
     let tangent_atom = exemplar.tangent.builder_handle().borrow_mut().add_constant(primal.zero_like());
     let tangent = LinearTerm::from_staged_parts(tangent_atom, exemplar.tangent.builder_handle());

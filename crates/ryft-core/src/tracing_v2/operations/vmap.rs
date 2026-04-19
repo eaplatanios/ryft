@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, Tracer, Value, ZeroLike,
+        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, Traceable, Tracer, TracingError, Value, ZeroLike,
         engine::Engine,
         linear::{linearize_program, replay_program_linearized_jit, transpose_linear_program_with_output_examples},
     },
@@ -127,13 +127,13 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
         (0..self.lane_count).flat_map(|_| self.output_types.iter().cloned()).collect::<Vec<_>>()
     }
 
-    pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>
+    pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>
     where
         O: InterpretableOp<T, V>,
         Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     {
         if inputs.len() != self.total_input_count() {
-            return Err(TraceError::InvalidInputCount { expected: self.total_input_count(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: self.total_input_count(), got: inputs.len() });
         }
 
         let lane_input_count = self.input_types.len();
@@ -199,13 +199,13 @@ impl<V: Traceable<ArrayType>, O: Clone, L: Clone> Op for VMapOp<ArrayType, V, O,
         "vmap"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         let expected_inputs = self.body.repeated_input_types();
         if inputs.len() != expected_inputs.len() {
-            return Err(TraceError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
         }
         if inputs != expected_inputs.as_slice() {
-            return Err(TraceError::IncompatibleAbstractValues { op: "vmap" });
+            return Err(TracingError::IncompatibleAbstractValues { op: "vmap" });
         }
         Ok(self.body.repeated_output_types())
     }
@@ -216,7 +216,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: InterpretableOp<ArrayType, V>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
@@ -237,7 +237,7 @@ where
     fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TraceError> {
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::vmap_op(self.clone()))?;
         let lane_input_count = self.body().input_types().len();
@@ -293,7 +293,8 @@ where
         &self,
         engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>>, TraceError> {
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>>, TracingError>
+    {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
@@ -323,7 +324,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
-    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TraceError> {
+    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         Tracer::apply_staged_op(inputs, O::vmap_op(self.clone()))
     }
 }
@@ -382,13 +383,13 @@ impl<V: Traceable<ArrayType>, O: Clone> Op for LinearVMapOp<ArrayType, V, O> {
         "vmap"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         let expected_inputs = self.body.repeated_input_types();
         if inputs.len() != expected_inputs.len() {
-            return Err(TraceError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
         }
         if inputs != expected_inputs.as_slice() {
-            return Err(TraceError::IncompatibleAbstractValues { op: "vmap" });
+            return Err(TracingError::IncompatibleAbstractValues { op: "vmap" });
         }
         Ok(self.body.repeated_output_types())
     }
@@ -399,7 +400,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: InterpretableOp<ArrayType, V>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
@@ -410,9 +411,9 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearVMapOp<Arr
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         if output_cotangents.len() != self.body.total_output_count() {
-            return Err(TraceError::InvalidInputCount {
+            return Err(TracingError::InvalidInputCount {
                 expected: self.body.total_output_count(),
                 got: output_cotangents.len(),
             });
@@ -435,7 +436,7 @@ pub(crate) fn make_linear_vmap<'engine, V, O>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
     body: &FlatTracedVMap<ArrayType, V, O>,
     input_primals: Vec<V>,
-) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
+) -> Result<LinearVMapOp<ArrayType, V>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,

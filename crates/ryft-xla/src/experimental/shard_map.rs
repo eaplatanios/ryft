@@ -69,7 +69,7 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::operations::{AddOp, MatMulOp, MatrixTransposeOp, MulOp};
 use ryft_core::tracing_v2::{
-    Cos, Linearized, MatrixOps, OneLike, Op, Program, Sin, TraceError, Traceable, Tracer, Value, ZeroLike,
+    Cos, Linearized, MatrixOps, OneLike, Op, Program, Sin, Traceable, Tracer, TracingError, Value, ZeroLike,
     trace as trace_types,
 };
 
@@ -172,7 +172,7 @@ pub enum ShardMapTraceError {
 
     /// Underlying tracing error returned while staging a shard-map body.
     #[error("{0}")]
-    TraceError(#[from] TraceError),
+    TracingError(#[from] TracingError),
 
     /// Underlying parameter-structure error returned while reparameterizing traced values.
     #[error("{0}")]

@@ -7,7 +7,7 @@ use std::{
 
 use ryft_core::{
     tracing_v2::{
-        CustomPrimitive, DifferentiableOp, InterpretableOp, LinearPrimitiveOp, LinearTerm, Op, TraceError,
+        CustomPrimitive, DifferentiableOp, InterpretableOp, LinearPrimitiveOp, LinearTerm, Op, TracingError,
         engine::Engine,
         forward::JvpTracer,
         linear::Linearized,
@@ -137,7 +137,7 @@ impl Op for XlaPrimitiveOp {
         }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         match self {
             Self::Add => AddOp.abstract_eval(inputs),
             Self::Mul => MulOp.abstract_eval(inputs),
@@ -182,7 +182,7 @@ impl Op for XlaPrimitiveOp {
 }
 
 impl InterpretableOp<ArrayType, ShardMapTensor> for XlaPrimitiveOp {
-    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Mul => MulOp.interpret(inputs),
@@ -224,7 +224,7 @@ impl
             LinearOperation = XlaLinearOperation,
         >,
         inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>>>, TraceError>
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>>>, TracingError>
     {
         match self {
             Self::Add => AddOp.jvp(engine, inputs),
@@ -240,11 +240,11 @@ impl
             Self::Reshape { input_type, output_type } => {
                 ReshapeOp::new(input_type.clone(), output_type.clone()).jvp(engine, inputs)
             }
-            Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
+            Self::VMap(vmap) => Err(TracingError::HigherOrderOpFailure {
                 op: "linearize_program",
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
-            Self::Rematerialize(remat) => Err(TraceError::HigherOrderOpFailure {
+            Self::Rematerialize(remat) => Err(TracingError::HigherOrderOpFailure {
                 op: "linearize_program",
                 message: format!("JVP rule for staged op '{}' is not implemented", remat.name()),
             }),
@@ -256,7 +256,10 @@ impl
 }
 
 impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for XlaPrimitiveOp {
-    fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+    fn interpret(
+        &self,
+        inputs: &[Linearized<ShardMapTracer>],
+    ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError> {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Mul => MulOp.interpret(inputs),
@@ -275,7 +278,7 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for XlaPrimitiveOp {
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
             Self::WithShardingConstraint(op) => op.interpret(inputs),
-            Self::Custom(_) => Err(TraceError::HigherOrderOpFailure {
+            Self::Custom(_) => Err(TracingError::HigherOrderOpFailure {
                 op: "eval_linearized_jit",
                 message: "linearized JIT replay for custom XLA ops is not supported".to_string(),
             }),

@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, Tracer, Value, ZeroLike,
+        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, Traceable, Tracer, TracingError, Value, ZeroLike,
         engine::Engine,
         linear::{
             linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
@@ -151,12 +151,12 @@ impl<V: Traceable<ArrayType>, O: Clone, L: Clone> Op for RematerializeOp<ArrayTy
         "rematerialize"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         if inputs.len() != self.body.input_types.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.body.input_types.len(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: self.body.input_types.len(), got: inputs.len() });
         }
         if inputs != self.body.input_types.as_slice() {
-            return Err(TraceError::IncompatibleAbstractValues { op: "rematerialize" });
+            return Err(TracingError::IncompatibleAbstractValues { op: "rematerialize" });
         }
         Ok(self.body.output_types.clone())
     }
@@ -167,7 +167,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: InterpretableOp<ArrayType, V>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.program.call(inputs.to_vec())
@@ -189,7 +189,7 @@ where
     fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TraceError> {
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::rematerialize_op(self.clone()))?;
         let tangent_outputs =
@@ -240,7 +240,8 @@ where
         &self,
         engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
         inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>>, TraceError> {
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>>, TracingError>
+    {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
@@ -268,7 +269,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType> + InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
-    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TraceError> {
+    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         Tracer::apply_staged_op(inputs, O::rematerialize_op(self.clone()))
     }
 }
@@ -323,12 +324,12 @@ impl<V: Traceable<ArrayType>, O: Clone> Op for LinearRematerializeOp<ArrayType, 
         "rematerialize"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         if inputs.len() != self.body.input_types.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.body.input_types.len(), got: inputs.len() });
+            return Err(TracingError::InvalidInputCount { expected: self.body.input_types.len(), got: inputs.len() });
         }
         if inputs != self.body.input_types.as_slice() {
-            return Err(TraceError::IncompatibleAbstractValues { op: "rematerialize" });
+            return Err(TracingError::IncompatibleAbstractValues { op: "rematerialize" });
         }
         Ok(self.body.output_types.clone())
     }
@@ -339,7 +340,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: InterpretableOp<ArrayType, V>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
         self.body.program.call(inputs.to_vec())
@@ -350,7 +351,7 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerial
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         let transpose = self.transpose_op();
         Ok(LinearTerm::apply_staged_op(
             output_cotangents,
@@ -370,7 +371,7 @@ pub(crate) fn make_linear_rematerialize<V, O>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
     body: &FlatTracedRematerialize<ArrayType, V, O>,
     input_primals: Vec<V>,
-) -> Result<LinearRematerializeOp<ArrayType, V>, TraceError>
+) -> Result<LinearRematerializeOp<ArrayType, V>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -433,7 +434,7 @@ pub(crate) trait RematerializeInvocationLeaf<
 >: Parameter + Sized
 {
     /// Invokes [`rematerialize`] for one concrete leaf regime.
-    fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>
+    fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where
         F: FnOnce(Input) -> Output;
 }
@@ -446,7 +447,7 @@ impl<
     Output: Parameterized<V, ParameterStructure: Clone>,
 > RematerializeInvocationLeaf<Input, Output> for V
 {
-    fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>
+    fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where
         F: FnOnce(Input) -> Output,
     {
@@ -474,7 +475,7 @@ where
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output, To<V> = Output::To<V>>,
     O: InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
-    fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>
+    fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where
         F: FnOnce(Input) -> Output,
     {
@@ -511,7 +512,7 @@ where
 
         let staged_outputs =
             Tracer::apply_staged_op(traced_inputs.as_slice(), O::rematerialize_op(RematerializeOp::new(body)))?;
-        Output::from_parameters(output_structure, staged_outputs).map_err(TraceError::from)
+        Output::from_parameters(output_structure, staged_outputs).map_err(TracingError::from)
     }
 }
 
@@ -533,7 +534,7 @@ where
 /// let (_, grad_fn) = compile_grad(&engine, |x: f64| rematerialize(|y| y.sin(), x).unwrap(), 1.0)?;
 /// ```
 #[allow(private_bounds)]
-pub fn rematerialize<F, Input, Output, V>(function: F, input: Input) -> Result<Output, TraceError>
+pub fn rematerialize<F, Input, Output, V>(function: F, input: Input) -> Result<Output, TracingError>
 where
     V: RematerializeInvocationLeaf<Input, Output>,
     Input: Parameterized<V, ParameterStructure: Clone>,

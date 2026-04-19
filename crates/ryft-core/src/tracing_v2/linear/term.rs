@@ -49,17 +49,17 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
     /// Shape validation is performed via [`Op::abstract_eval`]. Concrete evaluation is intentionally
     /// skipped because tangent-program outputs remain abstract until the staged linear program is
     /// replayed on concrete tangents.
-    pub fn apply_staged_op(inputs: &[Self], op: O, output_count: usize) -> Result<Vec<Self>, TraceError>
+    pub fn apply_staged_op(inputs: &[Self], op: O, output_count: usize) -> Result<Vec<Self>, TracingError>
     where
         O: Op<T>,
     {
         if inputs.is_empty() {
-            return Err(TraceError::EmptyParameterizedValue);
+            return Err(TracingError::EmptyParameterizedValue);
         }
 
         let builder = inputs[0].builder.clone();
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
-            return Err(TraceError::InternalInvariantViolation(
+            return Err(TracingError::InternalInvariantViolation(
                 "linear tracer inputs for one staged op must share the same builder",
             ));
         }
@@ -75,7 +75,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
         let output_atoms = borrow.add_equation_prevalidated(op, input_atoms, output_abstracts);
         drop(borrow);
         if output_atoms.len() != output_count {
-            return Err(TraceError::InvalidOutputCount { expected: output_count, got: output_atoms.len() });
+            return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_atoms.len() });
         }
         Ok(output_atoms.into_iter().map(|atom| Self { atom, builder: builder.clone() }).collect())
     }

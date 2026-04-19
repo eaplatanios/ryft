@@ -17,7 +17,7 @@ use indoc::indoc;
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
-        MatrixOps, OneLike, TraceError, Traceable, ZeroLike,
+        MatrixOps, OneLike, Traceable, TracingError, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
@@ -123,7 +123,7 @@ fn reshape_array_sharding(
     input: &ArrayType,
     target_shape: &Shape,
     op: &'static str,
-) -> Result<Option<Sharding>, TraceError> {
+) -> Result<Option<Sharding>, TracingError> {
     let Some(sharding) = input.sharding.clone() else {
         return Ok(None);
     };
@@ -136,7 +136,7 @@ fn reshape_array_sharding(
     let Some(groups) =
         reshape_dimension_groups(input_non_singleton_dimensions.as_slice(), output_non_singleton_dimensions.as_slice())
     else {
-        return Err(TraceError::InternalInvariantViolation(
+        return Err(TracingError::InternalInvariantViolation(
             "static reshape group alignment should succeed after element-count validation",
         ));
     };
@@ -158,7 +158,7 @@ fn reshape_array_sharding(
             .map(|(index, _)| &sharding.dimensions[*index])
             .all(is_effectively_unsharded_dimension)
         {
-            return Err(TraceError::IncompatibleAbstractValues { op });
+            return Err(TracingError::IncompatibleAbstractValues { op });
         }
 
         for (output_dimension_index, _) in
@@ -176,27 +176,27 @@ fn reshape_array_sharding(
         sharding.varying_manual_axes.clone(),
     )
     .map(|sharding| Some(sharding.without_auto_axes()))
-    .map_err(|_| TraceError::InternalInvariantViolation("reshape output sharding should match the target rank"))
+    .map_err(|_| TracingError::InternalInvariantViolation("reshape output sharding should match the target rank"))
 }
 
 /// Computes the abstract output type of one reshape application.
-pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static str) -> Result<ArrayType, TraceError> {
+pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static str) -> Result<ArrayType, TracingError> {
     if input.shape == *target_shape {
         return Ok(input.clone());
     }
 
     let Some(input_elements) = static_shape_element_count(&input.shape) else {
-        return Err(TraceError::IncompatibleAbstractValues { op });
+        return Err(TracingError::IncompatibleAbstractValues { op });
     };
     let Some(output_elements) = static_shape_element_count(target_shape) else {
-        return Err(TraceError::IncompatibleAbstractValues { op });
+        return Err(TracingError::IncompatibleAbstractValues { op });
     };
     if input_elements != output_elements {
-        return Err(TraceError::IncompatibleAbstractValues { op });
+        return Err(TracingError::IncompatibleAbstractValues { op });
     }
 
     ArrayType::new(input.data_type, target_shape.clone(), None, reshape_array_sharding(input, target_shape, op)?)
-        .map_err(|_| TraceError::InternalInvariantViolation("reshape output sharding should match the target rank"))
+        .map_err(|_| TracingError::InternalInvariantViolation("reshape output sharding should match the target rank"))
 }
 
 /// Value-level reshape capability shared by concrete leaves and transform-local wrappers.
@@ -208,7 +208,7 @@ pub trait ReshapeOps: Sized {
     ///
     /// Implementors keep the same Rust type before and after the reshape, so some value types can only accept a
     /// subset of logically valid shapes.
-    fn reshape(self, target_shape: Shape) -> Result<Self, TraceError>;
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError>;
 }
 
 /// Convenience trait for traceable leaves that can serve as the concrete values of a staged reshape.
@@ -225,11 +225,11 @@ impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 /// representations to be identical to the primal representation.
 pub trait ReshapeTangentSpace<V: ReshapeValue>: TangentSpace<ArrayType, V> {
     /// Reshapes one tangent value from `input_type` to `output_type`.
-    fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError>;
+    fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TracingError>;
 }
 
 impl<V: ReshapeValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike> ReshapeTangentSpace<V> for V {
-    fn reshape(_input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
+    fn reshape(_input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TracingError> {
         tangent.reshape(output_type.shape.clone())
     }
 }
@@ -244,7 +244,7 @@ impl<
 where
     O: Op<ArrayType>,
 {
-    fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError> {
+    fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TracingError> {
         if input_type == output_type {
             return Ok(tangent);
         }
@@ -260,7 +260,7 @@ where
 }
 
 impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.primal.tpe().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
         if input_type == output_type {
@@ -281,7 +281,7 @@ impl<
 where
     O: Op<ArrayType>,
 {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.tpe().into_owned();
         let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
         if input_type == output_type {
@@ -295,7 +295,7 @@ where
 }
 
 impl<V: ReshapeValue> ReshapeOps for Batch<V> {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         if self.lanes().iter().all(|lane| lane.tpe().shape == target_shape) {
             return Ok(self);
         }
@@ -309,14 +309,14 @@ impl<V: ReshapeValue> ReshapeOps for Batch<V> {
 }
 
 impl ReshapeOps for f32 {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         reshape_abstract(&self.tpe(), &target_shape, "reshape")?;
         Ok(self)
     }
 }
 
 impl ReshapeOps for f64 {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         reshape_abstract(&self.tpe(), &target_shape, "reshape")?;
         Ok(self)
     }
@@ -328,39 +328,39 @@ mod ndarray_support {
 
     use super::{ReshapeOps, reshape_abstract};
     use crate::{
-        tracing_v2::TraceError,
+        tracing_v2::TracingError,
         types::{Shape, Size, Typed},
     };
 
     impl ReshapeOps for Array2<f32> {
-        fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+        fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
             let input_type = self.tpe().into_owned();
             let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
             if input_type == output_type {
                 return Ok(self);
             }
             let [Size::Static(rows), Size::Static(cols)] = output_type.shape.dimensions.as_slice() else {
-                return Err(TraceError::IncompatibleAbstractValues { op: "reshape" });
+                return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
             };
             let values = self.iter().copied().collect::<Vec<_>>();
             Array2::from_shape_vec((*rows, *cols), values)
-                .map_err(|_| TraceError::IncompatibleAbstractValues { op: "reshape" })
+                .map_err(|_| TracingError::IncompatibleAbstractValues { op: "reshape" })
         }
     }
 
     impl ReshapeOps for Array2<f64> {
-        fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+        fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
             let input_type = self.tpe().into_owned();
             let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
             if input_type == output_type {
                 return Ok(self);
             }
             let [Size::Static(rows), Size::Static(cols)] = output_type.shape.dimensions.as_slice() else {
-                return Err(TraceError::IncompatibleAbstractValues { op: "reshape" });
+                return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
             };
             let values = self.iter().copied().collect::<Vec<_>>();
             Array2::from_shape_vec((*rows, *cols), values)
-                .map_err(|_| TraceError::IncompatibleAbstractValues { op: "reshape" })
+                .map_err(|_| TracingError::IncompatibleAbstractValues { op: "reshape" })
         }
     }
 }
@@ -408,17 +408,17 @@ impl Op for ReshapeOp {
         "reshape"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         if inputs[0] != *self.input_type() {
-            return Err(TraceError::IncompatibleAbstractValues { op: "reshape" });
+            return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
         }
         Ok(vec![self.output_type().clone()])
     }
 }
 
 impl<V: ReshapeValue> InterpretableOp<ArrayType, V> for ReshapeOp {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
@@ -428,7 +428,7 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         expect_input_count(output_cotangents.len(), 1)?;
         if self.input_type() == self.output_type() {
             return Ok(vec![Some(output_cotangents[0].clone())]);
@@ -456,14 +456,14 @@ impl<
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
 }
 
 impl<V: ReshapeValue> VectorizableOp<ArrayType, V> for ReshapeOp {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
@@ -613,7 +613,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(5)]), "reshape"),
-            Err(TraceError::IncompatibleAbstractValues { op: "reshape" })
+            Err(TracingError::IncompatibleAbstractValues { op: "reshape" })
         );
     }
 
@@ -630,7 +630,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(2), Size::Static(4)]), "reshape"),
-            Err(TraceError::IncompatibleAbstractValues { op: "reshape" })
+            Err(TracingError::IncompatibleAbstractValues { op: "reshape" })
         );
     }
 
@@ -649,7 +649,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(8)]), "reshape"),
-            Err(TraceError::IncompatibleAbstractValues { op: "reshape" })
+            Err(TracingError::IncompatibleAbstractValues { op: "reshape" })
         );
     }
 

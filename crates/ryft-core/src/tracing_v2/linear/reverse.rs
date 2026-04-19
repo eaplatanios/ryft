@@ -22,7 +22,7 @@ pub fn jvp_program<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>), TraceError>
+) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>), TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Traceable<ArrayType> + ZeroLike,
@@ -30,7 +30,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::LinearOperation: Clone + Op<ArrayType>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
@@ -65,7 +65,7 @@ pub(crate) fn jvp_traced<'engine, F, Input, Output, V, O, L, E>(
     function: F,
     primals: Input,
     tangents: Input,
-) -> Result<(Output, Output), TraceError>
+) -> Result<(Output, Output), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + PartialEq>,
@@ -79,10 +79,10 @@ where
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
     O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>>,
     LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
-    F: FnOnce(Input) -> Result<Output, TraceError>,
+    F: FnOnce(Input) -> Result<Output, TracingError>,
 {
     if primals.parameter_structure() != tangents.parameter_structure() {
-        return Err(TraceError::MismatchedParameterStructure);
+        return Err(TracingError::MismatchedParameterStructure);
     }
 
     let input_structure = primals.parameter_structure();
@@ -117,7 +117,7 @@ pub fn vjp<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input, E::LinearOperation>), TraceError>
+) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input, E::LinearOperation>), TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Traceable<ArrayType> + ZeroLike + OneLike,
@@ -125,7 +125,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::LinearOperation: Clone + Op<ArrayType>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
@@ -170,7 +170,11 @@ where
         E: 'engine;
 
     /// Invokes [`value_and_grad`] for one concrete leaf regime.
-    fn invoke<'engine, F>(engine: &'engine E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
+    fn invoke<'engine, F>(
+        engine: &'engine E,
+        function: F,
+        primals: Input,
+    ) -> Result<(Self::Value, Input), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
 }
@@ -207,7 +211,7 @@ where
     where
         E: 'engine;
 
-    fn invoke<'engine, F>(engine: &'engine E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
+    fn invoke<'engine, F>(engine: &'engine E, function: F, primals: Input) -> Result<(Self::Value, Input), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
@@ -249,7 +253,7 @@ where
     where
         E: 'call;
 
-    fn invoke<'call, F>(_engine: &'call E, function: F, primals: Input) -> Result<(Self::Value, Input), TraceError>
+    fn invoke<'call, F>(_engine: &'call E, function: F, primals: Input) -> Result<(Self::Value, Input), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>,
     {
@@ -437,7 +441,7 @@ where
         engine: &'engine E,
         function: F,
         primals: Input,
-    ) -> Result<(Self::Value, Input), TraceError>
+    ) -> Result<(Self::Value, Input), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
@@ -450,7 +454,7 @@ where
 
         let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
         if lane_primals.is_empty() {
-            return Err(TraceError::EmptyBatch);
+            return Err(TracingError::EmptyBatch);
         }
 
         let lane0 = lane_primals[0].clone();
@@ -506,11 +510,11 @@ where
         for lane in lane_primals {
             let flat: Vec<V> = lane.into_parameters().collect();
             let flat_result = compiled_vg.call(flat)?;
-            let (value, grad_flat) = flat_result.split_first().ok_or(TraceError::EmptyParameterizedValue)?;
+            let (value, grad_flat) = flat_result.split_first().ok_or(TracingError::EmptyParameterizedValue)?;
             lane_values.push(value.clone());
             lane_grads.push(
                 Input::To::<V>::from_parameters(input_structure.clone(), grad_flat.to_vec())
-                    .map_err(TraceError::from)?,
+                    .map_err(TracingError::from)?,
             );
         }
 
@@ -529,7 +533,7 @@ pub fn value_and_grad<'engine, E, F, Input, Leaf>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(<Leaf as ValueAndGradInvocationLeaf<E, Input>>::Value, Input), TraceError>
+) -> Result<(<Leaf as ValueAndGradInvocationLeaf<E, Input>>::Value, Input), TracingError>
 where
     E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,
@@ -546,7 +550,7 @@ where
 /// [`grad`] is just [`value_and_grad`] with the primal result discarded, but it is the most common
 /// user-facing reverse-mode entry point and therefore gets its own dedicated wrapper.
 #[allow(private_bounds, private_interfaces)]
-pub fn grad<'engine, E, F, Input, Leaf>(engine: &'engine E, function: F, primals: Input) -> Result<Input, TraceError>
+pub fn grad<'engine, E, F, Input, Leaf>(engine: &'engine E, function: F, primals: Input) -> Result<Input, TracingError>
 where
     E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,

@@ -1,13 +1,13 @@
 //! Reshape support for [`ShardMapTensor`].
 
-use ryft_core::tracing_v2::TraceError;
+use ryft_core::tracing_v2::TracingError;
 use ryft_core::tracing_v2::operations::reshape::{ReshapeOps, reshape_abstract};
 use ryft_core::types::{Shape, Typed};
 
 use crate::experimental::shard_map::ShardMapTensor;
 
 impl ReshapeOps for ShardMapTensor {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         Ok(Self::new(reshape_abstract(&self.tpe(), &target_shape, "reshape")?))
     }
 }

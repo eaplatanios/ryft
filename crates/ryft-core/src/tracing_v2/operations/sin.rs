@@ -9,7 +9,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    TraceError, Traceable,
+    Traceable, TracingError,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -74,13 +74,13 @@ impl Op for SinOp {
         "sin"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         Ok(vec![unary_abstract(inputs)?])
     }
 }
 
 impl<V: Traceable<ArrayType> + Sin> InterpretableOp<ArrayType, V> for SinOp {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().sin()])
     }
@@ -93,7 +93,7 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, O: Clon
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
         Ok(vec![JvpTracer {
@@ -104,7 +104,7 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, O: Clon
 }
 
 impl<V: Traceable<ArrayType> + Sin> VectorizableOp<ArrayType, V> for SinOp {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.sin()).collect())])
     }

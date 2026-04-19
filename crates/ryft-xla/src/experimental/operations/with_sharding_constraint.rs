@@ -8,7 +8,7 @@ use std::{
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, LinearProgramOpRef, Op,
-    PrimitiveOp, ProgramOpRef, TraceError, Tracer, VectorizableOp,
+    PrimitiveOp, ProgramOpRef, Tracer, TracingError, VectorizableOp,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -121,10 +121,10 @@ impl Op for WithShardingConstraintOp {
         "with_sharding_constraint"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         let mut output = unary_abstract(inputs)?;
         if output.rank() != self.sharding().rank() {
-            return Err(TraceError::IncompatibleAbstractValues { op: "with_sharding_constraint" });
+            return Err(TracingError::IncompatibleAbstractValues { op: "with_sharding_constraint" });
         }
         let mut sharding = self.sharding().clone();
         sharding.varying_manual_axes = output
@@ -138,7 +138,7 @@ impl Op for WithShardingConstraintOp {
 }
 
 impl InterpretableOp<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
-    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+    fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
@@ -148,7 +148,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TracingError> {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
@@ -190,7 +190,7 @@ impl
                 LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
             >,
         >,
-        TraceError,
+        TracingError,
     > {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
@@ -206,7 +206,10 @@ impl
 }
 
 impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingConstraintOp {
-    fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
+    fn interpret(
+        &self,
+        inputs: &[Linearized<ShardMapTracer>],
+    ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
         let primal = Tracer::apply_staged_op(
@@ -229,7 +232,7 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingCons
 }
 
 impl InterpretableOp<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
-    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TraceError> {
+    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
@@ -239,7 +242,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TracingError> {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
@@ -281,7 +284,7 @@ impl
                 LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
             >,
         >,
-        TraceError,
+        TracingError,
     > {
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
@@ -300,7 +303,7 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<ArrayType, V
     fn batch(
         &self,
         inputs: &[ryft_core::tracing_v2::Batch<V>],
-    ) -> Result<Vec<ryft_core::tracing_v2::Batch<V>>, TraceError> {
+    ) -> Result<Vec<ryft_core::tracing_v2::Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
@@ -310,8 +313,8 @@ impl InterpretableOp<ArrayType, Linearized<JitShardMapTracer>> for WithShardingC
     fn interpret(
         &self,
         _inputs: &[Linearized<JitShardMapTracer>],
-    ) -> Result<Vec<Linearized<JitShardMapTracer>>, TraceError> {
-        Err(TraceError::HigherOrderOpFailure {
+    ) -> Result<Vec<Linearized<JitShardMapTracer>>, TracingError> {
+        Err(TracingError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: "linearized JIT evaluation for 'with_sharding_constraint' at the JIT-tracer level is not \
                       supported"
@@ -473,7 +476,7 @@ mod tests {
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)
                     .unwrap()],
             ),
-            Err(TraceError::IncompatibleAbstractValues { op: "with_sharding_constraint" })
+            Err(TracingError::IncompatibleAbstractValues { op: "with_sharding_constraint" })
         );
     }
 

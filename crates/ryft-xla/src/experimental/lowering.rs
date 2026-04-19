@@ -2573,7 +2573,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, ProgramBuilder, Sin, TraceError, ZeroLike,
+        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, ProgramBuilder, Sin, TracingError, ZeroLike,
     };
     use ryft_core::types::Shape;
 
@@ -2613,18 +2613,18 @@ mod tests {
             "test_custom_lowered"
         }
 
-        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![inputs[0].clone()])
         }
     }
 
     impl InterpretableOp<ArrayType, ShardMapTensor> for TestCustomLoweredOp {
-        fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TraceError> {
+        fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![inputs[0].clone()])
         }

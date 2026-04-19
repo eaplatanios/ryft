@@ -17,7 +17,7 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        OneLike, Program, TraceError, Traceable, ZeroLike,
+        OneLike, Program, Traceable, TracingError, ZeroLike,
         engine::Engine,
         jit::Tracer,
         operations::{
@@ -131,9 +131,9 @@ pub fn stack<
     V: Parameter,
 >(
     inputs: Vec<Input>,
-) -> Result<Input::To<Batch<V>>, TraceError> {
+) -> Result<Input::To<Batch<V>>, TracingError> {
     let mut inputs = inputs.into_iter();
-    let first = inputs.next().ok_or(TraceError::EmptyBatch)?;
+    let first = inputs.next().ok_or(TracingError::EmptyBatch)?;
     let structure = first.parameter_structure();
     let parameter_count = structure.parameter_count();
     let mut buckets = (0..parameter_count).map(|_| Vec::new()).collect::<Vec<Vec<V>>>();
@@ -145,7 +145,7 @@ pub fn stack<
 
     for input in inputs {
         if input.parameter_structure() != structure {
-            return Err(TraceError::MismatchedParameterStructure);
+            return Err(TracingError::MismatchedParameterStructure);
         }
 
         for (bucket, parameter) in buckets.iter_mut().zip(input.into_parameters()) {
@@ -165,7 +165,7 @@ pub fn unstack<
     V: Parameter,
 >(
     batched: Input::To<Batch<V>>,
-) -> Result<Vec<Input>, TraceError> {
+) -> Result<Vec<Input>, TracingError> {
     let structure = batched.parameter_structure();
     let batches = batched.into_parameters().collect::<Vec<_>>();
     if batches.is_empty() {
@@ -174,7 +174,7 @@ pub fn unstack<
 
     let lane_count = batches[0].len();
     if batches.iter().any(|batch| batch.len() != lane_count) {
-        return Err(TraceError::MismatchedBatchSize);
+        return Err(TracingError::MismatchedBatchSize);
     }
 
     let mut lane_parameters = (0..lane_count).map(|_| Vec::with_capacity(batches.len())).collect::<Vec<Vec<V>>>();
@@ -186,7 +186,7 @@ pub fn unstack<
 
     lane_parameters
         .into_iter()
-        .map(|parameters| Input::from_parameters(structure.clone(), parameters).map_err(TraceError::from))
+        .map(|parameters| Input::from_parameters(structure.clone(), parameters).map_err(TracingError::from))
         .collect()
 }
 
@@ -205,7 +205,7 @@ pub(crate) trait VMapInvocationLeaf<
     fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
         function: F,
         inputs: Vec<Input>,
-    ) -> Result<Vec<Output>, TraceError>;
+    ) -> Result<Vec<Output>, TracingError>;
 }
 
 /// Concrete-value dispatch for [`vmap`]: stacks inputs into [`Batch`] leaves, applies the user function
@@ -224,7 +224,7 @@ impl<
     fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
         function: F,
         inputs: Vec<Input>,
-    ) -> Result<Vec<Output>, TraceError> {
+    ) -> Result<Vec<Output>, TracingError> {
         let batched_input = stack(inputs)?;
         unstack(function(batched_input))
     }
@@ -273,14 +273,14 @@ where
     fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
         function: F,
         inputs: Vec<Input>,
-    ) -> Result<Vec<Output>, TraceError> {
+    ) -> Result<Vec<Output>, TracingError> {
         let mut inputs = inputs.into_iter();
-        let first_input = inputs.next().ok_or(TraceError::EmptyBatch)?;
+        let first_input = inputs.next().ok_or(TracingError::EmptyBatch)?;
         let input_structure = first_input.parameter_structure();
         let mut traced_inputs = vec![first_input.into_parameters().collect::<Vec<_>>()];
         for input in inputs {
             if input.parameter_structure() != input_structure {
-                return Err(TraceError::MismatchedParameterStructure);
+                return Err(TracingError::MismatchedParameterStructure);
             }
             traced_inputs.push(input.into_parameters().collect::<Vec<_>>());
         }
@@ -291,7 +291,7 @@ where
             input_structure.clone(),
             traced_inputs[0].iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
-        let exemplar_engine = traced_inputs[0].first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
+        let exemplar_engine = traced_inputs[0].first().ok_or(TracingError::EmptyParameterizedValue)?.engine();
 
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,
@@ -309,7 +309,7 @@ where
                 for batch in batched_outputs.into_parameters() {
                     let mut outputs = batch.into_lanes();
                     if outputs.len() != 1 {
-                        return Err(TraceError::HigherOrderOpFailure {
+                        return Err(TracingError::HigherOrderOpFailure {
                             op: "vmap",
                             message: "traced vmap only supports bodies that preserve the per-lane output structure"
                                 .to_string(),
@@ -317,7 +317,7 @@ where
                     }
                     lane_outputs.push(outputs.pop().expect("single-lane batches should contain one output"));
                 }
-                Output::from_parameters(output_structure, lane_outputs).map_err(TraceError::from)
+                Output::from_parameters(output_structure, lane_outputs).map_err(TracingError::from)
             },
             exemplar_input_types,
         )?;
@@ -345,7 +345,7 @@ where
                 let start = lane_index * output_leaf_count;
                 let end = start + output_leaf_count;
                 Output::from_parameters(output_structure.clone(), staged_outputs[start..end].iter().cloned())
-                    .map_err(TraceError::from)
+                    .map_err(TracingError::from)
             })
             .collect()
     }
@@ -369,7 +369,7 @@ impl<
     fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
         function: F,
         inputs: Vec<Input>,
-    ) -> Result<Vec<Output>, TraceError> {
+    ) -> Result<Vec<Output>, TracingError> {
         let batched_input = stack(inputs)?;
         unstack(function(batched_input))
     }
@@ -391,7 +391,7 @@ pub fn vmap<
 >(
     function: F,
     inputs: Vec<Input>,
-) -> Result<Vec<Output>, TraceError> {
+) -> Result<Vec<Output>, TracingError> {
     V::invoke(function, inputs)
 }
 
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn stack_rejects_empty_inputs() {
         let result = stack::<(f64, f64), f64>(Vec::new());
-        assert!(matches!(result, Err(TraceError::EmptyBatch)));
+        assert!(matches!(result, Err(TracingError::EmptyBatch)));
         test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
@@ -425,7 +425,7 @@ mod tests {
     fn unstack_rejects_mismatched_lane_counts() {
         let batched = (Batch::new(vec![1.0f64]), Batch::new(vec![2.0f64, 3.0f64]));
         let result = unstack::<(f64, f64), f64>(batched);
-        assert!(matches!(result, Err(TraceError::MismatchedBatchSize)));
+        assert!(matches!(result, Err(TracingError::MismatchedBatchSize)));
         test_support::assert_reference_scalar_sine_jit_rendering();
     }
 

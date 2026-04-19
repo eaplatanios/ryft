@@ -16,15 +16,15 @@ fn replay_program_with<ProgramInput, ProgramOutput, V, O, R, LiftConstant, Apply
     inputs: Vec<R>,
     lift_constant: LiftConstant,
     apply_op: ApplyOp,
-) -> Result<Vec<R>, TraceError>
+) -> Result<Vec<R>, TracingError>
 where
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType>,
     O: Clone,
     R: Clone,
-    LiftConstant: Fn(&V, &[R]) -> Result<R, TraceError>,
-    ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TraceError>,
+    LiftConstant: Fn(&V, &[R]) -> Result<R, TracingError>,
+    ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TracingError>,
 {
     let mut values = vec![None; program.atom_count()];
     for (atom_id, value) in program.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
@@ -45,7 +45,7 @@ where
             Atom::Constant { value } => {
                 let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
                 if seed_inputs.is_empty() {
-                    return Err(TraceError::EmptyParameterizedValue);
+                    return Err(TracingError::EmptyParameterizedValue);
                 }
                 values[atom_id] = Some(lift_constant(value, seed_inputs.as_slice())?);
             }
@@ -57,7 +57,7 @@ where
                 let input_values = equation
                     .inputs
                     .iter()
-                    .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
+                    .map(|input| values[*input].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let outputs = apply_op(&equation.op, input_values)?;
                 for (output_atom, output_value) in equation.outputs.iter().copied().zip(outputs) {
@@ -70,7 +70,7 @@ where
     program
         .outputs()
         .iter()
-        .map(|output| values[*output].clone().ok_or(TraceError::UnboundAtomId { id: *output }))
+        .map(|output| values[*output].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
         .collect()
 }
 
@@ -81,7 +81,7 @@ where
 pub(crate) fn replay_program_linearized_jit<'engine, ProgramInput, ProgramOutput, V, O, L, E>(
     program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     inputs: Vec<LinearizedTracedValue<'engine, E>>,
-) -> Result<Vec<LinearizedTracedValue<'engine, E>>, TraceError>
+) -> Result<Vec<LinearizedTracedValue<'engine, E>>, TracingError>
 where
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
@@ -104,7 +104,7 @@ where
 pub(crate) fn linearize_traced_program<'engine, V, O, L, E>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     primals: Vec<Tracer<'engine, E>>,
-) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TraceError>
+) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     O: Clone + Op<ArrayType> + 'static,
@@ -112,7 +112,7 @@ where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     O: InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>> + Clone,
 {
-    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
+    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let input_count = primals.len();
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<
         Tracer<'engine, E>,
@@ -132,7 +132,7 @@ where
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
-            return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
+            return Err(TracingError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
         }
     };
     let program = builder

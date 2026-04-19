@@ -18,7 +18,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        Cos, MatrixOps, OneLike, Sin, TraceError, Traceable, Value, ZeroLike,
+        Cos, MatrixOps, OneLike, Sin, Traceable, TracingError, Value, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
@@ -183,12 +183,12 @@ impl<T: Type + Display, V: Traceable<T>> Clone for LinearPrimitiveOp<T, V> {
 
 impl<V: Traceable<ArrayType> + 'static> LinearPrimitiveOp<ArrayType, V> {
     /// Wraps one custom primitive in the linear-only operation universe after verifying transpose support.
-    pub fn custom(primitive: CustomPrimitive<ArrayType, V>) -> Result<Self, TraceError> {
+    pub fn custom(primitive: CustomPrimitive<ArrayType, V>) -> Result<Self, TracingError> {
         Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
     }
 
     /// Wraps one shared custom primitive in the linear-only operation universe after verifying transpose support.
-    pub fn custom_arc(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Result<Self, TraceError> {
+    pub fn custom_arc(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Result<Self, TracingError> {
         Ok(Self::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
     }
 }
@@ -360,12 +360,12 @@ impl<T: Type + Display, V: Traceable<T>> LinearRematerializeOperation<T, V> for 
 
 impl<T: Type + Display + 'static, V: Traceable<T> + 'static> LinearCustomOperation<T, V> for LinearPrimitiveOp<T, V> {
     #[inline]
-    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self, TraceError> {
+    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError> {
         Ok(LinearPrimitiveOp::Custom(Arc::new(primitive.into_linear()?)))
     }
 
     #[inline]
-    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TraceError> {
+    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError> {
         Ok(LinearPrimitiveOp::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
     }
 }
@@ -451,7 +451,7 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
         }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         match self {
             Self::Add => AddOp.abstract_eval(inputs),
             Self::Mul => MulOp.abstract_eval(inputs),
@@ -522,7 +522,7 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
         }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         match self {
             Self::Add => AddOp.abstract_eval(inputs),
             Self::Neg => NegOp.abstract_eval(inputs),
@@ -593,7 +593,7 @@ impl<
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Mul => MulOp.interpret(inputs),
@@ -627,7 +627,7 @@ impl<
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Neg => NegOp.interpret(inputs),
@@ -661,7 +661,7 @@ where
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         match self {
             Self::Add => AddOp.transpose(output_cotangents),
             Self::Neg => NegOp.transpose(output_cotangents),
@@ -721,7 +721,7 @@ where
     fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TraceError> {
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Mul => MulOp.interpret(inputs),
@@ -771,7 +771,7 @@ where
             LinearOperation = LinearPrimitiveOp<ArrayType, V>,
         >,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TracingError> {
         match self {
             Self::Add => DifferentiableOp::<
                 ArrayType,
@@ -852,7 +852,7 @@ where
                     LinearPrimitiveOp<ArrayType, V>,
                 >::jvp(&ReshapeOp::new(input_type.clone(), output_type.clone()), engine, inputs)
             }
-            Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
+            Self::VMap(vmap) => Err(TracingError::HigherOrderOpFailure {
                 op: "linearize_program",
                 message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
             }),
@@ -871,7 +871,7 @@ where
 impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Sin + Cos + MatrixOps + 'static>
     VectorizableOp<ArrayType, V> for PrimitiveOp<ArrayType, V>
 {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         match self {
             Self::Add => AddOp.batch(inputs),
             Self::Mul => MulOp.batch(inputs),
@@ -881,7 +881,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = 
             Self::MatMul => MatMulOp.batch(inputs),
             Self::MatrixTranspose => MatrixTransposeOp.batch(inputs),
             Self::Custom(op) => op.batch(inputs),
-            _ => Err(TraceError::HigherOrderOpFailure {
+            _ => Err(TracingError::HigherOrderOpFailure {
                 op: "vectorize",
                 message: format!("vectorization rule for staged op '{}' is not implemented", self.name()),
             }),

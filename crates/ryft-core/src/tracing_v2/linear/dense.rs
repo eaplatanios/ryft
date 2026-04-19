@@ -93,18 +93,18 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure,
         output_structure: OutputStructure,
         input_coordinate_counts: Vec<usize>,
         output_coordinate_counts: Vec<usize>,
-    ) -> Result<Self, TraceError> {
+    ) -> Result<Self, TracingError> {
         let rows = output_coordinate_counts.iter().sum::<usize>();
         let cols = input_coordinate_counts.iter().sum::<usize>();
         if rows_data.len() != rows {
-            return Err(TraceError::InternalInvariantViolation(
+            return Err(TracingError::InternalInvariantViolation(
                 "row-major Jacobian materialization produced an unexpected number of rows",
             ));
         }
         let mut values = Vec::with_capacity(rows.saturating_mul(cols));
         for row in rows_data {
             if row.len() != cols {
-                return Err(TraceError::InternalInvariantViolation(
+                return Err(TracingError::InternalInvariantViolation(
                     "row-major Jacobian materialization produced an unexpected row width",
                 ));
             }
@@ -127,11 +127,11 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure,
         output_structure: OutputStructure,
         input_coordinate_counts: Vec<usize>,
         output_coordinate_counts: Vec<usize>,
-    ) -> Result<Self, TraceError> {
+    ) -> Result<Self, TracingError> {
         let rows = output_coordinate_counts.iter().sum::<usize>();
         let cols = input_coordinate_counts.iter().sum::<usize>();
         if columns.len() != cols {
-            return Err(TraceError::InternalInvariantViolation(
+            return Err(TracingError::InternalInvariantViolation(
                 "column-major Jacobian materialization produced an unexpected number of columns",
             ));
         }
@@ -139,7 +139,7 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure,
         for row in 0..rows {
             for column in columns.iter() {
                 if column.len() != rows {
-                    return Err(TraceError::InternalInvariantViolation(
+                    return Err(TracingError::InternalInvariantViolation(
                         "column-major Jacobian materialization produced an unexpected column height",
                     ));
                 }
@@ -240,7 +240,7 @@ where
     value.into_parameters().flat_map(|parameter| parameter.coordinates()).collect::<Vec<_>>()
 }
 
-fn standard_basis<Value, V>(structure: &Value::ParameterStructure, parameters: &[V]) -> Result<Vec<Value>, TraceError>
+fn standard_basis<Value, V>(structure: &Value::ParameterStructure, parameters: &[V]) -> Result<Vec<Value>, TracingError>
 where
     Value: Parameterized<V, ParameterStructure: Clone>,
     V: CoordinateValue,
@@ -266,7 +266,7 @@ pub fn jacfwd<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
+) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
@@ -274,7 +274,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -318,7 +318,7 @@ pub fn jacrev<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
+) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
@@ -326,7 +326,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -364,13 +364,13 @@ pub fn hessian<'engine, E, F, Input, V>(
     engine: &'engine E,
     gradient_function: F,
     primals: Input,
-) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
+) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TracingError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,

@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    TraceError, Traceable,
+    Traceable, TracingError,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -53,7 +53,7 @@ impl Op for MulOp {
         "mul"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         Ok(vec![binary_same_abstract("mul", inputs)?])
     }
 
@@ -82,7 +82,7 @@ impl Op for MulOp {
 }
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> for MulOp {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
@@ -95,7 +95,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         let left = &inputs[0];
         let right = &inputs[1];
@@ -110,7 +110,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
 }
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOp<ArrayType, V> for MulOp {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;
         Ok(vec![Batch::new(

@@ -12,14 +12,14 @@ use thiserror::Error;
 use crate::parameters::Parameterized;
 use crate::types::ArrayType;
 
-use super::{Atom, Op, Program, TraceError, Traceable};
+use super::{Atom, Op, Program, Traceable, TracingError};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
 pub enum BenchmarkError {
     /// Wrapper around tracing failures while building or summarizing a benchmark case.
     #[error("{0}")]
-    Trace(#[from] TraceError),
+    Trace(#[from] TracingError),
 
     /// Wrapper around a boxed error returned by an external benchmark case provider.
     #[error("{0}")]

@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    TraceError, Traceable, ZeroLike,
+    Traceable, TracingError, ZeroLike,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -66,7 +66,7 @@ impl Op for AddOp {
         "add"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         Ok(vec![binary_same_abstract("add", inputs)?])
     }
 
@@ -91,7 +91,7 @@ impl Op for AddOp {
 }
 
 impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOp<ArrayType, V> for AddOp {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
@@ -101,7 +101,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(output_cotangents[0].clone()), Some(output_cotangents[0].clone())])
     }
@@ -114,7 +114,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![JvpTracer {
             primal: inputs[0].primal.clone() + inputs[1].primal.clone(),
@@ -124,7 +124,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O
 }
 
 impl<V: Traceable<ArrayType> + Add<Output = V>> VectorizableOp<ArrayType, V> for AddOp {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;
         Ok(vec![Batch::new(
@@ -156,7 +156,7 @@ mod tests {
             <AddOp as Op>::abstract_eval(&AddOp, &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)])
                 .unwrap_err();
 
-        assert_eq!(error, TraceError::IncompatibleAbstractValues { op: "add" });
+        assert_eq!(error, TracingError::IncompatibleAbstractValues { op: "add" });
         test_support::assert_reference_program_rendering();
     }
 
@@ -179,7 +179,7 @@ mod tests {
     fn test_add_batch_requires_matching_lane_counts() {
         let error = AddOp.batch(&[Batch::new(vec![1.0f64, 2.0f64]), Batch::new(vec![3.0f64])]).unwrap_err();
 
-        assert_eq!(error, TraceError::MismatchedBatchSize);
+        assert_eq!(error, TracingError::MismatchedBatchSize);
         test_support::assert_reference_scalar_sine_jit_rendering();
     }
 }

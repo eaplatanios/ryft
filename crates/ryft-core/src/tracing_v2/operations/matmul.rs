@@ -6,7 +6,7 @@
 
 use std::fmt::{Debug, Display};
 
-use crate::tracing_v2::{TraceError, Traceable, batch::Batch as BatchedValue, engine::Engine, forward::JvpTracer};
+use crate::tracing_v2::{Traceable, TracingError, batch::Batch as BatchedValue, engine::Engine, forward::JvpTracer};
 use crate::types::{ArrayType, Type};
 
 use super::{
@@ -46,14 +46,14 @@ impl Op for MatMulOp {
         "matmul"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![matmul_abstract(&inputs[0], &inputs[1], "matmul")?])
     }
 }
 
 impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatMulOp {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
@@ -66,14 +66,14 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
 }
 
 impl<V: MatrixValue> VectorizableOp<ArrayType, V> for MatMulOp {
-    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
+    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;
         Ok(vec![BatchedValue::new(

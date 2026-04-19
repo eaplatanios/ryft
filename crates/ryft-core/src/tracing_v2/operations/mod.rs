@@ -59,7 +59,7 @@ use crate::{
     parameters::Parameterized,
     sharding::Sharding,
     tracing_v2::{
-        TraceError, Traceable, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
+        Traceable, TracingError, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
     },
     types::{ArrayType, Type, Typed},
 };
@@ -171,13 +171,13 @@ fn binary_output_sharding(inputs: &[ArrayType]) -> Option<Sharding> {
 }
 
 /// Returns an input-count error when one staged op receives the wrong arity.
-pub fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TraceError> {
-    if inputs == expected { Ok(()) } else { Err(TraceError::InvalidInputCount { expected, got: inputs }) }
+pub fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TracingError> {
+    if inputs == expected { Ok(()) } else { Err(TracingError::InvalidInputCount { expected, got: inputs }) }
 }
 
 /// Returns a batch-size error when two batched inputs disagree on their lane count.
-pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<(), TraceError> {
-    if left.len() == right.len() { Ok(()) } else { Err(TraceError::MismatchedBatchSize) }
+pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<(), TracingError> {
+    if left.len() == right.len() { Ok(()) } else { Err(TracingError::MismatchedBatchSize) }
 }
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
@@ -197,16 +197,16 @@ pub fn lift_jit_constant<
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.
-pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TraceError> {
+pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TracingError> {
     expect_input_count(inputs.len(), 1)?;
     Ok(inputs[0].clone())
 }
 
 /// Propagates one binary input type through a shape-preserving staged op.
-pub fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Result<ArrayType, TraceError> {
+pub fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Result<ArrayType, TracingError> {
     expect_input_count(inputs.len(), 2)?;
     if inputs[0].data_type != inputs[1].data_type || inputs[0].shape != inputs[1].shape {
-        Err(TraceError::IncompatibleAbstractValues { op })
+        Err(TracingError::IncompatibleAbstractValues { op })
     } else {
         let sharding = binary_output_sharding(inputs);
         ArrayType::new(
@@ -215,7 +215,7 @@ pub fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Result<Ar
             if inputs[0].layout == inputs[1].layout { inputs[0].layout.clone() } else { None },
             sharding,
         )
-        .map_err(|_| TraceError::InternalInvariantViolation("binary output sharding should match operand rank"))
+        .map_err(|_| TracingError::InternalInvariantViolation("binary output sharding should match operand rank"))
     }
 }
 
@@ -233,7 +233,7 @@ pub trait Op<T: Type = ArrayType>: Debug + Display {
     fn name(&self) -> &'static str;
 
     /// Computes abstract output types from abstract input types without executing the operation.
-    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TraceError>;
+    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TracingError>;
 
     /// Returns simplified output atoms if this operation is a trivial algebraic identity.
     ///
@@ -256,7 +256,7 @@ pub trait Op<T: Type = ArrayType>: Debug + Display {
 /// Only code paths that actually execute operations (program replay, JIT example propagation) require this trait.
 pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
     /// Executes the operation on concrete values.
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 
 /// Semantic contract for staged operations that can live in linear programs.
@@ -341,7 +341,7 @@ pub trait LinearOperation<T: Type + Display, V: Traceable<T>, LinearCarrier: Clo
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<T, V, LinearCarrier>],
-    ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TraceError>;
+    ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TracingError>;
 }
 
 /// Forward-mode differentiation rule, generic over the tangent type `T` and staged carrier types.
@@ -362,13 +362,13 @@ pub trait DifferentiableOp<T: Type + Display, V: Traceable<T>, Tangent, O: Clone
         &self,
         engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, Tangent>],
-    ) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError>;
+    ) -> Result<Vec<JvpTracer<V, Tangent>>, TracingError>;
 }
 
 /// Primitive operation with a batching rule used by `vmap`.
 pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
     /// Applies the primitive's batching rule to batched inputs.
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError>;
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError>;
 }
 
 /// Capability bundle for the ordinary staged operation type stored in traced programs.
@@ -508,7 +508,7 @@ impl<O: Op<T> + ?Sized, T: Type> Op<T> for Arc<O> {
     }
 
     #[inline]
-    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TraceError> {
+    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TracingError> {
         (**self).abstract_eval(inputs)
     }
 
@@ -525,7 +525,7 @@ impl<O: Op<T> + ?Sized, T: Type> Op<T> for Arc<O> {
 
 impl<O: InterpretableOp<T, V> + ?Sized, T: Type, V: Traceable<T>> InterpretableOp<T, V> for Arc<O> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         (**self).interpret(inputs)
     }
 }
@@ -537,7 +537,7 @@ impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type + Display, V: Tra
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<T, V, LinearCarrier>],
-    ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TracingError> {
         (**self).transpose(output_cotangents)
     }
 }
@@ -556,14 +556,14 @@ impl<
         &self,
         engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, Tangent>],
-    ) -> Result<Vec<JvpTracer<V, Tangent>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, Tangent>>, TracingError> {
         (**self).jvp(engine, inputs)
     }
 }
 
 impl<O: VectorizableOp<T, V> + ?Sized, T: Type, V: Traceable<T>> VectorizableOp<T, V> for Arc<O> {
     #[inline]
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         (**self).batch(inputs)
     }
 }

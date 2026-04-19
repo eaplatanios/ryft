@@ -20,7 +20,7 @@ use std::{borrow::Cow, collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{Engine, InterpretableOp, LinearPrimitiveOp, Op, PrimitiveOp, TraceError, Traceable},
+    tracing_v2::{Engine, InterpretableOp, LinearPrimitiveOp, Op, PrimitiveOp, Traceable, TracingError},
     types::{ArrayType, Type, Typed},
 };
 
@@ -223,7 +223,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         op: O,
         inputs: Vec<AtomId>,
         output_values: Vec<V>,
-    ) -> Result<Vec<AtomId>, TraceError>
+    ) -> Result<Vec<AtomId>, TracingError>
     where
         O: Op<T>,
     {
@@ -232,7 +232,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .map(|input| {
                 self.atom(*input)
                     .map(|atom| atom.tpe().into_owned())
-                    .ok_or(TraceError::UnboundAtomId { id: *input })
+                    .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
@@ -272,7 +272,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     ///
     /// This is the staging path used by type-directed tracing and any traced replay that does not
     /// have representative concrete values available for the participating atoms.
-    pub fn add_equation_abstract(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
+    pub fn add_equation_abstract(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
     where
         O: Op<T>,
     {
@@ -281,7 +281,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .map(|input| {
                 self.atom(*input)
                     .map(|atom| atom.tpe().into_owned())
-                    .ok_or(TraceError::UnboundAtomId { id: *input })
+                    .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
@@ -300,13 +300,13 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// When every input atom is an [`Atom::Constant`], the operation is folded at program-construction
     /// time: `abstract_eval` and `eval` are still executed for validation, but the output atoms are
     /// recorded as constants and no equation is added to the program.
-    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
+    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
     where
         O: InterpretableOp<T, V>,
     {
         let input_examples = inputs
             .iter()
-            .map(|input| self.stored_value(*input).cloned().ok_or(TraceError::UnboundAtomId { id: *input }))
+            .map(|input| self.stored_value(*input).cloned().ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
         let output_values = op.interpret(input_examples.as_slice())?;
         self.add_equation_with_output_values(op, inputs, output_values)
@@ -481,7 +481,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// This is mainly a transform-support utility. It lets code that only has a staged program and
     /// abstract input metadata reconstruct one concrete witness per input leaf so it can replay or
     /// segment the program without requiring the original caller's inputs.
-    pub fn representative_input_values<E>(&self, engine: &E) -> Result<Vec<V>, TraceError>
+    pub fn representative_input_values<E>(&self, engine: &E) -> Result<Vec<V>, TracingError>
     where
         E: Engine<Type = T, Value = V> + ?Sized,
     {
@@ -490,7 +490,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             .copied()
             .map(|atom_id| match self.atom(atom_id) {
                 Some(Atom::Input { r#type }) => Ok(engine.zero(r#type)),
-                _ => Err(TraceError::InternalInvariantViolation("staged program input atom did not retain a type")),
+                _ => Err(TracingError::InternalInvariantViolation("staged program input atom did not retain a type")),
             })
             .collect()
     }
@@ -499,12 +499,12 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     ///
     /// This is the lowest-level replay helper in the module. [`Program::call`] builds on it to
     /// translate between structured parameterized values and the flat leaf vectors stored by the IR.
-    pub fn evaluate_atom_values(&self, input_values: Vec<V>) -> Result<Vec<V>, TraceError>
+    pub fn evaluate_atom_values(&self, input_values: Vec<V>) -> Result<Vec<V>, TracingError>
     where
         O: InterpretableOp<T, V>,
     {
         if input_values.len() != self.input_atoms.len() {
-            return Err(TraceError::InvalidInputCount { expected: self.input_atoms.len(), got: input_values.len() });
+            return Err(TracingError::InvalidInputCount { expected: self.input_atoms.len(), got: input_values.len() });
         }
 
         let mut values = vec![None; self.atoms.len()];
@@ -522,11 +522,11 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             let inputs = equation
                 .inputs
                 .iter()
-                .map(|input| values[*input].clone().ok_or(TraceError::UnboundAtomId { id: *input }))
+                .map(|input| values[*input].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs = equation.op.interpret(inputs.as_slice())?;
             if outputs.len() != equation.outputs.len() {
-                return Err(TraceError::InvalidOutputCount { expected: equation.outputs.len(), got: outputs.len() });
+                return Err(TracingError::InvalidOutputCount { expected: equation.outputs.len(), got: outputs.len() });
             }
 
             for (atom, value) in equation.outputs.iter().copied().zip(outputs) {
@@ -537,13 +537,13 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         values
             .into_iter()
             .enumerate()
-            .map(|(atom_id, value)| value.ok_or(TraceError::UnboundAtomId { id: atom_id }))
+            .map(|(atom_id, value)| value.ok_or(TracingError::UnboundAtomId { id: atom_id }))
             .collect()
     }
 
     /// Evaluates every atom in the program on its representative input exemplars, synthesized as
     /// zero values from the retained input types using the provided [`Engine`].
-    pub fn representative_atom_values<E>(&self, engine: &E) -> Result<Vec<V>, TraceError>
+    pub fn representative_atom_values<E>(&self, engine: &E) -> Result<Vec<V>, TracingError>
     where
         O: InterpretableOp<T, V>,
         E: Engine<Type = T, Value = V> + ?Sized,
@@ -581,14 +581,14 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// This is the user-facing replay entry point for staged programs. It checks that the incoming
     /// structured value matches the program's expected parameter structure, evaluates the flat IR,
     /// and then rebuilds the structured output.
-    pub fn call(&self, input: Input) -> Result<Output, TraceError>
+    pub fn call(&self, input: Input) -> Result<Output, TracingError>
     where
         O: InterpretableOp<T, V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
         if input.parameter_structure() != self.input_structure {
-            return Err(TraceError::MismatchedParameterStructure);
+            return Err(TracingError::MismatchedParameterStructure);
         }
 
         let values = self.evaluate_atom_values(input.into_parameters().collect::<Vec<_>>())?;
@@ -597,7 +597,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 
     /// Eliminates dead constants and equations that do not contribute to the program outputs.
-    pub fn simplify(&self) -> Result<Self, TraceError>
+    pub fn simplify(&self) -> Result<Self, TracingError>
     where
         O: Op<T>,
         Input::ParameterStructure: Clone,
@@ -633,7 +633,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             atom_mapping: &mut HashMap<usize, usize>,
             live_equations: &[bool],
             equation_by_output: &[Option<usize>],
-        ) -> Result<usize, TraceError>
+        ) -> Result<usize, TracingError>
         where
             O: Clone + Op<T>,
             T: Type,
@@ -645,15 +645,15 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                 return Ok(*mapped_atom);
             }
 
-            let atom = program.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
+            let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom {
                 Atom::Input { r#type } => builder.add_input_abstract(r#type.clone()),
                 Atom::Constant { value } => builder.add_constant(value.clone()),
                 Atom::Derived { .. } => {
                     let equation_index = equation_by_output[atom_id]
-                        .ok_or(TraceError::InternalInvariantViolation("derived atom had no owning equation"))?;
+                        .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
                     if !live_equations[equation_index] {
-                        return Err(TraceError::InternalInvariantViolation(
+                        return Err(TracingError::InternalInvariantViolation(
                             "attempted to remap a dead derived atom during program simplification",
                         ));
                     }
@@ -680,7 +680,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                     }
                     *atom_mapping
                         .get(&atom_id)
-                        .ok_or(TraceError::InternalInvariantViolation("failed to record remapped program outputs"))?
+                        .ok_or(TracingError::InternalInvariantViolation("failed to record remapped program outputs"))?
                 }
             };
             atom_mapping.entry(atom_id).or_insert(mapped_atom);
@@ -709,9 +709,11 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         let mut builder = ProgramBuilder::<O, T, V>::new();
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_atoms.iter().copied() {
-            let input = self.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+            let input = self.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             let Atom::Input { r#type } = input else {
-                return Err(TraceError::InternalInvariantViolation("staged program input atom did not retain a type"));
+                return Err(TracingError::InternalInvariantViolation(
+                    "staged program input atom did not retain a type",
+                ));
             };
             let mapped = builder.add_input_abstract(r#type.clone());
             atom_mapping.insert(input_atom, mapped);
@@ -796,7 +798,7 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOp, Sin, TraceError, Value, ZeroLike, test_support},
+        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOp, Sin, TracingError, Value, ZeroLike, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 
@@ -852,7 +854,7 @@ mod tests {
     fn program_builder_rejects_unbound_inputs() {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let result = builder.add_equation(PrimitiveOp::Add, vec![42, 99]);
-        assert!(matches!(result, Err(TraceError::UnboundAtomId { id: 42 })));
+        assert!(matches!(result, Err(TracingError::UnboundAtomId { id: 42 })));
         test_support::assert_reference_program_rendering();
     }
 
@@ -1026,7 +1028,7 @@ mod tests {
         }
 
         impl crate::tracing_v2::operations::reshape::ReshapeOps for TestIdentityValue {
-            fn reshape(self, target_shape: Shape) -> Result<Self, TraceError> {
+            fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
                 Ok(Self { r#type: ArrayType::new(DataType::F64, target_shape, None, None).unwrap(), value: self.value })
             }
         }

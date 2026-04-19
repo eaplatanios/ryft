@@ -20,7 +20,7 @@ use std::{
 use crate::{
     parameters::Parameter,
     tracing_v2::{
-        TraceError, Traceable, Value, ZeroLike,
+        Traceable, TracingError, Value, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
@@ -47,10 +47,10 @@ pub trait CustomTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 #[doc(hidden)]
 pub trait LinearCustomOperation<T: Type + Display, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of one custom primitive in the linear universe.
-    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self, TraceError>;
+    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError>;
 
     /// Constructs the carrier-specific representation of one shared custom primitive in the linear universe.
-    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TraceError>;
+    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError>;
 }
 
 /// Typed extension registry carried by one [`CustomPrimitive`].
@@ -120,7 +120,7 @@ impl<
     fn interpret(
         &self,
         inputs: &[Linearized<Tracer<'static, E>, InnerLinearOperation>],
-    ) -> Result<Vec<Linearized<Tracer<'static, E>, InnerLinearOperation>>, TraceError> {
+    ) -> Result<Vec<Linearized<Tracer<'static, E>, InnerLinearOperation>>, TracingError> {
         self.0.interpret(inputs)
     }
 }
@@ -152,7 +152,7 @@ impl<
     fn interpret<'engine>(
         &self,
         inputs: &[Linearized<Tracer<'engine, E>>],
-    ) -> Result<Vec<Linearized<Tracer<'engine, E>>>, TraceError> {
+    ) -> Result<Vec<Linearized<Tracer<'engine, E>>>, TracingError> {
         self.0.interpret(inputs)
     }
 }
@@ -279,22 +279,22 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
     }
 
     /// Returns one linear-only wrapper for this primitive after verifying that it provides a transpose rule.
-    pub fn into_linear(self) -> Result<LinearCustomPrimitive<T, V>, TraceError> {
+    pub fn into_linear(self) -> Result<LinearCustomPrimitive<T, V>, TracingError> {
         LinearCustomPrimitive::from_custom_primitive(Arc::new(self))
     }
 
     /// Clones this primitive into one linear-only wrapper after verifying that it provides a transpose rule.
-    pub fn to_linear(&self) -> Result<LinearCustomPrimitive<T, V>, TraceError> {
+    pub fn to_linear(&self) -> Result<LinearCustomPrimitive<T, V>, TracingError> {
         self.clone().into_linear()
     }
 
-    pub(super) fn missing_rule(&self, transform: &'static str) -> TraceError {
-        TraceError::MissingCustomRule { op: self.base.name(), transform }
+    pub(super) fn missing_rule(&self, transform: &'static str) -> TracingError {
+        TracingError::MissingCustomRule { op: self.base.name(), transform }
     }
 
     fn jvp_rule<O: Clone + 'static, L: Clone + 'static>(
         &self,
-    ) -> Result<&dyn DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L>, TraceError> {
+    ) -> Result<&dyn DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L>, TracingError> {
         self.extensions
             .get::<JvpRule<T, V, O, L>>()
             .map(JvpRule::rule)
@@ -341,7 +341,7 @@ impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<A
     pub(crate) fn interpret_linearized_jit<'engine, E>(
         &self,
         inputs: &[Linearized<Tracer<'engine, E>>],
-    ) -> Result<Vec<Linearized<Tracer<'engine, E>>>, TraceError>
+    ) -> Result<Vec<Linearized<Tracer<'engine, E>>>, TracingError>
     where
         V: Value<ArrayType>,
         E: Engine<
@@ -378,7 +378,7 @@ impl<V: Traceable<ArrayType>> Op for CustomPrimitive<ArrayType, V> {
     }
 
     #[inline]
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         self.base.abstract_eval(inputs)
     }
 
@@ -395,7 +395,7 @@ impl<V: Traceable<ArrayType>> Op for CustomPrimitive<ArrayType, V> {
 
 impl<V: Traceable<ArrayType>> InterpretableOp<ArrayType, V> for CustomPrimitive<ArrayType, V> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.base.interpret(inputs)
     }
 }
@@ -404,7 +404,7 @@ impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for Custom
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         self.transpose_rule
             .as_deref()
             .ok_or_else(|| self.missing_rule("transpose"))?
@@ -413,7 +413,7 @@ impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for Custom
 }
 
 impl<V: Traceable<ArrayType> + 'static> VectorizableOp<ArrayType, V> for CustomPrimitive<ArrayType, V> {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {
+    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         self.vectorization_rule.as_deref().ok_or_else(|| self.missing_rule("vectorize"))?.batch(inputs)
     }
 }
@@ -425,7 +425,7 @@ impl<V: Traceable<ArrayType> + 'static, O: Clone + 'static, L: Clone + 'static>
         &self,
         engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
         self.jvp_rule::<O, L>()?.jvp(engine, inputs)
     }
 }
@@ -449,7 +449,7 @@ where
     fn interpret(
         &self,
         inputs: &[Linearized<Tracer<'static, E>, InnerLinearOperation>],
-    ) -> Result<Vec<Linearized<Tracer<'static, E>, InnerLinearOperation>>, TraceError> {
+    ) -> Result<Vec<Linearized<Tracer<'static, E>, InnerLinearOperation>>, TracingError> {
         self.extensions
             .get::<LinearizedJitRule<V, O, OuterLinearOperation, InnerLinearOperation, E>>()
             .ok_or_else(|| self.missing_rule("linearized JIT replay"))?
@@ -469,7 +469,7 @@ pub struct LinearCustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter>
 
 impl<T: Type + Display + 'static, V: Traceable<T> + 'static> LinearCustomPrimitive<T, V> {
     /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
-    pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TraceError> {
+    pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError> {
         primitive.transpose_rule.as_ref().ok_or_else(|| primitive.missing_rule("transpose"))?;
         Ok(Self { primitive })
     }
@@ -500,7 +500,7 @@ impl<V: Traceable<ArrayType>> Op for LinearCustomPrimitive<ArrayType, V> {
     }
 
     #[inline]
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         self.primitive.abstract_eval(inputs)
     }
 
@@ -517,7 +517,7 @@ impl<V: Traceable<ArrayType>> Op for LinearCustomPrimitive<ArrayType, V> {
 
 impl<V: Traceable<ArrayType>> InterpretableOp<ArrayType, V> for LinearCustomPrimitive<ArrayType, V> {
     #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.primitive.interpret(inputs)
     }
 }
@@ -526,7 +526,7 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearCustomPrim
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         self.primitive
             .transpose_rule
             .as_deref()
@@ -543,7 +543,7 @@ mod tests {
 
     use super::*;
     use crate::tracing_v2::{
-        Batch, LinearProgramBuilder, LinearProgramOpRef, OneLike, Program, ProgramOpRef, TraceError, Tracer,
+        Batch, LinearProgramBuilder, LinearProgramOpRef, OneLike, Program, ProgramOpRef, Tracer, TracingError,
         engine::ArrayScalarEngine, grad, interpret_and_trace, jvp, vmap,
     };
     use crate::types::{ArrayType, DataType, Shape};
@@ -572,18 +572,18 @@ mod tests {
             "test_shift"
         }
 
-        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![inputs[0].clone()])
         }
     }
 
     impl InterpretableOp<ArrayType, f64> for ShiftOp {
-        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TraceError> {
+        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![inputs[0] + self.amount])
         }
@@ -593,9 +593,9 @@ mod tests {
         fn transpose(
             &self,
             output_cotangents: &[LinearTerm<ArrayType, f64>],
-        ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TraceError> {
+        ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TracingError> {
             if output_cotangents.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
             }
             Ok(vec![Some(output_cotangents[0].clone())])
         }
@@ -613,18 +613,18 @@ mod tests {
                 LinearOperation = LinearProgramOpRef<f64>,
             >,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
-        ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TraceError> {
+        ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![JvpTracer { primal: inputs[0].primal + self.amount, tangent: inputs[0].tangent.clone() }])
         }
     }
 
     impl VectorizableOp<ArrayType, f64> for ShiftOp {
-        fn batch(&self, inputs: &[Batch<f64>]) -> Result<Vec<Batch<f64>>, TraceError> {
+        fn batch(&self, inputs: &[Batch<f64>]) -> Result<Vec<Batch<f64>>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             Ok(vec![Batch::new(inputs[0].lanes().iter().map(|lane| lane + self.amount).collect::<Vec<_>>())])
         }
@@ -643,9 +643,9 @@ mod tests {
         fn interpret(
             &self,
             inputs: &[Linearized<Tracer<'engine, E>>],
-        ) -> Result<Vec<Linearized<Tracer<'engine, E>>>, TraceError> {
+        ) -> Result<Vec<Linearized<Tracer<'engine, E>>>, TracingError> {
             if inputs.len() != 1 {
-                return Err(TraceError::InvalidInputCount { expected: 1, got: inputs.len() });
+                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
             let primal = apply_custom_traced_unary(
                 inputs[0].primal.clone(),
@@ -659,7 +659,7 @@ mod tests {
     fn apply_custom_traced_unary<'engine, E>(
         input: Tracer<'engine, E>,
         primitive: CustomPrimitive<ArrayType, f64>,
-    ) -> Result<Tracer<'engine, E>, TraceError>
+    ) -> Result<Tracer<'engine, E>, TracingError>
     where
         E: Engine<
                 Type = ArrayType,
@@ -696,7 +696,7 @@ mod tests {
     fn apply_custom_batched_unary(
         input: Batch<f64>,
         primitive: CustomPrimitive<ArrayType, f64>,
-    ) -> Result<Batch<f64>, TraceError> {
+    ) -> Result<Batch<f64>, TracingError> {
         Ok(VectorizableOp::batch(&PrimitiveOp::Custom(Arc::new(primitive)), &[input])?
             .into_iter()
             .next()
@@ -714,7 +714,7 @@ mod tests {
 
         assert!(matches!(
             primitive.into_linear(),
-            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "transpose" })
+            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "transpose" })
         ));
     }
 
@@ -745,7 +745,7 @@ mod tests {
 
         assert!(matches!(
             primitive.transpose(&[cotangent]),
-            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "transpose" })
+            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "transpose" })
         ));
     }
 
@@ -753,7 +753,7 @@ mod tests {
     fn test_custom_primitive_missing_jvp_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let result: Result<(f64, f64), TraceError> = jvp(
+        let result: Result<(f64, f64), TracingError> = jvp(
             &engine,
             {
                 let primitive = primitive.clone();
@@ -763,14 +763,14 @@ mod tests {
             1.0f64,
         );
 
-        assert_eq!(result, Err(TraceError::MissingCustomRule { op: "test_shift", transform: "jvp" }),);
+        assert_eq!(result, Err(TracingError::MissingCustomRule { op: "test_shift", transform: "jvp" }),);
     }
 
     #[test]
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
-        let result: Result<(f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>), TraceError> =
+        let result: Result<(f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>), TracingError> =
             interpret_and_trace(
                 &engine,
                 {
@@ -793,7 +793,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "linearized JIT replay" })
+            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "linearized JIT replay" })
         ));
     }
 
@@ -847,7 +847,7 @@ mod tests {
 
         assert_eq!(
             apply_custom_batched_unary(Batch::new(vec![1.0f64, 2.0]), primitive),
-            Err(TraceError::MissingCustomRule { op: "test_shift", transform: "vectorize" }),
+            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "vectorize" }),
         );
     }
 

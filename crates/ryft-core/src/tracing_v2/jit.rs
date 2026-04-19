@@ -21,7 +21,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        AtomId, InterpretableOp, OneLike, Program, ProgramBuilder, TraceError, Traceable, ZeroLike,
+        AtomId, InterpretableOp, OneLike, Program, ProgramBuilder, Traceable, TracingError, ZeroLike,
         engine::Engine,
         operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
     },
@@ -44,7 +44,7 @@ pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
 
     /// Shared slot that records the first staging failure in this tracing scope.
-    staging_error: Rc<RefCell<Option<TraceError>>>,
+    staging_error: Rc<RefCell<Option<TracingError>>>,
 
     /// Engine borrowed by this tracing scope for metadata-driven value synthesis.
     engine: &'engine E,
@@ -90,7 +90,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// Staging helpers record the first abstract-evaluation or invariant failure here so later
     /// primitive applications can stop extending a broken trace while the entry point unwinds.
     #[inline]
-    pub fn staging_error_handle(&self) -> Rc<RefCell<Option<TraceError>>> {
+    pub fn staging_error_handle(&self) -> Rc<RefCell<Option<TracingError>>> {
         self.staging_error.clone()
     }
 
@@ -111,7 +111,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     pub fn from_engine(
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
-        staging_error: Rc<RefCell<Option<TraceError>>>,
+        staging_error: Rc<RefCell<Option<TracingError>>>,
         engine: &'engine E,
     ) -> Self {
         Self { atom, builder, staging_error, engine }
@@ -123,23 +123,23 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// higher-order transforms that need to inject backend-selected operations manually. The method
     /// validates that all inputs belong to the same tracing scope, runs abstract evaluation to
     /// determine the output arity, and records the equation unless the scope has already failed.
-    pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TraceError>
+    pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TracingError>
     where
         E::TracingOperation: Op<E::Type>,
     {
         if inputs.is_empty() {
-            return Err(TraceError::EmptyParameterizedValue);
+            return Err(TracingError::EmptyParameterizedValue);
         }
 
         let builder = inputs[0].builder.clone();
         let staging_error = inputs[0].staging_error.clone();
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
-            return Err(TraceError::InternalInvariantViolation(
+            return Err(TracingError::InternalInvariantViolation(
                 "tracer inputs for one staged op must share the same builder",
             ));
         }
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&staging_error, &input.staging_error)) {
-            return Err(TraceError::InternalInvariantViolation(
+            return Err(TracingError::InternalInvariantViolation(
                 "tracer inputs for one staged op must share the same staging error handle",
             ));
         }
@@ -304,7 +304,7 @@ pub fn trace<'engine, E, F, Input, Output>(
     input_types: Input,
 ) -> Result<
     (Output, Program<E::Type, E::Value, E::TracingOperation, Input::To<E::Value>, Output::To<E::Value>>),
-    TraceError,
+    TracingError,
 >
 where
     E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: Op<E::Type>> + ?Sized,
@@ -318,7 +318,7 @@ where
             ParameterStructure: Clone,
             Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
         >,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     let input_structure = input_types.parameter_structure();
     let builder = Rc::new(RefCell::new(ProgramBuilder::<E::TracingOperation, E::Type, E::Value>::new()));
@@ -330,7 +330,7 @@ where
             Tracer::from_engine(atom, builder.clone(), staging_error.clone(), engine)
         }),
     )
-    .map_err(TraceError::from)?;
+    .map_err(TracingError::from)?;
 
     let (output_structure, output_types, outputs) = {
         let traced_output = function(traced_input)?;
@@ -350,7 +350,7 @@ where
     }
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
-        Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
+        Err(_) => return Err(TracingError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
     let program =
         builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure);
@@ -371,14 +371,14 @@ pub fn interpret_and_trace<'engine, E, F, Input, Output>(
     engine: &'engine E,
     function: F,
     input: Input,
-) -> Result<(Output, Program<E::Type, E::Value, E::TracingOperation, Input, Output>), TraceError>
+) -> Result<(Output, Program<E::Type, E::Value, E::TracingOperation, Input, Output>), TracingError>
 where
     E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOp<E::Type, E::Value>>
         + ?Sized,
     Input:
         Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<'engine, E>>>,
     Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<'engine, E>>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     let input_structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -398,7 +398,7 @@ where
         },
         input_types,
     )?;
-    let output_structure = output_structure.ok_or(TraceError::InternalInvariantViolation(
+    let output_structure = output_structure.ok_or(TracingError::InternalInvariantViolation(
         "interpret_and_trace did not record the staged output structure",
     ))?;
     let program = flat_program.clone_with_structures::<Input, Output>(input_structure, output_structure).simplify()?;
@@ -556,12 +556,12 @@ mod tests {
                 "test_add"
             }
 
-            fn abstract_eval(&self, inputs: &[TestType]) -> Result<Vec<TestType>, TraceError> {
+            fn abstract_eval(&self, inputs: &[TestType]) -> Result<Vec<TestType>, TracingError> {
                 if inputs.len() != 2 {
-                    return Err(TraceError::InvalidInputCount { expected: 2, got: inputs.len() });
+                    return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
                 }
                 if !inputs[0].is_compatible_with(&inputs[1]) {
-                    return Err(TraceError::IncompatibleAbstractValues { op: "test_add" });
+                    return Err(TracingError::IncompatibleAbstractValues { op: "test_add" });
                 }
                 Ok(vec![inputs[0].clone()])
             }
@@ -586,12 +586,12 @@ mod tests {
         }
 
         impl InterpretableOp<TestType, TestValue> for TestAddOp {
-            fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TraceError> {
+            fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
                 if inputs.len() != 2 {
-                    return Err(TraceError::InvalidInputCount { expected: 2, got: inputs.len() });
+                    return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
                 }
                 if !inputs[0].r#type.is_compatible_with(&inputs[1].r#type) {
-                    return Err(TraceError::IncompatibleAbstractValues { op: "test_add" });
+                    return Err(TracingError::IncompatibleAbstractValues { op: "test_add" });
                 }
                 Ok(vec![inputs[0].clone() + inputs[1].clone()])
             }
@@ -727,7 +727,7 @@ mod tests {
         }
 
         impl ReshapeOps for TestAbstractValue {
-            fn reshape(self, _target_shape: crate::types::Shape) -> Result<Self, TraceError> {
+            fn reshape(self, _target_shape: crate::types::Shape) -> Result<Self, TracingError> {
                 Ok(self)
             }
         }
@@ -760,7 +760,7 @@ mod tests {
                     TestAbstractValue,
                 >,
             ),
-            TraceError,
+            TracingError,
         > = interpret_and_trace(
             &TestEngine,
             |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| Ok(inputs.0 + inputs.1),
@@ -770,7 +770,7 @@ mod tests {
             ),
         );
 
-        assert!(matches!(result, Err(TraceError::IncompatibleAbstractValues { op: "add" })));
+        assert!(matches!(result, Err(TracingError::IncompatibleAbstractValues { op: "add" })));
     }
 
     #[test]

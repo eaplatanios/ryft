@@ -94,12 +94,12 @@ pub use values::{OneLike, Traceable, Value, ZeroLike};
 
 /// Error type shared by the `tracing_v2` staging and transform pipeline.
 ///
-/// [`TraceError`] intentionally spans the whole subsystem: primitive abstract evaluation, staged
+/// [`TracingError`] intentionally spans the whole subsystem: primitive abstract evaluation, staged
 /// program construction, batching, higher-order transform synthesis, and program replay. Keeping
 /// the error vocabulary in one place lets the public transform APIs stay small while still
 /// preserving the failure modes that matter when debugging tracing behavior.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum TraceError {
+pub enum TracingError {
     /// Structured inputs or outputs did not have the same `Parameterized` shape.
     #[error("mismatched parameter structures")]
     MismatchedParameterStructure,

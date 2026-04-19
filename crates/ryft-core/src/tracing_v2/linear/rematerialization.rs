@@ -12,7 +12,7 @@ pub fn compile_grad<'engine, E, F, Input, V>(
     _engine: &'engine E,
     function: F,
     example_primals: Input,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -53,7 +53,7 @@ where
                     traced_primals,
                 )?;
             Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), traced_gradient)
-                .map_err(TraceError::from)
+                .map_err(TracingError::from)
         },
         example_primals,
     )?;
@@ -103,7 +103,7 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
     function: F,
     example_primals: Input,
     policy: RematerializationPolicy,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -147,7 +147,7 @@ fn compile_grad_segmented<'engine, E, F, Input, V>(
     function: &F,
     example_primals: Input,
     segment_size: Option<usize>,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -203,7 +203,7 @@ where
                     traced_primals,
                 )?;
             Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), traced_gradient)
-                .map_err(TraceError::from)
+                .map_err(TracingError::from)
         },
         example_primals,
     )?;
@@ -225,7 +225,7 @@ fn segment_program<E, V>(
     engine: &E,
     program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
     segment_size: usize,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
@@ -340,7 +340,7 @@ where
             .map(|&atom_id| {
                 program
                     .atom(atom_id)
-                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .ok_or(TracingError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.tpe().into_owned())
             })
             .collect::<Result<_, _>>()?;
@@ -349,7 +349,7 @@ where
             .map(|&atom_id| {
                 program
                     .atom(atom_id)
-                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .ok_or(TracingError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.tpe().into_owned())
             })
             .collect::<Result<_, _>>()?;
@@ -360,7 +360,7 @@ where
         // Add the RematerializeOp equation to the outer builder.
         let outer_inputs: Vec<AtomId> = boundary_input_atoms
             .iter()
-            .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TraceError::UnboundAtomId { id: orig_atom }))
+            .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
             .collect::<Result<_, _>>()?;
         let outer_outputs = outer_builder.add_equation_prevalidated(
             E::TracingOperation::rematerialize_op(remat_op),
@@ -380,7 +380,7 @@ where
     let outer_outputs: Vec<AtomId> = program
         .outputs()
         .iter()
-        .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TraceError::UnboundAtomId { id: orig_atom }))
+        .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
         .collect::<Result<_, _>>()?;
 
     let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
@@ -395,7 +395,7 @@ where
 fn wrap_program_in_rematerialize<E, V>(
     engine: &E,
     program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
@@ -409,7 +409,7 @@ where
         .map(|&atom_id| {
             program
                 .atom(atom_id)
-                .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                .ok_or(TracingError::UnboundAtomId { id: atom_id })
                 .map(|atom| atom.tpe().into_owned())
         })
         .collect::<Result<_, _>>()?;
@@ -419,7 +419,7 @@ where
         .map(|&atom_id| {
             program
                 .atom(atom_id)
-                .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                .ok_or(TracingError::UnboundAtomId { id: atom_id })
                 .map(|atom| atom.tpe().into_owned())
         })
         .collect::<Result<_, _>>()?;
@@ -458,7 +458,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
     segment_equations: &[Equation<O>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
-) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TraceError> {
+) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError> {
     let mut sub_builder: ProgramBuilder<O, ArrayType, V> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.
@@ -476,7 +476,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             if sub_atom_mapping.contains_key(&input_atom) {
                 continue;
             }
-            let atom = program.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+            let atom = program.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             if let Atom::Constant { value } = atom {
                 let sub_atom = sub_builder.add_constant(value.clone());
                 sub_atom_mapping.insert(input_atom, sub_atom);
@@ -490,7 +490,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             .inputs
             .iter()
             .map(|&orig_atom| {
-                sub_atom_mapping.get(&orig_atom).copied().ok_or(TraceError::UnboundAtomId { id: orig_atom })
+                sub_atom_mapping.get(&orig_atom).copied().ok_or(TracingError::UnboundAtomId { id: orig_atom })
             })
             .collect::<Result<_, _>>()?;
 
@@ -500,7 +500,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             .map(|&atom_id| {
                 program
                     .atom(atom_id)
-                    .ok_or(TraceError::UnboundAtomId { id: atom_id })
+                    .ok_or(TracingError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.tpe().into_owned())
             })
             .collect::<Result<_, _>>()?;
@@ -514,7 +514,9 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
     // Wire up boundary outputs.
     let sub_outputs: Vec<AtomId> = boundary_output_atoms
         .iter()
-        .map(|&orig_atom| sub_atom_mapping.get(&orig_atom).copied().ok_or(TraceError::UnboundAtomId { id: orig_atom }))
+        .map(|&orig_atom| {
+            sub_atom_mapping.get(&orig_atom).copied().ok_or(TracingError::UnboundAtomId { id: orig_atom })
+        })
         .collect::<Result<_, _>>()?;
 
     let sub_program = sub_builder.build::<Vec<V>, Vec<V>>(

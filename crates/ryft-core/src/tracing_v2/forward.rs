@@ -17,7 +17,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        LinearProgramOpRef, Program, TraceError, Traceable, Value, ZeroLike,
+        LinearProgramOpRef, Program, Traceable, TracingError, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
@@ -153,7 +153,7 @@ where
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TraceError>
+    ) -> Result<(Output, Output), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
 }
@@ -224,12 +224,12 @@ where
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TraceError>
+    ) -> Result<(Output, Output), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
         if primals.parameter_structure() != tangents.parameter_structure() {
-            return Err(TraceError::MismatchedParameterStructure);
+            return Err(TracingError::MismatchedParameterStructure);
         }
 
         let (primal_output, tangent_program): (Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>) =
@@ -274,7 +274,7 @@ where
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TraceError>
+    ) -> Result<(Output, Output), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>,
     {
@@ -471,12 +471,12 @@ where
         function: F,
         primals: Input,
         tangents: Input,
-    ) -> Result<(Output, Output), TraceError>
+    ) -> Result<(Output, Output), TracingError>
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
         if primals.parameter_structure() != tangents.parameter_structure() {
-            return Err(TraceError::MismatchedParameterStructure);
+            return Err(TracingError::MismatchedParameterStructure);
         }
 
         let erased_engine: &dyn Engine<
@@ -489,7 +489,7 @@ where
         let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
         let lane_tangents: Vec<Input::To<V>> = unstack(tangents)?;
         if lane_primals.is_empty() {
-            return Err(TraceError::EmptyBatch);
+            return Err(TracingError::EmptyBatch);
         }
 
         let lane0_primals = lane_primals[0].clone();
@@ -580,10 +580,10 @@ where
             let primal_flat: Vec<V> = primal_flat.to_vec();
             let tangent_flat: Vec<V> = tangent_flat.to_vec();
             lane_primal_outputs.push(
-                Output::To::<V>::from_parameters(output_structure.clone(), primal_flat).map_err(TraceError::from)?,
+                Output::To::<V>::from_parameters(output_structure.clone(), primal_flat).map_err(TracingError::from)?,
             );
             lane_tangent_outputs.push(
-                Output::To::<V>::from_parameters(output_structure.clone(), tangent_flat).map_err(TraceError::from)?,
+                Output::To::<V>::from_parameters(output_structure.clone(), tangent_flat).map_err(TracingError::from)?,
             );
         }
 
@@ -604,7 +604,7 @@ pub fn jvp<'engine, E, F, Input, Output, Leaf>(
     function: F,
     primals: Input,
     tangents: Input,
-) -> Result<(Output, Output), TraceError>
+) -> Result<(Output, Output), TracingError>
 where
     E: Engine<Type = ArrayType>,
     Leaf: JvpInvocationLeaf<E, Input, Output>,
@@ -648,9 +648,9 @@ mod tests {
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let result: Result<(f64, f64), TraceError> =
+        let result: Result<(f64, f64), TracingError> =
             jvp(&engine, |xs| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
-        assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
+        assert!(matches!(result, Err(TracingError::MismatchedParameterStructure)));
         test_support::assert_quadratic_pushforward_rendering();
     }
 

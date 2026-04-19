@@ -7,7 +7,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::tracing_v2::{
-    TraceError, Traceable, Value, ZeroLike,
+    Traceable, TracingError, Value, ZeroLike,
     batch::Batch as BatchedValue,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -73,7 +73,10 @@ impl<V: MatrixValue> RightMatMulOp<V> {
 ///
 /// Backend carriers use this helper when they need the metadata rule for a captured right-matmul
 /// operation without first constructing a concrete [`RightMatMulOp`].
-pub fn right_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+pub fn right_matmul_abstract_eval(
+    factor_type: &ArrayType,
+    inputs: &[ArrayType],
+) -> Result<Vec<ArrayType>, TracingError> {
     expect_input_count(inputs.len(), 1)?;
     Ok(vec![matmul_abstract(&inputs[0], factor_type, "right_matmul")?])
 }
@@ -95,7 +98,7 @@ impl<V: MatrixValue> Op for RightMatMulOp<V> {
         "right_matmul"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
+    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         right_matmul_abstract_eval(&<V as Typed<ArrayType>>::tpe(&self.factor), inputs)
     }
 
@@ -110,7 +113,7 @@ impl<V: MatrixValue> Op for RightMatMulOp<V> {
 }
 
 impl<V: MatrixValue> InterpretableOp<ArrayType, V> for RightMatMulOp<V> {
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().matmul(self.factor.clone())])
     }
@@ -120,7 +123,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOp<V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TraceError> {
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         expect_input_count(output_cotangents.len(), 1)?;
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
@@ -158,7 +161,8 @@ where
     fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>, TraceError> {
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>, TracingError>
+    {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };
@@ -182,7 +186,7 @@ impl<
         &self,
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TraceError> {
+    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = JvpTracer {
             primal: self.factor().clone(),
@@ -193,7 +197,7 @@ impl<
 }
 
 impl<V: MatrixValue> VectorizableOp<ArrayType, V> for RightMatMulOp<V> {
-    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TraceError> {
+    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(
             inputs[0].lanes().iter().cloned().map(|lane| lane.matmul(self.factor.clone())).collect(),
