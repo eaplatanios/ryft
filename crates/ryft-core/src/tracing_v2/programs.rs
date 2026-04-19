@@ -99,6 +99,11 @@ pub struct Equation<O> {
 /// [`Atom::Derived`] atoms whose value has been eagerly computed during staging, `None` otherwise.
 /// Those intermediates are an implementation detail of tracing and are discarded when the builder
 /// is finalized via [`Self::build`].
+///
+/// During traced execution the builder also carries the first staging failure encountered in that
+/// tracing scope. This lets infallible operator syntax like `x + y` poison the shared trace and
+/// stop recording new equations even though the surrounding closure cannot immediately return
+/// `Result`.
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
     /// Atom table accumulated so far, including inputs, constants, and derived outputs.
@@ -112,6 +117,9 @@ pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
 
     /// Equations recorded so far in execution order.
     equations: Vec<Equation<O>>,
+
+    /// First staging failure recorded while this builder was used for traced execution.
+    error: Option<TracingError>,
 }
 
 impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
@@ -121,7 +129,13 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// by one tracing scope.
     #[inline]
     pub fn new() -> Self {
-        Self { atoms: Vec::new(), intermediates: Vec::new(), input_atoms: Vec::new(), equations: Vec::new() }
+        Self {
+            atoms: Vec::new(),
+            intermediates: Vec::new(),
+            input_atoms: Vec::new(),
+            equations: Vec::new(),
+            error: None,
+        }
     }
 
     /// Returns the atom with the provided identifier.
@@ -209,6 +223,26 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     #[inline]
     pub fn equation_count(&self) -> usize {
         self.equations.len()
+    }
+
+    /// Returns `true` when traced execution has already recorded a staging failure on this builder.
+    #[inline]
+    pub(crate) fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    /// Records the first staging failure encountered by traced execution on this builder.
+    #[inline]
+    pub(crate) fn record_error_if_absent(&mut self, error: TracingError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    /// Removes and returns the first staging failure recorded on this builder, if any.
+    #[inline]
+    pub(crate) fn take_error(&mut self) -> Option<TracingError> {
+        self.error.take()
     }
 
     /// Adds a staged equation using pre-computed output values, performing abstract-eval validation,

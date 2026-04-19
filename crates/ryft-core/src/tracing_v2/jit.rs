@@ -46,16 +46,13 @@ pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     /// Shared builder that owns the staged program currently being traced.
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
 
-    /// Shared slot that records the first staging failure in this tracing scope.
-    error: Rc<RefCell<Option<TracingError>>>,
-
     /// Engine borrowed by this tracing scope for metadata-driven value synthesis.
     engine: &'engine E,
 }
 
 impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<'engine, E> {
     fn clone(&self) -> Self {
-        Self { atom: self.atom, builder: self.builder.clone(), error: self.error.clone(), engine: self.engine }
+        Self { atom: self.atom, builder: self.builder.clone(), engine: self.engine }
     }
 }
 
@@ -81,15 +78,6 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
         self.builder.clone()
     }
 
-    /// Returns the shared error slot for the current tracing scope.
-    ///
-    /// Staging helpers record the first abstract-evaluation or invariant failure here so later
-    /// primitive applications can stop extending a broken trace while the entry point unwinds.
-    #[inline]
-    pub fn error_handle(&self) -> Rc<RefCell<Option<TracingError>>> {
-        self.error.clone()
-    }
-
     /// Returns the engine borrowed by this tracing scope.
     ///
     /// The engine gives traced values access to metadata-driven zero/one synthesis and identifies
@@ -107,10 +95,9 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     pub fn from_engine(
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
-        error: Rc<RefCell<Option<TracingError>>>,
         engine: &'engine E,
     ) -> Self {
-        Self { atom, builder, error, engine }
+        Self { atom, builder, engine }
     }
 
     /// Stages one primitive application in the current trace and returns tracers for its outputs.
@@ -128,46 +115,34 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
         }
 
         let builder = inputs[0].builder.clone();
-        let error = inputs[0].error.clone();
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
             return Err(TracingError::InternalInvariantViolation(
                 "tracer inputs for one staged op must share the same builder",
             ));
         }
-        if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&error, &input.error)) {
-            return Err(TracingError::InternalInvariantViolation(
-                "tracer inputs for one staged op must share the same error handle",
-            ));
-        }
 
         let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
-        let output_count = {
+        let input_types = {
             let builder_borrow = builder.borrow();
-            match op.abstract_eval(
-                input_atoms
-                    .iter()
-                    .map(|input| {
-                        builder_borrow.atom(*input).expect("tracer input atoms should exist").tpe().into_owned()
-                    })
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            ) {
-                Ok(outputs) => outputs.len(),
-                Err(staging_error) => {
-                    if error.borrow().is_none() {
-                        *error.borrow_mut() = Some(staging_error);
-                    }
-                    1
-                }
+            input_atoms
+                .iter()
+                .map(|input| builder_borrow.atom(*input).expect("tracer input atoms should exist").tpe().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let output_count = match op.abstract_eval(input_types.as_slice()) {
+            Ok(outputs) => outputs.len(),
+            Err(error) => {
+                builder.borrow_mut().record_error_if_absent(error);
+                1
             }
         };
-        let output_atoms = if error.borrow().is_some() {
+        let output_atoms = if builder.borrow().has_error() {
             vec![inputs[0].atom; output_count]
         } else {
             match builder.borrow_mut().add_equation_abstract(op, input_atoms) {
                 Ok(outputs) => outputs,
-                Err(staging_error) => {
-                    *error.borrow_mut() = Some(staging_error);
+                Err(error) => {
+                    builder.borrow_mut().record_error_if_absent(error);
                     vec![inputs[0].atom; output_count]
                 }
             }
@@ -175,7 +150,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
 
         Ok(output_atoms
             .into_iter()
-            .map(|atom| Self { atom, builder: builder.clone(), error: error.clone(), engine: inputs[0].engine })
+            .map(|atom| Self { atom, builder: builder.clone(), engine: inputs[0].engine })
             .collect())
     }
 
@@ -197,7 +172,6 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
         E::TracingOperation: Op<E::Type>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
-        debug_assert!(Rc::ptr_eq(&self.error, &rhs.error));
         Self::apply_staged_op(&[self, rhs], op)
             .expect("binary traced staging should preserve non-empty inputs")
             .into_iter()
@@ -227,7 +201,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { atom, builder: self.builder.clone(), error: self.error.clone(), engine: self.engine }
+        Self { atom, builder: self.builder.clone(), engine: self.engine }
     }
 }
 
@@ -236,7 +210,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { atom, builder: self.builder.clone(), error: self.error.clone(), engine: self.engine }
+        Self { atom, builder: self.builder.clone(), engine: self.engine }
     }
 }
 
@@ -313,12 +287,11 @@ where
 {
     let input_structure = input_types.parameter_structure();
     let builder = Rc::new(RefCell::new(ProgramBuilder::<E::TracingOperation, E::Type, E::Value>::new()));
-    let error = Rc::new(RefCell::new(None));
     let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
             let atom = builder.borrow_mut().add_input_abstract(r#type);
-            Tracer::from_engine(atom, builder.clone(), error.clone(), engine)
+            Tracer::from_engine(atom, builder.clone(), engine)
         }),
     )
     .map_err(TracingError::from)?;
@@ -336,7 +309,7 @@ where
         (output_structure, output_types, outputs)
     };
 
-    if let Some(tracing_error) = error.borrow_mut().take() {
+    if let Some(tracing_error) = builder.borrow_mut().take_error() {
         return Err(tracing_error);
     }
     let builder = match Rc::try_unwrap(builder) {
@@ -414,10 +387,9 @@ mod tests {
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ProgramOpRef<f64>, ArrayType, f64>::new()));
-        let error = Rc::new(RefCell::new(None));
         let atom = builder.borrow_mut().add_input(&3.0f64);
         let engine = ArrayScalarEngine::<f64>::new();
-        let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, error, &engine);
+        let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, &engine);
         let zero = tracer.zero_like();
         assert_eq!(zero.tpe().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
         assert!(zero.atom > atom);
