@@ -28,18 +28,18 @@ where
 {
     let mut values = vec![None; program.atom_count()];
     for (atom_id, value) in program.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
-        values[atom_id.index()] = Some(value);
+        values[atom_id.index] = Some(value);
     }
 
     let mut equation_by_first_output = vec![None; program.atom_count()];
     for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[first_output.index()] = Some(equation_index);
+            equation_by_first_output[first_output.index] = Some(equation_index);
         }
     }
 
     for atom_index in 0..program.atom_count() {
-        let atom_id = AtomId::from_index(atom_index);
+        let atom_id = AtomId { index: atom_index };
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input(_) => {}
@@ -58,11 +58,11 @@ where
                 let input_values = equation
                     .inputs
                     .iter()
-                    .map(|input| values[input.index()].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
+                    .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let outputs = apply_op(&equation.op, input_values)?;
                 for (output_atom, output_value) in equation.outputs.iter().copied().zip(outputs) {
-                    values[output_atom.index()] = Some(output_value);
+                    values[output_atom.index] = Some(output_value);
                 }
             }
         }
@@ -71,7 +71,7 @@ where
     program
         .outputs()
         .iter()
-        .map(|output| values[output.index()].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
+        .map(|output| values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
         .collect()
 }
 
