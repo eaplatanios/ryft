@@ -18,27 +18,12 @@
 //! The traits are intentionally small so that future tensor-like leaf types, including PJRT-backed arrays, can adopt
 //! the tracing machinery by implementing a compact set of behaviors.
 
+use half::{bf16, f16};
+
 use crate::{
     parameters::Parameter,
     types::{ArrayType, Type, Typed},
 };
-
-/// Returns a zero value with the same structure as an existing value.
-///
-/// This is the universal "zero-like" capability: every type that participates in differentiation or batching can
-/// produce a zero from an exemplar, including tracer wrappers that cannot be synthesized from abstract metadata alone.
-pub trait ZeroLike {
-    /// Returns a zero value with the same shape as `self`.
-    fn zero_like(&self) -> Self;
-}
-
-/// Returns a one value with the same structure as an existing value.
-///
-/// This mirrors [`ZeroLike`] for the multiplicative identity.
-pub trait OneLike {
-    /// Returns a one value with the same shape as `self`.
-    fn one_like(&self) -> Self;
-}
 
 /// Marker trait that identifies concrete, non-tracer leaves.
 ///
@@ -87,7 +72,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// The bound is rarely a real constraint — in practice, the rule is simply "own your data":
 ///
 /// - Small [`Copy`] scalars (`f32`, `i32`, `half::bf16`, ...) satisfy `'static` trivially and can implement
-///   [`Traceable`] directly, as the built-in `f32`/`f64` impls below illustrate.
+///   [`Traceable`] directly, as the built-in scalar impls below illustrate.
 /// - Heavier payloads (array buffers, tensors, device allocations) should wrap the underlying handle in
 ///   [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded cases). This keeps the leaf cheaply
 ///   cloneable — which the [`Clone`] supertrait also demands — and severs any tie to a caller's scope. PJRT-backed
@@ -127,64 +112,73 @@ pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
     }
 }
 
-impl Traceable<ArrayType> for f32 {
-    #[inline]
-    fn is_zero(&self) -> bool {
-        *self == 0.0
-    }
-
-    #[inline]
-    fn is_one(&self) -> bool {
-        *self == 1.0
-    }
+/// Returns a zero value with the same structure as an existing value.
+///
+/// This is the universal "zero-like" capability: every type that participates in differentiation or batching can
+/// produce a zero from an exemplar, including tracer wrappers that cannot be synthesized from abstract metadata alone.
+pub trait ZeroLike {
+    /// Returns a zero value with the same shape as `self`.
+    fn zero_like(&self) -> Self;
 }
 
-impl Value<ArrayType> for f32 {}
-
-impl ZeroLike for f32 {
-    #[inline]
-    fn zero_like(&self) -> Self {
-        0.0
-    }
+/// Returns a one value with the same structure as an existing value.
+///
+/// This mirrors [`ZeroLike`] for the multiplicative identity.
+pub trait OneLike {
+    /// Returns a one value with the same shape as `self`.
+    fn one_like(&self) -> Self;
 }
 
-impl OneLike for f32 {
-    #[inline]
-    fn one_like(&self) -> Self {
-        1.0
-    }
+macro_rules! impl_scalar_value_traits {
+    ($ty:ty, $zero:expr, $one:expr) => {
+        impl Value<ArrayType> for $ty {}
+
+        impl Traceable<ArrayType> for $ty {
+            #[inline]
+            fn is_zero(&self) -> bool {
+                *self == self.zero_like()
+            }
+
+            #[inline]
+            fn is_one(&self) -> bool {
+                *self == self.one_like()
+            }
+        }
+
+        impl ZeroLike for $ty {
+            #[inline]
+            fn zero_like(&self) -> Self {
+                $zero
+            }
+        }
+
+        impl OneLike for $ty {
+            #[inline]
+            fn one_like(&self) -> Self {
+                $one
+            }
+        }
+    };
 }
 
-impl Traceable<ArrayType> for f64 {
-    #[inline]
-    fn is_zero(&self) -> bool {
-        *self == 0.0
-    }
-
-    #[inline]
-    fn is_one(&self) -> bool {
-        *self == 1.0
-    }
-}
-
-impl Value<ArrayType> for f64 {}
-
-impl ZeroLike for f64 {
-    #[inline]
-    fn zero_like(&self) -> Self {
-        0.0
-    }
-}
-
-impl OneLike for f64 {
-    #[inline]
-    fn one_like(&self) -> Self {
-        1.0
-    }
-}
+impl_scalar_value_traits!(bool, false, true);
+impl_scalar_value_traits!(i8, 0i8, 1i8);
+impl_scalar_value_traits!(i16, 0i16, 1i16);
+impl_scalar_value_traits!(i32, 0i32, 1i32);
+impl_scalar_value_traits!(i64, 0i64, 1i64);
+impl_scalar_value_traits!(u8, 0u8, 1u8);
+impl_scalar_value_traits!(u16, 0u16, 1u16);
+impl_scalar_value_traits!(u32, 0u32, 1u32);
+impl_scalar_value_traits!(u64, 0u64, 1u64);
+impl_scalar_value_traits!(bf16, bf16::ZERO, bf16::ONE);
+impl_scalar_value_traits!(f16, f16::ZERO, f16::ONE);
+impl_scalar_value_traits!(f32, 0.0f32, 1.0f32);
+impl_scalar_value_traits!(f64, 0.0f64, 1.0f64);
 
 #[cfg(test)]
 mod tests {
+    use half::{bf16, f16};
+
     use crate::{
         tracing_v2::{Cos, Sin, test_support},
         types::ArrayType,
@@ -193,14 +187,42 @@ mod tests {
 
     use super::*;
 
+    fn assert_scalar_value_type<V: Value<ArrayType>>(value: V, expected_type: DataType) {
+        assert_eq!(value.tpe().into_owned(), ArrayType::scalar(expected_type));
+    }
+
+    fn assert_scalar_identities<V>(value: V, zero: V, one: V)
+    where
+        V: Value<ArrayType> + ZeroLike + OneLike + std::fmt::Debug + PartialEq,
+    {
+        assert_eq!(value.zero_like(), zero);
+        assert_eq!(value.one_like(), one);
+        assert!(Traceable::is_zero(&zero));
+        assert!(Traceable::is_one(&one));
+    }
+
     #[test]
     fn test_scalar_leaf_traits_report_expected_values() {
+        assert_scalar_value_type(false, DataType::Boolean);
+        assert_scalar_value_type(1i8, DataType::I8);
+        assert_scalar_value_type(1i16, DataType::I16);
+        assert_scalar_value_type(1i32, DataType::I32);
+        assert_scalar_value_type(1i64, DataType::I64);
+        assert_scalar_value_type(1u8, DataType::U8);
+        assert_scalar_value_type(1u16, DataType::U16);
+        assert_scalar_value_type(1u32, DataType::U32);
+        assert_scalar_value_type(1u64, DataType::U64);
+        assert_scalar_value_type(bf16::from_f32(1.25), DataType::BF16);
+        assert_scalar_value_type(f16::from_f32(1.25), DataType::F16);
         assert_eq!(<f32 as Typed<ArrayType>>::tpe(&1.25f32).into_owned(), ArrayType::scalar(DataType::F32));
         assert_eq!(<f64 as Typed<ArrayType>>::tpe(&2.5f64).into_owned(), ArrayType::scalar(DataType::F64));
-        assert_eq!(ZeroLike::zero_like(&3.0f32), 0.0);
-        assert_eq!(ZeroLike::zero_like(&7.0f64), 0.0);
-        assert_eq!(OneLike::one_like(&3.0f32), 1.0);
-        assert_eq!(OneLike::one_like(&3.0f64), 1.0);
+        assert_scalar_identities(false, false, true);
+        assert_scalar_identities(5i32, 0i32, 1i32);
+        assert_scalar_identities(5u32, 0u32, 1u32);
+        assert_scalar_identities(bf16::from_f32(5.0), bf16::from_f32(0.0), bf16::from_f32(1.0));
+        assert_scalar_identities(f16::from_f32(5.0), f16::from_f32(0.0), f16::from_f32(1.0));
+        assert_scalar_identities(3.0f32, 0.0f32, 1.0f32);
+        assert_scalar_identities(7.0f64, 0.0f64, 1.0f64);
         test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
