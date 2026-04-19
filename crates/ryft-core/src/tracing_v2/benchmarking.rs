@@ -233,21 +233,21 @@ where
 {
     let mut op_histogram = BTreeMap::new();
     let mut nested_regions = Vec::new();
-    let mut depth_by_atom = vec![0usize; program.atom_count()];
-    let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_ids().iter().copied() {
+    let mut depth_by_atom = vec![0usize; program.atoms.len()];
+    let mut input_atom_flags = vec![false; program.atoms.len()];
+    for input_atom in program.input_ids.iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
     for (atom_id, atom) in
-        (0..program.atom_count()).filter_map(|atom_id| program.atom(atom_id).map(|atom| (atom_id, atom)))
+        (0..program.atoms.len()).map(|atom_index| (AtomId { index: atom_index }, &program.atoms[atom_index]))
     {
-        if input_atom_flags[atom_id] || matches!(atom, Atom::Constant(_)) {
-            depth_by_atom[atom_id] = 0;
+        if input_atom_flags[atom_id.index] || matches!(atom, Atom::Constant(_)) {
+            depth_by_atom[atom_id.index] = 0;
         }
     }
 
-    for instruction in program.instructions() {
+    for instruction in &program.instructions {
         let normalized_name = normalize_op_name(instruction.operation.name());
         *op_histogram.entry(normalized_name).or_insert(0) += 1;
 
@@ -261,14 +261,14 @@ where
 
     let nested_region_count = nested_regions.len()
         + nested_regions.iter().map(|nested_region| nested_region.nested_region_count).sum::<usize>();
-    let max_dependency_depth = program.output_ids().iter().map(|output| depth_by_atom[*output]).max().unwrap_or(0);
+    let max_dependency_depth = program.output_ids.iter().map(|output| depth_by_atom[output.index]).max().unwrap_or(0);
 
     Ok(IrBenchmarkSummary {
-        input_leaf_count: program.input_ids().len(),
-        output_leaf_count: program.output_ids().len(),
-        instruction_count: program.instructions().len(),
-        constant_count: (0..program.atom_count())
-            .filter_map(|atom_id| program.atom(atom_id))
+        input_leaf_count: program.input_ids.len(),
+        output_leaf_count: program.output_ids.len(),
+        instruction_count: program.instructions.len(),
+        constant_count: (0..program.atoms.len())
+            .map(|atom_index| &program.atoms[atom_index])
             .filter(|atom| matches!(atom, Atom::Constant(_)))
             .count(),
         op_histogram,

@@ -1093,18 +1093,18 @@ pub(crate) fn to_mlir_module_for_plain_program<
     let module = context.module(location);
 
     let input_tensor_types = program
-        .input_ids()
+        .input_ids
         .iter()
         .map(|atom_id| {
-            let input_atom = program.atom(*atom_id).expect("program input atoms should exist");
+            let input_atom = &program.atoms[atom_id.index];
             lower_tensor_type(&input_atom.r#type(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|atom_id| {
-            let output_atom = program.atom(*atom_id).expect("program output atoms should exist");
+            let output_atom = &program.atoms[atom_id.index];
             lower_tensor_type(&output_atom.r#type(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1152,7 +1152,7 @@ where
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
     let mut mesh = existing;
-    for instruction in program.instructions() {
+    for instruction in &program.instructions {
         match &instruction.operation {
             XlaPrimitiveOp::ShardMap(shard_map_op) => {
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
@@ -1596,7 +1596,7 @@ where
             return Ok(value);
         }
 
-        let atom = program.atom(atom_id).ok_or(LoweringError::MissingAtomValue { atom_id })?;
+        let atom = program.atoms.get(atom_id.index).ok_or(LoweringError::MissingAtomValue { atom_id })?;
         match atom {
             Atom::Constant(value) => lower_packed_literal_value(
                 value,
@@ -1609,25 +1609,24 @@ where
         }
     }
 
-    let mut atom_values = vec![None; program.atom_count()];
-    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
+    let mut atom_values = vec![None; program.atoms.len()];
+    for (input_index, atom_id) in program.input_ids.iter().copied().enumerate() {
         atom_values[atom_id.index] = Some(packed_inputs[input_index]);
     }
 
-    let mut instruction_by_first_output = vec![None; program.atom_count()];
-    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+    let mut instruction_by_first_output = vec![None; program.atoms.len()];
+    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
         if let Some(first_output) = instruction.outputs.first() {
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
-    let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_ids().iter().copied() {
+    let mut input_atom_flags = vec![false; program.atoms.len()];
+    for input_atom in program.input_ids.iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
-    for atom_index in 0..program.atom_count() {
-        let atom_id = AtomId { index: atom_index };
-        let atom = program.atom(atom_id).expect("atom IDs should be dense");
+    for atom_index in 0..program.atoms.len() {
+        let atom = &program.atoms[atom_index];
         match atom {
             Atom::Constant(_) => {}
             Atom::Variable(_) if input_atom_flags[atom_index] => {}
@@ -1635,7 +1634,7 @@ where
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let instruction = &program.instructions()[instruction_index];
+                let instruction = &program.instructions[instruction_index];
                 let inputs = instruction
                     .inputs
                     .iter()
@@ -1671,7 +1670,7 @@ where
     }
 
     program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|output| {
             resolve_packed_atom_value(program, atom_values.as_slice(), *output, lane_count, block, context, location)
@@ -1762,25 +1761,24 @@ where
     V: MlirLowerableValue,
     O: Clone + XlaOp<V>,
 {
-    let mut atom_values = vec![None; program.atom_count()];
-    for (atom_id, mlir_value) in program.input_ids().iter().copied().zip(input_values.iter().copied()) {
+    let mut atom_values = vec![None; program.atoms.len()];
+    for (atom_id, mlir_value) in program.input_ids.iter().copied().zip(input_values.iter().copied()) {
         atom_values[atom_id.index] = Some(mlir_value);
     }
 
-    let mut instruction_by_first_output = vec![None; program.atom_count()];
-    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+    let mut instruction_by_first_output = vec![None; program.atoms.len()];
+    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
         if let Some(first_output) = instruction.outputs.first() {
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
-    let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_ids().iter().copied() {
+    let mut input_atom_flags = vec![false; program.atoms.len()];
+    for input_atom in program.input_ids.iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
-    for atom_index in 0..program.atom_count() {
-        let atom_id = AtomId { index: atom_index };
-        let atom = program.atom(atom_id).expect("atom IDs should be dense");
+    for atom_index in 0..program.atoms.len() {
+        let atom = &program.atoms[atom_index];
         match atom {
             Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
@@ -1790,7 +1788,7 @@ where
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let instruction = &program.instructions()[instruction_index];
+                let instruction = &program.instructions[instruction_index];
                 let instruction_inputs = instruction
                     .inputs
                     .iter()
@@ -1799,7 +1797,7 @@ where
                 let output_types = instruction
                     .outputs
                     .iter()
-                    .map(|output| program.atom(*output).expect("instruction output should exist").r#type().into_owned())
+                    .map(|output| program.atoms[output.index].r#type().into_owned())
                     .collect::<Vec<_>>();
                 let mut lowerer = PlainMlirLowerer { block: *block, context, location };
                 let lowered_outputs = instruction.operation.lower_to_mlir(
@@ -1818,7 +1816,7 @@ where
     }
 
     program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
@@ -1839,26 +1837,25 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let mut atom_values = vec![None; program.atom_count()];
-    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
+    let mut atom_values = vec![None; program.atoms.len()];
+    for (input_index, atom_id) in program.input_ids.iter().copied().enumerate() {
         atom_values[atom_id.index] =
             Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
-    let mut instruction_by_first_output = vec![None; program.atom_count()];
-    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+    let mut instruction_by_first_output = vec![None; program.atoms.len()];
+    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
         if let Some(first_output) = instruction.outputs.first() {
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
-    let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_ids().iter().copied() {
+    let mut input_atom_flags = vec![false; program.atoms.len()];
+    for input_atom in program.input_ids.iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
-    for atom_index in 0..program.atom_count() {
-        let atom_id = AtomId { index: atom_index };
-        let atom = program.atom(atom_id).expect("atom IDs should be dense");
+    for atom_index in 0..program.atoms.len() {
+        let atom = &program.atoms[atom_index];
         match atom {
             Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
@@ -1868,7 +1865,7 @@ where
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let instruction = &program.instructions()[instruction_index];
+                let instruction = &program.instructions[instruction_index];
                 let inputs = instruction
                     .inputs
                     .iter()
@@ -1886,7 +1883,7 @@ where
     }
 
     program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
@@ -1903,26 +1900,26 @@ where
     ProgramInput: Parameterized<ShardMapTensor>,
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
-    let mut atom_values = vec![None; program.atom_count()];
-    for (input_index, atom_id) in program.input_ids().iter().copied().enumerate() {
+    let mut atom_values = vec![None; program.atoms.len()];
+    for (input_index, atom_id) in program.input_ids.iter().copied().enumerate() {
         atom_values[atom_id.index] =
             Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
-    let mut instruction_by_first_output = vec![None; program.atom_count()];
-    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+    let mut instruction_by_first_output = vec![None; program.atoms.len()];
+    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
         if let Some(first_output) = instruction.outputs.first() {
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
-    let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_ids().iter().copied() {
+    let mut input_atom_flags = vec![false; program.atoms.len()];
+    for input_atom in program.input_ids.iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
-    for atom_index in 0..program.atom_count() {
+    for atom_index in 0..program.atoms.len() {
         let atom_id = AtomId { index: atom_index };
-        let atom = program.atom(atom_id).expect("atom IDs should be dense");
+        let atom = &program.atoms[atom_index];
         match atom {
             Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_constant(atom_id, value, block, context, location)?);
@@ -1932,7 +1929,7 @@ where
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let instruction = &program.instructions()[instruction_index];
+                let instruction = &program.instructions[instruction_index];
                 let inputs = instruction
                     .inputs
                     .iter()
@@ -1950,7 +1947,7 @@ where
     }
 
     program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
@@ -2315,11 +2312,11 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let instruction = &program.instructions()[instruction_index];
+    let instruction = &program.instructions[instruction_index];
     let output_types = instruction
         .outputs
         .iter()
-        .map(|output| program.atom(*output).expect("instruction output should exist").r#type().into_owned())
+        .map(|output| program.atoms[output.index].r#type().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
     instruction.operation.lower_to_mlir(
@@ -2344,13 +2341,11 @@ where
     V: MlirLowerableValue,
     O: Clone + XlaOp<V>,
 {
-    let instruction = &program.instructions()[instruction_index];
+    let instruction = &program.instructions[instruction_index];
     let output_types = instruction
         .outputs
         .iter()
-        .map(|output| {
-            packed_array_type(&program.atom(*output).expect("instruction output should exist").r#type(), lane_count)
-        })
+        .map(|output| packed_array_type(&program.atoms[output.index].r#type(), lane_count))
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
     instruction.operation.lower_to_mlir(
@@ -2374,11 +2369,11 @@ where
     ProgramInput: Parameterized<ShardMapTensor>,
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
-    let instruction = &program.instructions()[instruction_index];
+    let instruction = &program.instructions[instruction_index];
     let output_types = instruction
         .outputs
         .iter()
-        .map(|output| program.atom(*output).expect("instruction output should exist").r#type().into_owned())
+        .map(|output| program.atoms[output.index].r#type().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
     dispatch_lower_shard_map_mlir(&instruction.operation, input_values, output_types.as_slice(), &mut lowerer)

@@ -26,25 +26,24 @@ where
     LiftConstant: Fn(&V, &[R]) -> Result<R, TracingError>,
     ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TracingError>,
 {
-    let mut values = vec![None; program.atom_count()];
-    for (atom_id, value) in program.input_ids().iter().copied().zip(inputs.iter().cloned()) {
+    let mut values = vec![None; program.atoms.len()];
+    for (atom_id, value) in program.input_ids.iter().copied().zip(inputs.iter().cloned()) {
         values[atom_id.index] = Some(value);
     }
 
-    let mut instruction_by_first_output = vec![None; program.atom_count()];
-    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+    let mut instruction_by_first_output = vec![None; program.atoms.len()];
+    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
         if let Some(first_output) = instruction.outputs.first() {
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
-    let mut input_atom_flags = vec![false; program.atom_count()];
-    for input_atom in program.input_ids().iter().copied() {
+    let mut input_atom_flags = vec![false; program.atoms.len()];
+    for input_atom in program.input_ids.iter().copied() {
         input_atom_flags[input_atom.index] = true;
     }
 
-    for atom_index in 0..program.atom_count() {
-        let atom_id = AtomId { index: atom_index };
-        let atom = program.atom(atom_id).expect("atom IDs should be dense");
+    for atom_index in 0..program.atoms.len() {
+        let atom = &program.atoms[atom_index];
         match atom {
             Atom::Constant(value) => {
                 let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
@@ -58,7 +57,7 @@ where
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let instruction = &program.instructions()[instruction_index];
+                let instruction = &program.instructions[instruction_index];
                 let input_values = instruction
                     .inputs
                     .iter()
@@ -73,7 +72,7 @@ where
     }
 
     program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|output| values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
         .collect()

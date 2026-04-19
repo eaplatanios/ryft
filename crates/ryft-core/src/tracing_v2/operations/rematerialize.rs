@@ -522,9 +522,9 @@ where
         let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
         let input_types = body_program
-            .input_ids()
+            .input_ids
             .iter()
-            .map(|id| body_program.atom(*id).expect("body input atom should exist").r#type().into_owned())
+            .map(|id| body_program.atoms[id.index].r#type().into_owned())
             .collect::<Vec<_>>();
         let output_types = exemplar_output_types.parameters().cloned().collect::<Vec<_>>();
         let body = FlatTracedRematerialize::from_parts(

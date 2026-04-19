@@ -238,7 +238,7 @@ where
     let program = program;
     let representative_values = program.representative_atom_values(engine)?;
     let representative_inputs = program.representative_input_values(engine)?;
-    let instructions = program.instructions();
+    let instructions = program.instructions.as_slice();
 
     // If the program has fewer instructions than a single segment, no segmentation is needed Ã¢â‚¬â€ wrap the
     // whole thing in a single RematerializeOp.
@@ -250,7 +250,7 @@ where
     let segments: Vec<&[Instruction<E::TracingOperation>]> = instructions.chunks(segment_size).collect();
 
     // Build a mapping from atom ID to which instruction produces it (if any).
-    let mut atom_producer: Vec<Option<usize>> = vec![None; program.atom_count()];
+    let mut atom_producer: Vec<Option<usize>> = vec![None; program.atoms.len()];
     for (instruction_index, instruction) in instructions.iter().enumerate() {
         for &output_atom in &instruction.outputs {
             atom_producer[output_atom.index] = Some(instruction_index);
@@ -259,7 +259,7 @@ where
 
     // Build a set tracking which atoms are consumed after a given instruction index.
     // For each atom, track all instruction indices that consume it.
-    let mut atom_consumers: Vec<Vec<usize>> = vec![Vec::new(); program.atom_count()];
+    let mut atom_consumers: Vec<Vec<usize>> = vec![Vec::new(); program.atoms.len()];
     for (instruction_index, instruction) in instructions.iter().enumerate() {
         for &input_atom in &instruction.inputs {
             atom_consumers[input_atom.index].push(instruction_index);
@@ -267,16 +267,16 @@ where
     }
     // Also mark program outputs as "consumed" at instruction_count (sentinel for "after all instructions").
     let sentinel = instructions.len();
-    for &output_atom in program.output_ids() {
+    for &output_atom in &program.output_ids {
         atom_consumers[output_atom.index].push(sentinel);
     }
 
     // Build the outer program.
-    let input_atoms = program.input_ids();
+    let input_atoms = program.input_ids.as_slice();
     let mut outer_builder: ProgramBuilder<E::TracingOperation, ArrayType, V> = ProgramBuilder::new();
 
     // Map from original atom IDs to outer-program atom IDs.
-    let mut atom_mapping: Vec<Option<AtomId>> = vec![None; program.atom_count()];
+    let mut atom_mapping: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
 
     // Register program inputs in the outer builder.
     for (&input_atom, representative_input) in input_atoms.iter().zip(representative_inputs.iter()) {
@@ -285,7 +285,8 @@ where
     }
 
     // Register constants that are used by instructions (they might be referenced across segments).
-    for (atom_id, atom) in program.atoms_iter() {
+    for (atom_index, atom) in program.atoms.iter().enumerate() {
+        let atom_id = AtomId { index: atom_index };
         if let Atom::Constant(value) = atom {
             let outer_atom = outer_builder.add_constant(value.clone());
             atom_mapping[atom_id.index] = Some(outer_atom);
@@ -342,7 +343,8 @@ where
             .iter()
             .map(|&atom_id| {
                 program
-                    .atom(atom_id)
+                    .atoms
+                    .get(atom_id.index)
                     .ok_or(TracingError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.r#type().into_owned())
             })
@@ -351,7 +353,8 @@ where
             .iter()
             .map(|&atom_id| {
                 program
-                    .atom(atom_id)
+                    .atoms
+                    .get(atom_id.index)
                     .ok_or(TracingError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.r#type().into_owned())
             })
@@ -381,7 +384,7 @@ where
 
     // Wire up the program outputs.
     let outer_outputs: Vec<AtomId> = program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|&orig_atom| atom_mapping[orig_atom.index].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
         .collect::<Result<_, _>>()?;
@@ -389,7 +392,7 @@ where
     let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
         flat_leaf_parameter_structure(input_atoms.len()),
-        flat_leaf_parameter_structure(program.output_ids().len()),
+        flat_leaf_parameter_structure(program.output_ids.len()),
     );
     Ok(outer_program)
 }
@@ -407,21 +410,23 @@ where
     let program = program;
     let representative_inputs = program.representative_input_values(engine)?;
     let input_types: Vec<_> = program
-        .input_ids()
+        .input_ids
         .iter()
         .map(|&atom_id| {
             program
-                .atom(atom_id)
+                .atoms
+                .get(atom_id.index)
                 .ok_or(TracingError::UnboundAtomId { id: atom_id })
                 .map(|atom| atom.r#type().into_owned())
         })
         .collect::<Result<_, _>>()?;
     let output_types: Vec<_> = program
-        .output_ids()
+        .output_ids
         .iter()
         .map(|&atom_id| {
             program
-                .atom(atom_id)
+                .atoms
+                .get(atom_id.index)
                 .ok_or(TracingError::UnboundAtomId { id: atom_id })
                 .map(|atom| atom.r#type().into_owned())
         })
@@ -445,7 +450,7 @@ where
     let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
         flat_leaf_parameter_structure(outer_inputs.len()),
-        flat_leaf_parameter_structure(program.output_ids().len()),
+        flat_leaf_parameter_structure(program.output_ids.len()),
     );
     Ok(outer_program)
 }
@@ -479,7 +484,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             if sub_atom_mapping.contains_key(&input_atom) {
                 continue;
             }
-            let atom = program.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
+            let atom = program.atoms.get(input_atom.index).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             if let Atom::Constant(value) = atom {
                 let sub_atom = sub_builder.add_constant(value.clone());
                 sub_atom_mapping.insert(input_atom, sub_atom);
@@ -502,7 +507,8 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             .iter()
             .map(|&atom_id| {
                 program
-                    .atom(atom_id)
+                    .atoms
+                    .get(atom_id.index)
                     .ok_or(TracingError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.r#type().into_owned())
             })

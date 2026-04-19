@@ -93,25 +93,25 @@ pub struct Instruction<O> {
 /// transforms exchange programs in this form.
 pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// Final atom table of the staged program.
-    atoms: Vec<Atom<T, V>>,
+    pub atoms: Vec<Atom<T, V>>,
 
     /// Input atom ids in the same order as the flattened input parameters.
-    input_ids: Vec<AtomId>,
+    pub input_ids: Vec<AtomId>,
 
     /// Output atom ids in the same order as the flattened output parameters.
-    output_ids: Vec<AtomId>,
+    pub output_ids: Vec<AtomId>,
 
     /// Ordered instructions that replay the staged computation.
-    instructions: Vec<Instruction<O>>,
+    pub instructions: Vec<Instruction<O>>,
 
     /// Structured input shape used to rebuild typed inputs from flat leaves.
-    input_structure: Input::ParameterStructure,
+    pub input_structure: Input::ParameterStructure,
 
     /// Structured output shape used to rebuild typed outputs from flat leaves.
-    output_structure: Output::ParameterStructure,
+    pub output_structure: Output::ParameterStructure,
 
     /// Phantom marker that ties the program to its structured input/output parameter families.
-    marker: PhantomData<fn(Input) -> Output>,
+    pub marker: PhantomData<fn(Input) -> Output>,
 }
 
 impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>> Clone
@@ -136,68 +136,16 @@ where
 impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
-    /// Returns the number of atoms in the program.
-    #[inline]
-    pub fn atom_count(&self) -> usize {
-        self.atoms.len()
-    }
-
-    /// Returns the atom with the provided identifier.
-    #[inline]
-    pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
-        self.atoms.get(id.index)
-    }
-
-    /// Returns an iterator over all atoms in the program, yielding `(atom_id, &Atom<T, V>)` pairs.
-    #[inline]
-    pub fn atoms_iter(&self) -> impl Iterator<Item = (AtomId, &Atom<T, V>)> {
-        self.atoms.iter().enumerate().map(|(atom_index, atom)| (AtomId { index: atom_index }, atom))
-    }
-
-    /// Returns the program input ids in parameter order.
-    #[inline]
-    pub fn input_ids(&self) -> &[AtomId] {
-        self.input_ids.as_slice()
-    }
-
     /// Returns the program input atoms in parameter order.
     #[inline]
     pub fn inputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
-        self.input_ids
-            .iter()
-            .map(|input_id| self.atom(*input_id).expect("program input ids should refer to existing atoms"))
-    }
-
-    /// Returns the instructions in execution order.
-    #[inline]
-    pub fn instructions(&self) -> &[Instruction<O>] {
-        self.instructions.as_slice()
-    }
-
-    /// Returns the output ids in parameter order.
-    #[inline]
-    pub fn output_ids(&self) -> &[AtomId] {
-        self.output_ids.as_slice()
+        self.input_ids.iter().map(|input_id| &self.atoms[input_id.index])
     }
 
     /// Returns the program output atoms in parameter order.
     #[inline]
     pub fn outputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
-        self.output_ids
-            .iter()
-            .map(|output_id| self.atom(*output_id).expect("program output ids should refer to existing atoms"))
-    }
-
-    /// Returns the expected input parameter structure.
-    #[inline]
-    pub fn input_structure(&self) -> &Input::ParameterStructure {
-        &self.input_structure
-    }
-
-    /// Returns the output parameter structure.
-    #[inline]
-    pub fn output_structure(&self) -> &Output::ParameterStructure {
-        &self.output_structure
+        self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
     }
 
     /// Returns representative concrete inputs for this program, synthesized as zero values from the
@@ -213,7 +161,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.input_ids
             .iter()
             .copied()
-            .map(|atom_id| match self.atom(atom_id) {
+            .map(|atom_id| match self.atoms.get(atom_id.index) {
                 Some(Atom::Variable(r#type)) => Ok(engine.zero(r#type)),
                 _ => Err(TracingError::InternalInvariantViolation("staged program input atom did not retain a type")),
             })
@@ -373,7 +321,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                 return Ok(*mapped_atom);
             }
 
-            let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+            let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom {
                 Atom::Constant(value) => builder.add_constant(value.clone()),
                 Atom::Variable(_) => {
@@ -396,7 +344,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                     let output_abstracts = instruction
                         .outputs
                         .iter()
-                        .map(|output| program.atom(*output).expect("output atom should exist").r#type().into_owned())
+                        .map(|output| program.atoms[output.index].r#type().into_owned())
                         .collect::<Vec<_>>();
                     let remapped_outputs = builder.add_instruction_prevalidated(
                         instruction.operation.clone(),
@@ -417,14 +365,14 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             Ok(mapped_atom)
         }
 
-        let mut instruction_by_output = vec![None; self.atom_count()];
+        let mut instruction_by_output = vec![None; self.atoms.len()];
         for (instruction_index, instruction) in self.instructions.iter().enumerate() {
             for output in instruction.outputs.iter().copied() {
                 instruction_by_output[output.index] = Some(instruction_index);
             }
         }
 
-        let mut live_atoms = vec![false; self.atom_count()];
+        let mut live_atoms = vec![false; self.atoms.len()];
         let mut live_instructions = vec![false; self.instructions.len()];
         for output in self.output_ids.iter().copied() {
             mark_live(
@@ -439,7 +387,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         let mut builder = ProgramBuilder::<O, T, V>::new();
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_ids.iter().copied() {
-            let input = self.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
+            let input = self.atoms.get(input_atom.index).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             let Atom::Variable(r#type) = input else {
                 return Err(TracingError::InternalInvariantViolation(
                     "staged program input atom did not retain a type",
@@ -848,8 +796,8 @@ mod tests {
         let sum = builder.add_instruction(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
-        assert!(matches!(program.atom(x).unwrap(), Atom::Variable(_)));
-        assert!(matches!(program.atom(two).unwrap(), Atom::Constant(_)));
+        assert!(matches!(program.atoms.get(x.index), Some(Atom::Variable(_))));
+        assert!(matches!(program.atoms.get(two.index), Some(Atom::Constant(_))));
         assert_eq!(program.call((2.0, 3.0)).unwrap(), 7.0);
         assert_eq!(
             program.to_string(),
@@ -916,7 +864,7 @@ mod tests {
 
         // Build the program and verify only the non-folded instruction survived.
         let program = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
-        assert_eq!(program.instructions().len(), 1);
+        assert_eq!(program.instructions.len(), 1);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -966,10 +914,10 @@ mod tests {
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         assert!(
-            matches!(program.atom(x).unwrap(), Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64))
+            matches!(program.atoms.get(x.index), Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64))
         );
-        assert!(matches!(program.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
-        assert!(matches!(program.atom(sum).unwrap(), Atom::Variable(_)));
+        assert!(matches!(program.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
+        assert!(matches!(program.atoms.get(sum.index), Some(Atom::Variable(_))));
         assert_eq!(program.representative_atom_values(&engine).unwrap(), vec![0.0, 3.0, 3.0]);
         assert_eq!(program.call(4.0).unwrap(), 7.0);
     }

@@ -368,7 +368,7 @@ where
         "interpret_and_trace did not record the staged output structure",
     ))?;
     let program = flat_program.clone_with_structures::<Input, Output>(input_structure, output_structure).simplify()?;
-    let concrete_input = Input::from_parameters(program.input_structure().clone(), input_values)?;
+    let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
     Ok((program.call(concrete_input)?, program))
 }
 
@@ -424,7 +424,7 @@ mod tests {
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.call(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
-        assert_eq!(program.input_ids().len(), 1);
+        assert_eq!(program.input_ids.len(), 1);
         assert_eq!(
             program.to_string(),
             indoc! {"
