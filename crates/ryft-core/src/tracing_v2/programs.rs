@@ -104,327 +104,6 @@ pub struct Equation<O> {
     pub outputs: Vec<AtomId>,
 }
 
-/// Builder for staged programs.
-///
-/// [`ProgramBuilder`] is the mutable workhorse used by the tracing entry points and by the
-/// linearization helpers. It is deliberately more stateful than [`Program`]: while staging, it can
-/// retain eager exemplar values for inputs and derived atoms so that primitive applications can be
-/// validated immediately, constants can be folded, and algebraic identities can be removed before
-/// they ever enter the final IR.
-///
-/// The builder keeps one entry in [`Self::intermediates`] for every atom: `Some` for
-/// [`Atom::Derived`] atoms whose value has been eagerly computed during staging, `None` otherwise.
-/// Those intermediates are an implementation detail of tracing and are discarded when the builder
-/// is finalized via [`Self::build`].
-///
-/// During traced execution the builder also carries the first staging failure encountered in that
-/// tracing scope. This lets infallible operator syntax like `x + y` poison the shared trace and
-/// stop recording new equations even though the surrounding closure cannot immediately return
-/// `Result`.
-#[derive(Clone, Debug)]
-pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
-    /// Atom table accumulated so far, including inputs, constants, and derived outputs.
-    atoms: Vec<Atom<T, V>>,
-
-    /// Optional eager exemplars retained for non-constant atoms while staging.
-    intermediates: Vec<Option<V>>,
-
-    /// Input atom ids in parameter order.
-    input_atoms: Vec<AtomId>,
-
-    /// Equations recorded so far in execution order.
-    equations: Vec<Equation<O>>,
-
-    /// First staging failure recorded while this builder was used for traced execution.
-    error: Option<TracingError>,
-}
-
-impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
-    /// Creates an empty builder.
-    ///
-    /// Fresh builders contain no atoms, equations, or retained exemplars and are typically owned
-    /// by one tracing scope.
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            atoms: Vec::new(),
-            intermediates: Vec::new(),
-            input_atoms: Vec::new(),
-            equations: Vec::new(),
-            error: None,
-        }
-    }
-
-    /// Returns the atom with the provided identifier.
-    #[inline]
-    pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
-        self.atoms.get(id.index())
-    }
-
-    /// Returns the concrete value associated with the provided atom, if one is available.
-    ///
-    /// For [`Atom::Constant`] this returns the retained value. For [`Atom::Input`] and
-    /// [`Atom::Derived`] this returns the eagerly computed exemplar stored in the builder's
-    /// side table, or `None` if none is available.
-    #[inline]
-    pub(crate) fn stored_value(&self, id: AtomId) -> Option<&V> {
-        match self.atoms.get(id.index())? {
-            Atom::Constant(value) => Some(value),
-            Atom::Input(_) | Atom::Derived(_) => self.intermediates.get(id.index()).and_then(Option::as_ref),
-        }
-    }
-
-    /// Adds a new input atom retaining only its abstract type, without recording any exemplar in
-    /// the builder's side table.
-    ///
-    /// Intended for program transforms that rebuild structure without needing intermediate values
-    /// (for example [`Program::simplify`]). Callers that later need a representative value for this
-    /// atom should obtain it from an [`Engine`](crate::tracing_v2::Engine) via
-    /// [`Program::representative_input_values`].
-    #[inline]
-    pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
-        let id = AtomId::from_index(self.atoms.len());
-        self.atoms.push(Atom::Input(abstract_value));
-        self.intermediates.push(None);
-        self.input_atoms.push(id);
-        id
-    }
-
-    /// Adds a new input atom using the abstract type and value of `example`.
-    #[inline]
-    pub fn add_input(&mut self, example: &V) -> AtomId {
-        let abstract_value = <V as Typed<T>>::r#type(example).into_owned();
-        self.add_input_with_example(abstract_value, example.clone())
-    }
-
-    /// Adds a new input atom with the supplied abstract type and a caller-supplied exemplar value.
-    #[inline]
-    fn add_input_with_example(&mut self, abstract_value: T, example_value: V) -> AtomId {
-        let id = AtomId::from_index(self.atoms.len());
-        self.atoms.push(Atom::Input(abstract_value));
-        self.intermediates.push(Some(example_value));
-        self.input_atoms.push(id);
-        id
-    }
-
-    /// Adds a constant atom to the program.
-    ///
-    /// Constants are retained verbatim in the final [`Program`] so later replay, lowering, and
-    /// simplification passes can recover the literal value.
-    #[inline]
-    pub fn add_constant(&mut self, value: V) -> AtomId {
-        let id = AtomId::from_index(self.atoms.len());
-        self.atoms.push(Atom::Constant(value));
-        self.intermediates.push(None);
-        id
-    }
-
-    /// Adds a staged equation without running abstract or concrete evaluation.
-    ///
-    /// This is intended for linear program construction where the output types are already known.
-    pub fn add_equation_prevalidated(&mut self, op: O, inputs: Vec<AtomId>, output_abstracts: Vec<T>) -> Vec<AtomId> {
-        let outputs = output_abstracts
-            .into_iter()
-            .map(|r#type| {
-                let id = AtomId::from_index(self.atoms.len());
-                self.atoms.push(Atom::Derived(r#type));
-                self.intermediates.push(None);
-                id
-            })
-            .collect::<Vec<_>>();
-        self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
-        outputs
-    }
-
-    /// Returns the number of equations added so far.
-    #[inline]
-    pub fn equation_count(&self) -> usize {
-        self.equations.len()
-    }
-
-    /// Returns `true` when traced execution has already recorded a staging failure on this builder.
-    #[inline]
-    pub(crate) fn has_error(&self) -> bool {
-        self.error.is_some()
-    }
-
-    /// Records the first staging failure encountered by traced execution on this builder.
-    #[inline]
-    pub(crate) fn record_error_if_absent(&mut self, error: TracingError) {
-        if self.error.is_none() {
-            self.error = Some(error);
-        }
-    }
-
-    /// Removes and returns the first staging failure recorded on this builder, if any.
-    #[inline]
-    pub(crate) fn take_error(&mut self) -> Option<TracingError> {
-        self.error.take()
-    }
-
-    /// Adds a staged equation using pre-computed output values, performing abstract-eval validation,
-    /// algebraic identity elimination, and constant folding.
-    ///
-    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`InterpretableOp::eval`] â€”
-    /// the caller supplies the concrete output values directly. Use this when the caller has already
-    /// computed the outputs (e.g., inside [`Tracer`](crate::tracing_v2::Tracer) staging
-    /// methods).
-    pub fn add_equation_with_output_values(
-        &mut self,
-        op: O,
-        inputs: Vec<AtomId>,
-        output_values: Vec<V>,
-    ) -> Result<Vec<AtomId>, TracingError>
-    where
-        O: Op<T>,
-    {
-        let input_abstracts = inputs
-            .iter()
-            .map(|input| {
-                self.atom(*input)
-                    .map(|atom| atom.r#type().into_owned())
-                    .ok_or(TracingError::UnboundAtomId { id: *input })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
-
-        // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
-        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
-            return Ok(simplified);
-        }
-
-        let all_constant = inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant(_))));
-
-        let outputs = output_abstracts
-            .into_iter()
-            .zip(output_values)
-            .map(|(r#type, output_value)| {
-                let id = self.atoms.len();
-                if all_constant {
-                    self.atoms.push(Atom::Constant(output_value));
-                    self.intermediates.push(None);
-                } else {
-                    self.atoms.push(Atom::Derived(r#type));
-                    self.intermediates.push(Some(output_value));
-                }
-                AtomId::from_index(id)
-            })
-            .collect::<Vec<_>>();
-
-        if !all_constant {
-            self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
-        }
-        Ok(outputs)
-    }
-
-    /// Adds a staged equation using only abstract evaluation.
-    ///
-    /// This is the staging path used by type-directed tracing and any traced replay that does not
-    /// have representative concrete values available for the participating atoms.
-    pub fn add_equation_abstract(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
-    where
-        O: Op<T>,
-    {
-        let input_abstracts = inputs
-            .iter()
-            .map(|input| {
-                self.atom(*input)
-                    .map(|atom| atom.r#type().into_owned())
-                    .ok_or(TracingError::UnboundAtomId { id: *input })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
-
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
-        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
-            return Ok(simplified);
-        }
-
-        Ok(self.add_equation_prevalidated(op, inputs, output_abstracts))
-    }
-
-    /// Adds a staged equation, validating its inputs through abstract evaluation first.
-    ///
-    /// When every input atom is an [`Atom::Constant`], the operation is folded at program-construction
-    /// time: `abstract_eval` and `eval` are still executed for validation, but the output atoms are
-    /// recorded as constants and no equation is added to the program.
-    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
-    where
-        O: InterpretableOp<T, V>,
-    {
-        let input_examples = inputs
-            .iter()
-            .map(|input| self.stored_value(*input).cloned().ok_or(TracingError::UnboundAtomId { id: *input }))
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_values = op.interpret(input_examples.as_slice())?;
-        self.add_equation_with_output_values(op, inputs, output_values)
-    }
-
-    /// Finalizes the builder into a program with the given input/output structures. The builder's
-    /// intermediate values are discarded; the resulting program retains only the atoms, equations,
-    /// and input/output structure.
-    pub fn build<Input, Output>(
-        self,
-        outputs: Vec<AtomId>,
-        input_structure: Input::ParameterStructure,
-        output_structure: Output::ParameterStructure,
-    ) -> Program<T, V, O, Input, Output>
-    where
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-    {
-        Program {
-            atoms: self.atoms,
-            input_atoms: self.input_atoms,
-            equations: self.equations,
-            outputs,
-            input_structure,
-            output_structure,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<O: Clone, T: Type, V: Traceable<T>> Default for ProgramBuilder<O, T, V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Canonical operation type used by the default staged program IR.
-///
-/// Most of the core crate stages ordinary programs against this built-in primitive carrier unless a
-/// backend supplies a different carrier through [`Engine::TracingOperation`](crate::tracing_v2::Engine::TracingOperation).
-pub type ProgramOpRef<V> = PrimitiveOp<ArrayType, V>;
-
-/// Canonical operation type used by the default staged linear-program IR.
-///
-/// Linearization and reverse-mode utilities use this as the default carrier for tangent and
-/// cotangent programs unless a backend overrides it through
-/// [`Engine::LinearOperation`](crate::tracing_v2::Engine::LinearOperation).
-pub type LinearProgramOpRef<V> = LinearPrimitiveOp<ArrayType, V>;
-
-/// Shared builder used by the staged linear-program IR. The optional `O` parameter allows callers
-/// to stage against an alternate linear operation carrier.
-pub type LinearProgramBuilder<V, O = LinearProgramOpRef<V>> = ProgramBuilder<O, ArrayType, V>;
-
-// ---------------------------------------------------------------------------
-// Algebraic identity elimination helpers
-// ---------------------------------------------------------------------------
-
-/// Checks if one staged constant is an exact zero.
-pub(crate) fn is_identity_zero<T: Type, V: Traceable<T>>(value: &V) -> bool {
-    value.is_zero()
-}
-
-/// Checks if one staged constant is an exact one.
-pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
-    value.is_one()
-}
-
 /// Executable staged program over an open operation set.
 ///
 /// [`Program`] is the persistent artifact produced by tracing. It stores the finalized atom table,
@@ -836,6 +515,327 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
         let outputs = self.outputs.iter().map(|output| format_atom(*output)).collect::<Vec<_>>().join(", ");
         write!(formatter, "in ({outputs})")
     }
+}
+
+/// Builder for staged programs.
+///
+/// [`ProgramBuilder`] is the mutable workhorse used by the tracing entry points and by the
+/// linearization helpers. It is deliberately more stateful than [`Program`]: while staging, it can
+/// retain eager exemplar values for inputs and derived atoms so that primitive applications can be
+/// validated immediately, constants can be folded, and algebraic identities can be removed before
+/// they ever enter the final IR.
+///
+/// The builder keeps one entry in [`Self::intermediates`] for every atom: `Some` for
+/// [`Atom::Derived`] atoms whose value has been eagerly computed during staging, `None` otherwise.
+/// Those intermediates are an implementation detail of tracing and are discarded when the builder
+/// is finalized via [`Self::build`].
+///
+/// During traced execution the builder also carries the first staging failure encountered in that
+/// tracing scope. This lets infallible operator syntax like `x + y` poison the shared trace and
+/// stop recording new equations even though the surrounding closure cannot immediately return
+/// `Result`.
+#[derive(Clone, Debug)]
+pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
+    /// Atom table accumulated so far, including inputs, constants, and derived outputs.
+    atoms: Vec<Atom<T, V>>,
+
+    /// Optional eager exemplars retained for non-constant atoms while staging.
+    intermediates: Vec<Option<V>>,
+
+    /// Input atom ids in parameter order.
+    input_atoms: Vec<AtomId>,
+
+    /// Equations recorded so far in execution order.
+    equations: Vec<Equation<O>>,
+
+    /// First staging failure recorded while this builder was used for traced execution.
+    error: Option<TracingError>,
+}
+
+impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
+    /// Creates an empty builder.
+    ///
+    /// Fresh builders contain no atoms, equations, or retained exemplars and are typically owned
+    /// by one tracing scope.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            atoms: Vec::new(),
+            intermediates: Vec::new(),
+            input_atoms: Vec::new(),
+            equations: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// Returns the atom with the provided identifier.
+    #[inline]
+    pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
+        self.atoms.get(id.index())
+    }
+
+    /// Returns the concrete value associated with the provided atom, if one is available.
+    ///
+    /// For [`Atom::Constant`] this returns the retained value. For [`Atom::Input`] and
+    /// [`Atom::Derived`] this returns the eagerly computed exemplar stored in the builder's
+    /// side table, or `None` if none is available.
+    #[inline]
+    pub(crate) fn stored_value(&self, id: AtomId) -> Option<&V> {
+        match self.atoms.get(id.index())? {
+            Atom::Constant(value) => Some(value),
+            Atom::Input(_) | Atom::Derived(_) => self.intermediates.get(id.index()).and_then(Option::as_ref),
+        }
+    }
+
+    /// Adds a new input atom retaining only its abstract type, without recording any exemplar in
+    /// the builder's side table.
+    ///
+    /// Intended for program transforms that rebuild structure without needing intermediate values
+    /// (for example [`Program::simplify`]). Callers that later need a representative value for this
+    /// atom should obtain it from an [`Engine`](crate::tracing_v2::Engine) via
+    /// [`Program::representative_input_values`].
+    #[inline]
+    pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
+        let id = AtomId::from_index(self.atoms.len());
+        self.atoms.push(Atom::Input(abstract_value));
+        self.intermediates.push(None);
+        self.input_atoms.push(id);
+        id
+    }
+
+    /// Adds a new input atom using the abstract type and value of `example`.
+    #[inline]
+    pub fn add_input(&mut self, example: &V) -> AtomId {
+        let abstract_value = <V as Typed<T>>::r#type(example).into_owned();
+        self.add_input_with_example(abstract_value, example.clone())
+    }
+
+    /// Adds a new input atom with the supplied abstract type and a caller-supplied exemplar value.
+    #[inline]
+    fn add_input_with_example(&mut self, abstract_value: T, example_value: V) -> AtomId {
+        let id = AtomId::from_index(self.atoms.len());
+        self.atoms.push(Atom::Input(abstract_value));
+        self.intermediates.push(Some(example_value));
+        self.input_atoms.push(id);
+        id
+    }
+
+    /// Adds a constant atom to the program.
+    ///
+    /// Constants are retained verbatim in the final [`Program`] so later replay, lowering, and
+    /// simplification passes can recover the literal value.
+    #[inline]
+    pub fn add_constant(&mut self, value: V) -> AtomId {
+        let id = AtomId::from_index(self.atoms.len());
+        self.atoms.push(Atom::Constant(value));
+        self.intermediates.push(None);
+        id
+    }
+
+    /// Adds a staged equation without running abstract or concrete evaluation.
+    ///
+    /// This is intended for linear program construction where the output types are already known.
+    pub fn add_equation_prevalidated(&mut self, op: O, inputs: Vec<AtomId>, output_abstracts: Vec<T>) -> Vec<AtomId> {
+        let outputs = output_abstracts
+            .into_iter()
+            .map(|r#type| {
+                let id = AtomId::from_index(self.atoms.len());
+                self.atoms.push(Atom::Derived(r#type));
+                self.intermediates.push(None);
+                id
+            })
+            .collect::<Vec<_>>();
+        self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
+        outputs
+    }
+
+    /// Returns the number of equations added so far.
+    #[inline]
+    pub fn equation_count(&self) -> usize {
+        self.equations.len()
+    }
+
+    /// Returns `true` when traced execution has already recorded a staging failure on this builder.
+    #[inline]
+    pub(crate) fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    /// Records the first staging failure encountered by traced execution on this builder.
+    #[inline]
+    pub(crate) fn record_error_if_absent(&mut self, error: TracingError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    /// Removes and returns the first staging failure recorded on this builder, if any.
+    #[inline]
+    pub(crate) fn take_error(&mut self) -> Option<TracingError> {
+        self.error.take()
+    }
+
+    /// Adds a staged equation using pre-computed output values, performing abstract-eval validation,
+    /// algebraic identity elimination, and constant folding.
+    ///
+    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`InterpretableOp::eval`] â€”
+    /// the caller supplies the concrete output values directly. Use this when the caller has already
+    /// computed the outputs (e.g., inside [`Tracer`](crate::tracing_v2::Tracer) staging
+    /// methods).
+    pub fn add_equation_with_output_values(
+        &mut self,
+        op: O,
+        inputs: Vec<AtomId>,
+        output_values: Vec<V>,
+    ) -> Result<Vec<AtomId>, TracingError>
+    where
+        O: Op<T>,
+    {
+        let input_abstracts = inputs
+            .iter()
+            .map(|input| {
+                self.atom(*input)
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(TracingError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
+
+        // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
+        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
+            return Ok(simplified);
+        }
+
+        let all_constant = inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant(_))));
+
+        let outputs = output_abstracts
+            .into_iter()
+            .zip(output_values)
+            .map(|(r#type, output_value)| {
+                let id = self.atoms.len();
+                if all_constant {
+                    self.atoms.push(Atom::Constant(output_value));
+                    self.intermediates.push(None);
+                } else {
+                    self.atoms.push(Atom::Derived(r#type));
+                    self.intermediates.push(Some(output_value));
+                }
+                AtomId::from_index(id)
+            })
+            .collect::<Vec<_>>();
+
+        if !all_constant {
+            self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
+        }
+        Ok(outputs)
+    }
+
+    /// Adds a staged equation using only abstract evaluation.
+    ///
+    /// This is the staging path used by type-directed tracing and any traced replay that does not
+    /// have representative concrete values available for the participating atoms.
+    pub fn add_equation_abstract(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
+    where
+        O: Op<T>,
+    {
+        let input_abstracts = inputs
+            .iter()
+            .map(|input| {
+                self.atom(*input)
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(TracingError::UnboundAtomId { id: *input })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
+
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
+        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
+            return Ok(simplified);
+        }
+
+        Ok(self.add_equation_prevalidated(op, inputs, output_abstracts))
+    }
+
+    /// Adds a staged equation, validating its inputs through abstract evaluation first.
+    ///
+    /// When every input atom is an [`Atom::Constant`], the operation is folded at program-construction
+    /// time: `abstract_eval` and `eval` are still executed for validation, but the output atoms are
+    /// recorded as constants and no equation is added to the program.
+    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
+    where
+        O: InterpretableOp<T, V>,
+    {
+        let input_examples = inputs
+            .iter()
+            .map(|input| self.stored_value(*input).cloned().ok_or(TracingError::UnboundAtomId { id: *input }))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_values = op.interpret(input_examples.as_slice())?;
+        self.add_equation_with_output_values(op, inputs, output_values)
+    }
+
+    /// Finalizes the builder into a program with the given input/output structures. The builder's
+    /// intermediate values are discarded; the resulting program retains only the atoms, equations,
+    /// and input/output structure.
+    pub fn build<Input, Output>(
+        self,
+        outputs: Vec<AtomId>,
+        input_structure: Input::ParameterStructure,
+        output_structure: Output::ParameterStructure,
+    ) -> Program<T, V, O, Input, Output>
+    where
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+    {
+        Program {
+            atoms: self.atoms,
+            input_atoms: self.input_atoms,
+            equations: self.equations,
+            outputs,
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<O: Clone, T: Type, V: Traceable<T>> Default for ProgramBuilder<O, T, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Canonical operation type used by the default staged program IR.
+///
+/// Most of the core crate stages ordinary programs against this built-in primitive carrier unless a
+/// backend supplies a different carrier through [`Engine::TracingOperation`](crate::tracing_v2::Engine::TracingOperation).
+pub type ProgramOpRef<V> = PrimitiveOp<ArrayType, V>;
+
+/// Canonical operation type used by the default staged linear-program IR.
+///
+/// Linearization and reverse-mode utilities use this as the default carrier for tangent and
+/// cotangent programs unless a backend overrides it through
+/// [`Engine::LinearOperation`](crate::tracing_v2::Engine::LinearOperation).
+pub type LinearProgramOpRef<V> = LinearPrimitiveOp<ArrayType, V>;
+
+/// Shared builder used by the staged linear-program IR. The optional `O` parameter allows callers
+/// to stage against an alternate linear operation carrier.
+pub type LinearProgramBuilder<V, O = LinearProgramOpRef<V>> = ProgramBuilder<O, ArrayType, V>;
+
+// ---------------------------------------------------------------------------
+// Algebraic identity elimination helpers
+// ---------------------------------------------------------------------------
+
+/// Checks if one staged constant is an exact zero.
+pub(crate) fn is_identity_zero<T: Type, V: Traceable<T>>(value: &V) -> bool {
+    value.is_zero()
+}
+
+/// Checks if one staged constant is an exact one.
+pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
+    value.is_one()
 }
 
 #[cfg(test)]
