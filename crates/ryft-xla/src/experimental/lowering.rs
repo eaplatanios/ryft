@@ -1598,7 +1598,7 @@ where
 
         let atom = program.atom(atom_id).ok_or(LoweringError::MissingAtomValue { atom_id })?;
         match atom {
-            Atom::Constant { value } => lower_packed_literal_value(
+            Atom::Constant(value) => lower_packed_literal_value(
                 value,
                 &packed_array_type(&atom.r#type(), lane_count),
                 block,
@@ -1625,9 +1625,9 @@ where
         let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input { .. } => {}
-            Atom::Constant { .. } => {}
-            Atom::Derived { .. } => {
+            Atom::Input(_) => {}
+            Atom::Constant(_) => {}
+            Atom::Derived(_) => {
                 let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
@@ -1771,11 +1771,11 @@ where
         let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input { .. } => {}
-            Atom::Constant { value } => {
+            Atom::Input(_) => {}
+            Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
-            Atom::Derived { .. } => {
+            Atom::Derived(_) => {
                 let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
@@ -1843,11 +1843,11 @@ where
         let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input { .. } => {}
-            Atom::Constant { value } => {
+            Atom::Input(_) => {}
+            Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
-            Atom::Derived { .. } => {
+            Atom::Derived(_) => {
                 let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
@@ -1901,11 +1901,11 @@ where
         let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input { .. } => {}
-            Atom::Constant { value } => {
+            Atom::Input(_) => {}
+            Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_constant(atom_id, value, block, context, location)?);
             }
-            Atom::Derived { .. } => {
+            Atom::Derived(_) => {
                 let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };

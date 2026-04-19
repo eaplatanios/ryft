@@ -238,7 +238,7 @@ where
     for (atom_id, atom) in
         (0..program.atom_count()).filter_map(|atom_id| program.atom(atom_id).map(|atom| (atom_id, atom)))
     {
-        if matches!(atom, Atom::Input { .. } | Atom::Constant { .. }) {
+        if matches!(atom, Atom::Input(_) | Atom::Constant(_)) {
             depth_by_atom[atom_id] = 0;
         }
     }
@@ -265,7 +265,7 @@ where
         equation_count: program.equations().len(),
         constant_count: (0..program.atom_count())
             .filter_map(|atom_id| program.atom(atom_id))
-            .filter(|atom| matches!(atom, Atom::Constant { .. }))
+            .filter(|atom| matches!(atom, Atom::Constant(_)))
             .count(),
         op_histogram,
         nested_region_count,

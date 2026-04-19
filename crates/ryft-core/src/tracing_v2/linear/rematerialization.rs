@@ -283,7 +283,7 @@ where
 
     // Register constants that are used by equations (they might be referenced across segments).
     for (atom_id, atom) in program.atoms_iter() {
-        if let Atom::Constant { value } = atom {
+        if let Atom::Constant(value) = atom {
             let outer_atom = outer_builder.add_constant(value.clone());
             atom_mapping[atom_id.index()] = Some(outer_atom);
         }
@@ -477,7 +477,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
                 continue;
             }
             let atom = program.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
-            if let Atom::Constant { value } = atom {
+            if let Atom::Constant(value) = atom {
                 let sub_atom = sub_builder.add_constant(value.clone());
                 sub_atom_mapping.insert(input_atom, sub_atom);
             }

@@ -42,15 +42,15 @@ where
         let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input { .. } => {}
-            Atom::Constant { value } => {
+            Atom::Input(_) => {}
+            Atom::Constant(value) => {
                 let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
                 if seed_inputs.is_empty() {
                     return Err(TracingError::EmptyParameterizedValue);
                 }
                 values[atom_index] = Some(lift_constant(value, seed_inputs.as_slice())?);
             }
-            Atom::Derived { .. } => {
+            Atom::Derived(_) => {
                 let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };

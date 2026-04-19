@@ -35,33 +35,24 @@ use crate::{
 pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant folded or supplied at trace time. Constants retain their value so the
     /// interpreter and MLIR lowering can emit them.
-    Constant {
-        /// Literal value held by this atom.
-        value: V,
-    },
+    Constant(V),
 
     /// Program input carrying only its abstract type. Any builder-time representative value is kept
     /// in the owning [`ProgramBuilder`]'s side table and is discarded when the program is finalized;
     /// later transforms recover representatives by synthesizing zeros from the retained type.
-    Input {
-        /// Abstract type retained for this input.
-        r#type: T,
-    },
+    Input(T),
 
     /// Atom produced by evaluating an equation. Carries only the abstract type; any eagerly
     /// evaluated intermediate value lives in the owning [`ProgramBuilder`]'s side table and is
     /// discarded when the program is finalized.
-    Derived {
-        /// Abstract type produced by the equation.
-        r#type: T,
-    },
+    Derived(T),
 }
 
 impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
     fn r#type(&self) -> Cow<'_, T> {
         match self {
-            Self::Constant { value } => value.r#type(),
-            Self::Input { r#type } | Self::Derived { r#type } => Cow::Borrowed(r#type),
+            Self::Constant(value) => value.r#type(),
+            Self::Input(r#type) | Self::Derived(r#type) => Cow::Borrowed(r#type),
         }
     }
 }
@@ -178,8 +169,8 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     #[inline]
     pub(crate) fn stored_value(&self, id: AtomId) -> Option<&V> {
         match self.atoms.get(id.index())? {
-            Atom::Constant { value } => Some(value),
-            Atom::Input { .. } | Atom::Derived { .. } => self.intermediates.get(id.index()).and_then(Option::as_ref),
+            Atom::Constant(value) => Some(value),
+            Atom::Input(_) | Atom::Derived(_) => self.intermediates.get(id.index()).and_then(Option::as_ref),
         }
     }
 
@@ -193,7 +184,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     #[inline]
     pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
         let id = AtomId::from_index(self.atoms.len());
-        self.atoms.push(Atom::Input { r#type: abstract_value });
+        self.atoms.push(Atom::Input(abstract_value));
         self.intermediates.push(None);
         self.input_atoms.push(id);
         id
@@ -210,7 +201,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     #[inline]
     fn add_input_with_example(&mut self, abstract_value: T, example_value: V) -> AtomId {
         let id = AtomId::from_index(self.atoms.len());
-        self.atoms.push(Atom::Input { r#type: abstract_value });
+        self.atoms.push(Atom::Input(abstract_value));
         self.intermediates.push(Some(example_value));
         self.input_atoms.push(id);
         id
@@ -223,7 +214,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = AtomId::from_index(self.atoms.len());
-        self.atoms.push(Atom::Constant { value });
+        self.atoms.push(Atom::Constant(value));
         self.intermediates.push(None);
         id
     }
@@ -236,7 +227,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .into_iter()
             .map(|r#type| {
                 let id = AtomId::from_index(self.atoms.len());
-                self.atoms.push(Atom::Derived { r#type });
+                self.atoms.push(Atom::Derived(r#type));
                 self.intermediates.push(None);
                 id
             })
@@ -298,13 +289,13 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
         // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_zero(value));
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_one(value));
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
         if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
 
-        let all_constant = inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant { .. })));
+        let all_constant = inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant(_))));
 
         let outputs = output_abstracts
             .into_iter()
@@ -312,10 +303,10 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .map(|(r#type, output_value)| {
                 let id = self.atoms.len();
                 if all_constant {
-                    self.atoms.push(Atom::Constant { value: output_value });
+                    self.atoms.push(Atom::Constant(output_value));
                     self.intermediates.push(None);
                 } else {
-                    self.atoms.push(Atom::Derived { r#type });
+                    self.atoms.push(Atom::Derived(r#type));
                     self.intermediates.push(Some(output_value));
                 }
                 AtomId::from_index(id)
@@ -346,8 +337,8 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .collect::<Result<Vec<_>, _>>()?;
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_zero(value));
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_one(value));
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
         if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
@@ -547,7 +538,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             .iter()
             .copied()
             .map(|atom_id| match self.atom(atom_id) {
-                Some(Atom::Input { r#type }) => Ok(engine.zero(r#type)),
+                Some(Atom::Input(r#type)) => Ok(engine.zero(r#type)),
                 _ => Err(TracingError::InternalInvariantViolation("staged program input atom did not retain a type")),
             })
             .collect()
@@ -571,7 +562,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         }
 
         for (atom_index, atom) in self.atoms.iter().enumerate() {
-            if let Atom::Constant { value } = atom {
+            if let Atom::Constant(value) = atom {
                 values[atom_index] = Some(value.clone());
             }
         }
@@ -705,9 +696,9 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 
             let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom {
-                Atom::Input { r#type } => builder.add_input_abstract(r#type.clone()),
-                Atom::Constant { value } => builder.add_constant(value.clone()),
-                Atom::Derived { .. } => {
+                Atom::Input(r#type) => builder.add_input_abstract(r#type.clone()),
+                Atom::Constant(value) => builder.add_constant(value.clone()),
+                Atom::Derived(_) => {
                     let equation_index = equation_by_output[atom_id.index()]
                         .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
                     if !live_equations[equation_index] {
@@ -768,7 +759,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_atoms.iter().copied() {
             let input = self.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
-            let Atom::Input { r#type } = input else {
+            let Atom::Input(r#type) = input else {
                 return Err(TracingError::InternalInvariantViolation(
                     "staged program input atom did not retain a type",
                 ));
@@ -817,13 +808,13 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
         let mut binding_count = 0usize;
         for (atom_id, atom) in self.atoms.iter().enumerate() {
             match atom {
-                Atom::Input { .. } => {}
-                Atom::Constant { .. } => {
+                Atom::Input(_) => {}
+                Atom::Constant(_) => {
                     let prefix = if binding_count == 0 { "let" } else { "   " };
                     writeln!(formatter, "{prefix} {} = const", format_typed_atom(AtomId::from_index(atom_id)))?;
                     binding_count += 1;
                 }
-                Atom::Derived { .. } => {
+                Atom::Derived(_) => {
                     let Some(equation_index) = equation_by_first_output[atom_id] else {
                         continue;
                     };
@@ -872,8 +863,8 @@ mod tests {
         let sum = builder.add_equation(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
-        assert!(matches!(program.atom(x).unwrap(), Atom::Input { .. }));
-        assert!(matches!(program.atom(two).unwrap(), Atom::Constant { .. }));
+        assert!(matches!(program.atom(x).unwrap(), Atom::Input(_)));
+        assert!(matches!(program.atom(two).unwrap(), Atom::Constant(_)));
         assert_eq!(program.call((2.0, 3.0)).unwrap(), 7.0);
         assert_eq!(
             program.to_string(),
@@ -928,14 +919,14 @@ mod tests {
         // Adding two constants should fold: no equation, output is constant.
         let folded = builder.add_equation(PrimitiveOp::Add, vec![a, b]).unwrap();
         assert_eq!(folded.len(), 1);
-        assert!(matches!(builder.atom(folded[0]).unwrap(), Atom::Constant { .. }));
+        assert!(matches!(builder.atom(folded[0]).unwrap(), Atom::Constant(_)));
         assert_eq!(builder.equation_count(), 0);
 
         // Introduce a non-constant input and combine with the folded constant.
         let x = builder.add_input(&10.0f64);
         let result = builder.add_equation(PrimitiveOp::Mul, vec![folded[0], x]).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Derived { .. }));
+        assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Derived(_)));
         assert_eq!(builder.equation_count(), 1);
 
         // Build the program and verify only the non-folded equation survived.
@@ -979,21 +970,17 @@ mod tests {
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
 
-        assert!(
-            matches!(builder.atom(x).unwrap(), Atom::Input { r#type } if *r#type == ArrayType::scalar(DataType::F64))
-        );
-        assert!(matches!(builder.atom(three).unwrap(), Atom::Constant { value } if *value == 3.0));
-        assert!(matches!(builder.atom(sum).unwrap(), Atom::Derived { .. }));
+        assert!(matches!(builder.atom(x).unwrap(), Atom::Input(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(builder.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
+        assert!(matches!(builder.atom(sum).unwrap(), Atom::Derived(_)));
         assert_eq!(builder.stored_value(x), Some(&2.0));
         assert_eq!(builder.stored_value(sum), Some(&5.0));
 
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        assert!(
-            matches!(program.atom(x).unwrap(), Atom::Input { r#type } if *r#type == ArrayType::scalar(DataType::F64))
-        );
-        assert!(matches!(program.atom(three).unwrap(), Atom::Constant { value } if *value == 3.0));
-        assert!(matches!(program.atom(sum).unwrap(), Atom::Derived { .. }));
+        assert!(matches!(program.atom(x).unwrap(), Atom::Input(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(program.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
+        assert!(matches!(program.atom(sum).unwrap(), Atom::Derived(_)));
         assert_eq!(program.representative_atom_values(&engine).unwrap(), vec![0.0, 3.0, 3.0]);
         assert_eq!(program.call(4.0).unwrap(), 7.0);
     }

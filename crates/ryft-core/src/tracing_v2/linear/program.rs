@@ -185,7 +185,7 @@ where
         primals[input_atom.index()] = Some(input_primal);
     }
     for (atom_id, atom) in program.atoms_iter() {
-        if let Atom::Constant { value } = atom {
+        if let Atom::Constant(value) = atom {
             primals[atom_id.index()] = Some(value.clone());
         }
     }

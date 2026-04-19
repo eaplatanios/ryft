@@ -726,11 +726,11 @@ fn project_flat_shard_map_program(
 
         let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
-            ryft_core::tracing_v2::Atom::Input { .. } => *kept_input_atoms.get(&atom_id).ok_or(
+            ryft_core::tracing_v2::Atom::Input(_) => *kept_input_atoms.get(&atom_id).ok_or(
                 TracingError::InternalInvariantViolation("projected flat shard-map program referenced a removed input"),
             )?,
-            ryft_core::tracing_v2::Atom::Constant { value } => builder.add_constant(value.clone()),
-            ryft_core::tracing_v2::Atom::Derived { .. } => {
+            ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
+            ryft_core::tracing_v2::Atom::Derived(_) => {
                 let equation_index = equation_by_output[atom_id.index()]
                     .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
                 let equation = &program.equations()[equation_index];
@@ -831,13 +831,13 @@ fn build_factorized_apply_program(
 
         let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
-            ryft_core::tracing_v2::Atom::Input { .. } => {
+            ryft_core::tracing_v2::Atom::Input(_) => {
                 return Err(TracingError::InternalInvariantViolation(
                     "factorized apply program referenced a primal input that was not materialized as a residual",
                 ));
             }
-            ryft_core::tracing_v2::Atom::Constant { value } => builder.add_constant(value.clone()),
-            ryft_core::tracing_v2::Atom::Derived { .. } => {
+            ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
+            ryft_core::tracing_v2::Atom::Derived(_) => {
                 if !depends_on_cotangent[atom_id.index()] {
                     return Err(TracingError::InternalInvariantViolation(
                         "factorized apply program referenced a cotangent-independent atom that was not materialized as a residual",
@@ -1149,15 +1149,15 @@ fn replay_traced_xla_program<
         let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            ryft_core::tracing_v2::Atom::Input { .. } => {}
-            ryft_core::tracing_v2::Atom::Constant { value } => {
+            ryft_core::tracing_v2::Atom::Input(_) => {}
+            ryft_core::tracing_v2::Atom::Constant(value) => {
                 let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
                 if seed_inputs.is_empty() {
                     return Err(ShardMapTraceError::TracingError(TracingError::EmptyParameterizedValue));
                 }
                 values[atom_index] = Some(V::lift_constant(value, seed_inputs.as_slice())?);
             }
-            ryft_core::tracing_v2::Atom::Derived { .. } => {
+            ryft_core::tracing_v2::Atom::Derived(_) => {
                 let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
