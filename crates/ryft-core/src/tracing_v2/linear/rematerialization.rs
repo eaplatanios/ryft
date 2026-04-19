@@ -190,8 +190,8 @@ where
 
             // Step 2: Segment the traced program to insert rematerialization boundaries.
             let segmented_program = match segment_size {
-                None => wrap_program_in_rematerialize(engine, &traced_program)?,
-                Some(size) => segment_program(engine, &traced_program, size)?,
+                None => wrap_program_in_rematerialize::<E, V>(&traced_program)?,
+                Some(size) => segment_program::<E, V>(&traced_program, size)?,
             };
 
             // Step 3: Linearize and transpose the segmented program to produce the pullback.
@@ -225,7 +225,6 @@ where
 /// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOp`]
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
 fn segment_program<E, V>(
-    engine: &E,
     program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
     segment_size: usize,
 ) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TracingError>
@@ -236,14 +235,12 @@ where
         InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation> + Op<ArrayType>,
 {
     let program = program;
-    let representative_values = program.representative_atom_values(engine)?;
-    let representative_inputs = program.representative_input_values(engine)?;
     let instructions = program.instructions.as_slice();
 
     // If the program has fewer instructions than a single segment, no segmentation is needed Ã¢â‚¬â€ wrap the
     // whole thing in a single RematerializeOp.
     if instructions.len() <= segment_size {
-        return wrap_program_in_rematerialize(engine, program);
+        return wrap_program_in_rematerialize::<E, V>(program);
     }
 
     // Divide instructions into segments.
@@ -279,8 +276,14 @@ where
     let mut atom_mapping: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
 
     // Register program inputs in the outer builder.
-    for (&input_atom, representative_input) in input_atoms.iter().zip(representative_inputs.iter()) {
-        let outer_atom = outer_builder.add_input(representative_input);
+    for &input_atom in input_atoms {
+        let input_type = program
+            .atoms
+            .get(input_atom.index)
+            .ok_or(TracingError::UnboundAtomId { id: input_atom })?
+            .r#type()
+            .into_owned();
+        let outer_atom = outer_builder.add_input_abstract(input_type);
         atom_mapping[input_atom.index] = Some(outer_atom);
     }
 
@@ -330,13 +333,7 @@ where
         }
 
         // Build the sub-program for this segment.
-        let sub_program = build_segment_sub_program(
-            program,
-            representative_values.as_slice(),
-            *segment,
-            &boundary_input_atoms,
-            &boundary_output_atoms,
-        )?;
+        let sub_program = build_segment_sub_program(program, *segment, &boundary_input_atoms, &boundary_output_atoms)?;
 
         // Build the RematerializeOp.
         let input_types: Vec<_> = boundary_input_atoms
@@ -399,7 +396,6 @@ where
 
 /// Wraps an entire program in a single [`RematerializeOp`] boundary.
 fn wrap_program_in_rematerialize<E, V>(
-    engine: &E,
     program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
 ) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TracingError>
 where
@@ -408,7 +404,6 @@ where
     E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
-    let representative_inputs = program.representative_input_values(engine)?;
     let input_types: Vec<_> = program
         .input_ids
         .iter()
@@ -436,10 +431,8 @@ where
     let remat_op = RematerializeOp::new(body);
 
     let mut outer_builder: ProgramBuilder<E::TracingOperation, ArrayType, V> = ProgramBuilder::new();
-    let outer_inputs: Vec<AtomId> = representative_inputs
-        .iter()
-        .map(|representative_input| outer_builder.add_input(representative_input))
-        .collect();
+    let outer_inputs: Vec<AtomId> =
+        input_types.iter().cloned().map(|input_type| outer_builder.add_input_abstract(input_type)).collect();
 
     let outer_outputs = outer_builder.add_instruction_prevalidated(
         E::TracingOperation::rematerialize_op(remat_op),
@@ -462,7 +455,6 @@ where
 /// and instructions within the sub-program.
 fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    representative_values: &[V],
     segment_instructions: &[Instruction<O>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
@@ -474,7 +466,13 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
 
     // Register boundary inputs as sub-program inputs.
     for &input_atom in boundary_input_atoms {
-        let sub_atom = sub_builder.add_input(&representative_values[input_atom.index]);
+        let input_type = program
+            .atoms
+            .get(input_atom.index)
+            .ok_or(TracingError::UnboundAtomId { id: input_atom })?
+            .r#type()
+            .into_owned();
+        let sub_atom = sub_builder.add_input_abstract(input_type);
         sub_atom_mapping.insert(input_atom, sub_atom);
     }
 

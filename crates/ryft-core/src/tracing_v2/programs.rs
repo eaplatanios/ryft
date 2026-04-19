@@ -150,26 +150,6 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
     }
 
-    /// Returns representative concrete inputs for this program, synthesized as zero values from the
-    /// retained input types using the provided [`Engine`].
-    ///
-    /// This is mainly a transform-support utility. It lets code that only has a staged program and
-    /// abstract input metadata reconstruct one concrete witness per input leaf so it can replay or
-    /// segment the program without requiring the original caller's inputs.
-    pub fn representative_input_values<E>(&self, engine: &E) -> Result<Vec<V>, TracingError>
-    where
-        E: Engine<Type = T, Value = V> + ?Sized,
-    {
-        self.input_ids
-            .iter()
-            .copied()
-            .map(|atom_id| match self.atoms.get(atom_id.index) {
-                Some(Atom::Variable(r#type)) => Ok(engine.zero(r#type)),
-                _ => Err(TracingError::InternalInvariantViolation("staged program input atom did not retain a type")),
-            })
-            .collect()
-    }
-
     /// Evaluates every atom in the program on the supplied flat input values.
     ///
     /// This is the lowest-level replay helper in the module. [`Program::call`] builds on it to
@@ -226,7 +206,16 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         O: InterpretableOp<T, V>,
         E: Engine<Type = T, Value = V> + ?Sized,
     {
-        self.evaluate_atom_values(self.representative_input_values(engine)?)
+        let representative_inputs = self
+            .input_ids
+            .iter()
+            .copied()
+            .map(|atom_id| match self.atoms.get(atom_id.index) {
+                Some(Atom::Variable(r#type)) => Ok(engine.zero(r#type)),
+                _ => Err(TracingError::InternalInvariantViolation("staged program input atom did not retain a type")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.evaluate_atom_values(representative_inputs)
     }
 
     /// Clones this program while replacing only the typed input/output structures.
@@ -553,8 +542,8 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     ///
     /// Intended for program transforms that rebuild structure without needing intermediate values
     /// (for example [`Program::simplify`]). Callers that later need a representative value for this
-    /// atom should obtain it from an [`Engine`](crate::tracing_v2::Engine) via
-    /// [`Program::representative_input_values`].
+    /// atom should synthesize it from the retained input type through an
+    /// [`Engine`](crate::tracing_v2::Engine).
     #[inline]
     pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
