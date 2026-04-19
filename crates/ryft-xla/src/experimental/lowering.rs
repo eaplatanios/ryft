@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    Atom, CustomPrimitive, Graph, LinearPrimitiveOp, MatrixOps, Op, PrimitiveOp, Traceable,
+    Atom, CustomPrimitive, LinearPrimitiveOp, MatrixOps, Op, PrimitiveOp, Program, Traceable,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearRematerializeOp, LinearVMapOp, MatMulOp, MatrixTransposeOp,
         MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -69,7 +69,7 @@ pub(crate) enum LoweringError {
     #[error("constructed MLIR module failed verification during XLA lowering")]
     MlirVerificationFailure,
 
-    /// Error returned when one traced XLA graph mixes shard maps from incompatible meshes.
+    /// Error returned when one traced XLA program mixes shard maps from incompatible meshes.
     #[error("traced XLA lowering requires all nested shard maps to use compatible logical meshes")]
     IncompatibleNestedMeshes,
 
@@ -86,10 +86,10 @@ pub(crate) enum LoweringError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum PlainMlirLoweringMode {
-    /// Lower the graph exactly as traced.
+    /// Lower the program exactly as traced.
     Unpacked,
 
-    /// Lower one packed `vmap` body graph with the provided lane count.
+    /// Lower one packed `vmap` body program with the provided lane count.
     Packed { lane_count: usize },
 }
 
@@ -160,7 +160,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         L: Clone,
     {
         lower_rematerialize_inline(
-            remat_op.body().compiled().program().graph(),
+            remat_op.body().program(),
             input_values,
             &mut self.block,
             self.context,
@@ -208,7 +208,7 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Implementing this trait makes an operation eligible for MLIR lowering via
-/// [`to_mlir_module_for_plain_graph`] and related entry points. The core [`PrimitiveOp`] and
+/// [`to_mlir_module_for_plain_program`] and related entry points. The core [`PrimitiveOp`] and
 /// [`LinearPrimitiveOp`] enums provide the default blanket implementations, and backends can add
 /// their own closed op carriers by implementing this trait for those enums.
 pub(crate) trait XlaOp<V: Traceable<ArrayType>>: ryft_core::tracing_v2::Op {
@@ -589,7 +589,7 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
                     &mut lowerer.block,
                     input_values,
                     &simplified_body.shard_map,
-                    simplified_body.compiled.graph(),
+                    &simplified_body.program,
                     simplified_body.local_input_types.as_slice(),
                     simplified_body.global_output_types.as_slice(),
                     lowerer.context,
@@ -657,7 +657,7 @@ where
         V: MlirLowerableValue,
     {
         lower_rematerialize_inline(
-            self.body().compiled().program().graph(),
+            self.body().program(),
             input_values,
             &mut lowerer.block,
             lowerer.context,
@@ -851,7 +851,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         L: Clone,
     {
         lower_rematerialize_inline(
-            remat_op.body().compiled().program().graph(),
+            remat_op.body().program(),
             input_values,
             &mut self.block,
             self.context,
@@ -860,23 +860,23 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested Shardy manual computation operation inside this lowering context.
-    pub(crate) fn lower_manual_computation<GraphInput, GraphOutput>(
+    pub(crate) fn lower_manual_computation<ProgramInput, ProgramOutput>(
         &mut self,
         outer_inputs: &[ValueRef<'b, 'c, 't>],
         shard_map: &ShardMap,
-        graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+        program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
         local_input_types: &[ArrayType],
         global_output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
-        GraphInput: Parameterized<ShardMapTensor>,
-        GraphOutput: Parameterized<ShardMapTensor>,
+        ProgramInput: Parameterized<ShardMapTensor>,
+        ProgramOutput: Parameterized<ShardMapTensor>,
     {
         lower_manual_computation(
             &mut self.block,
             outer_inputs,
             shard_map,
-            graph,
+            program,
             local_input_types,
             global_output_types,
             self.context,
@@ -895,9 +895,9 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 }
 
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
-pub(crate) fn to_mlir_module<Input, Output, GraphInput, GraphOutput, S>(
+pub(crate) fn to_mlir_module<Input, Output, ProgramInput, ProgramOutput, S>(
     shard_map: &ShardMap,
-    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
     global_input_types: &Input,
     local_input_types: &Input,
     global_output_types: &Output,
@@ -907,8 +907,8 @@ pub(crate) fn to_mlir_module<Input, Output, GraphInput, GraphOutput, S>(
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    GraphInput: Parameterized<ShardMapTensor>,
-    GraphOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<ShardMapTensor>,
+    ProgramOutput: Parameterized<ShardMapTensor>,
     S: AsRef<str>,
 {
     let function_name = normalize_function_name(function_name.as_ref())?;
@@ -970,7 +970,7 @@ where
             &mut function_block_ref,
             outer_inputs.as_slice(),
             shard_map,
-            graph,
+            program,
             local_input_types.as_slice(),
             global_output_types.as_slice(),
             &context,
@@ -993,9 +993,9 @@ where
     Ok(module.to_string())
 }
 
-/// Lowers an arbitrary traced XLA graph to a textual StableHLO/Shardy MLIR module.
-pub(crate) fn to_mlir_module_for_graph<Input, Output, GraphInput, GraphOutput, S>(
-    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+/// Lowers an arbitrary traced XLA program to a textual StableHLO/Shardy MLIR module.
+pub(crate) fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOutput, S>(
+    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
@@ -1003,8 +1003,8 @@ pub(crate) fn to_mlir_module_for_graph<Input, Output, GraphInput, GraphOutput, S
 where
     Input: Parameterized<ArrayType>,
     Output: Parameterized<ArrayType>,
-    GraphInput: Parameterized<ShardMapTensor>,
-    GraphOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<ShardMapTensor>,
+    ProgramOutput: Parameterized<ShardMapTensor>,
     S: AsRef<str>,
 {
     let function_name = normalize_function_name(function_name.as_ref())?;
@@ -1015,7 +1015,7 @@ where
     let location = context.unknown_location();
     let module = context.module(location);
 
-    if let Some(mesh) = collect_nested_sharding_mesh(graph, None)? {
+    if let Some(mesh) = collect_nested_sharding_mesh(program, None)? {
         let mesh_operation = mesh.to_mlir(location);
         module.body().append_operation(mesh_operation);
     }
@@ -1047,7 +1047,7 @@ where
         );
         {
             let mut function_block_ref = function_block.as_ref();
-            let outputs = lower_graph_outputs(graph, &mut function_block_ref, &context, location.as_ref())?;
+            let outputs = lower_program_outputs(program, &mut function_block_ref, &context, location.as_ref())?;
             function_block_ref.append_operation(func::r#return(outputs.as_slice(), location));
         }
         func::func(
@@ -1158,11 +1158,11 @@ impl MlirLowerableValue for ShardMapTensor {
     }
 }
 
-/// Lowers a plain traced `tracing_v2` graph to a textual StableHLO MLIR module.
+/// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
-pub(crate) fn to_mlir_module_for_plain_graph<V, Input, Output, O, S>(
-    graph: &Graph<O, ArrayType, V, Input, Output>,
+pub(crate) fn to_mlir_module_for_plain_program<V, Input, Output, O, S>(
+    program: &Program<ArrayType, V, Input, Output, O>,
     function_name: S,
 ) -> Result<String, LoweringError>
 where
@@ -1177,19 +1177,19 @@ where
     let location = context.unknown_location();
     let module = context.module(location);
 
-    let input_tensor_types = graph
+    let input_tensor_types = program
         .input_atoms()
         .iter()
         .map(|atom_id| {
-            let input_atom = graph.atom(*atom_id).expect("graph input atoms should exist");
+            let input_atom = program.atom(*atom_id).expect("program input atoms should exist");
             lower_tensor_type(&input_atom.tpe(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let output_tensor_types = graph
+    let output_tensor_types = program
         .outputs()
         .iter()
         .map(|atom_id| {
-            let output_atom = graph.atom(*atom_id).expect("graph output atoms should exist");
+            let output_atom = program.atom(*atom_id).expect("program output atoms should exist");
             lower_tensor_type(&output_atom.tpe(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1200,7 +1200,7 @@ where
         );
         {
             let mut function_block_ref = function_block.as_ref();
-            let outputs = lower_plain_graph_outputs(graph, &mut function_block_ref, &context, location.as_ref())?;
+            let outputs = lower_plain_program_outputs(program, &mut function_block_ref, &context, location.as_ref())?;
             function_block_ref.append_operation(func::r#return(outputs.as_slice(), location));
         }
         func::func(
@@ -1228,16 +1228,16 @@ where
     Ok(module.to_string())
 }
 
-fn collect_nested_sharding_mesh<GraphInput, GraphOutput>(
-    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput>(
+    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, LoweringError>
 where
-    GraphInput: Parameterized<ShardMapTensor>,
-    GraphOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<ShardMapTensor>,
+    ProgramOutput: Parameterized<ShardMapTensor>,
 {
     let mut mesh = existing;
-    for equation in graph.equations() {
+    for equation in program.equations() {
         match &equation.op {
             XlaPrimitiveOp::ShardMap(shard_map_op) => {
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
@@ -1249,7 +1249,7 @@ where
                         }
                         None => shard_map_op.body().shard_map.mesh().clone(),
                     });
-                    mesh = collect_nested_sharding_mesh(shard_map_op.body().compiled.graph(), mesh)?;
+                    mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
                 }
             }
             XlaPrimitiveOp::WithShardingConstraint(sharding_constraint_op) => {
@@ -1271,7 +1271,7 @@ where
                             }
                             None => shard_map_op.body().shard_map.mesh().clone(),
                         });
-                        mesh = collect_nested_sharding_mesh(shard_map_op.body().compiled.graph(), mesh)?;
+                        mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
                     }
                 } else if let Some(sharding_constraint_op) = custom_op.extensions().get::<WithShardingConstraintOp>() {
                     mesh = Some(match mesh.take() {
@@ -1299,11 +1299,11 @@ fn collect_nested_linear_shard_map_mesh(
                 Some(existing_mesh) => merge_logical_meshes(&existing_mesh, body.shard_map.mesh())?,
                 None => body.shard_map.mesh().clone(),
             });
-            collect_nested_sharding_mesh(body.compiled.graph(), mesh)
+            collect_nested_sharding_mesh(&body.program, mesh)
         }
         LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
-            let mesh = collect_nested_sharding_mesh(factorized.residual_body.compiled.graph(), existing)?;
-            collect_nested_sharding_mesh(factorized.apply_body.compiled.graph(), mesh)
+            let mesh = collect_nested_sharding_mesh(&factorized.residual_body.program, existing)?;
+            collect_nested_sharding_mesh(&factorized.apply_body.program, mesh)
         }
     }
 }
@@ -1646,9 +1646,9 @@ where
         .collect()
 }
 
-/// Lowers one packed `vmap` body graph whose inputs and outputs already carry a leading batch axis.
+/// Lowers one packed `vmap` body program whose inputs and outputs already carry a leading batch axis.
 fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-    graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
+    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
     packed_inputs: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
     block: &mut B,
@@ -1662,7 +1662,7 @@ where
     L: Location<'c, 't> + Copy,
 {
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-        graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
+        program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
         atom_values: &[Option<ValueRef<'b, 'c, 't>>],
         atom_id: usize,
         lane_count: usize,
@@ -1680,7 +1680,7 @@ where
             return Ok(value);
         }
 
-        let atom = graph.atom(atom_id).ok_or(LoweringError::MissingAtomValue { atom_id })?;
+        let atom = program.atom(atom_id).ok_or(LoweringError::MissingAtomValue { atom_id })?;
         match atom {
             Atom::Constant { value } => {
                 lower_packed_literal_value(value, &packed_array_type(&atom.tpe(), lane_count), block, context, location)
@@ -1689,20 +1689,20 @@ where
         }
     }
 
-    let mut atom_values = vec![None; graph.atom_count()];
-    for (input_index, atom_id) in graph.input_atoms().iter().copied().enumerate() {
+    let mut atom_values = vec![None; program.atom_count()];
+    for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
         atom_values[atom_id] = Some(packed_inputs[input_index]);
     }
 
-    let mut equation_by_first_output = vec![None; graph.atom_count()];
-    for (equation_index, equation) in graph.equations().iter().enumerate() {
+    let mut equation_by_first_output = vec![None; program.atom_count()];
+    for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
             equation_by_first_output[*first_output] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..graph.atom_count() {
-        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
+    for atom_id in 0..program.atom_count() {
+        let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { .. } => {}
@@ -1710,13 +1710,13 @@ where
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
-                let equation = &graph.equations()[equation_index];
+                let equation = &program.equations()[equation_index];
                 let inputs = equation
                     .inputs
                     .iter()
                     .map(|input| {
                         resolve_packed_atom_value(
-                            graph,
+                            program,
                             atom_values.as_slice(),
                             *input,
                             lane_count,
@@ -1728,7 +1728,7 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut block_ref = block.as_ref();
                 let lowered_outputs = lower_packed_plain_equation(
-                    graph,
+                    program,
                     equation_index,
                     inputs.as_slice(),
                     lane_count,
@@ -1743,11 +1743,11 @@ where
         }
     }
 
-    graph
+    program
         .outputs()
         .iter()
         .map(|output| {
-            resolve_packed_atom_value(graph, atom_values.as_slice(), *output, lane_count, block, context, location)
+            resolve_packed_atom_value(program, atom_values.as_slice(), *output, lane_count, block, context, location)
         })
         .collect::<Result<Vec<_>, _>>()
 }
@@ -1794,14 +1794,8 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let packed_outputs = lower_packed_program_outputs(
-        body.compiled().program().graph(),
-        packed_inputs.as_slice(),
-        lane_count,
-        block,
-        context,
-        location,
-    )?;
+    let packed_outputs =
+        lower_packed_program_outputs(body.program(), packed_inputs.as_slice(), lane_count, block, context, location)?;
     debug_assert_eq!(packed_outputs.len(), logical_output_count);
 
     let unpacked_by_output = packed_outputs
@@ -1830,7 +1824,7 @@ where
 /// MLIR values to the body's input atoms, lowering constants and equations in topological order,
 /// and returning the MLIR values corresponding to the body's output atoms.
 fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
-    graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
+    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -1840,20 +1834,20 @@ where
     V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
 {
-    let mut atom_values = vec![None; graph.atom_count()];
-    for (atom_id, mlir_value) in graph.input_atoms().iter().copied().zip(input_values.iter().copied()) {
+    let mut atom_values = vec![None; program.atom_count()];
+    for (atom_id, mlir_value) in program.input_atoms().iter().copied().zip(input_values.iter().copied()) {
         atom_values[atom_id] = Some(mlir_value);
     }
 
-    let mut equation_by_first_output = vec![None; graph.atom_count()];
-    for (equation_index, equation) in graph.equations().iter().enumerate() {
+    let mut equation_by_first_output = vec![None; program.atom_count()];
+    for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
             equation_by_first_output[*first_output] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..graph.atom_count() {
-        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
+    for atom_id in 0..program.atom_count() {
+        let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { value } => {
@@ -1863,7 +1857,7 @@ where
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
-                let equation = &graph.equations()[equation_index];
+                let equation = &program.equations()[equation_index];
                 let equation_inputs = equation
                     .inputs
                     .iter()
@@ -1872,7 +1866,7 @@ where
                 let output_types = equation
                     .outputs
                     .iter()
-                    .map(|output| graph.atom(*output).expect("equation output should exist").tpe().into_owned())
+                    .map(|output| program.atom(*output).expect("equation output should exist").tpe().into_owned())
                     .collect::<Vec<_>>();
                 let mut lowerer = PlainMlirLowerer { block: *block, context, location };
                 let lowered_outputs = equation.op.lower_to_mlir(
@@ -1888,18 +1882,18 @@ where
         }
     }
 
-    graph
+    program
         .outputs()
         .iter()
         .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Lowers one plain traced graph to values inside a block.
+/// Lowers one plain traced program to values inside a block.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
-fn lower_plain_graph_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    graph: &Graph<O, ArrayType, V, Input, Output>,
+fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
+    program: &Program<ArrayType, V, Input, Output, O>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1910,20 +1904,20 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let mut atom_values = vec![None; graph.atom_count()];
-    for (input_index, atom_id) in graph.input_atoms().iter().copied().enumerate() {
+    let mut atom_values = vec![None; program.atom_count()];
+    for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
         atom_values[atom_id] = Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
-    let mut equation_by_first_output = vec![None; graph.atom_count()];
-    for (equation_index, equation) in graph.equations().iter().enumerate() {
+    let mut equation_by_first_output = vec![None; program.atom_count()];
+    for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
             equation_by_first_output[*first_output] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..graph.atom_count() {
-        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
+    for atom_id in 0..program.atom_count() {
+        let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { value } => {
@@ -1933,14 +1927,14 @@ where
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
-                let equation = &graph.equations()[equation_index];
+                let equation = &program.equations()[equation_index];
                 let inputs = equation
                     .inputs
                     .iter()
                     .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lowered_outputs =
-                    lower_plain_equation(graph, equation_index, inputs.as_slice(), block, context, location)?;
+                    lower_plain_equation(program, equation_index, inputs.as_slice(), block, context, location)?;
                 for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
                     atom_values[output_atom] = Some(lowered_output);
                 }
@@ -1948,38 +1942,38 @@ where
         }
     }
 
-    graph
+    program
         .outputs()
         .iter()
         .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Lowers one traced graph to values inside a block.
-fn lower_graph_outputs<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
-    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+/// Lowers one traced program to values inside a block.
+fn lower_program_outputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
+    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    GraphInput: Parameterized<ShardMapTensor>,
-    GraphOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<ShardMapTensor>,
+    ProgramOutput: Parameterized<ShardMapTensor>,
 {
-    let mut atom_values = vec![None; graph.atom_count()];
-    for (input_index, atom_id) in graph.input_atoms().iter().copied().enumerate() {
+    let mut atom_values = vec![None; program.atom_count()];
+    for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
         atom_values[atom_id] = Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
-    let mut equation_by_first_output = vec![None; graph.atom_count()];
-    for (equation_index, equation) in graph.equations().iter().enumerate() {
+    let mut equation_by_first_output = vec![None; program.atom_count()];
+    for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
             equation_by_first_output[*first_output] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..graph.atom_count() {
-        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
+    for atom_id in 0..program.atom_count() {
+        let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { value } => {
@@ -1989,14 +1983,14 @@ where
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
-                let equation = &graph.equations()[equation_index];
+                let equation = &program.equations()[equation_index];
                 let inputs = equation
                     .inputs
                     .iter()
                     .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lowered_outputs =
-                    lower_equation(graph, equation_index, inputs.as_slice(), block, context, location)?;
+                    lower_equation(program, equation_index, inputs.as_slice(), block, context, location)?;
                 for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
                     atom_values[output_atom] = Some(lowered_output);
                 }
@@ -2004,27 +1998,27 @@ where
         }
     }
 
-    graph
+    program
         .outputs()
         .iter()
         .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Lowers one `sdy.manual_computation` operation, including its nested body graph.
-fn lower_manual_computation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
+/// Lowers one `sdy.manual_computation` operation, including its nested body program.
+fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     shard_map: &ShardMap,
-    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    GraphInput: Parameterized<ShardMapTensor>,
-    GraphOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<ShardMapTensor>,
+    ProgramOutput: Parameterized<ShardMapTensor>,
 {
     let local_input_tensor_types = local_input_types
         .iter()
@@ -2045,7 +2039,7 @@ where
     );
     {
         let mut body_block_ref = body_block.as_ref();
-        let body_outputs = lower_graph_outputs(graph, &mut body_block_ref, context, location.as_ref())?;
+        let body_outputs = lower_program_outputs(program, &mut body_block_ref, context, location.as_ref())?;
         body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location));
     }
     body_region.append_block(body_block);
@@ -2079,7 +2073,7 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 block,
                 input_values,
                 &simplified_body.shard_map,
-                simplified_body.compiled.graph(),
+                &simplified_body.program,
                 simplified_body.local_input_types.as_slice(),
                 simplified_body.global_output_types.as_slice(),
                 context,
@@ -2095,7 +2089,7 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 block,
                 &input_values[..residual_body.global_input_types.len()],
                 &residual_body.shard_map,
-                residual_body.compiled.graph(),
+                &residual_body.program,
                 residual_body.local_input_types.as_slice(),
                 residual_body.global_output_types.as_slice(),
                 context,
@@ -2115,7 +2109,7 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 block,
                 apply_inputs.as_slice(),
                 &apply_body.shard_map,
-                apply_body.compiled.graph(),
+                &apply_body.program,
                 apply_body.local_input_types.as_slice(),
                 apply_body.global_output_types.as_slice(),
                 context,
@@ -2329,7 +2323,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.lower_manual_computation(
                 input_values,
                 &simplified_body.shard_map,
-                simplified_body.compiled.graph(),
+                &simplified_body.program,
                 simplified_body.local_input_types.as_slice(),
                 simplified_body.global_output_types.as_slice(),
             )
@@ -2354,7 +2348,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
 fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    graph: &Graph<O, ArrayType, V, Input, Output>,
+    program: &Program<ArrayType, V, Input, Output, O>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2367,11 +2361,11 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let equation = &graph.equations()[equation_index];
+    let equation = &program.equations()[equation_index];
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| graph.atom(*output).expect("equation output should exist").tpe().into_owned())
+        .map(|output| program.atom(*output).expect("equation output should exist").tpe().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
     equation
@@ -2379,9 +2373,9 @@ where
         .lower_to_mlir(input_values, output_types.as_slice(), PlainMlirLoweringMode::Unpacked, &mut lowerer)
 }
 
-/// Lowers one equation inside a packed `vmap` body graph.
+/// Lowers one equation inside a packed `vmap` body program.
 fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
-    graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
+    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
@@ -2393,11 +2387,13 @@ where
     V: MlirLowerableValue,
     O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
 {
-    let equation = &graph.equations()[equation_index];
+    let equation = &program.equations()[equation_index];
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| packed_array_type(&graph.atom(*output).expect("equation output should exist").tpe(), lane_count))
+        .map(|output| {
+            packed_array_type(&program.atom(*output).expect("equation output should exist").tpe(), lane_count)
+        })
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
     equation.op.lower_to_mlir(
@@ -2409,8 +2405,8 @@ where
 }
 
 /// Lowers one traced equation to the corresponding StableHLO operation and returns its result value.
-fn lower_equation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
-    graph: &Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, GraphInput, GraphOutput>,
+fn lower_equation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
+    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2418,14 +2414,14 @@ fn lower_equation<'b, 'c: 'b, 't: 'c, GraphInput, GraphOutput>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
-    GraphInput: Parameterized<ShardMapTensor>,
-    GraphOutput: Parameterized<ShardMapTensor>,
+    ProgramInput: Parameterized<ShardMapTensor>,
+    ProgramOutput: Parameterized<ShardMapTensor>,
 {
-    let equation = &graph.equations()[equation_index];
+    let equation = &program.equations()[equation_index];
     let output_types = equation
         .outputs
         .iter()
-        .map(|output| graph.atom(*output).expect("equation output should exist").tpe().into_owned())
+        .map(|output| program.atom(*output).expect("equation output should exist").tpe().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
     dispatch_lower_shard_map_mlir(&equation.op, input_values, output_types.as_slice(), &mut lowerer)
@@ -2663,8 +2659,7 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, Sin, TraceError, ZeroLike,
-        program::ProgramBuilder,
+        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, ProgramBuilder, Sin, TraceError, ZeroLike,
     };
     use ryft_core::types::Shape;
 
@@ -2736,11 +2731,11 @@ mod tests {
         }
     }
 
-    fn custom_graph(
+    fn custom_program(
         op: XlaPrimitiveOp,
-    ) -> Graph<XlaPrimitiveOp, ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor> {
+    ) -> Program<ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor, XlaPrimitiveOp> {
         let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilder::<ShardMapTensor, crate::experimental::ops::XlaPrimitiveOp>::new();
+        let mut builder = ProgramBuilder::<crate::experimental::ops::XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
         let output = builder.add_equation(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)
@@ -2824,14 +2819,14 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_graph_uses_registered_custom_lowering() {
+    fn test_to_mlir_module_for_program_uses_registered_custom_lowering() {
         let primitive = CustomPrimitive::new(TestCustomLoweredOp)
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(TestCustomLowering)));
-        let graph = custom_graph(XlaPrimitiveOp::Custom(Arc::new(primitive)));
+        let program = custom_program(XlaPrimitiveOp::Custom(Arc::new(primitive)));
         let input_type = test_vector_type(4);
 
         assert_eq!(
-            to_mlir_module_for_graph(&graph, &input_type, &input_type, "main").unwrap(),
+            to_mlir_module_for_program(&program, &input_type, &input_type, "main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
@@ -2844,18 +2839,18 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_graph_reports_missing_custom_lowering() {
-        let graph = custom_graph(XlaPrimitiveOp::Custom(Arc::new(CustomPrimitive::new(TestCustomLoweredOp))));
+    fn test_to_mlir_module_for_program_reports_missing_custom_lowering() {
+        let program = custom_program(XlaPrimitiveOp::Custom(Arc::new(CustomPrimitive::new(TestCustomLoweredOp))));
         let input_type = test_vector_type(4);
 
         assert_eq!(
-            to_mlir_module_for_graph(&graph, &input_type, &input_type, "main"),
+            to_mlir_module_for_program(&program, &input_type, &input_type, "main"),
             Err(LoweringError::MissingCustomLowering { op: "test_custom_lowered".to_string() }),
         );
     }
 
     // ---------------------------------------------------------------------------
-    // Plain-graph StableHLO lowering tests for scalar programs
+    // Plain-program StableHLO lowering tests for scalar programs
     // ---------------------------------------------------------------------------
 
     fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
@@ -2875,10 +2870,10 @@ mod tests {
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
+        let (_, compiled): (f64, ryft_core::tracing_v2::Program<ArrayType, f64, (f64, f64), f64>) =
             ryft_core::tracing_v2::jit(&engine, |inputs| Ok(scalar_bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_graph(compiled.program().graph(), "main").unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -2897,7 +2892,7 @@ mod tests {
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, f64, f64>) =
+        let (_, compiled): (f64, ryft_core::tracing_v2::Program<ArrayType, f64, f64, f64>) =
             ryft_core::tracing_v2::jit(
                 &engine,
                 |x: ryft_core::tracing_v2::JitTracer<ArrayType, f64>| {
@@ -2911,7 +2906,7 @@ mod tests {
             )
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_graph(compiled.program().graph(), "main").unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft grad(x^4 + sin(x)) StableHLO ===\n{stablehlo}");
 
         // Verify key structural properties matching JAX's output:
@@ -2936,7 +2931,7 @@ mod tests {
             )
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_graph(pullback.program().graph(), "main").unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(pullback.program(), "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
 
         // Pullback takes one cotangent, returns two cotangent outputs (for x and y).
@@ -2950,26 +2945,24 @@ mod tests {
         // grad(f) wrapped in JIT — symbolic, like JAX's jit(grad(f)).
         // Uses the ValueAndGradInvocationLeaf<JitTracer<V>> dispatch that traces through vjp+pullback.
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (
-            (f64, f64),
-            ryft_core::tracing_v2::CompiledFunction<ArrayType, f64, (f64, f64), (f64, f64)>,
-        ) = ryft_core::tracing_v2::jit(
-            &engine,
-            |inputs: (
-                ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
-                ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
-            )| {
-                Ok(ryft_core::tracing_v2::grad(
-                    &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
-                    scalar_bilinear_sin,
-                    inputs,
-                )?)
-            },
-            (2.0f64, 3.0f64),
-        )
-        .unwrap();
+        let (_, compiled): ((f64, f64), ryft_core::tracing_v2::Program<ArrayType, f64, (f64, f64), (f64, f64)>) =
+            ryft_core::tracing_v2::jit(
+                &engine,
+                |inputs: (
+                    ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
+                    ryft_core::tracing_v2::JitTracer<ArrayType, f64>,
+                )| {
+                    Ok(ryft_core::tracing_v2::grad(
+                        &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
+                        scalar_bilinear_sin,
+                        inputs,
+                    )?)
+                },
+                (2.0f64, 3.0f64),
+            )
+            .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_graph(compiled.program().graph(), "main").unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft jit(grad(bilinear_sin)) StableHLO ===\n{stablehlo}");
 
         // cos(x) should be computed symbolically from %arg0, NOT as a baked-in constant.
@@ -2982,7 +2975,7 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
-    fn test_to_mlir_module_for_plain_graph_renders_transposed_matrix_pullback_factors() {
+    fn test_to_mlir_module_for_plain_program_renders_transposed_matrix_pullback_factors() {
         let left = arr2(&[[1.0f64, 2.0], [3.0, 4.0]]);
         let right = arr2(&[[5.0f64, 6.0], [7.0, 8.0]]);
         let (_, pullback): (
@@ -2996,7 +2989,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            to_mlir_module_for_plain_graph(pullback.program().graph(), "main").unwrap(),
+            to_mlir_module_for_plain_program(pullback.program(), "main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2x2xf64>) -> (tensor<2x2xf64>, tensor<2x2xf64>) {

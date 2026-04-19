@@ -92,7 +92,7 @@ impl<V: Traceable<ArrayType>> Op for ScaleOp<ArrayType, V> {
         _is_zero_constant: &dyn Fn(usize) -> bool,
         _is_one_constant: &dyn Fn(usize) -> bool,
     ) -> Option<Vec<usize>> {
-        if crate::tracing_v2::graph::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
+        if crate::tracing_v2::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
     }
 }
 
@@ -207,10 +207,10 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_graph = transpose_builder.build::<f64, f64>(vec![contribution_atom], Placeholder, Placeholder);
-        approx_eq(transpose_graph.call(2.0f64).unwrap(), 6.0);
+        let transpose_program = transpose_builder.build::<f64, f64>(vec![contribution_atom], Placeholder, Placeholder);
+        approx_eq(transpose_program.call(2.0f64).unwrap(), 6.0);
         assert_eq!(
-            transpose_graph.to_string(),
+            transpose_program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = scale %0

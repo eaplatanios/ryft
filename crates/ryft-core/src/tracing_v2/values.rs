@@ -5,7 +5,7 @@
 //!
 //! - [`Traceable`] — the base trait for **any** type that can appear as a leaf in a traced computation, whether it
 //!   holds concrete data (like `f64`) or is itself a tracing wrapper (like [`JitTracer<V>`](crate::tracing_v2::JitTracer)).
-//!   Every leaf in a staged graph implements this trait.
+//!   Every leaf in a staged program implements this trait.
 //!
 //! - [`Value`] — a marker subtrait of [`Traceable`] that identifies **concrete, non-tracer** leaves. Types like `f32`,
 //!   `f64`, or backend-backed arrays implement [`Value`]; tracing wrappers like
@@ -35,14 +35,14 @@ use crate::{
 /// Each composable transform (e.g., `jvp`, `grad`, `vmap`) provides:
 ///
 /// 1. an impl for `V: Value<T>` — eager dispatch that evaluates the transform on concrete data, and
-/// 2. an impl for `JitTracer<V>` — symbolic dispatch that stages the transform into the enclosing traced graph.
+/// 2. an impl for `JitTracer<V>` — symbolic dispatch that stages the transform into the enclosing traced program.
 ///
 /// Because `JitTracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
 pub trait Value<T: Type>: Traceable<T> {}
 
 /// Base trait for any leaf type that can participate in traced computations.
 ///
-/// [`Traceable`] is implemented by **every** type that can appear as a leaf in a staged graph — both concrete data
+/// [`Traceable`] is implemented by **every** type that can appear as a leaf in a staged program — both concrete data
 /// types (e.g., `f32`, `f64`, backend arrays) and tracing wrappers (e.g.,
 /// [`JitTracer`](crate::tracing_v2::JitTracer)). It ties each leaf to a type descriptor `T` via [`Typed`], while
 /// deliberately not implying eager numeric operations such as [`Sin`](crate::tracing_v2::Sin) or
@@ -58,14 +58,14 @@ pub trait Value<T: Type>: Traceable<T> {}
 ///
 /// # Why the `'static` bound?
 ///
-/// Tracing a closure produces a [`Program`](crate::tracing_v2::Program) (and, downstream, a
-/// [`CompiledFunction`](crate::tracing_v2::CompiledFunction)) whose lifetime is intentionally decoupled from the
-/// trace scope: the whole point of staging is to return the traced artifact, store it, and replay it later on fresh
-/// inputs. Constants of type `V` captured during tracing get baked directly into that staged output, so `V` cannot
-/// borrow from the tracing closure's local state without dragging its lifetime along. The `'static` bound enforces
-/// exactly this invariant structurally. As a side benefit, it also enables the [`TypeId`](std::any::TypeId)-keyed
-/// extension registry that [`CustomPrimitive`](crate::tracing_v2::CustomPrimitive) uses to dispatch optional
-/// transform rules (`Any`-based downcasting fundamentally requires `'static`).
+/// Tracing a closure produces a [`Program`](crate::tracing_v2::Program) whose lifetime is intentionally decoupled
+/// from the trace scope: the whole point of staging is to return the traced artifact, store it, and replay it later
+/// on fresh inputs. Constants of type `V` captured during tracing get baked directly into that staged output, so `V`
+/// cannot borrow from the tracing closure's local state without dragging its lifetime along. The `'static` bound
+/// enforces exactly this invariant structurally. As a side benefit, it also enables the
+/// [`TypeId`](std::any::TypeId)-keyed extension registry that
+/// [`CustomPrimitive`](crate::tracing_v2::CustomPrimitive) uses to dispatch optional transform rules (`Any`-based
+/// downcasting fundamentally requires `'static`).
 ///
 /// # Implementing [`Traceable`] for new leaf types
 ///
@@ -79,15 +79,15 @@ pub trait Value<T: Type>: Traceable<T> {}
 ///   arrays and similar backend values all take this shape.
 ///
 /// Avoid leaf types that borrow from external state: a reference-carrying wrapper cannot be baked into a staged
-/// graph that outlives the trace, and it will not satisfy `'static` either.
+/// program that outlives the trace, and it will not satisfy `'static` either.
 ///
 /// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
     ///
-    /// The graph builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)
+    /// The program builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)
     /// to detect and eliminate algebraic identities at staging time — for example, folding `x + 0` into `x` or `x * 0`
-    /// into `0` without emitting the operation into the staged graph.
+    /// into `0` without emitting the operation into the staged program.
     ///
     /// The default returns `false`, which is always safe: it simply opts the value out of identity-based
     /// simplification. Concrete leaf types that can inspect their contents (e.g., `f32`, dense arrays) should override
@@ -100,7 +100,7 @@ pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
 
     /// Returns `true` if every element of this value is exactly one.
     ///
-    /// This is the multiplicative-identity counterpart of [`Traceable::is_zero`]. The graph builder uses it during
+    /// This is the multiplicative-identity counterpart of [`Traceable::is_zero`]. The program builder uses it during
     /// [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify) to fold operations like `x * 1` into `x` or
     /// `scale(x, 1)` into `x`.
     ///

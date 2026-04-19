@@ -20,13 +20,12 @@ use std::{
 use crate::{
     parameters::Parameter,
     tracing_v2::{
-        TraceError, Traceable, ZeroLike,
+        LinearProgramOpRef, TraceError, Traceable, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
         jit::JitTracer,
         linear::{LinearTerm, Linearized},
-        program::LinearProgramOpRef,
     },
     types::{ArrayType, Type, Typed},
 };
@@ -453,8 +452,8 @@ mod tests {
 
     use super::*;
     use crate::tracing_v2::{
-        Batch, CompiledFunction, LinearProgramBuilder, OneLike, ProgramOpRef, TraceError, engine::ArrayScalarEngine,
-        grad, jit, jvp, vmap,
+        Batch, LinearProgramBuilder, OneLike, Program, ProgramOpRef, TraceError, engine::ArrayScalarEngine, grad, jit,
+        jvp, vmap,
     };
     use crate::types::{ArrayType, DataType, Shape};
 
@@ -605,7 +604,7 @@ mod tests {
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+        let (output, compiled): (f64, Program<ArrayType, f64, f64, f64>) = jit(
             &engine,
             {
                 let primitive = primitive.clone();
@@ -653,7 +652,7 @@ mod tests {
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
-        let result: Result<(f64, CompiledFunction<ArrayType, f64, f64, f64>), TraceError> = jit(
+        let result: Result<(f64, Program<ArrayType, f64, f64, f64>), TraceError> = jit(
             &engine,
             {
                 let primitive = primitive.clone();
@@ -698,7 +697,7 @@ mod tests {
             Ok(1.0f64),
         );
 
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+        let (output, compiled): (f64, Program<ArrayType, f64, f64, f64>) = jit(
             &engine,
             {
                 let primitive = primitive.clone();

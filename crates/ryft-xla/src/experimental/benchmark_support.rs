@@ -9,7 +9,7 @@ use ryft_core::tracing_v2::{
     MatrixOps, OneLike, Program, Sin,
     benchmarking::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
-        record, summarize_graph,
+        record, summarize_program,
     },
     grad, vmap,
 };
@@ -17,7 +17,7 @@ use ryft_core::tracing_v2::{
 use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-use crate::experimental::lowering::to_mlir_module_for_graph;
+use crate::experimental::lowering::to_mlir_module_for_program;
 use crate::experimental::ops::XlaPrimitiveOp;
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace,
@@ -104,7 +104,7 @@ fn summarize_nested_body(
     label: &'static str,
     body: &FlatTracedShardMap,
 ) -> Result<IrNestedRegionSummary, BenchmarkError> {
-    let program = body.compiled.program().simplify()?;
+    let program = body.program.simplify()?;
     Ok(nested_region(label, summarize_xla_program(&program)?))
 }
 
@@ -129,7 +129,7 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
         }
     }
 
-    summarize_graph(program.graph(), |op| {
+    summarize_program(program, |op| {
         if let XlaPrimitiveOp::ShardMap(shard_map_op) = op {
             let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
             if let Some(eval_mode) = shard_map_op.eval_mode() {
@@ -176,13 +176,13 @@ where
     Input::Family: ParameterizedFamily<ShardMapTensor>,
     Output::Family: ParameterizedFamily<ShardMapTensor>,
 {
-    let program = traced.compiled().program().simplify()?;
+    let program = traced.program().simplify()?;
     let summary = summarize_xla_program(&program)?;
     Ok(vec![record(
         case_id,
         "xla",
         "program",
-        to_mlir_module_for_graph(program.graph(), traced.global_input_types(), traced.global_output_types(), "main")
+        to_mlir_module_for_program(&program, traced.global_input_types(), traced.global_output_types(), "main")
             .map_err(|error| BenchmarkError::External(Box::new(error)))?,
         summary,
     )])

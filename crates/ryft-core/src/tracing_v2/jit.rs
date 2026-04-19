@@ -1,6 +1,6 @@
 //! Just-in-time staging support for `tracing_v2`.
 //!
-//! The current `jit` transform captures a graph of staged primitive applications and replays that graph with the
+//! The current `jit` transform captures a program of staged primitive applications and replays that program with the
 //! built-in interpreter. This keeps the API shape close to the eventual compiled-backend design while remaining easy
 //! to test in pure Rust.
 
@@ -16,11 +16,9 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        GraphBuilder, InterpretableOp, OneLike, TraceError, Traceable, ZeroLike,
+        AtomId, InterpretableOp, OneLike, Program, ProgramBuilder, ProgramOpRef, TraceError, Traceable, ZeroLike,
         engine::Engine,
-        graph::AtomId,
         operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
-        program::{Program, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -34,7 +32,7 @@ pub struct JitTracer<
     L: Clone + 'static = crate::tracing_v2::LinearProgramOpRef<V>,
 > {
     atom: AtomId,
-    builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
+    builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
     engine: *const dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     marker: PhantomData<fn() -> L>,
@@ -58,7 +56,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
     }
 
     #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<O, T, V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<O, T, V>>> {
         self.builder.clone()
     }
 
@@ -78,7 +76,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
     #[inline]
     pub fn from_engine(
         atom: AtomId,
-        builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
+        builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
         engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     ) -> Self {
@@ -88,7 +86,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
     #[inline]
     pub fn from_staged_parts(
         atom: AtomId,
-        builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
+        builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
         engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     ) -> Self {
@@ -287,79 +285,6 @@ where
     }
 }
 
-/// Staged function returned by [`jit`].
-///
-/// In the current prototype this type stores only the staged graph and replays it with the built-in interpreter.
-/// Later, once a concrete backend exists, it can grow additional fields that hold backend-specific compiled artifacts
-/// while keeping the same high-level API shape.
-pub struct CompiledFunction<
-    T: Type,
-    V: Typed<T> + Parameter,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-    O = ProgramOpRef<V>,
-> {
-    program: Program<T, V, Input, Output, O>,
-    marker: PhantomData<fn(Input) -> Output>,
-}
-
-impl<
-    T: Type,
-    V: Traceable<T>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    O: Clone,
-> Clone for CompiledFunction<T, V, Input, Output, O>
-{
-    fn clone(&self) -> Self {
-        Self { program: self.program.clone(), marker: PhantomData }
-    }
-}
-
-impl<T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
-    CompiledFunction<T, V, Input, Output, O>
-{
-    #[inline]
-    pub fn from_graph(graph: crate::tracing_v2::Graph<O, T, V, Input, Output>) -> Self {
-        Self::from_program(Program::from_graph(graph))
-    }
-
-    #[inline]
-    pub fn from_program(program: Program<T, V, Input, Output, O>) -> Self {
-        Self { program, marker: PhantomData }
-    }
-
-    /// Returns the staged graph backing this compiled function.
-    #[inline]
-    pub fn graph(&self) -> &crate::tracing_v2::Graph<O, T, V, Input, Output> {
-        self.program.graph()
-    }
-
-    /// Returns the staged program backing this compiled function.
-    #[inline]
-    pub fn program(&self) -> &Program<T, V, Input, Output, O> {
-        &self.program
-    }
-
-    /// Replays the staged graph on concrete input values.
-    pub fn call(&self, input: Input) -> Result<Output, TraceError>
-    where
-        O: InterpretableOp<T, V>,
-        Input::ParameterStructure: PartialEq,
-        Output::ParameterStructure: Clone,
-    {
-        self.program.call(input)
-    }
-}
-
-impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Display> Display
-    for CompiledFunction<T, V, Input, Output, O>
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.program, formatter)
-    }
-}
-
 /// Stages `function` using the staged op set selected by `engine`.
 pub fn trace_program<F, Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
@@ -382,7 +307,7 @@ where
 {
     let input_structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
-    let builder = Rc::new(RefCell::new(GraphBuilder::<O, ArrayType, V>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<O, ArrayType, V>::new()));
     let staging_error = Rc::new(RefCell::new(None));
     let concrete_input = Input::from_parameters(input_structure.clone(), input_values.clone())?;
     let traced_input = Input::To::<JitTracer<ArrayType, V, O, L>>::from_parameters(
@@ -408,9 +333,9 @@ where
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
-    let program = Program::from_graph(builder.build::<Input, Output>(outputs, input_structure, output_structure));
+    let program = builder.build::<Input, Output>(outputs, input_structure, output_structure);
     let program = program.simplify()?;
-    let concrete_input = Input::from_parameters(program.graph().input_structure().clone(), input_values)?;
+    let concrete_input = Input::from_parameters(program.input_structure().clone(), input_values)?;
     Ok((program.call(concrete_input)?, program))
 }
 
@@ -432,7 +357,7 @@ where
     F: FnOnce(Input::To<JitTracer<T, V, O, L>>) -> Result<Output::To<JitTracer<T, V, O, L>>, TraceError>,
 {
     let input_structure = input_types.parameter_structure();
-    let builder = Rc::new(RefCell::new(GraphBuilder::<O, T, V>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<O, T, V>::new()));
     let staging_error = Rc::new(RefCell::new(None));
     let traced_input = Input::To::<JitTracer<T, V, O, L>>::from_parameters(
         input_types.parameter_structure(),
@@ -463,8 +388,7 @@ where
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
-    let program =
-        Program::from_graph(builder.build::<Input::To<V>, Output::To<V>>(outputs, input_structure, output_structure));
+    let program = builder.build::<Input::To<V>, Output::To<V>>(outputs, input_structure, output_structure);
     let program = if simplify_program { program.simplify()? } else { program };
     Ok((output_types, program))
 }
@@ -513,12 +437,12 @@ where
     trace_program_from_types_with_operation_options(engine, function, input_types, true)
 }
 
-/// Stages `function` as a graph using the staged op set selected by `engine`.
+/// Stages `function` as a program using the staged op set selected by `engine`.
 pub fn jit<E, F, Input, Output, V>(
     engine: &E,
     function: F,
     input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
+) -> Result<(Output, Program<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
@@ -533,16 +457,15 @@ where
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
-    let (output, program) = trace_program(engine, function, input)?;
-    Ok((output, CompiledFunction::from_program(program)))
+    trace_program(engine, function, input)
 }
 
-/// Stages `function` as a graph using one explicit staged ordinary operation type.
+/// Stages `function` as a program using one explicit staged ordinary operation type.
 pub(crate) fn jit_for_operation<F, Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input: Input,
-) -> Result<(Output, CompiledFunction<ArrayType, V, Input, Output, O>), TraceError>
+) -> Result<(Output, Program<ArrayType, V, Input, Output, O>), TraceError>
 where
     V: Traceable<ArrayType>,
     O: Clone + 'static + InterpretableOp<ArrayType, V>,
@@ -557,16 +480,15 @@ where
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
-    let (output, program) = trace_program(engine, function, input)?;
-    Ok((output, CompiledFunction::from_program(program)))
+    trace_program(engine, function, input)
 }
 
-/// Stages `function` directly from type metadata as one graph.
+/// Stages `function` directly from type metadata as one program.
 pub fn jit_from_types<E, F, Input, Output, T, V>(
     engine: &E,
     function: F,
     input_types: Input,
-) -> Result<(Output, CompiledFunction<T, V, Input::To<V>, Output::To<V>, E::TracingOperation>), TraceError>
+) -> Result<(Output, Program<T, V, Input::To<V>, Output::To<V>, E::TracingOperation>), TraceError>
 where
     E: Engine<Type = T, Value = V>,
     T: Type + Display + Parameter,
@@ -582,8 +504,7 @@ where
     ) -> Result<Output::To<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
     E::TracingOperation: Op<T>,
 {
-    let (output_types, program) = trace_program_from_types(engine, function, input_types)?;
-    Ok((output_types, CompiledFunction::from_program(program)))
+    trace_program_from_types(engine, function, input_types)
 }
 
 #[cfg(test)]
@@ -601,7 +522,7 @@ mod tests {
 
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<f64>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ProgramOpRef<f64>, ArrayType, f64>::new()));
         let staging_error = Rc::new(RefCell::new(None));
         let atom = builder.borrow_mut().add_input(&3.0f64);
         let engine = ArrayScalarEngine::<f64>::new();
@@ -610,9 +531,9 @@ mod tests {
         assert_eq!(zero.tpe().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
         assert!(zero.atom > atom);
 
-        let graph = zero.builder.borrow().clone().build::<f64, f64>(vec![zero.atom], Placeholder, Placeholder);
+        let program = zero.builder.borrow().clone().build::<f64, f64>(vec![zero.atom], Placeholder, Placeholder);
         assert_eq!(
-            graph.to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const
@@ -623,9 +544,9 @@ mod tests {
     }
 
     #[test]
-    fn compiled_function_replays_staged_graphs() {
+    fn staged_program_replays_graphs() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = jit(
             &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let squared = x.clone() * x.clone();
@@ -636,10 +557,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
-        assert_eq!(compiled.call(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
-        assert_eq!(compiled.graph().input_atoms().len(), 1);
+        assert_eq!(program.call(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
+        assert_eq!(program.input_atoms().len(), 1);
         assert_eq!(
-            compiled.to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = mul %0 %0
@@ -767,12 +688,7 @@ mod tests {
         let result: Result<
             (
                 TestAbstractValue,
-                CompiledFunction<
-                    ArrayType,
-                    TestAbstractValue,
-                    (TestAbstractValue, TestAbstractValue),
-                    TestAbstractValue,
-                >,
+                Program<ArrayType, TestAbstractValue, (TestAbstractValue, TestAbstractValue), TestAbstractValue>,
             ),
             TraceError,
         > = jit(
@@ -790,9 +706,9 @@ mod tests {
     }
 
     #[test]
-    fn compiled_function_display_delegates_to_the_underlying_graph() {
+    fn staged_program_display_renders_the_staged_program() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
+        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) =
             jit(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         assert_eq!(
@@ -806,7 +722,6 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(compiled.to_string(), compiled.graph().to_string());
         test_support::assert_bilinear_jit_rendering();
     }
 }

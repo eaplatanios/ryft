@@ -2,7 +2,7 @@
 //!
 //! [`XlaEngine`] is the single backend token for traced XLA programs and PJRT-backed execution.
 //! It materializes concrete PJRT-backed arrays, lowers traced programs to MLIR, compiles them,
-//! and executes them. Type-directed tracing stages XLA graphs directly from [`ArrayType`] metadata
+//! and executes them. Type-directed tracing stages XLA programs directly from [`ArrayType`] metadata
 //! and therefore does not require a second tracing-only engine specialization.
 //!
 //! Cloning [`Array<'c>`] is cheap because every shard buffer lives behind an [`Arc`]; this is what

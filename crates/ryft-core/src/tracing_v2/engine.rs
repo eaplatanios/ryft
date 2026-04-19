@@ -1,9 +1,9 @@
-//! Context-carrying value construction for staged graph transforms.
+//! Context-carrying value construction for staged program transforms.
 //!
 //! The [`Engine`] trait is the abstraction used by differentiation, rematerialization, and
 //! vectorization transforms whenever they need to *synthesize* a concrete value from abstract
 //! type metadata alone — most commonly a representative zero used as a seed when replaying a
-//! staged graph.
+//! staged program.
 //!
 //! The trait exists because different leaf value types require different amounts of context to
 //! materialize a value from a [`Type`] descriptor:

@@ -1,23 +1,25 @@
-//! Shared graph representation used by staged transforms.
+//! Shared staged-program representation and default op-carrier aliases used by the tracing
+//! transforms.
 //!
-//! `Graph<O, T, V, Input, Output>` stores a linear sequence of equations over an open set of operation objects `O`.
-//! This common representation is reused for JIT graphs and for linear programs produced during differentiation.
+//! `Program<T, V, Input, Output, O>` stores a linear sequence of equations over an open set of
+//! operation objects `O`. This common representation is reused for JIT programs and for linear
+//! programs produced during differentiation.
 
 use std::{borrow::Cow, collections::HashMap, fmt::Display, marker::PhantomData};
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{Engine, InterpretableOp, Op, TraceError, Traceable},
-    types::{Type, Typed},
+    tracing_v2::{Engine, InterpretableOp, LinearPrimitiveOp, Op, PrimitiveOp, TraceError, Traceable},
+    types::{ArrayType, Type, Typed},
 };
 
-/// Identifier for an atom within a staged graph.
+/// Identifier for an atom within a staged program.
 pub type AtomId = usize;
 
 /// Staged atom carrying abstract metadata.
 ///
-/// The variant encodes how the atom entered the graph and determines which concrete state it
-/// retains. See [`GraphBuilder`] for how builder-time intermediate values for [`Atom::Derived`]
+/// The variant encodes how the atom entered the program and determines which concrete state it
+/// retains. See [`ProgramBuilder`] for how builder-time intermediate values for [`Atom::Derived`]
 /// are kept separately during staging.
 #[derive(Clone, Debug)]
 pub enum Atom<T: Type, V: Typed<T>> {
@@ -28,8 +30,8 @@ pub enum Atom<T: Type, V: Typed<T>> {
         value: V,
     },
 
-    /// Graph input carrying only its abstract type. Any builder-time representative value is kept
-    /// in the owning [`GraphBuilder`]'s side table and is discarded when the graph is finalized;
+    /// Program input carrying only its abstract type. Any builder-time representative value is kept
+    /// in the owning [`ProgramBuilder`]'s side table and is discarded when the program is finalized;
     /// later transforms recover representatives by synthesizing zeros from the retained type.
     Input {
         /// Abstract type retained for this input.
@@ -37,8 +39,8 @@ pub enum Atom<T: Type, V: Typed<T>> {
     },
 
     /// Atom produced by evaluating an equation. Carries only the abstract type; any eagerly
-    /// evaluated intermediate value lives in the owning [`GraphBuilder`]'s side table and is
-    /// discarded when the graph is finalized.
+    /// evaluated intermediate value lives in the owning [`ProgramBuilder`]'s side table and is
+    /// discarded when the program is finalized.
     Derived {
         /// Abstract type produced by the equation.
         r#type: T,
@@ -54,7 +56,7 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
     }
 }
 
-/// Single equation in a staged graph.
+/// Single equation in a staged program.
 #[derive(Clone, Debug)]
 pub struct Equation<O> {
     /// Operation applied by this equation.
@@ -65,21 +67,21 @@ pub struct Equation<O> {
     pub outputs: Vec<AtomId>,
 }
 
-/// Builder for staged graphs.
+/// Builder for staged programs.
 ///
 /// The builder keeps one entry in [`Self::intermediates`] for every atom: `Some` for [`Atom::Derived`]
 /// atoms whose value has been eagerly computed during staging, `None` otherwise. These intermediate
 /// values are used for on-the-fly interpretation and algebraic-identity checks but are discarded
-/// when the graph is finalized via [`Self::build`].
+/// when the program is finalized via [`Self::build`].
 #[derive(Clone, Debug)]
-pub struct GraphBuilder<O, T: Type, V: Typed<T>> {
+pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
     atoms: Vec<Atom<T, V>>,
     intermediates: Vec<Option<V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
 }
 
-impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
+impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Creates an empty builder.
     #[inline]
     pub fn new() -> Self {
@@ -108,10 +110,10 @@ impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
     /// Adds a new input atom retaining only its abstract type, without recording any exemplar in
     /// the builder's side table.
     ///
-    /// Intended for graph transforms that rebuild structure without needing intermediate values
-    /// (for example [`Graph::simplify`]). Callers that later need a representative value for this
+    /// Intended for program transforms that rebuild structure without needing intermediate values
+    /// (for example [`Program::simplify`]). Callers that later need a representative value for this
     /// atom should obtain it from an [`Engine`](crate::tracing_v2::Engine) via
-    /// [`Graph::representative_input_values`].
+    /// [`Program::representative_input_values`].
     #[inline]
     pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
         let id = self.atoms.len();
@@ -138,7 +140,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
         id
     }
 
-    /// Adds a constant atom to the graph.
+    /// Adds a constant atom to the program.
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = self.atoms.len();
@@ -256,9 +258,9 @@ impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
 
     /// Adds a staged equation, validating its inputs through abstract evaluation first.
     ///
-    /// When every input atom is an [`Atom::Constant`], the operation is folded at graph-construction
+    /// When every input atom is an [`Atom::Constant`], the operation is folded at program-construction
     /// time: `abstract_eval` and `eval` are still executed for validation, but the output atoms are
-    /// recorded as constants and no equation is added to the graph.
+    /// recorded as constants and no equation is added to the program.
     pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TraceError>
     where
         O: InterpretableOp<T, V>,
@@ -271,20 +273,20 @@ impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
         self.add_equation_with_output_values(op, inputs, output_values)
     }
 
-    /// Finalizes the builder into a graph with the given input/output structures. The builder's
-    /// intermediate values are discarded; the resulting graph retains only the atoms, equations,
+    /// Finalizes the builder into a program with the given input/output structures. The builder's
+    /// intermediate values are discarded; the resulting program retains only the atoms, equations,
     /// and input/output structure.
     pub fn build<Input, Output>(
         self,
         outputs: Vec<AtomId>,
         input_structure: Input::ParameterStructure,
         output_structure: Output::ParameterStructure,
-    ) -> Graph<O, T, V, Input, Output>
+    ) -> Program<T, V, Input, Output, O>
     where
         Input: Parameterized<V>,
         Output: Parameterized<V>,
     {
-        Graph {
+        Program {
             atoms: self.atoms,
             input_atoms: self.input_atoms,
             equations: self.equations,
@@ -296,11 +298,21 @@ impl<O: Clone, T: Type, V: Traceable<T>> GraphBuilder<O, T, V> {
     }
 }
 
-impl<O: Clone, T: Type, V: Traceable<T>> Default for GraphBuilder<O, T, V> {
+impl<O: Clone, T: Type, V: Traceable<T>> Default for ProgramBuilder<O, T, V> {
     fn default() -> Self {
         Self::new()
     }
 }
+
+/// Canonical operation type used by the staged program IR.
+pub type ProgramOpRef<V> = PrimitiveOp<ArrayType, V>;
+
+/// Canonical operation type used by the staged linear-program IR.
+pub type LinearProgramOpRef<V> = LinearPrimitiveOp<ArrayType, V>;
+
+/// Shared builder used by the staged linear-program IR. The optional `O` parameter allows callers
+/// to stage against an alternate linear operation carrier.
+pub type LinearProgramBuilder<V, O = LinearProgramOpRef<V>> = ProgramBuilder<O, ArrayType, V>;
 
 // ---------------------------------------------------------------------------
 // Algebraic identity elimination helpers
@@ -316,8 +328,14 @@ pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
     value.is_one()
 }
 
-/// Executable staged graph over an open operation set.
-pub struct Graph<O, T: Type, V: Typed<T> + Parameter, Input: Parameterized<V>, Output: Parameterized<V>> {
+/// Executable staged program over an open operation set.
+pub struct Program<
+    T: Type,
+    V: Typed<T> + Parameter,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+    O = ProgramOpRef<V>,
+> {
     atoms: Vec<Atom<T, V>>,
     input_atoms: Vec<AtomId>,
     equations: Vec<Equation<O>>,
@@ -333,7 +351,7 @@ impl<
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-> Clone for Graph<O, T, V, Input, Output>
+> Clone for Program<T, V, Input, Output, O>
 {
     fn clone(&self) -> Self {
         Self {
@@ -349,9 +367,9 @@ impl<
 }
 
 impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Graph<O, T, V, Input, Output>
+    Program<T, V, Input, Output, O>
 {
-    /// Returns the number of atoms in the graph.
+    /// Returns the number of atoms in the program.
     #[inline]
     pub fn atom_count(&self) -> usize {
         self.atoms.len()
@@ -363,13 +381,13 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.atoms.get(id)
     }
 
-    /// Returns an iterator over all atoms in the graph, yielding `(atom_id, &Atom<T, V>)` pairs.
+    /// Returns an iterator over all atoms in the program, yielding `(atom_id, &Atom<T, V>)` pairs.
     #[inline]
     pub fn atoms_iter(&self) -> impl Iterator<Item = (AtomId, &Atom<T, V>)> {
         self.atoms.iter().enumerate()
     }
 
-    /// Returns the graph input atoms in parameter order.
+    /// Returns the program input atoms in parameter order.
     #[inline]
     pub fn input_atoms(&self) -> &[AtomId] {
         self.input_atoms.as_slice()
@@ -399,7 +417,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         &self.output_structure
     }
 
-    /// Returns representative concrete inputs for this graph, synthesized as zero values from the
+    /// Returns representative concrete inputs for this program, synthesized as zero values from the
     /// retained input types using the provided [`Engine`].
     pub fn representative_input_values<E>(&self, engine: &E) -> Result<Vec<V>, TraceError>
     where
@@ -410,12 +428,12 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             .copied()
             .map(|atom_id| match self.atom(atom_id) {
                 Some(Atom::Input { r#type }) => Ok(engine.zero(r#type)),
-                _ => Err(TraceError::InternalInvariantViolation("staged graph input atom did not retain a type")),
+                _ => Err(TraceError::InternalInvariantViolation("staged program input atom did not retain a type")),
             })
             .collect()
     }
 
-    /// Evaluates every atom in the graph on the supplied flat input values.
+    /// Evaluates every atom in the program on the supplied flat input values.
     pub fn evaluate_atom_values(&self, input_values: Vec<V>) -> Result<Vec<V>, TraceError>
     where
         O: InterpretableOp<T, V>,
@@ -458,7 +476,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             .collect()
     }
 
-    /// Evaluates every atom in the graph on its representative input exemplars, synthesized as
+    /// Evaluates every atom in the program on its representative input exemplars, synthesized as
     /// zero values from the retained input types using the provided [`Engine`].
     pub fn representative_atom_values<E>(&self, engine: &E) -> Result<Vec<V>, TraceError>
     where
@@ -468,17 +486,17 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.evaluate_atom_values(self.representative_input_values(engine)?)
     }
 
-    /// Clones this graph while replacing only the typed input/output structures.
+    /// Clones this program while replacing only the typed input/output structures.
     pub fn clone_with_structures<NewInput, NewOutput>(
         &self,
         input_structure: NewInput::ParameterStructure,
         output_structure: NewOutput::ParameterStructure,
-    ) -> Graph<O, T, V, NewInput, NewOutput>
+    ) -> Program<T, V, NewInput, NewOutput, O>
     where
         NewInput: Parameterized<V>,
         NewOutput: Parameterized<V>,
     {
-        Graph {
+        Program {
             atoms: self.atoms.clone(),
             input_atoms: self.input_atoms.clone(),
             equations: self.equations.clone(),
@@ -489,7 +507,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         }
     }
 
-    /// Interprets the staged graph on concrete input values.
+    /// Interprets the staged program on concrete input values.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         O: InterpretableOp<T, V>,
@@ -505,7 +523,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
-    /// Eliminates dead constants and equations that do not contribute to the graph outputs.
+    /// Eliminates dead constants and equations that do not contribute to the program outputs.
     pub fn simplify(&self) -> Result<Self, TraceError>
     where
         O: Op<T>,
@@ -513,7 +531,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         Output::ParameterStructure: Clone,
     {
         fn mark_live<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
-            graph: &Graph<O, T, V, Input, Output>,
+            program: &Program<T, V, Input, Output, O>,
             atom_id: usize,
             live_atoms: &mut [bool],
             live_equations: &mut [bool],
@@ -528,17 +546,17 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                     return;
                 }
                 live_equations[equation_index] = true;
-                let equation = &graph.equations[equation_index];
+                let equation = &program.equations[equation_index];
                 for input in equation.inputs.iter().copied() {
-                    mark_live(graph, input, live_atoms, live_equations, equation_by_output);
+                    mark_live(program, input, live_atoms, live_equations, equation_by_output);
                 }
             }
         }
 
         fn remap_atom<O, T, V, Input, Output>(
             atom_id: usize,
-            graph: &Graph<O, T, V, Input, Output>,
-            builder: &mut GraphBuilder<O, T, V>,
+            program: &Program<T, V, Input, Output, O>,
+            builder: &mut ProgramBuilder<O, T, V>,
             atom_mapping: &mut HashMap<usize, usize>,
             live_equations: &[bool],
             equation_by_output: &[Option<usize>],
@@ -554,7 +572,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                 return Ok(*mapped_atom);
             }
 
-            let atom = graph.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
+            let atom = program.atom(atom_id).ok_or(TraceError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom {
                 Atom::Input { r#type } => builder.add_input_abstract(r#type.clone()),
                 Atom::Constant { value } => builder.add_constant(value.clone()),
@@ -563,22 +581,22 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                         .ok_or(TraceError::InternalInvariantViolation("derived atom had no owning equation"))?;
                     if !live_equations[equation_index] {
                         return Err(TraceError::InternalInvariantViolation(
-                            "attempted to remap a dead derived atom during graph simplification",
+                            "attempted to remap a dead derived atom during program simplification",
                         ));
                     }
-                    let equation = &graph.equations[equation_index];
+                    let equation = &program.equations[equation_index];
                     let remapped_inputs = equation
                         .inputs
                         .iter()
                         .copied()
                         .map(|input| {
-                            remap_atom(input, graph, builder, atom_mapping, live_equations, equation_by_output)
+                            remap_atom(input, program, builder, atom_mapping, live_equations, equation_by_output)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let output_abstracts = equation
                         .outputs
                         .iter()
-                        .map(|output| graph.atom(*output).expect("output atom should exist").tpe().into_owned())
+                        .map(|output| program.atom(*output).expect("output atom should exist").tpe().into_owned())
                         .collect::<Vec<_>>();
                     let remapped_outputs =
                         builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
@@ -589,7 +607,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                     }
                     *atom_mapping
                         .get(&atom_id)
-                        .ok_or(TraceError::InternalInvariantViolation("failed to record remapped graph outputs"))?
+                        .ok_or(TraceError::InternalInvariantViolation("failed to record remapped program outputs"))?
                 }
             };
             atom_mapping.entry(atom_id).or_insert(mapped_atom);
@@ -615,12 +633,12 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             );
         }
 
-        let mut builder = GraphBuilder::<O, T, V>::new();
+        let mut builder = ProgramBuilder::<O, T, V>::new();
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_atoms.iter().copied() {
             let input = self.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
             let Atom::Input { r#type } = input else {
-                return Err(TraceError::InternalInvariantViolation("staged graph input atom did not retain a type"));
+                return Err(TraceError::InternalInvariantViolation("staged program input atom did not retain a type"));
             };
             let mapped = builder.add_input_abstract(r#type.clone());
             atom_mapping.insert(input_atom, mapped);
@@ -647,7 +665,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 }
 
 impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for Graph<O, T, V, Input, Output>
+    for Program<T, V, Input, Output, O>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");
@@ -712,20 +730,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn graph_builder_tracks_atom_sources_and_executes() {
-        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+    fn program_builder_tracks_atom_sources_and_executes() {
+        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
         let scaled_x = builder.add_equation(PrimitiveOp::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
         let sum = builder.add_equation(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
-        let graph = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
+        let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
-        assert!(matches!(graph.atom(x).unwrap(), Atom::Input { .. }));
-        assert!(matches!(graph.atom(two).unwrap(), Atom::Constant { .. }));
-        assert_eq!(graph.call((2.0, 3.0)).unwrap(), 7.0);
+        assert!(matches!(program.atom(x).unwrap(), Atom::Input { .. }));
+        assert!(matches!(program.atom(two).unwrap(), Atom::Constant { .. }));
+        assert_eq!(program.call((2.0, 3.0)).unwrap(), 7.0);
         assert_eq!(
-            graph.to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = const
@@ -738,15 +756,15 @@ mod tests {
     }
 
     #[test]
-    fn graph_display_uses_typed_jaxpr_like_rendering() {
-        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+    fn program_display_uses_typed_jaxpr_like_rendering() {
+        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
-        let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
+        let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
         assert_eq!(
-            graph.to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const
@@ -758,16 +776,16 @@ mod tests {
     }
 
     #[test]
-    fn graph_builder_rejects_unbound_inputs() {
-        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+    fn program_builder_rejects_unbound_inputs() {
+        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let result = builder.add_equation(PrimitiveOp::Add, vec![42, 99]);
         assert!(matches!(result, Err(TraceError::UnboundAtomId { id: 42 })));
-        test_support::assert_reference_graph_rendering();
+        test_support::assert_reference_program_rendering();
     }
 
     #[test]
     fn test_constant_folding_eliminates_equations() {
-        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
 
@@ -784,11 +802,11 @@ mod tests {
         assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Derived { .. }));
         assert_eq!(builder.equation_count(), 1);
 
-        // Build the graph and verify only the non-folded equation survived.
-        let graph = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
-        assert_eq!(graph.equations().len(), 1);
+        // Build the program and verify only the non-folded equation survived.
+        let program = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
+        assert_eq!(program.equations().len(), 1);
         assert_eq!(
-            graph.to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %3:f64[] .
                 let %0:f64[] = const
@@ -802,25 +820,25 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_folding_graph_call_produces_correct_results() {
-        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+    fn test_constant_folding_program_call_produces_correct_results() {
+        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
         let folded_sum = builder.add_equation(PrimitiveOp::Add, vec![a, b]).unwrap()[0];
 
         let x = builder.add_input(&10.0f64);
         let product = builder.add_equation(PrimitiveOp::Mul, vec![folded_sum, x]).unwrap()[0];
-        let graph = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
+        let program = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
 
         // folded_sum = 2.0 + 3.0 = 5.0, product = 5.0 * input
-        assert_eq!(graph.call(10.0).unwrap(), 50.0);
-        assert_eq!(graph.call(0.5).unwrap(), 2.5);
-        assert_eq!(graph.call(0.0).unwrap(), 0.0);
+        assert_eq!(program.call(10.0).unwrap(), 50.0);
+        assert_eq!(program.call(0.5).unwrap(), 2.5);
+        assert_eq!(program.call(0.0).unwrap(), 0.0);
     }
 
     #[test]
-    fn built_graph_drops_derived_stored_values_but_reconstructs_representatives() {
-        let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+    fn built_program_drops_derived_stored_values_but_reconstructs_representatives() {
+        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&2.0f64);
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
@@ -833,15 +851,15 @@ mod tests {
         assert_eq!(builder.stored_value(x), Some(&2.0));
         assert_eq!(builder.stored_value(sum), Some(&5.0));
 
-        let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
+        let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         assert!(
-            matches!(graph.atom(x).unwrap(), Atom::Input { r#type } if *r#type == ArrayType::scalar(DataType::F64))
+            matches!(program.atom(x).unwrap(), Atom::Input { r#type } if *r#type == ArrayType::scalar(DataType::F64))
         );
-        assert!(matches!(graph.atom(three).unwrap(), Atom::Constant { value } if *value == 3.0));
-        assert!(matches!(graph.atom(sum).unwrap(), Atom::Derived { .. }));
-        assert_eq!(graph.representative_atom_values(&engine).unwrap(), vec![0.0, 3.0, 3.0]);
-        assert_eq!(graph.call(4.0).unwrap(), 7.0);
+        assert!(matches!(program.atom(three).unwrap(), Atom::Constant { value } if *value == 3.0));
+        assert!(matches!(program.atom(sum).unwrap(), Atom::Derived { .. }));
+        assert_eq!(program.representative_atom_values(&engine).unwrap(), vec![0.0, 3.0, 3.0]);
+        assert_eq!(program.call(4.0).unwrap(), 7.0);
     }
 
     #[test]
@@ -941,7 +959,7 @@ mod tests {
         }
 
         let mut builder =
-            GraphBuilder::<PrimitiveOp<ArrayType, TestIdentityValue>, ArrayType, TestIdentityValue>::new();
+            ProgramBuilder::<PrimitiveOp<ArrayType, TestIdentityValue>, ArrayType, TestIdentityValue>::new();
         let x = builder.add_input(&TestIdentityValue::scalar(5.0));
         let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
 

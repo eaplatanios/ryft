@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::parameters::Parameterized;
 use crate::types::ArrayType;
 
-use super::{Atom, Graph, Op, TraceError, Traceable};
+use super::{Atom, Op, Program, TraceError, Traceable};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -213,15 +213,15 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
     }
 }
 
-/// Summarizes one staged graph and its immediate nested regions.
+/// Summarizes one staged program and its immediate nested regions.
 ///
 /// # Parameters
 ///
-///   - `graph`: Graph to summarize.
+///   - `program`: Program to summarize.
 ///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
 ///     staged op.
-pub fn summarize_graph<V, Input, Output, O, F>(
-    graph: &Graph<O, ArrayType, V, Input, Output>,
+pub fn summarize_program<V, Input, Output, O, F>(
+    program: &Program<ArrayType, V, Input, Output, O>,
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
@@ -233,16 +233,17 @@ where
 {
     let mut op_histogram = BTreeMap::new();
     let mut nested_regions = Vec::new();
-    let mut depth_by_atom = vec![0usize; graph.atom_count()];
+    let mut depth_by_atom = vec![0usize; program.atom_count()];
 
-    for (atom_id, atom) in (0..graph.atom_count()).filter_map(|atom_id| graph.atom(atom_id).map(|atom| (atom_id, atom)))
+    for (atom_id, atom) in
+        (0..program.atom_count()).filter_map(|atom_id| program.atom(atom_id).map(|atom| (atom_id, atom)))
     {
         if matches!(atom, Atom::Input { .. } | Atom::Constant { .. }) {
             depth_by_atom[atom_id] = 0;
         }
     }
 
-    for equation in graph.equations() {
+    for equation in program.equations() {
         let normalized_name = normalize_op_name(equation.op.name());
         *op_histogram.entry(normalized_name).or_insert(0) += 1;
 
@@ -256,14 +257,14 @@ where
 
     let nested_region_count = nested_regions.len()
         + nested_regions.iter().map(|nested_region| nested_region.nested_region_count).sum::<usize>();
-    let max_dependency_depth = graph.outputs().iter().map(|output| depth_by_atom[*output]).max().unwrap_or(0);
+    let max_dependency_depth = program.outputs().iter().map(|output| depth_by_atom[*output]).max().unwrap_or(0);
 
     Ok(IrBenchmarkSummary {
-        input_leaf_count: graph.input_atoms().len(),
-        output_leaf_count: graph.outputs().len(),
-        equation_count: graph.equations().len(),
-        constant_count: (0..graph.atom_count())
-            .filter_map(|atom_id| graph.atom(atom_id))
+        input_leaf_count: program.input_atoms().len(),
+        output_leaf_count: program.outputs().len(),
+        equation_count: program.equations().len(),
+        constant_count: (0..program.atom_count())
+            .filter_map(|atom_id| program.atom(atom_id))
             .filter(|atom| matches!(atom, Atom::Constant { .. }))
             .count(),
         op_histogram,
@@ -273,12 +274,12 @@ where
     })
 }
 
-/// Converts one nested-region summary from a child graph into the public nested-region shape.
+/// Converts one nested-region summary from a child program into the public nested-region shape.
 ///
 /// # Parameters
 ///
 ///   - `label`: Stable nested-region label.
-///   - `summary`: Child graph summary.
+///   - `summary`: Child program summary.
 pub fn nested_region(label: &'static str, summary: IrBenchmarkSummary) -> IrNestedRegionSummary {
     IrNestedRegionSummary {
         label: label.to_string(),
@@ -302,15 +303,15 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{CompiledFunction, JitTracer, OneLike, Sin, engine::ArrayScalarEngine, jit};
+    use crate::tracing_v2::{JitTracer, OneLike, Program, Sin, engine::ArrayScalarEngine, jit};
 
     use super::*;
 
-    /// Summarizes a small scalar graph and verifies the structural metrics.
+    /// Summarizes a small scalar program and verifies the structural metrics.
     #[test]
-    fn test_summarize_graph_counts_constants_and_depth() {
+    fn test_summarize_program_counts_constants_and_depth() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = jit(
             &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let with_constant = x.clone() + x.one_like();
@@ -320,7 +321,7 @@ mod tests {
         )
         .unwrap();
 
-        let summary = summarize_graph(compiled.graph(), |_| Ok(Vec::new())).unwrap();
+        let summary = summarize_program(&compiled, |_| Ok(Vec::new())).unwrap();
         assert_eq!(
             summary,
             IrBenchmarkSummary {

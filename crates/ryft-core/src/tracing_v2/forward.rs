@@ -12,13 +12,12 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        TraceError, Traceable, Value, ZeroLike,
+        LinearProgramOpRef, Program, TraceError, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{JitTracer, jit, trace_program},
         linear::{LinearProgram, Linearized, jvp_program, jvp_traced, linearize_traced_program},
         operations::{CoreLinearReplayOp, DifferentiableOp, InterpretableOp, Op},
-        program::{LinearProgramOpRef, Program},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -203,7 +202,7 @@ where
 
 /// Already-traced dispatch for [`jvp`]: delegates to [`jvp_traced`] to replay the user function
 /// symbolically inside an enclosing [`JitTracer`] scope, staging both the primal output and the
-/// tangent propagation as part of the outer compiled graph.
+/// tangent propagation as part of the outer compiled program.
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
@@ -239,7 +238,7 @@ where
 /// per-element Jacobian-vector products over a batch without requiring an outer [`jit`] wrapper.
 ///
 /// Uses the same trace-once strategy as the reverse-mode batched dispatch for [`Batch`]: the user
-/// function is traced once to a [`Program`], and a [`CompiledFunction`] that
+/// function is traced once to a [`Program`], and a second [`Program`] that
 /// takes primals and tangents and returns `(primal_output, tangent_output)` per lane is compiled via
 /// [`jit`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
@@ -333,11 +332,12 @@ where
         let output_parameter_count = output_structure.parameter_count();
 
         // Reshape to flat Vec program for the JIT compilation step.
-        let flat_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-            vec![Placeholder; input_parameter_count],
-            vec![Placeholder; output_parameter_count],
-        ))
-        .simplify()?;
+        let flat_program = traced_program
+            .clone_with_structures::<Vec<V>, Vec<V>>(
+                vec![Placeholder; input_parameter_count],
+                vec![Placeholder; output_parameter_count],
+            )
+            .simplify()?;
 
         // Compile the full JVP into a reusable program. Inside the JIT scope, the program is
         // replayed symbolically with `linearize_traced_program`, which produces both the
@@ -345,10 +345,7 @@ where
         let combined_input_count = input_parameter_count * 2;
         let combined_output_count = output_parameter_count * 2;
 
-        let (_, compiled_jvp): (
-            Vec<V>,
-            crate::tracing_v2::CompiledFunction<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>,
-        ) = jit(
+        let (_, compiled_jvp): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = jit(
             engine,
             |jit_combined| {
                 let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
@@ -385,13 +382,13 @@ where
             combined_flat.extend(lane_t.into_parameters());
             let combined_result: Vec<V> = compiled_jvp.call(combined_flat)?;
             let (primal_flat, tangent_flat) = combined_result.split_at(output_parameter_count);
+            let primal_flat: Vec<V> = primal_flat.to_vec();
+            let tangent_flat: Vec<V> = tangent_flat.to_vec();
             lane_primal_outputs.push(
-                Output::To::<V>::from_parameters(output_structure.clone(), primal_flat.to_vec())
-                    .map_err(TraceError::from)?,
+                Output::To::<V>::from_parameters(output_structure.clone(), primal_flat).map_err(TraceError::from)?,
             );
             lane_tangent_outputs.push(
-                Output::To::<V>::from_parameters(output_structure.clone(), tangent_flat.to_vec())
-                    .map_err(TraceError::from)?,
+                Output::To::<V>::from_parameters(output_structure.clone(), tangent_flat).map_err(TraceError::from)?,
             );
         }
 

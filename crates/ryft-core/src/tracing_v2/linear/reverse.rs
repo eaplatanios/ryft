@@ -195,7 +195,7 @@ where
 
 /// Already-traced dispatch for [`value_and_grad`]: replays the user function symbolically inside an
 /// enclosing [`JitTracer`] scope, linearizes, transposes, and stages both the forward output and the
-/// backward gradient so they become part of the outer compiled graph.
+/// backward gradient so they become part of the outer compiled program.
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -246,7 +246,7 @@ where
 /// over a batch without requiring an outer [`jit`] wrapper.
 ///
 /// Uses a trace-once strategy for [`Batch`]: the user function is traced once to a [`Program`],
-/// and a [`CompiledFunction`] that produces `(V, Input::To<V>)` per lane is compiled via [`jit`].
+/// and a second [`Program`] that produces `(V, Input::To<V>)` per lane is compiled via [`jit`].
 /// Values and gradients are collected per lane and stacked separately.
 impl<
     E,
@@ -321,14 +321,15 @@ where
             trace_program(engine, |staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
-        let flat_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-            flat_leaf_parameter_structure(parameter_count),
-            flat_leaf_parameter_structure(1),
-        ))
-        .simplify()?;
+        let flat_program = traced_program
+            .clone_with_structures::<Vec<V>, Vec<V>>(
+                flat_leaf_parameter_structure(parameter_count),
+                flat_leaf_parameter_structure(1),
+            )
+            .simplify()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
-        let (_, compiled_vg): (Vec<V>, CompiledFunction<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = jit(
+        let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = jit(
             engine,
             |jit_primals: Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
                 let (output, gradient) = reverse_mode_scalar_traced_program(&flat_program, jit_primals)?;

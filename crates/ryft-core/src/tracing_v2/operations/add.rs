@@ -149,7 +149,7 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(error, TraceError::IncompatibleAbstractValues { op: "add" });
-        test_support::assert_reference_graph_rendering();
+        test_support::assert_reference_program_rendering();
     }
 
     #[test]

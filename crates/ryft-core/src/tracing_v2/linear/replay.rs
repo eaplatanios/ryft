@@ -1,34 +1,34 @@
 use super::*;
 
-fn replay_program_graph_with<GraphInput, GraphOutput, V, O, R, LiftConstant, ApplyOp>(
-    graph: &Graph<O, ArrayType, V, GraphInput, GraphOutput>,
+fn replay_program_with<ProgramInput, ProgramOutput, V, O, R, LiftConstant, ApplyOp>(
+    program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
     inputs: Vec<R>,
     lift_constant: LiftConstant,
     apply_op: ApplyOp,
 ) -> Result<Vec<R>, TraceError>
 where
-    GraphInput: Parameterized<V>,
-    GraphOutput: Parameterized<V>,
+    ProgramInput: Parameterized<V>,
+    ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType>,
     O: Clone,
     R: Clone,
     LiftConstant: Fn(&V, &[R]) -> Result<R, TraceError>,
     ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TraceError>,
 {
-    let mut values = vec![None; graph.atom_count()];
-    for (atom_id, value) in graph.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
+    let mut values = vec![None; program.atom_count()];
+    for (atom_id, value) in program.input_atoms().iter().copied().zip(inputs.iter().cloned()) {
         values[atom_id] = Some(value);
     }
 
-    let mut equation_by_first_output = vec![None; graph.atom_count()];
-    for (equation_index, equation) in graph.equations().iter().enumerate() {
+    let mut equation_by_first_output = vec![None; program.atom_count()];
+    for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
             equation_by_first_output[*first_output] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..graph.atom_count() {
-        let atom = graph.atom(atom_id).expect("atom IDs should be dense");
+    for atom_id in 0..program.atom_count() {
+        let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { value } => {
@@ -42,7 +42,7 @@ where
                 let Some(equation_index) = equation_by_first_output[atom_id] else {
                     continue;
                 };
-                let equation = &graph.equations()[equation_index];
+                let equation = &program.equations()[equation_index];
                 let input_values = equation
                     .inputs
                     .iter()
@@ -56,30 +56,27 @@ where
         }
     }
 
-    graph
+    program
         .outputs()
         .iter()
         .map(|output| values[*output].clone().ok_or(TraceError::UnboundAtomId { id: *output }))
         .collect()
 }
 
-pub(crate) fn replay_program_graph_linearized_jit<GraphInput, GraphOutput, V, O, L>(
-    graph: &Graph<O, ArrayType, V, GraphInput, GraphOutput>,
+pub(crate) fn replay_program_linearized_jit<ProgramInput, ProgramOutput, V, O, L>(
+    program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
     inputs: Vec<LinearizedTracedValue<V, O, L>>,
 ) -> Result<Vec<LinearizedTracedValue<V, O, L>>, TraceError>
 where
-    GraphInput: Parameterized<V>,
-    GraphOutput: Parameterized<V>,
+    ProgramInput: Parameterized<V>,
+    ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType> + ZeroLike,
     L: Clone + 'static,
     O: InterpretableOp<ArrayType, LinearizedTracedValue<V, O, L>> + Clone,
 {
-    replay_program_graph_with(
-        graph,
-        inputs,
-        super::program::lift_linearized_traced_constant::<V, O, L>,
-        |op, values| InterpretableOp::<ArrayType, LinearizedTracedValue<V, O, L>>::interpret(op, &values),
-    )
+    replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L>, |op, values| {
+        InterpretableOp::<ArrayType, LinearizedTracedValue<V, O, L>>::interpret(op, &values)
+    })
 }
 
 pub(crate) fn linearize_traced_program<V, O, L>(
@@ -105,7 +102,7 @@ where
             Linearized { primal, tangent: LinearTerm::from_staged_parts(atom, builder.clone()) }
         })
         .collect::<Vec<_>>();
-    let traced_output = replay_program_graph_linearized_jit::<_, _, _, O, L>(program.graph(), traced_input)?;
+    let traced_output = replay_program_linearized_jit::<_, _, _, O, L>(program, traced_input)?;
     let primal_outputs = traced_output.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
     let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom()).collect::<Vec<_>>();
     drop(traced_output);
@@ -115,12 +112,12 @@ where
             return Err(TraceError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
         }
     };
-    let program =
-        Program::from_graph(builder.build::<Vec<JitTracer<ArrayType, V, O, L>>, Vec<JitTracer<ArrayType, V, O, L>>>(
+    let program = builder
+        .build::<Vec<JitTracer<ArrayType, V, O, L>>, Vec<JitTracer<ArrayType, V, O, L>>>(
             tangent_outputs,
             vec![Placeholder; input_count],
             vec![Placeholder; primal_outputs.len()],
-        ))
+        )
         .simplify()?;
     Ok((primal_outputs.clone(), LinearProgram::from_program(program, zero)))
 }

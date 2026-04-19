@@ -9,8 +9,8 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::tracing_v2::{
-    Batch, CompiledFunction, JitTracer, LinearProgram, OneLike, Program, Sin, Traceable,
-    benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_graph},
+    Batch, JitTracer, LinearProgram, OneLike, Program, Sin, Traceable,
+    benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
     engine::ArrayScalarEngine,
     grad, jit, jvp, jvp_program, stack, unstack, value_and_grad, vjp, vmap,
 };
@@ -64,7 +64,7 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
 /// # Parameters
 ///
 ///   - `program`: Program to summarize.
-fn summarize_program<V, Input, Output, O>(
+fn summarize_tracing_program<V, Input, Output, O>(
     program: &Program<ArrayType, V, Input, Output, O>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
@@ -73,7 +73,7 @@ where
     Output: crate::parameters::Parameterized<V>,
     O: Clone + std::fmt::Display + crate::tracing_v2::Op,
 {
-    summarize_graph(program.graph(), |_| Ok(Vec::new()))
+    summarize_program(program, |_| Ok(Vec::new()))
 }
 
 /// Builds one tracing benchmark record from a staged program.
@@ -103,7 +103,7 @@ where
     Output: crate::parameters::Parameterized<V>,
     O: Clone + std::fmt::Display + crate::tracing_v2::Op,
 {
-    Ok(record(case_id, tracing_category(case_id), surface, program.to_string(), summarize_program(program)?))
+    Ok(record(case_id, tracing_category(case_id), surface, program.to_string(), summarize_tracing_program(program)?))
 }
 
 /// Returns the high-level category string for one tracing case.
@@ -151,9 +151,9 @@ fn hessian_style_second_derivative_traced(x: JitTracer<ArrayType, f64>) -> JitTr
 
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, (f64, f64), f64>) =
         jit(&ArrayScalarEngine::<f64>::new(), |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
-    Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", compiled.program())?])
+    Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
 /// Emits the staged scalar bilinear pushforward benchmark.
@@ -172,7 +172,7 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Ben
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = jit(
         &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let gradient: JitTracer<ArrayType, f64> = grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
@@ -180,12 +180,12 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
         },
         2.0f64,
     )?;
-    Ok(vec![tracing_record("scalar_quartic_plus_sin_grad", "grad", compiled.program())?])
+    Ok(vec![tracing_record("scalar_quartic_plus_sin_grad", "grad", &compiled)?])
 }
 
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): ((f64, f64), CompiledFunction<ArrayType, f64, f64, (f64, f64)>) = jit(
+    let (_, compiled): ((f64, f64), Program<ArrayType, f64, f64, (f64, f64)>) = jit(
         &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let value_and_gradient: (JitTracer<ArrayType, f64>, JitTracer<ArrayType, f64>) =
@@ -194,7 +194,7 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
         },
         2.0f64,
     )?;
-    Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_grad", compiled.program())?])
+    Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_grad", &compiled)?])
 }
 
 /// Emits the staged scalar linearization benchmark.
@@ -210,14 +210,14 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmar
 
 /// Emits the staged forward-over-reverse scalar benchmark.
 fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) =
         jit(&ArrayScalarEngine::<f64>::new(), |x| Ok(hessian_style_second_derivative_traced(x)), 2.0f64)?;
-    Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", compiled.program())?])
+    Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", &compiled)?])
 }
 
 /// Emits the staged reverse-over-batching scalar benchmark.
 fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = jit(
         &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let gradient: JitTracer<ArrayType, f64> = grad(
@@ -238,12 +238,12 @@ fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
         },
         2.0f64,
     )?;
-    Ok(vec![tracing_record("scalar_grad_of_vmap", "grad", compiled.program())?])
+    Ok(vec![tracing_record("scalar_grad_of_vmap", "grad", &compiled)?])
 }
 
 /// Emits the staged batching-over-reverse scalar benchmark.
 fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = jit(
         &ArrayScalarEngine::<f64>::new(),
         |x: JitTracer<ArrayType, f64>| {
             let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
@@ -270,7 +270,7 @@ fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
         },
         2.0f64,
     )?;
-    Ok(vec![tracing_record("scalar_vmap_of_grad", "vmap_of_grad", compiled.program())?])
+    Ok(vec![tracing_record("scalar_vmap_of_grad", "vmap_of_grad", &compiled)?])
 }
 
 /// Returns the fixed matrix inputs used by the matrix benchmark cases.
@@ -338,11 +338,9 @@ fn matrix_hessian_style_second_derivative(
 /// Emits the staged matrix JIT benchmark.
 #[cfg(feature = "ndarray")]
 fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (
-        Array2<f64>,
-        CompiledFunction<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>), Array2<f64>>,
-    ) = jit(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
-    Ok(vec![tracing_record("matrix_matmul_jit", "jit", compiled.program())?])
+    let (_, compiled): (Array2<f64>, Program<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>), Array2<f64>>) =
+        jit(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
+    Ok(vec![tracing_record("matrix_matmul_jit", "jit", &compiled)?])
 }
 
 /// Emits the staged matrix pullback benchmark.
@@ -358,9 +356,9 @@ fn emit_matrix_matmul_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Benchmark
 fn emit_matrix_three_matmul_sine_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (
         Array2<f64>,
-        CompiledFunction<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), Array2<f64>>,
+        Program<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), Array2<f64>>,
     ) = jit(&Array2Engine::<f64>::new(), matrix_hessian_style_second_derivative, hessian_style_matrix_inputs())?;
-    Ok(vec![tracing_record("matrix_three_matmul_sine_hessian_style", "hessian_style", compiled.program())?])
+    Ok(vec![tracing_record("matrix_three_matmul_sine_hessian_style", "hessian_style", &compiled)?])
 }
 
 #[cfg(test)]

@@ -95,7 +95,7 @@ impl<V: MatrixValue> Op for RightMatMulOp<V> {
         _is_zero_constant: &dyn Fn(usize) -> bool,
         _is_one_constant: &dyn Fn(usize) -> bool,
     ) -> Option<Vec<usize>> {
-        if crate::tracing_v2::graph::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
+        if crate::tracing_v2::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
     }
 }
 

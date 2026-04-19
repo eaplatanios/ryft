@@ -476,13 +476,13 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_graph = transpose_builder.build::<ShardMapTensor, ShardMapTensor>(
+        let transpose_program = transpose_builder.build::<ShardMapTensor, ShardMapTensor>(
             vec![contribution_atom],
             Placeholder,
             Placeholder,
         );
         assert_eq!(
-            transpose_graph.to_string(),
+            transpose_program.to_string(),
             format!("lambda %0:f32[8] .\nlet %1:f32[8][sharding={sharding}] = with_sharding_constraint %0\nin (%1)")
                 .trim_end(),
         );

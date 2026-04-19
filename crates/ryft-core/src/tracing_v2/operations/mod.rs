@@ -4,7 +4,7 @@
 //!
 //! - **Core traits** ([`Op`], [`InterpretableOp`], [`LinearOperation`], [`DifferentiableOp`],
 //!   [`VectorizableOp`]) — the operation-neutral dispatch interfaces every staged primitive must
-//!   satisfy in order to participate in graph construction, replay, and the various transforms.
+//!   satisfy in order to participate in program construction, replay, and the various transforms.
 //! - **Per-primitive submodules** ([`add`], [`mul`], [`neg`], …) — the concrete semantic op types
 //!   ([`AddOp`], [`MulOp`], …) and their associated hidden staging traits
 //!   ([`AddTracingOperation`](add::AddTracingOperation), [`MulTracingOperation`](mul::MulTracingOperation),
@@ -179,7 +179,7 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
     if left.len() == right.len() { Ok(()) } else { Err(TraceError::MismatchedBatchSize) }
 }
 
-/// Lifts one concrete value into the staged graph owned by a JIT tracer.
+/// Lifts one concrete value into the staged program owned by a JIT tracer.
 pub fn lift_jit_constant<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>(
     constant: &V,
     exemplar: &JitTracer<ArrayType, V, O, L>,
@@ -212,9 +212,9 @@ pub fn binary_same_abstract(op: &'static str, inputs: &[ArrayType]) -> Result<Ar
     }
 }
 
-/// Shape-level operation interface for staged graphs.
+/// Shape-level operation interface for staged programs.
 ///
-/// This trait covers the metadata surface needed for graph construction, display, simplification, and MLIR lowering.
+/// This trait covers the metadata surface needed for program construction, display, simplification, and MLIR lowering.
 /// Concrete execution is provided by the separate [`InterpretableOp`] trait. Staged-program differentiation rules
 /// are split between [`LinearOperation`] (transpose/replay) and [`DifferentiableOp`] (forward-mode JVP).
 ///
@@ -230,7 +230,7 @@ pub trait Op<T: Type = ArrayType>: Debug + Display {
 
     /// Returns simplified output atoms if this operation is a trivial algebraic identity.
     ///
-    /// Called during graph construction to eliminate no-op operations like `x + 0`, `x * 1`,
+    /// Called during program construction to eliminate no-op operations like `x + 0`, `x * 1`,
     /// or `scale(x, 1)`. The callbacks check whether an input atom is a constant zero or one.
     /// Returns `None` if no simplification applies.
     fn try_simplify(
@@ -245,8 +245,8 @@ pub trait Op<T: Type = ArrayType>: Debug + Display {
 
 /// Concrete execution capability for staged operations.
 ///
-/// Separated from [`Op`] so that graph construction, display, and simplification can work without value-type bounds.
-/// Only code paths that actually execute operations (graph replay, JIT example propagation) require this trait.
+/// Separated from [`Op`] so that program construction, display, and simplification can work without value-type bounds.
+/// Only code paths that actually execute operations (program replay, JIT example propagation) require this trait.
 pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
     /// Executes the operation on concrete values.
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError>;
@@ -369,7 +369,7 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
 
 /// Capability bundle for the ordinary staged operation type stored in traced programs.
 ///
-/// A [`TracingOperation`] is the operation flavor carried by the ordinary staged graph produced by
+/// A [`TracingOperation`] is the operation flavor carried by the ordinary staged program produced by
 /// transforms like [`trace_program`](crate::tracing_v2::trace_program) and
 /// [`jit`](fn@crate::tracing_v2::jit). In practice this is usually one backend-owned closed
 /// enum such as [`PrimitiveOp`] or `XlaPrimitiveOp`, but the trait is written as an additive bundle
@@ -389,7 +389,7 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
 ///
 /// [`VectorizableOp`] is intentionally **not** part of the bundle: `batch()` is only invoked on
 /// concrete ops while `vmap` traces through a Rust closure, never on ops stored in an ordinary
-/// graph, so pinning it here would unnecessarily restrict which op types can satisfy the bundle.
+/// program, so pinning it here would unnecessarily restrict which op types can satisfy the bundle.
 pub trait TracingOperation<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone>:
     Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L>
 {

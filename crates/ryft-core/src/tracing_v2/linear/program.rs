@@ -34,7 +34,7 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         Self { program, zero, marker: PhantomData }
     }
 
-    /// Returns the staged graph backing this linear program.
+    /// Returns the staged program backing this linear program.
     #[inline]
     pub fn program(&self) -> &Program<T, V, Input, Output, O> {
         &self.program
@@ -121,8 +121,8 @@ where
     L: Clone + Op<ArrayType>,
     O: Clone + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L>,
 {
-    fn tangent_for_atom<V, Input, Output, GraphOperation, LinearOperation>(
-        _graph: &Graph<GraphOperation, ArrayType, V, Input, Output>,
+    fn tangent_for_atom<V, Input, Output, ProgramOperation, LinearOperation>(
+        _program: &Program<ArrayType, V, Input, Output, ProgramOperation>,
         primal_values: &[Option<V>],
         builder: &Rc<RefCell<LinearProgramBuilder<V, LinearOperation>>>,
         tangents: &mut [Option<LinearTerm<ArrayType, V, LinearOperation>>],
@@ -132,7 +132,7 @@ where
         V: Traceable<ArrayType> + ZeroLike,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
-        GraphOperation: Clone + Op<ArrayType>,
+        ProgramOperation: Clone + Op<ArrayType>,
         LinearOperation: Clone + Op<ArrayType>,
     {
         if let Some(term) = tangents[atom_id].clone() {
@@ -145,26 +145,26 @@ where
         Ok(tangent)
     }
 
-    let graph = program.graph();
-    if input_primals.len() != graph.input_atoms().len() {
-        return Err(TraceError::InvalidInputCount { expected: graph.input_atoms().len(), got: input_primals.len() });
+    let program = program;
+    if input_primals.len() != program.input_atoms().len() {
+        return Err(TraceError::InvalidInputCount { expected: program.input_atoms().len(), got: input_primals.len() });
     }
     let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, L>::new()));
-    let mut primals: Vec<Option<V>> = vec![None; graph.atom_count()];
-    let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; graph.atom_count()];
-    for (input_atom, input_primal) in graph.input_atoms().iter().copied().zip(input_primals.into_iter()) {
+    let mut primals: Vec<Option<V>> = vec![None; program.atom_count()];
+    let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atom_count()];
+    for (input_atom, input_primal) in program.input_atoms().iter().copied().zip(input_primals.into_iter()) {
         let tangent_atom = builder.borrow_mut().add_input(&input_primal.zero_like());
         tangents[input_atom] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
         primals[input_atom] = Some(input_primal);
     }
-    for (atom_id, atom) in graph.atoms_iter() {
+    for (atom_id, atom) in program.atoms_iter() {
         if let Atom::Constant { value } = atom {
             primals[atom_id] = Some(value.clone());
         }
     }
 
-    for equation in graph.equations() {
+    for equation in program.equations() {
         let input_duals = equation
             .inputs
             .iter()
@@ -173,7 +173,7 @@ where
                 Ok(JvpTracer {
                     primal: primals[input_atom].clone().ok_or(TraceError::UnboundAtomId { id: input_atom })?,
                     tangent: tangent_for_atom(
-                        graph,
+                        program,
                         primals.as_slice(),
                         &builder,
                         tangents.as_mut_slice(),
@@ -196,12 +196,12 @@ where
         }
     }
 
-    let output_tangents = graph
+    let output_tangents = program
         .outputs()
         .iter()
         .copied()
         .map(|output_atom| {
-            tangent_for_atom(graph, primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
+            tangent_for_atom(program, primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
                 .map(|term| term.atom())
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -213,12 +213,13 @@ where
         }
     };
     Ok(LinearProgram {
-        program: Program::from_graph(builder.build::<Input, Output>(
-            output_tangents,
-            graph.input_structure().clone(),
-            graph.output_structure().clone(),
-        ))
-        .simplify()?,
+        program: builder
+            .build::<Input, Output>(
+                output_tangents,
+                program.input_structure().clone(),
+                program.output_structure().clone(),
+            )
+            .simplify()?,
         zero,
         marker: PhantomData,
     })
@@ -277,21 +278,21 @@ where
         Ok(())
     }
 
-    let graph = program.program.graph();
+    let linear_body = &program.program;
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, O>::new()));
-    let mut output_cotangent_inputs = Vec::with_capacity(graph.outputs().len());
-    for (output_index, output) in graph.outputs().iter().enumerate() {
-        let output_atom = graph.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
+    let mut output_cotangent_inputs = Vec::with_capacity(linear_body.outputs().len());
+    for (output_index, output) in linear_body.outputs().iter().enumerate() {
+        let output_atom = linear_body.atom(*output).ok_or(TraceError::UnboundAtomId { id: *output })?;
         let cotangent_input = make_output_cotangent_input(&mut builder.borrow_mut(), &output_atom.tpe(), output_index)?;
         output_cotangent_inputs.push(cotangent_input);
     }
 
-    let mut adjoints = vec![None; graph.atom_count()];
-    for (cotangent, output) in output_cotangent_inputs.into_iter().zip(graph.outputs().iter().copied()) {
+    let mut adjoints = vec![None; linear_body.atom_count()];
+    for (cotangent, output) in output_cotangent_inputs.into_iter().zip(linear_body.outputs().iter().copied()) {
         accumulate(&builder, adjoints.as_mut_slice(), output, cotangent)?;
     }
 
-    for equation in graph.equations().iter().rev() {
+    for equation in linear_body.equations().iter().rev() {
         let equation_output_cotangents =
             equation.outputs.iter().map(|output| adjoints[*output]).collect::<Option<Vec<_>>>();
         let Some(equation_output_cotangents) = equation_output_cotangents else {
@@ -306,7 +307,7 @@ where
     }
 
     let zero_atom = builder.borrow_mut().add_constant(program.zero.clone());
-    let outputs = graph
+    let outputs = linear_body
         .input_atoms()
         .iter()
         .copied()
@@ -321,12 +322,13 @@ where
         }
     };
     Ok(LinearProgram {
-        program: Program::from_graph(builder.build::<Output, Input>(
-            outputs,
-            graph.output_structure().clone(),
-            graph.input_structure().clone(),
-        ))
-        .simplify()?,
+        program: builder
+            .build::<Output, Input>(
+                outputs,
+                linear_body.output_structure().clone(),
+                linear_body.input_structure().clone(),
+            )
+            .simplify()?,
         zero: program.zero.clone(),
         marker: PhantomData,
     })
@@ -347,7 +349,7 @@ where
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
-    let expected_output_count = program.program().graph().outputs().len();
+    let expected_output_count = program.program().outputs().len();
     if output_examples.len() != expected_output_count {
         return Err(TraceError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }

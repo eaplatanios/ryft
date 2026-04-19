@@ -1,6 +1,6 @@
 //! Composable tracing and staged-program infrastructure for `ryft-core`.
 //!
-//! Staged computation is represented as a shared [`Graph`] over an open set of operation types.
+//! Staged computation is represented as a shared [`Program`] over an open set of operation types.
 //! Each equation stores an operation object rather than a tag enum, so backends extend the tracing
 //! surface by contributing their own op carrier instead of editing a central dispatch table.
 //!
@@ -16,7 +16,7 @@
 //!   provide a ready-to-use op-set for the default tracing pipeline.
 //! - `ops::custom` — the [`CustomPrimitive`] / [`LinearCustomPrimitive`] subsystem for
 //!   layering user-supplied ops onto any backend carrier without modifying the built-in enums.
-//! - [`graph`] and [`program`] — the shared staging container plus the surface [`Program`] /
+//! - `programs` — the shared staging container plus the surface [`Program`] /
 //!   [`LinearProgram`] types. [`Traceable`] and [`Value`] live alongside them as the leaf-value
 //!   traits.
 //! - [`engine`] — the [`Engine`] trait backends implement. It pins the concrete op-set via
@@ -44,11 +44,10 @@ pub(crate) mod benchmark_support;
 pub mod benchmarking;
 pub mod engine;
 pub mod forward;
-pub mod graph;
 pub mod jit;
 pub mod linear;
 pub mod operations;
-pub mod program;
+pub(crate) mod programs;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod values;
@@ -56,8 +55,7 @@ mod values;
 pub use batch::{Batch, stack, unstack, vmap};
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub use graph::{Atom, AtomId, Equation, Graph, GraphBuilder};
-pub use jit::{CompiledFunction, JitTracer, jit, jit_from_types, trace_program, trace_program_from_types};
+pub use jit::{JitTracer, jit, jit_from_types, trace_program, trace_program_from_types};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
     grad, hessian, jacfwd, jacrev, jvp_program, value_and_grad, vjp,
@@ -70,8 +68,10 @@ pub use operations::{
     Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
     LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, Sin, VectorizableOp,
 };
-pub use program::Program;
-pub use program::{LinearProgramBuilder, LinearProgramOpRef, ProgramBuilder, ProgramOpRef};
+pub(crate) use programs::is_identity_one;
+pub use programs::{
+    Atom, AtomId, Equation, LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder, ProgramOpRef,
+};
 pub use values::{OneLike, Traceable, Value, ZeroLike};
 
 /// Error type shared by the prototype tracing transforms.
@@ -93,15 +93,15 @@ pub enum TraceError {
     #[error("mismatched batch sizes across batched leaves")]
     MismatchedBatchSize,
 
-    /// A primitive or staged graph received the wrong number of inputs.
+    /// A primitive or staged program received the wrong number of inputs.
     #[error("invalid number of inputs; expected {expected} but got {got}")]
     InvalidInputCount { expected: usize, got: usize },
 
-    /// A primitive or staged graph produced the wrong number of outputs.
+    /// A primitive or staged program produced the wrong number of outputs.
     #[error("invalid number of outputs; expected {expected} but got {got}")]
     InvalidOutputCount { expected: usize, got: usize },
 
-    /// A staged graph referenced an atom that was never defined.
+    /// A staged program referenced an atom that was never defined.
     #[error("unbound atom ID: {id}")]
     UnboundAtomId { id: usize },
 

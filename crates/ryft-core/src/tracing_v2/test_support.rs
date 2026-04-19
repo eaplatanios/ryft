@@ -10,7 +10,7 @@ use crate::{
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) =
         jit(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.sin()), 2.0f64).unwrap();
 
     assert_eq!(
@@ -24,15 +24,15 @@ pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
     );
 }
 
-pub(crate) fn assert_reference_graph_rendering() {
-    let mut builder = GraphBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+pub(crate) fn assert_reference_program_rendering() {
+    let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
     let x = builder.add_input(&1.0f64);
     let three = builder.add_constant(3.0f64);
     let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
-    let graph = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
+    let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
     assert_eq!(
-        graph.to_string(),
+        program.to_string(),
         indoc! {"
             lambda %0:f64[] .
             let %1:f64[] = const
@@ -79,7 +79,7 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
 
 pub(crate) fn assert_bilinear_jit_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, compiled): (f64, CompiledFunction<ArrayType, f64, (f64, f64), f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, (f64, f64), f64>) =
         jit(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(

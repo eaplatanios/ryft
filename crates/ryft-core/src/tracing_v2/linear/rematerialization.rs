@@ -3,7 +3,7 @@ use super::*;
 /// Compiles a reverse-mode gradient function into a reusable staged program.
 ///
 /// Unlike [`grad`](super::grad), which returns concrete gradient values at a single primal point,
-/// this function returns a [`CompiledFunction`] that takes primal inputs and produces gradient
+/// this function returns a [`Program`] that takes primal inputs and produces gradient
 /// outputs symbolically. The compiled program embeds both the forward residual computation and the
 /// backward pass, so it can be replayed at arbitrary primal points without re-tracing.
 ///
@@ -13,7 +13,7 @@ pub fn compile_grad<E, F, Input, V>(
     _engine: &E,
     function: F,
     example_primals: Input,
-) -> Result<CompiledFunction<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
+) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -122,7 +122,7 @@ pub fn compile_grad_with_policy<E, F, Input, V>(
     function: F,
     example_primals: Input,
     policy: RematerializationPolicy,
-) -> Result<CompiledFunction<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
+) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -184,7 +184,7 @@ fn compile_grad_segmented<E, F, Input, V>(
     function: &F,
     example_primals: Input,
     segment_size: Option<usize>,
-) -> Result<CompiledFunction<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
+) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -248,7 +248,7 @@ where
             };
 
             // Step 3: Linearize and transpose the segmented program to produce the pullback.
-            // `linearize_traced_program` replays the graph at the JitTracer level (staging
+            // `linearize_traced_program` replays the program at the JitTracer level (staging
             // both forward and backward equations in the outer JIT builder) and returns the
             // primal outputs alongside the linear pushforward map.
             let (_, traced_gradient) = reverse_mode_scalar_traced_program(&segmented_program, traced_primals)?;
@@ -285,10 +285,10 @@ where
     E::TracingOperation:
         InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation> + Op<ArrayType>,
 {
-    let graph = program.graph();
-    let representative_values = graph.representative_atom_values(engine)?;
-    let representative_inputs = graph.representative_input_values(engine)?;
-    let equations = graph.equations();
+    let program = program;
+    let representative_values = program.representative_atom_values(engine)?;
+    let representative_inputs = program.representative_input_values(engine)?;
+    let equations = program.equations();
 
     // If the program has fewer equations than a single segment, no segmentation is needed — wrap the
     // whole thing in a single RematerializeOp.
@@ -300,7 +300,7 @@ where
     let segments: Vec<&[Equation<E::TracingOperation>]> = equations.chunks(segment_size).collect();
 
     // Build a mapping from atom ID to which equation produces it (if any).
-    let mut atom_producer: Vec<Option<usize>> = vec![None; graph.atom_count()];
+    let mut atom_producer: Vec<Option<usize>> = vec![None; program.atom_count()];
     for (equation_index, equation) in equations.iter().enumerate() {
         for &output_atom in &equation.outputs {
             atom_producer[output_atom] = Some(equation_index);
@@ -309,7 +309,7 @@ where
 
     // Build a set tracking which atoms are consumed after a given equation index.
     // For each atom, track all equation indices that consume it.
-    let mut atom_consumers: Vec<Vec<usize>> = vec![Vec::new(); graph.atom_count()];
+    let mut atom_consumers: Vec<Vec<usize>> = vec![Vec::new(); program.atom_count()];
     for (equation_index, equation) in equations.iter().enumerate() {
         for &input_atom in &equation.inputs {
             atom_consumers[input_atom].push(equation_index);
@@ -317,16 +317,16 @@ where
     }
     // Also mark program outputs as "consumed" at equation_count (sentinel for "after all equations").
     let sentinel = equations.len();
-    for &output_atom in graph.outputs() {
+    for &output_atom in program.outputs() {
         atom_consumers[output_atom].push(sentinel);
     }
 
     // Build the outer program.
-    let input_atoms = graph.input_atoms();
-    let mut outer_builder: ProgramBuilder<V, E::TracingOperation> = ProgramBuilder::new();
+    let input_atoms = program.input_atoms();
+    let mut outer_builder: ProgramBuilder<E::TracingOperation, ArrayType, V> = ProgramBuilder::new();
 
     // Map from original atom IDs to outer-program atom IDs.
-    let mut atom_mapping: Vec<Option<AtomId>> = vec![None; graph.atom_count()];
+    let mut atom_mapping: Vec<Option<AtomId>> = vec![None; program.atom_count()];
 
     // Register program inputs in the outer builder.
     for (&input_atom, representative_input) in input_atoms.iter().zip(representative_inputs.iter()) {
@@ -335,7 +335,7 @@ where
     }
 
     // Register constants that are used by equations (they might be referenced across segments).
-    for (atom_id, atom) in graph.atoms_iter() {
+    for (atom_id, atom) in program.atoms_iter() {
         if let Atom::Constant { value } = atom {
             let outer_atom = outer_builder.add_constant(value.clone());
             atom_mapping[atom_id] = Some(outer_atom);
@@ -380,7 +380,7 @@ where
 
         // Build the sub-program for this segment.
         let sub_program = build_segment_sub_program(
-            graph,
+            program,
             representative_values.as_slice(),
             *segment,
             &boundary_input_atoms,
@@ -391,7 +391,7 @@ where
         let input_types: Vec<_> = boundary_input_atoms
             .iter()
             .map(|&atom_id| {
-                graph
+                program
                     .atom(atom_id)
                     .ok_or(TraceError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.tpe().into_owned())
@@ -400,18 +400,14 @@ where
         let output_types: Vec<_> = boundary_output_atoms
             .iter()
             .map(|&atom_id| {
-                graph
+                program
                     .atom(atom_id)
                     .ok_or(TraceError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.tpe().into_owned())
             })
             .collect::<Result<_, _>>()?;
 
-        let body = FlatTracedRematerialize::from_parts(
-            input_types.clone(),
-            output_types.clone(),
-            CompiledFunction::from_program(sub_program),
-        );
+        let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), sub_program);
         let remat_op = RematerializeOp::new(body);
 
         // Add the RematerializeOp equation to the outer builder.
@@ -434,18 +430,18 @@ where
     }
 
     // Wire up the program outputs.
-    let outer_outputs: Vec<AtomId> = graph
+    let outer_outputs: Vec<AtomId> = program
         .outputs()
         .iter()
         .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TraceError::UnboundAtomId { id: orig_atom }))
         .collect::<Result<_, _>>()?;
 
-    let outer_graph = outer_builder.build::<Vec<V>, Vec<V>>(
+    let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
         flat_leaf_parameter_structure(input_atoms.len()),
-        flat_leaf_parameter_structure(graph.outputs().len()),
+        flat_leaf_parameter_structure(program.outputs().len()),
     );
-    Ok(Program::from_graph(outer_graph))
+    Ok(outer_program)
 }
 
 /// Wraps an entire program in a single [`RematerializeOp`] boundary.
@@ -458,37 +454,33 @@ where
     V: Traceable<ArrayType>,
     E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
-    let graph = program.graph();
-    let representative_inputs = graph.representative_input_values(engine)?;
-    let input_types: Vec<_> = graph
+    let program = program;
+    let representative_inputs = program.representative_input_values(engine)?;
+    let input_types: Vec<_> = program
         .input_atoms()
         .iter()
         .map(|&atom_id| {
-            graph
+            program
                 .atom(atom_id)
                 .ok_or(TraceError::UnboundAtomId { id: atom_id })
                 .map(|atom| atom.tpe().into_owned())
         })
         .collect::<Result<_, _>>()?;
-    let output_types: Vec<_> = graph
+    let output_types: Vec<_> = program
         .outputs()
         .iter()
         .map(|&atom_id| {
-            graph
+            program
                 .atom(atom_id)
                 .ok_or(TraceError::UnboundAtomId { id: atom_id })
                 .map(|atom| atom.tpe().into_owned())
         })
         .collect::<Result<_, _>>()?;
 
-    let body = FlatTracedRematerialize::from_parts(
-        input_types.clone(),
-        output_types.clone(),
-        CompiledFunction::from_program(program.clone()),
-    );
+    let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), program.clone());
     let remat_op = RematerializeOp::new(body);
 
-    let mut outer_builder: ProgramBuilder<V, E::TracingOperation> = ProgramBuilder::new();
+    let mut outer_builder: ProgramBuilder<E::TracingOperation, ArrayType, V> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> = representative_inputs
         .iter()
         .map(|representative_input| outer_builder.add_input(representative_input))
@@ -500,12 +492,12 @@ where
         output_types,
     );
 
-    let outer_graph = outer_builder.build::<Vec<V>, Vec<V>>(
+    let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
         flat_leaf_parameter_structure(outer_inputs.len()),
-        flat_leaf_parameter_structure(graph.outputs().len()),
+        flat_leaf_parameter_structure(program.outputs().len()),
     );
-    Ok(Program::from_graph(outer_graph))
+    Ok(outer_program)
 }
 
 /// Builds a sub-program for a single segment of equations.
@@ -514,13 +506,13 @@ where
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
 /// and equations within the sub-program.
 fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
-    graph: &Graph<O, ArrayType, V, Vec<V>, Vec<V>>,
+    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
     representative_values: &[V],
     segment_equations: &[Equation<O>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
 ) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>, O>, TraceError> {
-    let mut sub_builder: ProgramBuilder<V, O> = ProgramBuilder::new();
+    let mut sub_builder: ProgramBuilder<O, ArrayType, V> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.
     let mut sub_atom_mapping: std::collections::HashMap<AtomId, AtomId> = std::collections::HashMap::new();
@@ -537,7 +529,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             if sub_atom_mapping.contains_key(&input_atom) {
                 continue;
             }
-            let atom = graph.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
+            let atom = program.atom(input_atom).ok_or(TraceError::UnboundAtomId { id: input_atom })?;
             if let Atom::Constant { value } = atom {
                 let sub_atom = sub_builder.add_constant(value.clone());
                 sub_atom_mapping.insert(input_atom, sub_atom);
@@ -559,7 +551,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             .outputs
             .iter()
             .map(|&atom_id| {
-                graph
+                program
                     .atom(atom_id)
                     .ok_or(TraceError::UnboundAtomId { id: atom_id })
                     .map(|atom| atom.tpe().into_owned())
@@ -578,10 +570,10 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
         .map(|&orig_atom| sub_atom_mapping.get(&orig_atom).copied().ok_or(TraceError::UnboundAtomId { id: orig_atom }))
         .collect::<Result<_, _>>()?;
 
-    let sub_graph = sub_builder.build::<Vec<V>, Vec<V>>(
+    let sub_program = sub_builder.build::<Vec<V>, Vec<V>>(
         sub_outputs,
         flat_leaf_parameter_structure(boundary_input_atoms.len()),
         flat_leaf_parameter_structure(boundary_output_atoms.len()),
     );
-    Ok(Program::from_graph(sub_graph))
+    Ok(sub_program)
 }

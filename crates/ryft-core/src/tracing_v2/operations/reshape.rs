@@ -464,8 +464,7 @@ mod tests {
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing_v2::{
-            CompiledFunction, JitTracer, LinearProgramBuilder, jit::jit,
-            operations::matrix::ndarray_support::Array2Engine,
+            JitTracer, LinearProgramBuilder, Program, jit::jit, operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},
     };
@@ -694,7 +693,7 @@ mod tests {
         let engine = Array2Engine::<f64>::new();
         let (_, compiled): (
             ndarray::Array2<f64>,
-            CompiledFunction<ArrayType, ndarray::Array2<f64>, ndarray::Array2<f64>, ndarray::Array2<f64>>,
+            Program<ArrayType, ndarray::Array2<f64>, ndarray::Array2<f64>, ndarray::Array2<f64>>,
         ) = jit(
             &engine,
             |x: JitTracer<ArrayType, ndarray::Array2<f64>>| {
@@ -739,11 +738,14 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_graph = transpose_builder.build::<ndarray::Array2<f64>, ndarray::Array2<f64>>(
+        let transpose_program = transpose_builder.build::<ndarray::Array2<f64>, ndarray::Array2<f64>>(
             vec![contribution_atom],
             Placeholder,
             Placeholder,
         );
-        assert_eq!(transpose_graph.call(arr2(&[[1.0f64, 2.0, 3.0, 4.0]])).unwrap(), arr2(&[[1.0f64, 2.0], [3.0, 4.0]]));
+        assert_eq!(
+            transpose_program.call(arr2(&[[1.0f64, 2.0, 3.0, 4.0]])).unwrap(),
+            arr2(&[[1.0f64, 2.0], [3.0, 4.0]])
+        );
     }
 }

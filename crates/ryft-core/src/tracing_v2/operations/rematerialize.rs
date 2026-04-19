@@ -12,13 +12,12 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, JitTracer, LinearTerm, TraceError, Traceable, Value, ZeroLike,
+        JitTracer, LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, Value, ZeroLike,
         engine::Engine,
         linear::{
-            linearize_program, replay_program_graph_linearized_jit, trace_flat_program_from_input_types,
+            linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
             transpose_linear_program_with_output_examples,
         },
-        program::{LinearProgramOpRef, ProgramOpRef},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -51,8 +50,8 @@ pub struct FlatTracedRematerialize<T: Type, V: Typed<T> + Parameter, O = Program
     /// Canonical output types of the body.
     output_types: Vec<T>,
 
-    /// The compiled body sub-program.
-    compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
+    /// The body sub-program.
+    program: Program<T, V, Vec<V>, Vec<V>, O>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedRematerialize<T, V, O>
@@ -63,7 +62,7 @@ where
         Self {
             input_types: self.input_types.clone(),
             output_types: self.output_types.clone(),
-            compiled: self.compiled.clone(),
+            program: self.program.clone(),
         }
     }
 }
@@ -71,12 +70,8 @@ where
 impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
     /// Builds one erased traced rematerialize body from explicit staged parts.
     #[inline]
-    pub fn from_parts(
-        input_types: Vec<T>,
-        output_types: Vec<T>,
-        compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
-    ) -> Self {
-        Self { input_types, output_types, compiled }
+    pub fn from_parts(input_types: Vec<T>, output_types: Vec<T>, program: Program<T, V, Vec<V>, Vec<V>, O>) -> Self {
+        Self { input_types, output_types, program }
     }
 
     /// Returns the canonical input types of the body.
@@ -91,10 +86,10 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
         self.output_types.as_slice()
     }
 
-    /// Returns the compiled body sub-program.
+    /// Returns the body sub-program.
     #[inline]
-    pub fn compiled(&self) -> &CompiledFunction<T, V, Vec<V>, Vec<V>, O> {
-        &self.compiled
+    pub fn program(&self) -> &Program<T, V, Vec<V>, Vec<V>, O> {
+        &self.program
     }
 }
 
@@ -170,7 +165,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
-        self.body.compiled.call(inputs.to_vec())
+        self.body.program.call(inputs.to_vec())
     }
 }
 
@@ -191,10 +186,8 @@ where
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = JitTracer::apply_staged_op(primal_inputs.as_slice(), O::rematerialize_op(self.clone()))?;
-        let tangent_outputs = replay_program_graph_linearized_jit::<_, _, _, O, LinearProgramOpRef<V>>(
-            self.body().compiled().program().graph(),
-            inputs.to_vec(),
-        )?;
+        let tangent_outputs =
+            replay_program_linearized_jit::<_, _, _, O, LinearProgramOpRef<V>>(self.body().program(), inputs.to_vec())?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs.into_iter().map(|output| output.tangent))
@@ -317,7 +310,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TraceError> {
         let abstract_inputs = inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
-        self.body.compiled.call(inputs.to_vec())
+        self.body.program.call(inputs.to_vec())
     }
 }
 
@@ -356,19 +349,19 @@ where
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
     LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
 {
-    let output_primals = body.compiled.call(input_primals.clone())?;
-    let pushforward = linearize_program(engine, body.compiled.program(), input_primals)?;
+    let output_primals = body.program.call(input_primals.clone())?;
+    let pushforward = linearize_program(engine, body.program(), input_primals)?;
     let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOp::new(
         FlatTracedRematerialize::from_parts(
             body.input_types.clone(),
             body.output_types.clone(),
-            CompiledFunction::from_program(pushforward.program().clone()),
+            pushforward.program().clone(),
         ),
         FlatTracedRematerialize::from_parts(
             body.output_types.clone(),
             body.input_types.clone(),
-            CompiledFunction::from_program(pullback.program().clone()),
+            pullback.program().clone(),
         ),
     ))
 }
@@ -408,7 +401,7 @@ impl<
 
 /// Already-traced dispatch for [`rematerialize`]: traces the body function into a sub-program and
 /// stages a [`RematerializeOp`] in the enclosing [`JitTracer`] scope. The sub-program is traced
-/// once over exemplar values and compiled into a [`CompiledFunction`] that lowering can later handle.
+/// once over exemplar values and captured as a [`Program`] that lowering can later handle.
 impl<
     V: Traceable<ArrayType>,
     Input: Parameterized<Self, ParameterStructure: Clone, To<Self> = Input>,
@@ -444,19 +437,18 @@ where
         let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
         let input_types = body_program
-            .graph()
             .input_atoms()
             .iter()
-            .map(|id| body_program.graph().atom(*id).expect("body input atom should exist").tpe().into_owned())
+            .map(|id| body_program.atom(*id).expect("body input atom should exist").tpe().into_owned())
             .collect::<Vec<_>>();
         let output_types = exemplar_output_types.parameters().cloned().collect::<Vec<_>>();
         let body = FlatTracedRematerialize::from_parts(
             input_types,
             output_types,
-            CompiledFunction::from_graph(body_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
+            body_program.clone_with_structures::<Vec<V>, Vec<V>>(
                 vec![Placeholder; input_leaf_count],
                 vec![Placeholder; output_leaf_count],
-            )),
+            ),
         );
 
         let staged_outputs =
@@ -499,7 +491,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing_v2::{
-        CompiledFunction, JitTracer, Sin,
+        JitTracer, Program, Sin,
         engine::ArrayScalarEngine,
         jit,
         linear::{compile_grad, grad, value_and_grad},
@@ -521,9 +513,9 @@ mod tests {
 
     #[test]
     fn test_rematerialize_jit_produces_traced_op() {
-        // When used inside jit, rematerialize should produce a "rematerialize" op in the graph.
+        // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = jit(
             &engine,
             |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
             2.0f64,
@@ -531,15 +523,15 @@ mod tests {
         .unwrap();
 
         approx_eq(output, 2.0f64.sin());
-        let ir = compiled.to_string();
-        assert!(ir.contains("rematerialize"), "jit graph should contain the rematerialize op: {ir}");
+        let ir = program.to_string();
+        assert!(ir.contains("rematerialize"), "jit program should contain the rematerialize op: {ir}");
     }
 
     #[test]
-    fn test_rematerialize_jit_graph_rendering() {
-        // Check the exact rendering of the jit-traced graph containing a rematerialize op.
+    fn test_rematerialize_jit_program_rendering() {
+        // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+        let (_, program): (f64, Program<ArrayType, f64, f64, f64>) = jit(
             &engine,
             |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
             2.0f64,
@@ -547,7 +539,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            compiled.to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = rematerialize %0
@@ -651,13 +643,13 @@ mod tests {
         // The forward result with rematerialize should match the result without it.
         let without: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, CompiledFunction<ArrayType, f64, f64, f64>) =
+            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) =
                 jit(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = jit(
+            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) = jit(
                 &engine,
                 |x: JitTracer<ArrayType, f64>| {
                     Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap())

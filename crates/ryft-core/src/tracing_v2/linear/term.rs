@@ -1,10 +1,10 @@
 use super::*;
 
-/// Tangent representation backed by atoms in a staged linear graph.
+/// Tangent representation backed by atoms in a staged linear program.
 #[derive(Clone, Parameter)]
 pub struct LinearTerm<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
     atom: AtomId,
-    builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
+    builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone> std::fmt::Debug for LinearTerm<T, V, O> {
@@ -20,12 +20,12 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
     }
 
     #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<GraphBuilder<O, T, V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<O, T, V>>> {
         self.builder.clone()
     }
 
     #[inline]
-    pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<GraphBuilder<O, T, V>>>) -> Self {
+    pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<O, T, V>>>) -> Self {
         Self { atom, builder }
     }
 

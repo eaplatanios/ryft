@@ -1,7 +1,7 @@
 //! Vectorization support for `tracing_v2`.
 //!
 //! Concrete batching is still represented as explicit lane lists via [`Batch`]. For traced programs, however,
-//! [`vmap`] stages a compact higher-order op instead of eagerly duplicating one scalar graph per lane. That keeps the
+//! [`vmap`] stages a compact higher-order op instead of eagerly duplicating one scalar program per lane. That keeps the
 //! public batching surface unchanged while giving lowering enough structure to emit packed StableHLO that is much
 //! closer to JAX's current Shardy output.
 
@@ -10,7 +10,7 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
+        JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
         operations::{
             AddOp, FlatTracedVMap, InterpretableOp, MulOp, NegOp, Op, VMapOp, VMapTracingOperation, VectorizableOp,
         },
@@ -206,8 +206,8 @@ where
 }
 
 /// Already-traced dispatch for [`vmap`]: stages a compact higher-order [`VMapOp`] in the enclosing
-/// [`JitTracer`] scope instead of eagerly duplicating the scalar graph per lane. The body is traced
-/// once at a single-lane exemplar and compiled into a [`CompiledFunction`] that lowering can later
+/// [`JitTracer`] scope instead of eagerly duplicating the scalar program per lane. The body is traced
+/// once at a single-lane exemplar and captured as a [`Program`] that lowering can later
 /// emit as packed StableHLO.
 impl<
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
@@ -305,19 +305,12 @@ where
         let body = FlatTracedVMap::from_parts(
             lane_count,
             body_program
-                .graph()
                 .input_atoms()
                 .iter()
-                .map(|input| {
-                    body_program.graph().atom(*input).expect("body input atoms should exist").tpe().into_owned()
-                })
+                .map(|input| body_program.atom(*input).expect("body input atoms should exist").tpe().into_owned())
                 .collect::<Vec<_>>(),
             exemplar_output_types.parameters().cloned().collect::<Vec<_>>(),
-            CompiledFunction::from_graph(
-                body_program
-                    .graph()
-                    .clone_with_structures::<Vec<V>, Vec<V>>(flat_input_structure, flat_output_structure),
-            ),
+            body_program.clone_with_structures::<Vec<V>, Vec<V>>(flat_input_structure, flat_output_structure),
         );
 
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
@@ -428,7 +421,7 @@ mod tests {
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, compiled): (f64, CompiledFunction<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::jit(
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::jit(
             &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
@@ -442,9 +435,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, 6.0);
-        assert_eq!(compiled.call(3.0f64).unwrap(), 8.0);
+        assert_eq!(program.call(3.0f64).unwrap(), 8.0);
         assert_eq!(
-            compiled.to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[], %2:f64[] = vmap %0 %0

@@ -6,12 +6,9 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        CompiledFunction, JitTracer, LinearTerm, TraceError, Traceable, ZeroLike,
+        JitTracer, LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, ZeroLike,
         engine::Engine,
-        linear::{
-            linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
-        },
-        program::{LinearProgramOpRef, ProgramOpRef},
+        linear::{linearize_program, replay_program_linearized_jit, transpose_linear_program_with_output_examples},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -41,7 +38,7 @@ pub struct FlatTracedVMap<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>>
     lane_count: usize,
     input_types: Vec<T>,
     output_types: Vec<T>,
-    compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
+    program: Program<T, V, Vec<V>, Vec<V>, O>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedVMap<T, V, O>
@@ -53,7 +50,7 @@ where
             lane_count: self.lane_count,
             input_types: self.input_types.clone(),
             output_types: self.output_types.clone(),
-            compiled: self.compiled.clone(),
+            program: self.program.clone(),
         }
     }
 }
@@ -65,9 +62,9 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
         lane_count: usize,
         input_types: Vec<T>,
         output_types: Vec<T>,
-        compiled: CompiledFunction<T, V, Vec<V>, Vec<V>, O>,
+        program: Program<T, V, Vec<V>, Vec<V>, O>,
     ) -> Self {
-        Self { lane_count, input_types, output_types, compiled }
+        Self { lane_count, input_types, output_types, program }
     }
 
     /// Returns the body lane count.
@@ -88,10 +85,10 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
         self.output_types.as_slice()
     }
 
-    /// Returns the compiled flat body.
+    /// Returns the flat body program.
     #[inline]
-    pub fn compiled(&self) -> &CompiledFunction<T, V, Vec<V>, Vec<V>, O> {
-        &self.compiled
+    pub fn program(&self) -> &Program<T, V, Vec<V>, Vec<V>, O> {
+        &self.program
     }
 
     /// Returns the flattened input count across all lanes.
@@ -126,7 +123,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
         let lane_input_count = self.input_types.len();
         let mut outputs = Vec::with_capacity(self.total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
-            outputs.extend(self.compiled.call(lane_inputs.to_vec())?);
+            outputs.extend(self.program.call(lane_inputs.to_vec())?);
         }
         Ok(outputs)
     }
@@ -224,8 +221,8 @@ where
         let lane_input_count = self.body().input_types().len();
         let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
-            let lane_outputs = replay_program_graph_linearized_jit::<_, _, _, O, LinearProgramOpRef<V>>(
-                self.body().compiled().program().graph(),
+            let lane_outputs = replay_program_linearized_jit::<_, _, _, O, LinearProgramOpRef<V>>(
+                self.body().program(),
                 lane_inputs.to_vec(),
             )?;
             tangent_outputs.extend(lane_outputs.into_iter().map(|output| output.tangent));
@@ -394,21 +391,21 @@ where
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
     LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
 {
-    let output_primals = body.compiled.call(input_primals.clone())?;
-    let pushforward = linearize_program(engine, body.compiled.program(), input_primals)?;
+    let output_primals = body.program.call(input_primals.clone())?;
+    let pushforward = linearize_program(engine, body.program(), input_primals)?;
     let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearVMapOp::new(
         FlatTracedVMap::from_parts(
             body.lane_count,
             body.input_types.clone(),
             body.output_types.clone(),
-            CompiledFunction::from_program(pushforward.program().clone()),
+            pushforward.program().clone(),
         ),
         FlatTracedVMap::from_parts(
             body.lane_count,
             body.output_types.clone(),
             body.input_types.clone(),
-            CompiledFunction::from_program(pullback.program().clone()),
+            pullback.program().clone(),
         ),
     ))
 }

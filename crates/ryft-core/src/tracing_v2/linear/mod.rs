@@ -15,18 +15,17 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        OneLike, TraceError, Traceable, Value, ZeroLike,
+        Atom, AtomId, Equation, LinearProgramBuilder, LinearProgramOpRef, OneLike, Program, ProgramBuilder, TraceError,
+        Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
-        graph::{Atom, AtomId, Equation, Graph, GraphBuilder},
-        jit::{CompiledFunction, JitTracer, jit, jit_for_operation, trace_program},
+        jit::{JitTracer, jit, jit_for_operation, trace_program},
         operations::{
             CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,
             rematerialize::{FlatTracedRematerialize, RematerializeOp},
         },
-        program::{LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -46,7 +45,7 @@ pub use reverse::{grad, jvp_program, value_and_grad, vjp};
 pub use term::{LinearTerm, Linearized};
 
 pub(crate) use program::linearize_program;
-pub(crate) use replay::{linearize_traced_program, replay_program_graph_linearized_jit};
+pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
 pub(crate) use reverse::jvp_traced;
 
 type LinearizedTracedValue<V, O, L> =
@@ -96,11 +95,12 @@ where
             input_types,
         )?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
-    let traced_program = Program::from_graph(traced_program.graph().clone_with_structures::<Vec<V>, Vec<V>>(
-        flat_leaf_parameter_structure(traced_inputs.len()),
-        flat_leaf_parameter_structure(output_leaf_count),
-    ))
-    .simplify()?;
+    let traced_program = traced_program
+        .clone_with_structures::<Vec<V>, Vec<V>>(
+            flat_leaf_parameter_structure(traced_inputs.len()),
+            flat_leaf_parameter_structure(output_leaf_count),
+        )
+        .simplify()?;
     Ok((output_types, traced_program))
 }
 
@@ -145,8 +145,8 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing_v2::{
-            CustomPrimitive, DifferentiableOp, GraphBuilder, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op,
-            PrimitiveOp, ProgramOpRef, Sin, engine::ArrayScalarEngine, test_support,
+            CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp,
+            ProgramBuilder, ProgramOpRef, Sin, engine::ArrayScalarEngine, test_support,
         },
         types::{ArrayType, DataType},
     };
@@ -285,16 +285,16 @@ mod tests {
     }
 
     #[test]
-    fn linearize_program_does_not_replay_the_forward_graph_to_recover_representatives() {
+    fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
-        let mut builder = GraphBuilder::<ProgramOpRef<f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ProgramOpRef<f64>, ArrayType, f64>::new();
         let input = builder.add_input(&3.0f64);
         let output = builder.add_equation_prevalidated(
             PrimitiveOp::Custom(Arc::new(primitive)),
             vec![input],
             vec![ArrayType::scalar(DataType::F64)],
         );
-        let program = Program::from_graph(builder.build::<f64, f64>(output, Placeholder, Placeholder));
+        let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);
 
         let engine = ArrayScalarEngine::<f64>::new();
         let pushforward = linearize_program(&engine, &program, vec![3.0f64]).unwrap();
@@ -302,15 +302,15 @@ mod tests {
     }
 
     #[test]
-    fn transpose_linear_program_does_not_replay_the_forward_linear_graph_to_recover_representatives() {
+    fn transpose_linear_program_does_not_replay_the_forward_linear_program_to_recover_representatives() {
         let primitive = LinearPrimitiveOp::custom(
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp),
         )
         .unwrap();
-        let mut builder = GraphBuilder::<LinearProgramOpRef<f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<LinearProgramOpRef<f64>, ArrayType, f64>::new();
         let input = builder.add_input(&0.0f64);
         let output = builder.add_equation_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
-        let program = Program::from_graph(builder.build::<f64, f64>(output, Placeholder, Placeholder));
+        let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);
         let pushforward = LinearProgram::from_program(program, 0.0f64);
 
         let pullback = super::program::transpose_linear_program(&pushforward).unwrap();
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_program_display_delegates_to_the_underlying_graph() {
+    fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ArrayScalarEngine::<f64>::new();
         let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) =
             jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
@@ -336,7 +336,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(pushforward.to_string(), pushforward.program().graph().to_string());
+        assert_eq!(pushforward.to_string(), pushforward.program().to_string());
         test_support::assert_quadratic_pushforward_rendering();
     }
 
