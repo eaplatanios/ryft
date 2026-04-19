@@ -9,7 +9,7 @@
 //! lets [`XlaEngine`] act as the engine value for transforms that require
 //! [`Clone`](Engine::Value).
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::LazyLock};
 
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
@@ -93,15 +93,21 @@ impl<'c> XlaEngine<'c> {
         Self { client: Some(client), mesh: Some(mesh), compilation_options, marker: PhantomData }
     }
 
-    /// Creates a tracing-only backend token that carries the XLA staged operation universe but no
-    /// PJRT execution context.
+    /// Returns the singleton tracing-only backend token that carries the XLA staged operation
+    /// universe but no PJRT execution context.
     ///
     /// This token is sufficient for nested transforms over already-traced XLA values because those
     /// paths only need the backend's operation carriers; they never materialize concrete arrays via
     /// [`Engine::zero`] or [`Engine::one`].
     #[inline]
-    pub fn token() -> Self {
-        Self { client: None, mesh: None, compilation_options: CompilationOptions::default(), marker: PhantomData }
+    pub fn token() -> &'static Self {
+        static TOKEN: LazyLock<XlaEngine<'static>> = LazyLock::new(|| XlaEngine {
+            client: None,
+            mesh: None,
+            compilation_options: CompilationOptions::default(),
+            marker: PhantomData,
+        });
+        &TOKEN
     }
 
     /// Returns the PJRT [`Client`] this engine was constructed with.

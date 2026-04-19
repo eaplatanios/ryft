@@ -234,37 +234,40 @@ impl<
 /// once at a single-lane exemplar and captured as a [`Program`] that lowering can later
 /// emit as packed StableHLO.
 impl<
+    'engine,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     V: Traceable<ArrayType>
         + Parameterized<
             V,
             ParameterStructure = Placeholder,
-            To<Tracer<E>> = Tracer<E>,
-            Family: ParameterizedFamily<Tracer<E>>,
+            To<Tracer<'engine, E>> = Tracer<'engine, E>,
+            Family: ParameterizedFamily<Tracer<'engine, E>>,
         >,
     Input: Parameterized<
-            Tracer<E>,
+            Tracer<'engine, E>,
             ParameterStructure: Clone + PartialEq,
-            To<Tracer<E>> = Input,
-            Family: ParameterizedFamily<Batch<Tracer<E>>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+            To<Tracer<'engine, E>> = Input,
+            Family: ParameterizedFamily<Batch<Tracer<'engine, E>>>
+                        + ParameterizedFamily<V>
+                        + ParameterizedFamily<ArrayType>,
         >,
     Output: Parameterized<
-            Tracer<E>,
+            Tracer<'engine, E>,
             ParameterStructure: Clone,
-            To<Tracer<E>> = Output,
-            Family: ParameterizedFamily<Batch<Tracer<E>>>
-                        + ParameterizedFamily<Tracer<E>>
+            To<Tracer<'engine, E>> = Output,
+            Family: ParameterizedFamily<Batch<Tracer<'engine, E>>>
+                        + ParameterizedFamily<Tracer<'engine, E>>
                         + ParameterizedFamily<V>
                         + ParameterizedFamily<ArrayType>,
         >,
     O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
     L: Clone,
-> VMapInvocationLeaf<Input, Output> for Tracer<E>
+> VMapInvocationLeaf<Input, Output> for Tracer<'engine, E>
 where
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input, To<V> = Input::To<V>>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Output, To<V> = Output::To<V>>,
-    Vec<V>: Parameterized<V, To<Tracer<E>> = Vec<Tracer<E>>, ParameterStructure = Vec<Placeholder>>,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<Tracer<E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output, To<V> = Output::To<V>>,
+    Vec<V>: Parameterized<V, To<Tracer<'engine, E>> = Vec<Tracer<'engine, E>>, ParameterStructure = Vec<Placeholder>>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<Tracer<'engine, E>>,
 {
     fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
         function: F,
@@ -295,7 +298,7 @@ where
         ) = crate::tracing_v2::jit::trace(
             exemplar_engine,
             |lane_inputs| {
-                let batched_inputs = Input::To::<Batch<Tracer<E>>>::from_parameters(
+                let batched_inputs = Input::To::<Batch<Tracer<'engine, E>>>::from_parameters(
                     lane_inputs.parameter_structure(),
                     lane_inputs.into_parameters().map(|input| Batch::new(vec![input])),
                 )?;

@@ -118,11 +118,12 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
 }
 
 impl<
+    'engine,
     V: Traceable<ArrayType> + Cos,
     O: CosTracingOperation<ArrayType, V>,
     L: Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Cos for Tracer<E>
+> Cos for Tracer<'engine, E>
 where
     O: Op<ArrayType>,
 {

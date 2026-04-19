@@ -213,21 +213,21 @@ where
     }
 }
 
-impl<E, V: Value<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + 'static>
-    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>>> for VMapOp<ArrayType, V, O, L>
+impl<'engine, E, V: Value<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + 'static>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>> for VMapOp<ArrayType, V, O, L>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType>,
     O: InterpretableOp<ArrayType, V>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
     O: VMapTracingOperation<ArrayType, V, L>,
-    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
+    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<E>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<E>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::vmap_op(self.clone()))?;
         let lane_input_count = self.body().input_types().len();
@@ -245,17 +245,18 @@ where
     }
 }
 
-impl<V: Value<ArrayType> + ZeroLike, O: Clone + 'static>
+impl<V: Value<ArrayType> + ZeroLike + 'static, O: Clone + 'static>
     DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>
     for VMapOp<ArrayType, V, O>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
     O: InterpretableOp<ArrayType, V>,
-    O: InterpretableOp<
+    O: for<'call> InterpretableOp<
             ArrayType,
             crate::tracing_v2::linear::Linearized<
                 Tracer<
+                    'call,
                     dyn Engine<
                             Type = ArrayType,
                             Value = V,
@@ -266,10 +267,16 @@ where
             >,
         >,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    LinearProgramOpRef<
-        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
+    for<'call> LinearProgramOpRef<
+        Tracer<
+            'call,
+            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+        >,
     >:CoreLinearProgramOp<
-        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
+        Tracer<
+            'call,
+            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+        >,
     >,
 {
     fn jvp(
@@ -296,16 +303,17 @@ where
 }
 
 impl<
+    'engine,
     V: Value<ArrayType>,
     O: Clone,
     L: Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> InterpretableOp<ArrayType, Tracer<E>> for VMapOp<ArrayType, V, O, L>
+> InterpretableOp<ArrayType, Tracer<'engine, E>> for VMapOp<ArrayType, V, O, L>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
-    fn interpret(&self, inputs: &[Tracer<E>]) -> Result<Vec<Tracer<E>>, TraceError> {
+    fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TraceError> {
         Tracer::apply_staged_op(inputs, O::vmap_op(self.clone()))
     }
 }
@@ -410,21 +418,22 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearVMapOp<Arr
 
 /// Builds one linearized staged `vmap` op from its primal body at the provided primal inputs.
 #[allow(private_bounds)]
-pub(crate) fn make_linear_vmap<V, O>(
+pub(crate) fn make_linear_vmap<'engine, V, O>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
     body: &FlatTracedVMap<ArrayType, V, O>,
     input_primals: Vec<V>,
 ) -> Result<LinearVMapOp<ArrayType, V>, TraceError>
 where
-    V: Traceable<ArrayType> + ZeroLike,
+    V: Traceable<ArrayType> + ZeroLike + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Clone + Op<ArrayType> + 'static,
     O: InterpretableOp<ArrayType, V>,
     O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
-    O: InterpretableOp<
+    O: for<'call> InterpretableOp<
             ArrayType,
             crate::tracing_v2::linear::Linearized<
                 Tracer<
+                    'call,
                     dyn Engine<
                             Type = ArrayType,
                             Value = V,
@@ -435,10 +444,16 @@ where
             >,
         >,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    LinearProgramOpRef<
-        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
+    for<'call> LinearProgramOpRef<
+        Tracer<
+            'call,
+            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+        >,
     >:CoreLinearProgramOp<
-        Tracer<dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>>,
+        Tracer<
+            'call,
+            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+        >,
     >,
 {
     let output_primals = body.program.call(input_primals.clone())?;

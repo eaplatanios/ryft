@@ -24,6 +24,7 @@ use crate::experimental::ops::XlaPrimitiveOp;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
 type JitShardMapTracer = Tracer<
+    'static,
     dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
@@ -54,7 +55,7 @@ impl WithShardingConstraintOp {
 
     fn base_custom_primitive<V>(&self) -> CustomPrimitive<ArrayType, V>
     where
-        V: ryft_core::tracing_v2::Traceable<ArrayType>,
+        V: ryft_core::tracing_v2::Traceable<ArrayType> + 'static,
         Self: Clone
             + InterpretableOp<ArrayType, V>
             + LinearOperation<ArrayType, V>

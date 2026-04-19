@@ -181,7 +181,7 @@ impl<T: Type + Display, V: Traceable<T>> Clone for LinearPrimitiveOp<T, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearPrimitiveOp<ArrayType, V> {
+impl<V: Traceable<ArrayType> + 'static> LinearPrimitiveOp<ArrayType, V> {
     /// Wraps one custom primitive in the linear-only operation universe after verifying transpose support.
     pub fn custom(primitive: CustomPrimitive<ArrayType, V>) -> Result<Self, TraceError> {
         Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
@@ -358,7 +358,7 @@ impl<T: Type + Display, V: Traceable<T>> LinearRematerializeOperation<T, V> for 
     }
 }
 
-impl<T: Type + Display + 'static, V: Traceable<T>> LinearCustomOperation<T, V> for LinearPrimitiveOp<T, V> {
+impl<T: Type + Display + 'static, V: Traceable<T> + 'static> LinearCustomOperation<T, V> for LinearPrimitiveOp<T, V> {
     #[inline]
     fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self, TraceError> {
         Ok(LinearPrimitiveOp::Custom(Arc::new(primitive.into_linear()?)))
@@ -578,6 +578,7 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
 /// exposing it as one public value-bundle trait and instead express their requirements through the
 /// specific staged op carrier bounds they actually exercise.
 impl<
+    'engine,
     V: Value<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
@@ -692,6 +693,7 @@ where
 /// [`LeftMatMulOp`]: crate::tracing_v2::operations::LeftMatMulOp
 /// [`RightMatMulOp`]: crate::tracing_v2::operations::RightMatMulOp
 impl<
+    'engine,
     V: Value<ArrayType>
         + Add<Output = V>
         + Mul<Output = V>
@@ -702,7 +704,8 @@ impl<
         + OneLike
         + Parameterized<V>
         + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+        + 'static,
     E: Engine<
             Type = ArrayType,
             Value = V,
@@ -710,15 +713,15 @@ impl<
             LinearOperation = LinearPrimitiveOp<ArrayType, V>,
         > + ?Sized
         + 'static,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>>> for PrimitiveOp<ArrayType, V>
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>> for PrimitiveOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<E>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<E>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TraceError> {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Mul => MulOp.interpret(inputs),
@@ -735,7 +738,7 @@ where
             }
             Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Custom(op) => op.interpret(inputs),
+            Self::Custom(op) => op.interpret_linearized_jit(inputs),
         }
     }
 }
@@ -751,7 +754,8 @@ impl<
         + OneLike
         + Parameterized<V>
         + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps,
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+        + 'static,
 > DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>>
     for PrimitiveOp<ArrayType, V>
 where
@@ -864,7 +868,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Sin + Cos + MatrixOps>
+impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Sin + Cos + MatrixOps + 'static>
     VectorizableOp<ArrayType, V> for PrimitiveOp<ArrayType, V>
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TraceError> {

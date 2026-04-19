@@ -249,8 +249,8 @@ where
 /// [`jacfwd`] probes the pushforward with one basis tangent per input coordinate and collects the
 /// resulting output coordinates as matrix columns.
 #[allow(private_bounds)]
-pub fn jacfwd<E, F, Input, Output, V>(
-    engine: &E,
+pub fn jacfwd<'engine, E, F, Input, Output, V>(
+    engine: &'engine E,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -259,9 +259,9 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<E>>,
-    Output::Family: ParameterizedFamily<Tracer<E>>,
-    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -301,8 +301,8 @@ where
 /// [`jacrev`] probes the pullback with one basis cotangent per output coordinate and collects the
 /// resulting input coordinates as matrix rows.
 #[allow(private_bounds)]
-pub fn jacrev<E, F, Input, Output, V>(
-    engine: &E,
+pub fn jacrev<'engine, E, F, Input, Output, V>(
+    engine: &'engine E,
     function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
@@ -311,9 +311,9 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<E>>,
-    Output::Family: ParameterizedFamily<Tracer<E>>,
-    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -347,8 +347,8 @@ where
 /// In the current prototype, callers pass a first-derivative function (for example `first_derivative`)
 /// because Rust does not yet let this API re-instantiate an arbitrary closure at a deeper trace level.
 #[allow(private_bounds)]
-pub fn hessian<E, F, Input, V>(
-    engine: &E,
+pub fn hessian<'engine, E, F, Input, V>(
+    engine: &'engine E,
     gradient_function: F,
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
@@ -356,8 +356,8 @@ where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<E>>,
-    F: FnOnce(Input::To<Tracer<E>>) -> Result<Input::To<Tracer<E>>, TraceError>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,

@@ -225,11 +225,12 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
 }
 
 impl<
+    'engine,
     V: Traceable<ArrayType>,
     O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
     L: Clone,
     E: crate::tracing_v2::Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> MatrixOps for Tracer<E>
+> MatrixOps for Tracer<'engine, E>
 where
     O: Op<ArrayType>,
 {

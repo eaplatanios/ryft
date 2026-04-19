@@ -24,8 +24,8 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, Typed};
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearOperation, Op, TracerLinearOperation, VectorizableOp, expect_input_count,
-    lift_jit_constant, mul::MulTracingOperation, unary_abstract,
+    DifferentiableOp, InterpretableOp, LinearAddOperation, LinearNegOperation, LinearOperation, Op, VectorizableOp,
+    expect_input_count, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
 };
 
 /// Hidden staging trait for the scaling primitive.
@@ -125,22 +125,26 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
 }
 
 impl<
+    'engine,
     V: Value<ArrayType> + ZeroLike + Mul<Output = V>,
     O: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V> + 'static,
     OuterLinearOperation: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
-    InnerLinearOperation: TracerLinearOperation<V, O, OuterLinearOperation, E>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>>
+    InnerLinearOperation: Clone
+        + LinearAddOperation<ArrayType, Tracer<'engine, E>>
+        + LinearNegOperation<ArrayType, Tracer<'engine, E>>
+        + LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
+> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
     for ScaleOp<ArrayType, V>
 where
     O: Op<ArrayType>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<E>, InnerLinearOperation>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         Ok(vec![JvpTracer {

@@ -272,11 +272,12 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
 }
 
 impl<
+    'engine,
     V: Traceable<ArrayType>,
     O: ReshapeTracingOperation<ArrayType, V>,
     L: Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> ReshapeOps for Tracer<E>
+> ReshapeOps for Tracer<'engine, E>
 where
     O: Op<ArrayType>,
 {

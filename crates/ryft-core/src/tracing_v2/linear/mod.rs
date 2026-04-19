@@ -57,10 +57,15 @@ pub(crate) use program::linearize_program;
 pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
 pub(crate) use reverse::jvp_traced;
 
-type LinearizedTracedValue<E> = Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>;
+type LinearizedTracedValue<'engine, E> = Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>;
 
-type TracedLinearProgram<E> =
-    LinearProgram<ArrayType, Tracer<E>, Vec<Tracer<E>>, Vec<Tracer<E>>, LinearProgramOpRef<Tracer<E>>>;
+type TracedLinearProgram<'engine, E> = LinearProgram<
+    ArrayType,
+    Tracer<'engine, E>,
+    Vec<Tracer<'engine, E>>,
+    Vec<Tracer<'engine, E>>,
+    LinearProgramOpRef<Tracer<'engine, E>>,
+>;
 
 #[inline]
 fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
@@ -73,21 +78,21 @@ fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
 /// original function uses tuples, structs, or other parameterized shapes. This helper is the bridge
 /// between those worlds: it traces the structured function once, then retags the captured program
 /// so downstream reverse-mode code can operate on a canonical `Vec<V>` representation.
-pub(crate) fn trace_flat_program_from_input_types<Input, Output, V, O, L, E, F>(
+pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, O, L, E, F>(
     function: F,
-    traced_inputs: &[Tracer<E>],
+    traced_inputs: &[Tracer<'engine, E>],
     input_types: Input,
 ) -> Result<(Output, Program<ArrayType, V, Vec<V>, Vec<V>, O>), TraceError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<E>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<E>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
 {
     let exemplar_engine = traced_inputs.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
     let (output_types, traced_program): (Output, Program<ArrayType, V, Input::To<V>, Output::To<V>, O>) =
@@ -108,17 +113,17 @@ where
 /// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
 /// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
 /// output and the traced gradient leaves.
-fn reverse_mode_scalar_traced_program<V, O, L, E>(
+fn reverse_mode_scalar_traced_program<'engine, V, O, L, E>(
     traced_program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
-    traced_primals: Vec<Tracer<E>>,
-) -> Result<(Tracer<E>, Vec<Tracer<E>>), TraceError>
+    traced_primals: Vec<Tracer<'engine, E>>,
+) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>>,
-    LinearProgramOpRef<Tracer<E>>: CoreLinearProgramOp<Tracer<E>>,
+    O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>>,
+    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
 {
     let (outputs, pushforward) = linearize_traced_program::<V, O, L, E>(traced_program, traced_primals)?;
     if outputs.len() != 1 {
@@ -126,7 +131,7 @@ where
     }
     let traced_output = outputs[0].clone();
     let pullback =
-        transpose_linear_program_with_output_examples::<Tracer<E>, _, _, _>(&pushforward, outputs.as_slice())?;
+        transpose_linear_program_with_output_examples::<Tracer<'engine, E>, _, _, _>(&pushforward, outputs.as_slice())?;
     let traced_gradient = pullback.call(vec![traced_output.one_like()])?;
     Ok((traced_output, traced_gradient))
 }

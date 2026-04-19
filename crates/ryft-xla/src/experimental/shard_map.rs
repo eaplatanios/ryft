@@ -463,7 +463,7 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging XLA programs directly from types.
-pub(crate) type ShardMapTracer = Tracer<XlaEngine<'static>>;
+pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>;
@@ -1237,7 +1237,7 @@ where
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
         {
-            let (output_types, program) = trace_types(&engine, |input| Ok(function(input)), cloned_input_types)?;
+            let (output_types, program) = trace_types(engine, |input| Ok(function(input)), cloned_input_types)?;
             (output_types, program.simplify()?)
         }
     };
@@ -3029,7 +3029,7 @@ mod tests {
         let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
             |x: ShardMapTracer| {
                 let gradient: ShardMapTracer =
-                    grad(&crate::experimental::engine::XlaEngine::token(), |y: ShardMapTracer| y.sin(), x.clone())
+                    grad(crate::experimental::engine::XlaEngine::token(), |y: ShardMapTracer| y.sin(), x.clone())
                         .expect("gradient inside shard_map should succeed");
                 let lanes: Vec<ShardMapTracer> = vmap(
                     |y: ryft_core::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
@@ -3193,7 +3193,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     grad(
-                        &crate::experimental::engine::XlaEngine::token(),
+                        crate::experimental::engine::XlaEngine::token(),
                         {
                             let mesh = mesh.clone();
                             let sharding = sharding.clone();

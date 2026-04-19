@@ -182,14 +182,15 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
 pub fn lift_jit_constant<
+    'engine,
     V: Traceable<ArrayType>,
     O: Clone,
     L,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 >(
     constant: &V,
-    exemplar: &Tracer<E>,
-) -> Tracer<E> {
+    exemplar: &Tracer<'engine, E>,
+) -> Tracer<'engine, E> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
     Tracer::from_engine(atom, builder, exemplar.staging_error_handle(), exemplar.engine())
@@ -472,11 +473,11 @@ pub trait TracerLinearOperation<
             TracingOperation = O,
             LinearOperation = OuterLinearOperation,
         >,
->: Clone
-    + 'static
-    + add::LinearAddOperation<ArrayType, Tracer<E>>
-    + neg::LinearNegOperation<ArrayType, Tracer<E>>
-    + scale::LinearScaleOperation<ArrayType, Tracer<E>>
+>: Clone + 'static
+where
+    for<'engine> Self: add::LinearAddOperation<ArrayType, Tracer<'engine, E>>
+        + neg::LinearNegOperation<ArrayType, Tracer<'engine, E>>
+        + scale::LinearScaleOperation<ArrayType, Tracer<'engine, E>>
 {
 }
 
@@ -487,12 +488,12 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
-    InnerLinearOperation: Clone
-        + 'static
-        + add::LinearAddOperation<ArrayType, Tracer<E>>
-        + neg::LinearNegOperation<ArrayType, Tracer<E>>
-        + scale::LinearScaleOperation<ArrayType, Tracer<E>>,
+    InnerLinearOperation: Clone + 'static,
 > TracerLinearOperation<V, O, OuterLinearOperation, E> for InnerLinearOperation
+where
+    for<'engine> InnerLinearOperation: add::LinearAddOperation<ArrayType, Tracer<'engine, E>>
+        + neg::LinearNegOperation<ArrayType, Tracer<'engine, E>>
+        + scale::LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
 {
 }
 

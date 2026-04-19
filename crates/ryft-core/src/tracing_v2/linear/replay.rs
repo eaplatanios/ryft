@@ -78,20 +78,20 @@ where
 ///
 /// This is the key helper that lets higher-order transforms symbolically replay an already-traced
 /// body while preserving both its primal outputs and its staged tangent propagation.
-pub(crate) fn replay_program_linearized_jit<ProgramInput, ProgramOutput, V, O, L, E>(
+pub(crate) fn replay_program_linearized_jit<'engine, ProgramInput, ProgramOutput, V, O, L, E>(
     program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
-    inputs: Vec<LinearizedTracedValue<E>>,
-) -> Result<Vec<LinearizedTracedValue<E>>, TraceError>
+    inputs: Vec<LinearizedTracedValue<'engine, E>>,
+) -> Result<Vec<LinearizedTracedValue<'engine, E>>, TraceError>
 where
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType> + ZeroLike,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<E>> + Clone + 'static,
+    O: InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>> + Clone + 'static,
 {
     replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L, E>, |op, values| {
-        InterpretableOp::<ArrayType, LinearizedTracedValue<E>>::interpret(op, &values)
+        InterpretableOp::<ArrayType, LinearizedTracedValue<'engine, E>>::interpret(op, &values)
     })
 }
 
@@ -101,20 +101,23 @@ where
 /// [`super::program::linearize_program`]: instead of consuming concrete primals and producing a
 /// linear program immediately, it works inside an outer JIT trace and stages the resulting
 /// pushforward symbolically.
-pub(crate) fn linearize_traced_program<V, O, L, E>(
+pub(crate) fn linearize_traced_program<'engine, V, O, L, E>(
     program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
-    primals: Vec<Tracer<E>>,
-) -> Result<(Vec<Tracer<E>>, TracedLinearProgram<E>), TraceError>
+    primals: Vec<Tracer<'engine, E>>,
+) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<E>> + Clone,
+    O: InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>> + Clone,
 {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_count = primals.len();
-    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<Tracer<E>, LinearProgramOpRef<Tracer<E>>>::new()));
+    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<
+        Tracer<'engine, E>,
+        LinearProgramOpRef<Tracer<'engine, E>>,
+    >::new()));
     let traced_input = primals
         .into_iter()
         .map(|primal| {
@@ -133,7 +136,7 @@ where
         }
     };
     let program = builder
-        .build::<Vec<Tracer<E>>, Vec<Tracer<E>>>(
+        .build::<Vec<Tracer<'engine, E>>, Vec<Tracer<'engine, E>>>(
             tangent_outputs,
             vec![Placeholder; input_count],
             vec![Placeholder; primal_outputs.len()],

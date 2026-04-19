@@ -94,14 +94,14 @@ pub struct JvpTracer<V, T> {
 
 impl<V, T> Parameter for JvpTracer<V, T> {}
 
-impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V> + 'static> Typed<Ty> for JvpTracer<V, T> {
+impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V>> Typed<Ty> for JvpTracer<V, T> {
     #[inline]
     fn tpe(&self) -> Cow<'_, Ty> {
         <V as Typed<Ty>>::tpe(&self.primal)
     }
 }
 
-impl<Ty: Type + 'static, V: Traceable<Ty>, T: TangentSpace<Ty, V> + 'static> Traceable<Ty> for JvpTracer<V, T> {}
+impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V>> Traceable<Ty> for JvpTracer<V, T> {}
 
 impl<V: Traceable<ArrayType> + ZeroLike, T: TangentSpace<ArrayType, V>> ZeroLike for JvpTracer<V, T> {
     #[inline]
@@ -137,15 +137,24 @@ where
     Output: Parameterized<Self, ParameterStructure: Clone>,
 {
     /// Input type expected by the user-provided function.
-    type FunctionInput;
+    type FunctionInput<'engine>
+    where
+        E: 'engine;
 
     /// Output type produced by the user-provided function.
-    type FunctionOutput;
+    type FunctionOutput<'engine>
+    where
+        E: 'engine;
 
     /// Invokes [`jvp`] for one leaf regime.
-    fn invoke<F>(engine: &E, function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    fn invoke<'engine, F>(
+        engine: &'engine E,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
     where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput;
+        F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
 }
 
 impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Add for JvpTracer<V, T> {
@@ -188,8 +197,8 @@ impl<
 > JvpInvocationLeaf<E, Input, Output> for V
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
-    Input::Family: ParameterizedFamily<Tracer<E>>,
-    Output::Family: ParameterizedFamily<Tracer<E>>,
+    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
+    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -200,12 +209,23 @@ where
         >,
     E::LinearOperation: InterpretableOp<ArrayType, V> + Op<ArrayType>,
 {
-    type FunctionInput = Input::To<Tracer<E>>;
-    type FunctionOutput = Output::To<Tracer<E>>;
-
-    fn invoke<F>(engine: &E, function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    type FunctionInput<'engine>
+        = Input::To<Tracer<'engine, E>>
     where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
+        E: 'engine;
+    type FunctionOutput<'engine>
+        = Output::To<Tracer<'engine, E>>
+    where
+        E: 'engine;
+
+    fn invoke<'engine, F>(
+        engine: &'engine E,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
+    where
+        F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
         if primals.parameter_structure() != tangents.parameter_structure() {
             return Err(TraceError::MismatchedParameterStructure);
@@ -222,27 +242,40 @@ where
 /// symbolically inside an enclosing [`Tracer`] scope, staging both the primal output and the
 /// tangent propagation as part of the outer compiled program.
 impl<
+    'engine,
     E,
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<E>, ParameterStructure: Clone + PartialEq, To<Tracer<E>> = Input>,
-    Output: Parameterized<Tracer<E>, ParameterStructure: Clone, To<Tracer<E>> = Output>,
-> JvpInvocationLeaf<E, Input, Output> for Tracer<E>
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + PartialEq, To<Tracer<'engine, E>> = Input>,
+    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
+> JvpInvocationLeaf<E, Input, Output> for Tracer<'engine, E>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
-    Input::Family: ParameterizedFamily<Tracer<E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<Tracer<E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Output>,
-    E::TracingOperation: InterpretableOp<ArrayType, Linearized<Tracer<E>, LinearProgramOpRef<Tracer<E>>>>,
+    Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
+    E::TracingOperation:
+        InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>>,
     E::LinearOperation: Clone + Op<ArrayType> + 'static,
-    LinearProgramOpRef<Tracer<E>>: CoreLinearReplayOp<Tracer<E>>,
+    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
 {
-    type FunctionInput = Input;
-    type FunctionOutput = Output;
-
-    fn invoke<F>(_engine: &E, function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    type FunctionInput<'call>
+        = Input
     where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
+        E: 'call;
+    type FunctionOutput<'call>
+        = Output
+    where
+        E: 'call;
+
+    fn invoke<'call, F>(
+        _engine: &'call E,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
+    where
+        F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>,
     {
         jvp_traced::<_, _, _, V, E::TracingOperation, E::LinearOperation, E>(
             |input| Ok(function(input)),
@@ -261,24 +294,24 @@ where
 /// [`interpret_and_trace`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
     E,
-    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq> + 'static,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
 > JvpInvocationLeaf<E, Input, Output> for Batch<V>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
-    Vec<V>: Parameterized<
+    Vec<V>: for<'engine> Parameterized<
             V,
             ParameterStructure = Vec<Placeholder>,
             To<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
             > = Vec<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
@@ -286,18 +319,19 @@ where
                         >>,
             >,
         >,
-    Input::Family: ParameterizedFamily<
+    Input::Family: ParameterizedFamily<V>
+        + for<'engine> ParameterizedFamily<
             Batch<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
             >,
-        > + ParameterizedFamily<V>
-        + ParameterizedFamily<
-            Tracer<dyn Engine<
+        >
+        + for<'engine> ParameterizedFamily<
+            Tracer<'engine, dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
@@ -305,8 +339,8 @@ where
                     >>,
         >,
     Output::Family: ParameterizedFamily<V>
-        + ParameterizedFamily<
-            Tracer<dyn Engine<
+        + for<'engine> ParameterizedFamily<
+            Tracer<'engine, dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
@@ -314,19 +348,19 @@ where
                     >>,
         >,
     Input::To<V>: Clone
-        + Parameterized<
+        + for<'engine> Parameterized<
             V,
             ParameterStructure: Clone + PartialEq,
             To<Batch<V>> = Input,
             To<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
             > = Input::To<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
@@ -335,19 +369,19 @@ where
             >,
         >,
     Output::To<V>: Clone
-        + Parameterized<
+        + for<'engine> Parameterized<
             V,
             ParameterStructure: Clone + PartialEq,
             To<Batch<V>> = Output,
             To<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
             > = Output::To<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
@@ -355,16 +389,16 @@ where
                         >>,
             >,
         >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<
-            Tracer<dyn Engine<
+    <Vec<V> as Parameterized<V>>::Family: for<'engine> ParameterizedFamily<
+            Tracer<'engine, dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
                         LinearOperation = E::LinearOperation,
                     >>,
         >,
-    V::Family: ParameterizedFamily<
-            Tracer<dyn Engine<
+    V::Family: for<'engine> ParameterizedFamily<
+            Tracer<'engine, dyn Engine<
                         Type = ArrayType,
                         Value = V,
                         TracingOperation = E::TracingOperation,
@@ -373,17 +407,17 @@ where
         >,
     E::TracingOperation: Op<ArrayType>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: InterpretableOp<
+    E::TracingOperation: for<'engine> InterpretableOp<
             ArrayType,
             Linearized<
-                Tracer<dyn Engine<
+                Tracer<'engine, dyn Engine<
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
                 LinearProgramOpRef<
-                    Tracer<dyn Engine<
+                    Tracer<'engine, dyn Engine<
                                 Type = ArrayType,
                                 Value = V,
                                 TracingOperation = E::TracingOperation,
@@ -392,15 +426,15 @@ where
                 >,
             >,
         >,
-    LinearProgramOpRef<
-        Tracer<dyn Engine<
+    for<'engine> LinearProgramOpRef<
+        Tracer<'engine, dyn Engine<
                     Type = ArrayType,
                     Value = V,
                     TracingOperation = E::TracingOperation,
                     LinearOperation = E::LinearOperation,
                 >>,
     >: CoreLinearReplayOp<
-        Tracer<dyn Engine<
+        Tracer<'engine, dyn Engine<
                     Type = ArrayType,
                     Value = V,
                     TracingOperation = E::TracingOperation,
@@ -408,26 +442,37 @@ where
                 >>,
     >,
 {
-    type FunctionInput = Input::To<
-        Tracer<dyn Engine<
+    type FunctionInput<'engine>
+        = Input::To<
+        Tracer<'engine, dyn Engine<
                     Type = ArrayType,
                     Value = V,
                     TracingOperation = E::TracingOperation,
                     LinearOperation = E::LinearOperation,
                 >>,
-    >;
-    type FunctionOutput = Output::To<
-        Tracer<dyn Engine<
-                    Type = ArrayType,
-                    Value = V,
-                    TracingOperation = E::TracingOperation,
-                    LinearOperation = E::LinearOperation,
-                >>,
-    >;
-
-    fn invoke<F>(engine: &E, function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
+    >
     where
-        F: FnOnce(Self::FunctionInput) -> Self::FunctionOutput,
+        E: 'engine;
+    type FunctionOutput<'engine>
+        = Output::To<
+        Tracer<'engine, dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = E::TracingOperation,
+                    LinearOperation = E::LinearOperation,
+                >>,
+    >
+    where
+        E: 'engine;
+
+    fn invoke<'engine, F>(
+        engine: &'engine E,
+        function: F,
+        primals: Input,
+        tangents: Input,
+    ) -> Result<(Output, Output), TraceError>
+    where
+        F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
         if primals.parameter_structure() != tangents.parameter_structure() {
             return Err(TraceError::MismatchedParameterStructure);
@@ -457,8 +502,8 @@ where
         ) = interpret_and_trace(
             erased_engine,
             |staged_input| {
-                let staged_input: Self::FunctionInput = staged_input;
-                let staged_output: Self::FunctionOutput = function(staged_input);
+                let staged_input: Self::FunctionInput<'engine> = staged_input;
+                let staged_output: Self::FunctionOutput<'engine> = function(staged_input);
                 Ok(staged_output)
             },
             lane0_primals,
@@ -485,7 +530,7 @@ where
             interpret_and_trace(
                 erased_engine,
                 |jit_combined: Vec<
-                    Tracer<dyn Engine<
+                    Tracer<'engine, dyn Engine<
                                 Type = ArrayType,
                                 Value = V,
                                 TracingOperation = E::TracingOperation,
@@ -553,8 +598,8 @@ where
 /// direct forward-mode transform in the crate: it either traces the body once to build a staged
 /// pushforward or stages the whole JVP into an outer trace if the inputs are already symbolic.
 #[allow(private_bounds, private_interfaces)]
-pub fn jvp<E, F, Input, Output, Leaf>(
-    engine: &E,
+pub fn jvp<'engine, E, F, Input, Output, Leaf>(
+    engine: &'engine E,
     function: F,
     primals: Input,
     tangents: Input,
@@ -565,8 +610,8 @@ where
     Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Leaf, ParameterStructure: Clone>,
     F: FnOnce(
-        <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionInput,
-    ) -> <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionOutput,
+        <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionInput<'engine>,
+    ) -> <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionOutput<'engine>,
 {
     Leaf::invoke(engine, function, primals, tangents)
 }

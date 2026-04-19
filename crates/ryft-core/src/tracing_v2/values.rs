@@ -56,33 +56,26 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// [`Traceable::is_one`]. The default implementations return `false`, which keeps purely abstract or traced leaves
 /// valid while opting them out of constant-identity simplification.
 ///
-/// # Why the `'static` bound?
-///
-/// Tracing a closure produces a [`Program`](crate::tracing_v2::Program) whose lifetime is intentionally decoupled
-/// from the trace scope: the whole point of staging is to return the traced artifact, store it, and replay it later
-/// on fresh inputs. Constants of type `V` captured during tracing get baked directly into that staged output, so `V`
-/// cannot borrow from the tracing closure's local state without dragging its lifetime along. The `'static` bound
-/// enforces exactly this invariant structurally. As a side benefit, it also enables the
-/// [`TypeId`](std::any::TypeId)-keyed extension registry that
-/// [`CustomPrimitive`](crate::tracing_v2::CustomPrimitive) uses to dispatch optional transform rules (`Any`-based
-/// downcasting fundamentally requires `'static`).
+/// [`Traceable`] itself does not require `'static`. Borrowed leaf wrappers such as
+/// [`Tracer`](crate::tracing_v2::Tracer) are therefore free to model real engine borrows explicitly.
+/// Individual APIs that store traceable values behind [`Any`](std::any::Any), inside long-lived
+/// registries, or in staged artifacts that intentionally escape the current scope should add
+/// `'static` at those specific seams instead of imposing it on every traceable leaf globally.
 ///
 /// # Implementing [`Traceable`] for new leaf types
 ///
-/// The bound is rarely a real constraint â€” in practice, the rule is simply "own your data":
+/// Most concrete runtime values should still own their data:
 ///
-/// - Small [`Copy`] scalars (`f32`, `i32`, `half::bf16`, ...) satisfy `'static` trivially and can implement
-///   [`Traceable`] directly, as the built-in scalar impls below illustrate.
-/// - Heavier payloads (array buffers, tensors, device allocations) should wrap the underlying handle in
-///   [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded cases). This keeps the leaf cheaply
-///   cloneable â€” which the [`Clone`] supertrait also demands â€” and severs any tie to a caller's scope. PJRT-backed
-///   arrays and similar backend values all take this shape.
+/// - Small [`Copy`] scalars (`f32`, `i32`, `half::bf16`, ...) can implement [`Traceable`] directly, as the built-in
+///   scalar impls below illustrate.
+/// - Heavier payloads (array buffers, tensors, device allocations) should typically wrap the underlying handle in
+///   [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded cases) so the leaf stays cheaply cloneable.
 ///
-/// Avoid leaf types that borrow from external state: a reference-carrying wrapper cannot be baked into a staged
-/// program that outlives the trace, and it will not satisfy `'static` either.
+/// Borrowing leaf types is still valid when the borrow is semantically tied to the surrounding tracing scope; they
+/// simply cannot be stored in APIs that later add a `'static` requirement.
 ///
 /// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing wrappers.
-pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
+pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
     /// Returns `true` if every element of this value is exactly zero.
     ///
     /// The program builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)

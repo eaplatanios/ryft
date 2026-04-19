@@ -36,14 +36,14 @@ use crate::{
 /// output atoms. This makes `Tracer` the central "big picture" type for symbolic execution in
 /// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
 /// always instances of this type.
-pub struct Tracer<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> {
+pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
-    engine: &'static E,
+    engine: &'engine E,
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Clone for Tracer<E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<'engine, E> {
     fn clone(&self) -> Self {
         Self {
             atom: self.atom,
@@ -54,15 +54,15 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Clone for Tracer<E
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Parameter for Tracer<E> {}
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Parameter for Tracer<'engine, E> {}
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> std::fmt::Debug for Tracer<E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Tracer<E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> {
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -92,7 +92,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Tracer<E> {
     /// The engine gives traced values access to metadata-driven zero/one synthesis and identifies
     /// the staged operation carriers being recorded.
     #[inline]
-    pub fn engine(&self) -> &E {
+    pub fn engine(&self) -> &'engine E {
         self.engine
     }
 
@@ -105,12 +105,8 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Tracer<E> {
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &E,
+        engine: &'engine E,
     ) -> Self {
-        // SAFETY: traced values are confined to the tracing scope. Every public tracing entry
-        // point reclaims the shared builder before returning, so no `Tracer` can outlive the
-        // borrowed engine captured here even though we erase that lifetime from the type.
-        let engine = unsafe { std::mem::transmute::<&E, &'static E>(engine) };
         Self { atom, builder, staging_error, engine }
     }
 
@@ -212,7 +208,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Tracer<E> {
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Typed<E::Type> for Tracer<E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
     #[inline]
     fn tpe(&self) -> Cow<'_, E::Type> {
         Cow::Owned(
@@ -226,9 +222,9 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Typed<E::Type> for
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Traceable<E::Type> for Tracer<E> {}
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Traceable<E::Type> for Tracer<'engine, E> {}
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> ZeroLike for Tracer<E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer<'engine, E> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
@@ -237,7 +233,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> ZeroLike for Trace
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> OneLike for Tracer<E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<'engine, E> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
@@ -247,8 +243,9 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> OneLike for Tracer
 }
 
 impl<
+    'engine,
     E: Engine<Value: Traceable<E::Type>, TracingOperation: AddTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
-> Add for Tracer<E>
+> Add for Tracer<'engine, E>
 {
     type Output = Self;
 
@@ -259,8 +256,9 @@ impl<
 }
 
 impl<
+    'engine,
     E: Engine<Value: Traceable<E::Type>, TracingOperation: MulTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
-> Mul for Tracer<E>
+> Mul for Tracer<'engine, E>
 {
     type Output = Self;
 
@@ -271,8 +269,9 @@ impl<
 }
 
 impl<
+    'engine,
     E: Engine<Value: Traceable<E::Type>, TracingOperation: NegTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
-> Neg for Tracer<E>
+> Neg for Tracer<'engine, E>
 {
     type Output = Self;
 
@@ -292,8 +291,8 @@ impl<
 /// The returned pair contains both the structured output metadata inferred during tracing and the
 /// unsimplified staged program itself. Callers that want the canonical simplified form can invoke
 /// [`Program::simplify`](crate::tracing_v2::Program::simplify) afterward.
-pub fn trace<E, F, Input, Output>(
-    engine: &E,
+pub fn trace<'engine, E, F, Input, Output>(
+    engine: &'engine E,
     function: F,
     input_types: Input,
 ) -> Result<
@@ -301,27 +300,27 @@ pub fn trace<E, F, Input, Output>(
     TraceError,
 >
 where
-    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: Op<E::Type>> + ?Sized + 'static,
+    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: Op<E::Type>> + ?Sized,
     Input: Parameterized<
             E::Type,
             ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
+            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
         >,
     Output: Parameterized<
             E::Type,
             ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
+            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
         >,
-    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
 {
     let input_structure = input_types.parameter_structure();
     let builder = Rc::new(RefCell::new(ProgramBuilder::<E::TracingOperation, E::Type, E::Value>::new()));
     let staging_error = Rc::new(RefCell::new(None));
-    let traced_input = Input::To::<Tracer<E>>::from_parameters(
+    let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
             let atom = builder.borrow_mut().add_input_abstract(r#type);
-            Tracer::<E>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+            Tracer::from_engine(atom, builder.clone(), staging_error.clone(), engine)
         }),
     )
     .map_err(TraceError::from)?;
@@ -361,18 +360,18 @@ where
 ///
 /// - the concrete output that the caller would expect from eager execution, and
 /// - the staged [`Program`] representing the same computation for later reuse.
-pub fn interpret_and_trace<E, F, Input, Output>(
-    engine: &E,
+pub fn interpret_and_trace<'engine, E, F, Input, Output>(
+    engine: &'engine E,
     function: F,
     input: Input,
 ) -> Result<(Output, Program<E::Type, E::Value, Input, Output, E::TracingOperation>), TraceError>
 where
     E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOp<E::Type, E::Value>>
-        + ?Sized
-        + 'static,
-    Input: Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<E>>>,
-    Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<E>>>,
-    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
+        + ?Sized,
+    Input:
+        Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<'engine, E>>>,
+    Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<'engine, E>>>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
 {
     let input_structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -384,7 +383,8 @@ where
     ) = trace(
         engine,
         |flat_traced_input| {
-            let traced_input = Input::To::<Tracer<E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
+            let traced_input =
+                Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
             let traced_output = function(traced_input)?;
             output_structure = Some(traced_output.parameter_structure());
             Ok(traced_output.into_parameters().collect::<Vec<_>>())

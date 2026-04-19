@@ -385,7 +385,10 @@ where
     })
 }
 
-fn lift_traced_constant<V, O: Clone, L: Clone, E>(constant: &V, inputs: &[Tracer<E>]) -> Result<Tracer<E>, TraceError>
+fn lift_traced_constant<'engine, V, O: Clone, L: Clone, E>(
+    constant: &V,
+    inputs: &[Tracer<'engine, E>],
+) -> Result<Tracer<'engine, E>, TraceError>
 where
     V: Traceable<ArrayType>,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
@@ -395,10 +398,10 @@ where
     Ok(Tracer::from_engine(atom, exemplar.builder_handle(), exemplar.staging_error_handle(), exemplar.engine()))
 }
 
-pub(crate) fn lift_linearized_traced_constant<V, O: Clone + 'static, L: Clone + 'static, E>(
+pub(crate) fn lift_linearized_traced_constant<'engine, V, O: Clone + 'static, L: Clone + 'static, E>(
     constant: &V,
-    inputs: &[LinearizedTracedValue<E>],
-) -> Result<LinearizedTracedValue<E>, TraceError>
+    inputs: &[LinearizedTracedValue<'engine, E>],
+) -> Result<LinearizedTracedValue<'engine, E>, TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,

@@ -28,6 +28,7 @@ use crate::experimental::shard_map::{
 use crate::experimental::{engine::XlaEngine, ops::XlaPrimitiveOp};
 
 type JitShardMapTracer = Tracer<
+    'static,
     dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
@@ -218,7 +219,20 @@ impl ShardMapOp<ShardMapTensor> {
 impl ShardMapOp<ShardMapTracer> {
     /// Returns the traced-leaf custom-primitive registration for this shard-map op.
     pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTracer> {
-        self.base_custom_primitive().with_jvp_rule(self.clone()).with_linearized_jit_rule(self.clone())
+        self.base_custom_primitive()
+            .with_jvp_rule(self.clone())
+            .with_linearized_jit_rule_for::<
+                ProgramOpRef<ShardMapTracer>,
+                LinearProgramOpRef<ShardMapTracer>,
+                LinearProgramOpRef<JitShardMapTracer>,
+                dyn Engine<
+                        Type = ArrayType,
+                        Value = ShardMapTracer,
+                        TracingOperation = ProgramOpRef<ShardMapTracer>,
+                        LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+                    >,
+                _,
+            >(self.clone())
     }
 }
 
@@ -735,7 +749,7 @@ fn project_flat_shard_map_program(
 
     let equation_by_output = equation_by_output(program);
     let engine = crate::experimental::engine::XlaEngine::token();
-    let representative_values = program.representative_atom_values(&engine)?;
+    let representative_values = program.representative_atom_values(engine)?;
     let mut builder = ProgramBuilder::<XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
@@ -846,7 +860,7 @@ fn build_factorized_apply_program(
 
     let program = &body.program;
     let engine = crate::experimental::engine::XlaEngine::token();
-    let representative_values = program.representative_atom_values(&engine)?;
+    let representative_values = program.representative_atom_values(engine)?;
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = program.input_atoms()[primal_input_count..].to_vec();
     let equation_by_output = equation_by_output(program);
@@ -1270,7 +1284,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             XlaPrimitiveOp,
         >,
     ) = ryft_core::tracing_v2::interpret_and_trace(
-        &XlaEngine::token(),
+        XlaEngine::token(),
         {
             let body = body.clone();
             move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TraceError> {
@@ -1309,7 +1323,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             XlaPrimitiveOp,
         >,
     ) = ryft_core::tracing_v2::interpret_and_trace(
-        &XlaEngine::token(),
+        XlaEngine::token(),
         {
             let body = body.clone();
             move |combined_inputs: Vec<ShardMapTracer>| -> Result<Vec<ShardMapTracer>, TraceError> {
