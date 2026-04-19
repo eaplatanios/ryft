@@ -110,15 +110,17 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
     /// Structured output shape used to rebuild typed outputs from flat leaves.
     pub output_structure: Output::ParameterStructure,
 
-    /// Phantom marker that ties the program to its structured input/output parameter families.
+    /// Phantom marker that ties the program to its structured input and output [`Parameterized`] families.
     pub marker: PhantomData<fn(Input) -> Output>,
 }
 
-impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>> Clone
-    for Program<T, V, O, Input, Output>
-where
-    Input::ParameterStructure: Clone,
-    Output::ParameterStructure: Clone,
+impl<
+    O: Clone,
+    T: Type,
+    V: Traceable<T>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+> Clone for Program<T, V, O, Input, Output>
 {
     fn clone(&self) -> Self {
         Self {
