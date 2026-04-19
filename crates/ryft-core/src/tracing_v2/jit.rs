@@ -25,149 +25,6 @@ use crate::{
     types::{ArrayType, Type, Typed},
 };
 
-/// Input family that can be rebuilt with traced leaves for one staged carrier pair.
-#[doc(hidden)]
-pub trait TraceInput<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>:
-    Parameterized<V, ParameterStructure: Clone>
-{
-    /// Traced version of this input family for one staged carrier pair.
-    type Traced: Parameterized<JitTracer<ArrayType, V, O, L>, ParameterStructure = Self::ParameterStructure>;
-
-    /// Rebuilds `self` with traced leaves owned by `builder`.
-    fn into_traced(
-        self,
-        builder: Rc<RefCell<GraphBuilder<O, ArrayType, V>>>,
-        staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-    ) -> Result<Self::Traced, TraceError>;
-}
-
-impl<T, V, O, L> TraceInput<V, O, L> for T
-where
-    T: Parameterized<V, ParameterStructure: Clone>,
-    V: Traceable<ArrayType>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    T::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-{
-    type Traced = T::To<JitTracer<ArrayType, V, O, L>>;
-
-    fn into_traced(
-        self,
-        builder: Rc<RefCell<GraphBuilder<O, ArrayType, V>>>,
-        staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-    ) -> Result<Self::Traced, TraceError> {
-        let structure = self.parameter_structure();
-        Self::Traced::from_parameters(
-            structure,
-            self.into_parameters().map(|value| {
-                let atom = builder.borrow_mut().add_input(&value);
-                JitTracer::<ArrayType, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
-            }),
-        )
-        .map_err(TraceError::from)
-    }
-}
-
-/// Output family that can be lowered back to concrete leaves after tracing.
-#[doc(hidden)]
-pub trait TraceOutput<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>:
-    Parameterized<V, ParameterStructure: Clone>
-{
-    /// Traced version of this output family for one staged carrier pair.
-    type Traced: Parameterized<JitTracer<ArrayType, V, O, L>, ParameterStructure = Self::ParameterStructure>;
-
-    /// Lowers one traced output to its parameter structure and the corresponding staged output atoms.
-    fn from_traced(traced_output: Self::Traced) -> Result<(Self::ParameterStructure, Vec<AtomId>), TraceError>;
-}
-
-impl<T, V, O, L> TraceOutput<V, O, L> for T
-where
-    T: Parameterized<V, ParameterStructure: Clone>,
-    V: Traceable<ArrayType>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    T::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-{
-    type Traced = T::To<JitTracer<ArrayType, V, O, L>>;
-
-    fn from_traced(traced_output: Self::Traced) -> Result<(Self::ParameterStructure, Vec<AtomId>), TraceError> {
-        let output_structure = traced_output.parameter_structure();
-        let output_atoms = traced_output.into_parameters().map(|output| output.atom).collect::<Vec<_>>();
-        Ok((output_structure, output_atoms))
-    }
-}
-
-/// Type-directed tracing family for one staged carrier pair.
-///
-/// Unifies the input side (rebuilding a type exemplar with type-directed traced leaves via
-/// [`into_type_traced`](Self::into_type_traced)) and the output side (lowering a type-traced output back to type
-/// metadata and staged atoms via [`from_type_traced`](Self::from_type_traced)) into a single trait. Both
-/// directions share the same [`Staged`](Self::Staged) and [`Traced`](Self::Traced) projections.
-#[doc(hidden)]
-pub trait TypeTracing<T: Type + Display + Parameter, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>:
-    Parameterized<T, ParameterStructure: Clone>
-{
-    /// Staged concrete leaf family used by the traced program.
-    type Staged: Parameterized<V, ParameterStructure = Self::ParameterStructure>;
-
-    /// Type-traced version of this family for one staged carrier pair.
-    type Traced: Parameterized<JitTracer<T, V, O, L>, ParameterStructure = Self::ParameterStructure>;
-
-    /// Rebuilds `self` with type-directed traced leaves owned by `builder`.
-    fn into_type_traced(
-        self,
-        builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
-        staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
-    ) -> Result<Self::Traced, TraceError>;
-
-    /// Lowers one type-traced output back to type metadata and output atoms.
-    fn from_type_traced(traced_output: Self::Traced) -> Result<(Self, Vec<AtomId>), TraceError>;
-}
-
-impl<Value, T, V, O, L> TypeTracing<T, V, O, L> for Value
-where
-    Value: Parameterized<T, ParameterStructure: Clone>,
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    Value::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
-{
-    type Staged = Value::To<V>;
-    type Traced = Value::To<JitTracer<T, V, O, L>>;
-
-    fn into_type_traced(
-        self,
-        builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
-        staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
-    ) -> Result<Self::Traced, TraceError> {
-        let structure = self.parameter_structure();
-        Self::Traced::from_parameters(
-            structure,
-            self.into_parameters().map(|r#type| {
-                let atom = builder.borrow_mut().add_input_abstract(r#type);
-                JitTracer::<T, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
-            }),
-        )
-        .map_err(TraceError::from)
-    }
-
-    fn from_type_traced(traced_output: Self::Traced) -> Result<(Self, Vec<AtomId>), TraceError> {
-        let output_structure = traced_output.parameter_structure();
-        let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
-        let output_types = Value::from_parameters(
-            output_structure,
-            traced_outputs.iter().map(|output| output.tpe().into_owned()).collect::<Vec<_>>(),
-        )?;
-        let output_atoms = traced_outputs.into_iter().map(|output| output.atom).collect::<Vec<_>>();
-        Ok((output_types, output_atoms))
-    }
-}
-
 /// Tracer used while staging JIT programs.
 #[derive(Clone)]
 pub struct JitTracer<
@@ -503,6 +360,91 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 }
 
+fn traced_input_from_values<Input, V, O, L>(
+    input: Input,
+    builder: Rc<RefCell<GraphBuilder<O, ArrayType, V>>>,
+    staging_error: Rc<RefCell<Option<TraceError>>>,
+    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+) -> Result<Input::To<JitTracer<ArrayType, V, O, L>>, TraceError>
+where
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    V: Traceable<ArrayType>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+{
+    let structure = input.parameter_structure();
+    Input::To::<JitTracer<ArrayType, V, O, L>>::from_parameters(
+        structure,
+        input.into_parameters().map(|value| {
+            let atom = builder.borrow_mut().add_input(&value);
+            JitTracer::<ArrayType, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+        }),
+    )
+    .map_err(TraceError::from)
+}
+
+fn traced_output_to_structure_and_atoms<Output, V, O, L>(
+    traced_output: Output::To<JitTracer<ArrayType, V, O, L>>,
+) -> Result<(Output::ParameterStructure, Vec<AtomId>), TraceError>
+where
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    V: Traceable<ArrayType>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+{
+    let output_structure = traced_output.parameter_structure();
+    let output_atoms = traced_output.into_parameters().map(|output| output.atom()).collect::<Vec<_>>();
+    Ok((output_structure, output_atoms))
+}
+
+fn type_traced_input_from_types<Input, T, V, O, L>(
+    input_types: Input,
+    builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
+    staging_error: Rc<RefCell<Option<TraceError>>>,
+    engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
+) -> Result<Input::To<JitTracer<T, V, O, L>>, TraceError>
+where
+    Input: Parameterized<T, ParameterStructure: Clone>,
+    T: Type + Display + Parameter,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    Input::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
+{
+    let structure = input_types.parameter_structure();
+    Input::To::<JitTracer<T, V, O, L>>::from_parameters(
+        structure,
+        input_types.into_parameters().map(|r#type| {
+            let atom = builder.borrow_mut().add_input_abstract(r#type);
+            JitTracer::<T, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+        }),
+    )
+    .map_err(TraceError::from)
+}
+
+fn type_traced_output_to_types_and_atoms<Output, T, V, O, L>(
+    traced_output: Output::To<JitTracer<T, V, O, L>>,
+) -> Result<(Output, Vec<AtomId>), TraceError>
+where
+    Output: Parameterized<T, ParameterStructure: Clone>,
+    T: Type + Display + Parameter,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    Output::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
+{
+    let output_structure = traced_output.parameter_structure();
+    let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
+    let output_types = Output::from_parameters(
+        output_structure,
+        traced_outputs.iter().map(|output| output.tpe().into_owned()).collect::<Vec<_>>(),
+    )?;
+    let output_atoms = traced_outputs.into_iter().map(|output| output.atom()).collect::<Vec<_>>();
+    Ok((output_types, output_atoms))
+}
+
 fn trace_program_with_operation_options<F, Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
@@ -513,9 +455,13 @@ where
     V: Traceable<ArrayType>,
     O: Clone + 'static + InterpretableOp<ArrayType, V>,
     L: Clone + 'static,
-    Input: TraceInput<V, O, L>,
-    Output: TraceOutput<V, O, L>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    F: FnOnce(
+        Input::To<JitTracer<ArrayType, V, O, L>>,
+    ) -> Result<Output::To<JitTracer<ArrayType, V, O, L>>, TraceError>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
@@ -524,11 +470,11 @@ where
     let builder = Rc::new(RefCell::new(GraphBuilder::<O, ArrayType, V>::new()));
     let staging_error = Rc::new(RefCell::new(None));
     let concrete_input = Input::from_parameters(input_structure.clone(), input_values.clone())?;
-    let traced_input = concrete_input.into_traced(builder.clone(), staging_error.clone(), engine)?;
+    let traced_input = traced_input_from_values(concrete_input, builder.clone(), staging_error.clone(), engine)?;
 
     let (output_structure, outputs) = {
         let traced_output = function(traced_input)?;
-        Output::from_traced(traced_output)?
+        traced_output_to_structure_and_atoms::<Output, V, O, L>(traced_output)?
     };
 
     if let Some(error) = staging_error.borrow_mut().take() {
@@ -549,24 +495,26 @@ fn trace_program_from_types_with_operation_options<F, Input, Output, T, V, O, L>
     function: F,
     input_types: Input,
     simplify_program: bool,
-) -> Result<(Output, Program<T, V, Input::Staged, Output::Staged, O>), TraceError>
+) -> Result<(Output, Program<T, V, Input::To<V>, Output::To<V>, O>), TraceError>
 where
     T: Type + Display + Parameter,
     V: Traceable<T>,
     O: Clone + 'static + Op<T>,
     L: Clone + 'static,
-    Input: TypeTracing<T, V, O, L>,
-    Output: TypeTracing<T, V, O, L>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<T, ParameterStructure: Clone>,
+    Output: Parameterized<T, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
+    F: FnOnce(Input::To<JitTracer<T, V, O, L>>) -> Result<Output::To<JitTracer<T, V, O, L>>, TraceError>,
 {
     let input_structure = input_types.parameter_structure();
     let builder = Rc::new(RefCell::new(GraphBuilder::<O, T, V>::new()));
     let staging_error = Rc::new(RefCell::new(None));
-    let traced_input = input_types.into_type_traced(builder.clone(), staging_error.clone(), engine)?;
+    let traced_input = type_traced_input_from_types(input_types, builder.clone(), staging_error.clone(), engine)?;
 
     let (output_structure, output_types, outputs) = {
         let traced_output = function(traced_input)?;
-        let (output_types, outputs) = Output::from_type_traced(traced_output)?;
+        let (output_types, outputs) = type_traced_output_to_types_and_atoms::<Output, T, V, O, L>(traced_output)?;
         let output_structure = output_types.parameter_structure();
         (output_structure, output_types, outputs)
     };
@@ -579,7 +527,7 @@ where
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
     let program =
-        Program::from_graph(builder.build::<Input::Staged, Output::Staged>(outputs, input_structure, output_structure));
+        Program::from_graph(builder.build::<Input::To<V>, Output::To<V>>(outputs, input_structure, output_structure));
     let program = if simplify_program { program.simplify()? } else { program };
     Ok((output_types, program))
 }
@@ -593,9 +541,13 @@ pub fn trace_program<E, F, Input, Output, V>(
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    F: FnOnce(
+        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    ) -> Result<Output::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
@@ -613,9 +565,13 @@ where
     V: Traceable<ArrayType>,
     O: Clone + 'static + InterpretableOp<ArrayType, V>,
     L: Clone + 'static,
-    Input: TraceInput<V, O, L>,
-    Output: TraceOutput<V, O, L>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    F: FnOnce(
+        Input::To<JitTracer<ArrayType, V, O, L>>,
+    ) -> Result<Output::To<JitTracer<ArrayType, V, O, L>>, TraceError>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
@@ -627,14 +583,20 @@ pub fn trace_program_from_types<E, F, Input, Output, T, V>(
     engine: &E,
     function: F,
     input_types: Input,
-) -> Result<(Output, Program<T, V, Input::Staged, Output::Staged, E::TracingOperation>), TraceError>
+) -> Result<(Output, Program<T, V, Input::To<V>, Output::To<V>, E::TracingOperation>), TraceError>
 where
     E: Engine<Type = T, Value = V>,
     T: Type + Display + Parameter,
     V: Traceable<T>,
-    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<T, ParameterStructure: Clone>,
+    Output: Parameterized<T, ParameterStructure: Clone>,
+    Input::Family:
+        ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>,
+    Output::Family:
+        ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>,
+    F: FnOnce(
+        Input::To<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>,
+    ) -> Result<Output::To<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
     E::TracingOperation: Op<T>,
 {
     trace_program_from_types_with_operation_options(engine, function, input_types, true)
@@ -645,15 +607,17 @@ pub(crate) fn trace_program_from_types_for_operation<F, Input, Output, T, V, O, 
     engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input_types: Input,
-) -> Result<(Output, Program<T, V, Input::Staged, Output::Staged, O>), TraceError>
+) -> Result<(Output, Program<T, V, Input::To<V>, Output::To<V>, O>), TraceError>
 where
     T: Type + Display + Parameter,
     V: Traceable<T>,
     O: Clone + 'static + Op<T>,
     L: Clone + 'static,
-    Input: TypeTracing<T, V, O, L>,
-    Output: TypeTracing<T, V, O, L>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<T, ParameterStructure: Clone>,
+    Output: Parameterized<T, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
+    F: FnOnce(Input::To<JitTracer<T, V, O, L>>) -> Result<Output::To<JitTracer<T, V, O, L>>, TraceError>,
 {
     trace_program_from_types_with_operation_options(engine, function, input_types, true)
 }
@@ -667,9 +631,13 @@ pub fn jit<E, F, Input, Output, V>(
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    Input: TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    F: FnOnce(
+        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    ) -> Result<Output::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
@@ -688,9 +656,13 @@ where
     V: Traceable<ArrayType>,
     O: Clone + 'static + InterpretableOp<ArrayType, V>,
     L: Clone + 'static,
-    Input: TraceInput<V, O, L>,
-    Output: TraceOutput<V, O, L>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    F: FnOnce(
+        Input::To<JitTracer<ArrayType, V, O, L>>,
+    ) -> Result<Output::To<JitTracer<ArrayType, V, O, L>>, TraceError>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
@@ -703,14 +675,20 @@ pub fn jit_from_types<E, F, Input, Output, T, V>(
     engine: &E,
     function: F,
     input_types: Input,
-) -> Result<(Output, CompiledFunction<T, V, Input::Staged, Output::Staged, E::TracingOperation>), TraceError>
+) -> Result<(Output, CompiledFunction<T, V, Input::To<V>, Output::To<V>, E::TracingOperation>), TraceError>
 where
     E: Engine<Type = T, Value = V>,
     T: Type + Display + Parameter,
     V: Traceable<T>,
-    Input: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    Output: TypeTracing<T, V, E::TracingOperation, E::LinearOperation>,
-    F: FnOnce(Input::Traced) -> Result<Output::Traced, TraceError>,
+    Input: Parameterized<T, ParameterStructure: Clone>,
+    Output: Parameterized<T, ParameterStructure: Clone>,
+    Input::Family:
+        ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>,
+    Output::Family:
+        ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>,
+    F: FnOnce(
+        Input::To<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>,
+    ) -> Result<Output::To<JitTracer<T, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
     E::TracingOperation: Op<T>,
 {
     let (output_types, program) = trace_program_from_types(engine, function, input_types)?;

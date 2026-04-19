@@ -12,7 +12,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        TraceError, TraceInput, TraceOutput, Traceable, Value, ZeroLike,
+        TraceError, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{JitTracer, jit, trace_program},
@@ -166,11 +166,13 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<Array
 impl<
     E,
     V: Value<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq> + TraceInput<V, E::TracingOperation, E::LinearOperation>,
-    Output: Parameterized<Self, ParameterStructure: Clone> + TraceOutput<V, E::TracingOperation, E::LinearOperation>,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Output: Parameterized<Self, ParameterStructure: Clone>,
 > JvpInvocationLeaf<E, Input, Output> for V
 where
     E: Engine<Type = ArrayType, Value = V>,
+    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -181,8 +183,8 @@ where
         >,
     E::LinearOperation: InterpretableOp<ArrayType, V> + Op<ArrayType>,
 {
-    type FunctionInput = Input::Traced;
-    type FunctionOutput = Output::Traced;
+    type FunctionInput = Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>;
+    type FunctionOutput = Output::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>;
 
     fn invoke<F>(engine: &E, function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
     where
@@ -213,10 +215,8 @@ impl<
 where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<V>: TraceInput<V, O, L, Traced = Input>,
-    Output::To<V>: TraceOutput<V, O, L, Traced = Output>,
-    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
-    Output::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<JitTracer<ArrayType, V, O, L>> = Input>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<JitTracer<ArrayType, V, O, L>> = Output>,
     O: InterpretableOp<
             ArrayType,
             Linearized<JitTracer<ArrayType, V, O, L>, LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>>,
@@ -250,27 +250,37 @@ impl<
 > JvpInvocationLeaf<E, Input, Output> for Batch<V>
 where
     E: Engine<Type = ArrayType, Value = V>,
-    Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
-    Input::Family: ParameterizedFamily<V>,
-    Output::Family: ParameterizedFamily<V>,
+    Vec<V>: Parameterized<
+            V,
+            ParameterStructure = Vec<Placeholder>,
+            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = Vec<
+                JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+            >,
+        >,
+    Input::Family:
+        ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    Output::Family:
+        ParameterizedFamily<V> + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     Input::To<V>: Clone
-        + Parameterized<V, ParameterStructure: Clone + PartialEq, To<Batch<V>> = Input>
-        + TraceInput<V, E::TracingOperation, E::LinearOperation>,
+        + Parameterized<
+            V,
+            ParameterStructure: Clone + PartialEq,
+            To<Batch<V>> = Input,
+            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = Input::To<
+                JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+            >,
+        >,
     Output::To<V>: Clone
-        + Parameterized<V, ParameterStructure: Clone + PartialEq, To<Batch<V>> = Output>
-        + TraceOutput<V, E::TracingOperation, E::LinearOperation>,
-    Vec<V>: TraceInput<
+        + Parameterized<
             V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+            ParameterStructure: Clone + PartialEq,
+            To<Batch<V>> = Output,
+            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = Output::To<
+                JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+            >,
         >,
-    Vec<V>: TraceOutput<
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            Traced = Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-        >,
+    <Vec<V> as Parameterized<V>>::Family:
+        ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     V::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
     E::TracingOperation: Op<ArrayType>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
@@ -284,8 +294,8 @@ where
     LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
         CoreLinearReplayOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
 {
-    type FunctionInput = <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced;
-    type FunctionOutput = <Output::To<V> as TraceOutput<V, E::TracingOperation, E::LinearOperation>>::Traced;
+    type FunctionInput = Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>;
+    type FunctionOutput = Output::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>;
 
     fn invoke<F>(engine: &E, function: F, primals: Input, tangents: Input) -> Result<(Output, Output), TraceError>
     where
@@ -311,7 +321,7 @@ where
             Program<ArrayType, V, Input::To<V>, Output::To<V>, E::TracingOperation>,
         ) = trace_program(
             engine,
-            |staged_input: <Input::To<V> as TraceInput<V, E::TracingOperation, E::LinearOperation>>::Traced| {
+            |staged_input| {
                 let staged_input: Self::FunctionInput = staged_input;
                 let staged_output: Self::FunctionOutput = function(staged_input);
                 Ok(staged_output)
@@ -340,7 +350,7 @@ where
             crate::tracing_v2::CompiledFunction<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>,
         ) = jit(
             engine,
-            |jit_combined: Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
+            |jit_combined| {
                 let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
 
                 // Replay the forward pass symbolically and linearize at the symbolic primals.

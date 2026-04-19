@@ -11,7 +11,6 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         CompiledFunction, JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
-        jit::{TraceInput, TraceOutput},
         operations::{
             AddOp, FlatTracedVMap, InterpretableOp, MulOp, NegOp, Op, VMapOp, VMapTracingOperation, VectorizableOp,
         },
@@ -223,6 +222,8 @@ where
         + ParameterizedFamily<Self>
         + ParameterizedFamily<V>
         + ParameterizedFamily<ArrayType>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Self> = Input, To<V> = Input::To<V>>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Self> = Output, To<V> = Output::To<V>>,
     V: Parameterized<
             V,
             To<JitTracer<ArrayType, V, O, L>> = JitTracer<ArrayType, V, O, L>,
@@ -235,10 +236,6 @@ where
             ParameterStructure = Vec<Placeholder>,
         >,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-    Input::To<V>: TraceInput<V, O, L>,
-    Output::To<V>: TraceOutput<V, O, L>,
-    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
-    Output::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
     O: InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
@@ -296,8 +293,7 @@ where
                     }
                     lane_outputs.push(outputs.pop().expect("single-lane batches should contain one output"));
                 }
-                Output::To::<JitTracer<ArrayType, V, O, L>>::from_parameters(output_structure, lane_outputs)
-                    .map_err(TraceError::from)
+                Output::from_parameters(output_structure, lane_outputs).map_err(TraceError::from)
             },
             exemplar_input_types,
         )?;

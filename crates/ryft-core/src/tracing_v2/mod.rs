@@ -57,10 +57,7 @@ pub use batch::{Batch, stack, unstack, vmap};
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use graph::{Atom, AtomId, Equation, Graph, GraphBuilder};
-pub use jit::{
-    CompiledFunction, JitTracer, TraceInput, TraceOutput, TypeTracing, jit, jit_from_types, trace_program,
-    trace_program_from_types,
-};
+pub use jit::{CompiledFunction, JitTracer, jit, jit_from_types, trace_program, trace_program_from_types};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
     grad, hessian, jacfwd, jacrev, jvp_program, value_and_grad, vjp,

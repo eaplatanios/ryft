@@ -12,11 +12,11 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        CompiledFunction, JitTracer, LinearTerm, Program, TraceError, TraceInput, TraceOutput, Traceable, Value,
-        ZeroLike,
+        CompiledFunction, JitTracer, LinearTerm, TraceError, Traceable, Value, ZeroLike,
         engine::Engine,
         linear::{
-            linearize_program, replay_program_graph_linearized_jit, transpose_linear_program_with_output_examples,
+            linearize_program, replay_program_graph_linearized_jit, trace_flat_program_from_input_types,
+            transpose_linear_program_with_output_examples,
         },
         program::{LinearProgramOpRef, ProgramOpRef},
     },
@@ -419,10 +419,8 @@ impl<
 where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<V>: TraceInput<V, O, L, Traced = Input>,
-    Output::To<V>: TraceOutput<V, O, L, Traced = Output>,
-    Input::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Input::To<V>, Traced = Input>,
-    Output::To<ArrayType>: crate::tracing_v2::TypeTracing<ArrayType, V, O, L, Staged = Output::To<V>, Traced = Output>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<JitTracer<ArrayType, V, O, L>> = Input, To<V> = Input::To<V>>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<JitTracer<ArrayType, V, O, L>> = Output, To<V> = Output::To<V>>,
     O: InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>
@@ -436,28 +434,12 @@ where
             input_structure.clone(),
             traced_inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
-        let exemplar_engine = traced_inputs.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
-
-        let (exemplar_output_types, body_program): (
-            Output::To<ArrayType>,
-            Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
-        ) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
-            _,
-            Input::To<ArrayType>,
-            Output::To<ArrayType>,
-            ArrayType,
-            V,
-            O,
-            L,
-        >(
-            exemplar_engine,
-            move |staged_input| {
-                let adapted_input =
-                    Input::from_parameters(input_structure, staged_input.into_parameters().collect::<Vec<_>>())?;
-                Ok(function(adapted_input))
-            },
-            exemplar_input_types,
-        )?;
+        let (exemplar_output_types, body_program) =
+            trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, _>(
+                |staged_input| Ok(function(staged_input)),
+                traced_inputs.as_slice(),
+                exemplar_input_types,
+            )?;
 
         let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
