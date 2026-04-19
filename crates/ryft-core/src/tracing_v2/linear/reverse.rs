@@ -243,10 +243,10 @@ where
 
 /// Batched dispatch for [`value_and_grad`], enabling standalone
 /// `vmap(|x| value_and_grad(f, x), inputs)` -- computing per-element function values and gradients
-/// over a batch without requiring an outer [`jit`] wrapper.
+/// over a batch without requiring an outer [`trace_program`] wrapper.
 ///
 /// Uses a trace-once strategy for [`Batch`]: the user function is traced once to a [`Program`],
-/// and a second [`Program`] that produces `(V, Input::To<V>)` per lane is compiled via [`jit`].
+/// and a second [`Program`] that produces `(V, Input::To<V>)` per lane is compiled via [`trace_program`].
 /// Values and gradients are collected per lane and stacked separately.
 impl<
     E,
@@ -329,7 +329,7 @@ where
             .simplify()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
-        let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = jit(
+        let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = trace_program(
             engine,
             |jit_primals: Vec<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
                 let (output, gradient) = reverse_mode_scalar_traced_program(&flat_program, jit_primals)?;

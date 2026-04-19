@@ -31,8 +31,9 @@
 //! # Op selection through `Engine`
 //!
 //! The public tracing surface ([`jvp`](crate::tracing_v2::jvp), [`vjp`](crate::tracing_v2::vjp),
-//! [`jit`](fn@crate::tracing_v2::jit), [`trace_program`](crate::tracing_v2::trace_program), and
-//! friends) is parameterized by an [`Engine`], and the staged op carriers used inside those
+//! [`trace_program`](crate::tracing_v2::trace_program),
+//! [`trace_program_from_types`](crate::tracing_v2::trace_program_from_types), and friends) is
+//! parameterized by an [`Engine`], and the staged op carriers used inside those
 //! transforms are picked by that engine via [`Engine::TracingOperation`] and
 //! [`Engine::LinearOperation`]. This is what keeps the op universe open: a backend contributes
 //! its own closed carrier (for example, `XlaPrimitiveOp`) by implementing [`Engine`] with those
@@ -371,7 +372,8 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
 ///
 /// A [`TracingOperation`] is the operation flavor carried by the ordinary staged program produced by
 /// transforms like [`trace_program`](crate::tracing_v2::trace_program) and
-/// [`jit`](fn@crate::tracing_v2::jit). In practice this is usually one backend-owned closed
+/// [`trace_program_from_types`](crate::tracing_v2::trace_program_from_types). In practice this is
+/// usually one backend-owned closed
 /// enum such as [`PrimitiveOp`] or `XlaPrimitiveOp`, but the trait is written as an additive bundle
 /// so any type that provides the same capabilities can serve as the carrier.
 ///

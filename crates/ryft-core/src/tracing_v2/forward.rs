@@ -15,7 +15,7 @@ use crate::{
         LinearProgramOpRef, Program, TraceError, Traceable, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
-        jit::{JitTracer, jit, trace_program},
+        jit::{JitTracer, trace_program},
         linear::{LinearProgram, Linearized, jvp_program, jvp_traced, linearize_traced_program},
         operations::{CoreLinearReplayOp, DifferentiableOp, InterpretableOp, Op},
     },
@@ -235,12 +235,12 @@ where
 }
 
 /// Batched dispatch for [`jvp`], enabling standalone `vmap(|x| jvp(f, x, dx), inputs)` -- computing
-/// per-element Jacobian-vector products over a batch without requiring an outer [`jit`] wrapper.
+/// per-element Jacobian-vector products over a batch without requiring an outer [`trace_program`] wrapper.
 ///
 /// Uses the same trace-once strategy as the reverse-mode batched dispatch for [`Batch`]: the user
 /// function is traced once to a [`Program`], and a second [`Program`] that
 /// takes primals and tangents and returns `(primal_output, tangent_output)` per lane is compiled via
-/// [`jit`]. Primal and tangent outputs are collected per lane and stacked separately.
+/// [`trace_program`]. Primal and tangent outputs are collected per lane and stacked separately.
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
@@ -345,7 +345,7 @@ where
         let combined_input_count = input_parameter_count * 2;
         let combined_output_count = output_parameter_count * 2;
 
-        let (_, compiled_jvp): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = jit(
+        let (_, compiled_jvp): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) = trace_program(
             engine,
             |jit_combined| {
                 let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);

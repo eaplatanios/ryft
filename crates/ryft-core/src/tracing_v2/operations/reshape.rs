@@ -464,7 +464,7 @@ mod tests {
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing_v2::{
-            JitTracer, LinearProgramBuilder, Program, jit::jit, operations::matrix::ndarray_support::Array2Engine,
+            JitTracer, LinearProgramBuilder, Program, operations::matrix::ndarray_support::Array2Engine, trace_program,
         },
         types::{DataType, Shape},
     };
@@ -694,7 +694,7 @@ mod tests {
         let (_, compiled): (
             ndarray::Array2<f64>,
             Program<ArrayType, ndarray::Array2<f64>, ndarray::Array2<f64>, ndarray::Array2<f64>>,
-        ) = jit(
+        ) = trace_program(
             &engine,
             |x: JitTracer<ArrayType, ndarray::Array2<f64>>| {
                 x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)]))

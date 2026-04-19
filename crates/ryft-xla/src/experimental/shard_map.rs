@@ -70,7 +70,7 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension
 use ryft_core::tracing_v2::operations::{AddOp, MatMulOp, MatrixTransposeOp, MulOp};
 use ryft_core::tracing_v2::{
     Cos, JitTracer, LinearPrimitiveOp, Linearized, MatrixOps, OneLike, Op, Program, Sin, TraceError, Traceable, Value,
-    ZeroLike, jit_from_types,
+    ZeroLike, trace_program_from_types,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -888,7 +888,7 @@ impl ShardMap {
         context.shardy_manual_axes(self.manual_axes())
     }
 
-    /// Traces a shard-map body over local body tensor types using `tracing_v2::jit`.
+    /// Traces a shard-map body over local body tensor types using `tracing_v2::trace_program_from_types`.
     ///
     /// # Parameters
     ///
@@ -1237,7 +1237,11 @@ where
             input_types.parameter_structure(),
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
-        jit_from_types(&engine, |input| Ok(function(input)), cloned_input_types)?
+        {
+            let (output_types, program) =
+                trace_program_from_types(&engine, |input| Ok(function(input)), cloned_input_types)?;
+            (output_types, program.simplify()?)
+        }
     };
     Ok((output_types, program))
 }

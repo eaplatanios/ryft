@@ -31,7 +31,7 @@
 //!   [`grad`], [`value_and_grad`], plus [`jacrev`] / [`jacfwd`] / [`hessian`] helpers.
 //! - `batch` — vectorization via [`vmap`], [`stack`], [`unstack`].
 //! - [`jit`](mod@self::jit) — staged-program capture via [`trace_program`] and compilation via
-//!   [`jit`](fn@self::jit::jit).
+//!   [`trace_program_from_types`] when only abstract input metadata is available.
 
 use thiserror::Error;
 
@@ -55,7 +55,7 @@ mod values;
 pub use batch::{Batch, stack, unstack, vmap};
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub use jit::{JitTracer, jit, jit_from_types, trace_program, trace_program_from_types};
+pub use jit::{JitTracer, trace_program, trace_program_from_types};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
     grad, hessian, jacfwd, jacrev, jvp_program, value_and_grad, vjp,

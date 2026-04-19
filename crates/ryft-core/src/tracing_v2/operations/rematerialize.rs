@@ -493,8 +493,8 @@ mod tests {
     use crate::tracing_v2::{
         JitTracer, Program, Sin,
         engine::ArrayScalarEngine,
-        jit,
         linear::{compile_grad, grad, value_and_grad},
+        trace_program,
     };
 
     use super::*;
@@ -515,7 +515,7 @@ mod tests {
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = jit(
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
             &engine,
             |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
             2.0f64,
@@ -531,7 +531,7 @@ mod tests {
     fn test_rematerialize_jit_program_rendering() {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, program): (f64, Program<ArrayType, f64, f64, f64>) = jit(
+        let (_, program): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
             &engine,
             |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
             2.0f64,
@@ -644,12 +644,13 @@ mod tests {
         let without: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
             let (output, _): (f64, Program<ArrayType, f64, f64, f64>) =
-                jit(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
+                trace_program(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 3.0f64)
+                    .unwrap();
             output
         };
         let with: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) = jit(
+            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
                 &engine,
                 |x: JitTracer<ArrayType, f64>| {
                     Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap())

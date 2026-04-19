@@ -20,7 +20,7 @@ use crate::{
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
-        jit::{JitTracer, jit, jit_for_operation, trace_program},
+        jit::{JitTracer, trace_program},
         operations::{
             CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,
@@ -89,11 +89,7 @@ where
 {
     let exemplar_engine = traced_inputs.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
     let (output_types, traced_program): (Output, Program<ArrayType, V, Input::To<V>, Output::To<V>, O>) =
-        crate::tracing_v2::jit::trace_program_from_types_for_operation::<_, Input, Output, ArrayType, V, O, L>(
-            exemplar_engine,
-            function,
-            input_types,
-        )?;
+        crate::tracing_v2::jit::trace_program_from_types(exemplar_engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let traced_program = traced_program
         .clone_with_structures::<Vec<V>, Vec<V>>(

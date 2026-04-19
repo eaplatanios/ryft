@@ -264,15 +264,7 @@ where
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,
             Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
-        ) = crate::tracing_v2::jit::trace_program_from_types_for_operation::<
-            _,
-            Input::To<ArrayType>,
-            Output::To<ArrayType>,
-            ArrayType,
-            V,
-            O,
-            L,
-        >(
+        ) = crate::tracing_v2::jit::trace_program_from_types(
             exemplar_engine,
             |lane_inputs| {
                 let batched_inputs = Input::To::<Batch<JitTracer<ArrayType, V, O, L>>>::from_parameters(
@@ -297,6 +289,7 @@ where
             },
             exemplar_input_types,
         )?;
+        let body_program = body_program.simplify()?;
 
         let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();
@@ -421,7 +414,7 @@ mod tests {
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = crate::tracing_v2::jit::jit(
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = crate::tracing_v2::trace_program(
             &engine,
             |x: JitTracer<ArrayType, f64>| {
                 let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(

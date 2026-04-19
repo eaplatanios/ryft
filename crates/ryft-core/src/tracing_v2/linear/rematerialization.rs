@@ -49,7 +49,7 @@ where
     ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
+    let (_, compiled) = trace_program::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
         _engine,
         |primals: Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
@@ -221,7 +221,7 @@ where
     ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = jit_for_operation::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
+    let (_, compiled) = trace_program::<_, Input, Input, V, E::TracingOperation, E::LinearOperation>(
         engine,
         |primals: Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
