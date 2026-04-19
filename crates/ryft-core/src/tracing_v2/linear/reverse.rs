@@ -77,8 +77,8 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
-    O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>>,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
+    O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
     if primals.parameter_structure() != tangents.parameter_structure() {
@@ -239,9 +239,9 @@ where
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
     E::TracingOperation:
-        InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>>,
+        InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
     E::LinearOperation: Clone + Op<ArrayType> + 'static,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
 {
     type Value = Tracer<'engine, E>;
     type FunctionInput<'call>
@@ -389,7 +389,8 @@ where
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
-                LinearProgramOpRef<
+                LinearPrimitiveOp<
+                    ArrayType,
                     Tracer<'engine, dyn Engine<
                                 Type = ArrayType,
                                 Value = V,
@@ -399,7 +400,8 @@ where
                 >,
             >,
         >,
-    for<'engine> LinearProgramOpRef<
+    for<'engine> LinearPrimitiveOp<
+        ArrayType,
         Tracer<'engine, dyn Engine<
                     Type = ArrayType,
                     Value = V,

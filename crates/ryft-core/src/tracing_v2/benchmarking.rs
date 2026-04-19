@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, f64, f64>) =
+        let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOp<ArrayType, f64>, f64, f64>) =
             interpret_and_trace(
                 &engine,
                 |x| {

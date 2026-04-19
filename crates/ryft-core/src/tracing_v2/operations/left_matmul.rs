@@ -108,7 +108,7 @@ impl<V: MatrixValue> Op for LeftMatMulOp<V> {
         _is_zero_constant: &dyn Fn(AtomId) -> bool,
         _is_one_constant: &dyn Fn(AtomId) -> bool,
     ) -> Option<Vec<AtomId>> {
-        if crate::tracing_v2::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
+        if self.factor.is_one() { Some(inputs.to_vec()) } else { None }
     }
 }
 

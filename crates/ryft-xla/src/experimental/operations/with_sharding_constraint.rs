@@ -7,8 +7,8 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, LinearProgramOpRef, Op,
-    PrimitiveOp, ProgramOpRef, Tracer, TracingError, VectorizableOp,
+    CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, Tracer,
+    TracingError, VectorizableOp,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -28,8 +28,8 @@ type JitShardMapTracer = Tracer<
     dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            TracingOperation = ProgramOpRef<ShardMapTracer>,
-            LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+            TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
+            LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
         >,
 >;
 use crate::mlir::ToMlir;
@@ -90,14 +90,14 @@ impl WithShardingConstraintOp {
         self.base_custom_primitive::<ShardMapTracer>()
             .with_jvp_rule(self.clone())
             .with_linearized_jit_rule_for::<
-                ProgramOpRef<ShardMapTracer>,
-                LinearProgramOpRef<ShardMapTracer>,
-                LinearProgramOpRef<JitShardMapTracer>,
+                PrimitiveOp<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOp<ArrayType, JitShardMapTracer>,
                 dyn Engine<
                         Type = ArrayType,
                         Value = ShardMapTracer,
-                        TracingOperation = ProgramOpRef<ShardMapTracer>,
-                        LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+                        TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
+                        LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
                     >,
                 _,
             >(self.clone())
@@ -348,7 +348,7 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{LinearOperation, LinearProgramBuilder, LinearTerm};
+    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOp, LinearTerm, ProgramBuilder};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -486,7 +486,11 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ShardMapTensor>::new()));
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            LinearPrimitiveOp<ArrayType, ShardMapTensor>,
+            ArrayType,
+            ShardMapTensor,
+        >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&ShardMapTensor::new(input_type.clone()));
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution =

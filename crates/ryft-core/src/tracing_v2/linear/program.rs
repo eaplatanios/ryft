@@ -11,7 +11,7 @@ pub struct LinearProgram<
     V: Traceable<T> + Parameter,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Clone = LinearProgramOpRef<V>,
+    O: Clone = LinearPrimitiveOp<ArrayType, V>,
 > {
     /// Underlying staged program that replays the linear map.
     program: Program<T, V, O, Input, Output>,
@@ -109,7 +109,7 @@ impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>>
 ///     the primitive outputs.
 fn transpose<V, O>(
     op: &O,
-    builder: &Rc<RefCell<LinearProgramBuilder<V, O>>>,
+    builder: &Rc<RefCell<ProgramBuilder<O, ArrayType, V>>>,
     output_cotangents: &[AtomId],
 ) -> Result<Vec<Option<AtomId>>, TracingError>
 where
@@ -147,7 +147,7 @@ where
     fn tangent_for_atom<V, Input, Output, ProgramOperation, LinearOperation>(
         _program: &Program<ArrayType, V, ProgramOperation, Input, Output>,
         primal_values: &[Option<V>],
-        builder: &Rc<RefCell<LinearProgramBuilder<V, LinearOperation>>>,
+        builder: &Rc<RefCell<ProgramBuilder<LinearOperation, ArrayType, V>>>,
         tangents: &mut [Option<LinearTerm<ArrayType, V, LinearOperation>>],
         atom_id: AtomId,
     ) -> Result<LinearTerm<ArrayType, V, LinearOperation>, TracingError>
@@ -176,7 +176,7 @@ where
         });
     }
     let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
-    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, L>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<L, ArrayType, V>::new()));
     let mut primals: Vec<Option<V>> = vec![None; program.atom_count()];
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atom_count()];
     for (input_atom, input_primal) in program.input_atoms().iter().copied().zip(input_primals.into_iter()) {
@@ -269,7 +269,7 @@ where
     O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
     let zero = program.zero.zero_like();
-    transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V, O>, _, _| {
+    transpose_linear_program_with_output_inputs(program, |builder: &mut ProgramBuilder<O, ArrayType, V>, _, _| {
         Ok(builder.add_input(&zero))
     })
 }
@@ -282,11 +282,11 @@ where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    F: FnMut(&mut LinearProgramBuilder<V, O>, &ArrayType, usize) -> Result<AtomId, TracingError>,
+    F: FnMut(&mut ProgramBuilder<O, ArrayType, V>, &ArrayType, usize) -> Result<AtomId, TracingError>,
     O: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
     fn accumulate<V, O>(
-        builder: &Rc<RefCell<LinearProgramBuilder<V, O>>>,
+        builder: &Rc<RefCell<ProgramBuilder<O, ArrayType, V>>>,
         adjoints: &mut [Option<AtomId>],
         atom: AtomId,
         contribution: AtomId,
@@ -312,7 +312,7 @@ where
     }
 
     let linear_body = &program.program;
-    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<V, O>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<O, ArrayType, V>::new()));
     let mut output_cotangent_inputs = Vec::with_capacity(linear_body.outputs().len());
     for (output_index, output) in linear_body.outputs().iter().enumerate() {
         let output_atom = linear_body.atom(*output).ok_or(TracingError::UnboundAtomId { id: *output })?;
@@ -389,9 +389,12 @@ where
     if output_examples.len() != expected_output_count {
         return Err(TracingError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }
-    transpose_linear_program_with_output_inputs(program, |builder: &mut LinearProgramBuilder<V, O>, _, output_index| {
-        Ok(builder.add_input(&output_examples[output_index].zero_like()))
-    })
+    transpose_linear_program_with_output_inputs(
+        program,
+        |builder: &mut ProgramBuilder<O, ArrayType, V>, _, output_index| {
+            Ok(builder.add_input(&output_examples[output_index].zero_like()))
+        },
+    )
 }
 
 fn lift_traced_constant<'engine, V, O: Clone, L: Clone, E>(

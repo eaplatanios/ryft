@@ -8,7 +8,7 @@ use super::*;
 /// in a shared linear-program builder and stages new linear equations as it is combined with other
 /// terms.
 #[derive(Clone, Parameter)]
-pub struct LinearTerm<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
+pub struct LinearTerm<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearPrimitiveOp<ArrayType, V>> {
     /// Atom id representing this symbolic tangent or cotangent inside the shared linear builder.
     atom: AtomId,
 
@@ -170,4 +170,4 @@ impl<
 /// This is the default tangent payload fed into primitive JVP rules during linearization: the
 /// primal component is an ordinary leaf `V`, while the tangent component is a symbolic
 /// [`LinearTerm`] staged into the linear builder.
-pub type Linearized<V, O = LinearProgramOpRef<V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;
+pub type Linearized<V, O = LinearPrimitiveOp<ArrayType, V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;

@@ -281,9 +281,10 @@ pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
 ///   ```rust,ignore
 ///   use std::{cell::RefCell, rc::Rc};
 ///
-///   use ryft_core::tracing_v2::{LinearOperation, LinearProgramBuilder, LinearTerm, ScaleOp};
+///   use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOp, LinearTerm, ProgramBuilder, ScaleOp};
 ///
-///   let builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
+///   let builder =
+///       Rc::new(RefCell::new(ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new()));
 ///   let cotangent_atom = builder.borrow_mut().add_input(&1.0f64);
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
@@ -296,9 +297,10 @@ pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
 ///   ```rust,ignore
 ///   use std::{cell::RefCell, rc::Rc};
 ///
-///   use ryft_core::tracing_v2::{AddOp, LinearOperation, LinearProgramBuilder, LinearTerm};
+///   use ryft_core::tracing_v2::{AddOp, LinearOperation, LinearPrimitiveOp, LinearTerm, ProgramBuilder};
 ///
-///   let builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
+///   let builder =
+///       Rc::new(RefCell::new(ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new()));
 ///   let cotangent_atom = builder.borrow_mut().add_input(&1.0f64);
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
@@ -313,9 +315,13 @@ pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
 ///   use std::{cell::RefCell, rc::Rc};
 ///
 ///   use ndarray::arr2;
-///   use ryft_core::tracing_v2::{LinearOperation, LinearProgramBuilder, LinearTerm, MatrixTransposeOp};
+///   use ryft_core::tracing_v2::{
+///       LinearOperation, LinearPrimitiveOp, LinearTerm, MatrixTransposeOp, ProgramBuilder,
+///   };
 ///
-///   let builder = Rc::new(RefCell::new(LinearProgramBuilder::<ndarray::Array2<f64>>::new()));
+///   let builder = Rc::new(RefCell::new(
+///       ProgramBuilder::<LinearPrimitiveOp<ArrayType, ndarray::Array2<f64>>, ArrayType, ndarray::Array2<f64>>::new(),
+///   ));
 ///   let cotangent_atom = builder.borrow_mut().add_input(&arr2(&[[1.0, 2.0], [3.0, 4.0]]));
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///

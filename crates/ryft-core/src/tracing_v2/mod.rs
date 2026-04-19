@@ -86,10 +86,7 @@ pub use operations::{
     Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
     LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, Sin, VectorizableOp,
 };
-pub(crate) use programs::is_identity_one;
-pub use programs::{
-    Atom, AtomId, Equation, LinearProgramBuilder, LinearProgramOpRef, Program, ProgramBuilder, ProgramOpRef,
-};
+pub use programs::{Atom, AtomId, Equation, Program, ProgramBuilder};
 pub use values::{OneLike, Traceable, Value, ZeroLike};
 
 /// Error type shared by the `tracing_v2` staging and transform pipeline.

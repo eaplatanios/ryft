@@ -19,7 +19,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        LinearProgramOpRef, Program, Traceable, TracingError, Value, ZeroLike,
+        LinearPrimitiveOp, Program, Traceable, TracingError, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
@@ -256,9 +256,9 @@ where
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
     E::TracingOperation:
-        InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>>,
+        InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
     E::LinearOperation: Clone + Op<ArrayType> + 'static,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input
@@ -417,7 +417,8 @@ where
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
-                LinearProgramOpRef<
+                LinearPrimitiveOp<
+                    ArrayType,
                     Tracer<'engine, dyn Engine<
                                 Type = ArrayType,
                                 Value = V,
@@ -427,7 +428,8 @@ where
                 >,
             >,
         >,
-    for<'engine> LinearProgramOpRef<
+    for<'engine> LinearPrimitiveOp<
+        ArrayType,
         Tracer<'engine, dyn Engine<
                     Type = ArrayType,
                     Value = V,

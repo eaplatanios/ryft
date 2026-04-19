@@ -106,7 +106,7 @@ impl<V: Traceable<ArrayType>> Op for ScaleOp<ArrayType, V> {
         _is_zero_constant: &dyn Fn(AtomId) -> bool,
         _is_one_constant: &dyn Fn(AtomId) -> bool,
     ) -> Option<Vec<AtomId>> {
-        if crate::tracing_v2::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
+        if self.factor.is_one() { Some(inputs.to_vec()) } else { None }
     }
 }
 
@@ -188,7 +188,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::{parameters::Placeholder, tracing_v2::LinearProgramBuilder};
+    use crate::{
+        parameters::Placeholder,
+        tracing_v2::{LinearPrimitiveOp, ProgramBuilder},
+    };
 
     use super::*;
 
@@ -199,7 +202,8 @@ mod tests {
 
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
-        let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
+        let transpose_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ScaleOp::new(3.0f64)

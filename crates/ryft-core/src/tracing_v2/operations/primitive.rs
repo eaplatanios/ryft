@@ -446,14 +446,14 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
                 ScaleOp::<ArrayType, V>::new(factor.clone()).try_simplify(inputs, is_zero_constant, is_one_constant)
             }
             Self::LeftMatMul { factor } => {
-                if crate::tracing_v2::is_identity_one(factor) {
+                if factor.is_one() {
                     Some(inputs.to_vec())
                 } else {
                     None
                 }
             }
             Self::RightMatMul { factor } => {
-                if crate::tracing_v2::is_identity_one(factor) {
+                if factor.is_one() {
                     Some(inputs.to_vec())
                 } else {
                     None
@@ -512,14 +512,14 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
                 ScaleOp::<ArrayType, V>::new(factor.clone()).try_simplify(inputs, is_zero_constant, is_one_constant)
             }
             Self::LeftMatMul { factor } => {
-                if crate::tracing_v2::is_identity_one(factor) {
+                if factor.is_one() {
                     Some(inputs.to_vec())
                 } else {
                     None
                 }
             }
             Self::RightMatMul { factor } => {
-                if crate::tracing_v2::is_identity_one(factor) {
+                if factor.is_one() {
                     Some(inputs.to_vec())
                 } else {
                     None

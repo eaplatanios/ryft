@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, Traceable, Tracer, TracingError, Value, ZeroLike,
+        LinearPrimitiveOp, LinearTerm, PrimitiveOp, Program, Traceable, Tracer, TracingError, Value, ZeroLike,
         engine::Engine,
         linear::{
             linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
@@ -21,9 +21,7 @@ use crate::{
     types::{ArrayType, Type, Typed},
 };
 
-use super::{
-    CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, Op, primitive::LinearPrimitiveOp,
-};
+use super::{CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, Op};
 
 /// Hidden staging trait for the `rematerialize` higher-order primitive.
 #[doc(hidden)]
@@ -46,7 +44,7 @@ pub trait LinearRematerializeOperation<T: Type + Display, V: Traceable<T>>: Clon
 /// Like [`crate::tracing_v2::operations::FlatTracedVMap`], this stores a flattened traced body that
 /// higher-order op nodes can carry around independently of the caller's original parameter shapes.
 #[derive(Clone)]
-pub struct FlatTracedRematerialize<T: Type, V: Traceable<T>, O = ProgramOpRef<V>> {
+pub struct FlatTracedRematerialize<T: Type, V: Traceable<T>, O = PrimitiveOp<ArrayType, V>> {
     /// Canonical input types of the body.
     input_types: Vec<T>,
 
@@ -93,8 +91,8 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
 pub struct RematerializeOp<
     T: Type + Display,
     V: Traceable<T> + Parameter,
-    O: Clone = ProgramOpRef<V>,
-    L: Clone = LinearProgramOpRef<V>,
+    O: Clone = PrimitiveOp<ArrayType, V>,
+    L: Clone = LinearPrimitiveOp<ArrayType, V>,
 > {
     /// The forward body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
@@ -167,7 +165,7 @@ where
     O: InterpretableOp<ArrayType, V>,
     O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
     O: RematerializeTracingOperation<ArrayType, V, L>,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
 {
     fn interpret(
         &self,
@@ -186,11 +184,22 @@ where
 }
 
 impl<V: Value<ArrayType> + ZeroLike + 'static, O: Clone + 'static>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>
-    for RematerializeOp<ArrayType, V, O>
+    DifferentiableOp<
+        ArrayType,
+        V,
+        LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>,
+        O,
+        LinearPrimitiveOp<ArrayType, V>,
+    > for RematerializeOp<ArrayType, V, O>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
+    O: DifferentiableOp<
+            ArrayType,
+            V,
+            LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>,
+            O,
+            LinearPrimitiveOp<ArrayType, V>,
+        >,
     O: InterpretableOp<ArrayType, V>,
     O: for<'engine> InterpretableOp<
             ArrayType,
@@ -201,30 +210,48 @@ where
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = O,
-                            LinearOperation = LinearProgramOpRef<V>,
+                            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
                         >,
                 >,
             >,
         >,
-    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    for<'engine> LinearProgramOpRef<
+    LinearPrimitiveOp<ArrayType, V>: CoreLinearProgramOp<V>,
+    for<'engine> LinearPrimitiveOp<
+        ArrayType,
         Tracer<
             'engine,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >:CoreLinearProgramOp<
         Tracer<
             'engine,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >,
 {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
-        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>>, TracingError>
-    {
+        engine: &dyn Engine<
+            Type = ArrayType,
+            Value = V,
+            TracingOperation = O,
+            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+        >,
+        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>>],
+    ) -> Result<
+        Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>>>,
+        TracingError,
+    > {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
@@ -259,7 +286,11 @@ where
 
 /// Linear-only rematerialization boundary that always carries both the linear body and its transpose body.
 #[derive(Clone)]
-pub struct LinearRematerializeOp<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
+pub struct LinearRematerializeOp<
+    T: Type + Display,
+    V: Traceable<T> + Parameter,
+    O: Clone = LinearPrimitiveOp<ArrayType, V>,
+> {
     /// The forward linear body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
 
@@ -346,7 +377,7 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerial
 /// pullback programs at the provided primal inputs.
 #[allow(private_bounds)]
 pub(crate) fn make_linear_rematerialize<V, O>(
-    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearPrimitiveOp<ArrayType, V>>,
     body: &FlatTracedRematerialize<ArrayType, V, O>,
     input_primals: Vec<V>,
 ) -> Result<LinearRematerializeOp<ArrayType, V>, TracingError>
@@ -355,7 +386,13 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Clone + Op<ArrayType> + 'static,
     O: InterpretableOp<ArrayType, V>,
-    O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
+    O: DifferentiableOp<
+            ArrayType,
+            V,
+            LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>,
+            O,
+            LinearPrimitiveOp<ArrayType, V>,
+        >,
     O: for<'engine> InterpretableOp<
             ArrayType,
             crate::tracing_v2::linear::Linearized<
@@ -365,21 +402,32 @@ where
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = O,
-                            LinearOperation = LinearProgramOpRef<V>,
+                            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
                         >,
                 >,
             >,
         >,
-    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    for<'engine> LinearProgramOpRef<
+    LinearPrimitiveOp<ArrayType, V>: CoreLinearProgramOp<V>,
+    for<'engine> LinearPrimitiveOp<
+        ArrayType,
         Tracer<
             'engine,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >:CoreLinearProgramOp<
         Tracer<
             'engine,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >,
 {
@@ -552,7 +600,7 @@ mod tests {
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
+        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
             interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         approx_eq(output, 2.0f64.sin());
@@ -564,7 +612,7 @@ mod tests {
     fn test_rematerialize_jit_program_rendering() {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, program): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
+        let (_, program): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
             interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         assert_eq!(
@@ -646,18 +694,19 @@ mod tests {
         // The forward result with rematerialize should match the result without it.
         let without: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
+            let (output, _): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
                 interpret_and_trace(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
-                &engine,
-                |x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()),
-                3.0f64,
-            )
-            .unwrap();
+            let (output, _): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+                interpret_and_trace(
+                    &engine,
+                    |x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()),
+                    3.0f64,
+                )
+                .unwrap();
             output
         };
 

@@ -24,8 +24,8 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        Atom, AtomId, Equation, LinearProgramBuilder, LinearProgramOpRef, OneLike, Program, ProgramBuilder, Traceable,
-        TracingError, Value, ZeroLike,
+        Atom, AtomId, Equation, LinearPrimitiveOp, OneLike, Program, ProgramBuilder, Traceable, TracingError, Value,
+        ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
@@ -57,14 +57,15 @@ pub(crate) use program::linearize_program;
 pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
 pub(crate) use reverse::jvp_traced;
 
-type LinearizedTracedValue<'engine, E> = Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>;
+type LinearizedTracedValue<'engine, E> =
+    Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>;
 
 type TracedLinearProgram<'engine, E> = LinearProgram<
     ArrayType,
     Tracer<'engine, E>,
     Vec<Tracer<'engine, E>>,
     Vec<Tracer<'engine, E>>,
-    LinearProgramOpRef<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>,
 >;
 
 #[inline]
@@ -122,8 +123,8 @@ where
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearProgramOpRef<Tracer<'engine, E>>>>,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
 {
     let (outputs, pushforward) = linearize_traced_program::<V, O, L, E>(traced_program, traced_primals)?;
     if outputs.len() != 1 {
@@ -150,7 +151,7 @@ mod tests {
         parameters::Placeholder,
         tracing_v2::{
             CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp,
-            ProgramBuilder, ProgramOpRef, Sin, engine::ArrayScalarEngine, test_support,
+            ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support,
         },
         types::{ArrayType, DataType},
     };
@@ -222,16 +223,22 @@ mod tests {
         }
     }
 
-    impl DifferentiableOp<ArrayType, f64, LinearTerm<ArrayType, f64>, ProgramOpRef<f64>, LinearProgramOpRef<f64>>
-        for PanicReplayOp
+    impl
+        DifferentiableOp<
+            ArrayType,
+            f64,
+            LinearTerm<ArrayType, f64>,
+            PrimitiveOp<ArrayType, f64>,
+            LinearPrimitiveOp<ArrayType, f64>,
+        > for PanicReplayOp
     {
         fn jvp(
             &self,
             _engine: &dyn Engine<
                 Type = ArrayType,
                 Value = f64,
-                TracingOperation = ProgramOpRef<f64>,
-                LinearOperation = LinearProgramOpRef<f64>,
+                TracingOperation = PrimitiveOp<ArrayType, f64>,
+                LinearOperation = LinearPrimitiveOp<ArrayType, f64>,
             >,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
@@ -291,7 +298,7 @@ mod tests {
     #[test]
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
-        let mut builder = ProgramBuilder::<ProgramOpRef<f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let input = builder.add_input(&3.0f64);
         let output = builder.add_equation_prevalidated(
             PrimitiveOp::Custom(Arc::new(primitive)),
@@ -311,7 +318,7 @@ mod tests {
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<LinearProgramOpRef<f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let input = builder.add_input(&0.0f64);
         let output = builder.add_equation_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);

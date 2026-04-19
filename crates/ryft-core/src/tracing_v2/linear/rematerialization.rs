@@ -18,7 +18,7 @@ where
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation:
         InterpretableOp<ArrayType, V> + InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>> + Op<ArrayType>,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -111,7 +111,7 @@ where
         + InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Op<ArrayType>,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -155,7 +155,7 @@ where
         + InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Op<ArrayType>,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,

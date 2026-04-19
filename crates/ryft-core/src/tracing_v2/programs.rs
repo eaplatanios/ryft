@@ -22,8 +22,8 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{Engine, InterpretableOp, LinearPrimitiveOp, Op, PrimitiveOp, Traceable, TracingError},
-    types::{ArrayType, Type, Typed},
+    tracing_v2::{Engine, InterpretableOp, Op, Traceable, TracingError},
+    types::{Type, Typed},
 };
 
 /// Staged atom carrying abstract metadata.
@@ -702,8 +702,8 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
         // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
         if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
@@ -750,8 +750,8 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .collect::<Result<Vec<_>, _>>()?;
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_zero(value));
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if is_identity_one(value));
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
         if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
@@ -805,37 +805,6 @@ impl<O: Clone, T: Type, V: Traceable<T>> Default for ProgramBuilder<O, T, V> {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Canonical operation type used by the default staged program IR.
-///
-/// Most of the core crate stages ordinary programs against this built-in primitive carrier unless a
-/// backend supplies a different carrier through [`Engine::TracingOperation`](crate::tracing_v2::Engine::TracingOperation).
-pub type ProgramOpRef<V> = PrimitiveOp<ArrayType, V>;
-
-/// Canonical operation type used by the default staged linear-program IR.
-///
-/// Linearization and reverse-mode utilities use this as the default carrier for tangent and
-/// cotangent programs unless a backend overrides it through
-/// [`Engine::LinearOperation`](crate::tracing_v2::Engine::LinearOperation).
-pub type LinearProgramOpRef<V> = LinearPrimitiveOp<ArrayType, V>;
-
-/// Shared builder used by the staged linear-program IR. The optional `O` parameter allows callers
-/// to stage against an alternate linear operation carrier.
-pub type LinearProgramBuilder<V, O = LinearProgramOpRef<V>> = ProgramBuilder<O, ArrayType, V>;
-
-// ---------------------------------------------------------------------------
-// Algebraic identity elimination helpers
-// ---------------------------------------------------------------------------
-
-/// Checks if one staged constant is an exact zero.
-pub(crate) fn is_identity_zero<T: Type, V: Traceable<T>>(value: &V) -> bool {
-    value.is_zero()
-}
-
-/// Checks if one staged constant is an exact one.
-pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
-    value.is_one()
 }
 
 #[cfg(test)]

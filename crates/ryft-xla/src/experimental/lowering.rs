@@ -2801,7 +2801,13 @@ mod tests {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             f64,
-            ryft_core::tracing_v2::Program<ArrayType, f64, ryft_core::tracing_v2::ProgramOpRef<f64>, (f64, f64), f64>,
+            ryft_core::tracing_v2::Program<
+                ArrayType,
+                f64,
+                ryft_core::tracing_v2::PrimitiveOp<ArrayType, f64>,
+                (f64, f64),
+                f64,
+            >,
         ) = ryft_core::tracing_v2::interpret_and_trace(
             &engine,
             |inputs| Ok(scalar_bilinear_sin(inputs)),
@@ -2830,7 +2836,13 @@ mod tests {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             f64,
-            ryft_core::tracing_v2::Program<ArrayType, f64, ryft_core::tracing_v2::ProgramOpRef<f64>, f64, f64>,
+            ryft_core::tracing_v2::Program<
+                ArrayType,
+                f64,
+                ryft_core::tracing_v2::PrimitiveOp<ArrayType, f64>,
+                f64,
+                f64,
+            >,
         ) = ryft_core::tracing_v2::interpret_and_trace(
             &engine,
             |x| {
@@ -2868,7 +2880,7 @@ mod tests {
                 f64,
                 f64,
                 (f64, f64),
-                ryft_core::tracing_v2::LinearProgramOpRef<f64>,
+                ryft_core::tracing_v2::LinearPrimitiveOp<ArrayType, f64>,
             >,
         ) = ryft_core::tracing_v2::vjp(
             &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
@@ -2896,7 +2908,7 @@ mod tests {
             ryft_core::tracing_v2::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::ProgramOpRef<f64>,
+                ryft_core::tracing_v2::PrimitiveOp<ArrayType, f64>,
                 (f64, f64),
                 (f64, f64),
             >,
@@ -2936,7 +2948,7 @@ mod tests {
                 Array2<f64>,
                 Array2<f64>,
                 (Array2<f64>, Array2<f64>),
-                ryft_core::tracing_v2::LinearProgramOpRef<Array2<f64>>,
+                ryft_core::tracing_v2::LinearPrimitiveOp<ArrayType, Array2<f64>>,
             >,
         ) = ryft_core::tracing_v2::vjp(
             &ryft_core::tracing_v2::operations::matrix::ndarray_support::Array2Engine::<f64>::new(),

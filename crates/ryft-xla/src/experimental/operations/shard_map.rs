@@ -12,9 +12,8 @@ use ryft_core::{
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
         AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp,
-        LinearProgramBuilder, LinearProgramOpRef, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, Program,
-        ProgramBuilder, ProgramOpRef, Sin, Traceable, Tracer, TracingError, ZeroLike, engine::Engine,
-        forward::JvpTracer,
+        LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, Program, ProgramBuilder, Sin, Traceable, Tracer,
+        TracingError, ZeroLike, engine::Engine, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -33,8 +32,8 @@ type JitShardMapTracer = Tracer<
     dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            TracingOperation = ProgramOpRef<ShardMapTracer>,
-            LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+            TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
+            LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
         >,
 >;
 
@@ -240,14 +239,14 @@ impl ShardMapOp<ShardMapTracer> {
         self.base_custom_primitive()
             .with_jvp_rule(self.clone())
             .with_linearized_jit_rule_for::<
-                ProgramOpRef<ShardMapTracer>,
-                LinearProgramOpRef<ShardMapTracer>,
-                LinearProgramOpRef<JitShardMapTracer>,
+                PrimitiveOp<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOp<ArrayType, JitShardMapTracer>,
                 dyn Engine<
                         Type = ArrayType,
                         Value = ShardMapTracer,
-                        TracingOperation = ProgramOpRef<ShardMapTracer>,
-                        LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+                        TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
+                        LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
                     >,
                 _,
             >(self.clone())
@@ -1074,7 +1073,11 @@ fn try_linearize_traced_shard_map_body<
 > {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let input_structure = vec![ryft_core::parameters::Placeholder; primals.len()];
-    let builder = std::rc::Rc::new(std::cell::RefCell::new(LinearProgramBuilder::new()));
+    let builder = std::rc::Rc::new(std::cell::RefCell::new(ProgramBuilder::<
+        LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+        ArrayType,
+        ShardMapTracer,
+    >::new()));
     let traced_input = primals
         .into_iter()
         .map(|primal| {

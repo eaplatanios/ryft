@@ -115,9 +115,10 @@ where
 {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let input_count = primals.len();
-    let builder = Rc::new(RefCell::new(LinearProgramBuilder::<
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<
+        LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>,
+        ArrayType,
         Tracer<'engine, E>,
-        LinearProgramOpRef<Tracer<'engine, E>>,
     >::new()));
     let traced_input = primals
         .into_iter()

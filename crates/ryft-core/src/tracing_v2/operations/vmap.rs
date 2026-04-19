@@ -11,16 +11,14 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, Traceable, Tracer, TracingError, Value, ZeroLike,
+        LinearPrimitiveOp, LinearTerm, PrimitiveOp, Program, Traceable, Tracer, TracingError, Value, ZeroLike,
         engine::Engine,
         linear::{linearize_program, replay_program_linearized_jit, transpose_linear_program_with_output_examples},
     },
     types::{ArrayType, Type},
 };
 
-use super::{
-    CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, Op, primitive::LinearPrimitiveOp,
-};
+use super::{CoreLinearProgramOp, DifferentiableOp, InterpretableOp, LinearOperation, Op};
 
 /// Hidden staging trait for the `vmap` higher-order primitive.
 #[doc(hidden)]
@@ -44,7 +42,7 @@ pub trait LinearVMapOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// replayed, transposed, and lowered without carrying the caller's original structured parameter
 /// types around.
 #[derive(Clone)]
-pub struct FlatTracedVMap<T: Type, V: Traceable<T>, O = ProgramOpRef<V>> {
+pub struct FlatTracedVMap<T: Type, V: Traceable<T>, O = PrimitiveOp<ArrayType, V>> {
     /// Number of logical lanes represented by this flattened batched body.
     lane_count: usize,
 
@@ -140,8 +138,8 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
 pub struct VMapOp<
     T: Type + Display,
     V: Traceable<T> + Parameter,
-    O: Clone = ProgramOpRef<V>,
-    L: Clone = LinearProgramOpRef<V>,
+    O: Clone = PrimitiveOp<ArrayType, V>,
+    L: Clone = LinearPrimitiveOp<ArrayType, V>,
 > {
     /// Captured flattened forward body for the batched computation.
     body: FlatTracedVMap<T, V, O>,
@@ -214,7 +212,7 @@ where
     O: InterpretableOp<ArrayType, V>,
     O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
     O: VMapTracingOperation<ArrayType, V, L>,
-    LinearProgramOpRef<Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
 {
     fn interpret(
         &self,
@@ -238,11 +236,22 @@ where
 }
 
 impl<V: Value<ArrayType> + ZeroLike + 'static, O: Clone + 'static>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>
-    for VMapOp<ArrayType, V, O>
+    DifferentiableOp<
+        ArrayType,
+        V,
+        LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>,
+        O,
+        LinearPrimitiveOp<ArrayType, V>,
+    > for VMapOp<ArrayType, V, O>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
+    O: DifferentiableOp<
+            ArrayType,
+            V,
+            LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>,
+            O,
+            LinearPrimitiveOp<ArrayType, V>,
+        >,
     O: InterpretableOp<ArrayType, V>,
     O: for<'call> InterpretableOp<
             ArrayType,
@@ -253,30 +262,48 @@ where
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = O,
-                            LinearOperation = LinearProgramOpRef<V>,
+                            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
                         >,
                 >,
             >,
         >,
-    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    for<'call> LinearProgramOpRef<
+    LinearPrimitiveOp<ArrayType, V>: CoreLinearProgramOp<V>,
+    for<'call> LinearPrimitiveOp<
+        ArrayType,
         Tracer<
             'call,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >:CoreLinearProgramOp<
         Tracer<
             'call,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >,
 {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
-        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>>>, TracingError>
-    {
+        engine: &dyn Engine<
+            Type = ArrayType,
+            Value = V,
+            TracingOperation = O,
+            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+        >,
+        inputs: &[crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>>],
+    ) -> Result<
+        Vec<crate::tracing_v2::JvpTracer<V, LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>>>,
+        TracingError,
+    > {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOp<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
@@ -317,7 +344,7 @@ where
 /// Linear programs need slightly more structure than ordinary programs because reverse-mode
 /// transposition must know how to batch both the forward linear map and its transpose.
 #[derive(Clone)]
-pub struct LinearVMapOp<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
+pub struct LinearVMapOp<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearPrimitiveOp<ArrayType, V>> {
     /// Captured flattened forward linear body.
     body: FlatTracedVMap<T, V, O>,
 
@@ -410,7 +437,7 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearVMapOp<Arr
 /// Builds one linearized staged `vmap` op from its primal body at the provided primal inputs.
 #[allow(private_bounds)]
 pub(crate) fn make_linear_vmap<'engine, V, O>(
-    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearPrimitiveOp<ArrayType, V>>,
     body: &FlatTracedVMap<ArrayType, V, O>,
     input_primals: Vec<V>,
 ) -> Result<LinearVMapOp<ArrayType, V>, TracingError>
@@ -419,7 +446,13 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Clone + Op<ArrayType> + 'static,
     O: InterpretableOp<ArrayType, V>,
-    O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
+    O: DifferentiableOp<
+            ArrayType,
+            V,
+            LinearTerm<ArrayType, V, LinearPrimitiveOp<ArrayType, V>>,
+            O,
+            LinearPrimitiveOp<ArrayType, V>,
+        >,
     O: for<'call> InterpretableOp<
             ArrayType,
             crate::tracing_v2::linear::Linearized<
@@ -429,21 +462,32 @@ where
                             Type = ArrayType,
                             Value = V,
                             TracingOperation = O,
-                            LinearOperation = LinearProgramOpRef<V>,
+                            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
                         >,
                 >,
             >,
         >,
-    LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    for<'call> LinearProgramOpRef<
+    LinearPrimitiveOp<ArrayType, V>: CoreLinearProgramOp<V>,
+    for<'call> LinearPrimitiveOp<
+        ArrayType,
         Tracer<
             'call,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >:CoreLinearProgramOp<
         Tracer<
             'call,
-            dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearProgramOpRef<V>>,
+            dyn Engine<
+                    Type = ArrayType,
+                    Value = V,
+                    TracingOperation = O,
+                    LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                >,
         >,
     >,
 {

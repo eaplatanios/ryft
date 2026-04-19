@@ -480,7 +480,7 @@ mod tests {
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing_v2::{
-            LinearProgramBuilder, Program, ProgramOpRef, interpret_and_trace,
+            LinearPrimitiveOp, PrimitiveOp, Program, ProgramBuilder, interpret_and_trace,
             operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},
@@ -713,7 +713,7 @@ mod tests {
             Program<
                 ArrayType,
                 ndarray::Array2<f64>,
-                ProgramOpRef<ndarray::Array2<f64>>,
+                PrimitiveOp<ArrayType, ndarray::Array2<f64>>,
                 ndarray::Array2<f64>,
                 ndarray::Array2<f64>,
             >,
@@ -736,7 +736,11 @@ mod tests {
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
         let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
-        let transpose_builder = Rc::new(RefCell::new(LinearProgramBuilder::<ndarray::Array2<f64>>::new()));
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            LinearPrimitiveOp<ArrayType, ndarray::Array2<f64>>,
+            ArrayType,
+            ndarray::Array2<f64>,
+        >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&output_value);
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ReshapeOp::new(

@@ -543,7 +543,7 @@ mod tests {
 
     use super::*;
     use crate::tracing_v2::{
-        Batch, LinearProgramBuilder, LinearProgramOpRef, OneLike, Program, ProgramOpRef, Tracer, TracingError,
+        Batch, LinearPrimitiveOp, OneLike, PrimitiveOp, Program, ProgramBuilder, Tracer, TracingError,
         engine::ArrayScalarEngine, grad, interpret_and_trace, jvp, vmap,
     };
     use crate::types::{ArrayType, DataType, Shape};
@@ -601,16 +601,22 @@ mod tests {
         }
     }
 
-    impl DifferentiableOp<ArrayType, f64, LinearTerm<ArrayType, f64>, ProgramOpRef<f64>, LinearProgramOpRef<f64>>
-        for ShiftOp
+    impl
+        DifferentiableOp<
+            ArrayType,
+            f64,
+            LinearTerm<ArrayType, f64>,
+            PrimitiveOp<ArrayType, f64>,
+            LinearPrimitiveOp<ArrayType, f64>,
+        > for ShiftOp
     {
         fn jvp(
             &self,
             _engine: &dyn Engine<
                 Type = ArrayType,
                 Value = f64,
-                TracingOperation = ProgramOpRef<f64>,
-                LinearOperation = LinearProgramOpRef<f64>,
+                TracingOperation = PrimitiveOp<ArrayType, f64>,
+                LinearOperation = LinearPrimitiveOp<ArrayType, f64>,
             >,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
@@ -722,15 +728,16 @@ mod tests {
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let (output, compiled): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
-            &engine,
-            {
-                let primitive = primitive.clone();
-                move |x| Ok(stage_custom_traced_unary(x, primitive.clone()))
-            },
-            3.0f64,
-        )
-        .unwrap();
+        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+            interpret_and_trace(
+                &engine,
+                {
+                    let primitive = primitive.clone();
+                    move |x| Ok(stage_custom_traced_unary(x, primitive.clone()))
+                },
+                3.0f64,
+            )
+            .unwrap();
 
         assert_eq!(output, 5.0);
         assert_eq!(compiled.call(4.0f64), Ok(6.0));
@@ -739,7 +746,7 @@ mod tests {
     #[test]
     fn test_custom_primitive_missing_transpose_rule_reports_targeted_error() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let builder = Rc::new(RefCell::new(LinearProgramBuilder::<f64>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new()));
         let cotangent_atom = builder.borrow_mut().add_input(&0.0);
         let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder);
 
@@ -770,7 +777,7 @@ mod tests {
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
-        let result: Result<(f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>), TracingError> =
+        let result: Result<(f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>), TracingError> =
             interpret_and_trace(
                 &engine,
                 {
@@ -816,26 +823,27 @@ mod tests {
             Ok(1.0f64),
         );
 
-        let (output, compiled): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
-            &engine,
-            {
-                let primitive = primitive.clone();
-                move |x: Tracer<ArrayScalarEngine<f64>>| {
-                    let (primal, tangent) = jvp(
-                        &engine,
-                        {
-                            let primitive = primitive.clone();
-                            move |inner| stage_custom_traced_unary(inner, primitive.clone())
-                        },
-                        x.clone(),
-                        x.one_like(),
-                    )?;
-                    Ok(primal + tangent)
-                }
-            },
-            3.0f64,
-        )
-        .unwrap();
+        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+            interpret_and_trace(
+                &engine,
+                {
+                    let primitive = primitive.clone();
+                    move |x: Tracer<ArrayScalarEngine<f64>>| {
+                        let (primal, tangent) = jvp(
+                            &engine,
+                            {
+                                let primitive = primitive.clone();
+                                move |inner| stage_custom_traced_unary(inner, primitive.clone())
+                            },
+                            x.clone(),
+                            x.one_like(),
+                        )?;
+                        Ok(primal + tangent)
+                    }
+                },
+                3.0f64,
+            )
+            .unwrap();
 
         assert_eq!(output, 6.0);
         assert_eq!(compiled.call(4.0f64), Ok(7.0));

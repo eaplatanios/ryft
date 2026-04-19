@@ -399,7 +399,7 @@ pub fn vmap<
 mod tests {
     use indoc::indoc;
 
-    use crate::tracing_v2::{ProgramOpRef, Sin, Tracer, engine::ArrayScalarEngine, test_support};
+    use crate::tracing_v2::{PrimitiveOp, Sin, Tracer, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
+        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
             crate::tracing_v2::interpret_and_trace(
                 &engine,
                 |x| {
