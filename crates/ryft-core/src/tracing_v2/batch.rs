@@ -91,14 +91,14 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>> Neg for Batch<V> {
     }
 }
 
-impl<V: Parameter + ZeroLike> ZeroLike for Batch<V> {
+impl<V: ZeroLike> ZeroLike for Batch<V> {
     #[inline]
     fn zero_like(&self) -> Self {
         Self::new(self.lanes.iter().map(ZeroLike::zero_like).collect())
     }
 }
 
-impl<V: Parameter + OneLike> OneLike for Batch<V> {
+impl<V: OneLike> OneLike for Batch<V> {
     #[inline]
     fn one_like(&self) -> Self {
         Self::new(self.lanes.iter().map(OneLike::one_like).collect())
@@ -106,12 +106,12 @@ impl<V: Parameter + OneLike> OneLike for Batch<V> {
 }
 
 /// Stacks a list of structured inputs into one structured value whose leaves are [`Batch`] values.
-pub fn stack<Input, V>(inputs: Vec<Input>) -> Result<Input::To<Batch<V>>, TraceError>
-where
+pub fn stack<
+    Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<V>>>,
     V: Parameter,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Batch<V>>,
-{
+>(
+    inputs: Vec<Input>,
+) -> Result<Input::To<Batch<V>>, TraceError> {
     let mut inputs = inputs.into_iter();
     let first = inputs.next().ok_or(TraceError::EmptyBatch)?;
     let structure = first.parameter_structure();
@@ -137,12 +137,12 @@ where
 }
 
 /// Splits a structured batch back into one structured value per lane.
-pub fn unstack<Input, V>(batched: Input::To<Batch<V>>) -> Result<Vec<Input>, TraceError>
-where
+pub fn unstack<
+    Input: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<V>>>,
     V: Parameter,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<Batch<V>>,
-{
+>(
+    batched: Input::To<Batch<V>>,
+) -> Result<Vec<Input>, TraceError> {
     let structure = batched.parameter_structure();
     let batches = batched.into_parameters().collect::<Vec<_>>();
     if batches.is_empty() {
@@ -170,16 +170,15 @@ where
 /// Dispatch trait used by [`vmap`] so it can handle both concrete batches and already traced values.
 #[doc(hidden)]
 pub(crate) trait VMapInvocationLeaf<
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
-    Output: Parameterized<Self, ParameterStructure: Clone>,
+    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<Self>>>,
+    Output: Parameterized<Self, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<Self>>>,
 >: Parameter + Sized
 {
     /// Invokes [`vmap`] for one concrete leaf regime.
-    fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
-    where
-        Input::Family: ParameterizedFamily<Batch<Self>>,
-        Output::Family: ParameterizedFamily<Batch<Self>>,
-        F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>;
+    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        function: F,
+        inputs: Vec<Input>,
+    ) -> Result<Vec<Output>, TraceError>;
 }
 
 /// Concrete-value dispatch for [`vmap`]: stacks inputs into [`Batch`] leaves, applies the user function
@@ -191,17 +190,14 @@ pub(crate) trait VMapInvocationLeaf<
 /// through the conditional op-local trait impls on [`Batch`].
 impl<
     V: Traceable<ArrayType> + crate::tracing_v2::Value<ArrayType>,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
+    Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<V>>>,
+    Output: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<V>>>,
 > VMapInvocationLeaf<Input, Output> for V
-where
-    Input::Family: ParameterizedFamily<Batch<V>>,
-    Output::Family: ParameterizedFamily<Batch<V>>,
 {
-    fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
-    where
-        F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>,
-    {
+    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        function: F,
+        inputs: Vec<Input>,
+    ) -> Result<Vec<Output>, TraceError> {
         let batched_input = stack(inputs)?;
         unstack(function(batched_input))
     }
@@ -212,31 +208,42 @@ where
 /// once at a single-lane exemplar and captured as a [`Program`] that lowering can later
 /// emit as packed StableHLO.
 impl<
-    E,
-    V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<E>, ParameterStructure: Clone + PartialEq, To<Tracer<E>> = Input>,
-    Output: Parameterized<Tracer<E>, ParameterStructure: Clone, To<Tracer<E>> = Output>,
-    O: Clone + Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    V: Traceable<ArrayType>
+        + Parameterized<
+            V,
+            ParameterStructure = Placeholder,
+            To<Tracer<E>> = Tracer<E>,
+            Family: ParameterizedFamily<Tracer<E>>,
+        >,
+    Input: Parameterized<
+            Tracer<E>,
+            ParameterStructure: Clone + PartialEq,
+            To<Tracer<E>> = Input,
+            Family: ParameterizedFamily<Batch<Tracer<E>>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
+        >,
+    Output: Parameterized<
+            Tracer<E>,
+            ParameterStructure: Clone,
+            To<Tracer<E>> = Output,
+            Family: ParameterizedFamily<Batch<Tracer<E>>>
+                        + ParameterizedFamily<Tracer<E>>
+                        + ParameterizedFamily<V>
+                        + ParameterizedFamily<ArrayType>,
+        >,
+    O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
     L: Clone,
 > VMapInvocationLeaf<Input, Output> for Tracer<E>
 where
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    Input::Family: ParameterizedFamily<Batch<Tracer<E>>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<Batch<Tracer<E>>>
-        + ParameterizedFamily<Tracer<E>>
-        + ParameterizedFamily<V>
-        + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Input, To<V> = Input::To<V>>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<E>> = Output, To<V> = Output::To<V>>,
-    V: Parameterized<V, To<Tracer<E>> = Tracer<E>, ParameterStructure: Clone + PartialEq>,
-    V::Family: ParameterizedFamily<Tracer<E>>,
     Vec<V>: Parameterized<V, To<Tracer<E>> = Vec<Tracer<E>>, ParameterStructure = Vec<Placeholder>>,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<Tracer<E>>,
 {
-    fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
-    where
-        F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>,
-    {
+    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        function: F,
+        inputs: Vec<Input>,
+    ) -> Result<Vec<Output>, TraceError> {
         let mut inputs = inputs.into_iter();
         let first_input = inputs.next().ok_or(TraceError::EmptyBatch)?;
         let input_structure = first_input.parameter_structure();
@@ -325,19 +332,14 @@ where
 /// `Batch<Batch<V>>` is enforced through the conditional blanket impls on `Batch<_>`.
 impl<
     V: Traceable<ArrayType>,
-    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
-    Output: Parameterized<Batch<V>, ParameterStructure: Clone>,
+    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<Batch<V>>>>,
+    Output: Parameterized<Batch<V>, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<Batch<V>>>>,
 > VMapInvocationLeaf<Input, Output> for Batch<V>
-where
-    Input::Family: ParameterizedFamily<Batch<Batch<V>>>,
-    Output::Family: ParameterizedFamily<Batch<Batch<V>>>,
 {
-    fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
-    where
-        Input::Family: ParameterizedFamily<Batch<Self>>,
-        Output::Family: ParameterizedFamily<Batch<Self>>,
-        F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>,
-    {
+    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        function: F,
+        inputs: Vec<Input>,
+    ) -> Result<Vec<Output>, TraceError> {
         let batched_input = stack(inputs)?;
         unstack(function(batched_input))
     }
@@ -346,15 +348,15 @@ where
 /// Maps `function` over a leading batch axis by stacking inputs, running the batched computation, and then
 /// unstacking the result.
 #[allow(private_bounds)]
-pub fn vmap<F, Input, Output, V>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
-where
-    V: VMapInvocationLeaf<Input, Output>,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Batch<V>>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Output::Family: ParameterizedFamily<Batch<V>>,
+pub fn vmap<
     F: FnOnce(Input::To<Batch<V>>) -> Output::To<Batch<V>>,
-{
+    Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<V>>>,
+    Output: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<V>>>,
+    V: VMapInvocationLeaf<Input, Output>,
+>(
+    function: F,
+    inputs: Vec<Input>,
+) -> Result<Vec<Output>, TraceError> {
     V::invoke(function, inputs)
 }
 

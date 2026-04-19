@@ -115,50 +115,38 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one plain traced literal value inside this lowering context.
-    pub(crate) fn lower_literal_value<V>(&mut self, value: &V) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    pub(crate) fn lower_literal_value<V: MlirLowerableValue>(
+        &mut self,
+        value: &V,
+    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
         lower_literal_value(value, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one packed literal value inside this lowering context.
-    pub(crate) fn lower_packed_literal_value<V>(
+    pub(crate) fn lower_packed_literal_value<V: MlirLowerableValue>(
         &mut self,
         value: &V,
         packed_output_type: &ArrayType,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
         lower_packed_literal_value(value, packed_output_type, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V, O>(
+    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOp<V>>(
         &mut self,
         body: &FlatTracedVMap<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-        O: Clone + Op + XlaOp<V>,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_vmap_results(body, VMapLoweringMode::Forward, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V, O, L>(
+    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOp<V>, L: Clone>(
         &mut self,
         remat_op: &RematerializeOp<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-        O: Clone + Op + XlaOp<V>,
-        L: Clone,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
             remat_op.body().program(),
             input_values,
@@ -211,7 +199,7 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
 /// [`to_mlir_module_for_plain_program`] and related entry points. The core [`PrimitiveOp`] and
 /// [`LinearPrimitiveOp`] enums provide the default blanket implementations, and backends can add
 /// their own closed op carriers by implementing this trait for those enums.
-pub(crate) trait XlaOp<V: Traceable<ArrayType>>: ryft_core::tracing_v2::Op {
+pub(crate) trait XlaOp<V: MlirLowerableValue>: ryft_core::tracing_v2::Op {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -219,39 +207,31 @@ pub(crate) trait XlaOp<V: Traceable<ArrayType>>: ryft_core::tracing_v2::Op {
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue;
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for AddOp {
+impl<V: MlirLowerableValue> XlaOp<V> for AddOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result =
             lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
         Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for MulOp {
+impl<V: MlirLowerableValue> XlaOp<V> for MulOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result =
             lowerer
                 .block
@@ -260,33 +240,27 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for MulOp {
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for NegOp {
+impl<V: MlirLowerableValue> XlaOp<V> for NegOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
         Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for SinOp {
+impl<V: MlirLowerableValue> XlaOp<V> for SinOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result =
             lowerer
                 .block
@@ -295,17 +269,14 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for SinOp {
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for CosOp {
+impl<V: MlirLowerableValue> XlaOp<V> for CosOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result =
             lowerer
                 .block
@@ -314,33 +285,27 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for CosOp {
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for MatrixTransposeOp {
+impl<V: MlirLowerableValue> XlaOp<V> for MatrixTransposeOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result = lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
         Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for MatMulOp {
+impl<V: MlirLowerableValue> XlaOp<V> for MatMulOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
@@ -356,17 +321,14 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for MatMulOp {
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for ScaleOp<ArrayType, V> {
+impl<V: MlirLowerableValue> XlaOp<V> for ScaleOp<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let factor = self.factor();
         let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
@@ -397,17 +359,14 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for ScaleOp<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for LeftMatMulOp<V> {
+impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for LeftMatMulOp<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let factor = self.factor();
         let factor_value = match mode {
             PlainMlirLoweringMode::Packed { lane_count } => {
@@ -431,17 +390,14 @@ impl<V: Traceable<ArrayType> + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for Le
     }
 }
 
-impl<V: Traceable<ArrayType> + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for RightMatMulOp<V> {
+impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for RightMatMulOp<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let factor = self.factor();
         let factor_value = match mode {
             PlainMlirLoweringMode::Packed { lane_count } => {
@@ -465,17 +421,14 @@ impl<V: Traceable<ArrayType> + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for Ri
     }
 }
 
-impl<V: Traceable<ArrayType>> XlaOp<V> for ReshapeOp {
+impl<V: MlirLowerableValue> XlaOp<V> for ReshapeOp {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let output_shape = static_dimensions(self.output_type())?;
         let result = lowerer.block.append_operation(stable_hlo::reshape(
             input_values[0],
@@ -486,20 +439,14 @@ impl<V: Traceable<ArrayType>> XlaOp<V> for ReshapeOp {
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Op + XlaOp<V>, L: Clone> XlaOp<V> for VMapOp<ArrayType, V, O, L>
-where
-    O: XlaOp<V>,
-{
+impl<V: MlirLowerableValue, O: Clone + XlaOp<V>, L: Clone> XlaOp<V> for VMapOp<ArrayType, V, O, L> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lowerer.lower_vmap(self.body(), input_values)
     }
 }
@@ -511,10 +458,7 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        ShardMapTensor: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
             Self::Add => {
                 <AddOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer)
@@ -617,20 +561,14 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Op + XlaOp<V>> XlaOp<V> for LinearVMapOp<ArrayType, V, O>
-where
-    O: XlaOp<V>,
-{
+impl<V: MlirLowerableValue, O: Clone + XlaOp<V>> XlaOp<V> for LinearVMapOp<ArrayType, V, O> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_vmap_results(
             self.body(),
             VMapLoweringMode::Transpose,
@@ -642,20 +580,14 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Op + XlaOp<V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, O>
-where
-    O: XlaOp<V>,
-{
+impl<V: MlirLowerableValue, O: Clone + XlaOp<V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, O> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         _output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
             self.body().program(),
             input_values,
@@ -666,17 +598,14 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V> {
+impl<V: MlirLowerableValue + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
             PrimitiveOp::Add => <AddOp as XlaOp<V>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer),
             PrimitiveOp::Mul => <MulOp as XlaOp<V>>::lower_to_mlir(&MulOp, input_values, output_types, mode, lowerer),
@@ -732,17 +661,14 @@ impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V>
     }
 }
 
-impl<V: Traceable<ArrayType> + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayType, V> {
+impl<V: MlirLowerableValue + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
             LinearPrimitiveOp::Add => {
                 <AddOp as XlaOp<V>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer)
@@ -826,30 +752,21 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V, O>(
+    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOp<V>>(
         &mut self,
         body: &FlatTracedVMap<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-        O: Clone + Op + XlaOp<V>,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_vmap_results(body, VMapLoweringMode::Forward, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V, O, L>(
+    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOp<V>, L: Clone>(
         &mut self,
         remat_op: &RematerializeOp<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        V: MlirLowerableValue,
-        O: Clone + Op + XlaOp<V>,
-        L: Clone,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
             remat_op.body().program(),
             input_values,
@@ -860,18 +777,17 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested Shardy manual computation operation inside this lowering context.
-    pub(crate) fn lower_manual_computation<ProgramInput, ProgramOutput>(
+    pub(crate) fn lower_manual_computation<
+        ProgramInput: Parameterized<ShardMapTensor>,
+        ProgramOutput: Parameterized<ShardMapTensor>,
+    >(
         &mut self,
         outer_inputs: &[ValueRef<'b, 'c, 't>],
         shard_map: &ShardMap,
         program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
         local_input_types: &[ArrayType],
         global_output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-    where
-        ProgramInput: Parameterized<ShardMapTensor>,
-        ProgramOutput: Parameterized<ShardMapTensor>,
-    {
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_manual_computation(
             &mut self.block,
             outer_inputs,
@@ -895,7 +811,13 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 }
 
 /// Lowers a traced shard-map program to a textual StableHLO/Shardy MLIR module.
-pub(crate) fn to_mlir_module<Input, Output, ProgramInput, ProgramOutput, S>(
+pub(crate) fn to_mlir_module<
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
+    ProgramInput: Parameterized<ShardMapTensor>,
+    ProgramOutput: Parameterized<ShardMapTensor>,
+    S: AsRef<str>,
+>(
     shard_map: &ShardMap,
     program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
     global_input_types: &Input,
@@ -903,14 +825,7 @@ pub(crate) fn to_mlir_module<Input, Output, ProgramInput, ProgramOutput, S>(
     global_output_types: &Output,
     _local_output_types: &Output,
     function_name: S,
-) -> Result<String, LoweringError>
-where
-    Input: Parameterized<ArrayType>,
-    Output: Parameterized<ArrayType>,
-    ProgramInput: Parameterized<ShardMapTensor>,
-    ProgramOutput: Parameterized<ShardMapTensor>,
-    S: AsRef<str>,
-{
+) -> Result<String, LoweringError> {
     let function_name = normalize_function_name(function_name.as_ref())?;
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
     let local_input_types = local_input_types.parameters().cloned().collect::<Vec<_>>();
@@ -1161,17 +1076,16 @@ impl MlirLowerableValue for ShardMapTensor {
 /// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
-pub(crate) fn to_mlir_module_for_plain_program<V, Input, Output, O, S>(
-    program: &Program<ArrayType, V, Input, Output, O>,
-    function_name: S,
-) -> Result<String, LoweringError>
-where
+pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
+    O: Clone + XlaOp<V>,
     S: AsRef<str>,
-{
+>(
+    program: &Program<ArrayType, V, Input, Output, O>,
+    function_name: S,
+) -> Result<String, LoweringError> {
     let function_name = normalize_function_name(function_name.as_ref())?;
     let context = MlirContext::new();
     let location = context.unknown_location();
@@ -1658,7 +1572,7 @@ fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
+    O: Clone + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
@@ -1672,7 +1586,7 @@ where
     ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
     where
         B: Block<'b, 'c, 't>,
-        O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
+        O: Clone + XlaOp<V>,
         V: MlirLowerableValue,
         L: Location<'c, 't> + Copy,
     {
@@ -1764,7 +1678,7 @@ fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
+    O: Clone + XlaOp<V>,
     L: Location<'c, 't> + Copy,
 {
     let lane_count = body.lane_count();
@@ -1832,7 +1746,7 @@ fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
+    O: Clone + XlaOp<V>,
 {
     let mut atom_values = vec![None; program.atom_count()];
     for (atom_id, mlir_value) in program.input_atoms().iter().copied().zip(input_values.iter().copied()) {
@@ -1900,7 +1814,7 @@ fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
+    O: Clone + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -2357,7 +2271,7 @@ fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
+    O: Clone + XlaOp<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -2385,7 +2299,7 @@ fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + ryft_core::tracing_v2::Op + XlaOp<V>,
+    O: Clone + XlaOp<V>,
 {
     let equation = &program.equations()[equation_index];
     let output_types = equation

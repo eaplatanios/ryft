@@ -7,7 +7,6 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    fmt::Display,
     ops::{Add, Mul, Neg},
     rc::Rc,
 };
@@ -19,30 +18,18 @@ use crate::{
         engine::Engine,
         operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
     },
-    types::{Type, Typed},
+    types::Typed,
 };
 
 /// Tracer used while staging JIT programs.
-pub struct Tracer<E: Engine + ?Sized>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
+pub struct Tracer<E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
     engine: *const E,
 }
 
-impl<E: Engine + ?Sized> Clone for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<E> {
     fn clone(&self) -> Self {
         Self {
             atom: self.atom,
@@ -53,34 +40,15 @@ where
     }
 }
 
-impl<E: Engine + ?Sized> Parameter for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
-}
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Parameter for Tracer<E> {}
 
-impl<E: Engine + ?Sized> std::fmt::Debug for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
-impl<E: Engine + ?Sized> Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -219,13 +187,7 @@ where
     }
 }
 
-impl<E: Engine + ?Sized> Typed<E::Type> for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Typed<E::Type> for Tracer<E> {
     #[inline]
     fn tpe(&self) -> Cow<'_, E::Type> {
         Cow::Owned(
@@ -239,22 +201,9 @@ where
     }
 }
 
-impl<E: Engine + ?Sized + 'static> Traceable<E::Type> for Tracer<E>
-where
-    E::Type: Type + Display + 'static,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
-}
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Traceable<E::Type> for Tracer<E> {}
 
-impl<E: Engine + ?Sized> ZeroLike for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer<E> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
@@ -263,13 +212,7 @@ where
     }
 }
 
-impl<E: Engine + ?Sized> OneLike for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: Clone + 'static,
-    E::LinearOperation: Clone + 'static,
-{
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<E> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
@@ -278,12 +221,9 @@ where
     }
 }
 
-impl<E: Engine + ?Sized> Add for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: AddTracingOperation<E::Type, E::Value> + Op<E::Type> + Clone + 'static,
-    E::LinearOperation: Clone + 'static,
+impl<
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: AddTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
+> Add for Tracer<E>
 {
     type Output = Self;
 
@@ -293,12 +233,9 @@ where
     }
 }
 
-impl<E: Engine + ?Sized> Mul for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: MulTracingOperation<E::Type, E::Value> + Op<E::Type> + Clone + 'static,
-    E::LinearOperation: Clone + 'static,
+impl<
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: MulTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
+> Mul for Tracer<E>
 {
     type Output = Self;
 
@@ -308,12 +245,9 @@ where
     }
 }
 
-impl<E: Engine + ?Sized> Neg for Tracer<E>
-where
-    E::Type: Type + Display,
-    E::Value: Traceable<E::Type> + Parameter,
-    E::TracingOperation: NegTracingOperation<E::Type, E::Value> + Op<E::Type> + Clone + 'static,
-    E::LinearOperation: Clone + 'static,
+impl<
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: NegTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
+> Neg for Tracer<E>
 {
     type Output = Self;
 
@@ -331,18 +265,12 @@ pub fn interpret_and_trace<E, F, Input, Output>(
     input: Input,
 ) -> Result<(Output, Program<E::Type, E::Value, Input, Output, E::TracingOperation>), TraceError>
 where
-    E: Engine + ?Sized + 'static,
-    E::Type: Type + Display + Parameter,
-    E::Value: Traceable<E::Type>,
-    E::TracingOperation: Clone + 'static + InterpretableOp<E::Type, E::Value>,
-    E::LinearOperation: Clone + 'static,
-    Input: Parameterized<E::Value, ParameterStructure: Clone>,
-    Output: Parameterized<E::Value, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<Tracer<E>>,
-    Output::Family: ParameterizedFamily<Tracer<E>>,
+    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOp<E::Type, E::Value>>
+        + ?Sized
+        + 'static,
+    Input: Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<E>>>,
+    Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<E>>>,
     F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
 {
     let input_structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -382,15 +310,17 @@ pub fn trace<E, F, Input, Output>(
     TraceError,
 >
 where
-    E: Engine + ?Sized + 'static,
-    E::Type: Type + Display + Parameter,
-    E::Value: Traceable<E::Type>,
-    E::TracingOperation: Clone + 'static + Op<E::Type>,
-    E::LinearOperation: Clone + 'static,
-    Input: Parameterized<E::Type, ParameterStructure: Clone>,
-    Output: Parameterized<E::Type, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
-    Output::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
+    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: Op<E::Type>> + ?Sized + 'static,
+    Input: Parameterized<
+            E::Type,
+            ParameterStructure: Clone,
+            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
+        >,
+    Output: Parameterized<
+            E::Type,
+            ParameterStructure: Clone,
+            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<E>>,
+        >,
     F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
 {
     let input_structure = input_types.parameter_structure();

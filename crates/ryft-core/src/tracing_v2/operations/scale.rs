@@ -115,7 +115,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
 
 impl<
     V: Value<ArrayType> + ZeroLike + Mul<Output = V>,
-    O: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V>,
+    O: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V> + 'static,
     OuterLinearOperation: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized

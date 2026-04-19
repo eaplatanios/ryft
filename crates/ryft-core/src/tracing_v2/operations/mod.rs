@@ -56,7 +56,7 @@ use std::{
 };
 
 use crate::{
-    parameters::{Parameter, Parameterized},
+    parameters::Parameterized,
     sharding::Sharding,
     tracing_v2::{
         TraceError, Traceable, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
@@ -181,13 +181,15 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
 }
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
-pub fn lift_jit_constant<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static, E>(
+pub fn lift_jit_constant<
+    V: Traceable<ArrayType>,
+    O: Clone,
+    L,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+>(
     constant: &V,
     exemplar: &Tracer<E>,
-) -> Tracer<E>
-where
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-{
+) -> Tracer<E> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
     Tracer::from_staged_parts(atom, builder, exemplar.staging_error_handle(), exemplar.engine())
@@ -324,11 +326,8 @@ pub trait InterpretableOp<T: Type, V: Typed<T>>: Op<T> {
 ///
 /// Structural validation happens when the forward linear program is built and when any staged ops
 /// emitted by the rule are added to the transpose program.
-pub trait LinearOperation<
-    T: Type + Display,
-    V: Traceable<T> + Parameter,
-    LinearCarrier: Clone = primitive::LinearPrimitiveOp<T, V>,
->: Op<T>
+pub trait LinearOperation<T: Type + Display, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearPrimitiveOp<T, V>>:
+    Op<T>
 {
     /// Applies the transpose rule for reverse-mode differentiation.
     ///
@@ -400,8 +399,13 @@ pub trait TracingOperation<T: Type + Display, V: Traceable<T>, O: Clone, L: Clon
 {
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone, Operation> TracingOperation<T, V, O, L> for Operation where
-    Operation: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L>
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone,
+    L: Clone,
+    Operation: Op<T> + InterpretableOp<T, V> + DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L>,
+> TracingOperation<T, V, O, L> for Operation
 {
 }
 
@@ -416,8 +420,8 @@ pub trait LinearProgramOp<T: Type + Display, V: Traceable<T>>:
 {
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearProgramOp<T, V> for O where
-    O: Op<T> + InterpretableOp<T, V> + LinearOperation<T, V, O>
+impl<T: Type + Display, V: Traceable<T>, O: Clone + Op<T> + InterpretableOp<T, V> + LinearOperation<T, V, O>>
+    LinearProgramOp<T, V> for O
 {
 }
 
@@ -442,8 +446,8 @@ pub(crate) trait CoreLinearProgramOp<V: Traceable<ArrayType>>:
 {
 }
 
-impl<V: Traceable<ArrayType>, O: Clone> CoreLinearProgramOp<V> for O where
-    O: CoreLinearReplayOp<V> + LinearOperation<ArrayType, V, O>
+impl<V: Traceable<ArrayType>, O: Clone + CoreLinearReplayOp<V> + LinearOperation<ArrayType, V, O>>
+    CoreLinearProgramOp<V> for O
 {
 }
 
@@ -483,14 +487,12 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
-    InnerLinearOperation,
-> TracerLinearOperation<V, O, OuterLinearOperation, E> for InnerLinearOperation
-where
     InnerLinearOperation: Clone
         + 'static
         + add::LinearAddOperation<ArrayType, Tracer<E>>
         + neg::LinearNegOperation<ArrayType, Tracer<E>>
         + scale::LinearScaleOperation<ArrayType, Tracer<E>>,
+> TracerLinearOperation<V, O, OuterLinearOperation, E> for InnerLinearOperation
 {
 }
 
@@ -539,10 +541,14 @@ impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type + Display, V: Tra
     }
 }
 
-impl<InnerOperation, T: Type + Display, V: Traceable<T>, Tangent, O: Clone, L: Clone>
-    DifferentiableOp<T, V, Tangent, O, L> for Arc<InnerOperation>
-where
+impl<
     InnerOperation: DifferentiableOp<T, V, Tangent, O, L> + ?Sized,
+    T: Type + Display,
+    V: Traceable<T>,
+    Tangent,
+    O: Clone,
+    L: Clone,
+> DifferentiableOp<T, V, Tangent, O, L> for Arc<InnerOperation>
 {
     #[inline]
     fn jvp(

@@ -169,7 +169,7 @@ where
     }
 }
 
-impl<E, V: Value<ArrayType> + ZeroLike, O: Clone, L: Clone>
+impl<E, V: Value<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + 'static>
     InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<E>>> for RematerializeOp<ArrayType, V, O, L>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
@@ -441,8 +441,8 @@ impl<
     V: Traceable<ArrayType>,
     Input: Parameterized<Tracer<E>, ParameterStructure: Clone, To<Tracer<E>> = Input>,
     Output: Parameterized<Tracer<E>, ParameterStructure: Clone, To<Tracer<E>> = Output>,
-    O: Clone + Op<ArrayType>,
-    L: Clone,
+    O: Clone + Op<ArrayType> + 'static,
+    L: Clone + 'static,
 > RematerializeInvocationLeaf<Input, Output> for Tracer<E>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,

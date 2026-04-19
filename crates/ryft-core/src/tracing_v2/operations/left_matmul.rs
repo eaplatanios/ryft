@@ -126,7 +126,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for LeftMatMulOp<V> {
 
 impl<
     V: Value<ArrayType> + MatrixOps + ZeroLike,
-    O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
+    O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V> + 'static,
     OuterLinearOperation: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized

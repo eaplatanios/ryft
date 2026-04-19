@@ -73,7 +73,7 @@ where
     V: Traceable<ArrayType> + ZeroLike,
     L: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<E>> + Clone,
+    O: InterpretableOp<ArrayType, LinearizedTracedValue<E>> + Clone + 'static,
 {
     replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L, E>, |op, values| {
         InterpretableOp::<ArrayType, LinearizedTracedValue<E>>::interpret(op, &values)

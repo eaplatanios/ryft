@@ -192,18 +192,23 @@ impl<'c> XlaEngine<'c> {
     ///   - `traced`: Traced XLA program to lower.
     ///   - `function_name`: Symbol name to use for the outer `func.func` in the emitted module.
     #[allow(private_bounds, private_interfaces)]
-    pub fn lower<Input, Output, S>(
+    pub fn lower<
+        Input: Parameterized<
+                ArrayType,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
+            >,
+        Output: Parameterized<
+                ArrayType,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
+            >,
+        S: AsRef<str>,
+    >(
         &self,
         traced: &TracedXlaProgram<Input, Output>,
         function_name: S,
-    ) -> Result<String, XlaEngineError>
-    where
-        Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Input::Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-        Output::Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-        S: AsRef<str>,
-    {
+    ) -> Result<String, XlaEngineError> {
         traced.to_mlir_module(function_name).map_err(Into::into)
     }
 
@@ -288,20 +293,25 @@ impl<'c> XlaEngine<'c> {
     ///   - `inputs`: Global input arrays in the order expected by the traced program.
     ///   - `output_types`: One [`ArrayType`] per traced program output.
     #[allow(private_bounds, private_interfaces)]
-    pub fn run<Input, Output, S>(
+    pub fn run<
+        Input: Parameterized<
+                ArrayType,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
+            >,
+        Output: Parameterized<
+                ArrayType,
+                ParameterStructure: Clone,
+                Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
+            >,
+        S: AsRef<str>,
+    >(
         &self,
         traced: &TracedXlaProgram<Input, Output>,
         function_name: S,
         inputs: Vec<Array<'c>>,
         output_types: &[ArrayType],
-    ) -> Result<Vec<Array<'c>>, XlaEngineError>
-    where
-        Input: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-        Input::Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-        Output::Family: ParameterizedFamily<super::shard_map::ShardMapTensor>,
-        S: AsRef<str>,
-    {
+    ) -> Result<Vec<Array<'c>>, XlaEngineError> {
         let mlir_module = self.lower(traced, function_name)?;
         let executable = self.compile(&mlir_module)?;
         self.execute(&executable, inputs, output_types)
