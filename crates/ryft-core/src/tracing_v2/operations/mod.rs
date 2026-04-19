@@ -27,6 +27,26 @@
 //! code which writes `Op` without a type parameter continues to work unchanged. Sub-traits like
 //! [`InterpretableOp`] are also generic over the type descriptor `T`, so the type descriptor always
 //! precedes the value type in all generic parameter lists.
+//!
+//! # Op selection through `Engine`
+//!
+//! The public tracing surface ([`jvp`](crate::tracing_v2::jvp), [`vjp`](crate::tracing_v2::vjp),
+//! [`jit`](fn@crate::tracing_v2::jit), [`trace_program`](crate::tracing_v2::trace_program), and
+//! friends) is parameterized by an [`Engine`], and the staged op carriers used inside those
+//! transforms are picked by that engine via [`Engine::TracingOperation`] and
+//! [`Engine::LinearOperation`]. This is what keeps the op universe open: a backend contributes
+//! its own closed carrier (for example, `XlaPrimitiveOp`) by implementing [`Engine`] with those
+//! associated types pointing at its backend-specific enum, without editing any central dispatch
+//! layer in `tracing_v2`.
+//!
+//! Do **not** reintroduce a `Supports*` umbrella trait that bundles "all capabilities a transform
+//! might need" onto a single bound. Per-op staging is expressed through the small hidden
+//! capability traits that live next to each operation (for example, `add::AddTracingOperation`
+//! and `mul::MulTracingOperation`), and transform code should bound itself on the concrete
+//! engine-selected carrier or on the specific per-op capability traits it actually exercises —
+//! never on a catch-all façade. The [`TracingOperation`] and [`LinearProgramOp`] bundles defined
+//! in this module are additive aliases used only to name the bundle locally; they are not an
+//! extension point and should not grow new "is-supported" requirements.
 
 use std::{
     collections::BTreeSet,
@@ -351,7 +371,7 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
 ///
 /// A [`TracingOperation`] is the operation flavor carried by the ordinary staged graph produced by
 /// transforms like [`trace_program`](crate::tracing_v2::trace_program) and
-/// [`jit`](crate::tracing_v2::jit). In practice this is usually one backend-owned closed
+/// [`jit`](fn@crate::tracing_v2::jit). In practice this is usually one backend-owned closed
 /// enum such as [`PrimitiveOp`] or `XlaPrimitiveOp`, but the trait is written as an additive bundle
 /// so any type that provides the same capabilities can serve as the carrier.
 ///

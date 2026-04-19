@@ -71,7 +71,7 @@ struct LinearShardMapState {
 
 /// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering.
 #[derive(Clone)]
-pub struct ShardMapOp<V: Traceable<ArrayType>> {
+pub struct ShardMapOp<V> {
     body: FlatTracedShardMap,
     input_types: Vec<ArrayType>,
     output_types: Vec<ArrayType>,
@@ -79,7 +79,7 @@ pub struct ShardMapOp<V: Traceable<ArrayType>> {
     marker: PhantomData<fn() -> V>,
 }
 
-impl<V: Traceable<ArrayType>> ShardMapOp<V> {
+impl<V> ShardMapOp<V> {
     /// Creates one ordinary staged shard-map op from its erased body payload.
     #[inline]
     pub fn new(body: FlatTracedShardMap) -> Self {
@@ -139,6 +139,7 @@ impl<V: Traceable<ArrayType>> ShardMapOp<V> {
     /// Returns the shared custom-primitive registration used by this shard-map variant.
     fn base_custom_primitive(&self) -> CustomPrimitive<ArrayType, V>
     where
+        V: Traceable<ArrayType>,
         Self: Clone + InterpretableOp<ArrayType, V> + LinearOperation<ArrayType, V> + 'static,
     {
         CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
@@ -212,13 +213,13 @@ impl ShardMapOp<ShardMapTracer> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Debug for ShardMapOp<V> {
+impl<V> Debug for ShardMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.has_linear_state() { write!(formatter, "LinearShardMap") } else { write!(formatter, "ShardMap") }
     }
 }
 
-impl<V: Traceable<ArrayType>> Display for ShardMapOp<V> {
+impl<V> Display for ShardMapOp<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.has_linear_state() { write!(formatter, "linear_shard_map") } else { write!(formatter, "shard_map") }
     }

@@ -316,12 +316,6 @@ impl ShardMapTensor {
     }
 
     #[inline]
-    /// Returns the array metadata carried by this abstract tensor.
-    pub fn r#type(&self) -> &ArrayType {
-        &self.array_type
-    }
-
-    #[inline]
     /// Returns the preserved constant class when this tensor is known to be all zeros or all ones.
     pub fn constant_kind(&self) -> Option<ShardMapConstantKind> {
         self.constant_kind

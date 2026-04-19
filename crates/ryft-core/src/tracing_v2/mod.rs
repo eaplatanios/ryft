@@ -1,13 +1,37 @@
-//! Prototype tracing design for `ryft-core`.
+//! Composable tracing and staged-program infrastructure for `ryft-core`.
 //!
-//! The key idea in this version is that staged computation is represented using a shared graph over
-//! an open set of operation types:
+//! Staged computation is represented as a shared [`Graph`] over an open set of operation types.
+//! Each equation stores an operation object rather than a tag enum, so backends extend the tracing
+//! surface by contributing their own op carrier instead of editing a central dispatch table.
 //!
-//! - `Parameterized<P>` lifts and lowers structured inputs and outputs.
-//! - `Graph<O, V, In, Out>` is the common staging form.
-//! - Each equation stores an operation object, not a tag enum.
-//! - Primitive ops carry their own `eval`, `jvp`, `batch`, and transpose rules.
-//! - Tracer values carry the transform-local state needed to stage nested traces.
+//! # Module layout
+//!
+//! - `ops::core` — foundational operation traits: [`Op`], [`InterpretableOp`],
+//!   [`LinearOperation`], [`DifferentiableOp`], [`VectorizableOp`]. Every op carrier implements
+//!   these; transforms consume them.
+//! - `ops::staging` — small hidden capability traits (`AddTracingOperation`,
+//!   `MatMulLinearOperation`, etc.) that the transforms bound themselves on. Backends implement
+//!   one per op they stage.
+//! - `ops::primitive` — the built-in [`PrimitiveOp`] / [`LinearPrimitiveOp`] carriers that
+//!   provide a ready-to-use op-set for the default tracing pipeline.
+//! - `ops::custom` — the [`CustomPrimitive`] / [`LinearCustomPrimitive`] subsystem for
+//!   layering user-supplied ops onto any backend carrier without modifying the built-in enums.
+//! - [`graph`] and [`program`] — the shared staging container plus the surface [`Program`] /
+//!   [`LinearProgram`] types. [`Traceable`] and [`Value`] live alongside them as the leaf-value
+//!   traits.
+//! - [`engine`] — the [`Engine`] trait backends implement. It pins the concrete op-set via
+//!   [`Engine::TracingOperation`] and [`Engine::LinearOperation`] associated types, which is how
+//!   op selection is surfaced to transforms rather than via umbrella capability bundles.
+//!
+//! # Transforms
+//!
+//! - [`forward`] — forward-mode AD via [`jvp`], producing [`Dual`] tangents and the underlying
+//!   [`JvpTracer`].
+//! - [`linear`] — linearization, transposition, and reverse-mode AD: [`jvp_program`], [`vjp`],
+//!   [`grad`], [`value_and_grad`], plus [`jacrev`] / [`jacfwd`] / [`hessian`] helpers.
+//! - `batch` — vectorization via [`vmap`], [`stack`], [`unstack`].
+//! - [`jit`](mod@self::jit) — staged-program capture via [`trace_program`] and compilation via
+//!   [`jit`](fn@self::jit::jit).
 
 use thiserror::Error;
 

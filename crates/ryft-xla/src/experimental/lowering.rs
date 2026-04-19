@@ -135,24 +135,16 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V, O, L>(
+    pub(crate) fn lower_vmap<V, O>(
         &mut self,
-        vmap_op: &VMapOp<ArrayType, V, O, L>,
+        body: &FlatTracedVMap<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
         O: Clone + Op + XlaOp<V>,
-        L: Clone,
     {
-        lower_vmap_results(
-            vmap_op.body(),
-            lower_vmap_mode(vmap_op),
-            input_values,
-            &mut self.block,
-            self.context,
-            self.location,
-        )
+        lower_vmap_results(body, VMapLoweringMode::Forward, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
@@ -508,7 +500,7 @@ where
     where
         V: MlirLowerableValue,
     {
-        lowerer.lower_vmap(self, input_values)
+        lowerer.lower_vmap(self.body(), input_values)
     }
 }
 
@@ -577,7 +569,7 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
                 mode,
                 lowerer,
             ),
-            Self::VMap(vmap) => lowerer.lower_vmap(vmap.as_ref(), input_values),
+            Self::VMap(vmap) => lowerer.lower_vmap(vmap.body(), input_values),
             Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
             Self::ShardMap(shard_map_op) => {
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
@@ -834,24 +826,16 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V, O, L>(
+    pub(crate) fn lower_vmap<V, O>(
         &mut self,
-        vmap_op: &VMapOp<ArrayType, V, O, L>,
+        body: &FlatTracedVMap<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
         V: MlirLowerableValue,
         O: Clone + Op + XlaOp<V>,
-        L: Clone,
     {
-        lower_vmap_results(
-            vmap_op.body(),
-            lower_vmap_mode(vmap_op),
-            input_values,
-            &mut self.block,
-            self.context,
-            self.location,
-        )
+        lower_vmap_results(body, VMapLoweringMode::Forward, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
@@ -1159,7 +1143,7 @@ impl MlirLowerableValue for ShardMapTensor {
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
         let constant_kind = self.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id: 0 })?;
-        lower_constant_elements_attribute(self.r#type().data_type, tensor_type, constant_kind, context)
+        lower_constant_elements_attribute(self.tpe().data_type, tensor_type, constant_kind, context)
     }
 
     fn to_scalar_dense_elements_attribute<'c, 't>(
@@ -1170,7 +1154,7 @@ impl MlirLowerableValue for ShardMapTensor {
         let Some(constant_kind) = self.constant_kind() else {
             return Ok(None);
         };
-        Ok(Some(lower_constant_elements_attribute(self.r#type().data_type, tensor_type, constant_kind, context)?))
+        Ok(Some(lower_constant_elements_attribute(self.tpe().data_type, tensor_type, constant_kind, context)?))
     }
 }
 
@@ -1346,16 +1330,6 @@ enum VMapLoweringMode {
 
     /// Lower transposed linear `vmap` using the transpose-friendly pad-and-reduce structure JAX emits.
     Transpose,
-}
-
-/// Maps the canonical traced `vmap` op to the lowering-specific packing mode.
-fn lower_vmap_mode<V, O, L>(_vmap_op: &VMapOp<ArrayType, V, O, L>) -> VMapLoweringMode
-where
-    V: Traceable<ArrayType>,
-    O: Clone,
-    L: Clone,
-{
-    VMapLoweringMode::Forward
 }
 
 /// Returns the static dimensions for one tensor type.
@@ -2200,15 +2174,14 @@ where
     L: Location<'c, 't> + Copy,
 {
     let constant_kind = value.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id })?;
-    let tensor_type = lower_tensor_type(value.r#type(), context, location)?;
-    if !value.r#type().shape.dimensions.is_empty() {
+    let array_type = value.tpe();
+    let tensor_type = lower_tensor_type(&array_type, context, location)?;
+    if !array_type.shape.dimensions.is_empty() {
         let scalar_tensor_type = context
-            .tensor_type(lower_element_type(value.r#type().data_type, context)?, &[], None, location)
-            .ok_or_else(|| LoweringError::InvalidTensorType {
-                array_type: ArrayType::scalar(value.r#type().data_type),
-            })?;
+            .tensor_type(lower_element_type(array_type.data_type, context)?, &[], None, location)
+            .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(array_type.data_type) })?;
         let scalar_elements =
-            lower_constant_elements_attribute(value.r#type().data_type, scalar_tensor_type, constant_kind, context)?;
+            lower_constant_elements_attribute(array_type.data_type, scalar_tensor_type, constant_kind, context)?;
         let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location));
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
@@ -2218,7 +2191,7 @@ where
         ));
         return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
     }
-    let elements = lower_constant_elements_attribute(value.r#type().data_type, tensor_type, constant_kind, context)?;
+    let elements = lower_constant_elements_attribute(array_type.data_type, tensor_type, constant_kind, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location));
     Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
 }
@@ -2343,7 +2316,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
-        XlaPrimitiveOp::VMap(vmap_op) => lowerer.lower_vmap(vmap_op.as_ref(), input_values),
+        XlaPrimitiveOp::VMap(vmap_op) => lowerer.lower_vmap(vmap_op.body(), input_values),
         XlaPrimitiveOp::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
         XlaPrimitiveOp::ShardMap(shard_map_op) => {
             if let Some(eval_mode) = shard_map_op.eval_mode() {
