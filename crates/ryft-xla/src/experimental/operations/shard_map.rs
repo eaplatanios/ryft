@@ -716,7 +716,6 @@ fn project_flat_shard_map_program(
         builder: &mut ProgramBuilder<XlaPrimitiveOp, ArrayType, ShardMapTensor>,
         atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
         kept_input_atoms: &std::collections::HashMap<AtomId, AtomId>,
-        representative_values: &[ShardMapTensor],
         instruction_by_output: &[Option<usize>],
     ) -> Result<AtomId, TracingError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
@@ -741,15 +740,7 @@ fn project_flat_shard_map_program(
                     .iter()
                     .copied()
                     .map(|input| {
-                        remap_atom(
-                            input,
-                            program,
-                            builder,
-                            atom_mapping,
-                            kept_input_atoms,
-                            representative_values,
-                            instruction_by_output,
-                        )
+                        remap_atom(input, program, builder, atom_mapping, kept_input_atoms, instruction_by_output)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let output_abstracts = instruction
@@ -778,12 +769,10 @@ fn project_flat_shard_map_program(
     }
 
     let instruction_by_output = instruction_by_output(program);
-    let engine = crate::experimental::engine::XlaEngine::token();
-    let representative_values = program.representative_atom_values(engine)?;
     let mut builder = ProgramBuilder::<XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(&representative_values[atom_id.index]);
+        let mapped_atom = builder.add_input_abstract(program.atoms[atom_id.index].r#type().into_owned());
         input_mapping.insert(atom_id, mapped_atom);
     }
 
@@ -798,7 +787,6 @@ fn project_flat_shard_map_program(
                 &mut builder,
                 &mut atom_mapping,
                 &input_mapping,
-                representative_values.as_slice(),
                 instruction_by_output.as_slice(),
             )
         })
@@ -823,7 +811,6 @@ fn build_factorized_apply_program(
         atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
         replacement_inputs: &std::collections::HashMap<AtomId, AtomId>,
         depends_on_cotangent: &[bool],
-        representative_values: &[ShardMapTensor],
         instruction_by_output: &[Option<usize>],
     ) -> Result<AtomId, TracingError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
@@ -860,7 +847,6 @@ fn build_factorized_apply_program(
                             atom_mapping,
                             replacement_inputs,
                             depends_on_cotangent,
-                            representative_values,
                             instruction_by_output,
                         )
                     })
@@ -891,8 +877,6 @@ fn build_factorized_apply_program(
     }
 
     let program = &body.program;
-    let engine = crate::experimental::engine::XlaEngine::token();
-    let representative_values = program.representative_atom_values(engine)?;
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = program.input_ids[primal_input_count..].to_vec();
     let instruction_by_output = instruction_by_output(program);
@@ -900,11 +884,11 @@ fn build_factorized_apply_program(
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(&representative_values[atom_id.index]);
+        let mapped_atom = builder.add_input_abstract(program.atoms[atom_id.index].r#type().into_owned());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
     for atom_id in residual_atoms.iter().copied() {
-        let mapped_atom = builder.add_input(&representative_values[atom_id.index]);
+        let mapped_atom = builder.add_input_abstract(program.atoms[atom_id.index].r#type().into_owned());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
 
@@ -921,7 +905,6 @@ fn build_factorized_apply_program(
                 &mut atom_mapping,
                 &replacement_inputs,
                 depends_on_cotangent,
-                representative_values.as_slice(),
                 instruction_by_output.as_slice(),
             )
         })

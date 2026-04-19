@@ -22,7 +22,7 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{Engine, InterpretableOp, Op, Traceable, TracingError},
+    tracing_v2::{InterpretableOp, Op, Traceable, TracingError},
     types::{Type, Typed},
 };
 
@@ -197,25 +197,6 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             .enumerate()
             .map(|(atom_index, value)| value.ok_or(TracingError::UnboundAtomId { id: AtomId { index: atom_index } }))
             .collect()
-    }
-
-    /// Evaluates every atom in the program on its representative input exemplars, synthesized as
-    /// zero values from the retained input types using the provided [`Engine`].
-    pub fn representative_atom_values<E>(&self, engine: &E) -> Result<Vec<V>, TracingError>
-    where
-        O: InterpretableOp<T, V>,
-        E: Engine<Type = T, Value = V> + ?Sized,
-    {
-        let representative_inputs = self
-            .input_ids
-            .iter()
-            .copied()
-            .map(|atom_id| match self.atoms.get(atom_id.index) {
-                Some(Atom::Variable(r#type)) => Ok(engine.zero(r#type)),
-                _ => Err(TracingError::InternalInvariantViolation("staged program input atom did not retain a type")),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.evaluate_atom_values(representative_inputs)
     }
 
     /// Clones this program while replacing only the typed input/output structures.
@@ -888,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn built_program_drops_derived_stored_values_but_reconstructs_representatives() {
+    fn built_program_drops_derived_stored_values_but_remains_executable() {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&2.0f64);
         let three = builder.add_constant(3.0f64);
@@ -903,13 +884,11 @@ mod tests {
         assert_eq!(builder.stored_value(sum), Some(&5.0));
 
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
-        let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         assert!(
             matches!(program.atoms.get(x.index), Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64))
         );
         assert!(matches!(program.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
         assert!(matches!(program.atoms.get(sum.index), Some(Atom::Variable(_))));
-        assert_eq!(program.representative_atom_values(&engine).unwrap(), vec![0.0, 3.0, 3.0]);
         assert_eq!(program.call(4.0).unwrap(), 7.0);
     }
 
