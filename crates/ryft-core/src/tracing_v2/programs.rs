@@ -26,36 +26,6 @@ use crate::{
     types::{ArrayType, Type, Typed},
 };
 
-/// Identifier for an atom within a staged program.
-///
-/// Atom identifiers are stable indexes into a program's atom table. Equations refer to their
-/// inputs and outputs by these ids, which keeps the staged IR compact and easy to clone.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Parameter)]
-pub struct AtomId {
-    /// Zero-based index of this atom inside the owning program's atom table.
-    index: usize,
-}
-
-impl AtomId {
-    /// Creates an atom identifier from its zero-based position in a program's atom table.
-    #[inline]
-    pub const fn from_index(index: usize) -> Self {
-        Self { index }
-    }
-
-    /// Returns this atom identifier's zero-based position in the owning program's atom table.
-    #[inline]
-    pub const fn index(self) -> usize {
-        self.index
-    }
-}
-
-impl Display for AtomId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.index)
-    }
-}
-
 /// Staged atom carrying abstract metadata.
 ///
 /// The variant encodes how the atom entered the program and determines which concrete state it
@@ -93,6 +63,36 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
             Self::Constant { value } => value.r#type(),
             Self::Input { r#type } | Self::Derived { r#type } => Cow::Borrowed(r#type),
         }
+    }
+}
+
+/// Identifier for an atom within a staged program.
+///
+/// Atom identifiers are stable indexes into a program's atom table. Equations refer to their
+/// inputs and outputs by these ids, which keeps the staged IR compact and easy to clone.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Parameter)]
+pub struct AtomId {
+    /// Zero-based index of this atom inside the owning program's atom table.
+    index: usize,
+}
+
+impl AtomId {
+    /// Creates an atom identifier from its zero-based position in a program's atom table.
+    #[inline]
+    pub const fn from_index(index: usize) -> Self {
+        Self { index }
+    }
+
+    /// Returns this atom identifier's zero-based position in the owning program's atom table.
+    #[inline]
+    pub const fn index(self) -> usize {
+        self.index
+    }
+}
+
+impl Display for AtomId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.index)
     }
 }
 
