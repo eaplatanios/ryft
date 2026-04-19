@@ -1,37 +1,55 @@
-//! Composable tracing and staged-program infrastructure for `ryft-core`.
+//! Composable tracing, staging, and autodiff infrastructure for `ryft-core`.
 //!
-//! Staged computation is represented as a shared [`Program`] over an open set of operation types.
-//! Each equation stores an operation object rather than a tag enum, so backends extend the tracing
-//! surface by contributing their own op carrier instead of editing a central dispatch table.
+//! `tracing_v2` is the shared execution model behind the library's higher-order transforms. User
+//! code starts as ordinary Rust over structured values, and the modules here decide whether that
+//! code should run eagerly on concrete leaves, replay symbolically on [`Tracer`] leaves to capture
+//! a staged [`Program`], or replay on richer traced values such as [`JvpTracer`] and
+//! [`LinearTerm`] to derive tangent and cotangent programs.
 //!
-//! # Module layout
+//! The central design choice is that staged equations store operation objects rather than a single
+//! global opcode enum. That keeps the operation universe open: the default core pipeline uses
+//! [`PrimitiveOp`] and [`LinearPrimitiveOp`], while backend crates can contribute their own closed
+//! carriers through [`Engine::TracingOperation`] and [`Engine::LinearOperation`] without rewriting
+//! the tracing and differentiation logic.
 //!
-//! - `ops::core` Ã¢â‚¬â€ foundational operation traits: [`Op`], [`InterpretableOp`],
-//!   [`LinearOperation`], [`DifferentiableOp`], [`VectorizableOp`]. Every op carrier implements
-//!   these; transforms consume them.
-//! - `ops::staging` Ã¢â‚¬â€ small hidden capability traits (`AddTracingOperation`,
-//!   `MatMulLinearOperation`, etc.) that the transforms bound themselves on. Backends implement
-//!   one per op they stage.
-//! - `ops::primitive` Ã¢â‚¬â€ the built-in [`PrimitiveOp`] / [`LinearPrimitiveOp`] carriers that
-//!   provide a ready-to-use op-set for the default tracing pipeline.
-//! - `ops::custom` Ã¢â‚¬â€ the [`CustomPrimitive`] / [`LinearCustomPrimitive`] subsystem for
-//!   layering user-supplied ops onto any backend carrier without modifying the built-in enums.
-//! - `programs` Ã¢â‚¬â€ the shared staging container plus the surface [`Program`] /
-//!   [`LinearProgram`] types. [`Traceable`] and [`Value`] live alongside them as the leaf-value
-//!   traits.
-//! - [`engine`] Ã¢â‚¬â€ the [`Engine`] trait backends implement. It pins the concrete op-set via
-//!   [`Engine::TracingOperation`] and [`Engine::LinearOperation`] associated types, which is how
-//!   op selection is surfaced to transforms rather than via umbrella capability bundles.
+//! # Big Picture
 //!
-//! # Transforms
+//! A typical `tracing_v2` flow looks like this:
 //!
-//! - [`forward`] Ã¢â‚¬â€ forward-mode AD via [`jvp`], producing [`Dual`] tangents and the underlying
-//!   [`JvpTracer`].
-//! - [`linear`] Ã¢â‚¬â€ linearization, transposition, and reverse-mode AD: [`jvp_program`], [`vjp`],
-//!   [`grad`], [`value_and_grad`], plus [`jacrev`] / [`jacfwd`] / [`hessian`] helpers.
-//! - `batch` Ã¢â‚¬â€ vectorization via [`vmap`], [`stack`], [`unstack`].
-//! - [`jit`](mod@self::jit) Ã¢â‚¬â€ staged-program capture via [`interpret_and_trace`] and compilation via
-//!   [`trace`] when only abstract input metadata is available.
+//! 1. A transform such as [`interpret_and_trace`], [`jvp`], [`vjp`], or [`vmap`] receives a Rust
+//!    closure.
+//! 2. The transform chooses a leaf regime: concrete values, [`Tracer`] values, [`Batch`] values,
+//!    [`JvpTracer`] values, or staged linear terms.
+//! 3. Primitive trait impls in [`operations`] either execute eagerly or record equations into a
+//!    [`ProgramBuilder`].
+//! 4. The resulting [`Program`] or [`LinearProgram`] is simplified, replayed, transposed, or
+//!    handed off to a backend-specific lowering layer.
+//!
+//! This is what makes JIT tracing, batching, and autodiff feel like variations on one staged IR
+//! instead of separate subsystems.
+//!
+//! # Module Layout
+//!
+//! - [`operations`] defines the semantic primitive traits and the built-in operation carriers.
+//! - The internal programs module owns the staged IR itself: atoms, equations, builders, and
+//!   executable programs.
+//! - The internal values module defines the leaf-level contracts ([`Traceable`], [`Value`],
+//!   [`ZeroLike`], [`OneLike`]) that let the same transform code work over concrete values and
+//!   tracer wrappers.
+//! - [`engine`] defines the backend token that selects op carriers and synthesizes representative
+//!   values from abstract metadata.
+//! - [`jit`](self::jit) captures ordinary staged programs from traced execution.
+//! - [`forward`] layers forward-mode differentiation on top of the same staging model.
+//! - [`linear`] turns staged primal programs into linear maps, pullbacks, dense Jacobians, and
+//!   compiled gradients.
+//! - [`Batch`] together with [`stack`], [`unstack`], and [`vmap`] provides the explicit batching
+//!   surface.
+//!
+//! # Role In The Library
+//!
+//! `tracing_v2` is the bridge between user-facing math code and backend-specific execution. The
+//! core crate owns tracing semantics, staged-program manipulation, and transform construction;
+//! backend crates reuse that machinery to decide how captured programs are represented and lowered.
 
 use thiserror::Error;
 
@@ -74,7 +92,12 @@ pub use programs::{
 };
 pub use values::{OneLike, Traceable, Value, ZeroLike};
 
-/// Error type shared by the prototype tracing transforms.
+/// Error type shared by the `tracing_v2` staging and transform pipeline.
+///
+/// [`TraceError`] intentionally spans the whole subsystem: primitive abstract evaluation, staged
+/// program construction, batching, higher-order transform synthesis, and program replay. Keeping
+/// the error vocabulary in one place lets the public transform APIs stay small while still
+/// preserving the failure modes that matter when debugging tracing behavior.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TraceError {
     /// Structured inputs or outputs did not have the same `Parameterized` shape.

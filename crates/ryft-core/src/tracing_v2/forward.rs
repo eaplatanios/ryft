@@ -1,8 +1,13 @@
 //! Forward-mode differentiation primitives.
 //!
-//! The core value in this module is [`JvpTracer`], which carries both a primal value and a tangent value. Primitive
-//! operations implement their JVP rules in [`crate::tracing_v2::operations`], while this module provides the user-facing
-//! wrapper type and the `jvp` transform itself.
+//! This module is the forward-mode half of the autodiff story. It introduces [`JvpTracer`], the
+//! paired primal/tangent leaf wrapper used while propagating Jacobian-vector products through a
+//! computation, and it exposes [`jvp`], the public transform that evaluates a function together
+//! with the directional derivative induced by a tangent input.
+//!
+//! Primitive operations contribute their local JVP rules in [`crate::tracing_v2::operations`], but
+//! the orchestration happens here: concrete execution, traced execution inside an enclosing JIT
+//! scope, and batched execution all meet at the same dispatch seam.
 
 use std::{
     borrow::Cow,
@@ -24,8 +29,11 @@ use crate::{
 
 /// Tangent representation for a traced primal value.
 ///
-/// The default implementation is the primal type itself, but transforms such as [`jvp_program`] replace tangents
-/// with a staged linear representation like [`crate::tracing_v2::LinearTerm`].
+/// [`TangentSpace`] tells the forward-mode machinery what kind of object should travel alongside a
+/// given primal leaf while computing a Jacobian-vector product. The simplest case uses the primal
+/// type itself, but staged linearization replaces tangents with symbolic values such as
+/// [`crate::tracing_v2::LinearTerm`] so that the same primitive JVP rules can build reusable linear
+/// programs instead of concrete numbers.
 ///
 /// [`jvp_program`]: crate::tracing_v2::jvp_program
 pub trait TangentSpace<T: Type, V: Typed<T>>: Clone + Parameter {
@@ -68,10 +76,14 @@ impl<T: Type, V: Traceable<T> + Add<Output = V> + Mul<Output = V> + Neg<Output =
 
 /// Forward-mode tracer carrying both a primal and a tangent.
 ///
+/// [`JvpTracer`] is to forward-mode AD what [`Tracer`](crate::tracing_v2::Tracer) is to ordinary
+/// staging: it is the leaf wrapper that primitive operations see when a function is being evaluated
+/// in JVP mode. The `primal` field carries the usual runtime value, while the `tangent` field
+/// carries the directional derivative information flowing alongside it.
+///
 /// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
-/// signatures (e.g., trait default methods) without propagating value-level bounds. The required
-/// relationship `T: TangentSpace<V>` is enforced on the impl blocks that actually operate on the
-/// values.
+/// signatures without eagerly propagating all tangent-space requirements. The required
+/// relationship is enforced only on the impl blocks that actually manipulate the values.
 #[derive(Clone, Debug)]
 pub struct JvpTracer<V, T> {
     /// The primal value.
@@ -108,9 +120,15 @@ impl<V: Traceable<ArrayType> + crate::tracing_v2::OneLike, T: TangentSpace<Array
 }
 
 /// Standard dual number representation used for first-order forward-mode evaluation.
+///
+/// [`Dual`] is the common case where primal and tangent live in the same space, which is exactly
+/// the setup used by ordinary first-order JVPs over concrete leaves.
 pub type Dual<V> = JvpTracer<V, V>;
 
 /// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
+///
+/// The public transform is intentionally small; this trait is where the concrete, traced, and
+/// batched execution strategies branch apart.
 #[doc(hidden)]
 pub trait JvpInvocationLeaf<E, Input, Output>: Parameter + Sized
 where
@@ -531,7 +549,9 @@ where
 
 /// Evaluates `function` on `primals` and propagates the supplied tangent values forward.
 ///
-/// The returned pair is `(primal_output, tangent_output)`.
+/// The returned pair is `(primal_output, tangent_output)`. Architecturally, [`jvp`] is the most
+/// direct forward-mode transform in the crate: it either traces the body once to build a staged
+/// pushforward or stages the whole JVP into an outer trace if the inputs are already symbolic.
 #[allow(private_bounds, private_interfaces)]
 pub fn jvp<E, F, Input, Output, Leaf>(
     engine: &E,

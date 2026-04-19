@@ -1,4 +1,8 @@
 //! Right matrix-multiplication primitive for [`crate::tracing_v2`].
+//!
+//! This module specializes matrix multiplication to the linear-map form `input @ factor`. Together
+//! with [`super::left_matmul`], it gives transpose and linearization code explicit building blocks
+//! for non-commutative matrix actions.
 
 use std::fmt::{Debug, Display};
 
@@ -43,6 +47,8 @@ pub trait LinearRightMatMulOperation<T: Type + Display, V: Traceable<T>>: Clone 
 }
 
 /// Linear map `tangent -> tangent @ factor`.
+///
+/// [`RightMatMulOp`] is the right-acting sibling of [`super::LeftMatMulOp`].
 #[derive(Clone)]
 pub struct RightMatMulOp<V: MatrixValue> {
     factor: V,
@@ -63,6 +69,9 @@ impl<V: MatrixValue> RightMatMulOp<V> {
 }
 
 /// Validates abstract inputs using the factor's abstract type without needing a concrete instance.
+///
+/// Backend carriers use this helper when they need the metadata rule for a captured right-matmul
+/// operation without first constructing a concrete [`RightMatMulOp`].
 pub fn right_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
     expect_input_count(inputs.len(), 1)?;
     Ok(vec![matmul_abstract(&inputs[0], factor_type, "right_matmul")?])

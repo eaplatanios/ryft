@@ -114,8 +114,12 @@ pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
 
 /// Returns a zero value with the same structure as an existing value.
 ///
-/// This is the universal "zero-like" capability: every type that participates in differentiation or batching can
-/// produce a zero from an exemplar, including tracer wrappers that cannot be synthesized from abstract metadata alone.
+/// [`ZeroLike`] is the local, value-level counterpart to
+/// [`Engine::zero`](crate::tracing_v2::Engine::zero). When a transform already has an exemplar in
+/// hand, it uses this trait instead of going back through abstract metadata. That is especially
+/// important for wrappers like [`Tracer`](crate::tracing_v2::Tracer) and
+/// [`JvpTracer`](crate::tracing_v2::JvpTracer), which can stage or derive a zero from their
+/// existing state even when abstract synthesis alone would be insufficient.
 pub trait ZeroLike {
     /// Returns a zero value with the same shape as `self`.
     fn zero_like(&self) -> Self;
@@ -123,7 +127,9 @@ pub trait ZeroLike {
 
 /// Returns a one value with the same structure as an existing value.
 ///
-/// This mirrors [`ZeroLike`] for the multiplicative identity.
+/// This mirrors [`ZeroLike`] for the multiplicative identity. It is used in the same places where
+/// transforms need a unit seed from an exemplar, such as reverse-mode pullbacks for scalar-output
+/// functions.
 pub trait OneLike {
     /// Returns a one value with the same shape as `self`.
     fn one_like(&self) -> Self;

@@ -1,4 +1,8 @@
 //! Cosine primitive for [`crate::tracing_v2`].
+//!
+//! This module is the cosine-side companion to [`super::sin`]. It exposes the value-level cosine
+//! capability used in generic user code and the staged primitive used by tracing, batching, and
+//! derivative construction.
 
 use std::{
     fmt::{Debug, Display},
@@ -24,6 +28,9 @@ pub trait CosTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Elementwise cosine capability.
+///
+/// This trait is implemented by concrete values and the transform-local wrappers that can represent
+/// cosine symbolically.
 pub trait Cos: Sized {
     /// Computes the elementwise cosine.
     fn cos(self) -> Self;
@@ -44,6 +51,9 @@ impl Cos for f64 {
 }
 
 /// Elementwise cosine primitive.
+///
+/// [`CosOp`] is stored in staged programs whenever cosine is traced explicitly, and its JVP rule is
+/// reused by both forward-mode evaluation and higher-order traced transforms.
 #[derive(Clone, Default)]
 pub struct CosOp;
 

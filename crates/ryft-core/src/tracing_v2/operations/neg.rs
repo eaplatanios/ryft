@@ -1,4 +1,8 @@
 //! Negation primitive for [`crate::tracing_v2`].
+//!
+//! This module provides the unary sign-flip primitive used throughout staged arithmetic. Like the
+//! other core scalar primitives, it demonstrates the full lifecycle of one semantic operation
+//! across abstract evaluation, replay, linear transposition, forward-mode AD, and batching.
 
 use std::{
     fmt::{Debug, Display},
@@ -33,6 +37,9 @@ pub trait LinearNegOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Elementwise negation primitive.
+///
+/// [`NegOp`] is the canonical example of a shape-preserving unary primitive with a nontrivial
+/// transpose rule.
 #[derive(Clone, Default)]
 pub struct NegOp;
 

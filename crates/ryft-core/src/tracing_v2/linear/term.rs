@@ -1,6 +1,12 @@
 use super::*;
 
 /// Tangent representation backed by atoms in a staged linear program.
+///
+/// [`LinearTerm`] is the symbolic tangent/cotangent analogue of [`Tracer`](crate::tracing_v2::Tracer).
+/// When a primitive JVP rule is building a reusable linear program instead of computing a concrete
+/// tangent immediately, its tangent values are instances of this type. Each term points at one atom
+/// in a shared linear-program builder and stages new linear equations as it is combined with other
+/// terms.
 #[derive(Clone, Parameter)]
 pub struct LinearTerm<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
     atom: AtomId,
@@ -14,16 +20,22 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> std::fmt::Debug for LinearTer
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
+    /// Returns the atom id backing this symbolic linear term.
     #[inline]
     pub fn atom(&self) -> AtomId {
         self.atom
     }
 
+    /// Returns a clone of the shared builder that owns this term.
     #[inline]
     pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<O, T, V>>> {
         self.builder.clone()
     }
 
+    /// Reconstructs a linear term from already-staged parts.
+    ///
+    /// This is mainly used by the linearization and transpose helpers when they need to hand
+    /// primitive rules a symbolic tangent view over existing builder state.
     #[inline]
     pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<O, T, V>>>) -> Self {
         Self { atom, builder }
@@ -151,4 +163,8 @@ impl<
 }
 
 /// Standard traced value used while building linear programs.
+///
+/// This is the default tangent payload fed into primitive JVP rules during linearization: the
+/// primal component is an ordinary leaf `V`, while the tangent component is a symbolic
+/// [`LinearTerm`] staged into the linear builder.
 pub type Linearized<V, O = LinearProgramOpRef<V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;

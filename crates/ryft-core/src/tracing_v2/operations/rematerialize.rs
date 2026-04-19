@@ -1,10 +1,9 @@
 //! Higher-order `rematerialize` operation for [`crate::tracing_v2`].
 //!
-//! Wraps a sub-computation so that its forward pass is recomputed (rather than saved) during
-//! reverse-mode differentiation. During forward execution the behavior is identical to calling the
-//! body directly; the difference is visible only to the differentiation transform, which embeds the
-//! body's forward equations in the tangent program instead of baking intermediate values as
-//! constants.
+//! This module gives staged programs an explicit rematerialization boundary. The forward semantics
+//! are intentionally boring: calling a rematerialized body is the same as calling the body
+//! directly. The interesting behavior shows up later, when reverse-mode differentiation decides
+//! whether to save intermediates or recompute them.
 
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -43,6 +42,9 @@ pub trait LinearRematerializeOperation<T: Type + Display, V: Traceable<T>>: Clon
 }
 
 /// Erased traced body for a rematerialization boundary.
+///
+/// Like [`crate::tracing_v2::operations::FlatTracedVMap`], this stores a flattened traced body that
+/// higher-order op nodes can carry around independently of the caller's original parameter shapes.
 pub struct FlatTracedRematerialize<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {
     /// Canonical input types of the body.
     input_types: Vec<T>,
@@ -97,7 +99,8 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
 ///
 /// During forward execution the body is evaluated normally. When linearized, the body's pushforward
 /// is computed and staged so that the tangent program recomputes forward intermediates from the
-/// inputs rather than storing them as constants.
+/// inputs rather than storing them as constants. This makes [`RematerializeOp`] the staged IR hook
+/// that powers the user-facing rematerialization policies in [`crate::tracing_v2::linear`].
 pub struct RematerializeOp<
     T: Type + Display,
     V: Traceable<T> + Parameter,

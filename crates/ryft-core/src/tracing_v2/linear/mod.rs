@@ -1,7 +1,16 @@
 //! Linearization, transposition, and higher-order differentiation utilities.
 //!
-//! This module turns forward-mode traces into staged linear programs, transposes those programs for reverse-mode
-//! differentiation, and materializes dense Jacobians/Hessians for coordinate-based leaf types.
+//! This module is the "middle layer" between raw tracing and user-facing reverse-mode APIs. Its
+//! job is to take an ordinary staged primal program and turn it into the linear objects that power
+//! the rest of autodiff:
+//!
+//! - [`LinearProgram`] for reusable pushforwards and pullbacks,
+//! - reverse-mode transforms such as [`vjp`], [`grad`], and [`value_and_grad`],
+//! - dense Jacobian and Hessian materialization helpers, and
+//! - rematerialization-aware compiled gradients.
+//!
+//! In the larger architecture, this is where the system stops thinking in terms of "run the
+//! original function again" and starts reasoning about the linear maps induced by that function.
 
 use std::{
     cell::RefCell,
@@ -60,10 +69,10 @@ fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
 
 /// Traces one type-directed body and normalizes the captured program to flat leaf vectors.
 ///
-/// The caller supplies explicit staged input types plus the closure that should run on the
-/// corresponding traced family. The captured program still uses the caller-selected staged op
-/// carrier `O`, but its inputs and outputs are rewritten to `Vec<V>` so later linearization and
-/// transposition code can share one flat reverse-mode path regardless of the original structure.
+/// Many linearization helpers want a uniform "flat vector of leaves" view even when the caller's
+/// original function uses tuples, structs, or other parameterized shapes. This helper is the bridge
+/// between those worlds: it traces the structured function once, then retags the captured program
+/// so downstream reverse-mode code can operate on a canonical `Vec<V>` representation.
 pub(crate) fn trace_flat_program_from_input_types<Input, Output, V, O, L, E, F>(
     function: F,
     traced_inputs: &[Tracer<E>],
@@ -94,6 +103,11 @@ where
 }
 
 /// Linearizes one flat scalar traced program and stages its pullback with a unit cotangent seed.
+///
+/// This is the internal core of traced reverse-mode for scalar-output functions. Given a staged
+/// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
+/// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
+/// output and the traced gradient leaves.
 fn reverse_mode_scalar_traced_program<V, O, L, E>(
     traced_program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
     traced_primals: Vec<Tracer<E>>,

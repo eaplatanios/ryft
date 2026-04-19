@@ -53,6 +53,10 @@ pub trait LinearCustomOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Typed extension registry carried by one [`CustomPrimitive`].
+///
+/// The registry is how custom primitives attach optional transform-specific rules without forcing
+/// the core [`CustomPrimitive`] struct to know about every possible backend or higher-order
+/// transform ahead of time.
 #[derive(Clone, Default)]
 pub struct CustomPrimitiveExtensions<T: Type, V: Typed<T>> {
     entries: HashMap<TypeId, Arc<dyn Any>>,
@@ -126,8 +130,9 @@ impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V>> CustomBaseO
 
 /// Rule-based registration object used by [`PrimitiveOp::Custom`].
 ///
-/// The base op always supplies shape metadata and eager interpretation. Optional transform rules are
-/// registered using the existing tracing traits directly:
+/// [`CustomPrimitive`] is the main extensibility seam for the operation system. The base op always
+/// supplies shape metadata and eager interpretation; optional transform rules are registered using
+/// the existing tracing traits directly:
 ///
 /// - [`LinearOperation<ArrayType, V>`] for reverse-mode transpose,
 /// - [`DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>`] for forward-mode JVP,
@@ -377,6 +382,9 @@ where
 }
 
 /// Linear-only wrapper around one [`CustomPrimitive`] that guarantees a transpose rule is present.
+///
+/// Linear programs cannot store an op unless reverse-mode transposition is known to exist. This
+/// wrapper is the proof object that a custom primitive has satisfied that requirement.
 #[derive(Clone)]
 pub struct LinearCustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
     primitive: Arc<CustomPrimitive<T, V>>,

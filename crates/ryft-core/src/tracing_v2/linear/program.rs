@@ -1,6 +1,11 @@
 use super::*;
 
 /// Staged linear map produced by [`jvp_program`](super::jvp_program) or [`vjp`](super::vjp).
+///
+/// [`LinearProgram`] is the reusable artifact that sits between first-order tracing and
+/// higher-order autodiff. A pushforward produced by forward-mode linearization and a pullback
+/// produced by reverse-mode transposition are represented by the same type; only the chosen input
+/// and output structures differ.
 pub struct LinearProgram<
     T: Type + Display,
     V: Traceable<T> + Parameter,
@@ -29,18 +34,29 @@ impl<
 impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone>
     LinearProgram<T, V, Input, Output, O>
 {
+    /// Wraps an already-built staged program as a linear map.
+    ///
+    /// Callers use this when a helper has already constructed the linear IR and just needs to tag
+    /// it with the representative zero required by later transpose logic.
     #[inline]
     pub fn from_program(program: Program<T, V, Input, Output, O>, zero: V) -> Self {
         Self { program, zero, marker: PhantomData }
     }
 
     /// Returns the staged program backing this linear program.
+    ///
+    /// This is useful when a downstream helper needs to inspect or retag the underlying IR while
+    /// preserving the linear-map interpretation at the API boundary.
     #[inline]
     pub fn program(&self) -> &Program<T, V, Input, Output, O> {
         &self.program
     }
 
     /// Applies the linear program to a concrete input tangent or cotangent.
+    ///
+    /// Conceptually this is no different from replaying an ordinary [`Program`], but the
+    /// documentation deliberately uses linear language because these programs represent derived
+    /// linear maps rather than original user functions.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         O: InterpretableOp<T, V>,
@@ -77,11 +93,10 @@ impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>>
 
 /// Applies one primitive's semantic transpose rule while transposing a staged linear program.
 ///
-/// The transpose builder's cotangent atoms are wrapped as [`LinearTerm<ArrayType, V>`] so primitive rules can
-/// emit staged cotangent contributions directly.
-///
-/// The returned atom ids are staged cotangent contributions in the transpose builder, aligned with
-/// the forward primitive inputs.
+/// This helper is the local handshake between IR-level transposition and primitive-level reverse
+/// rules. The surrounding transpose pass deals in atom ids, but [`LinearOperation::transpose`] is
+/// expressed in terms of [`LinearTerm`] values so primitive implementations can stage new linear
+/// equations directly.
 ///
 /// # Parameters
 ///   - `op`: primitive whose transpose rule should be applied.
@@ -109,6 +124,11 @@ where
         .collect())
 }
 
+/// Converts a staged primal program into a staged pushforward linear map.
+///
+/// This is the reusable IR-level form of forward-mode differentiation. Instead of evaluating the
+/// JVP immediately, it builds a [`LinearProgram`] that can be replayed later on arbitrary tangent
+/// inputs at the same primal point.
 pub(crate) fn linearize_program<Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     program: &Program<ArrayType, V, Input, Output, O>,
@@ -225,6 +245,11 @@ where
     })
 }
 
+/// Transposes a linear pushforward program into its reverse-mode pullback.
+///
+/// This is the IR-level core of reverse-mode AD in `tracing_v2`. Higher-level helpers such as
+/// [`vjp`](super::vjp) and [`grad`](super::grad) build on this operation after first producing a
+/// forward linear program.
 #[allow(private_bounds)]
 pub fn transpose_linear_program<V, Input, Output, O>(
     program: &LinearProgram<ArrayType, V, Input, Output, O>,
@@ -338,6 +363,8 @@ where
 ///
 /// This variant is useful when the linear program's leaf type cannot be synthesized from bare
 /// [`ArrayType`] metadata alone, but the caller still has representative output values available.
+/// It plays the same architectural role as [`transpose_linear_program`], but swaps metadata-driven
+/// cotangent synthesis for exemplar-driven synthesis.
 #[allow(private_bounds)]
 pub fn transpose_linear_program_with_output_examples<V, Input, Output, O>(
     program: &LinearProgram<ArrayType, V, Input, Output, O>,

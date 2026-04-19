@@ -1,5 +1,23 @@
+//! Reverse-mode transforms built on top of staged linear programs.
+//!
+//! This module takes the IR-level building blocks from the rest of [`super`] and assembles the
+//! user-facing reverse-mode APIs. The broad flow is:
+//!
+//! 1. trace a primal program,
+//! 2. linearize it into a pushforward,
+//! 3. transpose that pushforward into a pullback, and
+//! 4. seed the pullback appropriately to obtain gradients or value-and-gradient pairs.
+//!
+//! The concrete, traced, and batched variants all share that structure; they only differ in where
+//! the final replay happens.
+
 use super::*;
 
+/// Traces `function` once and returns both its primal output and a reusable pushforward program.
+///
+/// [`jvp_program`] is the staged counterpart to [`crate::tracing_v2::jvp`]. Instead of immediately
+/// applying a tangent input, it captures the Jacobian-vector product as a [`LinearProgram`] that
+/// can be replayed later on any tangent with the same parameter structure.
 pub fn jvp_program<E, F, Input, Output, V>(
     engine: &E,
     function: F,
@@ -37,6 +55,11 @@ where
     ))
 }
 
+/// Runs forward-mode differentiation inside an existing outer trace.
+///
+/// This is the traced-execution path for [`crate::tracing_v2::jvp`]. Rather than producing a
+/// standalone linear program, it stages both the primal replay and the pushforward application into
+/// the surrounding JIT trace so higher-order transforms can keep composing symbolically.
 #[allow(private_bounds)]
 pub(crate) fn jvp_traced<F, Input, Output, V, O, L, E>(
     function: F,
@@ -85,6 +108,10 @@ where
 }
 
 /// Returns the primal output together with a pullback produced by transposing the staged pushforward.
+///
+/// [`vjp`] is the reusable reverse-mode primitive in the public API. It traces the primal function,
+/// builds the corresponding pushforward program, and then transposes that pushforward into a staged
+/// pullback that maps output cotangents back to input cotangents.
 #[allow(private_bounds)]
 pub fn vjp<E, F, Input, Output, V>(
     engine: &E,
@@ -120,7 +147,9 @@ where
 /// values and on already traced values.
 ///
 /// The trait always produces `(value, gradient)`; [`grad`] is a thin wrapper that drops the primal
-/// value, while [`value_and_grad`] exposes the full pair.
+/// value, while [`value_and_grad`] exposes the full pair. This keeps the public reverse-mode API
+/// compact while allowing concrete replay, traced replay, and batched replay to specialize
+/// independently.
 #[doc(hidden)]
 pub trait ValueAndGradInvocationLeaf<E, Input>: Parameter + Sized
 where
@@ -464,6 +493,9 @@ where
 }
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
+///
+/// This is the most direct reverse-mode API when the caller needs both the function value and the
+/// gradient at the same primal point.
 #[allow(private_bounds, private_interfaces)]
 pub fn value_and_grad<E, F, Input, Leaf>(
     engine: &E,
@@ -482,6 +514,9 @@ where
 }
 
 /// Computes the reverse-mode gradient of a scalar-output function.
+///
+/// [`grad`] is just [`value_and_grad`] with the primal result discarded, but it is the most common
+/// user-facing reverse-mode entry point and therefore gets its own dedicated wrapper.
 #[allow(private_bounds, private_interfaces)]
 pub fn grad<E, F, Input, Leaf>(engine: &E, function: F, primals: Input) -> Result<Input, TraceError>
 where

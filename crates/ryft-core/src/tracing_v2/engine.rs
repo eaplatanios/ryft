@@ -36,50 +36,83 @@ use crate::{
 
 /// Synthesizes concrete leaf values from abstract type metadata.
 ///
-/// An [`Engine`] carries whatever context is required to construct a value of
-/// [`Value`](Engine::Value) from a [`Type`](Engine::Type) descriptor. The sole responsibility
-/// of the trait is metadata-driven zero/one construction plus staged-carrier selection for the
-/// user-facing tracing transforms. The hot evaluation paths do not use it, so engine dispatch is
-/// restricted to the few call sites that genuinely need representative synthesis or an explicit
-/// backend token.
+/// [`Engine`] is the backend token threaded through the public `tracing_v2` transforms. It has
+/// two closely related jobs:
+///
+/// 1. choose the closed operation carriers that ordinary and linear staged programs should store,
+///    and
+/// 2. synthesize representative zero and one values from abstract metadata when a transform needs
+///    an exemplar but only knows a leaf's type.
+///
+/// That second responsibility is what lets higher-order transforms stay generic. Linearization,
+/// reverse-mode transposition, rematerialization, and traced `vmap` all occasionally need to
+/// rebuild a value from shape/type information alone; [`Engine`] is the narrow seam where
+/// backend-specific knowledge enters the otherwise backend-agnostic transform code.
 ///
 /// Implementations should be cheap to clone (the common case is a [`Copy`] zero-sized type) and
-/// must return values whose [`Typed::tpe`] matches the input type metadata.
+/// must return values whose type metadata agrees with the input descriptor.
 pub trait Engine {
     /// Abstract type metadata interpreted by this engine.
+    ///
+    /// This is the descriptor carried by staged atoms and used during abstract evaluation. For the
+    /// default core pipeline it is usually [`ArrayType`](crate::types::ArrayType), but the trait is
+    /// generic so backends can substitute a richer metadata type if needed.
     type Type: Type + Display;
 
     /// Concrete leaf value produced by this engine.
+    ///
+    /// The value is what program replay and eager transforms actually operate on. In other words,
+    /// [`Engine::Type`] is the abstract description used while staging, while [`Engine::Value`] is
+    /// the runtime leaf that inhabits traced programs once they are executed.
     type Value;
 
     /// Ordinary staged operation type selected by this engine for public tracing transforms.
+    ///
+    /// Programs produced by [`trace`](crate::tracing_v2::trace) and
+    /// [`interpret_and_trace`](crate::tracing_v2::interpret_and_trace) store this carrier.
     type TracingOperation: Clone + 'static;
 
     /// Linear staged operation type selected by this engine for tangent and cotangent programs.
+    ///
+    /// Linear programs produced by [`jvp_program`](crate::tracing_v2::jvp_program),
+    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
     type LinearOperation: Clone + 'static;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
+    ///
+    /// Transforms use this when they need a representative value for a leaf without having a
+    /// concrete witness available, for example when replaying a staged program from retained input
+    /// types or constructing zero cotangents in a transposed linear program.
     fn zero(&self, r#type: &Self::Type) -> Self::Value;
 
     /// Returns the multiplicative-identity value corresponding to the provided type metadata.
+    ///
+    /// This is used less frequently than [`Engine::zero`] but plays the same architectural role:
+    /// it lets traced code materialize identity seeds without depending on an existing exemplar.
     fn one(&self, r#type: &Self::Type) -> Self::Value;
 }
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
 ///
-/// [`ArrayScalarEngine<V>`] is a zero-sized type used whenever a test or scalar-only pipeline needs
-/// an engine whose [`Type`](Engine::Type) is [`ArrayType`] but whose [`Value`](Engine::Value) is a
-/// scalar such as `f32` or `f64`. The engine ignores the supplied [`ArrayType`] metadata and returns
-/// the canonical scalar zero or one, which is well-defined because scalar leaves represent exactly
-/// one shape.
+/// [`ArrayScalarEngine<V>`] is the "minimal backend" used throughout tests and scalar-only
+/// examples. It demonstrates the intended role of an [`Engine`] in the smallest possible form:
+/// there is no device handle, no mesh state, and no backend registry, just the choice of the
+/// built-in primitive carriers plus metadata-driven construction of scalar zeros and ones.
+///
+/// The engine ignores most of the supplied [`ArrayType`] metadata because scalar leaves have a
+/// single canonical runtime representation. That makes it a good teaching example for the rest of
+/// the tracing stack: if a transform works against [`ArrayScalarEngine`], the same code path can be
+/// reused by richer engines that need sharding, device, or runtime context.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArrayScalarEngine<V> {
     marker: PhantomData<fn() -> V>,
 }
 
 impl<V> ArrayScalarEngine<V> {
-    /// Returns a new [`ArrayScalarEngine<V>`]. This is a no-op at runtime since the engine is
-    /// zero-sized.
+    /// Returns a new [`ArrayScalarEngine<V>`].
+    ///
+    /// This is a no-op at runtime because the engine is zero-sized; the method mainly exists to
+    /// give examples and tests an explicit, readable backend token.
     #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }

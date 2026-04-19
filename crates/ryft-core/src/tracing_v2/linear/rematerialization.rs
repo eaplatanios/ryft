@@ -2,12 +2,11 @@ use super::*;
 
 /// Compiles a reverse-mode gradient function into a reusable staged program.
 ///
-/// Unlike [`grad`](super::grad), which returns concrete gradient values at a single primal point,
-/// this function returns a [`Program`] that takes primal inputs and produces gradient
-/// outputs symbolically. The compiled program embeds both the forward residual computation and the
-/// backward pass, so it can be replayed at arbitrary primal points without re-tracing.
-///
-/// This is analogous to JAX's `jit(grad(f))`.
+/// Unlike [`grad`](super::grad), which returns concrete gradient values at one primal point, this
+/// function returns a staged [`Program`] whose inputs are primals and whose outputs are gradients.
+/// In the larger architecture, it is the "compile the whole reverse-mode pipeline" entry point:
+/// the traced forward pass, the linearization, and the pullback application are all baked into one
+/// reusable artifact.
 #[allow(private_bounds)]
 pub fn compile_grad<E, F, Input, V>(
     _engine: &E,
@@ -62,11 +61,10 @@ where
 
 /// Policy controlling how forward-pass intermediates are handled during reverse-mode differentiation.
 ///
-/// This trades off memory usage against recomputation cost. [`SaveAll`](RematerializationPolicy::SaveAll) is the
-/// default: all intermediates are saved, giving fast backward passes at the cost of high memory.
-/// [`RecomputeAll`](RematerializationPolicy::RecomputeAll) saves nothing, recomputing everything from inputs.
-/// [`Checkpoint`](RematerializationPolicy::Checkpoint) is the classic middle ground, saving intermediates at
-/// regular intervals and recomputing within each segment.
+/// Rematerialization is the place where `tracing_v2` exposes a memory-vs-recomputation choice to
+/// callers. The policy does not change the mathematical gradient; it changes where the staged
+/// reverse-mode program inserts rematerialization boundaries, which in turn affects what a backend
+/// may save versus recompute during the backward pass.
 #[derive(Clone, Debug)]
 pub enum RematerializationPolicy {
     /// Save all forward-pass intermediates (maximum memory, no recomputation).

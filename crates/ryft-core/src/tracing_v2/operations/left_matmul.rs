@@ -1,4 +1,8 @@
 //! Left matrix-multiplication primitive for [`crate::tracing_v2`].
+//!
+//! This module specializes matrix multiplication to the common linear-map form `factor @ input`.
+//! It is used heavily by matrix transpose rules because cotangent propagation naturally produces
+//! captured left and right linear actions rather than only free-standing binary matmuls.
 
 use std::fmt::{Debug, Display};
 
@@ -42,6 +46,9 @@ pub trait LinearLeftMatMulOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Linear map `tangent -> factor @ tangent`.
+///
+/// [`LeftMatMulOp`] is the matrix-valued analogue of [`super::ScaleOp`]: it captures one factor in
+/// the op object and applies that factor to every input it is replayed on.
 #[derive(Clone)]
 pub struct LeftMatMulOp<V: MatrixValue> {
     factor: V,
@@ -62,6 +69,9 @@ impl<V: MatrixValue> LeftMatMulOp<V> {
 }
 
 /// Validates abstract inputs using the factor's abstract type without needing a concrete instance.
+///
+/// Backend carriers use this helper when they need the metadata rule for a captured left-matmul
+/// operation without first constructing a concrete [`LeftMatMulOp`].
 pub fn left_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
     expect_input_count(inputs.len(), 1)?;
     Ok(vec![matmul_abstract(factor_type, &inputs[0], "left_matmul")?])

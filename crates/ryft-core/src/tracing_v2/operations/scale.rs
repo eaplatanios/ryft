@@ -1,4 +1,9 @@
 //! Scaling primitive for [`crate::tracing_v2`].
+//!
+//! `ScaleOp` is the main example of a primitive with captured constant state. Unlike bare
+//! multiplication, the scale factor is part of the op object itself, which makes this module a good
+//! reference for how traced constants move through replay, linearization, and higher-order traced
+//! execution.
 
 use std::{
     fmt::{Debug, Display},
@@ -38,6 +43,9 @@ pub trait LinearScaleOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Unary linear operation that multiplies its input by a captured factor.
+///
+/// In ordinary programs this represents "multiply by a closed-over constant." In linear programs
+/// the same semantic idea is reused to scale tangent and cotangent terms.
 #[derive(Clone)]
 pub struct ScaleOp<T: Type, V: Typed<T>> {
     factor: V,
@@ -60,6 +68,9 @@ impl<T: Type, V: Traceable<T>> ScaleOp<T, V> {
 
 impl<V: Traceable<ArrayType>> ScaleOp<ArrayType, V> {
     /// Validates abstract inputs without needing a concrete instance.
+    ///
+    /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
+    /// from type information before they have committed to a concrete `ScaleOp` value.
     pub fn abstract_eval_static(inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TraceError> {
         Ok(vec![unary_abstract(inputs)?])
     }

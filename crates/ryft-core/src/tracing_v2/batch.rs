@@ -1,9 +1,16 @@
 //! Vectorization support for `tracing_v2`.
 //!
-//! Concrete batching is still represented as explicit lane lists via [`Batch`]. For traced programs, however,
-//! [`vmap`] stages a compact higher-order op instead of eagerly duplicating one scalar program per lane. That keeps the
-//! public batching surface unchanged while giving lowering enough structure to emit packed StableHLO that is much
-//! closer to JAX's current Shardy output.
+//! This module provides the batching story for the rest of the tracing stack. At the surface, users
+//! interact with [`vmap`] and the explicit lane container [`Batch`]. Under the hood, the module has
+//! two execution regimes that mirror the rest of `tracing_v2`:
+//!
+//! - on concrete leaves, batching is represented literally as a vector of lanes and primitive
+//!   batching rules operate on those lane lists;
+//! - on traced leaves, [`vmap`] stages a compact higher-order op instead of eagerly duplicating one
+//!   scalar program per lane.
+//!
+//! That split is what lets the public API stay simple while still preserving enough structure for
+//! backend lowering to emit packed batched programs.
 
 use std::ops::{Add, Mul, Neg};
 
@@ -22,6 +29,11 @@ use crate::{
 use ryft_macros::Parameter;
 
 /// Batched leaf value represented as an explicit list of lanes.
+///
+/// [`Batch`] is the concrete batching counterpart to [`Tracer`](crate::tracing_v2::Tracer): when a
+/// transform wants to interpret a batched computation eagerly, each leaf becomes one `Batch<V>`
+/// containing a lane-by-lane view of the input. Primitive batching rules consume and produce these
+/// values directly.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct Batch<V> {
     lanes: Vec<V>,
@@ -29,6 +41,9 @@ pub struct Batch<V> {
 
 impl<V> Batch<V> {
     /// Creates a new batched value from a list of lanes.
+    ///
+    /// The lane order is semantically meaningful and is preserved by [`stack`], [`unstack`], and
+    /// primitive batching rules.
     #[inline]
     pub fn new(lanes: Vec<V>) -> Self {
         Self { lanes }
@@ -106,6 +121,10 @@ impl<V: OneLike> OneLike for Batch<V> {
 }
 
 /// Stacks a list of structured inputs into one structured value whose leaves are [`Batch`] values.
+///
+/// This is the structural entry point for concrete `vmap` execution. It transposes a
+/// "batch-of-structures" into a "structure-of-batches" so the user function can run once over
+/// batched leaves instead of once per lane.
 pub fn stack<
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<V>>>,
     V: Parameter,
@@ -137,6 +156,9 @@ pub fn stack<
 }
 
 /// Splits a structured batch back into one structured value per lane.
+///
+/// This is the inverse of [`stack`]. Concrete `vmap` uses it after the batched body runs so the
+/// caller gets one structured output per original lane.
 pub fn unstack<
     Input: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<V>>>,
     V: Parameter,
@@ -168,6 +190,10 @@ pub fn unstack<
 }
 
 /// Dispatch trait used by [`vmap`] so it can handle both concrete batches and already traced values.
+///
+/// The trait is the batching analogue of the dispatch seams used by [`jvp`](crate::tracing_v2::jvp)
+/// and [`grad`](crate::tracing_v2::grad): the public transform stays small while the concrete,
+/// traced, and nested-batch execution strategies each get their own implementation.
 #[doc(hidden)]
 pub(crate) trait VMapInvocationLeaf<
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<Self>>>,
@@ -345,8 +371,13 @@ impl<
     }
 }
 
-/// Maps `function` over a leading batch axis by stacking inputs, running the batched computation, and then
-/// unstacking the result.
+/// Maps `function` over a leading batch axis.
+///
+/// Conceptually, [`vmap`] lifts a scalar function into a batched function. For concrete inputs it
+/// does so by stacking the input leaves into [`Batch`] values, running the user closure once, and
+/// then unstacking the result back into one output per lane. For traced inputs it instead stages a
+/// compact higher-order `vmap` operation so later transforms and lowerings can treat batching as a
+/// first-class program construct.
 #[allow(private_bounds)]
 pub fn vmap<
     F: FnOnce(Input::To<Batch<V>>) -> Output::To<Batch<V>>,

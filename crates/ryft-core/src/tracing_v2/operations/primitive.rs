@@ -52,9 +52,10 @@ use super::{
 
 /// Closed set of built-in staged operations.
 ///
-/// Every known primitive is a zero-cost enum variant. Operations originating outside
-/// `ryft-core` (e.g., shard-map ops in `ryft-xla`) go through the [`Custom`](PrimitiveOp::Custom) escape
-/// hatch, which still uses dynamic dispatch.
+/// [`PrimitiveOp`] is the default ordinary-program carrier for `ryft-core`. Each variant is a
+/// thin tag around one semantic primitive defined elsewhere in [`super`], and the carrier exists so
+/// tracing entry points can store "one of the built-in operations" without resorting to trait
+/// objects for the common case.
 pub enum PrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Elementwise addition.
     Add,
@@ -125,6 +126,10 @@ impl<T: Type + Display, V: Traceable<T>> Clone for PrimitiveOp<T, V> {
 }
 
 /// Closed set of operations that may appear in staged linear programs.
+///
+/// [`LinearPrimitiveOp`] is the linear-program sibling of [`PrimitiveOp`]. It contains only the
+/// operations that make sense in tangent and cotangent programs plus the linearized higher-order
+/// ops needed by `vmap` and rematerialization.
 pub enum LinearPrimitiveOp<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Elementwise addition.
     Add,

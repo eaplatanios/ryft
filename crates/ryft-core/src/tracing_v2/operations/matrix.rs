@@ -1,8 +1,9 @@
 //! Matrix-specific tracing extensions built on top of the core `tracing_v2` primitives.
 //!
-//! This module keeps the non-commutative details of matrix multiplication localized by introducing explicit left and
-//! right linear actions for transposition, while reusing the same JVP, batching, and JIT infrastructure as scalar
-//! values.
+//! The scalar primitives in [`super`] assume commutative arithmetic, but matrix-valued tracing
+//! needs a little more structure: matrix multiplication is non-commutative, transposition matters,
+//! and reverse-mode rules need to express left and right multiplication separately. This module
+//! localizes those extra semantics so the rest of the tracing stack can stay generic.
 
 use std::{
     collections::BTreeSet,
@@ -28,6 +29,9 @@ use super::{
 };
 
 /// Matrix operations required by the tracing prototype.
+///
+/// This is the value-level capability trait that generic user code and primitive replay rely on
+/// when they want to treat a leaf as a matrix.
 pub trait MatrixOps: Sized {
     /// Matrix multiplication.
     fn matmul(self, rhs: Self) -> Self;
@@ -38,8 +42,9 @@ pub trait MatrixOps: Sized {
 
 /// Convenience trait for traceable matrix leaves.
 ///
-/// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in this module expect
-/// those array types to describe rank-2 matrices with static dimensions and floating-point element types.
+/// Matrix values use [`ArrayType`] as their staged descriptor. The matrix-specific primitives in
+/// this module expect those array types to describe rank-2 matrices with static dimensions and
+/// floating-point element types.
 pub trait MatrixValue: Traceable<ArrayType> + MatrixOps {}
 
 impl<T: Traceable<ArrayType> + MatrixOps> MatrixValue for T {}
@@ -69,6 +74,9 @@ impl MatrixOps for f64 {
 }
 
 /// Tangent representation for matrix-valued primals.
+///
+/// This extends [`TangentSpace`](crate::tracing_v2::TangentSpace) with the additional linear
+/// actions needed by matrix-valued JVP and transpose rules.
 pub trait MatrixTangentSpace<V: MatrixValue>: TangentSpace<ArrayType, V> {
     /// Applies the linear map `tangent -> factor @ tangent`.
     fn matmul_left(factor: V, tangent: Self) -> Self;
@@ -166,6 +174,9 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
 }
 
 /// Computes the abstract output type of one matrix multiplication.
+///
+/// This is the shared shape-and-sharding rule used by matrix multiplication across tracing,
+/// simplification, and backend wrappers.
 pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
     let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
     let (rhs_data_type, rhs_rows, rhs_cols) = matrix_parts(rhs, op)?;
@@ -177,6 +188,9 @@ pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Re
 }
 
 /// Computes the abstract output type of one matrix transpose.
+///
+/// This centralizes the matrix-transpose metadata rule so both the core primitive and any backend
+/// wrappers agree on how shapes and sharding should propagate.
 pub fn transpose_abstract(input: &ArrayType, op: &'static str) -> Result<ArrayType, TraceError> {
     let (data_type, rows, cols) = matrix_parts(input, op)?;
     let sharding = transpose_array_sharding(input);

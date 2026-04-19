@@ -1,5 +1,16 @@
+//! Replay helpers used while turning traced programs into linear programs.
+//!
+//! These helpers sit below the public autodiff APIs and above the raw staged IR. They replay an
+//! existing traced program on specialized leaf wrappers so linearization can reuse the same program
+//! body without re-running the original user closure.
+
 use super::*;
 
+/// Replays one staged program under caller-supplied leaf semantics.
+///
+/// This is the generic engine behind several internal replay modes: ordinary interpretation,
+/// linearized JIT replay, and symbolic linearization all use the same atom-walking logic while
+/// customizing how constants are lifted and how primitive equations are applied.
 fn replay_program_with<ProgramInput, ProgramOutput, V, O, R, LiftConstant, ApplyOp>(
     program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
     inputs: Vec<R>,
@@ -63,6 +74,10 @@ where
         .collect()
 }
 
+/// Replays a staged program on traced dual leaves inside an outer JIT scope.
+///
+/// This is the key helper that lets higher-order transforms symbolically replay an already-traced
+/// body while preserving both its primal outputs and its staged tangent propagation.
 pub(crate) fn replay_program_linearized_jit<ProgramInput, ProgramOutput, V, O, L, E>(
     program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
     inputs: Vec<LinearizedTracedValue<E>>,
@@ -80,6 +95,12 @@ where
     })
 }
 
+/// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
+///
+/// In the overall architecture, this is the traced-program analogue of
+/// [`super::program::linearize_program`]: instead of consuming concrete primals and producing a
+/// linear program immediately, it works inside an outer JIT trace and stages the resulting
+/// pushforward symbolically.
 pub(crate) fn linearize_traced_program<V, O, L, E>(
     program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
     primals: Vec<Tracer<E>>,

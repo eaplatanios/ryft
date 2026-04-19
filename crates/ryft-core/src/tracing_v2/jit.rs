@@ -1,8 +1,15 @@
 //! Just-in-time staging support for `tracing_v2`.
 //!
-//! The current [`interpret_and_trace`] transform captures a program of staged primitive applications and replays that
-//! program with the built-in interpreter. This keeps the API shape close to the eventual compiled-backend design while
-//! remaining easy to test in pure Rust.
+//! This module is the entry point for turning ordinary Rust closures into staged programs. It owns
+//! [`Tracer`], the symbolic leaf wrapper that records primitive applications into a shared
+//! [`ProgramBuilder`](crate::tracing_v2::ProgramBuilder), plus the two main capture modes:
+//!
+//! - [`trace`] records a program from abstract input metadata alone.
+//! - [`interpret_and_trace`] records the same program shape while also replaying it eagerly on
+//!   concrete inputs so the caller gets both the runtime result and the staged artifact.
+//!
+//! The rest of `tracing_v2` builds on these same primitives. Forward-mode, reverse-mode,
+//! rematerialization, and traced `vmap` all eventually stage through [`Tracer`].
 
 use std::{
     borrow::Cow,
@@ -21,7 +28,14 @@ use crate::{
     types::Typed,
 };
 
-/// Tracer used while staging JIT programs.
+/// Symbolic leaf used while staging ordinary traced programs.
+///
+/// A [`Tracer`] is the value-level facade for one staged atom. Primitive trait impls on
+/// [`Tracer`] do not compute numerically; instead, they add equations to a shared
+/// [`ProgramBuilder`](crate::tracing_v2::ProgramBuilder) and return new tracers pointing at the
+/// output atoms. This makes `Tracer` the central "big picture" type for symbolic execution in
+/// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
+/// always instances of this type.
 pub struct Tracer<E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
@@ -55,16 +69,28 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
         self.atom
     }
 
+    /// Returns a clone of the shared builder that owns this tracer's staged atom.
+    ///
+    /// Higher-order transforms use this to stage additional equations into the same trace without
+    /// exposing the builder mutably through the public API surface.
     #[inline]
     pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>> {
         self.builder.clone()
     }
 
+    /// Returns the shared error slot for the current tracing scope.
+    ///
+    /// Staging helpers record the first abstract-evaluation or invariant failure here so later
+    /// primitive applications can stop extending a broken trace while the entry point unwinds.
     #[inline]
     pub fn staging_error_handle(&self) -> Rc<RefCell<Option<TraceError>>> {
         self.staging_error.clone()
     }
 
+    /// Returns the engine borrowed by this tracing scope.
+    ///
+    /// The engine gives traced values access to metadata-driven zero/one synthesis and identifies
+    /// the staged operation carriers being recorded.
     #[inline]
     pub fn engine(&self) -> &E {
         // Safe because traced values are confined to the tracing scope: all public tracing entry
@@ -73,6 +99,10 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
         unsafe { &*self.engine }
     }
 
+    /// Constructs a traced leaf from an existing tracing scope.
+    ///
+    /// This is the standard constructor used by entry points such as [`trace`] when they turn one
+    /// input leaf into the corresponding symbolic tracer.
     #[inline]
     pub fn from_engine(
         atom: AtomId,
@@ -83,6 +113,10 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
         Self::from_staged_parts(atom, builder, staging_error, engine)
     }
 
+    /// Reconstructs a tracer from already-shared staged state.
+    ///
+    /// Higher-order transforms use this when they need to create new tracer views over atoms that
+    /// already exist in a surrounding trace.
     #[inline]
     pub fn from_staged_parts(
         atom: AtomId,
@@ -97,6 +131,12 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
         Self { atom, builder, staging_error, engine }
     }
 
+    /// Stages one primitive application in the current trace and returns tracers for its outputs.
+    ///
+    /// This is the common helper behind both the arithmetic trait impls on [`Tracer`] and the
+    /// higher-order transforms that need to inject backend-selected operations manually. The method
+    /// validates that all inputs belong to the same tracing scope, runs abstract evaluation to
+    /// determine the output arity, and records the equation unless the scope has already failed.
     pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TraceError>
     where
         E::TracingOperation: Op<E::Type>,
@@ -162,6 +202,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
             .collect())
     }
 
+    /// Stages a single-input primitive application and returns its unique output.
     pub fn unary(self, op: E::TracingOperation) -> Self
     where
         E::TracingOperation: Op<E::Type>,
@@ -173,6 +214,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
             .expect("unary traced staging should produce one output")
     }
 
+    /// Stages a two-input primitive application and returns its unique output.
     pub fn binary(self, rhs: Self, op: E::TracingOperation) -> Self
     where
         E::TracingOperation: Op<E::Type>,
@@ -259,8 +301,14 @@ impl<
 
 /// Stages `function` directly from type metadata using the staged op set selected by `engine`.
 ///
-/// This captures the raw staged program without applying post-trace simplification so callers can
-/// decide whether to keep the unsimplified form or run [`Program::simplify`] themselves.
+/// [`trace`] is the most "symbolic" entry point in the module: it never needs concrete runtime
+/// inputs, only the parameterized input metadata. The closure is executed once on [`Tracer`] leaves
+/// that stand in for those abstract inputs, and the resulting builder state is finalized into a
+/// [`Program`].
+///
+/// The returned pair contains both the structured output metadata inferred during tracing and the
+/// unsimplified staged program itself. Callers that want the canonical simplified form can invoke
+/// [`Program::simplify`](crate::tracing_v2::Program::simplify) afterward.
 pub fn trace<E, F, Input, Output>(
     engine: &E,
     function: F,
@@ -322,6 +370,14 @@ where
 
 /// Stages `function`, interprets the resulting program on the supplied concrete inputs, and returns
 /// both the interpreted output and the staged program.
+///
+/// This is the main "trace what I just ran" API used throughout tests and higher-order transforms.
+/// It first captures the symbolic program shape through [`trace`], then immediately re-tags that
+/// flat trace with the caller's original structures, simplifies it, and replays it on the supplied
+/// inputs. The result is a convenient pair:
+///
+/// - the concrete output that the caller would expect from eager execution, and
+/// - the staged [`Program`] representing the same computation for later reuse.
 pub fn interpret_and_trace<E, F, Input, Output>(
     engine: &E,
     function: F,

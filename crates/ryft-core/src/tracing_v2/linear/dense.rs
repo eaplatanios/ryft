@@ -1,6 +1,11 @@
 use super::*;
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
+///
+/// Dense Jacobian and Hessian materialization only makes sense for leaf types with a finite,
+/// explicit basis. [`CoordinateValue`] is the bridge from the generic tracing world into that
+/// coordinate-based view: it teaches the dense helpers how many coordinates a leaf contributes,
+/// what basis vectors to probe with, and how to flatten outputs back into numeric entries.
 pub trait CoordinateValue: Traceable<ArrayType> + ZeroLike + OneLike {
     /// Scalar-like coordinate type used by dense Jacobians and Hessians.
     type Coordinate: Clone + Debug + PartialEq + 'static;
@@ -52,6 +57,11 @@ impl CoordinateValue for f64 {
     }
 }
 
+/// Dense matrix representation of a Jacobian- or Hessian-like linear map.
+///
+/// The stored matrix is accompanied by the input and output parameter structures plus per-leaf
+/// coordinate counts so callers can relate rows and columns back to the original structured
+/// function signature.
 #[derive(Clone, Debug)]
 pub struct DenseJacobian<S, InputStructure, OutputStructure> {
     values: Vec<S>,
@@ -134,57 +144,68 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure,
         })
     }
 
+    /// Returns the total number of matrix rows.
     #[inline]
     pub fn rows(&self) -> usize {
         self.rows
     }
 
+    /// Returns the total number of matrix columns.
     #[inline]
     pub fn cols(&self) -> usize {
         self.cols
     }
 
+    /// Returns the dimension of the flattened input coordinate space.
     #[inline]
     pub fn input_dimension(&self) -> usize {
         self.cols
     }
 
+    /// Returns the dimension of the flattened output coordinate space.
     #[inline]
     pub fn output_dimension(&self) -> usize {
         self.rows
     }
 
+    /// Returns the matrix entries in row-major order.
     #[inline]
     pub fn values(&self) -> &[S] {
         self.values.as_slice()
     }
 
+    /// Returns the structured input metadata the matrix columns correspond to.
     #[inline]
     pub fn input_structure(&self) -> &InputStructure {
         &self.input_structure
     }
 
+    /// Returns the structured output metadata the matrix rows correspond to.
     #[inline]
     pub fn output_structure(&self) -> &OutputStructure {
         &self.output_structure
     }
 
+    /// Returns how many flattened coordinates each input leaf contributes.
     #[inline]
     pub fn input_coordinate_counts(&self) -> &[usize] {
         self.input_coordinate_counts.as_slice()
     }
 
+    /// Returns how many flattened coordinates each output leaf contributes.
     #[inline]
     pub fn output_coordinate_counts(&self) -> &[usize] {
         self.output_coordinate_counts.as_slice()
     }
 
+    /// Returns one matrix element if the requested row and column are in bounds.
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&S> {
         (row < self.rows && col < self.cols).then(|| &self.values[row * self.cols + col])
     }
 
     #[cfg(any(feature = "ndarray", test))]
+    /// Converts the dense Jacobian into an `ndarray::Array2`.
     pub fn to_array2(&self) -> ndarray::Array2<S> {
         ndarray::Array2::from_shape_vec((self.rows, self.cols), self.values.clone())
             .expect("dense Jacobian dimensions should match the stored values")
@@ -224,6 +245,9 @@ where
 }
 
 /// Materializes a dense Jacobian using forward-mode differentiation.
+///
+/// [`jacfwd`] probes the pushforward with one basis tangent per input coordinate and collects the
+/// resulting output coordinates as matrix columns.
 #[allow(private_bounds)]
 pub fn jacfwd<E, F, Input, Output, V>(
     engine: &E,
@@ -273,6 +297,9 @@ where
 }
 
 /// Materializes a dense Jacobian using reverse-mode differentiation.
+///
+/// [`jacrev`] probes the pullback with one basis cotangent per output coordinate and collects the
+/// resulting input coordinates as matrix rows.
 #[allow(private_bounds)]
 pub fn jacrev<E, F, Input, Output, V>(
     engine: &E,

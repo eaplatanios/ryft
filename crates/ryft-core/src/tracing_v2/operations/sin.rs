@@ -1,4 +1,10 @@
 //! Sine primitive for [`crate::tracing_v2`].
+//!
+//! This module shows the pattern used for nonlinear elementwise primitives in `tracing_v2`: a
+//! small value-level capability trait for concrete leaves, a semantic primitive type for staged
+//! programs, and glue impls that teach [`JvpTracer`](crate::tracing_v2::JvpTracer),
+//! [`Tracer`](crate::tracing_v2::Tracer), and [`Batch`](crate::tracing_v2::Batch) how to reuse the
+//! same operation in forward-mode, symbolic tracing, and batching.
 
 use std::fmt::{Debug, Display};
 
@@ -21,6 +27,9 @@ pub trait SinTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Elementwise sine capability.
+///
+/// This trait is the value-level entry point that lets generic user code write `x.sin()` whether
+/// `x` is a concrete scalar, a traced leaf, a JVP leaf, or a batched leaf.
 pub trait Sin: Sized {
     /// Computes the elementwise sine.
     fn sin(self) -> Self;
@@ -41,6 +50,10 @@ impl Sin for f64 {
 }
 
 /// Elementwise sine primitive.
+///
+/// [`SinOp`] is the staged-program representation of the sine primitive. Ordinary traced programs
+/// store this op (or a backend-specific carrier that wraps it), while JVP and batching rules
+/// delegate through its semantic implementation.
 #[derive(Clone, Default)]
 pub struct SinOp;
 

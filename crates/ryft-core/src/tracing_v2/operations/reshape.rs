@@ -1,8 +1,10 @@
 //! Reshape primitive for [`crate::tracing_v2`].
 //!
-//! This module adds one linear unary primitive that changes only tensor shape metadata while preserving element order
-//! and element count. The public trait surface is deliberately fallible because not every traceable leaf type can
-//! represent every logical target shape with the same Rust type.
+//! Reshaping is one of the places where the staged tracing model has to talk explicitly about
+//! abstract metadata. The runtime effect is "same elements, different logical shape," but whether a
+//! particular leaf type can realize that change is value-specific. This module therefore carries
+//! both the abstract reshape rule and the fallible value-level capability trait used by concrete
+//! leaves and traced wrappers.
 
 use std::{
     fmt::{Debug, Display},
@@ -198,6 +200,9 @@ pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static st
 }
 
 /// Value-level reshape capability shared by concrete leaves and transform-local wrappers.
+///
+/// This trait is intentionally fallible because keeping the same Rust type before and after the
+/// reshape may rule out some logically valid target shapes for a given leaf representation.
 pub trait ReshapeOps: Sized {
     /// Reshapes `self` to `target_shape`.
     ///
@@ -207,11 +212,17 @@ pub trait ReshapeOps: Sized {
 }
 
 /// Convenience trait for traceable leaves that can serve as the concrete values of a staged reshape.
+///
+/// This is the trait bound most reshape-aware transforms use when they need both the abstract leaf
+/// contract and the value-level reshape operation.
 pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
 
 impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 /// Tangent-space reshape capability used by [`JvpTracer`].
+///
+/// Forward-mode AD uses this to propagate tangents through reshape without forcing all tangent
+/// representations to be identical to the primal representation.
 pub trait ReshapeTangentSpace<V: ReshapeValue>: TangentSpace<ArrayType, V> {
     /// Reshapes one tangent value from `input_type` to `output_type`.
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TraceError>;

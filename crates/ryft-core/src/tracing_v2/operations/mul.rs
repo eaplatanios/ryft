@@ -1,4 +1,8 @@
 //! Multiplication primitive for [`crate::tracing_v2`].
+//!
+//! `MulOp` is the bilinear counterpart to [`super::AddOp`]. It is used directly in user programs
+//! and indirectly inside derivative rules for many other primitives, so its docs are a good place
+//! to understand how one primitive threads through staging, replay, batching, and JVP evaluation.
 
 use std::{
     fmt::{Debug, Display},
@@ -26,6 +30,9 @@ pub trait MulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Elementwise multiplication primitive.
+///
+/// Multiplication is both a user-visible primitive and a building block for derivative rules such
+/// as the JVP of [`super::SinOp`] and the replay of captured scale factors.
 #[derive(Clone, Default)]
 pub struct MulOp;
 

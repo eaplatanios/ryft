@@ -1,9 +1,20 @@
 //! Shared staged-program representation and default op-carrier aliases used by the tracing
 //! transforms.
 //!
-//! `Program<T, V, Input, Output, O>` stores a linear sequence of equations over an open set of
-//! operation objects `O`. This common representation is reused for JIT programs and for linear
-//! programs produced during differentiation.
+//! This module owns the IR that all of `tracing_v2` is built on top of. Whether we are capturing a
+//! user closure with [`trace`](crate::tracing_v2::trace), replaying a staged program with
+//! [`Program::call`], or linearizing a primal program into a [`LinearProgram`](crate::tracing_v2::LinearProgram),
+//! we keep coming back to the same core pieces:
+//!
+//! - [`Atom`] values describe the leaves of the staged graph.
+//! - [`Equation`] values connect atoms through concrete operation objects.
+//! - [`ProgramBuilder`] incrementally stages those equations while optionally retaining eager
+//!   exemplars for simplification and validation.
+//! - [`Program`] is the persistent, executable artifact shared between JIT tracing, linearization,
+//!   transposition, and backend lowering.
+//!
+//! The generic parameters stay intentionally open so that the same IR can represent both ordinary
+//! programs and tangent/cotangent programs over backend-specific op carriers.
 
 use std::{borrow::Cow, collections::HashMap, fmt::Display, marker::PhantomData};
 
@@ -14,6 +25,9 @@ use crate::{
 };
 
 /// Identifier for an atom within a staged program.
+///
+/// Atom identifiers are stable indexes into a program's atom table. Equations refer to their
+/// inputs and outputs by these ids, which keeps the staged IR compact and easy to clone.
 pub type AtomId = usize;
 
 /// Staged atom carrying abstract metadata.
@@ -57,6 +71,10 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
 }
 
 /// Single equation in a staged program.
+///
+/// An [`Equation`] is the IR-level record of one primitive application. It names the operation
+/// object to apply, the input atoms it consumes, and the output atoms it defines. Programs are
+/// purely dataflow-based, so equations execute in list order with no control-flow nodes.
 #[derive(Clone, Debug)]
 pub struct Equation<O> {
     /// Operation applied by this equation.
@@ -69,10 +87,16 @@ pub struct Equation<O> {
 
 /// Builder for staged programs.
 ///
-/// The builder keeps one entry in [`Self::intermediates`] for every atom: `Some` for [`Atom::Derived`]
-/// atoms whose value has been eagerly computed during staging, `None` otherwise. These intermediate
-/// values are used for on-the-fly interpretation and algebraic-identity checks but are discarded
-/// when the program is finalized via [`Self::build`].
+/// [`ProgramBuilder`] is the mutable workhorse used by the tracing entry points and by the
+/// linearization helpers. It is deliberately more stateful than [`Program`]: while staging, it can
+/// retain eager exemplar values for inputs and derived atoms so that primitive applications can be
+/// validated immediately, constants can be folded, and algebraic identities can be removed before
+/// they ever enter the final IR.
+///
+/// The builder keeps one entry in [`Self::intermediates`] for every atom: `Some` for
+/// [`Atom::Derived`] atoms whose value has been eagerly computed during staging, `None` otherwise.
+/// Those intermediates are an implementation detail of tracing and are discarded when the builder
+/// is finalized via [`Self::build`].
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
     atoms: Vec<Atom<T, V>>,
@@ -83,6 +107,9 @@ pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
 
 impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Creates an empty builder.
+    ///
+    /// Fresh builders contain no atoms, equations, or retained exemplars and are typically owned
+    /// by one tracing scope.
     #[inline]
     pub fn new() -> Self {
         Self { atoms: Vec::new(), intermediates: Vec::new(), input_atoms: Vec::new(), equations: Vec::new() }
@@ -141,6 +168,9 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     }
 
     /// Adds a constant atom to the program.
+    ///
+    /// Constants are retained verbatim in the final [`Program`] so later replay, lowering, and
+    /// simplification passes can recover the literal value.
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = self.atoms.len();
@@ -304,10 +334,17 @@ impl<O: Clone, T: Type, V: Traceable<T>> Default for ProgramBuilder<O, T, V> {
     }
 }
 
-/// Canonical operation type used by the staged program IR.
+/// Canonical operation type used by the default staged program IR.
+///
+/// Most of the core crate stages ordinary programs against this built-in primitive carrier unless a
+/// backend supplies a different carrier through [`Engine::TracingOperation`](crate::tracing_v2::Engine::TracingOperation).
 pub type ProgramOpRef<V> = PrimitiveOp<ArrayType, V>;
 
-/// Canonical operation type used by the staged linear-program IR.
+/// Canonical operation type used by the default staged linear-program IR.
+///
+/// Linearization and reverse-mode utilities use this as the default carrier for tangent and
+/// cotangent programs unless a backend overrides it through
+/// [`Engine::LinearOperation`](crate::tracing_v2::Engine::LinearOperation).
 pub type LinearProgramOpRef<V> = LinearPrimitiveOp<ArrayType, V>;
 
 /// Shared builder used by the staged linear-program IR. The optional `O` parameter allows callers
@@ -329,6 +366,11 @@ pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
 }
 
 /// Executable staged program over an open operation set.
+///
+/// [`Program`] is the persistent artifact produced by tracing. It stores the finalized atom table,
+/// the ordered list of equations, and the structured input/output metadata needed to turn flat leaf
+/// evaluation back into user-facing structured values. Both ordinary JIT traces and higher-order
+/// transforms exchange programs in this form.
 pub struct Program<
     T: Type,
     V: Typed<T> + Parameter,
@@ -419,6 +461,10 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 
     /// Returns representative concrete inputs for this program, synthesized as zero values from the
     /// retained input types using the provided [`Engine`].
+    ///
+    /// This is mainly a transform-support utility. It lets code that only has a staged program and
+    /// abstract input metadata reconstruct one concrete witness per input leaf so it can replay or
+    /// segment the program without requiring the original caller's inputs.
     pub fn representative_input_values<E>(&self, engine: &E) -> Result<Vec<V>, TraceError>
     where
         E: Engine<Type = T, Value = V> + ?Sized,
@@ -434,6 +480,9 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 
     /// Evaluates every atom in the program on the supplied flat input values.
+    ///
+    /// This is the lowest-level replay helper in the module. [`Program::call`] builds on it to
+    /// translate between structured parameterized values and the flat leaf vectors stored by the IR.
     pub fn evaluate_atom_values(&self, input_values: Vec<V>) -> Result<Vec<V>, TraceError>
     where
         O: InterpretableOp<T, V>,
@@ -487,6 +536,10 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 
     /// Clones this program while replacing only the typed input/output structures.
+    ///
+    /// Many transforms trace or linearize through a flattened `Vec<V>` view of a structured input.
+    /// This helper lets them keep the same equations and atoms while retagging the program with the
+    /// caller-visible parameter structures they want to expose.
     pub fn clone_with_structures<NewInput, NewOutput>(
         &self,
         input_structure: NewInput::ParameterStructure,
@@ -508,6 +561,10 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 
     /// Interprets the staged program on concrete input values.
+    ///
+    /// This is the user-facing replay entry point for staged programs. It checks that the incoming
+    /// structured value matches the program's expected parameter structure, evaluates the flat IR,
+    /// and then rebuilds the structured output.
     pub fn call(&self, input: Input) -> Result<Output, TraceError>
     where
         O: InterpretableOp<T, V>,

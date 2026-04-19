@@ -1,4 +1,9 @@
 //! Higher-order `vmap` operations for [`crate::tracing_v2`].
+//!
+//! The public [`crate::tracing_v2::vmap`] transform lives in [`crate::tracing_v2::batch`], but the
+//! traced representation of that transform lives here. These types let batching survive as a
+//! first-class node inside staged programs instead of being lowered immediately into repeated scalar
+//! work.
 
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -34,6 +39,10 @@ pub trait LinearVMapOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Erased traced `vmap` body used by the staged higher-order op.
+///
+/// The body is stored in a flattened, lane-agnostic form so the higher-order op can be cloned,
+/// replayed, transposed, and lowered without carrying the caller's original structured parameter
+/// types around.
 pub struct FlatTracedVMap<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {
     lane_count: usize,
     input_types: Vec<T>,
@@ -130,6 +139,9 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
 }
 
 /// Higher-order `vmap` op that carries one canonical forward program payload.
+///
+/// Ordinary traced programs store [`VMapOp`] when vectorization is preserved symbolically instead
+/// of being unrolled into repeated scalar equations.
 pub struct VMapOp<
     T: Type + Display,
     V: Traceable<T> + Parameter,
@@ -299,6 +311,10 @@ where
 }
 
 /// Linear-only `vmap` op that always carries both the linear body and its transpose body.
+/// Higher-order linear `vmap` op that carries both a forward body and a transpose body.
+///
+/// Linear programs need slightly more structure than ordinary programs because reverse-mode
+/// transposition must know how to batch both the forward linear map and its transpose.
 pub struct LinearVMapOp<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
     body: FlatTracedVMap<T, V, O>,
     transpose_body: FlatTracedVMap<T, V, O>,

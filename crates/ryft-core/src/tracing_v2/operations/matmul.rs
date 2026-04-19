@@ -1,4 +1,8 @@
 //! Matrix multiplication primitive for [`crate::tracing_v2`].
+//!
+//! This module defines the staged matrix-multiplication primitive itself. The supporting matrix
+//! capability traits live in [`super::matrix`]; this file is the concrete semantic op that traced
+//! programs store once those capabilities are available.
 
 use std::fmt::{Debug, Display};
 
@@ -18,6 +22,10 @@ pub trait MatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 }
 
 /// Primitive representing matrix multiplication.
+///
+/// [`MatMulOp`] is the matrix-valued analogue of the core scalar arithmetic primitives. Its JVP
+/// rule delegates to the matrix tangent-space helpers so the same op can be reused for concrete
+/// execution, traced execution, and batching.
 #[derive(Clone, Default)]
 pub struct MatMulOp;
 
