@@ -360,91 +360,6 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 }
 
-fn traced_input_from_values<Input, V, O, L>(
-    input: Input,
-    builder: Rc<RefCell<GraphBuilder<O, ArrayType, V>>>,
-    staging_error: Rc<RefCell<Option<TraceError>>>,
-    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-) -> Result<Input::To<JitTracer<ArrayType, V, O, L>>, TraceError>
-where
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    V: Traceable<ArrayType>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-{
-    let structure = input.parameter_structure();
-    Input::To::<JitTracer<ArrayType, V, O, L>>::from_parameters(
-        structure,
-        input.into_parameters().map(|value| {
-            let atom = builder.borrow_mut().add_input(&value);
-            JitTracer::<ArrayType, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
-        }),
-    )
-    .map_err(TraceError::from)
-}
-
-fn traced_output_to_structure_and_atoms<Output, V, O, L>(
-    traced_output: Output::To<JitTracer<ArrayType, V, O, L>>,
-) -> Result<(Output::ParameterStructure, Vec<AtomId>), TraceError>
-where
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    V: Traceable<ArrayType>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-{
-    let output_structure = traced_output.parameter_structure();
-    let output_atoms = traced_output.into_parameters().map(|output| output.atom()).collect::<Vec<_>>();
-    Ok((output_structure, output_atoms))
-}
-
-fn type_traced_input_from_types<Input, T, V, O, L>(
-    input_types: Input,
-    builder: Rc<RefCell<GraphBuilder<O, T, V>>>,
-    staging_error: Rc<RefCell<Option<TraceError>>>,
-    engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
-) -> Result<Input::To<JitTracer<T, V, O, L>>, TraceError>
-where
-    Input: Parameterized<T, ParameterStructure: Clone>,
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    Input::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
-{
-    let structure = input_types.parameter_structure();
-    Input::To::<JitTracer<T, V, O, L>>::from_parameters(
-        structure,
-        input_types.into_parameters().map(|r#type| {
-            let atom = builder.borrow_mut().add_input_abstract(r#type);
-            JitTracer::<T, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
-        }),
-    )
-    .map_err(TraceError::from)
-}
-
-fn type_traced_output_to_types_and_atoms<Output, T, V, O, L>(
-    traced_output: Output::To<JitTracer<T, V, O, L>>,
-) -> Result<(Output, Vec<AtomId>), TraceError>
-where
-    Output: Parameterized<T, ParameterStructure: Clone>,
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    O: Clone + 'static,
-    L: Clone + 'static,
-    Output::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
-{
-    let output_structure = traced_output.parameter_structure();
-    let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
-    let output_types = Output::from_parameters(
-        output_structure,
-        traced_outputs.iter().map(|output| output.tpe().into_owned()).collect::<Vec<_>>(),
-    )?;
-    let output_atoms = traced_outputs.into_iter().map(|output| output.atom()).collect::<Vec<_>>();
-    Ok((output_types, output_atoms))
-}
-
 fn trace_program_with_operation_options<F, Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
@@ -470,11 +385,20 @@ where
     let builder = Rc::new(RefCell::new(GraphBuilder::<O, ArrayType, V>::new()));
     let staging_error = Rc::new(RefCell::new(None));
     let concrete_input = Input::from_parameters(input_structure.clone(), input_values.clone())?;
-    let traced_input = traced_input_from_values(concrete_input, builder.clone(), staging_error.clone(), engine)?;
+    let traced_input = Input::To::<JitTracer<ArrayType, V, O, L>>::from_parameters(
+        concrete_input.parameter_structure(),
+        concrete_input.into_parameters().map(|value| {
+            let atom = builder.borrow_mut().add_input(&value);
+            JitTracer::<ArrayType, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+        }),
+    )
+    .map_err(TraceError::from)?;
 
     let (output_structure, outputs) = {
         let traced_output = function(traced_input)?;
-        traced_output_to_structure_and_atoms::<Output, V, O, L>(traced_output)?
+        let output_structure = traced_output.parameter_structure();
+        let outputs = traced_output.into_parameters().map(|output| output.atom()).collect::<Vec<_>>();
+        (output_structure, outputs)
     };
 
     if let Some(error) = staging_error.borrow_mut().take() {
@@ -510,11 +434,24 @@ where
     let input_structure = input_types.parameter_structure();
     let builder = Rc::new(RefCell::new(GraphBuilder::<O, T, V>::new()));
     let staging_error = Rc::new(RefCell::new(None));
-    let traced_input = type_traced_input_from_types(input_types, builder.clone(), staging_error.clone(), engine)?;
+    let traced_input = Input::To::<JitTracer<T, V, O, L>>::from_parameters(
+        input_types.parameter_structure(),
+        input_types.into_parameters().map(|r#type| {
+            let atom = builder.borrow_mut().add_input_abstract(r#type);
+            JitTracer::<T, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+        }),
+    )
+    .map_err(TraceError::from)?;
 
     let (output_structure, output_types, outputs) = {
         let traced_output = function(traced_input)?;
-        let (output_types, outputs) = type_traced_output_to_types_and_atoms::<Output, T, V, O, L>(traced_output)?;
+        let output_structure = traced_output.parameter_structure();
+        let traced_outputs = traced_output.into_parameters().collect::<Vec<_>>();
+        let output_types = Output::from_parameters(
+            output_structure.clone(),
+            traced_outputs.iter().map(|output| output.tpe().into_owned()).collect::<Vec<_>>(),
+        )?;
+        let outputs = traced_outputs.into_iter().map(|output| output.atom()).collect::<Vec<_>>();
         let output_structure = output_types.parameter_structure();
         (output_structure, output_types, outputs)
     };
