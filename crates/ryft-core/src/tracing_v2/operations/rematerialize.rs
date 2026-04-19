@@ -151,7 +151,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
-        self.body.program.call(inputs.to_vec())
+        self.body.program.interpret(inputs.to_vec())
     }
 }
 
@@ -352,7 +352,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.abstract_eval(abstract_inputs.as_slice())?;
-        self.body.program.call(inputs.to_vec())
+        self.body.program.interpret(inputs.to_vec())
     }
 }
 
@@ -431,7 +431,7 @@ where
         >,
     >,
 {
-    let output_primals = body.program.call(input_primals.clone())?;
+    let output_primals = body.program.interpret(input_primals.clone())?;
     let pushforward = linearize_program(engine, body.program(), input_primals)?;
     let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOp::new(
@@ -530,10 +530,15 @@ where
         let body = FlatTracedRematerialize::from_parts(
             input_types,
             output_types,
-            body_program.clone_with_structures::<Vec<V>, Vec<V>>(
-                vec![Placeholder; input_leaf_count],
-                vec![Placeholder; output_leaf_count],
-            ),
+            Program {
+                atoms: body_program.atoms.clone(),
+                input_ids: body_program.input_ids.clone(),
+                output_ids: body_program.output_ids.clone(),
+                instructions: body_program.instructions.clone(),
+                input_structure: vec![Placeholder; input_leaf_count],
+                output_structure: vec![Placeholder; output_leaf_count],
+                marker: std::marker::PhantomData,
+            },
         );
 
         let staged_outputs =
@@ -653,14 +658,14 @@ mod tests {
         let compiled = compile_grad(&engine, |x| rematerialize(|y| y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         // Verify at the original primal point: d/dx sin(x) = cos(x).
-        let grad_at_2 = compiled.call(2.0f64).unwrap();
+        let grad_at_2 = compiled.interpret(2.0f64).unwrap();
         approx_eq(grad_at_2, 2.0f64.cos());
 
         // Verify at a different primal point to confirm the gradient is symbolic.
-        let grad_at_half = compiled.call(0.5f64).unwrap();
+        let grad_at_half = compiled.interpret(0.5f64).unwrap();
         approx_eq(grad_at_half, 0.5f64.cos());
 
-        let grad_at_pi = compiled.call(std::f64::consts::PI).unwrap();
+        let grad_at_pi = compiled.interpret(std::f64::consts::PI).unwrap();
         approx_eq(grad_at_pi, std::f64::consts::PI.cos());
     }
 
@@ -682,10 +687,10 @@ mod tests {
             compile_grad(&engine, |x| rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         // d/dx(x^2 + sin(x)) = 2x + cos(x)
-        let grad_at_2 = compiled.call(2.0f64).unwrap();
+        let grad_at_2 = compiled.interpret(2.0f64).unwrap();
         approx_eq(grad_at_2, 2.0 * 2.0 + 2.0f64.cos());
 
-        let grad_at_half = compiled.call(0.5f64).unwrap();
+        let grad_at_half = compiled.interpret(0.5f64).unwrap();
         approx_eq(grad_at_half, 2.0 * 0.5 + 0.5f64.cos());
     }
 

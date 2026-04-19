@@ -3,7 +3,7 @@
 //!
 //! This module owns the IR that all of `tracing_v2` is built on top of. Whether we are capturing a
 //! user closure with [`trace`](crate::tracing_v2::trace), replaying a staged program with
-//! [`Program::call`], or linearizing a primal program into a [`LinearProgram`](crate::tracing_v2::LinearProgram),
+//! [`Program::interpret`], or linearizing a primal program into a [`LinearProgram`](crate::tracing_v2::LinearProgram),
 //! we keep coming back to the same core pieces:
 //!
 //! - [`Atom`] values describe the leaves of the staged program.
@@ -150,37 +150,12 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
     }
 
-    /// Clones this program while replacing only the typed input/output structures.
-    ///
-    /// Many transforms trace or linearize through a flattened `Vec<V>` view of a structured input.
-    /// This helper lets them keep the same instructions and atoms while retagging the program with the
-    /// caller-visible parameter structures they want to expose.
-    pub fn clone_with_structures<NewInput, NewOutput>(
-        &self,
-        input_structure: NewInput::ParameterStructure,
-        output_structure: NewOutput::ParameterStructure,
-    ) -> Program<T, V, O, NewInput, NewOutput>
-    where
-        NewInput: Parameterized<V>,
-        NewOutput: Parameterized<V>,
-    {
-        Program {
-            atoms: self.atoms.clone(),
-            input_ids: self.input_ids.clone(),
-            instructions: self.instructions.clone(),
-            output_ids: self.output_ids.clone(),
-            input_structure,
-            output_structure,
-            marker: PhantomData,
-        }
-    }
-
     /// Interprets the staged program on concrete input values.
     ///
     /// This is the user-facing replay entry point for staged programs. It checks that the incoming
     /// structured value matches the program's expected parameter structure, evaluates the flat IR,
     /// and then rebuilds the structured output.
-    pub fn call(&self, input: Input) -> Result<Output, TracingError>
+    pub fn interpret(&self, input: Input) -> Result<Output, TracingError>
     where
         O: InterpretableOp<T, V>,
         Input::ParameterStructure: PartialEq,
@@ -760,7 +735,7 @@ mod tests {
 
         assert!(matches!(program.atoms.get(x.index), Some(Atom::Variable(_))));
         assert!(matches!(program.atoms.get(two.index), Some(Atom::Constant(_))));
-        assert_eq!(program.call((2.0, 3.0)).unwrap(), 7.0);
+        assert_eq!(program.interpret((2.0, 3.0)).unwrap(), 7.0);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -853,9 +828,9 @@ mod tests {
         let program = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
 
         // folded_sum = 2.0 + 3.0 = 5.0, product = 5.0 * input
-        assert_eq!(program.call(10.0).unwrap(), 50.0);
-        assert_eq!(program.call(0.5).unwrap(), 2.5);
-        assert_eq!(program.call(0.0).unwrap(), 0.0);
+        assert_eq!(program.interpret(10.0).unwrap(), 50.0);
+        assert_eq!(program.interpret(0.5).unwrap(), 2.5);
+        assert_eq!(program.interpret(0.0).unwrap(), 0.0);
     }
 
     #[test]
@@ -879,7 +854,7 @@ mod tests {
         );
         assert!(matches!(program.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
         assert!(matches!(program.atoms.get(sum.index), Some(Atom::Variable(_))));
-        assert_eq!(program.call(4.0).unwrap(), 7.0);
+        assert_eq!(program.interpret(4.0).unwrap(), 7.0);
     }
 
     #[test]

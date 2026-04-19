@@ -516,12 +516,16 @@ where
         let output_parameter_count = output_structure.parameter_count();
 
         // Reshape to flat Vec program for the JIT compilation step.
-        let flat_program = traced_program
-            .clone_with_structures::<Vec<V>, Vec<V>>(
-                vec![Placeholder; input_parameter_count],
-                vec![Placeholder; output_parameter_count],
-            )
-            .simplify()?;
+        let flat_program = Program {
+            atoms: traced_program.atoms.clone(),
+            input_ids: traced_program.input_ids.clone(),
+            output_ids: traced_program.output_ids.clone(),
+            instructions: traced_program.instructions.clone(),
+            input_structure: vec![Placeholder; input_parameter_count],
+            output_structure: vec![Placeholder; output_parameter_count],
+            marker: std::marker::PhantomData,
+        }
+        .simplify()?;
 
         // Compile the full JVP into a reusable program. Inside the JIT scope, the program is
         // replayed symbolically with `linearize_traced_program`, which produces both the
@@ -577,7 +581,7 @@ where
             let mut combined_flat = Vec::with_capacity(combined_input_count);
             combined_flat.extend(lane_p.into_parameters());
             combined_flat.extend(lane_t.into_parameters());
-            let combined_result: Vec<V> = compiled_jvp.call(combined_flat)?;
+            let combined_result: Vec<V> = compiled_jvp.interpret(combined_flat)?;
             let (primal_flat, tangent_flat) = combined_result.split_at(output_parameter_count);
             let primal_flat: Vec<V> = primal_flat.to_vec();
             let tangent_flat: Vec<V> = tangent_flat.to_vec();

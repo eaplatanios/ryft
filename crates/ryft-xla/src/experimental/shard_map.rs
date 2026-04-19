@@ -1089,10 +1089,15 @@ impl FlatTracedShardMap {
     {
         let local_input_types = traced.local_input_types.parameters().cloned().collect::<Vec<_>>();
         let local_output_types = traced.local_output_types.parameters().cloned().collect::<Vec<_>>();
-        let program = traced.program.clone_with_structures::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            vec![Placeholder; local_input_types.len()],
-            vec![Placeholder; local_output_types.len()],
-        );
+        let program = Program {
+            atoms: traced.program.atoms.clone(),
+            input_ids: traced.program.input_ids.clone(),
+            output_ids: traced.program.output_ids.clone(),
+            instructions: traced.program.instructions.clone(),
+            input_structure: vec![Placeholder; local_input_types.len()],
+            output_structure: vec![Placeholder; local_output_types.len()],
+            marker: std::marker::PhantomData,
+        };
         Self::from_parts(
             traced.shard_map.clone(),
             traced.global_input_types.parameters().cloned().collect::<Vec<_>>(),

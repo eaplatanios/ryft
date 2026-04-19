@@ -99,12 +99,16 @@ where
     let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
         crate::tracing_v2::jit::trace(exemplar_engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
-    let traced_program = traced_program
-        .clone_with_structures::<Vec<V>, Vec<V>>(
-            flat_leaf_parameter_structure(traced_inputs.len()),
-            flat_leaf_parameter_structure(output_leaf_count),
-        )
-        .simplify()?;
+    let traced_program = Program {
+        atoms: traced_program.atoms.clone(),
+        input_ids: traced_program.input_ids.clone(),
+        output_ids: traced_program.output_ids.clone(),
+        instructions: traced_program.instructions.clone(),
+        input_structure: flat_leaf_parameter_structure(traced_inputs.len()),
+        output_structure: flat_leaf_parameter_structure(output_leaf_count),
+        marker: std::marker::PhantomData,
+    }
+    .simplify()?;
     Ok((output_types, traced_program))
 }
 
@@ -360,14 +364,14 @@ mod tests {
         // d/dx(x^2 + sin(x)) = 2x + cos(x)
 
         // Verify at the original primal point.
-        let grad_at_2 = compiled.call(2.0f64).unwrap();
+        let grad_at_2 = compiled.interpret(2.0f64).unwrap();
         approx_eq(grad_at_2, 2.0 * 2.0 + 2.0f64.cos());
 
         // Verify at a DIFFERENT primal point Ã¢â‚¬â€ this is the key test.
-        let grad_at_half = compiled.call(0.5f64).unwrap();
+        let grad_at_half = compiled.interpret(0.5f64).unwrap();
         approx_eq(grad_at_half, 2.0 * 0.5 + 0.5f64.cos());
 
-        let grad_at_pi = compiled.call(std::f64::consts::PI).unwrap();
+        let grad_at_pi = compiled.interpret(std::f64::consts::PI).unwrap();
         approx_eq(grad_at_pi, 2.0 * std::f64::consts::PI + std::f64::consts::PI.cos());
 
         // The program should contain cos (from sin's derivative), not baked constants.
@@ -381,12 +385,12 @@ mod tests {
         let compiled = compile_grad(&engine, bilinear_sin, (2.0f64, 3.0f64)).unwrap();
 
         // df/dx = y + cos(x), df/dy = x
-        let (grad_x, grad_y) = compiled.call((2.0f64, 3.0f64)).unwrap();
+        let (grad_x, grad_y) = compiled.interpret((2.0f64, 3.0f64)).unwrap();
         approx_eq(grad_x, 3.0 + 2.0f64.cos());
         approx_eq(grad_y, 2.0);
 
         // At a different primal point:
-        let (grad_x2, grad_y2) = compiled.call((1.0f64, 5.0f64)).unwrap();
+        let (grad_x2, grad_y2) = compiled.interpret((1.0f64, 5.0f64)).unwrap();
         approx_eq(grad_x2, 5.0 + 1.0f64.cos());
         approx_eq(grad_y2, 1.0);
     }
@@ -403,13 +407,13 @@ mod tests {
         let compiled_save_all =
             compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::SaveAll).unwrap();
 
-        let grad_plain = compiled_plain.call(2.0f64).unwrap();
-        let grad_save_all = compiled_save_all.call(2.0f64).unwrap();
+        let grad_plain = compiled_plain.interpret(2.0f64).unwrap();
+        let grad_save_all = compiled_save_all.interpret(2.0f64).unwrap();
         approx_eq(grad_plain, grad_save_all);
 
         // Also verify at a different primal point.
-        let grad_plain_2 = compiled_plain.call(0.5f64).unwrap();
-        let grad_save_all_2 = compiled_save_all.call(0.5f64).unwrap();
+        let grad_plain_2 = compiled_plain.interpret(0.5f64).unwrap();
+        let grad_save_all_2 = compiled_save_all.interpret(0.5f64).unwrap();
         approx_eq(grad_plain_2, grad_save_all_2);
     }
 
@@ -421,10 +425,10 @@ mod tests {
             compile_grad_with_policy(&engine, quadratic_plus_sin, 2.0f64, RematerializationPolicy::RecomputeAll)
                 .unwrap();
 
-        approx_eq(compiled.call(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
-        approx_eq(compiled.call(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
+        approx_eq(compiled.interpret(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
+        approx_eq(compiled.interpret(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
         approx_eq(
-            compiled.call(std::f64::consts::PI).unwrap(),
+            compiled.interpret(std::f64::consts::PI).unwrap(),
             2.0 * std::f64::consts::PI + std::f64::consts::PI.cos(),
         );
     }
@@ -439,8 +443,8 @@ mod tests {
                 .unwrap();
 
         for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
-            let grad_plain = compiled_plain.call(x).unwrap();
-            let grad_recompute = compiled_recompute.call(x).unwrap();
+            let grad_plain = compiled_plain.interpret(x).unwrap();
+            let grad_recompute = compiled_recompute.interpret(x).unwrap();
             approx_eq(grad_plain, grad_recompute);
         }
     }
@@ -458,8 +462,8 @@ mod tests {
         )
         .unwrap();
 
-        approx_eq(compiled.call(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
-        approx_eq(compiled.call(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
+        approx_eq(compiled.interpret(2.0f64).unwrap(), 2.0 * 2.0 + 2.0f64.cos());
+        approx_eq(compiled.interpret(0.5f64).unwrap(), 2.0 * 0.5 + 0.5f64.cos());
     }
 
     #[test]
@@ -476,7 +480,7 @@ mod tests {
 
         for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
             let expected = 2.0 * x + x.cos();
-            approx_eq(compiled.call(x).unwrap(), expected);
+            approx_eq(compiled.interpret(x).unwrap(), expected);
         }
     }
 
@@ -494,8 +498,8 @@ mod tests {
         .unwrap();
 
         for x in [0.0, 0.5, 1.0, 2.0, 3.0, std::f64::consts::PI] {
-            let grad_plain = compiled_plain.call(x).unwrap();
-            let grad_checkpoint = compiled_checkpoint.call(x).unwrap();
+            let grad_plain = compiled_plain.interpret(x).unwrap();
+            let grad_checkpoint = compiled_checkpoint.interpret(x).unwrap();
             approx_eq(grad_plain, grad_checkpoint);
         }
     }
@@ -515,7 +519,7 @@ mod tests {
         .unwrap();
 
         for x in [0.0, 1.0, 2.0] {
-            approx_eq(compiled_save_all.call(x).unwrap(), compiled_checkpoint.call(x).unwrap());
+            approx_eq(compiled_save_all.interpret(x).unwrap(), compiled_checkpoint.interpret(x).unwrap());
         }
     }
 
@@ -533,7 +537,7 @@ mod tests {
         .unwrap();
 
         for x in [0.0, 1.0, 2.0, std::f64::consts::PI] {
-            approx_eq(compiled.call(x).unwrap(), 2.0 * x + x.cos());
+            approx_eq(compiled.interpret(x).unwrap(), 2.0 * x + x.cos());
         }
     }
 }

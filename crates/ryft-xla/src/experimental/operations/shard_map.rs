@@ -1389,10 +1389,15 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             pushforward_local_input_types,
             body.global_output_types.clone(),
             body.local_output_types.clone(),
-            pushforward_compiled.clone_with_structures::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-                vec![ryft_core::parameters::Placeholder; local_input_count * 2],
-                vec![ryft_core::parameters::Placeholder; local_output_count],
-            ),
+            Program {
+                atoms: pushforward_compiled.atoms.clone(),
+                input_ids: pushforward_compiled.input_ids.clone(),
+                output_ids: pushforward_compiled.output_ids.clone(),
+                instructions: pushforward_compiled.instructions.clone(),
+                input_structure: vec![ryft_core::parameters::Placeholder; local_input_count * 2],
+                output_structure: vec![ryft_core::parameters::Placeholder; local_output_count],
+                marker: std::marker::PhantomData,
+            },
         ),
         pullback: FlatTracedShardMap::from_parts(
             pullback_shard_map,
@@ -1400,10 +1405,15 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             pullback_local_input_types,
             body.global_input_types.clone(),
             body.local_input_types.clone(),
-            pullback_compiled.clone_with_structures::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-                vec![ryft_core::parameters::Placeholder; local_input_count + local_output_count],
-                vec![ryft_core::parameters::Placeholder; local_input_count],
-            ),
+            Program {
+                atoms: pullback_compiled.atoms.clone(),
+                input_ids: pullback_compiled.input_ids.clone(),
+                output_ids: pullback_compiled.output_ids.clone(),
+                instructions: pullback_compiled.instructions.clone(),
+                input_structure: vec![ryft_core::parameters::Placeholder; local_input_count + local_output_count],
+                output_structure: vec![ryft_core::parameters::Placeholder; local_input_count],
+                marker: std::marker::PhantomData,
+            },
         ),
     })
 }

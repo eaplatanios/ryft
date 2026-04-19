@@ -740,7 +740,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, 5.0);
-        assert_eq!(compiled.call(4.0f64), Ok(6.0));
+        assert_eq!(compiled.interpret(4.0f64), Ok(6.0));
     }
 
     #[test]
@@ -846,7 +846,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, 6.0);
-        assert_eq!(compiled.call(4.0f64), Ok(7.0));
+        assert_eq!(compiled.interpret(4.0f64), Ok(7.0));
     }
 
     #[test]

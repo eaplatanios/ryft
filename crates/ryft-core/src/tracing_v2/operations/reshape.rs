@@ -765,7 +765,7 @@ mod tests {
             Placeholder,
         );
         assert_eq!(
-            transpose_program.call(arr2(&[[1.0f64, 2.0, 3.0, 4.0]])).unwrap(),
+            transpose_program.interpret(arr2(&[[1.0f64, 2.0, 3.0, 4.0]])).unwrap(),
             arr2(&[[1.0f64, 2.0], [3.0, 4.0]])
         );
     }

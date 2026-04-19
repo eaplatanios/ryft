@@ -220,7 +220,7 @@ mod tests {
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
         let transpose_program = transpose_builder.build::<f64, f64>(vec![contribution_atom], Placeholder, Placeholder);
-        approx_eq(transpose_program.call(2.0f64).unwrap(), 6.0);
+        approx_eq(transpose_program.interpret(2.0f64).unwrap(), 6.0);
         assert_eq!(
             transpose_program.to_string(),
             indoc! {"

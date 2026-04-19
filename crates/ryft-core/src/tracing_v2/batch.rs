@@ -335,7 +335,15 @@ where
                 .map(|input| body_program.atoms[input.index].r#type().into_owned())
                 .collect::<Vec<_>>(),
             exemplar_output_types.parameters().cloned().collect::<Vec<_>>(),
-            body_program.clone_with_structures::<Vec<V>, Vec<V>>(flat_input_structure, flat_output_structure),
+            Program {
+                atoms: body_program.atoms.clone(),
+                input_ids: body_program.input_ids.clone(),
+                output_ids: body_program.output_ids.clone(),
+                instructions: body_program.instructions.clone(),
+                input_structure: flat_input_structure,
+                output_structure: flat_output_structure,
+                marker: std::marker::PhantomData,
+            },
         );
 
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
@@ -459,7 +467,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, 6.0);
-        assert_eq!(program.call(3.0f64).unwrap(), 8.0);
+        assert_eq!(program.interpret(3.0f64).unwrap(), 8.0);
         assert_eq!(
             program.to_string(),
             indoc! {"

@@ -367,9 +367,18 @@ where
     let output_structure = output_structure.ok_or(TracingError::InternalInvariantViolation(
         "interpret_and_trace did not record the staged output structure",
     ))?;
-    let program = flat_program.clone_with_structures::<Input, Output>(input_structure, output_structure).simplify()?;
+    let program: Program<E::Type, E::Value, E::TracingOperation, Input, Output> = Program {
+        atoms: flat_program.atoms.clone(),
+        input_ids: flat_program.input_ids.clone(),
+        output_ids: flat_program.output_ids.clone(),
+        instructions: flat_program.instructions.clone(),
+        input_structure,
+        output_structure,
+        marker: std::marker::PhantomData,
+    }
+    .simplify()?;
     let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
-    Ok((program.call(concrete_input)?, program))
+    Ok((program.interpret(concrete_input)?, program))
 }
 
 #[cfg(test)]
@@ -423,7 +432,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
-        assert_eq!(program.call(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
+        assert_eq!(program.interpret(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
         assert_eq!(program.input_ids.len(), 1);
         assert_eq!(
             program.to_string(),
@@ -596,7 +605,7 @@ mod tests {
         assert_eq!(output, TestValue::new(scalar_type.clone(), 6));
         assert_eq!(
             program
-                .call((TestValue::new(scalar_type.clone(), 4), TestValue::new(scalar_type.clone(), 5)))
+                .interpret((TestValue::new(scalar_type.clone(), 4), TestValue::new(scalar_type.clone(), 5)))
                 .unwrap(),
             TestValue::new(scalar_type, 10),
         );

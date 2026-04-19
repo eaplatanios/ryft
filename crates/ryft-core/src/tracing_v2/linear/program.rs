@@ -66,7 +66,7 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
-        self.program.call(input)
+        self.program.interpret(input)
     }
 }
 

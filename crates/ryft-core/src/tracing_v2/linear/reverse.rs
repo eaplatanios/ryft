@@ -469,12 +469,16 @@ where
             interpret_and_trace(erased_engine, |staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
-        let flat_program = traced_program
-            .clone_with_structures::<Vec<V>, Vec<V>>(
-                flat_leaf_parameter_structure(parameter_count),
-                flat_leaf_parameter_structure(1),
-            )
-            .simplify()?;
+        let flat_program = Program {
+            atoms: traced_program.atoms.clone(),
+            input_ids: traced_program.input_ids.clone(),
+            output_ids: traced_program.output_ids.clone(),
+            instructions: traced_program.instructions.clone(),
+            input_structure: flat_leaf_parameter_structure(parameter_count),
+            output_structure: flat_leaf_parameter_structure(1),
+            marker: std::marker::PhantomData,
+        }
+        .simplify()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
         let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>) =
@@ -511,7 +515,7 @@ where
         let mut lane_grads = Vec::with_capacity(lane_primals.len());
         for lane in lane_primals {
             let flat: Vec<V> = lane.into_parameters().collect();
-            let flat_result = compiled_vg.call(flat)?;
+            let flat_result = compiled_vg.interpret(flat)?;
             let (value, grad_flat) = flat_result.split_first().ok_or(TracingError::EmptyParameterizedValue)?;
             lane_values.push(value.clone());
             lane_grads.push(

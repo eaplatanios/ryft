@@ -124,7 +124,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
         let lane_input_count = self.input_types.len();
         let mut outputs = Vec::with_capacity(self.total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
-            outputs.extend(self.program.call(lane_inputs.to_vec())?);
+            outputs.extend(self.program.interpret(lane_inputs.to_vec())?);
         }
         Ok(outputs)
     }
@@ -491,7 +491,7 @@ where
         >,
     >,
 {
-    let output_primals = body.program.call(input_primals.clone())?;
+    let output_primals = body.program.interpret(input_primals.clone())?;
     let pushforward = linearize_program(engine, body.program(), input_primals)?;
     let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearVMapOp::new(
