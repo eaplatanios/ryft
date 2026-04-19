@@ -257,46 +257,6 @@ impl<
     }
 }
 
-/// Stages `function`, interprets the resulting program on the supplied concrete inputs, and returns
-/// both the interpreted output and the staged program.
-pub fn interpret_and_trace<E, F, Input, Output>(
-    engine: &E,
-    function: F,
-    input: Input,
-) -> Result<(Output, Program<E::Type, E::Value, Input, Output, E::TracingOperation>), TraceError>
-where
-    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOp<E::Type, E::Value>>
-        + ?Sized
-        + 'static,
-    Input: Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<E>>>,
-    Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<E>>>,
-    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
-{
-    let input_structure = input.parameter_structure();
-    let input_values = input.into_parameters().collect::<Vec<_>>();
-    let input_types = input_values.iter().map(|value| value.tpe().into_owned()).collect::<Vec<_>>();
-    let mut output_structure = None;
-    let (_, flat_program): (
-        Vec<E::Type>,
-        Program<E::Type, E::Value, Vec<E::Value>, Vec<E::Value>, E::TracingOperation>,
-    ) = trace(
-        engine,
-        |flat_traced_input| {
-            let traced_input = Input::To::<Tracer<E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
-            let traced_output = function(traced_input)?;
-            output_structure = Some(traced_output.parameter_structure());
-            Ok(traced_output.into_parameters().collect::<Vec<_>>())
-        },
-        input_types,
-    )?;
-    let output_structure = output_structure.ok_or(TraceError::InternalInvariantViolation(
-        "interpret_and_trace did not record the staged output structure",
-    ))?;
-    let program = flat_program.clone_with_structures::<Input, Output>(input_structure, output_structure).simplify()?;
-    let concrete_input = Input::from_parameters(program.input_structure().clone(), input_values)?;
-    Ok((program.call(concrete_input)?, program))
-}
-
 /// Stages `function` directly from type metadata using the staged op set selected by `engine`.
 ///
 /// This captures the raw staged program without applying post-trace simplification so callers can
@@ -358,6 +318,46 @@ where
     let program =
         builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure);
     Ok((output_types, program))
+}
+
+/// Stages `function`, interprets the resulting program on the supplied concrete inputs, and returns
+/// both the interpreted output and the staged program.
+pub fn interpret_and_trace<E, F, Input, Output>(
+    engine: &E,
+    function: F,
+    input: Input,
+) -> Result<(Output, Program<E::Type, E::Value, Input, Output, E::TracingOperation>), TraceError>
+where
+    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOp<E::Type, E::Value>>
+        + ?Sized
+        + 'static,
+    Input: Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<E>>>,
+    Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<E>>>,
+    F: FnOnce(Input::To<Tracer<E>>) -> Result<Output::To<Tracer<E>>, TraceError>,
+{
+    let input_structure = input.parameter_structure();
+    let input_values = input.into_parameters().collect::<Vec<_>>();
+    let input_types = input_values.iter().map(|value| value.tpe().into_owned()).collect::<Vec<_>>();
+    let mut output_structure = None;
+    let (_, flat_program): (
+        Vec<E::Type>,
+        Program<E::Type, E::Value, Vec<E::Value>, Vec<E::Value>, E::TracingOperation>,
+    ) = trace(
+        engine,
+        |flat_traced_input| {
+            let traced_input = Input::To::<Tracer<E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
+            let traced_output = function(traced_input)?;
+            output_structure = Some(traced_output.parameter_structure());
+            Ok(traced_output.into_parameters().collect::<Vec<_>>())
+        },
+        input_types,
+    )?;
+    let output_structure = output_structure.ok_or(TraceError::InternalInvariantViolation(
+        "interpret_and_trace did not record the staged output structure",
+    ))?;
+    let program = flat_program.clone_with_structures::<Input, Output>(input_structure, output_structure).simplify()?;
+    let concrete_input = Input::from_parameters(program.input_structure().clone(), input_values)?;
+    Ok((program.call(concrete_input)?, program))
 }
 
 #[cfg(test)]
