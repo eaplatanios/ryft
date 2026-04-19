@@ -6,7 +6,7 @@
 //! [`Program::call`], or linearizing a primal program into a [`LinearProgram`](crate::tracing_v2::LinearProgram),
 //! we keep coming back to the same core pieces:
 //!
-//! - [`Atom`] values describe the leaves of the staged graph.
+//! - [`Atom`] values describe the leaves of the staged program.
 //! - [`Instruction`] values connect atoms through concrete operation objects.
 //! - [`ProgramBuilder`] incrementally stages those instructions while optionally retaining eager
 //!   exemplars for simplification and validation.
@@ -28,31 +28,26 @@ use crate::{
 
 /// Staged atom carrying abstract metadata.
 ///
-/// The variant encodes how the atom entered the program and determines which concrete state it
-/// retains. See [`ProgramBuilder`] for how builder-time intermediate values for [`Atom::Derived`]
-/// are kept separately during staging.
+/// The variant encodes whether the atom is a retained literal constant or an ordinary program
+/// variable. Input-vs-derived provenance for variable atoms lives in the owning [`Program`]'s
+/// [`Program::input_atoms`] list and instruction outputs rather than in the atom enum itself.
 #[derive(Clone, Debug)]
 pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant folded or supplied at trace time. Constants retain their value so the
     /// interpreter and MLIR lowering can emit them.
     Constant(V),
 
-    /// Program input carrying only its abstract type. Any builder-time representative value is kept
-    /// in the owning [`ProgramBuilder`]'s side table and is discarded when the program is finalized;
-    /// later transforms recover representatives by synthesizing zeros from the retained type.
-    Input(T),
-
-    /// Atom produced by evaluating an instruction. Carries only the abstract type; any eagerly
-    /// evaluated intermediate value lives in the owning [`ProgramBuilder`]'s side table and is
-    /// discarded when the program is finalized.
-    Derived(T),
+    /// Non-constant program variable carrying only its abstract type. Any builder-time exemplar
+    /// lives in the owning [`ProgramBuilder`]'s side table and is discarded when the program is
+    /// finalized.
+    Variable(T),
 }
 
 impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
     fn r#type(&self) -> Cow<'_, T> {
         match self {
             Self::Constant(value) => value.r#type(),
-            Self::Input(r#type) | Self::Derived(r#type) => Cow::Borrowed(r#type),
+            Self::Variable(r#type) => Cow::Borrowed(r#type),
         }
     }
 }
@@ -203,7 +198,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             .iter()
             .copied()
             .map(|atom_id| match self.atom(atom_id) {
-                Some(Atom::Input(r#type)) => Ok(engine.zero(r#type)),
+                Some(Atom::Variable(r#type)) => Ok(engine.zero(r#type)),
                 _ => Err(TracingError::InternalInvariantViolation("staged program input atom did not retain a type")),
             })
             .collect()
@@ -364,14 +359,13 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 
             let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom {
-                Atom::Input(r#type) => builder.add_input_abstract(r#type.clone()),
                 Atom::Constant(value) => builder.add_constant(value.clone()),
-                Atom::Derived(_) => {
+                Atom::Variable(_) => {
                     let instruction_index = instruction_by_output[atom_id.index]
-                        .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning instruction"))?;
+                        .ok_or(TracingError::InternalInvariantViolation("variable atom had no owning instruction"))?;
                     if !live_instructions[instruction_index] {
                         return Err(TracingError::InternalInvariantViolation(
-                            "attempted to remap a dead derived atom during program simplification",
+                            "attempted to remap a dead variable atom during program simplification",
                         ));
                     }
                     let instruction = &program.instructions[instruction_index];
@@ -430,7 +424,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_atoms.iter().copied() {
             let input = self.atom(input_atom).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
-            let Atom::Input(r#type) = input else {
+            let Atom::Variable(r#type) = input else {
                 return Err(TracingError::InternalInvariantViolation(
                     "staged program input atom did not retain a type",
                 ));
@@ -477,15 +471,19 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
         }
 
         let mut binding_count = 0usize;
+        let mut input_atom_flags = vec![false; self.atoms.len()];
+        for input_atom in self.input_atoms.iter().copied() {
+            input_atom_flags[input_atom.index] = true;
+        }
         for (atom_id, atom) in self.atoms.iter().enumerate() {
             match atom {
-                Atom::Input(_) => {}
                 Atom::Constant(_) => {
                     let prefix = if binding_count == 0 { "let" } else { "   " };
                     writeln!(formatter, "{prefix} {} = const", format_typed_atom(AtomId { index: atom_id }))?;
                     binding_count += 1;
                 }
-                Atom::Derived(_) => {
+                Atom::Variable(_) if input_atom_flags[atom_id] => {}
+                Atom::Variable(_) => {
                     let Some(instruction_index) = instruction_by_first_output[atom_id] else {
                         continue;
                     };
@@ -518,12 +516,12 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
 ///
 /// [`ProgramBuilder`] is the mutable workhorse used by the tracing entry points and by the
 /// linearization helpers. It is deliberately more stateful than [`Program`]: while staging, it can
-/// retain eager exemplar values for inputs and derived atoms so that primitive applications can be
+/// retain eager exemplar values for variable atoms so that primitive applications can be
 /// validated immediately, constants can be folded, and algebraic identities can be removed before
 /// they ever enter the final IR.
 ///
 /// The builder keeps one entry in [`Self::intermediates`] for every atom: `Some` for
-/// [`Atom::Derived`] atoms whose value has been eagerly computed during staging, `None` otherwise.
+/// non-constant atoms whose value has been eagerly computed during staging, `None` otherwise.
 /// Those intermediates are an implementation detail of tracing and are discarded when the builder
 /// is finalized via [`Self::build`].
 ///
@@ -573,14 +571,14 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
 
     /// Returns the concrete value associated with the provided atom, if one is available.
     ///
-    /// For [`Atom::Constant`] this returns the retained value. For [`Atom::Input`] and
-    /// [`Atom::Derived`] this returns the eagerly computed exemplar stored in the builder's
+    /// For [`Atom::Constant`] this returns the retained value. For [`Atom::Variable`] this returns
+    /// the eagerly computed exemplar stored in the builder's
     /// side table, or `None` if none is available.
     #[inline]
     pub(crate) fn stored_value(&self, id: AtomId) -> Option<&V> {
         match self.atoms.get(id.index)? {
             Atom::Constant(value) => Some(value),
-            Atom::Input(_) | Atom::Derived(_) => self.intermediates.get(id.index).and_then(Option::as_ref),
+            Atom::Variable(_) => self.intermediates.get(id.index).and_then(Option::as_ref),
         }
     }
 
@@ -594,7 +592,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     #[inline]
     pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
-        self.atoms.push(Atom::Input(abstract_value));
+        self.atoms.push(Atom::Variable(abstract_value));
         self.intermediates.push(None);
         self.input_atoms.push(id);
         id
@@ -611,7 +609,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     #[inline]
     fn add_input_with_example(&mut self, abstract_value: T, example_value: V) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
-        self.atoms.push(Atom::Input(abstract_value));
+        self.atoms.push(Atom::Variable(abstract_value));
         self.intermediates.push(Some(example_value));
         self.input_atoms.push(id);
         id
@@ -642,7 +640,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .into_iter()
             .map(|r#type| {
                 let id = AtomId { index: self.atoms.len() };
-                self.atoms.push(Atom::Derived(r#type));
+                self.atoms.push(Atom::Variable(r#type));
                 self.intermediates.push(None);
                 id
             })
@@ -721,7 +719,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
                     self.atoms.push(Atom::Constant(output_value));
                     self.intermediates.push(None);
                 } else {
-                    self.atoms.push(Atom::Derived(r#type));
+                    self.atoms.push(Atom::Variable(r#type));
                     self.intermediates.push(Some(output_value));
                 }
                 AtomId { index: id }
@@ -825,7 +823,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn program_builder_tracks_atom_sources_and_executes() {
+    fn program_builder_tracks_atom_kinds_and_executes() {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
@@ -834,7 +832,7 @@ mod tests {
         let sum = builder.add_instruction(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
-        assert!(matches!(program.atom(x).unwrap(), Atom::Input(_)));
+        assert!(matches!(program.atom(x).unwrap(), Atom::Variable(_)));
         assert!(matches!(program.atom(two).unwrap(), Atom::Constant(_)));
         assert_eq!(program.call((2.0, 3.0)).unwrap(), 7.0);
         assert_eq!(
@@ -897,7 +895,7 @@ mod tests {
         let x = builder.add_input(&10.0f64);
         let result = builder.add_instruction(PrimitiveOp::Mul, vec![folded[0], x]).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Derived(_)));
+        assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Variable(_)));
         assert_eq!(builder.instruction_count(), 1);
 
         // Build the program and verify only the non-folded instruction survived.
@@ -941,17 +939,21 @@ mod tests {
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_instruction(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
 
-        assert!(matches!(builder.atom(x).unwrap(), Atom::Input(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(
+            matches!(builder.atom(x).unwrap(), Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64))
+        );
         assert!(matches!(builder.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
-        assert!(matches!(builder.atom(sum).unwrap(), Atom::Derived(_)));
+        assert!(matches!(builder.atom(sum).unwrap(), Atom::Variable(_)));
         assert_eq!(builder.stored_value(x), Some(&2.0));
         assert_eq!(builder.stored_value(sum), Some(&5.0));
 
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        assert!(matches!(program.atom(x).unwrap(), Atom::Input(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
+        assert!(
+            matches!(program.atom(x).unwrap(), Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64))
+        );
         assert!(matches!(program.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
-        assert!(matches!(program.atom(sum).unwrap(), Atom::Derived(_)));
+        assert!(matches!(program.atom(sum).unwrap(), Atom::Variable(_)));
         assert_eq!(program.representative_atom_values(&engine).unwrap(), vec![0.0, 3.0, 3.0]);
         assert_eq!(program.call(4.0).unwrap(), 7.0);
     }

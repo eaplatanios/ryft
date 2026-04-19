@@ -234,11 +234,15 @@ where
     let mut op_histogram = BTreeMap::new();
     let mut nested_regions = Vec::new();
     let mut depth_by_atom = vec![0usize; program.atom_count()];
+    let mut input_atom_flags = vec![false; program.atom_count()];
+    for input_atom in program.input_atoms().iter().copied() {
+        input_atom_flags[input_atom.index] = true;
+    }
 
     for (atom_id, atom) in
         (0..program.atom_count()).filter_map(|atom_id| program.atom(atom_id).map(|atom| (atom_id, atom)))
     {
-        if matches!(atom, Atom::Input(_) | Atom::Constant(_)) {
+        if input_atom_flags[atom_id] || matches!(atom, Atom::Constant(_)) {
             depth_by_atom[atom_id] = 0;
         }
     }

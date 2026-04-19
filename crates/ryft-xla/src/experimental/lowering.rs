@@ -1620,14 +1620,18 @@ where
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
+    let mut input_atom_flags = vec![false; program.atom_count()];
+    for input_atom in program.input_atoms().iter().copied() {
+        input_atom_flags[input_atom.index] = true;
+    }
 
     for atom_index in 0..program.atom_count() {
         let atom_id = AtomId { index: atom_index };
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input(_) => {}
             Atom::Constant(_) => {}
-            Atom::Derived(_) => {
+            Atom::Variable(_) if input_atom_flags[atom_index] => {}
+            Atom::Variable(_) => {
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
@@ -1769,16 +1773,20 @@ where
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
+    let mut input_atom_flags = vec![false; program.atom_count()];
+    for input_atom in program.input_atoms().iter().copied() {
+        input_atom_flags[input_atom.index] = true;
+    }
 
     for atom_index in 0..program.atom_count() {
         let atom_id = AtomId { index: atom_index };
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input(_) => {}
             Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
-            Atom::Derived(_) => {
+            Atom::Variable(_) if input_atom_flags[atom_index] => {}
+            Atom::Variable(_) => {
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
@@ -1843,16 +1851,20 @@ where
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
+    let mut input_atom_flags = vec![false; program.atom_count()];
+    for input_atom in program.input_atoms().iter().copied() {
+        input_atom_flags[input_atom.index] = true;
+    }
 
     for atom_index in 0..program.atom_count() {
         let atom_id = AtomId { index: atom_index };
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input(_) => {}
             Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
-            Atom::Derived(_) => {
+            Atom::Variable(_) if input_atom_flags[atom_index] => {}
+            Atom::Variable(_) => {
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
@@ -1903,16 +1915,20 @@ where
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
+    let mut input_atom_flags = vec![false; program.atom_count()];
+    for input_atom in program.input_atoms().iter().copied() {
+        input_atom_flags[input_atom.index] = true;
+    }
 
     for atom_index in 0..program.atom_count() {
         let atom_id = AtomId { index: atom_index };
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            Atom::Input(_) => {}
             Atom::Constant(value) => {
                 atom_values[atom_index] = Some(lower_constant(atom_id, value, block, context, location)?);
             }
-            Atom::Derived(_) => {
+            Atom::Variable(_) if input_atom_flags[atom_index] => {}
+            Atom::Variable(_) => {
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };

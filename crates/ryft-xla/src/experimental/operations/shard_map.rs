@@ -722,16 +722,19 @@ fn project_flat_shard_map_program(
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
             return Ok(*mapped_atom);
         }
+        if let Some(mapped_input) = kept_input_atoms.get(&atom_id) {
+            atom_mapping.insert(atom_id, *mapped_input);
+            return Ok(*mapped_input);
+        }
 
         let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
-            ryft_core::tracing_v2::Atom::Input(_) => *kept_input_atoms.get(&atom_id).ok_or(
-                TracingError::InternalInvariantViolation("projected flat shard-map program referenced a removed input"),
-            )?,
             ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
-            ryft_core::tracing_v2::Atom::Derived(_) => {
+            ryft_core::tracing_v2::Atom::Variable(_) => {
                 let instruction_index = instruction_by_output[atom_id.index]
-                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning instruction"))?;
+                    .ok_or(TracingError::InternalInvariantViolation(
+                        "projected flat shard-map program referenced a removed input or a variable atom without an owning instruction",
+                    ))?;
                 let instruction = &program.instructions()[instruction_index];
                 let remapped_inputs = instruction
                     .inputs
@@ -835,20 +838,17 @@ fn build_factorized_apply_program(
 
         let atom = program.atom(atom_id).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
-            ryft_core::tracing_v2::Atom::Input(_) => {
-                return Err(TracingError::InternalInvariantViolation(
-                    "factorized apply program referenced a primal input that was not materialized as a residual",
-                ));
-            }
             ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
-            ryft_core::tracing_v2::Atom::Derived(_) => {
+            ryft_core::tracing_v2::Atom::Variable(_) => {
                 if !depends_on_cotangent[atom_id.index] {
                     return Err(TracingError::InternalInvariantViolation(
                         "factorized apply program referenced a cotangent-independent atom that was not materialized as a residual",
                     ));
                 }
-                let instruction_index = instruction_by_output[atom_id.index]
-                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning instruction"))?;
+                let instruction_index =
+                    instruction_by_output[atom_id.index].ok_or(TracingError::InternalInvariantViolation(
+                        "factorized apply program referenced a primal input that was not materialized as a residual",
+                    ))?;
                 let instruction = &program.instructions()[instruction_index];
                 let remapped_inputs = instruction
                     .inputs
@@ -1157,12 +1157,15 @@ fn replay_traced_xla_program<
             instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
+    let mut input_atom_flags = vec![false; program.atom_count()];
+    for input_atom in program.input_atoms().iter().copied() {
+        input_atom_flags[input_atom.index] = true;
+    }
 
     for atom_index in 0..program.atom_count() {
         let atom_id = AtomId { index: atom_index };
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
-            ryft_core::tracing_v2::Atom::Input(_) => {}
             ryft_core::tracing_v2::Atom::Constant(value) => {
                 let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
                 if seed_inputs.is_empty() {
@@ -1170,7 +1173,8 @@ fn replay_traced_xla_program<
                 }
                 values[atom_index] = Some(V::lift_constant(value, seed_inputs.as_slice())?);
             }
-            ryft_core::tracing_v2::Atom::Derived(_) => {
+            ryft_core::tracing_v2::Atom::Variable(_) if input_atom_flags[atom_index] => {}
+            ryft_core::tracing_v2::Atom::Variable(_) => {
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
