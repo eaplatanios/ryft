@@ -401,7 +401,7 @@ where
 {
     let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
     let atom = exemplar.builder_handle().borrow_mut().add_constant(constant.clone());
-    Ok(Tracer::from_engine(atom, exemplar.builder_handle(), exemplar.staging_error_handle(), exemplar.engine()))
+    Ok(Tracer::from_engine(atom, exemplar.builder_handle(), exemplar.error_handle(), exemplar.engine()))
 }
 
 pub(crate) fn lift_linearized_traced_constant<'engine, V, O: Clone + 'static, L: Clone + 'static, E>(

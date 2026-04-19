@@ -47,26 +47,21 @@ pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
 
     /// Shared slot that records the first staging failure in this tracing scope.
-    staging_error: Rc<RefCell<Option<TracingError>>>,
+    error: Rc<RefCell<Option<TracingError>>>,
 
     /// Engine borrowed by this tracing scope for metadata-driven value synthesis.
     engine: &'engine E,
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<'engine, E> {
+    fn clone(&self) -> Self {
+        Self { atom: self.atom, builder: self.builder.clone(), error: self.error.clone(), engine: self.engine }
     }
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<'engine, E> {
-    fn clone(&self) -> Self {
-        Self {
-            atom: self.atom,
-            builder: self.builder.clone(),
-            staging_error: self.staging_error.clone(),
-            engine: self.engine,
-        }
+impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
@@ -91,8 +86,8 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// Staging helpers record the first abstract-evaluation or invariant failure here so later
     /// primitive applications can stop extending a broken trace while the entry point unwinds.
     #[inline]
-    pub fn staging_error_handle(&self) -> Rc<RefCell<Option<TracingError>>> {
-        self.staging_error.clone()
+    pub fn error_handle(&self) -> Rc<RefCell<Option<TracingError>>> {
+        self.error.clone()
     }
 
     /// Returns the engine borrowed by this tracing scope.
@@ -112,10 +107,10 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     pub fn from_engine(
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
-        staging_error: Rc<RefCell<Option<TracingError>>>,
+        error: Rc<RefCell<Option<TracingError>>>,
         engine: &'engine E,
     ) -> Self {
-        Self { atom, builder, staging_error, engine }
+        Self { atom, builder, error, engine }
     }
 
     /// Stages one primitive application in the current trace and returns tracers for its outputs.
@@ -133,15 +128,15 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
         }
 
         let builder = inputs[0].builder.clone();
-        let staging_error = inputs[0].staging_error.clone();
+        let error = inputs[0].error.clone();
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
             return Err(TracingError::InternalInvariantViolation(
                 "tracer inputs for one staged op must share the same builder",
             ));
         }
-        if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&staging_error, &input.staging_error)) {
+        if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&error, &input.error)) {
             return Err(TracingError::InternalInvariantViolation(
-                "tracer inputs for one staged op must share the same staging error handle",
+                "tracer inputs for one staged op must share the same error handle",
             ));
         }
 
@@ -158,21 +153,21 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
                     .as_slice(),
             ) {
                 Ok(outputs) => outputs.len(),
-                Err(error) => {
-                    if staging_error.borrow().is_none() {
-                        *staging_error.borrow_mut() = Some(error);
+                Err(staging_error) => {
+                    if error.borrow().is_none() {
+                        *error.borrow_mut() = Some(staging_error);
                     }
                     1
                 }
             }
         };
-        let output_atoms = if staging_error.borrow().is_some() {
+        let output_atoms = if error.borrow().is_some() {
             vec![inputs[0].atom; output_count]
         } else {
             match builder.borrow_mut().add_equation_abstract(op, input_atoms) {
                 Ok(outputs) => outputs,
-                Err(error) => {
-                    *staging_error.borrow_mut() = Some(error);
+                Err(staging_error) => {
+                    *error.borrow_mut() = Some(staging_error);
                     vec![inputs[0].atom; output_count]
                 }
             }
@@ -180,12 +175,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
 
         Ok(output_atoms
             .into_iter()
-            .map(|atom| Self {
-                atom,
-                builder: builder.clone(),
-                staging_error: staging_error.clone(),
-                engine: inputs[0].engine,
-            })
+            .map(|atom| Self { atom, builder: builder.clone(), error: error.clone(), engine: inputs[0].engine })
             .collect())
     }
 
@@ -207,7 +197,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
         E::TracingOperation: Op<E::Type>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
-        debug_assert!(Rc::ptr_eq(&self.staging_error, &rhs.staging_error));
+        debug_assert!(Rc::ptr_eq(&self.error, &rhs.error));
         Self::apply_staged_op(&[self, rhs], op)
             .expect("binary traced staging should preserve non-empty inputs")
             .into_iter()
@@ -237,7 +227,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { atom, builder: self.builder.clone(), staging_error: self.staging_error.clone(), engine: self.engine }
+        Self { atom, builder: self.builder.clone(), error: self.error.clone(), engine: self.engine }
     }
 }
 
@@ -246,7 +236,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { atom, builder: self.builder.clone(), staging_error: self.staging_error.clone(), engine: self.engine }
+        Self { atom, builder: self.builder.clone(), error: self.error.clone(), engine: self.engine }
     }
 }
 
@@ -323,12 +313,12 @@ where
 {
     let input_structure = input_types.parameter_structure();
     let builder = Rc::new(RefCell::new(ProgramBuilder::<E::TracingOperation, E::Type, E::Value>::new()));
-    let staging_error = Rc::new(RefCell::new(None));
+    let error = Rc::new(RefCell::new(None));
     let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
             let atom = builder.borrow_mut().add_input_abstract(r#type);
-            Tracer::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+            Tracer::from_engine(atom, builder.clone(), error.clone(), engine)
         }),
     )
     .map_err(TracingError::from)?;
@@ -346,8 +336,8 @@ where
         (output_structure, output_types, outputs)
     };
 
-    if let Some(error) = staging_error.borrow_mut().take() {
-        return Err(error);
+    if let Some(tracing_error) = error.borrow_mut().take() {
+        return Err(tracing_error);
     }
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
@@ -424,10 +414,10 @@ mod tests {
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ProgramOpRef<f64>, ArrayType, f64>::new()));
-        let staging_error = Rc::new(RefCell::new(None));
+        let error = Rc::new(RefCell::new(None));
         let atom = builder.borrow_mut().add_input(&3.0f64);
         let engine = ArrayScalarEngine::<f64>::new();
-        let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, staging_error, &engine);
+        let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, error, &engine);
         let zero = tracer.zero_like();
         assert_eq!(zero.tpe().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
         assert!(zero.atom > atom);
