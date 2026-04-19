@@ -16,7 +16,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        AtomId, InterpretableOp, OneLike, Program, ProgramBuilder, ProgramOpRef, TraceError, Traceable, ZeroLike,
+        AtomId, InterpretableOp, OneLike, Program, ProgramBuilder, TraceError, Traceable, ZeroLike,
         engine::Engine,
         operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
     },
@@ -27,14 +27,9 @@ use crate::{
 pub struct Tracer<
     T: Type + Display,
     V: Traceable<T> + Parameter,
-    O: Clone + 'static = ProgramOpRef<V>,
-    L: Clone + 'static = crate::tracing_v2::LinearProgramOpRef<V>,
-    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized = dyn Engine<
-        Type = T,
-        Value = V,
-        TracingOperation = O,
-        LinearOperation = L,
-    >,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
@@ -485,7 +480,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
+        tracing_v2::{ProgramBuilder, ProgramOpRef, Sin, engine::ArrayScalarEngine, test_support},
         types::ArrayType,
     };
 

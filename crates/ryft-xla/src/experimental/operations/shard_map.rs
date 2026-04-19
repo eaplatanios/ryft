@@ -12,8 +12,8 @@ use ryft_core::{
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
         AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp,
-        LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, Program, ProgramBuilder,
-        Sin, TraceError, Traceable, Tracer, ZeroLike, engine::Engine, forward::JvpTracer,
+        LinearProgramBuilder, LinearProgramOpRef, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, Program,
+        ProgramBuilder, ProgramOpRef, Sin, TraceError, Traceable, Tracer, ZeroLike, engine::Engine, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -26,6 +26,19 @@ use crate::experimental::shard_map::{
     ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap,
 };
 use crate::experimental::{engine::XlaEngine, ops::XlaPrimitiveOp};
+
+type JitShardMapTracer = Tracer<
+    ArrayType,
+    ShardMapTracer,
+    ProgramOpRef<ShardMapTracer>,
+    LinearProgramOpRef<ShardMapTracer>,
+    dyn Engine<
+            Type = ArrayType,
+            Value = ShardMapTracer,
+            TracingOperation = ProgramOpRef<ShardMapTracer>,
+            LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+        >,
+>;
 
 /// Shared program type used by erased shard-map bodies.
 type FlatShardMapProgram = Program<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>, XlaPrimitiveOp>;
@@ -502,11 +515,11 @@ impl
     }
 }
 
-impl InterpretableOp<ArrayType, Linearized<Tracer<ArrayType, ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
+impl InterpretableOp<ArrayType, Linearized<JitShardMapTracer>> for ShardMapOp<ShardMapTracer> {
     fn interpret(
         &self,
-        _inputs: &[Linearized<Tracer<ArrayType, ShardMapTracer>>],
-    ) -> Result<Vec<Linearized<Tracer<ArrayType, ShardMapTracer>>>, TraceError> {
+        _inputs: &[Linearized<JitShardMapTracer>],
+    ) -> Result<Vec<Linearized<JitShardMapTracer>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: format!(

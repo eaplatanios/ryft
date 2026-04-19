@@ -7,8 +7,8 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp,
-    TraceError, Tracer, VectorizableOp,
+    CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, LinearProgramOpRef, Op,
+    PrimitiveOp, ProgramOpRef, TraceError, Tracer, VectorizableOp,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -22,6 +22,19 @@ use crate::experimental::lowering::{
 };
 use crate::experimental::ops::XlaPrimitiveOp;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
+
+type JitShardMapTracer = Tracer<
+    ArrayType,
+    ShardMapTracer,
+    ProgramOpRef<ShardMapTracer>,
+    LinearProgramOpRef<ShardMapTracer>,
+    dyn Engine<
+            Type = ArrayType,
+            Value = ShardMapTracer,
+            TracingOperation = ProgramOpRef<ShardMapTracer>,
+            LinearOperation = LinearProgramOpRef<ShardMapTracer>,
+        >,
+>;
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
@@ -284,11 +297,11 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<ArrayType, V
     }
 }
 
-impl InterpretableOp<ArrayType, Linearized<Tracer<ArrayType, ShardMapTracer>>> for WithShardingConstraintOp {
+impl InterpretableOp<ArrayType, Linearized<JitShardMapTracer>> for WithShardingConstraintOp {
     fn interpret(
         &self,
-        _inputs: &[Linearized<Tracer<ArrayType, ShardMapTracer>>],
-    ) -> Result<Vec<Linearized<Tracer<ArrayType, ShardMapTracer>>>, TraceError> {
+        _inputs: &[Linearized<JitShardMapTracer>],
+    ) -> Result<Vec<Linearized<JitShardMapTracer>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: "linearized JIT evaluation for 'with_sharding_constraint' at the JIT-tracer level is not \
