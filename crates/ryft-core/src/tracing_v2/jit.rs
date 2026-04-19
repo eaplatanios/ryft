@@ -360,11 +360,11 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 }
 
-fn trace_program_with_operation_options<F, Input, Output, V, O, L>(
+/// Stages `function` using the staged op set selected by `engine`.
+pub fn trace_program<F, Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input: Input,
-    simplify_program: bool,
 ) -> Result<(Output, Program<ArrayType, V, Input, Output, O>), TraceError>
 where
     V: Traceable<ArrayType>,
@@ -409,7 +409,7 @@ where
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
     let program = Program::from_graph(builder.build::<Input, Output>(outputs, input_structure, output_structure));
-    let program = if simplify_program { program.simplify()? } else { program };
+    let program = program.simplify()?;
     let concrete_input = Input::from_parameters(program.graph().input_structure().clone(), input_values)?;
     Ok((program.call(concrete_input)?, program))
 }
@@ -467,52 +467,6 @@ where
         Program::from_graph(builder.build::<Input::To<V>, Output::To<V>>(outputs, input_structure, output_structure));
     let program = if simplify_program { program.simplify()? } else { program };
     Ok((output_types, program))
-}
-
-/// Stages `function` using the staged op set selected by `engine`.
-pub fn trace_program<E, F, Input, Output, V>(
-    engine: &E,
-    function: F,
-    input: Input,
-) -> Result<(Output, Program<ArrayType, V, Input, Output, E::TracingOperation>), TraceError>
-where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType>,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    F: FnOnce(
-        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    ) -> Result<Output::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
-{
-    trace_program_with_operation_options(engine, function, input, true)
-}
-
-/// Stages `function` using one explicit staged ordinary operation type.
-pub(crate) fn trace_program_for_operation<F, Input, Output, V, O, L>(
-    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-    function: F,
-    input: Input,
-) -> Result<(Output, Program<ArrayType, V, Input, Output, O>), TraceError>
-where
-    V: Traceable<ArrayType>,
-    O: Clone + 'static + InterpretableOp<ArrayType, V>,
-    L: Clone + 'static,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-    F: FnOnce(
-        Input::To<JitTracer<ArrayType, V, O, L>>,
-    ) -> Result<Output::To<JitTracer<ArrayType, V, O, L>>, TraceError>,
-    Input::ParameterStructure: PartialEq,
-    Output::ParameterStructure: Clone,
-{
-    trace_program_with_operation_options(engine, function, input, true)
 }
 
 /// Stages `function` directly from type metadata using one explicit staged ordinary operation type.
@@ -579,7 +533,7 @@ where
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
-    let (output, program) = trace_program_with_operation_options(engine, function, input, true)?;
+    let (output, program) = trace_program(engine, function, input)?;
     Ok((output, CompiledFunction::from_program(program)))
 }
 
@@ -603,7 +557,7 @@ where
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
-    let (output, program) = trace_program_for_operation(engine, function, input)?;
+    let (output, program) = trace_program(engine, function, input)?;
     Ok((output, CompiledFunction::from_program(program)))
 }
 

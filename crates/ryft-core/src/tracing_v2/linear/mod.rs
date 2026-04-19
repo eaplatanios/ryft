@@ -20,7 +20,7 @@ use crate::{
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         graph::{Atom, AtomId, Equation, Graph, GraphBuilder},
-        jit::{CompiledFunction, JitTracer, jit, jit_for_operation, trace_program, trace_program_for_operation},
+        jit::{CompiledFunction, JitTracer, jit, jit_for_operation, trace_program},
         operations::{
             CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,

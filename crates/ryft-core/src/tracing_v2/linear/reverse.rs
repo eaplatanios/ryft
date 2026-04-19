@@ -28,12 +28,7 @@ where
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
-    let (primal_output, program) =
-        trace_program_for_operation::<_, Input, Output, V, E::TracingOperation, E::LinearOperation>(
-            engine,
-            function,
-            reconstructed_primals,
-        )?;
+    let (primal_output, program) = trace_program(engine, function, reconstructed_primals)?;
     Ok((
         primal_output,
         linearize_program::<Input, Output, V, E::TracingOperation, E::LinearOperation>(
