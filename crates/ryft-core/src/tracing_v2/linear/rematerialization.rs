@@ -74,13 +74,14 @@ pub enum RematerializationPolicy {
     /// Recompute all forward-pass intermediates from inputs (minimum memory, maximum recomputation).
     RecomputeAll,
 
-    /// Save intermediates every `segment_size` equations, recomputing within each segment.
+    /// Save intermediates every `segment_size` instructions, recomputing within each segment.
     ///
-    /// With a program of N equations, setting `segment_size` to approximately the square root of N gives O(sqrt(N))
-    /// memory usage. A `segment_size` of zero or one degenerates to [`SaveAll`](RematerializationPolicy::SaveAll)
-    /// since each segment contains at most one equation.
+    /// With a program of N instructions, setting `segment_size` to approximately the square root of
+    /// N gives O(sqrt(N)) memory usage. A `segment_size` of zero or one degenerates to
+    /// [`SaveAll`](RematerializationPolicy::SaveAll) since each segment contains at most one
+    /// instruction.
     Checkpoint {
-        /// Number of equations per rematerialization segment.
+        /// Number of instructions per rematerialization segment.
         segment_size: usize,
     },
 }
@@ -95,7 +96,7 @@ pub enum RematerializationPolicy {
 ///   - [`RematerializationPolicy::RecomputeAll`]: the entire forward body is wrapped in a single
 ///     [`rematerialize`] boundary, forcing the backward pass to recompute all intermediates from inputs.
 ///   - [`RematerializationPolicy::Checkpoint`]: the forward body is partitioned into segments of at most
-///     `segment_size` equations, each wrapped in its own [`rematerialize`] boundary. Intermediates at segment
+///     `segment_size` instructions, each wrapped in its own [`rematerialize`] boundary. Intermediates at segment
 ///     boundaries are saved while within-segment intermediates are recomputed.
 #[allow(private_bounds)]
 pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
@@ -137,7 +138,7 @@ where
 ///
 /// When `segment_size` is `None`, the entire program is wrapped in a single [`RematerializeOp`]
 /// (equivalent to [`RematerializationPolicy::RecomputeAll`]). When `Some(s)`, the program is
-/// partitioned into segments of at most `s` equations, each wrapped in its own [`RematerializeOp`].
+/// partitioned into segments of at most `s` instructions, each wrapped in its own [`RematerializeOp`].
 ///
 /// Internally, this replicates the flow of `grad` for [`Tracer`]-level inputs Ã¢â‚¬â€ trace, linearize,
 /// transpose, stage pullback Ã¢â‚¬â€ but inserts a segmentation step between tracing and linearization so
@@ -195,7 +196,7 @@ where
 
             // Step 3: Linearize and transpose the segmented program to produce the pullback.
             // `linearize_traced_program` replays the program at the Tracer level (staging
-            // both forward and backward equations in the outer JIT builder) and returns the
+            // both forward and backward instructions in the outer JIT builder) and returns the
             // primal outputs alongside the linear pushforward map.
             let (_, traced_gradient) =
                 reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
@@ -210,12 +211,14 @@ where
     Ok(compiled)
 }
 
-/// Partitions a program's equations into segments of at most `segment_size`, wrapping each segment in a
+/// Partitions a program's instructions into segments of at most `segment_size`, wrapping each
+/// segment in a
 /// [`RematerializeOp`].
 ///
-/// Given a program with N equations and a segment size S, this produces a new program with at most
-/// `ceil(N / S)` equations. Each equation is a [`RematerializeOp`] whose body sub-program contains the
-/// original equations from that segment. Atoms crossing segment boundaries become inputs/outputs of the
+/// Given a program with N instructions and a segment size S, this produces a new program with at
+/// most `ceil(N / S)` instructions. Each instruction is a [`RematerializeOp`] whose body
+/// sub-program contains the original instructions from that segment. Atoms crossing segment
+/// boundaries become inputs/outputs of the
 /// respective sub-programs.
 ///
 /// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
@@ -235,35 +238,35 @@ where
     let program = program;
     let representative_values = program.representative_atom_values(engine)?;
     let representative_inputs = program.representative_input_values(engine)?;
-    let equations = program.equations();
+    let instructions = program.instructions();
 
-    // If the program has fewer equations than a single segment, no segmentation is needed Ã¢â‚¬â€ wrap the
+    // If the program has fewer instructions than a single segment, no segmentation is needed Ã¢â‚¬â€ wrap the
     // whole thing in a single RematerializeOp.
-    if equations.len() <= segment_size {
+    if instructions.len() <= segment_size {
         return wrap_program_in_rematerialize(engine, program);
     }
 
-    // Divide equations into segments.
-    let segments: Vec<&[Equation<E::TracingOperation>]> = equations.chunks(segment_size).collect();
+    // Divide instructions into segments.
+    let segments: Vec<&[Instruction<E::TracingOperation>]> = instructions.chunks(segment_size).collect();
 
-    // Build a mapping from atom ID to which equation produces it (if any).
+    // Build a mapping from atom ID to which instruction produces it (if any).
     let mut atom_producer: Vec<Option<usize>> = vec![None; program.atom_count()];
-    for (equation_index, equation) in equations.iter().enumerate() {
-        for &output_atom in &equation.outputs {
-            atom_producer[output_atom.index] = Some(equation_index);
+    for (instruction_index, instruction) in instructions.iter().enumerate() {
+        for &output_atom in &instruction.outputs {
+            atom_producer[output_atom.index] = Some(instruction_index);
         }
     }
 
-    // Build a set tracking which atoms are consumed after a given equation index.
-    // For each atom, track all equation indices that consume it.
+    // Build a set tracking which atoms are consumed after a given instruction index.
+    // For each atom, track all instruction indices that consume it.
     let mut atom_consumers: Vec<Vec<usize>> = vec![Vec::new(); program.atom_count()];
-    for (equation_index, equation) in equations.iter().enumerate() {
-        for &input_atom in &equation.inputs {
-            atom_consumers[input_atom.index].push(equation_index);
+    for (instruction_index, instruction) in instructions.iter().enumerate() {
+        for &input_atom in &instruction.inputs {
+            atom_consumers[input_atom.index].push(instruction_index);
         }
     }
-    // Also mark program outputs as "consumed" at equation_count (sentinel for "after all equations").
-    let sentinel = equations.len();
+    // Also mark program outputs as "consumed" at instruction_count (sentinel for "after all instructions").
+    let sentinel = instructions.len();
     for &output_atom in program.outputs() {
         atom_consumers[output_atom.index].push(sentinel);
     }
@@ -281,7 +284,7 @@ where
         atom_mapping[input_atom.index] = Some(outer_atom);
     }
 
-    // Register constants that are used by equations (they might be referenced across segments).
+    // Register constants that are used by instructions (they might be referenced across segments).
     for (atom_id, atom) in program.atoms_iter() {
         if let Atom::Constant(value) = atom {
             let outer_atom = outer_builder.add_constant(value.clone());
@@ -290,18 +293,18 @@ where
     }
 
     // Process each segment.
-    let mut equation_offset = 0;
+    let mut instruction_offset = 0;
     for segment in &segments {
-        let segment_start = equation_offset;
-        let segment_end = equation_offset + segment.len();
+        let segment_start = instruction_offset;
+        let segment_end = instruction_offset + segment.len();
 
         // Identify boundary inputs: atoms consumed by this segment that are produced outside it
         // (by previous segments or program inputs/constants).
         let mut boundary_input_atoms: Vec<AtomId> = Vec::new();
         let mut boundary_input_set = std::collections::HashSet::new();
-        for equation in *segment {
-            for &input_atom in &equation.inputs {
-                // If this atom is produced by an equation outside this segment (or is an input/constant).
+        for instruction in *segment {
+            for &input_atom in &instruction.inputs {
+                // If this atom is produced by an instruction outside this segment (or is an input/constant).
                 let produced_in_segment = atom_producer[input_atom.index]
                     .map_or(false, |producer_idx| producer_idx >= segment_start && producer_idx < segment_end);
                 if !produced_in_segment && boundary_input_set.insert(input_atom) {
@@ -314,8 +317,8 @@ where
         // (by later segments or as program outputs).
         let mut boundary_output_atoms: Vec<AtomId> = Vec::new();
         let mut boundary_output_set = std::collections::HashSet::new();
-        for equation in *segment {
-            for &output_atom in &equation.outputs {
+        for instruction in *segment {
+            for &output_atom in &instruction.outputs {
                 let consumed_outside = atom_consumers[output_atom.index]
                     .iter()
                     .any(|&consumer_idx| consumer_idx < segment_start || consumer_idx >= segment_end);
@@ -357,12 +360,12 @@ where
         let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), sub_program);
         let remat_op = RematerializeOp::new(body);
 
-        // Add the RematerializeOp equation to the outer builder.
+        // Add the RematerializeOp instruction to the outer builder.
         let outer_inputs: Vec<AtomId> = boundary_input_atoms
             .iter()
             .map(|&orig_atom| atom_mapping[orig_atom.index].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
             .collect::<Result<_, _>>()?;
-        let outer_outputs = outer_builder.add_equation_prevalidated(
+        let outer_outputs = outer_builder.add_instruction_prevalidated(
             E::TracingOperation::rematerialize_op(remat_op),
             outer_inputs,
             output_types,
@@ -373,7 +376,7 @@ where
             atom_mapping[orig_atom.index] = Some(*outer_atom);
         }
 
-        equation_offset = segment_end;
+        instruction_offset = segment_end;
     }
 
     // Wire up the program outputs.
@@ -433,7 +436,7 @@ where
         .map(|representative_input| outer_builder.add_input(representative_input))
         .collect();
 
-    let outer_outputs = outer_builder.add_equation_prevalidated(
+    let outer_outputs = outer_builder.add_instruction_prevalidated(
         E::TracingOperation::rematerialize_op(remat_op),
         outer_inputs.clone(),
         output_types,
@@ -447,15 +450,15 @@ where
     Ok(outer_program)
 }
 
-/// Builds a sub-program for a single segment of equations.
+/// Builds a sub-program for a single segment of instructions.
 ///
 /// The sub-program takes the boundary input atoms as its inputs and produces the boundary output atoms as its
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
-/// and equations within the sub-program.
+/// and instructions within the sub-program.
 fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     representative_values: &[V],
-    segment_equations: &[Equation<O>],
+    segment_instructions: &[Instruction<O>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError> {
@@ -470,9 +473,9 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
         sub_atom_mapping.insert(input_atom, sub_atom);
     }
 
-    // Register constants used by equations in this segment.
-    for equation in segment_equations {
-        for &input_atom in &equation.inputs {
+    // Register constants used by instructions in this segment.
+    for instruction in segment_instructions {
+        for &input_atom in &instruction.inputs {
             if sub_atom_mapping.contains_key(&input_atom) {
                 continue;
             }
@@ -484,9 +487,9 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
         }
     }
 
-    // Add equations to the sub-program.
-    for equation in segment_equations {
-        let sub_inputs: Vec<AtomId> = equation
+    // Add instructions to the sub-program.
+    for instruction in segment_instructions {
+        let sub_inputs: Vec<AtomId> = instruction
             .inputs
             .iter()
             .map(|&orig_atom| {
@@ -494,7 +497,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
             })
             .collect::<Result<_, _>>()?;
 
-        let output_abstracts: Vec<_> = equation
+        let output_abstracts: Vec<_> = instruction
             .outputs
             .iter()
             .map(|&atom_id| {
@@ -504,9 +507,10 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
                     .map(|atom| atom.r#type().into_owned())
             })
             .collect::<Result<_, _>>()?;
-        let sub_outputs = sub_builder.add_equation_prevalidated(equation.op.clone(), sub_inputs, output_abstracts);
+        let sub_outputs =
+            sub_builder.add_instruction_prevalidated(instruction.operation.clone(), sub_inputs, output_abstracts);
 
-        for (orig_atom, sub_atom) in equation.outputs.iter().zip(sub_outputs.iter()) {
+        for (orig_atom, sub_atom) in instruction.outputs.iter().zip(sub_outputs.iter()) {
             sub_atom_mapping.insert(*orig_atom, *sub_atom);
         }
     }

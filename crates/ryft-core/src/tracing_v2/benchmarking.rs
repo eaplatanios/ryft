@@ -45,8 +45,8 @@ pub struct IrNestedRegionSummary {
     /// Number of output leaves produced by the nested region.
     pub output_leaf_count: usize,
 
-    /// Number of equations in the nested region.
-    pub equation_count: usize,
+    /// Number of instructions in the nested region.
+    pub instruction_count: usize,
 
     /// Number of constant atoms in the nested region.
     pub constant_count: usize,
@@ -70,8 +70,8 @@ pub struct IrBenchmarkSummary {
     /// Number of output leaves produced by the artifact.
     pub output_leaf_count: usize,
 
-    /// Number of equations in the artifact.
-    pub equation_count: usize,
+    /// Number of instructions in the artifact.
+    pub instruction_count: usize,
 
     /// Number of constant atoms in the artifact.
     pub constant_count: usize,
@@ -243,16 +243,16 @@ where
         }
     }
 
-    for equation in program.equations() {
-        let normalized_name = normalize_op_name(equation.op.name());
+    for instruction in program.instructions() {
+        let normalized_name = normalize_op_name(instruction.operation.name());
         *op_histogram.entry(normalized_name).or_insert(0) += 1;
 
-        let input_depth = equation.inputs.iter().map(|input| depth_by_atom[*input]).max().unwrap_or(0);
-        for output in equation.outputs.iter().copied() {
+        let input_depth = instruction.inputs.iter().map(|input| depth_by_atom[*input]).max().unwrap_or(0);
+        for output in instruction.outputs.iter().copied() {
             depth_by_atom[output] = input_depth + 1;
         }
 
-        nested_regions.extend(nested_regions_for_op(&equation.op)?);
+        nested_regions.extend(nested_regions_for_op(&instruction.operation)?);
     }
 
     let nested_region_count = nested_regions.len()
@@ -262,7 +262,7 @@ where
     Ok(IrBenchmarkSummary {
         input_leaf_count: program.input_atoms().len(),
         output_leaf_count: program.outputs().len(),
-        equation_count: program.equations().len(),
+        instruction_count: program.instructions().len(),
         constant_count: (0..program.atom_count())
             .filter_map(|atom_id| program.atom(atom_id))
             .filter(|atom| matches!(atom, Atom::Constant(_)))
@@ -285,7 +285,7 @@ pub fn nested_region(label: &'static str, summary: IrBenchmarkSummary) -> IrNest
         label: label.to_string(),
         input_leaf_count: summary.input_leaf_count,
         output_leaf_count: summary.output_leaf_count,
-        equation_count: summary.equation_count,
+        instruction_count: summary.instruction_count,
         constant_count: summary.constant_count,
         op_histogram: summary.op_histogram,
         nested_region_count: summary.nested_region_count,
@@ -328,7 +328,7 @@ mod tests {
             IrBenchmarkSummary {
                 input_leaf_count: 1,
                 output_leaf_count: 1,
-                equation_count: 2,
+                instruction_count: 2,
                 constant_count: 1,
                 op_histogram: BTreeMap::from([("add".to_string(), 1usize), ("sin".to_string(), 1usize),]),
                 nested_region_count: 0,

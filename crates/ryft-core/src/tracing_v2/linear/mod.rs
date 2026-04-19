@@ -24,7 +24,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        Atom, AtomId, Equation, LinearPrimitiveOp, OneLike, Program, ProgramBuilder, Traceable, TracingError, Value,
+        Atom, AtomId, Instruction, LinearPrimitiveOp, OneLike, Program, ProgramBuilder, Traceable, TracingError, Value,
         ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
@@ -300,7 +300,7 @@ mod tests {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let input = builder.add_input(&3.0f64);
-        let output = builder.add_equation_prevalidated(
+        let output = builder.add_instruction_prevalidated(
             PrimitiveOp::Custom(Arc::new(primitive)),
             vec![input],
             vec![ArrayType::scalar(DataType::F64)],
@@ -320,7 +320,8 @@ mod tests {
         .unwrap();
         let mut builder = ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let input = builder.add_input(&0.0f64);
-        let output = builder.add_equation_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
+        let output =
+            builder.add_instruction_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);
         let pushforward = LinearProgram::from_program(program, 0.0f64);
 
@@ -447,7 +448,7 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_gives_correct_gradient() {
         // Checkpoint with segment_size=2 should give the correct gradient for a function with
-        // ~4 equations: x*x, sin(x), x*x + sin(x).
+        // ~4 instructions: x*x, sin(x), x*x + sin(x).
         let engine = ArrayScalarEngine::<f64>::new();
         let compiled = compile_grad_with_policy(
             &engine,
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_compile_grad_checkpoint_large_segment_wraps_whole_program() {
-        // Checkpoint with a segment_size larger than the number of equations should wrap
+        // Checkpoint with a segment_size larger than the number of instructions should wrap
         // the entire program in a single RematerializeOp, equivalent to RecomputeAll.
         let engine = ArrayScalarEngine::<f64>::new();
         let compiled = compile_grad_with_policy(

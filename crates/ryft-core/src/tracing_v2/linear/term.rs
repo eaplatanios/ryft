@@ -5,7 +5,7 @@ use super::*;
 /// [`LinearTerm`] is the symbolic tangent/cotangent analogue of [`Tracer`](crate::tracing_v2::Tracer).
 /// When a primitive JVP rule is building a reusable linear program instead of computing a concrete
 /// tangent immediately, its tangent values are instances of this type. Each term points at one atom
-/// in a shared linear-program builder and stages new linear equations as it is combined with other
+/// in a shared linear-program builder and stages new linear instructions as it is combined with other
 /// terms.
 #[derive(Clone, Parameter)]
 pub struct LinearTerm<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearPrimitiveOp<ArrayType, V>> {
@@ -72,7 +72,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
                 .map(|id| borrow.atom(*id).expect("staged input should exist").r#type().into_owned())
                 .collect::<Vec<_>>(),
         )?;
-        let output_atoms = borrow.add_equation_prevalidated(op, input_atoms, output_abstracts);
+        let output_atoms = borrow.add_instruction_prevalidated(op, input_atoms, output_abstracts);
         drop(borrow);
         if output_atoms.len() != output_count {
             return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_atoms.len() });
@@ -89,7 +89,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
         let mut borrow = self.builder.borrow_mut();
         let input_atom = borrow.atom(self.atom).expect("staged input should exist");
         let abstract_value = input_atom.r#type().into_owned();
-        let atom = borrow.add_equation_prevalidated(op, vec![self.atom], vec![abstract_value])[0];
+        let atom = borrow.add_instruction_prevalidated(op, vec![self.atom], vec![abstract_value])[0];
         drop(borrow);
         Self { atom, builder: self.builder }
     }
@@ -105,7 +105,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
         let input_atom = borrow.atom(self.atom).expect("staged input should exist");
         let abstract_value = input_atom.r#type().into_owned();
         let atom =
-            borrow.add_equation_prevalidated(O::linear_add_op(), vec![self.atom, rhs.atom], vec![abstract_value])[0];
+            borrow.add_instruction_prevalidated(O::linear_add_op(), vec![self.atom, rhs.atom], vec![abstract_value])[0];
         drop(borrow);
         Self { atom, builder: self.builder }
     }
@@ -142,7 +142,7 @@ impl<
         let input_atom = borrow.atom(lhs.atom).expect("staged input should exist");
         let abstract_value = input_atom.r#type().into_owned();
         let atom =
-            borrow.add_equation_prevalidated(O::linear_add_op(), vec![lhs.atom, rhs.atom], vec![abstract_value])[0];
+            borrow.add_instruction_prevalidated(O::linear_add_op(), vec![lhs.atom, rhs.atom], vec![abstract_value])[0];
         drop(borrow);
         Self { atom, builder: lhs.builder }
     }

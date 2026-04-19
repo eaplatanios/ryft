@@ -1152,8 +1152,8 @@ where
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
     let mut mesh = existing;
-    for equation in program.equations() {
-        match &equation.op {
+    for instruction in program.instructions() {
+        match &instruction.operation {
             XlaPrimitiveOp::ShardMap(shard_map_op) => {
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
                     mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
@@ -1614,10 +1614,10 @@ where
         atom_values[atom_id.index] = Some(packed_inputs[input_index]);
     }
 
-    let mut equation_by_first_output = vec![None; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[first_output.index] = Some(equation_index);
+    let mut instruction_by_first_output = vec![None; program.atom_count()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        if let Some(first_output) = instruction.outputs.first() {
+            instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
 
@@ -1628,11 +1628,11 @@ where
             Atom::Input(_) => {}
             Atom::Constant(_) => {}
             Atom::Derived(_) => {
-                let Some(equation_index) = equation_by_first_output[atom_index] else {
+                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let equation = &program.equations()[equation_index];
-                let inputs = equation
+                let instruction = &program.instructions()[instruction_index];
+                let inputs = instruction
                     .inputs
                     .iter()
                     .map(|input| {
@@ -1648,16 +1648,18 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut block_ref = block.as_ref();
-                let lowered_outputs = lower_packed_plain_equation(
+                let lowered_outputs = lower_packed_plain_instruction(
                     program,
-                    equation_index,
+                    instruction_index,
                     inputs.as_slice(),
                     lane_count,
                     &mut block_ref,
                     context,
                     location.as_ref(),
                 )?;
-                for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
+                for (output_atom, lowered_output) in
+                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
+                {
                     atom_values[output_atom.index] = Some(lowered_output);
                 }
             }
@@ -1742,7 +1744,8 @@ where
 }
 
 /// Inlines a rematerialize body's sub-program into the given block by mapping the provided input
-/// MLIR values to the body's input atoms, lowering constants and equations in topological order,
+/// MLIR values to the body's input atoms, lowering constants and instructions in topological
+/// order,
 /// and returning the MLIR values corresponding to the body's output atoms.
 fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
@@ -1760,10 +1763,10 @@ where
         atom_values[atom_id.index] = Some(mlir_value);
     }
 
-    let mut equation_by_first_output = vec![None; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[first_output.index] = Some(equation_index);
+    let mut instruction_by_first_output = vec![None; program.atom_count()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        if let Some(first_output) = instruction.outputs.first() {
+            instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
 
@@ -1776,28 +1779,30 @@ where
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
             Atom::Derived(_) => {
-                let Some(equation_index) = equation_by_first_output[atom_index] else {
+                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let equation = &program.equations()[equation_index];
-                let equation_inputs = equation
+                let instruction = &program.instructions()[instruction_index];
+                let instruction_inputs = instruction
                     .inputs
                     .iter()
                     .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
-                let output_types = equation
+                let output_types = instruction
                     .outputs
                     .iter()
-                    .map(|output| program.atom(*output).expect("equation output should exist").r#type().into_owned())
+                    .map(|output| program.atom(*output).expect("instruction output should exist").r#type().into_owned())
                     .collect::<Vec<_>>();
                 let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-                let lowered_outputs = equation.op.lower_to_mlir(
-                    equation_inputs.as_slice(),
+                let lowered_outputs = instruction.operation.lower_to_mlir(
+                    instruction_inputs.as_slice(),
                     output_types.as_slice(),
                     PlainMlirLoweringMode::Unpacked,
                     &mut lowerer,
                 )?;
-                for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
+                for (output_atom, lowered_output) in
+                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
+                {
                     atom_values[output_atom.index] = Some(lowered_output);
                 }
             }
@@ -1832,10 +1837,10 @@ where
             Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
-    let mut equation_by_first_output = vec![None; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[first_output.index] = Some(equation_index);
+    let mut instruction_by_first_output = vec![None; program.atom_count()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        if let Some(first_output) = instruction.outputs.first() {
+            instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
 
@@ -1848,18 +1853,20 @@ where
                 atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
             Atom::Derived(_) => {
-                let Some(equation_index) = equation_by_first_output[atom_index] else {
+                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let equation = &program.equations()[equation_index];
-                let inputs = equation
+                let instruction = &program.instructions()[instruction_index];
+                let inputs = instruction
                     .inputs
                     .iter()
                     .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lowered_outputs =
-                    lower_plain_equation(program, equation_index, inputs.as_slice(), block, context, location)?;
-                for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
+                    lower_plain_instruction(program, instruction_index, inputs.as_slice(), block, context, location)?;
+                for (output_atom, lowered_output) in
+                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
+                {
                     atom_values[output_atom.index] = Some(lowered_output);
                 }
             }
@@ -1890,10 +1897,10 @@ where
             Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
-    let mut equation_by_first_output = vec![None; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[first_output.index] = Some(equation_index);
+    let mut instruction_by_first_output = vec![None; program.atom_count()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        if let Some(first_output) = instruction.outputs.first() {
+            instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
 
@@ -1906,18 +1913,20 @@ where
                 atom_values[atom_index] = Some(lower_constant(atom_id, value, block, context, location)?);
             }
             Atom::Derived(_) => {
-                let Some(equation_index) = equation_by_first_output[atom_index] else {
+                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let equation = &program.equations()[equation_index];
-                let inputs = equation
+                let instruction = &program.instructions()[instruction_index];
+                let inputs = instruction
                     .inputs
                     .iter()
                     .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lowered_outputs =
-                    lower_equation(program, equation_index, inputs.as_slice(), block, context, location)?;
-                for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
+                    lower_instruction(program, instruction_index, inputs.as_slice(), block, context, location)?;
+                for (output_atom, lowered_output) in
+                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
+                {
                     atom_values[output_atom.index] = Some(lowered_output);
                 }
             }
@@ -2273,12 +2282,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Lowers one traced equation from a plain `tracing_v2` program.
+/// Lowers one traced instruction from a plain `tracing_v2` program.
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
-fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
+fn lower_plain_instruction<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     program: &Program<ArrayType, V, O, Input, Output>,
-    equation_index: usize,
+    instruction_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -2290,22 +2299,25 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let equation = &program.equations()[equation_index];
-    let output_types = equation
+    let instruction = &program.instructions()[instruction_index];
+    let output_types = instruction
         .outputs
         .iter()
-        .map(|output| program.atom(*output).expect("equation output should exist").r#type().into_owned())
+        .map(|output| program.atom(*output).expect("instruction output should exist").r#type().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-    equation
-        .op
-        .lower_to_mlir(input_values, output_types.as_slice(), PlainMlirLoweringMode::Unpacked, &mut lowerer)
+    instruction.operation.lower_to_mlir(
+        input_values,
+        output_types.as_slice(),
+        PlainMlirLoweringMode::Unpacked,
+        &mut lowerer,
+    )
 }
 
-/// Lowers one equation inside a packed `vmap` body program.
-fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
+/// Lowers one instruction inside a packed `vmap` body program.
+fn lower_packed_plain_instruction<'b, 'c: 'b, 't: 'c, O, V>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    equation_index: usize,
+    instruction_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2316,16 +2328,16 @@ where
     V: MlirLowerableValue,
     O: Clone + XlaOp<V>,
 {
-    let equation = &program.equations()[equation_index];
-    let output_types = equation
+    let instruction = &program.instructions()[instruction_index];
+    let output_types = instruction
         .outputs
         .iter()
         .map(|output| {
-            packed_array_type(&program.atom(*output).expect("equation output should exist").r#type(), lane_count)
+            packed_array_type(&program.atom(*output).expect("instruction output should exist").r#type(), lane_count)
         })
         .collect::<Vec<_>>();
     let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-    equation.op.lower_to_mlir(
+    instruction.operation.lower_to_mlir(
         input_values,
         output_types.as_slice(),
         PlainMlirLoweringMode::Packed { lane_count },
@@ -2333,10 +2345,10 @@ where
     )
 }
 
-/// Lowers one traced equation to the corresponding StableHLO operation and returns its result value.
-fn lower_equation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
+/// Lowers one traced instruction to the corresponding StableHLO operation and returns its result value.
+fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
-    equation_index: usize,
+    instruction_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -2346,14 +2358,14 @@ where
     ProgramInput: Parameterized<ShardMapTensor>,
     ProgramOutput: Parameterized<ShardMapTensor>,
 {
-    let equation = &program.equations()[equation_index];
-    let output_types = equation
+    let instruction = &program.instructions()[instruction_index];
+    let output_types = instruction
         .outputs
         .iter()
-        .map(|output| program.atom(*output).expect("equation output should exist").r#type().into_owned())
+        .map(|output| program.atom(*output).expect("instruction output should exist").r#type().into_owned())
         .collect::<Vec<_>>();
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
-    dispatch_lower_shard_map_mlir(&equation.op, input_values, output_types.as_slice(), &mut lowerer)
+    dispatch_lower_shard_map_mlir(&instruction.operation, input_values, output_types.as_slice(), &mut lowerer)
 }
 
 /// Normalizes a user-provided MLIR symbol name.
@@ -2666,7 +2678,7 @@ mod tests {
         let input_type = test_vector_type(4);
         let mut builder = ProgramBuilder::<crate::experimental::ops::XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
-        let output = builder.add_equation(op, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)
     }
 

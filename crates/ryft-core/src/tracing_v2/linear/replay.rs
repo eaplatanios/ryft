@@ -10,7 +10,7 @@ use super::*;
 ///
 /// This is the generic engine behind several internal replay modes: ordinary interpretation,
 /// linearized JIT replay, and symbolic linearization all use the same atom-walking logic while
-/// customizing how constants are lifted and how primitive equations are applied.
+/// customizing how constants are lifted and how primitive instructions are applied.
 fn replay_program_with<ProgramInput, ProgramOutput, V, O, R, LiftConstant, ApplyOp>(
     program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     inputs: Vec<R>,
@@ -31,10 +31,10 @@ where
         values[atom_id.index] = Some(value);
     }
 
-    let mut equation_by_first_output = vec![None; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[first_output.index] = Some(equation_index);
+    let mut instruction_by_first_output = vec![None; program.atom_count()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        if let Some(first_output) = instruction.outputs.first() {
+            instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
 
@@ -51,17 +51,17 @@ where
                 values[atom_index] = Some(lift_constant(value, seed_inputs.as_slice())?);
             }
             Atom::Derived(_) => {
-                let Some(equation_index) = equation_by_first_output[atom_index] else {
+                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let equation = &program.equations()[equation_index];
-                let input_values = equation
+                let instruction = &program.instructions()[instruction_index];
+                let input_values = instruction
                     .inputs
                     .iter()
                     .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
-                let outputs = apply_op(&equation.op, input_values)?;
-                for (output_atom, output_value) in equation.outputs.iter().copied().zip(outputs) {
+                let outputs = apply_op(&instruction.operation, input_values)?;
+                for (output_atom, output_value) in instruction.outputs.iter().copied().zip(outputs) {
                     values[output_atom.index] = Some(output_value);
                 }
             }

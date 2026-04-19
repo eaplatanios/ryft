@@ -7,8 +7,8 @@
 //! we keep coming back to the same core pieces:
 //!
 //! - [`Atom`] values describe the leaves of the staged graph.
-//! - [`Equation`] values connect atoms through concrete operation objects.
-//! - [`ProgramBuilder`] incrementally stages those equations while optionally retaining eager
+//! - [`Instruction`] values connect atoms through concrete operation objects.
+//! - [`ProgramBuilder`] incrementally stages those instructions while optionally retaining eager
 //!   exemplars for simplification and validation.
 //! - [`Program`] is the persistent, executable artifact shared between JIT tracing, linearization,
 //!   transposition, and backend lowering.
@@ -42,7 +42,7 @@ pub enum Atom<T: Type, V: Typed<T>> {
     /// later transforms recover representatives by synthesizing zeros from the retained type.
     Input(T),
 
-    /// Atom produced by evaluating an equation. Carries only the abstract type; any eagerly
+    /// Atom produced by evaluating an instruction. Carries only the abstract type; any eagerly
     /// evaluated intermediate value lives in the owning [`ProgramBuilder`]'s side table and is
     /// discarded when the program is finalized.
     Derived(T),
@@ -59,7 +59,7 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
 
 /// Identifier for an atom within a staged program.
 ///
-/// Atom identifiers are stable indexes into a program's atom table. Equations refer to their
+/// Atom identifiers are stable indexes into a program's atom table. Instructions refer to their
 /// inputs and outputs by these ids, which keeps the staged IR compact and easy to clone.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Parameter)]
 pub struct AtomId {
@@ -73,27 +73,27 @@ impl Display for AtomId {
     }
 }
 
-/// Single equation in a staged program.
+/// Single instruction in a staged program.
 ///
-/// An [`Equation`] is the IR-level record of one primitive application. It names the operation
+/// An [`Instruction`] is the IR-level record of one primitive application. It names the operation
 /// object to apply, the input atoms it consumes, and the output atoms it defines. Programs are
-/// purely dataflow-based, so equations execute in list order with no control-flow nodes.
+/// purely dataflow-based, so instructions execute in list order with no control-flow nodes.
 #[derive(Clone, Debug)]
-pub struct Equation<O> {
-    /// Operation applied by this equation.
-    pub op: O,
+pub struct Instruction<O> {
+    /// Operation applied by this instruction.
+    pub operation: O,
 
-    /// Input atoms consumed by the equation.
+    /// Input atoms consumed by the instruction.
     pub inputs: Vec<AtomId>,
 
-    /// Output atoms produced by the equation.
+    /// Output atoms produced by the instruction.
     pub outputs: Vec<AtomId>,
 }
 
 /// Executable staged program over an open operation set.
 ///
 /// [`Program`] is the persistent artifact produced by tracing. It stores the finalized atom table,
-/// the ordered list of equations, and the structured input/output metadata needed to turn flat leaf
+/// the ordered list of instructions, and the structured input/output metadata needed to turn flat leaf
 /// evaluation back into user-facing structured values. Both ordinary JIT traces and higher-order
 /// transforms exchange programs in this form.
 pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
@@ -103,8 +103,8 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
     /// Input atom ids in the same order as the flattened input parameters.
     input_atoms: Vec<AtomId>,
 
-    /// Ordered equations that replay the staged computation.
-    equations: Vec<Equation<O>>,
+    /// Ordered instructions that replay the staged computation.
+    instructions: Vec<Instruction<O>>,
 
     /// Output atom ids in the same order as the flattened output parameters.
     outputs: Vec<AtomId>,
@@ -129,7 +129,7 @@ where
         Self {
             atoms: self.atoms.clone(),
             input_atoms: self.input_atoms.clone(),
-            equations: self.equations.clone(),
+            instructions: self.instructions.clone(),
             outputs: self.outputs.clone(),
             input_structure: self.input_structure.clone(),
             output_structure: self.output_structure.clone(),
@@ -165,10 +165,10 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.input_atoms.as_slice()
     }
 
-    /// Returns the equations in execution order.
+    /// Returns the instructions in execution order.
     #[inline]
-    pub fn equations(&self) -> &[Equation<O>] {
-        self.equations.as_slice()
+    pub fn instructions(&self) -> &[Instruction<O>] {
+        self.instructions.as_slice()
     }
 
     /// Returns the output atoms in parameter order.
@@ -232,18 +232,21 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             }
         }
 
-        for equation in &self.equations {
-            let inputs = equation
+        for instruction in &self.instructions {
+            let inputs = instruction
                 .inputs
                 .iter()
                 .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                 .collect::<Result<Vec<_>, _>>()?;
-            let outputs = equation.op.interpret(inputs.as_slice())?;
-            if outputs.len() != equation.outputs.len() {
-                return Err(TracingError::InvalidOutputCount { expected: equation.outputs.len(), got: outputs.len() });
+            let outputs = instruction.operation.interpret(inputs.as_slice())?;
+            if outputs.len() != instruction.outputs.len() {
+                return Err(TracingError::InvalidOutputCount {
+                    expected: instruction.outputs.len(),
+                    got: outputs.len(),
+                });
             }
 
-            for (atom, value) in equation.outputs.iter().copied().zip(outputs) {
+            for (atom, value) in instruction.outputs.iter().copied().zip(outputs) {
                 values[atom.index] = Some(value);
             }
         }
@@ -268,7 +271,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// Clones this program while replacing only the typed input/output structures.
     ///
     /// Many transforms trace or linearize through a flattened `Vec<V>` view of a structured input.
-    /// This helper lets them keep the same equations and atoms while retagging the program with the
+    /// This helper lets them keep the same instructions and atoms while retagging the program with the
     /// caller-visible parameter structures they want to expose.
     pub fn clone_with_structures<NewInput, NewOutput>(
         &self,
@@ -282,7 +285,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         Program {
             atoms: self.atoms.clone(),
             input_atoms: self.input_atoms.clone(),
-            equations: self.equations.clone(),
+            instructions: self.instructions.clone(),
             outputs: self.outputs.clone(),
             input_structure,
             output_structure,
@@ -310,7 +313,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
-    /// Eliminates dead constants and equations that do not contribute to the program outputs.
+    /// Eliminates dead constants and instructions that do not contribute to the program outputs.
     pub fn simplify(&self) -> Result<Self, TracingError>
     where
         O: Op<T>,
@@ -321,21 +324,21 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             program: &Program<T, V, O, Input, Output>,
             atom_id: AtomId,
             live_atoms: &mut [bool],
-            live_equations: &mut [bool],
-            equation_by_output: &[Option<usize>],
+            live_instructions: &mut [bool],
+            instruction_by_output: &[Option<usize>],
         ) {
             if live_atoms[atom_id.index] {
                 return;
             }
             live_atoms[atom_id.index] = true;
-            if let Some(equation_index) = equation_by_output[atom_id.index] {
-                if live_equations[equation_index] {
+            if let Some(instruction_index) = instruction_by_output[atom_id.index] {
+                if live_instructions[instruction_index] {
                     return;
                 }
-                live_equations[equation_index] = true;
-                let equation = &program.equations[equation_index];
-                for input in equation.inputs.iter().copied() {
-                    mark_live(program, input, live_atoms, live_equations, equation_by_output);
+                live_instructions[instruction_index] = true;
+                let instruction = &program.instructions[instruction_index];
+                for input in instruction.inputs.iter().copied() {
+                    mark_live(program, input, live_atoms, live_instructions, instruction_by_output);
                 }
             }
         }
@@ -345,8 +348,8 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             program: &Program<T, V, O, Input, Output>,
             builder: &mut ProgramBuilder<O, T, V>,
             atom_mapping: &mut HashMap<AtomId, AtomId>,
-            live_equations: &[bool],
-            equation_by_output: &[Option<usize>],
+            live_instructions: &[bool],
+            instruction_by_output: &[Option<usize>],
         ) -> Result<AtomId, TracingError>
         where
             O: Clone + Op<T>,
@@ -364,31 +367,34 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                 Atom::Input(r#type) => builder.add_input_abstract(r#type.clone()),
                 Atom::Constant(value) => builder.add_constant(value.clone()),
                 Atom::Derived(_) => {
-                    let equation_index = equation_by_output[atom_id.index]
-                        .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
-                    if !live_equations[equation_index] {
+                    let instruction_index = instruction_by_output[atom_id.index]
+                        .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning instruction"))?;
+                    if !live_instructions[instruction_index] {
                         return Err(TracingError::InternalInvariantViolation(
                             "attempted to remap a dead derived atom during program simplification",
                         ));
                     }
-                    let equation = &program.equations[equation_index];
-                    let remapped_inputs = equation
+                    let instruction = &program.instructions[instruction_index];
+                    let remapped_inputs = instruction
                         .inputs
                         .iter()
                         .copied()
                         .map(|input| {
-                            remap_atom(input, program, builder, atom_mapping, live_equations, equation_by_output)
+                            remap_atom(input, program, builder, atom_mapping, live_instructions, instruction_by_output)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let output_abstracts = equation
+                    let output_abstracts = instruction
                         .outputs
                         .iter()
                         .map(|output| program.atom(*output).expect("output atom should exist").r#type().into_owned())
                         .collect::<Vec<_>>();
-                    let remapped_outputs =
-                        builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
+                    let remapped_outputs = builder.add_instruction_prevalidated(
+                        instruction.operation.clone(),
+                        remapped_inputs,
+                        output_abstracts,
+                    );
                     for (old_output, new_output) in
-                        equation.outputs.iter().copied().zip(remapped_outputs.iter().copied())
+                        instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
                     {
                         atom_mapping.insert(old_output, new_output);
                     }
@@ -401,22 +407,22 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             Ok(mapped_atom)
         }
 
-        let mut equation_by_output = vec![None; self.atom_count()];
-        for (equation_index, equation) in self.equations.iter().enumerate() {
-            for output in equation.outputs.iter().copied() {
-                equation_by_output[output.index] = Some(equation_index);
+        let mut instruction_by_output = vec![None; self.atom_count()];
+        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
+            for output in instruction.outputs.iter().copied() {
+                instruction_by_output[output.index] = Some(instruction_index);
             }
         }
 
         let mut live_atoms = vec![false; self.atom_count()];
-        let mut live_equations = vec![false; self.equations.len()];
+        let mut live_instructions = vec![false; self.instructions.len()];
         for output in self.outputs.iter().copied() {
             mark_live(
                 self,
                 output,
                 live_atoms.as_mut_slice(),
-                live_equations.as_mut_slice(),
-                equation_by_output.as_slice(),
+                live_instructions.as_mut_slice(),
+                instruction_by_output.as_slice(),
             );
         }
 
@@ -443,8 +449,8 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                     self,
                     &mut builder,
                     &mut atom_mapping,
-                    live_equations.as_slice(),
-                    equation_by_output.as_slice(),
+                    live_instructions.as_slice(),
+                    instruction_by_output.as_slice(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -463,10 +469,10 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
         let inputs = self.input_atoms.iter().map(|input| format_typed_atom(*input)).collect::<Vec<_>>().join(", ");
         writeln!(formatter, "lambda {inputs} .")?;
 
-        let mut equation_by_first_output = vec![None; self.atoms.len()];
-        for (index, equation) in self.equations.iter().enumerate() {
-            if let Some(first_output) = equation.outputs.first() {
-                equation_by_first_output[first_output.index] = Some(index);
+        let mut instruction_by_first_output = vec![None; self.atoms.len()];
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            if let Some(first_output) = instruction.outputs.first() {
+                instruction_by_first_output[first_output.index] = Some(index);
             }
         }
 
@@ -480,18 +486,23 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
                     binding_count += 1;
                 }
                 Atom::Derived(_) => {
-                    let Some(equation_index) = equation_by_first_output[atom_id] else {
+                    let Some(instruction_index) = instruction_by_first_output[atom_id] else {
                         continue;
                     };
-                    let equation = &self.equations[equation_index];
-                    let outputs =
-                        equation.outputs.iter().map(|output| format_typed_atom(*output)).collect::<Vec<_>>().join(", ");
-                    let inputs = equation.inputs.iter().map(|input| format_atom(*input)).collect::<Vec<_>>().join(" ");
+                    let instruction = &self.instructions[instruction_index];
+                    let outputs = instruction
+                        .outputs
+                        .iter()
+                        .map(|output| format_typed_atom(*output))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let inputs =
+                        instruction.inputs.iter().map(|input| format_atom(*input)).collect::<Vec<_>>().join(" ");
                     let prefix = if binding_count == 0 { "let" } else { "   " };
                     if inputs.is_empty() {
-                        writeln!(formatter, "{prefix} {outputs} = {}", equation.op)?;
+                        writeln!(formatter, "{prefix} {outputs} = {}", instruction.operation)?;
                     } else {
-                        writeln!(formatter, "{prefix} {outputs} = {} {inputs}", equation.op)?;
+                        writeln!(formatter, "{prefix} {outputs} = {} {inputs}", instruction.operation)?;
                     }
                     binding_count += 1;
                 }
@@ -518,7 +529,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
 ///
 /// During traced execution the builder also carries the first staging failure encountered in that
 /// tracing scope. This lets infallible operator syntax like `x + y` poison the shared trace and
-/// stop recording new equations even though the surrounding closure cannot immediately return
+/// stop recording new instructions even though the surrounding closure cannot immediately return
 /// `Result`.
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
@@ -531,8 +542,8 @@ pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
     /// Input atom ids in parameter order.
     input_atoms: Vec<AtomId>,
 
-    /// Equations recorded so far in execution order.
-    equations: Vec<Equation<O>>,
+    /// Instructions recorded so far in execution order.
+    instructions: Vec<Instruction<O>>,
 
     /// First staging failure recorded while this builder was used for traced execution.
     error: Option<TracingError>,
@@ -541,7 +552,7 @@ pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
 impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Creates an empty builder.
     ///
-    /// Fresh builders contain no atoms, equations, or retained exemplars and are typically owned
+    /// Fresh builders contain no atoms, instructions, or retained exemplars and are typically owned
     /// by one tracing scope.
     #[inline]
     pub fn new() -> Self {
@@ -549,7 +560,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             atoms: Vec::new(),
             intermediates: Vec::new(),
             input_atoms: Vec::new(),
-            equations: Vec::new(),
+            instructions: Vec::new(),
             error: None,
         }
     }
@@ -618,10 +629,15 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         id
     }
 
-    /// Adds a staged equation without running abstract or concrete evaluation.
+    /// Adds a staged instruction without running abstract or concrete evaluation.
     ///
     /// This is intended for linear program construction where the output types are already known.
-    pub fn add_equation_prevalidated(&mut self, op: O, inputs: Vec<AtomId>, output_abstracts: Vec<T>) -> Vec<AtomId> {
+    pub fn add_instruction_prevalidated(
+        &mut self,
+        operation: O,
+        inputs: Vec<AtomId>,
+        output_abstracts: Vec<T>,
+    ) -> Vec<AtomId> {
         let outputs = output_abstracts
             .into_iter()
             .map(|r#type| {
@@ -631,14 +647,14 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
                 id
             })
             .collect::<Vec<_>>();
-        self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
+        self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
         outputs
     }
 
-    /// Returns the number of equations added so far.
+    /// Returns the number of instructions added so far.
     #[inline]
-    pub fn equation_count(&self) -> usize {
-        self.equations.len()
+    pub fn instruction_count(&self) -> usize {
+        self.instructions.len()
     }
 
     /// Returns `true` when traced execution has already recorded a staging failure on this builder.
@@ -661,16 +677,16 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         self.error.take()
     }
 
-    /// Adds a staged equation using pre-computed output values, performing abstract-eval validation,
+    /// Adds a staged instruction using pre-computed output values, performing abstract-eval validation,
     /// algebraic identity elimination, and constant folding.
     ///
-    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`InterpretableOp::eval`] â€”
+    /// Unlike [`add_instruction`](Self::add_instruction), this method does not call [`InterpretableOp::eval`].
     /// the caller supplies the concrete output values directly. Use this when the caller has already
     /// computed the outputs (e.g., inside [`Tracer`](crate::tracing_v2::Tracer) staging
     /// methods).
-    pub fn add_equation_with_output_values(
+    pub fn add_instruction_with_output_values(
         &mut self,
-        op: O,
+        operation: O,
         inputs: Vec<AtomId>,
         output_values: Vec<V>,
     ) -> Result<Vec<AtomId>, TracingError>
@@ -685,12 +701,12 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
                     .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
+        let output_abstracts = operation.abstract_eval(input_abstracts.as_slice())?;
 
         // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
         let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
         let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
-        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
+        if let Some(simplified) = operation.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
 
@@ -713,16 +729,16 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .collect::<Vec<_>>();
 
         if !all_constant {
-            self.equations.push(Equation { op, inputs, outputs: outputs.clone() });
+            self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
         }
         Ok(outputs)
     }
 
-    /// Adds a staged equation using only abstract evaluation.
+    /// Adds a staged instruction using only abstract evaluation.
     ///
     /// This is the staging path used by type-directed tracing and any traced replay that does not
     /// have representative concrete values available for the participating atoms.
-    pub fn add_equation_abstract(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
+    pub fn add_instruction_abstract(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
     where
         O: Op<T>,
     {
@@ -734,23 +750,23 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
                     .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
+        let output_abstracts = operation.abstract_eval(input_abstracts.as_slice())?;
 
         let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
         let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
-        if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
+        if let Some(simplified) = operation.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
 
-        Ok(self.add_equation_prevalidated(op, inputs, output_abstracts))
+        Ok(self.add_instruction_prevalidated(operation, inputs, output_abstracts))
     }
 
-    /// Adds a staged equation, validating its inputs through abstract evaluation first.
+    /// Adds a staged instruction, validating its inputs through abstract evaluation first.
     ///
     /// When every input atom is an [`Atom::Constant`], the operation is folded at program-construction
     /// time: `abstract_eval` and `eval` are still executed for validation, but the output atoms are
-    /// recorded as constants and no equation is added to the program.
-    pub fn add_equation(&mut self, op: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
+    /// recorded as constants and no instruction is added to the program.
+    pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
     where
         O: InterpretableOp<T, V>,
     {
@@ -758,12 +774,12 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .iter()
             .map(|input| self.stored_value(*input).cloned().ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
-        let output_values = op.interpret(input_examples.as_slice())?;
-        self.add_equation_with_output_values(op, inputs, output_values)
+        let output_values = operation.interpret(input_examples.as_slice())?;
+        self.add_instruction_with_output_values(operation, inputs, output_values)
     }
 
     /// Finalizes the builder into a program with the given input/output structures. The builder's
-    /// intermediate values are discarded; the resulting program retains only the atoms, equations,
+    /// intermediate values are discarded; the resulting program retains only the atoms, instructions,
     /// and input/output structure.
     pub fn build<Input, Output>(
         self,
@@ -778,7 +794,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         Program {
             atoms: self.atoms,
             input_atoms: self.input_atoms,
-            equations: self.equations,
+            instructions: self.instructions,
             outputs,
             input_structure,
             output_structure,
@@ -814,8 +830,8 @@ mod tests {
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
-        let scaled_x = builder.add_equation(PrimitiveOp::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
-        let sum = builder.add_equation(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
+        let scaled_x = builder.add_instruction(PrimitiveOp::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(program.atom(x).unwrap(), Atom::Input(_)));
@@ -839,7 +855,7 @@ mod tests {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
         assert_eq!(
@@ -857,7 +873,7 @@ mod tests {
     #[test]
     fn program_builder_rejects_unbound_inputs() {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
-        let result = builder.add_equation(PrimitiveOp::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
+        let result = builder.add_instruction(PrimitiveOp::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
         assert!(matches!(
             result,
             Err(TracingError::UnboundAtomId { id }) if id == AtomId { index: 42 }
@@ -866,27 +882,27 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_folding_eliminates_equations() {
+    fn test_constant_folding_eliminates_instructions() {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
 
-        // Adding two constants should fold: no equation, output is constant.
-        let folded = builder.add_equation(PrimitiveOp::Add, vec![a, b]).unwrap();
+        // Adding two constants should fold: no instruction, output is constant.
+        let folded = builder.add_instruction(PrimitiveOp::Add, vec![a, b]).unwrap();
         assert_eq!(folded.len(), 1);
         assert!(matches!(builder.atom(folded[0]).unwrap(), Atom::Constant(_)));
-        assert_eq!(builder.equation_count(), 0);
+        assert_eq!(builder.instruction_count(), 0);
 
         // Introduce a non-constant input and combine with the folded constant.
         let x = builder.add_input(&10.0f64);
-        let result = builder.add_equation(PrimitiveOp::Mul, vec![folded[0], x]).unwrap();
+        let result = builder.add_instruction(PrimitiveOp::Mul, vec![folded[0], x]).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Derived(_)));
-        assert_eq!(builder.equation_count(), 1);
+        assert_eq!(builder.instruction_count(), 1);
 
-        // Build the program and verify only the non-folded equation survived.
+        // Build the program and verify only the non-folded instruction survived.
         let program = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
-        assert_eq!(program.equations().len(), 1);
+        assert_eq!(program.instructions().len(), 1);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -906,10 +922,10 @@ mod tests {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
-        let folded_sum = builder.add_equation(PrimitiveOp::Add, vec![a, b]).unwrap()[0];
+        let folded_sum = builder.add_instruction(PrimitiveOp::Add, vec![a, b]).unwrap()[0];
 
         let x = builder.add_input(&10.0f64);
-        let product = builder.add_equation(PrimitiveOp::Mul, vec![folded_sum, x]).unwrap()[0];
+        let product = builder.add_instruction(PrimitiveOp::Mul, vec![folded_sum, x]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
 
         // folded_sum = 2.0 + 3.0 = 5.0, product = 5.0 * input
@@ -923,7 +939,7 @@ mod tests {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
         let x = builder.add_input(&2.0f64);
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
 
         assert!(matches!(builder.atom(x).unwrap(), Atom::Input(r#type) if *r#type == ArrayType::scalar(DataType::F64)));
         assert!(matches!(builder.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
@@ -1041,14 +1057,14 @@ mod tests {
         let x = builder.add_input(&TestIdentityValue::scalar(5.0));
         let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
 
-        let simplified_add = builder.add_equation(PrimitiveOp::Add, vec![x, zero]).unwrap();
+        let simplified_add = builder.add_instruction(PrimitiveOp::Add, vec![x, zero]).unwrap();
         assert_eq!(simplified_add, vec![x]);
-        assert_eq!(builder.equation_count(), 0);
+        assert_eq!(builder.instruction_count(), 0);
 
         let simplified_scale = builder
-            .add_equation(PrimitiveOp::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
+            .add_instruction(PrimitiveOp::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
             .unwrap();
         assert_eq!(simplified_scale, vec![x]);
-        assert_eq!(builder.equation_count(), 0);
+        assert_eq!(builder.instruction_count(), 0);
     }
 }

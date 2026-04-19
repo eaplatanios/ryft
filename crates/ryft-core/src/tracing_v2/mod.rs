@@ -6,7 +6,7 @@
 //! a staged [`Program`], or replay on richer traced values such as [`JvpTracer`] and
 //! [`LinearTerm`] to derive tangent and cotangent programs.
 //!
-//! The central design choice is that staged equations store operation objects rather than a single
+//! The central design choice is that staged instructions store operation objects rather than a single
 //! global opcode enum. That keeps the operation universe open: the default core pipeline uses
 //! [`PrimitiveOp`] and [`LinearPrimitiveOp`], while backend crates can contribute their own closed
 //! carriers through [`Engine::TracingOperation`] and [`Engine::LinearOperation`] without rewriting
@@ -20,7 +20,7 @@
 //!    closure.
 //! 2. The transform chooses a leaf regime: concrete values, [`Tracer`] values, [`Batch`] values,
 //!    [`JvpTracer`] values, or staged linear terms.
-//! 3. Primitive trait impls in [`operations`] either execute eagerly or record equations into a
+//! 3. Primitive trait impls in [`operations`] either execute eagerly or record instructions into a
 //!    [`ProgramBuilder`].
 //! 4. The resulting [`Program`] or [`LinearProgram`] is simplified, replayed, transposed, or
 //!    handed off to a backend-specific lowering layer.
@@ -31,7 +31,7 @@
 //! # Module Layout
 //!
 //! - [`operations`] defines the semantic primitive traits and the built-in operation carriers.
-//! - The internal programs module owns the staged IR itself: atoms, equations, builders, and
+//! - The internal programs module owns the staged IR itself: atoms, instructions, builders, and
 //!   executable programs.
 //! - The internal values module defines the leaf-level contracts ([`Traceable`], [`Value`],
 //!   [`ZeroLike`], [`OneLike`]) that let the same transform code work over concrete values and
@@ -86,7 +86,7 @@ pub use operations::{
     Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
     LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, Sin, VectorizableOp,
 };
-pub use programs::{Atom, AtomId, Equation, Program, ProgramBuilder};
+pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder};
 pub use values::{OneLike, Traceable, Value, ZeroLike};
 
 /// Error type shared by the `tracing_v2` staging and transform pipeline.

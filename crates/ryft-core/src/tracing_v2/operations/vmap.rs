@@ -133,7 +133,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
 /// Higher-order `vmap` op that carries one canonical forward program payload.
 ///
 /// Ordinary traced programs store [`VMapOp`] when vectorization is preserved symbolically instead
-/// of being unrolled into repeated scalar equations.
+/// of being unrolled into repeated scalar instructions.
 #[derive(Clone)]
 pub struct VMapOp<
     T: Type + Display,

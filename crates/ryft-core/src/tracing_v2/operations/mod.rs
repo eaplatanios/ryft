@@ -462,7 +462,7 @@ impl<V: Traceable<ArrayType>, O: Clone + CoreLinearReplayOp<V> + LinearOperation
 /// Capability bundle gathering the linear staging traits needed to drive `Tracer` replay.
 ///
 /// This bundle is `'static` because it must satisfy the `'static` requirements imposed by the JIT
-/// tracer's storage of staged equations and is bounded over the [`Tracer`] flavor that backs
+/// tracer's storage of staged instructions and is bounded over the [`Tracer`] flavor that backs
 /// linearized JIT replay rules. Any inner linear operation type that implements
 /// [`LinearAddOperation`](add::LinearAddOperation),
 /// [`LinearNegOperation`](neg::LinearNegOperation), and

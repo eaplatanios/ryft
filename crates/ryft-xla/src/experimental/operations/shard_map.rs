@@ -631,15 +631,15 @@ fn transpose_body_cotangent_input_count(body: &FlatTracedShardMap) -> usize {
     body.global_input_types.len() - transpose_body_primal_input_count(body)
 }
 
-/// Computes dense owning-equation indices for one flat shard-map program.
-fn equation_by_output(program: &FlatShardMapProgram) -> Vec<Option<usize>> {
-    let mut equation_by_output = vec![None; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        for output in equation.outputs.iter().copied() {
-            equation_by_output[output.index] = Some(equation_index);
+/// Computes dense owning-instruction indices for one flat shard-map program.
+fn instruction_by_output(program: &FlatShardMapProgram) -> Vec<Option<usize>> {
+    let mut instruction_by_output = vec![None; program.atom_count()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        for output in instruction.outputs.iter().copied() {
+            instruction_by_output[output.index] = Some(instruction_index);
         }
     }
-    equation_by_output
+    instruction_by_output
 }
 
 /// Marks one atom and all of its dependencies as live.
@@ -647,42 +647,42 @@ fn mark_live_flat_program(
     program: &FlatShardMapProgram,
     atom_id: AtomId,
     live_atoms: &mut [bool],
-    live_equations: &mut [bool],
-    equation_by_output: &[Option<usize>],
+    live_instructions: &mut [bool],
+    instruction_by_output: &[Option<usize>],
 ) {
     if live_atoms[atom_id.index] {
         return;
     }
 
     live_atoms[atom_id.index] = true;
-    if let Some(equation_index) = equation_by_output[atom_id.index] {
-        if live_equations[equation_index] {
+    if let Some(instruction_index) = instruction_by_output[atom_id.index] {
+        if live_instructions[instruction_index] {
             return;
         }
 
-        live_equations[equation_index] = true;
-        let equation = &program.equations()[equation_index];
-        for input in equation.inputs.iter().copied() {
-            mark_live_flat_program(program, input, live_atoms, live_equations, equation_by_output);
+        live_instructions[instruction_index] = true;
+        let instruction = &program.instructions()[instruction_index];
+        for input in instruction.inputs.iter().copied() {
+            mark_live_flat_program(program, input, live_atoms, live_instructions, instruction_by_output);
         }
     }
 }
 
-/// Returns live atom/equation masks for one flat shard-map program.
+/// Returns live atom/instruction masks for one flat shard-map program.
 fn live_sets_for_flat_program(program: &FlatShardMapProgram) -> (Vec<bool>, Vec<bool>) {
-    let equation_by_output = equation_by_output(program);
+    let instruction_by_output = instruction_by_output(program);
     let mut live_atoms = vec![false; program.atom_count()];
-    let mut live_equations = vec![false; program.equations().len()];
+    let mut live_instructions = vec![false; program.instructions().len()];
     for output in program.outputs().iter().copied() {
         mark_live_flat_program(
             program,
             output,
             live_atoms.as_mut_slice(),
-            live_equations.as_mut_slice(),
-            equation_by_output.as_slice(),
+            live_instructions.as_mut_slice(),
+            instruction_by_output.as_slice(),
         );
     }
-    (live_atoms, live_equations)
+    (live_atoms, live_instructions)
 }
 
 /// Tracks whether each atom in one transpose body depends on a cotangent input.
@@ -694,11 +694,11 @@ fn cotangent_dependencies_for_transpose_body(body: &FlatTracedShardMap) -> Vec<b
         depends_on_cotangent[atom_id.index] = input_index >= primal_input_count;
     }
 
-    for equation in program.equations() {
-        let equation_depends_on_cotangent =
-            equation.inputs.iter().copied().any(|input| depends_on_cotangent[input.index]);
-        for output in equation.outputs.iter().copied() {
-            depends_on_cotangent[output.index] = equation_depends_on_cotangent;
+    for instruction in program.instructions() {
+        let instruction_depends_on_cotangent =
+            instruction.inputs.iter().copied().any(|input| depends_on_cotangent[input.index]);
+        for output in instruction.outputs.iter().copied() {
+            depends_on_cotangent[output.index] = instruction_depends_on_cotangent;
         }
     }
     depends_on_cotangent
@@ -717,7 +717,7 @@ fn project_flat_shard_map_program(
         atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
         kept_input_atoms: &std::collections::HashMap<AtomId, AtomId>,
         representative_values: &[ShardMapTensor],
-        equation_by_output: &[Option<usize>],
+        instruction_by_output: &[Option<usize>],
     ) -> Result<AtomId, TracingError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
             return Ok(*mapped_atom);
@@ -730,10 +730,10 @@ fn project_flat_shard_map_program(
             )?,
             ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
             ryft_core::tracing_v2::Atom::Derived(_) => {
-                let equation_index = equation_by_output[atom_id.index]
-                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
-                let equation = &program.equations()[equation_index];
-                let remapped_inputs = equation
+                let instruction_index = instruction_by_output[atom_id.index]
+                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning instruction"))?;
+                let instruction = &program.instructions()[instruction_index];
+                let remapped_inputs = instruction
                     .inputs
                     .iter()
                     .copied()
@@ -745,20 +745,25 @@ fn project_flat_shard_map_program(
                             atom_mapping,
                             kept_input_atoms,
                             representative_values,
-                            equation_by_output,
+                            instruction_by_output,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let output_abstracts = equation
+                let output_abstracts = instruction
                     .outputs
                     .iter()
                     .map(|output| {
-                        program.atom(*output).expect("equation output atom should exist").r#type().into_owned()
+                        program.atom(*output).expect("instruction output atom should exist").r#type().into_owned()
                     })
                     .collect::<Vec<_>>();
-                let remapped_outputs =
-                    builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
-                for (old_output, new_output) in equation.outputs.iter().copied().zip(remapped_outputs.iter().copied()) {
+                let remapped_outputs = builder.add_instruction_prevalidated(
+                    instruction.operation.clone(),
+                    remapped_inputs,
+                    output_abstracts,
+                );
+                for (old_output, new_output) in
+                    instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
+                {
                     atom_mapping.insert(old_output, new_output);
                 }
                 *atom_mapping.get(&atom_id).ok_or(TracingError::InternalInvariantViolation(
@@ -771,7 +776,7 @@ fn project_flat_shard_map_program(
         Ok(mapped_atom)
     }
 
-    let equation_by_output = equation_by_output(program);
+    let instruction_by_output = instruction_by_output(program);
     let engine = crate::experimental::engine::XlaEngine::token();
     let representative_values = program.representative_atom_values(engine)?;
     let mut builder = ProgramBuilder::<XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
@@ -793,7 +798,7 @@ fn project_flat_shard_map_program(
                 &mut atom_mapping,
                 &input_mapping,
                 representative_values.as_slice(),
-                equation_by_output.as_slice(),
+                instruction_by_output.as_slice(),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -818,7 +823,7 @@ fn build_factorized_apply_program(
         replacement_inputs: &std::collections::HashMap<AtomId, AtomId>,
         depends_on_cotangent: &[bool],
         representative_values: &[ShardMapTensor],
-        equation_by_output: &[Option<usize>],
+        instruction_by_output: &[Option<usize>],
     ) -> Result<AtomId, TracingError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
             return Ok(*mapped_atom);
@@ -842,10 +847,10 @@ fn build_factorized_apply_program(
                         "factorized apply program referenced a cotangent-independent atom that was not materialized as a residual",
                     ));
                 }
-                let equation_index = equation_by_output[atom_id.index]
-                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
-                let equation = &program.equations()[equation_index];
-                let remapped_inputs = equation
+                let instruction_index = instruction_by_output[atom_id.index]
+                    .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning instruction"))?;
+                let instruction = &program.instructions()[instruction_index];
+                let remapped_inputs = instruction
                     .inputs
                     .iter()
                     .copied()
@@ -858,20 +863,25 @@ fn build_factorized_apply_program(
                             replacement_inputs,
                             depends_on_cotangent,
                             representative_values,
-                            equation_by_output,
+                            instruction_by_output,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let output_abstracts = equation
+                let output_abstracts = instruction
                     .outputs
                     .iter()
                     .map(|output| {
-                        program.atom(*output).expect("equation output atom should exist").r#type().into_owned()
+                        program.atom(*output).expect("instruction output atom should exist").r#type().into_owned()
                     })
                     .collect::<Vec<_>>();
-                let remapped_outputs =
-                    builder.add_equation_prevalidated(equation.op.clone(), remapped_inputs, output_abstracts);
-                for (old_output, new_output) in equation.outputs.iter().copied().zip(remapped_outputs.iter().copied()) {
+                let remapped_outputs = builder.add_instruction_prevalidated(
+                    instruction.operation.clone(),
+                    remapped_inputs,
+                    output_abstracts,
+                );
+                for (old_output, new_output) in
+                    instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
+                {
                     atom_mapping.insert(old_output, new_output);
                 }
                 *atom_mapping.get(&atom_id).ok_or(TracingError::InternalInvariantViolation(
@@ -889,7 +899,7 @@ fn build_factorized_apply_program(
     let representative_values = program.representative_atom_values(engine)?;
     let primal_input_count = transpose_body_primal_input_count(body);
     let cotangent_input_atoms = program.input_atoms()[primal_input_count..].to_vec();
-    let equation_by_output = equation_by_output(program);
+    let instruction_by_output = instruction_by_output(program);
     let mut builder = ProgramBuilder::<XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
     let mut replacement_inputs = std::collections::HashMap::new();
 
@@ -916,7 +926,7 @@ fn build_factorized_apply_program(
                 &replacement_inputs,
                 depends_on_cotangent,
                 representative_values.as_slice(),
-                equation_by_output.as_slice(),
+                instruction_by_output.as_slice(),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -939,19 +949,19 @@ fn factorize_transpose_shard_map_body(
         return Ok(None);
     }
 
-    let (live_atoms, live_equations) = live_sets_for_flat_program(program);
+    let (live_atoms, live_instructions) = live_sets_for_flat_program(program);
     let depends_on_cotangent = cotangent_dependencies_for_transpose_body(&simplified_body);
     let mut needed_as_residual = vec![false; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        if !live_equations[equation_index] {
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        if !live_instructions[instruction_index] {
             continue;
         }
-        let equation_depends_on_cotangent =
-            equation.outputs.iter().copied().any(|output| depends_on_cotangent[output.index]);
-        if !equation_depends_on_cotangent {
+        let instruction_depends_on_cotangent =
+            instruction.outputs.iter().copied().any(|output| depends_on_cotangent[output.index]);
+        if !instruction_depends_on_cotangent {
             continue;
         }
-        for input in equation.inputs.iter().copied() {
+        for input in instruction.inputs.iter().copied() {
             if live_atoms[input.index] && !depends_on_cotangent[input.index] {
                 needed_as_residual[input.index] = true;
             }
@@ -1141,10 +1151,10 @@ fn replay_traced_xla_program<
         values[atom_id.index] = Some(value);
     }
 
-    let mut equation_by_first_output = vec![None; program.atom_count()];
-    for (equation_index, equation) in program.equations().iter().enumerate() {
-        if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[first_output.index] = Some(equation_index);
+    let mut instruction_by_first_output = vec![None; program.atom_count()];
+    for (instruction_index, instruction) in program.instructions().iter().enumerate() {
+        if let Some(first_output) = instruction.outputs.first() {
+            instruction_by_first_output[first_output.index] = Some(instruction_index);
         }
     }
 
@@ -1161,16 +1171,16 @@ fn replay_traced_xla_program<
                 values[atom_index] = Some(V::lift_constant(value, seed_inputs.as_slice())?);
             }
             ryft_core::tracing_v2::Atom::Derived(_) => {
-                let Some(equation_index) = equation_by_first_output[atom_index] else {
+                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
-                let equation = &program.equations()[equation_index];
-                let input_values = equation
+                let instruction = &program.instructions()[instruction_index];
+                let input_values = instruction
                     .inputs
                     .iter()
                     .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
-                let outputs = match &equation.op {
+                let outputs = match &instruction.operation {
                     XlaPrimitiveOp::ShardMap(shard_map_op) => {
                         if shard_map_op.has_linear_state() {
                             return Err(ShardMapTraceError::TracingError(TracingError::HigherOrderOpFailure {
@@ -1193,7 +1203,10 @@ fn replay_traced_xla_program<
                         } else {
                             return Err(ShardMapTraceError::TracingError(TracingError::HigherOrderOpFailure {
                                 op: "shard_map",
-                                message: format!("replaying staged op '{}' is not supported", equation.op.name()),
+                                message: format!(
+                                    "replaying staged op '{}' is not supported",
+                                    instruction.operation.name()
+                                ),
                             }));
                         }
                     }
@@ -1211,7 +1224,7 @@ fn replay_traced_xla_program<
                         }));
                     }
                 };
-                for (output_atom, output_value) in equation.outputs.iter().copied().zip(outputs) {
+                for (output_atom, output_value) in instruction.outputs.iter().copied().zip(outputs) {
                     values[output_atom.index] = Some(output_value);
                 }
             }

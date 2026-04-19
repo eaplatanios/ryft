@@ -33,7 +33,7 @@ use crate::{
 /// Symbolic leaf used while staging ordinary traced programs.
 ///
 /// A [`Tracer`] is the value-level facade for one staged atom. Primitive trait impls on
-/// [`Tracer`] do not compute numerically; instead, they add equations to a shared
+/// [`Tracer`] do not compute numerically; instead, they add instructions to a shared
 /// [`ProgramBuilder`](crate::tracing_v2::ProgramBuilder) and return new tracers pointing at the
 /// output atoms. This makes `Tracer` the central "big picture" type for symbolic execution in
 /// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
@@ -71,7 +71,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
 
     /// Returns a clone of the shared builder that owns this tracer's staged atom.
     ///
-    /// Higher-order transforms use this to stage additional equations into the same trace without
+    /// Higher-order transforms use this to stage additional instructions into the same trace without
     /// exposing the builder mutably through the public API surface.
     #[inline]
     pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>> {
@@ -105,7 +105,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// This is the common helper behind both the arithmetic trait impls on [`Tracer`] and the
     /// higher-order transforms that need to inject backend-selected operations manually. The method
     /// validates that all inputs belong to the same tracing scope, runs abstract evaluation to
-    /// determine the output arity, and records the equation unless the scope has already failed.
+    /// determine the output arity, and records the instruction unless the scope has already failed.
     pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TracingError>
     where
         E::TracingOperation: Op<E::Type>,
@@ -141,7 +141,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
         let output_atoms = if builder.borrow().has_error() {
             vec![inputs[0].atom; output_count]
         } else {
-            match builder.borrow_mut().add_equation_abstract(op, input_atoms) {
+            match builder.borrow_mut().add_instruction_abstract(op, input_atoms) {
                 Ok(outputs) => outputs,
                 Err(error) => {
                     builder.borrow_mut().record_error_if_absent(error);

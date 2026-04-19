@@ -99,7 +99,7 @@ impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>>
 /// This helper is the local handshake between IR-level transposition and primitive-level reverse
 /// rules. The surrounding transpose pass deals in atom ids, but [`LinearOperation::transpose`] is
 /// expressed in terms of [`LinearTerm`] values so primitive implementations can stage new linear
-/// equations directly.
+/// instructions directly.
 ///
 /// # Parameters
 ///   - `op`: primitive whose transpose rule should be applied.
@@ -190,8 +190,8 @@ where
         }
     }
 
-    for equation in program.equations() {
-        let input_duals = equation
+    for instruction in program.instructions() {
+        let input_duals = instruction
             .inputs
             .iter()
             .copied()
@@ -209,14 +209,17 @@ where
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
         let output_duals = DifferentiableOp::<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L>::jvp(
-            &equation.op,
+            &instruction.operation,
             engine,
             input_duals.as_slice(),
         )?;
-        if output_duals.len() != equation.outputs.len() {
-            return Err(TracingError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
+        if output_duals.len() != instruction.outputs.len() {
+            return Err(TracingError::InvalidOutputCount {
+                expected: instruction.outputs.len(),
+                got: output_duals.len(),
+            });
         }
-        for (output_atom, output_dual) in equation.outputs.iter().copied().zip(output_duals.into_iter()) {
+        for (output_atom, output_dual) in instruction.outputs.iter().copied().zip(output_duals.into_iter()) {
             primals[output_atom.index] = Some(output_dual.primal);
             tangents[output_atom.index] = Some(output_dual.tangent);
         }
@@ -298,7 +301,7 @@ where
                 let mut builder_borrow = builder.borrow_mut();
                 let abstract_value =
                     builder_borrow.atom(existing).expect("adjoint atom should exist").r#type().into_owned();
-                builder_borrow.add_equation_prevalidated(
+                builder_borrow.add_instruction_prevalidated(
                     O::linear_add_op(),
                     vec![existing, contribution],
                     vec![abstract_value],
@@ -324,14 +327,14 @@ where
         accumulate(&builder, adjoints.as_mut_slice(), output, cotangent)?;
     }
 
-    for equation in linear_body.equations().iter().rev() {
-        let equation_output_cotangents =
-            equation.outputs.iter().map(|output| adjoints[output.index]).collect::<Option<Vec<_>>>();
-        let Some(equation_output_cotangents) = equation_output_cotangents else {
+    for instruction in linear_body.instructions().iter().rev() {
+        let instruction_output_cotangents =
+            instruction.outputs.iter().map(|output| adjoints[output.index]).collect::<Option<Vec<_>>>();
+        let Some(instruction_output_cotangents) = instruction_output_cotangents else {
             continue;
         };
-        let input_cotangents = transpose(&equation.op, &builder, equation_output_cotangents.as_slice())?;
-        for (input, contribution) in equation.inputs.iter().copied().zip(input_cotangents) {
+        let input_cotangents = transpose(&instruction.operation, &builder, instruction_output_cotangents.as_slice())?;
+        for (input, contribution) in instruction.inputs.iter().copied().zip(input_cotangents) {
             if let Some(contribution) = contribution {
                 accumulate(&builder, adjoints.as_mut_slice(), input, contribution)?;
             }

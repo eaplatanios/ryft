@@ -28,7 +28,7 @@ pub(crate) fn assert_reference_program_rendering() {
     let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
     let x = builder.add_input(&1.0f64);
     let three = builder.add_constant(3.0f64);
-    let sum = builder.add_equation(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
+    let sum = builder.add_instruction(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
     let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
     assert_eq!(
