@@ -20,7 +20,7 @@ use crate::{
         engine::Engine,
         operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
     },
-    types::{ArrayType, Type, Typed},
+    types::{Type, Typed},
 };
 
 /// Tracer used while staging JIT programs.
@@ -212,9 +212,7 @@ impl<T: Type + Display + 'static, V: Traceable<T>, O: Clone + 'static, L: Clone 
 {
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + 'static> ZeroLike
-    for JitTracer<ArrayType, V, O, L>
-{
+impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> ZeroLike for JitTracer<T, V, O, L> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
@@ -229,9 +227,7 @@ impl<V: Traceable<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + 'static>
     }
 }
 
-impl<V: Traceable<ArrayType> + OneLike, O: Clone + 'static, L: Clone + 'static> OneLike
-    for JitTracer<ArrayType, V, O, L>
-{
+impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> OneLike for JitTracer<T, V, O, L> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
@@ -246,10 +242,10 @@ impl<V: Traceable<ArrayType> + OneLike, O: Clone + 'static, L: Clone + 'static> 
     }
 }
 
-impl<V: Traceable<ArrayType>, O: AddTracingOperation<ArrayType, V> + 'static, L: Clone + 'static> Add
-    for JitTracer<ArrayType, V, O, L>
+impl<T: Type + Display, V: Traceable<T>, O: AddTracingOperation<T, V> + 'static, L: Clone + 'static> Add
+    for JitTracer<T, V, O, L>
 where
-    O: Op<ArrayType>,
+    O: Op<T>,
 {
     type Output = Self;
 
@@ -259,10 +255,10 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: MulTracingOperation<ArrayType, V> + 'static, L: Clone + 'static> Mul
-    for JitTracer<ArrayType, V, O, L>
+impl<T: Type + Display, V: Traceable<T>, O: MulTracingOperation<T, V> + 'static, L: Clone + 'static> Mul
+    for JitTracer<T, V, O, L>
 where
-    O: Op<ArrayType>,
+    O: Op<T>,
 {
     type Output = Self;
 
@@ -272,10 +268,10 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: NegTracingOperation<ArrayType, V> + 'static, L: Clone + 'static> Neg
-    for JitTracer<ArrayType, V, O, L>
+impl<T: Type + Display, V: Traceable<T>, O: NegTracingOperation<T, V> + 'static, L: Clone + 'static> Neg
+    for JitTracer<T, V, O, L>
 where
-    O: Op<ArrayType>,
+    O: Op<T>,
 {
     type Output = Self;
 
@@ -286,22 +282,21 @@ where
 }
 
 /// Stages `function` using the staged op set selected by `engine`.
-pub fn trace_program<F, Input, Output, V, O, L>(
-    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+pub fn trace_program<F, Input, Output, T, V, O, L>(
+    engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
     function: F,
     input: Input,
-) -> Result<(Output, Program<ArrayType, V, Input, Output, O>), TraceError>
+) -> Result<(Output, Program<T, V, Input, Output, O>), TraceError>
 where
-    V: Traceable<ArrayType>,
-    O: Clone + 'static + InterpretableOp<ArrayType, V>,
+    T: Type + Display + Parameter,
+    V: Traceable<T>,
+    O: Clone + 'static + InterpretableOp<T, V>,
     L: Clone + 'static,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-    F: FnOnce(
-        Input::To<JitTracer<ArrayType, V, O, L>>,
-    ) -> Result<Output::To<JitTracer<ArrayType, V, O, L>>, TraceError>,
+    Input::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
+    Output::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
+    F: FnOnce(Input::To<JitTracer<T, V, O, L>>) -> Result<Output::To<JitTracer<T, V, O, L>>, TraceError>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
@@ -309,13 +304,11 @@ where
     let input_values = input.into_parameters().collect::<Vec<_>>();
     let input_types = input_values.iter().map(|value| value.tpe().into_owned()).collect::<Vec<_>>();
     let mut output_structure = None;
-    let (_, flat_program): (Vec<ArrayType>, Program<ArrayType, V, Vec<V>, Vec<V>, O>) = trace_program_from_types(
+    let (_, flat_program): (Vec<T>, Program<T, V, Vec<V>, Vec<V>, O>) = trace_program_from_types(
         engine,
         |flat_traced_input| {
-            let traced_input = Input::To::<JitTracer<ArrayType, V, O, L>>::from_parameters(
-                input_structure.clone(),
-                flat_traced_input,
-            )?;
+            let traced_input =
+                Input::To::<JitTracer<T, V, O, L>>::from_parameters(input_structure.clone(), flat_traced_input)?;
             let traced_output = function(traced_input)?;
             output_structure = Some(traced_output.parameter_structure());
             Ok(traced_output.into_parameters().collect::<Vec<_>>())
@@ -394,6 +387,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing_v2::{ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
+        types::ArrayType,
     };
 
     use super::*;
@@ -447,6 +441,173 @@ mod tests {
                 in (%3)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn trace_program_supports_non_array_types() {
+        use std::fmt;
+
+        use ryft_macros::Parameter;
+
+        use crate::types::Type;
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct TestType(&'static str);
+
+        impl Type for TestType {
+            fn is_compatible_with(&self, other: &Self) -> bool {
+                self == other
+            }
+        }
+
+        impl Parameter for TestType {}
+
+        impl fmt::Display for TestType {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, Parameter, PartialEq)]
+        struct TestValue {
+            r#type: TestType,
+            value: i32,
+        }
+
+        impl TestValue {
+            fn new(r#type: TestType, value: i32) -> Self {
+                Self { r#type, value }
+            }
+        }
+
+        impl Typed<TestType> for TestValue {
+            fn tpe(&self) -> Cow<'_, TestType> {
+                Cow::Borrowed(&self.r#type)
+            }
+        }
+
+        impl Traceable<TestType> for TestValue {
+            fn is_zero(&self) -> bool {
+                self.value == 0
+            }
+
+            fn is_one(&self) -> bool {
+                self.value == 1
+            }
+        }
+
+        impl crate::tracing_v2::Value<TestType> for TestValue {}
+
+        impl Add for TestValue {
+            type Output = Self;
+
+            fn add(self, rhs: Self) -> Self::Output {
+                assert_eq!(self.r#type, rhs.r#type);
+                Self { r#type: self.r#type, value: self.value + rhs.value }
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        struct TestAddOp;
+
+        impl fmt::Display for TestAddOp {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("test_add")
+            }
+        }
+
+        impl AddTracingOperation<TestType, TestValue> for TestAddOp {
+            fn add_op() -> Self {
+                Self
+            }
+        }
+
+        impl Op<TestType> for TestAddOp {
+            fn name(&self) -> &'static str {
+                "test_add"
+            }
+
+            fn abstract_eval(&self, inputs: &[TestType]) -> Result<Vec<TestType>, TraceError> {
+                if inputs.len() != 2 {
+                    return Err(TraceError::InvalidInputCount { expected: 2, got: inputs.len() });
+                }
+                if !inputs[0].is_compatible_with(&inputs[1]) {
+                    return Err(TraceError::IncompatibleAbstractValues { op: "test_add" });
+                }
+                Ok(vec![inputs[0].clone()])
+            }
+
+            fn try_simplify(
+                &self,
+                inputs: &[usize],
+                is_zero_constant: &dyn Fn(usize) -> bool,
+                _is_one_constant: &dyn Fn(usize) -> bool,
+            ) -> Option<Vec<usize>> {
+                if inputs.len() != 2 {
+                    return None;
+                }
+                if is_zero_constant(inputs[0]) {
+                    Some(vec![inputs[1]])
+                } else if is_zero_constant(inputs[1]) {
+                    Some(vec![inputs[0]])
+                } else {
+                    None
+                }
+            }
+        }
+
+        impl InterpretableOp<TestType, TestValue> for TestAddOp {
+            fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TraceError> {
+                if inputs.len() != 2 {
+                    return Err(TraceError::InvalidInputCount { expected: 2, got: inputs.len() });
+                }
+                if !inputs[0].r#type.is_compatible_with(&inputs[1].r#type) {
+                    return Err(TraceError::IncompatibleAbstractValues { op: "test_add" });
+                }
+                Ok(vec![inputs[0].clone() + inputs[1].clone()])
+            }
+        }
+
+        struct TestEngine;
+
+        impl Engine for TestEngine {
+            type Type = TestType;
+            type Value = TestValue;
+            type TracingOperation = TestAddOp;
+            type LinearOperation = TestAddOp;
+
+            fn zero(&self, r#type: &TestType) -> TestValue {
+                TestValue::new(r#type.clone(), 0)
+            }
+
+            fn one(&self, r#type: &TestType) -> TestValue {
+                TestValue::new(r#type.clone(), 1)
+            }
+        }
+
+        let scalar_type = TestType("test_scalar");
+        let (output, program): (TestValue, Program<TestType, TestValue, (TestValue, TestValue), TestValue, TestAddOp>) =
+            trace_program(
+                &TestEngine,
+                |inputs: (
+                    JitTracer<TestType, TestValue, TestAddOp, TestAddOp>,
+                    JitTracer<TestType, TestValue, TestAddOp, TestAddOp>,
+                )| {
+                    let sum = inputs.0.clone() + inputs.1;
+                    let stabilized = sum + inputs.0.zero_like();
+                    Ok(stabilized + inputs.0.one_like())
+                },
+                (TestValue::new(scalar_type.clone(), 2), TestValue::new(scalar_type.clone(), 3)),
+            )
+            .unwrap();
+
+        assert_eq!(output, TestValue::new(scalar_type.clone(), 6));
+        assert_eq!(
+            program
+                .call((TestValue::new(scalar_type.clone(), 4), TestValue::new(scalar_type.clone(), 5)))
+                .unwrap(),
+            TestValue::new(scalar_type, 10),
         );
     }
 

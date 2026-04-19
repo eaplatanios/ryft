@@ -42,8 +42,8 @@ pub trait TangentSpace<T: Type, V: Typed<T>>: Clone + Parameter {
     fn zero_like(primal: &V, tangent: &Self) -> Self;
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike>
-    TangentSpace<ArrayType, V> for V
+impl<T: Type, V: Traceable<T> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike> TangentSpace<T, V>
+    for V
 {
     #[inline]
     fn add(lhs: Self, rhs: Self) -> Self {
@@ -80,16 +80,16 @@ pub struct JvpTracer<V, T> {
     pub tangent: T,
 }
 
-impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V>> Parameter for JvpTracer<V, T> {}
+impl<V, T> Parameter for JvpTracer<V, T> {}
 
-impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V> + 'static> Typed<ArrayType> for JvpTracer<V, T> {
+impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V> + 'static> Typed<Ty> for JvpTracer<V, T> {
     #[inline]
-    fn tpe(&self) -> Cow<'_, ArrayType> {
-        <V as Typed<ArrayType>>::tpe(&self.primal)
+    fn tpe(&self) -> Cow<'_, Ty> {
+        <V as Typed<Ty>>::tpe(&self.primal)
     }
 }
 
-impl<V: Traceable<ArrayType>, T: TangentSpace<ArrayType, V> + 'static> Traceable<ArrayType> for JvpTracer<V, T> {}
+impl<Ty: Type + 'static, V: Traceable<Ty>, T: TangentSpace<Ty, V> + 'static> Traceable<Ty> for JvpTracer<V, T> {}
 
 impl<V: Traceable<ArrayType> + ZeroLike, T: TangentSpace<ArrayType, V>> ZeroLike for JvpTracer<V, T> {
     #[inline]
@@ -422,7 +422,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        borrow::Cow,
+        fmt,
+        ops::{Add, Mul, Neg},
+    };
+
+    use ryft_macros::Parameter;
+
     use crate::tracing_v2::{OneLike, engine::ArrayScalarEngine, test_support};
+    use crate::types::{Type, Typed};
 
     use super::*;
 
@@ -446,5 +455,109 @@ mod tests {
             jvp(&engine, |xs: Vec<JitTracer<ArrayType, f64>>| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(result, Err(TraceError::MismatchedParameterStructure)));
         test_support::assert_quadratic_pushforward_rendering();
+    }
+
+    #[test]
+    fn jvp_tracer_exposes_generic_type_metadata_for_non_array_types() {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct TestType(&'static str);
+
+        impl Type for TestType {
+            fn is_compatible_with(&self, other: &Self) -> bool {
+                self == other
+            }
+        }
+
+        impl fmt::Display for TestType {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+
+        #[derive(Clone, Debug, Eq, Parameter, PartialEq)]
+        struct TestValue {
+            r#type: TestType,
+            value: i32,
+        }
+
+        impl TestValue {
+            fn new(r#type: TestType, value: i32) -> Self {
+                Self { r#type, value }
+            }
+        }
+
+        impl Typed<TestType> for TestValue {
+            fn tpe(&self) -> Cow<'_, TestType> {
+                Cow::Borrowed(&self.r#type)
+            }
+        }
+
+        impl Traceable<TestType> for TestValue {}
+
+        impl ZeroLike for TestValue {
+            fn zero_like(&self) -> Self {
+                Self::new(self.r#type.clone(), 0)
+            }
+        }
+
+        impl Add for TestValue {
+            type Output = Self;
+
+            fn add(self, rhs: Self) -> Self::Output {
+                assert_eq!(self.r#type, rhs.r#type);
+                Self::new(self.r#type, self.value + rhs.value)
+            }
+        }
+
+        impl Mul for TestValue {
+            type Output = Self;
+
+            fn mul(self, rhs: Self) -> Self::Output {
+                assert_eq!(self.r#type, rhs.r#type);
+                Self::new(self.r#type, self.value * rhs.value)
+            }
+        }
+
+        impl Neg for TestValue {
+            type Output = Self;
+
+            fn neg(self) -> Self::Output {
+                Self::new(self.r#type, -self.value)
+            }
+        }
+
+        let scalar_type = TestType("test_scalar");
+        let left = JvpTracer {
+            primal: TestValue::new(scalar_type.clone(), 3),
+            tangent: TestValue::new(scalar_type.clone(), 4),
+        };
+        assert_eq!(left.tpe().into_owned(), scalar_type.clone());
+
+        fn assert_traceable<T: Type, V: Traceable<T>>(_value: &V) {}
+
+        assert_traceable::<TestType, _>(&left);
+
+        assert_eq!(
+            <TestValue as TangentSpace<TestType, TestValue>>::zero_like(&left.primal, &left.tangent),
+            TestValue::new(scalar_type.clone(), 0),
+        );
+        assert_eq!(
+            <TestValue as TangentSpace<TestType, TestValue>>::add(
+                TestValue::new(scalar_type.clone(), 4),
+                TestValue::new(scalar_type.clone(), 5),
+            ),
+            TestValue::new(scalar_type.clone(), 9),
+        );
+        assert_eq!(
+            <TestValue as TangentSpace<TestType, TestValue>>::scale(
+                TestValue::new(scalar_type.clone(), 3),
+                TestValue::new(scalar_type.clone(), 5),
+            ),
+            TestValue::new(scalar_type.clone(), 15),
+        );
+        assert_eq!(
+            <TestValue as TangentSpace<TestType, TestValue>>::neg(TestValue::new(scalar_type.clone(), 4)),
+            TestValue::new(scalar_type, -4),
+        );
     }
 }
