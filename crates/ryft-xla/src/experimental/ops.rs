@@ -7,7 +7,7 @@ use std::{
 
 use ryft_core::{
     tracing_v2::{
-        CustomPrimitive, DifferentiableOp, InterpretableOp, LinearPrimitiveOp, LinearTerm, Op, TracingError,
+        AtomId, CustomPrimitive, DifferentiableOp, InterpretableOp, LinearPrimitiveOp, LinearTerm, Op, TracingError,
         engine::Engine,
         forward::JvpTracer,
         linear::Linearized,
@@ -162,10 +162,10 @@ impl Op for XlaPrimitiveOp {
 
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         match self {
             Self::Add => AddOp.try_simplify(inputs, is_zero_constant, is_one_constant),
             Self::Mul => MulOp.try_simplify(inputs, is_zero_constant, is_one_constant),

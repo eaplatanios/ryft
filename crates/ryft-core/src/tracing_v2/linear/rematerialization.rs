@@ -250,7 +250,7 @@ where
     let mut atom_producer: Vec<Option<usize>> = vec![None; program.atom_count()];
     for (equation_index, equation) in equations.iter().enumerate() {
         for &output_atom in &equation.outputs {
-            atom_producer[output_atom] = Some(equation_index);
+            atom_producer[output_atom.index()] = Some(equation_index);
         }
     }
 
@@ -259,13 +259,13 @@ where
     let mut atom_consumers: Vec<Vec<usize>> = vec![Vec::new(); program.atom_count()];
     for (equation_index, equation) in equations.iter().enumerate() {
         for &input_atom in &equation.inputs {
-            atom_consumers[input_atom].push(equation_index);
+            atom_consumers[input_atom.index()].push(equation_index);
         }
     }
     // Also mark program outputs as "consumed" at equation_count (sentinel for "after all equations").
     let sentinel = equations.len();
     for &output_atom in program.outputs() {
-        atom_consumers[output_atom].push(sentinel);
+        atom_consumers[output_atom.index()].push(sentinel);
     }
 
     // Build the outer program.
@@ -278,14 +278,14 @@ where
     // Register program inputs in the outer builder.
     for (&input_atom, representative_input) in input_atoms.iter().zip(representative_inputs.iter()) {
         let outer_atom = outer_builder.add_input(representative_input);
-        atom_mapping[input_atom] = Some(outer_atom);
+        atom_mapping[input_atom.index()] = Some(outer_atom);
     }
 
     // Register constants that are used by equations (they might be referenced across segments).
     for (atom_id, atom) in program.atoms_iter() {
         if let Atom::Constant { value } = atom {
             let outer_atom = outer_builder.add_constant(value.clone());
-            atom_mapping[atom_id] = Some(outer_atom);
+            atom_mapping[atom_id.index()] = Some(outer_atom);
         }
     }
 
@@ -302,7 +302,7 @@ where
         for equation in *segment {
             for &input_atom in &equation.inputs {
                 // If this atom is produced by an equation outside this segment (or is an input/constant).
-                let produced_in_segment = atom_producer[input_atom]
+                let produced_in_segment = atom_producer[input_atom.index()]
                     .map_or(false, |producer_idx| producer_idx >= segment_start && producer_idx < segment_end);
                 if !produced_in_segment && boundary_input_set.insert(input_atom) {
                     boundary_input_atoms.push(input_atom);
@@ -316,7 +316,7 @@ where
         let mut boundary_output_set = std::collections::HashSet::new();
         for equation in *segment {
             for &output_atom in &equation.outputs {
-                let consumed_outside = atom_consumers[output_atom]
+                let consumed_outside = atom_consumers[output_atom.index()]
                     .iter()
                     .any(|&consumer_idx| consumer_idx < segment_start || consumer_idx >= segment_end);
                 if consumed_outside && boundary_output_set.insert(output_atom) {
@@ -360,7 +360,7 @@ where
         // Add the RematerializeOp equation to the outer builder.
         let outer_inputs: Vec<AtomId> = boundary_input_atoms
             .iter()
-            .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
+            .map(|&orig_atom| atom_mapping[orig_atom.index()].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
             .collect::<Result<_, _>>()?;
         let outer_outputs = outer_builder.add_equation_prevalidated(
             E::TracingOperation::rematerialize_op(remat_op),
@@ -370,7 +370,7 @@ where
 
         // Map the boundary output atoms to their outer-program counterparts.
         for (orig_atom, outer_atom) in boundary_output_atoms.iter().zip(outer_outputs.iter()) {
-            atom_mapping[*orig_atom] = Some(*outer_atom);
+            atom_mapping[orig_atom.index()] = Some(*outer_atom);
         }
 
         equation_offset = segment_end;
@@ -380,7 +380,7 @@ where
     let outer_outputs: Vec<AtomId> = program
         .outputs()
         .iter()
-        .map(|&orig_atom| atom_mapping[orig_atom].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
+        .map(|&orig_atom| atom_mapping[orig_atom.index()].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
         .collect::<Result<_, _>>()?;
 
     let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
@@ -466,7 +466,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
 
     // Register boundary inputs as sub-program inputs.
     for &input_atom in boundary_input_atoms {
-        let sub_atom = sub_builder.add_input(&representative_values[input_atom]);
+        let sub_atom = sub_builder.add_input(&representative_values[input_atom.index()]);
         sub_atom_mapping.insert(input_atom, sub_atom);
     }
 

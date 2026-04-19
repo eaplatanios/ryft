@@ -18,7 +18,7 @@ use std::{
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        Cos, MatrixOps, OneLike, Sin, Traceable, TracingError, Value, ZeroLike,
+        AtomId, Cos, MatrixOps, OneLike, Sin, Traceable, TracingError, Value, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
@@ -434,10 +434,10 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
 
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         match self {
             Self::Add => AddOp.try_simplify(inputs, is_zero_constant, is_one_constant),
             Self::Mul => MulOp.try_simplify(inputs, is_zero_constant, is_one_constant),
@@ -501,10 +501,10 @@ impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
 
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         match self {
             Self::Add => AddOp.try_simplify(inputs, is_zero_constant, is_one_constant),
             Self::Neg => NegOp.try_simplify(inputs, is_zero_constant, is_one_constant),

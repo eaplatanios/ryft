@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    Traceable, TracingError,
+    AtomId, Traceable, TracingError,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -59,10 +59,10 @@ impl Op for MulOp {
 
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         if inputs.len() == 2 {
             if is_one_constant(inputs[0]) {
                 Some(vec![inputs[1]])

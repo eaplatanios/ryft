@@ -59,7 +59,8 @@ use crate::{
     parameters::Parameterized,
     sharding::Sharding,
     tracing_v2::{
-        Traceable, TracingError, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
+        AtomId, Traceable, TracingError, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer,
+        linear::LinearTerm,
     },
     types::{ArrayType, Type, Typed},
 };
@@ -242,10 +243,10 @@ pub trait Op<T: Type = ArrayType>: Debug + Display {
     /// Returns `None` if no simplification applies.
     fn try_simplify(
         &self,
-        _inputs: &[usize],
-        _is_zero_constant: &dyn Fn(usize) -> bool,
-        _is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        _inputs: &[AtomId],
+        _is_zero_constant: &dyn Fn(AtomId) -> bool,
+        _is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         None
     }
 }
@@ -515,10 +516,10 @@ impl<O: Op<T> + ?Sized, T: Type> Op<T> for Arc<O> {
     #[inline]
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         (**self).try_simplify(inputs, is_zero_constant, is_one_constant)
     }
 }

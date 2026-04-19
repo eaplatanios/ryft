@@ -126,7 +126,7 @@ pub enum TracingError {
 
     /// A staged program referenced an atom that was never defined.
     #[error("unbound atom ID: {id}")]
-    UnboundAtomId { id: usize },
+    UnboundAtomId { id: AtomId },
 
     /// Abstract evaluation detected incompatible operand metadata for a primitive application.
     #[error("incompatible abstract values while tracing operation '{op}'")]

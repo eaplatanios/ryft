@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::tracing_v2::{
-    Traceable, TracingError, ZeroLike,
+    AtomId, Traceable, TracingError, ZeroLike,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -66,10 +66,10 @@ impl Op for NegOp {
 
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        _is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        _is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         if inputs.len() == 1 && is_zero_constant(inputs[0]) { Some(vec![inputs[0]]) } else { None }
     }
 }

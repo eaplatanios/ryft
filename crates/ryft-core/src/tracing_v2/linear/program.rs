@@ -158,13 +158,13 @@ where
         ProgramOperation: Clone + Op<ArrayType>,
         LinearOperation: Clone + Op<ArrayType>,
     {
-        if let Some(term) = tangents[atom_id].clone() {
+        if let Some(term) = tangents[atom_id.index()].clone() {
             return Ok(term);
         }
-        let primal = primal_values[atom_id].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+        let primal = primal_values[atom_id.index()].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let tangent_atom = builder.borrow_mut().add_constant(primal.zero_like());
         let tangent = LinearTerm::from_staged_parts(tangent_atom, builder.clone());
-        tangents[atom_id] = Some(tangent.clone());
+        tangents[atom_id.index()] = Some(tangent.clone());
         Ok(tangent)
     }
 
@@ -181,12 +181,12 @@ where
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atom_count()];
     for (input_atom, input_primal) in program.input_atoms().iter().copied().zip(input_primals.into_iter()) {
         let tangent_atom = builder.borrow_mut().add_input(&input_primal.zero_like());
-        tangents[input_atom] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
-        primals[input_atom] = Some(input_primal);
+        tangents[input_atom.index()] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
+        primals[input_atom.index()] = Some(input_primal);
     }
     for (atom_id, atom) in program.atoms_iter() {
         if let Atom::Constant { value } = atom {
-            primals[atom_id] = Some(value.clone());
+            primals[atom_id.index()] = Some(value.clone());
         }
     }
 
@@ -197,7 +197,9 @@ where
             .copied()
             .map(|input_atom| {
                 Ok(JvpTracer {
-                    primal: primals[input_atom].clone().ok_or(TracingError::UnboundAtomId { id: input_atom })?,
+                    primal: primals[input_atom.index()]
+                        .clone()
+                        .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
                     tangent: tangent_for_atom(
                         program,
                         primals.as_slice(),
@@ -217,8 +219,8 @@ where
             return Err(TracingError::InvalidOutputCount { expected: equation.outputs.len(), got: output_duals.len() });
         }
         for (output_atom, output_dual) in equation.outputs.iter().copied().zip(output_duals.into_iter()) {
-            primals[output_atom] = Some(output_dual.primal);
-            tangents[output_atom] = Some(output_dual.tangent);
+            primals[output_atom.index()] = Some(output_dual.primal);
+            tangents[output_atom.index()] = Some(output_dual.tangent);
         }
     }
 
@@ -293,7 +295,7 @@ where
         V: Traceable<ArrayType>,
         O: LinearAddOperation<ArrayType, V> + Op<ArrayType> + Clone,
     {
-        adjoints[atom] = Some(match adjoints[atom] {
+        adjoints[atom.index()] = Some(match adjoints[atom.index()] {
             Some(existing) => {
                 let mut builder_borrow = builder.borrow_mut();
                 let abstract_value =
@@ -326,7 +328,7 @@ where
 
     for equation in linear_body.equations().iter().rev() {
         let equation_output_cotangents =
-            equation.outputs.iter().map(|output| adjoints[*output]).collect::<Option<Vec<_>>>();
+            equation.outputs.iter().map(|output| adjoints[output.index()]).collect::<Option<Vec<_>>>();
         let Some(equation_output_cotangents) = equation_output_cotangents else {
             continue;
         };
@@ -343,7 +345,7 @@ where
         .input_atoms()
         .iter()
         .copied()
-        .map(|input| adjoints[input].unwrap_or(zero_atom))
+        .map(|input| adjoints[input.index()].unwrap_or(zero_atom))
         .collect::<Vec<_>>();
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),

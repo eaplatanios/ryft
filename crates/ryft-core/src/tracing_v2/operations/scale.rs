@@ -14,7 +14,7 @@ use std::{
 use indoc::indoc;
 
 use crate::tracing_v2::{
-    Traceable, TracingError, Value, ZeroLike,
+    AtomId, Traceable, TracingError, Value, ZeroLike,
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
@@ -102,10 +102,10 @@ impl<V: Traceable<ArrayType>> Op for ScaleOp<ArrayType, V> {
 
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        _is_zero_constant: &dyn Fn(usize) -> bool,
-        _is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        _is_zero_constant: &dyn Fn(AtomId) -> bool,
+        _is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         if crate::tracing_v2::is_identity_one(&self.factor) { Some(inputs.to_vec()) } else { None }
     }
 }

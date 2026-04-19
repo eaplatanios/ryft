@@ -20,7 +20,7 @@ use std::{
 use crate::{
     parameters::Parameter,
     tracing_v2::{
-        Traceable, TracingError, Value, ZeroLike,
+        AtomId, Traceable, TracingError, Value, ZeroLike,
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
@@ -385,10 +385,10 @@ impl<V: Traceable<ArrayType>> Op for CustomPrimitive<ArrayType, V> {
     #[inline]
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         self.base.try_simplify(inputs, is_zero_constant, is_one_constant)
     }
 }
@@ -507,10 +507,10 @@ impl<V: Traceable<ArrayType>> Op for LinearCustomPrimitive<ArrayType, V> {
     #[inline]
     fn try_simplify(
         &self,
-        inputs: &[usize],
-        is_zero_constant: &dyn Fn(usize) -> bool,
-        is_one_constant: &dyn Fn(usize) -> bool,
-    ) -> Option<Vec<usize>> {
+        inputs: &[AtomId],
+        is_zero_constant: &dyn Fn(AtomId) -> bool,
+        is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
         self.primitive.try_simplify(inputs, is_zero_constant, is_one_constant)
     }
 }

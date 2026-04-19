@@ -18,6 +18,8 @@
 
 use std::{borrow::Cow, collections::HashMap, fmt::Display, marker::PhantomData};
 
+use ryft_macros::Parameter;
+
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{Engine, InterpretableOp, LinearPrimitiveOp, Op, PrimitiveOp, Traceable, TracingError},
@@ -28,7 +30,31 @@ use crate::{
 ///
 /// Atom identifiers are stable indexes into a program's atom table. Equations refer to their
 /// inputs and outputs by these ids, which keeps the staged IR compact and easy to clone.
-pub type AtomId = usize;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Parameter)]
+pub struct AtomId {
+    /// Zero-based index of this atom inside the owning program's atom table.
+    index: usize,
+}
+
+impl AtomId {
+    /// Creates an atom identifier from its zero-based position in a program's atom table.
+    #[inline]
+    pub const fn from_index(index: usize) -> Self {
+        Self { index }
+    }
+
+    /// Returns this atom identifier's zero-based position in the owning program's atom table.
+    #[inline]
+    pub const fn index(self) -> usize {
+        self.index
+    }
+}
+
+impl Display for AtomId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.index)
+    }
+}
 
 /// Staged atom carrying abstract metadata.
 ///
@@ -141,7 +167,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Returns the atom with the provided identifier.
     #[inline]
     pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
-        self.atoms.get(id)
+        self.atoms.get(id.index())
     }
 
     /// Returns the concrete value associated with the provided atom, if one is available.
@@ -151,9 +177,9 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// side table, or `None` if none is available.
     #[inline]
     pub(crate) fn stored_value(&self, id: AtomId) -> Option<&V> {
-        match self.atoms.get(id)? {
+        match self.atoms.get(id.index())? {
             Atom::Constant { value } => Some(value),
-            Atom::Input { .. } | Atom::Derived { .. } => self.intermediates.get(id).and_then(Option::as_ref),
+            Atom::Input { .. } | Atom::Derived { .. } => self.intermediates.get(id.index()).and_then(Option::as_ref),
         }
     }
 
@@ -166,7 +192,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// [`Program::representative_input_values`].
     #[inline]
     pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
-        let id = self.atoms.len();
+        let id = AtomId::from_index(self.atoms.len());
         self.atoms.push(Atom::Input { r#type: abstract_value });
         self.intermediates.push(None);
         self.input_atoms.push(id);
@@ -183,7 +209,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Adds a new input atom with the supplied abstract type and a caller-supplied exemplar value.
     #[inline]
     fn add_input_with_example(&mut self, abstract_value: T, example_value: V) -> AtomId {
-        let id = self.atoms.len();
+        let id = AtomId::from_index(self.atoms.len());
         self.atoms.push(Atom::Input { r#type: abstract_value });
         self.intermediates.push(Some(example_value));
         self.input_atoms.push(id);
@@ -196,7 +222,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// simplification passes can recover the literal value.
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
-        let id = self.atoms.len();
+        let id = AtomId::from_index(self.atoms.len());
         self.atoms.push(Atom::Constant { value });
         self.intermediates.push(None);
         id
@@ -209,7 +235,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         let outputs = output_abstracts
             .into_iter()
             .map(|r#type| {
-                let id = self.atoms.len();
+                let id = AtomId::from_index(self.atoms.len());
                 self.atoms.push(Atom::Derived { r#type });
                 self.intermediates.push(None);
                 id
@@ -272,8 +298,8 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
         // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
-        let is_zero = |id: usize| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_zero(value));
-        let is_one = |id: usize| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_one(value));
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_zero(value));
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_one(value));
         if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
@@ -292,7 +318,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
                     self.atoms.push(Atom::Derived { r#type });
                     self.intermediates.push(Some(output_value));
                 }
-                id
+                AtomId::from_index(id)
             })
             .collect::<Vec<_>>();
 
@@ -320,8 +346,8 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
             .collect::<Result<Vec<_>, _>>()?;
         let output_abstracts = op.abstract_eval(input_abstracts.as_slice())?;
 
-        let is_zero = |id: usize| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_zero(value));
-        let is_one = |id: usize| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_one(value));
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_zero(value));
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant { value }) if is_identity_one(value));
         if let Some(simplified) = op.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
@@ -468,13 +494,13 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// Returns the atom with the provided identifier.
     #[inline]
     pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
-        self.atoms.get(id)
+        self.atoms.get(id.index())
     }
 
     /// Returns an iterator over all atoms in the program, yielding `(atom_id, &Atom<T, V>)` pairs.
     #[inline]
     pub fn atoms_iter(&self) -> impl Iterator<Item = (AtomId, &Atom<T, V>)> {
-        self.atoms.iter().enumerate()
+        self.atoms.iter().enumerate().map(|(atom_index, atom)| (AtomId::from_index(atom_index), atom))
     }
 
     /// Returns the program input atoms in parameter order.
@@ -541,12 +567,12 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 
         let mut values = vec![None; self.atoms.len()];
         for (atom, value) in self.input_atoms.iter().copied().zip(input_values) {
-            values[atom] = Some(value);
+            values[atom.index()] = Some(value);
         }
 
-        for (atom_id, atom) in self.atoms.iter().enumerate() {
+        for (atom_index, atom) in self.atoms.iter().enumerate() {
             if let Atom::Constant { value } = atom {
-                values[atom_id] = Some(value.clone());
+                values[atom_index] = Some(value.clone());
             }
         }
 
@@ -554,7 +580,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             let inputs = equation
                 .inputs
                 .iter()
-                .map(|input| values[*input].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
+                .map(|input| values[input.index()].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
                 .collect::<Result<Vec<_>, _>>()?;
             let outputs = equation.op.interpret(inputs.as_slice())?;
             if outputs.len() != equation.outputs.len() {
@@ -562,14 +588,14 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             }
 
             for (atom, value) in equation.outputs.iter().copied().zip(outputs) {
-                values[atom] = Some(value);
+                values[atom.index()] = Some(value);
             }
         }
 
         values
             .into_iter()
             .enumerate()
-            .map(|(atom_id, value)| value.ok_or(TracingError::UnboundAtomId { id: atom_id }))
+            .map(|(atom_index, value)| value.ok_or(TracingError::UnboundAtomId { id: AtomId::from_index(atom_index) }))
             .collect()
     }
 
@@ -624,7 +650,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         }
 
         let values = self.evaluate_atom_values(input.into_parameters().collect::<Vec<_>>())?;
-        let outputs = self.outputs.iter().map(|output| values[*output].clone()).collect::<Vec<_>>();
+        let outputs = self.outputs.iter().map(|output| values[output.index()].clone()).collect::<Vec<_>>();
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
@@ -637,16 +663,16 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     {
         fn mark_live<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
             program: &Program<T, V, O, Input, Output>,
-            atom_id: usize,
+            atom_id: AtomId,
             live_atoms: &mut [bool],
             live_equations: &mut [bool],
             equation_by_output: &[Option<usize>],
         ) {
-            if live_atoms[atom_id] {
+            if live_atoms[atom_id.index()] {
                 return;
             }
-            live_atoms[atom_id] = true;
-            if let Some(equation_index) = equation_by_output[atom_id] {
+            live_atoms[atom_id.index()] = true;
+            if let Some(equation_index) = equation_by_output[atom_id.index()] {
                 if live_equations[equation_index] {
                     return;
                 }
@@ -659,13 +685,13 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         }
 
         fn remap_atom<O, T, V, Input, Output>(
-            atom_id: usize,
+            atom_id: AtomId,
             program: &Program<T, V, O, Input, Output>,
             builder: &mut ProgramBuilder<O, T, V>,
-            atom_mapping: &mut HashMap<usize, usize>,
+            atom_mapping: &mut HashMap<AtomId, AtomId>,
             live_equations: &[bool],
             equation_by_output: &[Option<usize>],
-        ) -> Result<usize, TracingError>
+        ) -> Result<AtomId, TracingError>
         where
             O: Clone + Op<T>,
             T: Type,
@@ -682,7 +708,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
                 Atom::Input { r#type } => builder.add_input_abstract(r#type.clone()),
                 Atom::Constant { value } => builder.add_constant(value.clone()),
                 Atom::Derived { .. } => {
-                    let equation_index = equation_by_output[atom_id]
+                    let equation_index = equation_by_output[atom_id.index()]
                         .ok_or(TracingError::InternalInvariantViolation("derived atom had no owning equation"))?;
                     if !live_equations[equation_index] {
                         return Err(TracingError::InternalInvariantViolation(
@@ -722,7 +748,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         let mut equation_by_output = vec![None; self.atom_count()];
         for (equation_index, equation) in self.equations.iter().enumerate() {
             for output in equation.outputs.iter().copied() {
-                equation_by_output[output] = Some(equation_index);
+                equation_by_output[output.index()] = Some(equation_index);
             }
         }
 
@@ -776,7 +802,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");
-        let format_typed_atom = |id: AtomId| format!("%{id}:{}", self.atoms[id].r#type());
+        let format_typed_atom = |id: AtomId| format!("%{id}:{}", self.atoms[id.index()].r#type());
 
         let inputs = self.input_atoms.iter().map(|input| format_typed_atom(*input)).collect::<Vec<_>>().join(", ");
         writeln!(formatter, "lambda {inputs} .")?;
@@ -784,7 +810,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
         let mut equation_by_first_output = vec![None; self.atoms.len()];
         for (index, equation) in self.equations.iter().enumerate() {
             if let Some(first_output) = equation.outputs.first() {
-                equation_by_first_output[*first_output] = Some(index);
+                equation_by_first_output[first_output.index()] = Some(index);
             }
         }
 
@@ -794,7 +820,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
                 Atom::Input { .. } => {}
                 Atom::Constant { .. } => {
                     let prefix = if binding_count == 0 { "let" } else { "   " };
-                    writeln!(formatter, "{prefix} {} = const", format_typed_atom(atom_id))?;
+                    writeln!(formatter, "{prefix} {} = const", format_typed_atom(AtomId::from_index(atom_id)))?;
                     binding_count += 1;
                 }
                 Atom::Derived { .. } => {
@@ -885,8 +911,11 @@ mod tests {
     #[test]
     fn program_builder_rejects_unbound_inputs() {
         let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
-        let result = builder.add_equation(PrimitiveOp::Add, vec![42, 99]);
-        assert!(matches!(result, Err(TracingError::UnboundAtomId { id: 42 })));
+        let result = builder.add_equation(PrimitiveOp::Add, vec![AtomId::from_index(42), AtomId::from_index(99)]);
+        assert!(matches!(
+            result,
+            Err(TracingError::UnboundAtomId { id }) if id == AtomId::from_index(42)
+        ));
         test_support::assert_reference_program_rendering();
     }
 

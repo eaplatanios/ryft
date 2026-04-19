@@ -13,7 +13,7 @@ use ryft_mlir::{
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    Atom, CustomPrimitive, LinearPrimitiveOp, MatrixOps, Op, PrimitiveOp, Program, Traceable,
+    Atom, AtomId, CustomPrimitive, LinearPrimitiveOp, MatrixOps, Op, PrimitiveOp, Program, Traceable,
     operations::{
         AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearRematerializeOp, LinearVMapOp, MatMulOp, MatrixTransposeOp,
         MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
@@ -51,7 +51,7 @@ pub(crate) enum LoweringError {
 
     /// Error returned when lowering encounters a constant value that it does not know how to build.
     #[error("unsupported traced constant at atom %{atom_id} during XLA lowering")]
-    UnsupportedConstant { atom_id: usize },
+    UnsupportedConstant { atom_id: AtomId },
 
     /// Error returned when lowering encounters a type that does not have StableHLO support yet.
     #[error("unsupported data type '{data_type}' during XLA lowering")]
@@ -59,7 +59,7 @@ pub(crate) enum LoweringError {
 
     /// Error returned when lowering needs a staged value that was never assigned.
     #[error("missing lowered value for staged atom %{atom_id}")]
-    MissingAtomValue { atom_id: usize },
+    MissingAtomValue { atom_id: AtomId },
 
     /// Error returned when MLIR rejects the constructed dense-elements attribute.
     #[error("invalid dense elements attribute for data type '{data_type}' during XLA lowering")]
@@ -1057,7 +1057,8 @@ impl MlirLowerableValue for ShardMapTensor {
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        let constant_kind = self.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id: 0 })?;
+        let constant_kind =
+            self.constant_kind().ok_or(LoweringError::UnsupportedConstant { atom_id: AtomId::from_index(0) })?;
         lower_constant_elements_attribute(self.r#type().data_type, tensor_type, constant_kind, context)
     }
 
@@ -1579,7 +1580,7 @@ where
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
         program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
         atom_values: &[Option<ValueRef<'b, 'c, 't>>],
-        atom_id: usize,
+        atom_id: AtomId,
         lane_count: usize,
         block: &mut B,
         context: &'c MlirContext<'t>,
@@ -1591,7 +1592,7 @@ where
         V: MlirLowerableValue,
         L: Location<'c, 't> + Copy,
     {
-        if let Some(value) = atom_values[atom_id] {
+        if let Some(value) = atom_values[atom_id.index()] {
             return Ok(value);
         }
 
@@ -1610,23 +1611,24 @@ where
 
     let mut atom_values = vec![None; program.atom_count()];
     for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
-        atom_values[atom_id] = Some(packed_inputs[input_index]);
+        atom_values[atom_id.index()] = Some(packed_inputs[input_index]);
     }
 
     let mut equation_by_first_output = vec![None; program.atom_count()];
     for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[*first_output] = Some(equation_index);
+            equation_by_first_output[first_output.index()] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..program.atom_count() {
+    for atom_index in 0..program.atom_count() {
+        let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { .. } => {}
             Atom::Derived { .. } => {
-                let Some(equation_index) = equation_by_first_output[atom_id] else {
+                let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
                 let equation = &program.equations()[equation_index];
@@ -1656,7 +1658,7 @@ where
                     location.as_ref(),
                 )?;
                 for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
-                    atom_values[output_atom] = Some(lowered_output);
+                    atom_values[output_atom.index()] = Some(lowered_output);
                 }
             }
         }
@@ -1755,32 +1757,33 @@ where
 {
     let mut atom_values = vec![None; program.atom_count()];
     for (atom_id, mlir_value) in program.input_atoms().iter().copied().zip(input_values.iter().copied()) {
-        atom_values[atom_id] = Some(mlir_value);
+        atom_values[atom_id.index()] = Some(mlir_value);
     }
 
     let mut equation_by_first_output = vec![None; program.atom_count()];
     for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[*first_output] = Some(equation_index);
+            equation_by_first_output[first_output.index()] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..program.atom_count() {
+    for atom_index in 0..program.atom_count() {
+        let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { value } => {
-                atom_values[atom_id] = Some(lower_literal_value(value, block, context, location)?);
+                atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
             Atom::Derived { .. } => {
-                let Some(equation_index) = equation_by_first_output[atom_id] else {
+                let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
                 let equation = &program.equations()[equation_index];
                 let equation_inputs = equation
                     .inputs
                     .iter()
-                    .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
+                    .map(|input| atom_values[input.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let output_types = equation
                     .outputs
@@ -1795,7 +1798,7 @@ where
                     &mut lowerer,
                 )?;
                 for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
-                    atom_values[output_atom] = Some(lowered_output);
+                    atom_values[output_atom.index()] = Some(lowered_output);
                 }
             }
         }
@@ -1804,7 +1807,7 @@ where
     program
         .outputs()
         .iter()
-        .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
+        .map(|output| atom_values[output.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -1825,37 +1828,39 @@ where
 {
     let mut atom_values = vec![None; program.atom_count()];
     for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
-        atom_values[atom_id] = Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
+        atom_values[atom_id.index()] =
+            Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
     let mut equation_by_first_output = vec![None; program.atom_count()];
     for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[*first_output] = Some(equation_index);
+            equation_by_first_output[first_output.index()] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..program.atom_count() {
+    for atom_index in 0..program.atom_count() {
+        let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { value } => {
-                atom_values[atom_id] = Some(lower_literal_value(value, block, context, location)?);
+                atom_values[atom_index] = Some(lower_literal_value(value, block, context, location)?);
             }
             Atom::Derived { .. } => {
-                let Some(equation_index) = equation_by_first_output[atom_id] else {
+                let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
                 let equation = &program.equations()[equation_index];
                 let inputs = equation
                     .inputs
                     .iter()
-                    .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
+                    .map(|input| atom_values[input.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lowered_outputs =
                     lower_plain_equation(program, equation_index, inputs.as_slice(), block, context, location)?;
                 for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
-                    atom_values[output_atom] = Some(lowered_output);
+                    atom_values[output_atom.index()] = Some(lowered_output);
                 }
             }
         }
@@ -1864,7 +1869,7 @@ where
     program
         .outputs()
         .iter()
-        .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
+        .map(|output| atom_values[output.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -1881,37 +1886,39 @@ where
 {
     let mut atom_values = vec![None; program.atom_count()];
     for (input_index, atom_id) in program.input_atoms().iter().copied().enumerate() {
-        atom_values[atom_id] = Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
+        atom_values[atom_id.index()] =
+            Some(block.argument(input_index).expect("body block arguments should exist").as_ref());
     }
 
     let mut equation_by_first_output = vec![None; program.atom_count()];
     for (equation_index, equation) in program.equations().iter().enumerate() {
         if let Some(first_output) = equation.outputs.first() {
-            equation_by_first_output[*first_output] = Some(equation_index);
+            equation_by_first_output[first_output.index()] = Some(equation_index);
         }
     }
 
-    for atom_id in 0..program.atom_count() {
+    for atom_index in 0..program.atom_count() {
+        let atom_id = AtomId::from_index(atom_index);
         let atom = program.atom(atom_id).expect("atom IDs should be dense");
         match atom {
             Atom::Input { .. } => {}
             Atom::Constant { value } => {
-                atom_values[atom_id] = Some(lower_constant(atom_id, value, block, context, location)?);
+                atom_values[atom_index] = Some(lower_constant(atom_id, value, block, context, location)?);
             }
             Atom::Derived { .. } => {
-                let Some(equation_index) = equation_by_first_output[atom_id] else {
+                let Some(equation_index) = equation_by_first_output[atom_index] else {
                     continue;
                 };
                 let equation = &program.equations()[equation_index];
                 let inputs = equation
                     .inputs
                     .iter()
-                    .map(|input| atom_values[*input].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
+                    .map(|input| atom_values[input.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lowered_outputs =
                     lower_equation(program, equation_index, inputs.as_slice(), block, context, location)?;
                 for (output_atom, lowered_output) in equation.outputs.iter().copied().zip(lowered_outputs.into_iter()) {
-                    atom_values[output_atom] = Some(lowered_output);
+                    atom_values[output_atom.index()] = Some(lowered_output);
                 }
             }
         }
@@ -1920,7 +1927,7 @@ where
     program
         .outputs()
         .iter()
-        .map(|output| atom_values[*output].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
+        .map(|output| atom_values[output.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -2076,7 +2083,7 @@ where
 
 /// Lowers a traced constant atom to a StableHLO constant operation and returns its result value.
 fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
-    atom_id: usize,
+    atom_id: AtomId,
     value: &ShardMapTensor,
     block: &mut B,
     context: &'c MlirContext<'t>,
@@ -2170,7 +2177,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaPrimitiveOp::Scale { factor } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
+            let factor_value =
+                lower_constant(AtomId::from_index(0), factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let factor_type = factor.r#type();
             let factor_broadcast = if *factor_type != output_types[0] {
                 let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
@@ -2191,7 +2199,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
         XlaPrimitiveOp::LeftMatMul { factor } => {
-            let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
+            let factor_value =
+                lower_constant(AtomId::from_index(0), factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
@@ -2206,7 +2215,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
         XlaPrimitiveOp::RightMatMul { factor } => {
-            let factor_value = lower_constant(0, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
+            let factor_value =
+                lower_constant(AtomId::from_index(0), factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
