@@ -582,7 +582,7 @@ fn reify_captured_global_primals(
     let staging_error = exemplar.staging_error_handle();
     Ok(captured_global_primals
         .iter()
-        .map(|atom| Tracer::from_staged_parts(*atom, builder.clone(), staging_error.clone(), exemplar.engine()))
+        .map(|atom| Tracer::from_engine(*atom, builder.clone(), staging_error.clone(), exemplar.engine()))
         .collect())
 }
 
@@ -1390,7 +1390,7 @@ impl ReplayShardMapValue for ShardMapTracer {
         let builder = exemplar.builder_handle();
         let staging_error = exemplar.staging_error_handle();
         let atom = builder.borrow_mut().add_constant(constant.clone());
-        Ok(Tracer::from_staged_parts(atom, builder, staging_error, exemplar.engine()))
+        Ok(Tracer::from_engine(atom, builder, staging_error, exemplar.engine()))
     }
 
     fn apply_flat_body(body: FlatTracedShardMap, inputs: Vec<Self>) -> Result<Vec<Self>, ShardMapTraceError> {

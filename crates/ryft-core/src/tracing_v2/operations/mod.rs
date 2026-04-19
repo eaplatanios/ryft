@@ -192,7 +192,7 @@ pub fn lift_jit_constant<
 ) -> Tracer<E> {
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
-    Tracer::from_staged_parts(atom, builder, exemplar.staging_error_handle(), exemplar.engine())
+    Tracer::from_engine(atom, builder, exemplar.staging_error_handle(), exemplar.engine())
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.

@@ -36,14 +36,14 @@ use crate::{
 /// output atoms. This makes `Tracer` the central "big picture" type for symbolic execution in
 /// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
 /// always instances of this type.
-pub struct Tracer<E: Engine<Value: Traceable<E::Type>> + ?Sized> {
+pub struct Tracer<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
-    engine: *const E,
+    engine: &'static E,
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<E> {
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Clone for Tracer<E> {
     fn clone(&self) -> Self {
         Self {
             atom: self.atom,
@@ -54,15 +54,15 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<E> {
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Parameter for Tracer<E> {}
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Parameter for Tracer<E> {}
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<E> {
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> std::fmt::Debug for Tracer<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Tracer<E> {
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -93,10 +93,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
     /// the staged operation carriers being recorded.
     #[inline]
     pub fn engine(&self) -> &E {
-        // Safe because traced values are confined to the tracing scope: all public tracing entry
-        // points require the shared builder to be uniquely reclaimed before they return, so no
-        // tracer can outlive the borrowed engine captured here.
-        unsafe { &*self.engine }
+        self.engine
     }
 
     /// Constructs a traced leaf from an existing tracing scope.
@@ -110,24 +107,10 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
         staging_error: Rc<RefCell<Option<TraceError>>>,
         engine: &E,
     ) -> Self {
-        Self::from_staged_parts(atom, builder, staging_error, engine)
-    }
-
-    /// Reconstructs a tracer from already-shared staged state.
-    ///
-    /// Higher-order transforms use this when they need to create new tracer views over atoms that
-    /// already exist in a surrounding trace.
-    #[inline]
-    pub fn from_staged_parts(
-        atom: AtomId,
-        builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
-        staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &E,
-    ) -> Self {
-        // Safe because traced values are confined to the tracing scope and all public tracing
-        // entry points require reclaiming the shared builder before they return, so no staged
-        // tracer can outlive the engine reference captured here.
-        let engine = engine as *const E;
+        // SAFETY: traced values are confined to the tracing scope. Every public tracing entry
+        // point reclaims the shared builder before returning, so no `Tracer` can outlive the
+        // borrowed engine captured here even though we erase that lifetime from the type.
+        let engine = unsafe { std::mem::transmute::<&E, &'static E>(engine) };
         Self { atom, builder, staging_error, engine }
     }
 
@@ -229,7 +212,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<E> {
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Typed<E::Type> for Tracer<E> {
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Typed<E::Type> for Tracer<E> {
     #[inline]
     fn tpe(&self) -> Cow<'_, E::Type> {
         Cow::Owned(
@@ -245,7 +228,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> Typed<E::Type> for Tracer<E>
 
 impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> Traceable<E::Type> for Tracer<E> {}
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer<E> {
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> ZeroLike for Tracer<E> {
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
@@ -254,7 +237,7 @@ impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer<E> {
     }
 }
 
-impl<E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<E> {
+impl<E: Engine<Value: Traceable<E::Type>> + ?Sized + 'static> OneLike for Tracer<E> {
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
