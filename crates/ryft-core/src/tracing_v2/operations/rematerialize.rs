@@ -53,7 +53,7 @@ pub struct FlatTracedRematerialize<T: Type, V: Typed<T> + Parameter, O = Program
     output_types: Vec<T>,
 
     /// The body sub-program.
-    program: Program<T, V, Vec<V>, Vec<V>, O>,
+    program: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedRematerialize<T, V, O>
@@ -72,7 +72,7 @@ where
 impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
     /// Builds one erased traced rematerialize body from explicit staged parts.
     #[inline]
-    pub fn from_parts(input_types: Vec<T>, output_types: Vec<T>, program: Program<T, V, Vec<V>, Vec<V>, O>) -> Self {
+    pub fn from_parts(input_types: Vec<T>, output_types: Vec<T>, program: Program<T, V, O, Vec<V>, Vec<V>>) -> Self {
         Self { input_types, output_types, program }
     }
 
@@ -90,7 +90,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
 
     /// Returns the body sub-program.
     #[inline]
-    pub fn program(&self) -> &Program<T, V, Vec<V>, Vec<V>, O> {
+    pub fn program(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.program
     }
 }
@@ -109,6 +109,8 @@ pub struct RematerializeOp<
 > {
     /// The forward body sub-program.
     body: FlatTracedRematerialize<T, V, O>,
+
+    /// Phantom marker tying the op to the linear carrier used when the body is linearized.
     marker: PhantomData<fn() -> L>,
 }
 
@@ -571,7 +573,7 @@ mod tests {
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) =
+        let (output, program): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
             interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         approx_eq(output, 2.0f64.sin());
@@ -583,7 +585,7 @@ mod tests {
     fn test_rematerialize_jit_program_rendering() {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, program): (f64, Program<ArrayType, f64, f64, f64>) =
+        let (_, program): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
             interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         assert_eq!(
@@ -665,13 +667,13 @@ mod tests {
         // The forward result with rematerialize should match the result without it.
         let without: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) =
+            let (output, _): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
                 interpret_and_trace(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
+            let (output, _): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
                 &engine,
                 |x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()),
                 3.0f64,

@@ -12,7 +12,7 @@ use super::*;
 /// linearized JIT replay, and symbolic linearization all use the same atom-walking logic while
 /// customizing how constants are lifted and how primitive equations are applied.
 fn replay_program_with<ProgramInput, ProgramOutput, V, O, R, LiftConstant, ApplyOp>(
-    program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
+    program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     inputs: Vec<R>,
     lift_constant: LiftConstant,
     apply_op: ApplyOp,
@@ -79,7 +79,7 @@ where
 /// This is the key helper that lets higher-order transforms symbolically replay an already-traced
 /// body while preserving both its primal outputs and its staged tangent propagation.
 pub(crate) fn replay_program_linearized_jit<'engine, ProgramInput, ProgramOutput, V, O, L, E>(
-    program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
+    program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     inputs: Vec<LinearizedTracedValue<'engine, E>>,
 ) -> Result<Vec<LinearizedTracedValue<'engine, E>>, TraceError>
 where
@@ -102,7 +102,7 @@ where
 /// linear program immediately, it works inside an outer JIT trace and stages the resulting
 /// pushforward symbolically.
 pub(crate) fn linearize_traced_program<'engine, V, O, L, E>(
-    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TraceError>
 where

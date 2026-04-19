@@ -65,7 +65,7 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
 ///
 ///   - `program`: Program to summarize.
 fn summarize_tracing_program<V, Input, Output, O>(
-    program: &Program<ArrayType, V, Input, Output, O>,
+    program: &Program<ArrayType, V, O, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
     V: Traceable<ArrayType>,
@@ -86,7 +86,7 @@ where
 fn tracing_record<V, Input, Output, O>(
     case_id: &'static str,
     surface: &'static str,
-    program: &Program<ArrayType, V, Input, Output, O>,
+    program: &Program<ArrayType, V, O, Input, Output>,
 ) -> Result<IrBenchmarkRecord, BenchmarkError>
 where
     V: Traceable<ArrayType>
@@ -151,55 +151,62 @@ fn hessian_style_second_derivative_traced(x: Tracer<ArrayScalarEngine<f64>>) -> 
 
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, (f64, f64), f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, (f64, f64), f64>) =
         interpret_and_trace(&ArrayScalarEngine::<f64>::new(), |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
 /// Emits the staged scalar bilinear pushforward benchmark.
 fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, (f64, f64), f64>) =
-        jvp_program(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
+    let (_, pushforward): (
+        f64,
+        LinearProgram<ArrayType, f64, (f64, f64), f64, crate::tracing_v2::LinearProgramOpRef<f64>>,
+    ) = jvp_program(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", pushforward.program())?])
 }
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pullback): (f64, LinearProgram<ArrayType, f64, f64, (f64, f64)>) =
-        vjp(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
+    let (_, pullback): (
+        f64,
+        LinearProgram<ArrayType, f64, f64, (f64, f64), crate::tracing_v2::LinearProgramOpRef<f64>>,
+    ) = vjp(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", pullback.program())?])
 }
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
-        &ArrayScalarEngine::<f64>::new(),
-        |x| {
-            let gradient: Tracer<ArrayScalarEngine<f64>> = grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
-            Ok(gradient)
-        },
-        2.0f64,
-    )?;
+    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, f64, f64>) =
+        interpret_and_trace(
+            &ArrayScalarEngine::<f64>::new(),
+            |x| {
+                let gradient: Tracer<ArrayScalarEngine<f64>> =
+                    grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
+                Ok(gradient)
+            },
+            2.0f64,
+        )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_grad", "grad", &compiled)?])
 }
 
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): ((f64, f64), Program<ArrayType, f64, f64, (f64, f64)>) = interpret_and_trace(
-        &ArrayScalarEngine::<f64>::new(),
-        |x| {
-            let value_and_gradient: (Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>) =
-                value_and_grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
-            Ok(value_and_gradient)
-        },
-        2.0f64,
-    )?;
+    let (_, compiled): ((f64, f64), Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, f64, (f64, f64)>) =
+        interpret_and_trace(
+            &ArrayScalarEngine::<f64>::new(),
+            |x| {
+                let value_and_gradient: (Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>) =
+                    value_and_grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
+                Ok(value_and_gradient)
+            },
+            2.0f64,
+        )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_grad", &compiled)?])
 }
 
 /// Emits the staged scalar linearization benchmark.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) =
+    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64, crate::tracing_v2::LinearProgramOpRef<f64>>) =
         jvp_program(&ArrayScalarEngine::<f64>::new(), |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
     Ok(vec![tracing_record(
         "scalar_quartic_plus_sin_linearize_pushforward",
@@ -210,70 +217,74 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmar
 
 /// Emits the staged forward-over-reverse scalar benchmark.
 fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
-        &ArrayScalarEngine::<f64>::new(),
-        |x| Ok(hessian_style_second_derivative_traced(x)),
-        2.0f64,
-    )?;
+    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, f64, f64>) =
+        interpret_and_trace(
+            &ArrayScalarEngine::<f64>::new(),
+            |x| Ok(hessian_style_second_derivative_traced(x)),
+            2.0f64,
+        )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", &compiled)?])
 }
 
 /// Emits the staged reverse-over-batching scalar benchmark.
 fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
-        &ArrayScalarEngine::<f64>::new(),
-        |x| {
-            let gradient: Tracer<ArrayScalarEngine<f64>> = grad(
-                &ArrayScalarEngine::<f64>::new(),
-                |y| {
-                    let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
-                        |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| batch.clone() * batch.clone() + batch.sin(),
-                        vec![y.clone(), y],
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("scalar grad-of-vmap IR benchmark should batch identical tracer inputs: {error}")
-                    });
-                    outputs[0].clone() + outputs[1].clone()
-                },
-                x,
-            )?;
-            Ok(gradient)
-        },
-        2.0f64,
-    )?;
+    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, f64, f64>) =
+        interpret_and_trace(
+            &ArrayScalarEngine::<f64>::new(),
+            |x| {
+                let gradient: Tracer<ArrayScalarEngine<f64>> = grad(
+                    &ArrayScalarEngine::<f64>::new(),
+                    |y| {
+                        let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
+                            |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| batch.clone() * batch.clone() + batch.sin(),
+                            vec![y.clone(), y],
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("scalar grad-of-vmap IR benchmark should batch identical tracer inputs: {error}")
+                        });
+                        outputs[0].clone() + outputs[1].clone()
+                    },
+                    x,
+                )?;
+                Ok(gradient)
+            },
+            2.0f64,
+        )?;
     Ok(vec![tracing_record("scalar_grad_of_vmap", "grad", &compiled)?])
 }
 
 /// Emits the staged batching-over-reverse scalar benchmark.
 fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
-        &ArrayScalarEngine::<f64>::new(),
-        |x| {
-            let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
-                |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| {
-                    let lanes = unstack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(batch)
-                        .unwrap_or_else(|error| {
-                            panic!("scalar vmap-of-grad IR benchmark should unstack the batch: {error}")
-                        });
-                    let gradients = lanes
-                        .into_iter()
-                        .map(|lane| {
-                            grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, lane).unwrap_or_else(|error| {
-                                panic!("scalar vmap-of-grad IR benchmark should trace each lane gradient: {error}")
+    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, f64, f64>) =
+        interpret_and_trace(
+            &ArrayScalarEngine::<f64>::new(),
+            |x| {
+                let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
+                    |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| {
+                        let lanes = unstack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(batch)
+                            .unwrap_or_else(|error| {
+                                panic!("scalar vmap-of-grad IR benchmark should unstack the batch: {error}")
+                            });
+                        let gradients = lanes
+                            .into_iter()
+                            .map(|lane| {
+                                grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, lane).unwrap_or_else(|error| {
+                                    panic!("scalar vmap-of-grad IR benchmark should trace each lane gradient: {error}")
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>();
-                    stack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(gradients).unwrap_or_else(
-                        |error| panic!("scalar vmap-of-grad IR benchmark should restack lane gradients: {error}"),
-                    )
-                },
-                vec![x.clone(), x],
-            )
-            .unwrap_or_else(|error| panic!("scalar vmap-of-grad IR benchmark should batch the gradients: {error}"));
-            Ok(outputs[0].clone() + outputs[1].clone())
-        },
-        2.0f64,
-    )?;
+                            .collect::<Vec<_>>();
+                        stack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(gradients)
+                            .unwrap_or_else(|error| {
+                                panic!("scalar vmap-of-grad IR benchmark should restack lane gradients: {error}")
+                            })
+                    },
+                    vec![x.clone(), x],
+                )
+                .unwrap_or_else(|error| panic!("scalar vmap-of-grad IR benchmark should batch the gradients: {error}"));
+                Ok(outputs[0].clone() + outputs[1].clone())
+            },
+            2.0f64,
+        )?;
     Ok(vec![tracing_record("scalar_vmap_of_grad", "vmap_of_grad", &compiled)?])
 }
 
@@ -342,16 +353,32 @@ fn matrix_hessian_style_second_derivative(
 /// Emits the staged matrix JIT benchmark.
 #[cfg(feature = "ndarray")]
 fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (Array2<f64>, Program<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>), Array2<f64>>) =
-        interpret_and_trace(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
+    let (_, compiled): (
+        Array2<f64>,
+        Program<
+            ArrayType,
+            Array2<f64>,
+            crate::tracing_v2::ProgramOpRef<Array2<f64>>,
+            (Array2<f64>, Array2<f64>),
+            Array2<f64>,
+        >,
+    ) = interpret_and_trace(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
     Ok(vec![tracing_record("matrix_matmul_jit", "jit", &compiled)?])
 }
 
 /// Emits the staged matrix pullback benchmark.
 #[cfg(feature = "ndarray")]
 fn emit_matrix_matmul_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pullback): (Array2<f64>, LinearProgram<ArrayType, Array2<f64>, Array2<f64>, (Array2<f64>, Array2<f64>)>) =
-        vjp(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
+    let (_, pullback): (
+        Array2<f64>,
+        LinearProgram<
+            ArrayType,
+            Array2<f64>,
+            Array2<f64>,
+            (Array2<f64>, Array2<f64>),
+            crate::tracing_v2::LinearProgramOpRef<Array2<f64>>,
+        >,
+    ) = vjp(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
     Ok(vec![tracing_record("matrix_matmul_vjp_pullback", "vjp_pullback", pullback.program())?])
 }
 
@@ -360,7 +387,13 @@ fn emit_matrix_matmul_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Benchmark
 fn emit_matrix_three_matmul_sine_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (
         Array2<f64>,
-        Program<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), Array2<f64>>,
+        Program<
+            ArrayType,
+            Array2<f64>,
+            crate::tracing_v2::ProgramOpRef<Array2<f64>>,
+            (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>),
+            Array2<f64>,
+        >,
     ) = interpret_and_trace(
         &Array2Engine::<f64>::new(),
         matrix_hessian_style_second_derivative,

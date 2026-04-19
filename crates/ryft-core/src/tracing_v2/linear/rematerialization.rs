@@ -12,7 +12,7 @@ pub fn compile_grad<'engine, E, F, Input, V>(
     _engine: &'engine E,
     function: F,
     example_primals: Input,
-) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -103,7 +103,7 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
     function: F,
     example_primals: Input,
     policy: RematerializationPolicy,
-) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -147,7 +147,7 @@ fn compile_grad_segmented<'engine, E, F, Input, V>(
     function: &F,
     example_primals: Input,
     segment_size: Option<usize>,
-) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
@@ -223,9 +223,9 @@ where
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
 fn segment_program<E, V>(
     engine: &E,
-    program: &Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>,
+    program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
     segment_size: usize,
-) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>, TraceError>
+) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
@@ -394,8 +394,8 @@ where
 /// Wraps an entire program in a single [`RematerializeOp`] boundary.
 fn wrap_program_in_rematerialize<E, V>(
     engine: &E,
-    program: &Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>,
-) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>, TraceError>
+    program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
+) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TraceError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
@@ -453,12 +453,12 @@ where
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
 /// and equations within the sub-program.
 fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
-    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     representative_values: &[V],
     segment_equations: &[Equation<O>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
-) -> Result<Program<ArrayType, V, Vec<V>, Vec<V>, O>, TraceError> {
+) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TraceError> {
     let mut sub_builder: ProgramBuilder<O, ArrayType, V> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.

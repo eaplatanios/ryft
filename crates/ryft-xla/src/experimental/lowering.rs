@@ -784,7 +784,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         &mut self,
         outer_inputs: &[ValueRef<'b, 'c, 't>],
         shard_map: &ShardMap,
-        program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+        program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
         local_input_types: &[ArrayType],
         global_output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
@@ -819,7 +819,7 @@ pub(crate) fn to_mlir_module<
     S: AsRef<str>,
 >(
     shard_map: &ShardMap,
-    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
     global_input_types: &Input,
     local_input_types: &Input,
     global_output_types: &Output,
@@ -910,7 +910,7 @@ pub(crate) fn to_mlir_module<
 
 /// Lowers an arbitrary traced XLA program to a textual StableHLO/Shardy MLIR module.
 pub(crate) fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOutput, S>(
-    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
@@ -1083,7 +1083,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
     O: Clone + XlaOp<V>,
     S: AsRef<str>,
 >(
-    program: &Program<ArrayType, V, Input, Output, O>,
+    program: &Program<ArrayType, V, O, Input, Output>,
     function_name: S,
 ) -> Result<String, LoweringError> {
     let function_name = normalize_function_name(function_name.as_ref())?;
@@ -1143,7 +1143,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
 }
 
 fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, LoweringError>
 where
@@ -1562,7 +1562,7 @@ where
 
 /// Lowers one packed `vmap` body program whose inputs and outputs already carry a leading batch axis.
 fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     packed_inputs: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
     block: &mut B,
@@ -1576,7 +1576,7 @@ where
     L: Location<'c, 't> + Copy,
 {
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-        program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
+        program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
         atom_values: &[Option<ValueRef<'b, 'c, 't>>],
         atom_id: usize,
         lane_count: usize,
@@ -1738,7 +1738,7 @@ where
 /// MLIR values to the body's input atoms, lowering constants and equations in topological order,
 /// and returning the MLIR values corresponding to the body's output atoms.
 fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
-    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -1807,7 +1807,7 @@ where
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
 fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    program: &Program<ArrayType, V, Input, Output, O>,
+    program: &Program<ArrayType, V, O, Input, Output>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1865,7 +1865,7 @@ where
 
 /// Lowers one traced program to values inside a block.
 fn lower_program_outputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1924,7 +1924,7 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     shard_map: &ShardMap,
-    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
@@ -2262,7 +2262,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
 #[cfg(any(test, feature = "benchmarking"))]
 #[allow(dead_code)]
 fn lower_plain_equation<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    program: &Program<ArrayType, V, Input, Output, O>,
+    program: &Program<ArrayType, V, O, Input, Output>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2289,7 +2289,7 @@ where
 
 /// Lowers one equation inside a packed `vmap` body program.
 fn lower_packed_plain_equation<'b, 'c: 'b, 't: 'c, O, V>(
-    program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     lane_count: usize,
@@ -2320,7 +2320,7 @@ where
 
 /// Lowers one traced equation to the corresponding StableHLO operation and returns its result value.
 fn lower_equation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
     equation_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2647,7 +2647,7 @@ mod tests {
 
     fn custom_program(
         op: XlaPrimitiveOp,
-    ) -> Program<ArrayType, ShardMapTensor, ShardMapTensor, ShardMapTensor, XlaPrimitiveOp> {
+    ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
         let mut builder = ProgramBuilder::<crate::experimental::ops::XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
@@ -2784,13 +2784,15 @@ mod tests {
     #[test]
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, ryft_core::tracing_v2::Program<ArrayType, f64, (f64, f64), f64>) =
-            ryft_core::tracing_v2::interpret_and_trace(
-                &engine,
-                |inputs| Ok(scalar_bilinear_sin(inputs)),
-                (2.0f64, 3.0f64),
-            )
-            .unwrap();
+        let (_, compiled): (
+            f64,
+            ryft_core::tracing_v2::Program<ArrayType, f64, ryft_core::tracing_v2::ProgramOpRef<f64>, (f64, f64), f64>,
+        ) = ryft_core::tracing_v2::interpret_and_trace(
+            &engine,
+            |inputs| Ok(scalar_bilinear_sin(inputs)),
+            (2.0f64, 3.0f64),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         assert_eq!(
@@ -2811,19 +2813,21 @@ mod tests {
     #[test]
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, ryft_core::tracing_v2::Program<ArrayType, f64, f64, f64>) =
-            ryft_core::tracing_v2::interpret_and_trace(
-                &engine,
-                |x| {
-                    Ok(ryft_core::tracing_v2::grad(
-                        &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
-                        scalar_quartic_plus_sin,
-                        x,
-                    )?)
-                },
-                2.0f64,
-            )
-            .unwrap();
+        let (_, compiled): (
+            f64,
+            ryft_core::tracing_v2::Program<ArrayType, f64, ryft_core::tracing_v2::ProgramOpRef<f64>, f64, f64>,
+        ) = ryft_core::tracing_v2::interpret_and_trace(
+            &engine,
+            |x| {
+                Ok(ryft_core::tracing_v2::grad(
+                    &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
+                    scalar_quartic_plus_sin,
+                    x,
+                )?)
+            },
+            2.0f64,
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft grad(x^4 + sin(x)) StableHLO ===\n{stablehlo}");
@@ -2842,13 +2846,21 @@ mod tests {
     #[test]
     fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
         // Standalone pullback â€” specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
-        let (_, pullback): (f64, ryft_core::tracing_v2::LinearProgram<ArrayType, f64, f64, (f64, f64)>) =
-            ryft_core::tracing_v2::vjp(
-                &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
-                |inputs| Ok(scalar_bilinear_sin(inputs)),
-                (2.0f64, 3.0f64),
-            )
-            .unwrap();
+        let (_, pullback): (
+            f64,
+            ryft_core::tracing_v2::LinearProgram<
+                ArrayType,
+                f64,
+                f64,
+                (f64, f64),
+                ryft_core::tracing_v2::LinearProgramOpRef<f64>,
+            >,
+        ) = ryft_core::tracing_v2::vjp(
+            &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
+            |inputs| Ok(scalar_bilinear_sin(inputs)),
+            (2.0f64, 3.0f64),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(pullback.program(), "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
@@ -2864,19 +2876,27 @@ mod tests {
         // grad(f) wrapped in JIT â€” symbolic, like JAX's jit(grad(f)).
         // Uses the ValueAndGradInvocationLeaf<Tracer<V>> dispatch that traces through vjp+pullback.
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
-        let (_, compiled): ((f64, f64), ryft_core::tracing_v2::Program<ArrayType, f64, (f64, f64), (f64, f64)>) =
-            ryft_core::tracing_v2::interpret_and_trace(
-                &engine,
-                |inputs| {
-                    Ok(ryft_core::tracing_v2::grad(
-                        &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
-                        scalar_bilinear_sin,
-                        inputs,
-                    )?)
-                },
-                (2.0f64, 3.0f64),
-            )
-            .unwrap();
+        let (_, compiled): (
+            (f64, f64),
+            ryft_core::tracing_v2::Program<
+                ArrayType,
+                f64,
+                ryft_core::tracing_v2::ProgramOpRef<f64>,
+                (f64, f64),
+                (f64, f64),
+            >,
+        ) = ryft_core::tracing_v2::interpret_and_trace(
+            &engine,
+            |inputs| {
+                Ok(ryft_core::tracing_v2::grad(
+                    &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
+                    scalar_bilinear_sin,
+                    inputs,
+                )?)
+            },
+            (2.0f64, 3.0f64),
+        )
+        .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft jit(grad(bilinear_sin)) StableHLO ===\n{stablehlo}");
@@ -2896,7 +2916,13 @@ mod tests {
         let right = arr2(&[[5.0f64, 6.0], [7.0, 8.0]]);
         let (_, pullback): (
             Array2<f64>,
-            ryft_core::tracing_v2::LinearProgram<ArrayType, Array2<f64>, Array2<f64>, (Array2<f64>, Array2<f64>)>,
+            ryft_core::tracing_v2::LinearProgram<
+                ArrayType,
+                Array2<f64>,
+                Array2<f64>,
+                (Array2<f64>, Array2<f64>),
+                ryft_core::tracing_v2::LinearProgramOpRef<Array2<f64>>,
+            >,
         ) = ryft_core::tracing_v2::vjp(
             &ryft_core::tracing_v2::operations::matrix::ndarray_support::Array2Engine::<f64>::new(),
             |inputs| Ok(bilinear_matmul(inputs)),

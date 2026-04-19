@@ -60,7 +60,10 @@ pub trait LinearCustomOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// transform ahead of time.
 #[derive(Clone, Default)]
 pub struct CustomPrimitiveExtensions<T: Type, V: Typed<T>> {
+    /// Type-indexed extension entries carried by the custom primitive.
     entries: HashMap<TypeId, Arc<dyn Any>>,
+
+    /// Phantom marker tying the registry to the primitive's abstract and concrete leaf types.
     _marker: std::marker::PhantomData<(T, V)>,
 }
 
@@ -181,9 +184,16 @@ impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V>> CustomBaseO
 /// - [`InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
 pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
+    /// Required base op providing abstract evaluation and eager interpretation.
     base: Arc<dyn CustomBaseOp<T, V>>,
+
+    /// Optional reverse-mode transpose rule for the primitive.
     transpose_rule: Option<Arc<dyn LinearOperation<T, V>>>,
+
+    /// Optional batching rule for the primitive.
     vectorization_rule: Option<Arc<dyn VectorizableOp<T, V>>>,
+
+    /// Typed extension registry carrying backend- or transform-specific extra rules.
     extensions: CustomPrimitiveExtensions<T, V>,
 }
 
@@ -453,6 +463,7 @@ where
 /// wrapper is the proof object that a custom primitive has satisfied that requirement.
 #[derive(Clone)]
 pub struct LinearCustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
+    /// Wrapped custom primitive known to provide a transpose rule.
     primitive: Arc<CustomPrimitive<T, V>>,
 }
 
@@ -711,7 +722,7 @@ mod tests {
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let (output, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
+        let (output, compiled): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
             &engine,
             {
                 let primitive = primitive.clone();
@@ -759,25 +770,26 @@ mod tests {
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
-        let result: Result<(f64, Program<ArrayType, f64, f64, f64>), TraceError> = interpret_and_trace(
-            &engine,
-            {
-                let primitive = primitive.clone();
-                move |x: Tracer<ArrayScalarEngine<f64>>| {
-                    let (primal, tangent) = jvp(
-                        &engine,
-                        {
-                            let primitive = primitive.clone();
-                            move |inner| stage_custom_traced_unary(inner, primitive.clone())
-                        },
-                        x.clone(),
-                        x.one_like(),
-                    )?;
-                    Ok(primal + tangent)
-                }
-            },
-            3.0f64,
-        );
+        let result: Result<(f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>), TraceError> =
+            interpret_and_trace(
+                &engine,
+                {
+                    let primitive = primitive.clone();
+                    move |x: Tracer<ArrayScalarEngine<f64>>| {
+                        let (primal, tangent) = jvp(
+                            &engine,
+                            {
+                                let primitive = primitive.clone();
+                                move |inner| stage_custom_traced_unary(inner, primitive.clone())
+                            },
+                            x.clone(),
+                            x.one_like(),
+                        )?;
+                        Ok(primal + tangent)
+                    }
+                },
+                3.0f64,
+            );
 
         assert!(matches!(
             result,
@@ -804,7 +816,7 @@ mod tests {
             Ok(1.0f64),
         );
 
-        let (output, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
+        let (output, compiled): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
             &engine,
             {
                 let primitive = primitive.clone();

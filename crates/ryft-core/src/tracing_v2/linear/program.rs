@@ -13,8 +13,13 @@ pub struct LinearProgram<
     Output: Parameterized<V>,
     O: Clone = LinearProgramOpRef<V>,
 > {
-    program: Program<T, V, Input, Output, O>,
+    /// Underlying staged program that replays the linear map.
+    program: Program<T, V, O, Input, Output>,
+
+    /// Representative additive identity used when transpose logic must synthesize missing inputs.
     zero: V,
+
+    /// Phantom marker tying the linear program to its structured input/output parameter families.
     marker: PhantomData<fn(Input) -> Output>,
 }
 
@@ -39,7 +44,7 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// Callers use this when a helper has already constructed the linear IR and just needs to tag
     /// it with the representative zero required by later transpose logic.
     #[inline]
-    pub fn from_program(program: Program<T, V, Input, Output, O>, zero: V) -> Self {
+    pub fn from_program(program: Program<T, V, O, Input, Output>, zero: V) -> Self {
         Self { program, zero, marker: PhantomData }
     }
 
@@ -48,7 +53,7 @@ impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// This is useful when a downstream helper needs to inspect or retag the underlying IR while
     /// preserving the linear-map interpretation at the API boundary.
     #[inline]
-    pub fn program(&self) -> &Program<T, V, Input, Output, O> {
+    pub fn program(&self) -> &Program<T, V, O, Input, Output> {
         &self.program
     }
 
@@ -131,7 +136,7 @@ where
 /// inputs at the same primal point.
 pub(crate) fn linearize_program<Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-    program: &Program<ArrayType, V, Input, Output, O>,
+    program: &Program<ArrayType, V, O, Input, Output>,
     input_primals: Vec<V>,
 ) -> Result<LinearProgram<ArrayType, V, Input, Output, L>, TraceError>
 where
@@ -142,7 +147,7 @@ where
     O: Clone + DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L>,
 {
     fn tangent_for_atom<V, Input, Output, ProgramOperation, LinearOperation>(
-        _program: &Program<ArrayType, V, Input, Output, ProgramOperation>,
+        _program: &Program<ArrayType, V, ProgramOperation, Input, Output>,
         primal_values: &[Option<V>],
         builder: &Rc<RefCell<LinearProgramBuilder<V, LinearOperation>>>,
         tangents: &mut [Option<LinearTerm<ArrayType, V, LinearOperation>>],

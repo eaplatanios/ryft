@@ -316,6 +316,7 @@ pub mod ndarray_support {
     /// and returns a uniformly filled matrix of the requested shape.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Array2Engine<V> {
+        /// Phantom marker tying the zero-sized engine to its matrix element type.
         marker: PhantomData<fn() -> V>,
     }
 

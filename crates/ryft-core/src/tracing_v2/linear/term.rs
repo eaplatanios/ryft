@@ -9,7 +9,10 @@ use super::*;
 /// terms.
 #[derive(Clone, Parameter)]
 pub struct LinearTerm<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
+    /// Atom id representing this symbolic tangent or cotangent inside the shared linear builder.
     atom: AtomId,
+
+    /// Shared builder that owns the staged linear program currently being assembled.
     builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
 }
 

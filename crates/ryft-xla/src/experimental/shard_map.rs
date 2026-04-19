@@ -276,7 +276,10 @@ pub enum ShardMapConstantKind {
 /// Abstract tensor leaf used while tracing XLA programs directly from [`ArrayType`] metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardMapTensor {
+    /// Abstract array metadata carried by this traced XLA tensor leaf.
     array_type: ArrayType,
+
+    /// Preserved zero/one constant classification when known exactly.
     constant_kind: Option<ShardMapConstantKind>,
 }
 
@@ -466,7 +469,7 @@ impl MatrixOps for ShardMapTensor {
 pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
-pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>;
+pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, Input, Output>;
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
@@ -686,11 +689,22 @@ where
     Input::Family: ParameterizedFamily<ShardMapTensor>,
     Output::Family: ParameterizedFamily<ShardMapTensor>,
 {
+    /// Manual SPMD metadata describing how the body is partitioned over the mesh.
     shard_map: ShardMap,
+
+    /// Global input types supplied by the caller.
     global_input_types: Input,
+
+    /// Local input types seen by the traced manual body.
     local_input_types: Input,
+
+    /// Global output types reconstructed from the traced local outputs.
     global_output_types: Output,
+
+    /// Local output types produced by the traced manual body.
     local_output_types: Output,
+
+    /// Staged traced body specialized to abstract shard-map tensor leaves.
     program: XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
 }
 
@@ -701,8 +715,13 @@ where
     Input::Family: ParameterizedFamily<ShardMapTensor>,
     Output::Family: ParameterizedFamily<ShardMapTensor>,
 {
+    /// Global input types supplied to the traced function.
     global_input_types: Input,
+
+    /// Global output types inferred by tracing the function.
     global_output_types: Output,
+
+    /// Staged traced XLA program specialized to abstract shard-map tensor leaves.
     program: XlaProgram<Input::To<ShardMapTensor>, Output::To<ShardMapTensor>>,
 }
 
@@ -718,10 +737,19 @@ where
 /// Reference: https://docs.jax.dev/en/latest/notebooks/shard_map.html.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShardMap {
+    /// Logical mesh that the manual computation is defined over.
     mesh: LogicalMesh,
+
+    /// Validated shardings for each global input leaf.
     in_shardings: Vec<Sharding>,
+
+    /// Validated shardings for each global output leaf.
     out_shardings: Vec<Sharding>,
+
+    /// Active manual mesh axes for this shard-map invocation.
     manual_axes: Vec<String>,
+
+    /// Whether to enforce JAX-style omitted-manual-axis output validation.
     check_vma: bool,
 }
 
@@ -1017,11 +1045,22 @@ where
 /// Erased shard-map body payload used by nested higher-order shard-map ops.
 #[derive(Clone)]
 pub struct FlatTracedShardMap {
+    /// Manual SPMD metadata carried by this erased shard-map body.
     pub(crate) shard_map: ShardMap,
+
+    /// Global input types corresponding to the erased body inputs.
     pub(crate) global_input_types: Vec<ArrayType>,
+
+    /// Local input types seen inside the erased shard-map body.
     pub(crate) local_input_types: Vec<ArrayType>,
+
+    /// Global output types reconstructed from the erased body outputs.
     pub(crate) global_output_types: Vec<ArrayType>,
+
+    /// Local output types produced inside the erased shard-map body.
     pub(crate) local_output_types: Vec<ArrayType>,
+
+    /// Flattened staged program implementing the erased shard-map body.
     pub(crate) program: XlaProgram<Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
 }
 

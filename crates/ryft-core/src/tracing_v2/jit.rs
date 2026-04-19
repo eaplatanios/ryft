@@ -37,9 +37,16 @@ use crate::{
 /// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
 /// always instances of this type.
 pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
+    /// Atom id representing this traced leaf inside the shared staged program.
     atom: AtomId,
+
+    /// Shared builder that owns the staged program currently being traced.
     builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
+
+    /// Shared slot that records the first staging failure in this tracing scope.
     staging_error: Rc<RefCell<Option<TraceError>>>,
+
+    /// Engine borrowed by this tracing scope for metadata-driven value synthesis.
     engine: &'engine E,
 }
 
@@ -296,7 +303,7 @@ pub fn trace<'engine, E, F, Input, Output>(
     function: F,
     input_types: Input,
 ) -> Result<
-    (Output, Program<E::Type, E::Value, Input::To<E::Value>, Output::To<E::Value>, E::TracingOperation>),
+    (Output, Program<E::Type, E::Value, E::TracingOperation, Input::To<E::Value>, Output::To<E::Value>>),
     TraceError,
 >
 where
@@ -364,7 +371,7 @@ pub fn interpret_and_trace<'engine, E, F, Input, Output>(
     engine: &'engine E,
     function: F,
     input: Input,
-) -> Result<(Output, Program<E::Type, E::Value, Input, Output, E::TracingOperation>), TraceError>
+) -> Result<(Output, Program<E::Type, E::Value, E::TracingOperation, Input, Output>), TraceError>
 where
     E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOp<E::Type, E::Value>>
         + ?Sized,
@@ -379,7 +386,7 @@ where
     let mut output_structure = None;
     let (_, flat_program): (
         Vec<E::Type>,
-        Program<E::Type, E::Value, Vec<E::Value>, Vec<E::Value>, E::TracingOperation>,
+        Program<E::Type, E::Value, E::TracingOperation, Vec<E::Value>, Vec<E::Value>>,
     ) = trace(
         engine,
         |flat_traced_input| {
@@ -439,7 +446,7 @@ mod tests {
     #[test]
     fn staged_program_replays_graphs() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
+        let (output, program): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
             &engine,
             |x: Tracer<ArrayScalarEngine<f64>>| {
                 let squared = x.clone() * x.clone();
@@ -608,7 +615,7 @@ mod tests {
         }
 
         let scalar_type = TestType("test_scalar");
-        let (output, program): (TestValue, Program<TestType, TestValue, (TestValue, TestValue), TestValue, TestAddOp>) =
+        let (output, program): (TestValue, Program<TestType, TestValue, TestAddOp, (TestValue, TestValue), TestValue>) =
             interpret_and_trace(
                 &TestEngine,
                 |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| {
@@ -745,7 +752,13 @@ mod tests {
         let result: Result<
             (
                 TestAbstractValue,
-                Program<ArrayType, TestAbstractValue, (TestAbstractValue, TestAbstractValue), TestAbstractValue>,
+                Program<
+                    ArrayType,
+                    TestAbstractValue,
+                    crate::tracing_v2::PrimitiveOp<ArrayType, TestAbstractValue>,
+                    (TestAbstractValue, TestAbstractValue),
+                    TestAbstractValue,
+                >,
             ),
             TraceError,
         > = interpret_and_trace(
@@ -763,7 +776,7 @@ mod tests {
     #[test]
     fn staged_program_display_renders_the_staged_program() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
+        let (_, compiled): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) = interpret_and_trace(
             &engine,
             |x: Tracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
             2.0f64,

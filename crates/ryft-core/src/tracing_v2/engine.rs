@@ -105,6 +105,7 @@ pub trait Engine {
 /// reused by richer engines that need sharding, device, or runtime context.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArrayScalarEngine<V> {
+    /// Phantom marker that ties the zero-sized engine to its scalar leaf type.
     marker: PhantomData<fn() -> V>,
 }
 

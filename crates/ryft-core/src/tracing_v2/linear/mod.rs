@@ -82,7 +82,7 @@ pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, O, 
     function: F,
     traced_inputs: &[Tracer<'engine, E>],
     input_types: Input,
-) -> Result<(Output, Program<ArrayType, V, Vec<V>, Vec<V>, O>), TraceError>
+) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TraceError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
@@ -95,7 +95,7 @@ where
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TraceError>,
 {
     let exemplar_engine = traced_inputs.first().ok_or(TraceError::EmptyParameterizedValue)?.engine();
-    let (output_types, traced_program): (Output, Program<ArrayType, V, Input::To<V>, Output::To<V>, O>) =
+    let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
         crate::tracing_v2::jit::trace(exemplar_engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let traced_program = traced_program
@@ -114,7 +114,7 @@ where
 /// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
 /// output and the traced gradient leaves.
 fn reverse_mode_scalar_traced_program<'engine, V, O, L, E>(
-    traced_program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
+    traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     traced_primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TraceError>
 where

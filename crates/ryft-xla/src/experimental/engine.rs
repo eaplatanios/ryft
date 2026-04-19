@@ -73,6 +73,7 @@ pub struct XlaEngine<'c> {
     /// Default compilation options forwarded to [`Client::compile`].
     compilation_options: CompilationOptions,
 
+    /// Phantom marker tying the engine lifetime to the concrete PJRT-backed array value type.
     marker: PhantomData<fn() -> Array<'c>>,
 }
 

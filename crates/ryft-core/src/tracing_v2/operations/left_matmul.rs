@@ -51,6 +51,7 @@ pub trait LinearLeftMatMulOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// the op object and applies that factor to every input it is replayed on.
 #[derive(Clone)]
 pub struct LeftMatMulOp<V: MatrixValue> {
+    /// Matrix factor multiplied on the left of every input.
     factor: V,
 }
 

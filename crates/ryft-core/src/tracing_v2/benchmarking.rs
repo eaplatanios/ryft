@@ -221,7 +221,7 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
 ///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
 ///     staged op.
 pub fn summarize_program<V, Input, Output, O, F>(
-    program: &Program<ArrayType, V, Input, Output, O>,
+    program: &Program<ArrayType, V, O, Input, Output>,
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
@@ -311,15 +311,16 @@ mod tests {
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
-            &engine,
-            |x| {
-                let with_constant = x.clone() + x.one_like();
-                with_constant.sin()
-            },
-            2.0f64,
-        )
-        .unwrap();
+        let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::ProgramOpRef<f64>, f64, f64>) =
+            interpret_and_trace(
+                &engine,
+                |x| {
+                    let with_constant = x.clone() + x.one_like();
+                    with_constant.sin()
+                },
+                2.0f64,
+            )
+            .unwrap();
 
         let summary = summarize_program(&compiled, |_| Ok(Vec::new())).unwrap();
         assert_eq!(

@@ -153,7 +153,10 @@ impl DevicePutOptions<DevicePutPlacement, DevicePutPlacement, bool, Option<bool>
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedDevicePutPlacement {
+    /// Concrete device mesh selected for the put operation.
     mesh: DeviceMesh,
+
+    /// Concrete global sharding selected for the put operation.
     sharding: Sharding,
 }
 
@@ -1099,9 +1102,16 @@ impl std::fmt::Debug for ArrayShard<'_> {
 /// over `ArrayImpl`.
 #[derive(Clone)]
 pub struct Array<'o> {
+    /// Global array metadata carried by this distributed array handle.
     array_type: ArrayType,
+
+    /// All global shards in mesh order together with their device ownership.
     shards: Vec<ArrayShard<'o>>,
+
+    /// Lookup table from device id to the corresponding shard index in [`Self::shards`].
     shard_index_by_device: HashMap<DeviceId, usize>,
+
+    /// Indices of the shards addressable from the current process.
     addressable_shard_indices: Vec<usize>,
 }
 
@@ -1735,7 +1745,10 @@ where
 ///
 /// This stores one `Vec<ExecutionInput>` per addressable device (in caller-provided device order).
 pub struct ExecuteArguments<'o> {
+    /// Addressable devices in the same order as [`Self::inputs_by_device`].
     addressable_device_ids: Vec<DeviceId>,
+
+    /// Execution inputs grouped by addressable device.
     inputs_by_device: Vec<Vec<ExecutionInput<'o>>>,
 }
 

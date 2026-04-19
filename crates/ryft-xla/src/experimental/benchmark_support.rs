@@ -114,7 +114,7 @@ fn summarize_nested_body(
 ///
 ///   - `program`: Program to summarize.
 fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
-    program: &Program<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,

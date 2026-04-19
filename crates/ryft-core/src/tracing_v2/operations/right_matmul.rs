@@ -51,6 +51,7 @@ pub trait LinearRightMatMulOperation<T: Type + Display, V: Traceable<T>>: Clone 
 /// [`RightMatMulOp`] is the right-acting sibling of [`super::LeftMatMulOp`].
 #[derive(Clone)]
 pub struct RightMatMulOp<V: MatrixValue> {
+    /// Matrix factor multiplied on the right of every input.
     factor: V,
 }
 

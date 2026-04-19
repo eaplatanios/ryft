@@ -88,6 +88,7 @@ impl<T: Type, V: Traceable<T> + Add<Output = V> + Mul<Output = V> + Neg<Output =
 pub struct JvpTracer<V, T> {
     /// The primal value.
     pub primal: V,
+
     /// The tangent value associated with the primal.
     pub tangent: T,
 }
@@ -498,7 +499,7 @@ where
         // Trace the function once at lane 0 primals, consuming the FnOnce closure.
         let (primal_output_0, traced_program): (
             Output::To<V>,
-            Program<ArrayType, V, Input::To<V>, Output::To<V>, E::TracingOperation>,
+            Program<ArrayType, V, E::TracingOperation, Input::To<V>, Output::To<V>>,
         ) = interpret_and_trace(
             erased_engine,
             |staged_input| {
@@ -526,7 +527,7 @@ where
         let combined_input_count = input_parameter_count * 2;
         let combined_output_count = output_parameter_count * 2;
 
-        let (_, compiled_jvp): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) =
+        let (_, compiled_jvp): (Vec<V>, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>) =
             interpret_and_trace(
                 erased_engine,
                 |jit_combined: Vec<

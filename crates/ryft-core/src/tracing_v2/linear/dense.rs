@@ -64,12 +64,25 @@ impl CoordinateValue for f64 {
 /// function signature.
 #[derive(Clone, Debug)]
 pub struct DenseJacobian<S, InputStructure, OutputStructure> {
+    /// Row-major matrix entries of the dense Jacobian.
     values: Vec<S>,
+
+    /// Number of rows in the dense matrix.
     rows: usize,
+
+    /// Number of columns in the dense matrix.
     cols: usize,
+
+    /// Structured input parameter shape used by the differentiated function.
     input_structure: InputStructure,
+
+    /// Structured output parameter shape used by the differentiated function.
     output_structure: OutputStructure,
+
+    /// Coordinate counts contributed by each flattened input leaf.
     input_coordinate_counts: Vec<usize>,
+
+    /// Coordinate counts contributed by each flattened output leaf.
     output_coordinate_counts: Vec<usize>,
 }
 

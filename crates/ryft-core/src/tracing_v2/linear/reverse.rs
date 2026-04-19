@@ -459,7 +459,7 @@ where
         let lane0_flat: Vec<V> = lane0.into_parameters().collect();
 
         // Trace the user function once at lane 0 primals, consuming the FnOnce closure.
-        let (_, traced_program): (V, Program<ArrayType, V, Input::To<V>, V, E::TracingOperation>) =
+        let (_, traced_program): (V, Program<ArrayType, V, E::TracingOperation, Input::To<V>, V>) =
             interpret_and_trace(erased_engine, |staged_input| Ok(function(staged_input)), lane_primals[0].clone())?;
 
         // Reshape the program to flat Vec<V> inputs and outputs for the JIT compilation step.
@@ -471,7 +471,7 @@ where
             .simplify()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
-        let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, Vec<V>, Vec<V>, E::TracingOperation>) =
+        let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>) =
             interpret_and_trace(
                 erased_engine,
                 |jit_primals: Vec<

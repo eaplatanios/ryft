@@ -37,6 +37,7 @@ use crate::mlir::ToMlir;
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
 #[derive(Clone)]
 pub struct WithShardingConstraintOp {
+    /// Requested sharding that the input leaf must satisfy after lowering.
     sharding: Sharding,
 }
 

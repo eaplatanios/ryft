@@ -38,11 +38,14 @@ type JitShardMapTracer = Tracer<
 >;
 
 /// Shared program type used by erased shard-map bodies.
-type FlatShardMapProgram = Program<ArrayType, ShardMapTensor, Vec<ShardMapTensor>, Vec<ShardMapTensor>, XlaPrimitiveOp>;
+type FlatShardMapProgram = Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, Vec<ShardMapTensor>, Vec<ShardMapTensor>>;
 
 #[derive(Clone)]
 struct LinearShardMapBodies {
+    /// Forward linear shard-map body used for tangent evaluation.
     pushforward: FlatTracedShardMap,
+
+    /// Transposed linear shard-map body used for cotangent evaluation.
     pullback: FlatTracedShardMap,
 }
 
@@ -73,18 +76,32 @@ pub enum LinearShardMapEvalMode {
 /// tracer-leaf ops, where `ShardMapOp<ShardMapTracer>::interpret` reifies each atom back into a `Tracer`.
 #[derive(Clone)]
 struct LinearShardMapState {
+    /// Staged primal atom ids captured when the shard-map body was linearized.
     captured_global_primals: Vec<AtomId>,
+
+    /// Evaluation strategy used when replaying the forward linear body.
     eval_mode: LinearShardMapEvalMode,
+
+    /// Evaluation strategy used when replaying the transpose body.
     transpose_mode: LinearShardMapEvalMode,
 }
 
 /// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering.
 #[derive(Clone)]
 pub struct ShardMapOp<V> {
+    /// Canonical erased shard-map body carried by this higher-order op.
     body: FlatTracedShardMap,
+
+    /// Global input types expected by the carried body.
     input_types: Vec<ArrayType>,
+
+    /// Global output types produced by the carried body.
     output_types: Vec<ArrayType>,
+
+    /// Optional linear execution state present only for linearized shard-map ops.
     linear_state: Option<LinearShardMapState>,
+
+    /// Phantom marker tying the op to the traced leaf type it will replay with.
     marker: PhantomData<fn() -> V>,
 }
 
@@ -1099,7 +1116,7 @@ fn replay_traced_xla_program<
     ProgramOutput: ryft_core::parameters::Parameterized<ShardMapTensor>,
     V: ReplayShardMapValue,
 >(
-    program: &Program<ArrayType, ShardMapTensor, ProgramInput, ProgramOutput, XlaPrimitiveOp>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
     inputs: Vec<V>,
 ) -> Result<Vec<V>, ShardMapTraceError> {
     let mut values = vec![None; program.atom_count()];
@@ -1279,9 +1296,9 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         ryft_core::tracing_v2::Program<
             ArrayType,
             ShardMapTensor,
-            Vec<ShardMapTensor>,
-            Vec<ShardMapTensor>,
             XlaPrimitiveOp,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
         >,
     ) = ryft_core::tracing_v2::interpret_and_trace(
         XlaEngine::token(),
@@ -1318,9 +1335,9 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
         ryft_core::tracing_v2::Program<
             ArrayType,
             ShardMapTensor,
-            Vec<ShardMapTensor>,
-            Vec<ShardMapTensor>,
             XlaPrimitiveOp,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
         >,
     ) = ryft_core::tracing_v2::interpret_and_trace(
         XlaEngine::token(),

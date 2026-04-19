@@ -36,6 +36,7 @@ use ryft_macros::Parameter;
 /// values directly.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct Batch<V> {
+    /// Lane values carried by this batch in semantic lane order.
     lanes: Vec<V>,
 }
 
@@ -294,7 +295,7 @@ where
 
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,
-            Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
+            Program<ArrayType, V, O, Input::To<V>, Output::To<V>>,
         ) = crate::tracing_v2::jit::trace(
             exemplar_engine,
             |lane_inputs| {
@@ -398,7 +399,7 @@ pub fn vmap<
 mod tests {
     use indoc::indoc;
 
-    use crate::tracing_v2::{Sin, Tracer, engine::ArrayScalarEngine, test_support};
+    use crate::tracing_v2::{ProgramOpRef, Sin, Tracer, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -445,16 +446,17 @@ mod tests {
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = crate::tracing_v2::interpret_and_trace(
-            &engine,
-            |x| {
-                let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> =
-                    vmap(|batch| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
-                Ok(outputs[0].clone() + outputs[1].clone())
-            },
-            2.0f64,
-        )
-        .unwrap();
+        let (output, program): (f64, Program<ArrayType, f64, ProgramOpRef<f64>, f64, f64>) =
+            crate::tracing_v2::interpret_and_trace(
+                &engine,
+                |x| {
+                    let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> =
+                        vmap(|batch| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
+                    Ok(outputs[0].clone() + outputs[1].clone())
+                },
+                2.0f64,
+            )
+            .unwrap();
 
         assert_eq!(output, 6.0);
         assert_eq!(program.call(3.0f64).unwrap(), 8.0);

@@ -480,7 +480,8 @@ mod tests {
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing_v2::{
-            LinearProgramBuilder, Program, interpret_and_trace, operations::matrix::ndarray_support::Array2Engine,
+            LinearProgramBuilder, Program, ProgramOpRef, interpret_and_trace,
+            operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},
     };
@@ -709,7 +710,13 @@ mod tests {
         let engine = Array2Engine::<f64>::new();
         let (_, compiled): (
             ndarray::Array2<f64>,
-            Program<ArrayType, ndarray::Array2<f64>, ndarray::Array2<f64>, ndarray::Array2<f64>>,
+            Program<
+                ArrayType,
+                ndarray::Array2<f64>,
+                ProgramOpRef<ndarray::Array2<f64>>,
+                ndarray::Array2<f64>,
+                ndarray::Array2<f64>,
+            >,
         ) = interpret_and_trace(&engine, |x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
             .unwrap();
 

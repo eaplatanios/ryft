@@ -44,10 +44,17 @@ pub trait LinearVMapOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// replayed, transposed, and lowered without carrying the caller's original structured parameter
 /// types around.
 pub struct FlatTracedVMap<T: Type, V: Typed<T> + Parameter, O = ProgramOpRef<V>> {
+    /// Number of logical lanes represented by this flattened batched body.
     lane_count: usize,
+
+    /// Canonical per-lane input types of the captured body.
     input_types: Vec<T>,
+
+    /// Canonical per-lane output types of the captured body.
     output_types: Vec<T>,
-    program: Program<T, V, Vec<V>, Vec<V>, O>,
+
+    /// Flattened staged program that evaluates one lane at a time during replay.
+    program: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone> Clone for FlatTracedVMap<T, V, O>
@@ -71,7 +78,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
         lane_count: usize,
         input_types: Vec<T>,
         output_types: Vec<T>,
-        program: Program<T, V, Vec<V>, Vec<V>, O>,
+        program: Program<T, V, O, Vec<V>, Vec<V>>,
     ) -> Self {
         Self { lane_count, input_types, output_types, program }
     }
@@ -96,7 +103,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
 
     /// Returns the flat body program.
     #[inline]
-    pub fn program(&self) -> &Program<T, V, Vec<V>, Vec<V>, O> {
+    pub fn program(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.program
     }
 
@@ -148,7 +155,10 @@ pub struct VMapOp<
     O: Clone = ProgramOpRef<V>,
     L: Clone = LinearProgramOpRef<V>,
 > {
+    /// Captured flattened forward body for the batched computation.
     body: FlatTracedVMap<T, V, O>,
+
+    /// Phantom marker tying the op to the linear carrier used by nested transforms.
     marker: PhantomData<fn() -> L>,
 }
 
@@ -324,7 +334,10 @@ where
 /// Linear programs need slightly more structure than ordinary programs because reverse-mode
 /// transposition must know how to batch both the forward linear map and its transpose.
 pub struct LinearVMapOp<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearProgramOpRef<V>> {
+    /// Captured flattened forward linear body.
     body: FlatTracedVMap<T, V, O>,
+
+    /// Captured flattened transpose body used for reverse-mode batching.
     transpose_body: FlatTracedVMap<T, V, O>,
 }
 

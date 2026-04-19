@@ -79,8 +79,10 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
 pub struct Equation<O> {
     /// Operation applied by this equation.
     pub op: O,
+
     /// Input atoms consumed by the equation.
     pub inputs: Vec<AtomId>,
+
     /// Output atoms produced by the equation.
     pub outputs: Vec<AtomId>,
 }
@@ -99,9 +101,16 @@ pub struct Equation<O> {
 /// is finalized via [`Self::build`].
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
+    /// Atom table accumulated so far, including inputs, constants, and derived outputs.
     atoms: Vec<Atom<T, V>>,
+
+    /// Optional eager exemplars retained for non-constant atoms while staging.
     intermediates: Vec<Option<V>>,
+
+    /// Input atom ids in parameter order.
     input_atoms: Vec<AtomId>,
+
+    /// Equations recorded so far in execution order.
     equations: Vec<Equation<O>>,
 }
 
@@ -311,7 +320,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         outputs: Vec<AtomId>,
         input_structure: Input::ParameterStructure,
         output_structure: Output::ParameterStructure,
-    ) -> Program<T, V, Input, Output, O>
+    ) -> Program<T, V, O, Input, Output>
     where
         Input: Parameterized<V>,
         Output: Parameterized<V>,
@@ -371,19 +380,26 @@ pub(crate) fn is_identity_one<T: Type, V: Traceable<T>>(value: &V) -> bool {
 /// the ordered list of equations, and the structured input/output metadata needed to turn flat leaf
 /// evaluation back into user-facing structured values. Both ordinary JIT traces and higher-order
 /// transforms exchange programs in this form.
-pub struct Program<
-    T: Type,
-    V: Typed<T> + Parameter,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-    O = ProgramOpRef<V>,
-> {
+pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
+    /// Final atom table of the staged program.
     atoms: Vec<Atom<T, V>>,
+
+    /// Input atom ids in the same order as the flattened input parameters.
     input_atoms: Vec<AtomId>,
+
+    /// Ordered equations that replay the staged computation.
     equations: Vec<Equation<O>>,
+
+    /// Output atom ids in the same order as the flattened output parameters.
     outputs: Vec<AtomId>,
+
+    /// Structured input shape used to rebuild typed inputs from flat leaves.
     input_structure: Input::ParameterStructure,
+
+    /// Structured output shape used to rebuild typed outputs from flat leaves.
     output_structure: Output::ParameterStructure,
+
+    /// Phantom marker that ties the program to its structured input/output parameter families.
     marker: PhantomData<fn(Input) -> Output>,
 }
 
@@ -393,7 +409,7 @@ impl<
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-> Clone for Program<T, V, Input, Output, O>
+> Clone for Program<T, V, O, Input, Output>
 {
     fn clone(&self) -> Self {
         Self {
@@ -409,7 +425,7 @@ impl<
 }
 
 impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Program<T, V, Input, Output, O>
+    Program<T, V, O, Input, Output>
 {
     /// Returns the number of atoms in the program.
     #[inline]
@@ -544,7 +560,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         &self,
         input_structure: NewInput::ParameterStructure,
         output_structure: NewOutput::ParameterStructure,
-    ) -> Program<T, V, NewInput, NewOutput, O>
+    ) -> Program<T, V, O, NewInput, NewOutput>
     where
         NewInput: Parameterized<V>,
         NewOutput: Parameterized<V>,
@@ -588,7 +604,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         Output::ParameterStructure: Clone,
     {
         fn mark_live<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
-            program: &Program<T, V, Input, Output, O>,
+            program: &Program<T, V, O, Input, Output>,
             atom_id: usize,
             live_atoms: &mut [bool],
             live_equations: &mut [bool],
@@ -612,7 +628,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 
         fn remap_atom<O, T, V, Input, Output>(
             atom_id: usize,
-            program: &Program<T, V, Input, Output, O>,
+            program: &Program<T, V, O, Input, Output>,
             builder: &mut ProgramBuilder<O, T, V>,
             atom_mapping: &mut HashMap<usize, usize>,
             live_equations: &[bool],
@@ -722,7 +738,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
 }
 
 impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for Program<T, V, Input, Output, O>
+    for Program<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");

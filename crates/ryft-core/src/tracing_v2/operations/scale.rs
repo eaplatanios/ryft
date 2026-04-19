@@ -48,7 +48,10 @@ pub trait LinearScaleOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// the same semantic idea is reused to scale tangent and cotangent terms.
 #[derive(Clone)]
 pub struct ScaleOp<T: Type, V: Typed<T>> {
+    /// Captured factor applied to every input of this unary linear op.
     factor: V,
+
+    /// Phantom marker tying the captured factor to the abstract type it is interpreted against.
     _marker: std::marker::PhantomData<T>,
 }
 
