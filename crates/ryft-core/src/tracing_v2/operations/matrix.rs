@@ -15,7 +15,7 @@ use crate::{
         TraceError, Traceable, ZeroLike,
         batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
-        jit::JitTracer,
+        jit::Tracer,
         linear::LinearTerm,
     },
     types::{ArrayType, DataType, Shape, Size, Typed},
@@ -214,7 +214,8 @@ impl<
     V: Traceable<ArrayType>,
     O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
     L: Clone,
-> MatrixOps for JitTracer<ArrayType, V, O, L>
+    E: crate::tracing_v2::Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> MatrixOps for Tracer<ArrayType, V, O, L, E>
 where
     O: Op<ArrayType>,
 {

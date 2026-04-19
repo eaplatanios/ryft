@@ -9,10 +9,10 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::tracing_v2::{
-    Batch, JitTracer, LinearProgram, OneLike, Program, Sin, Traceable,
+    Batch, LinearProgram, OneLike, Program, Sin, Traceable, Tracer,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
     engine::ArrayScalarEngine,
-    grad, jvp, jvp_program, stack, trace_program, unstack, value_and_grad, vjp, vmap,
+    grad, interpret_and_trace, jvp, jvp_program, stack, unstack, value_and_grad, vjp, vmap,
 };
 #[cfg(feature = "ndarray")]
 use crate::tracing_v2::{MatrixOps, ZeroLike, operations::matrix::ndarray_support::Array2Engine};
@@ -139,11 +139,11 @@ where
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
 }
 
-fn first_derivative_traced(x: JitTracer<ArrayType, f64>) -> JitTracer<ArrayType, f64> {
+fn first_derivative_traced(x: Tracer<ArrayType, f64>) -> Tracer<ArrayType, f64> {
     grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x).expect("scalar first traced derivative should succeed")
 }
 
-fn hessian_style_second_derivative_traced(x: JitTracer<ArrayType, f64>) -> JitTracer<ArrayType, f64> {
+fn hessian_style_second_derivative_traced(x: Tracer<ArrayType, f64>) -> Tracer<ArrayType, f64> {
     jvp(&ArrayScalarEngine::<f64>::new(), first_derivative_traced, x.clone(), x.one_like())
         .expect("scalar Hessian-style benchmark should succeed")
         .1
@@ -152,7 +152,7 @@ fn hessian_style_second_derivative_traced(x: JitTracer<ArrayType, f64>) -> JitTr
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (f64, Program<ArrayType, f64, (f64, f64), f64>) =
-        trace_program(&ArrayScalarEngine::<f64>::new(), |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
+        interpret_and_trace(&ArrayScalarEngine::<f64>::new(), |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jit", "jit", &compiled)?])
 }
 
@@ -172,10 +172,10 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Ben
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
-        |x: JitTracer<ArrayType, f64>| {
-            let gradient: JitTracer<ArrayType, f64> = grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
+        |x| {
+            let gradient: Tracer<ArrayType, f64> = grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
             Ok(gradient)
         },
         2.0f64,
@@ -185,10 +185,10 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
 
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): ((f64, f64), Program<ArrayType, f64, f64, (f64, f64)>) = trace_program(
+    let (_, compiled): ((f64, f64), Program<ArrayType, f64, f64, (f64, f64)>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
-        |x: JitTracer<ArrayType, f64>| {
-            let value_and_gradient: (JitTracer<ArrayType, f64>, JitTracer<ArrayType, f64>) =
+        |x| {
+            let value_and_gradient: (Tracer<ArrayType, f64>, Tracer<ArrayType, f64>) =
                 value_and_grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, x)?;
             Ok(value_and_gradient)
         },
@@ -210,21 +210,24 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmar
 
 /// Emits the staged forward-over-reverse scalar benchmark.
 fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) =
-        trace_program(&ArrayScalarEngine::<f64>::new(), |x| Ok(hessian_style_second_derivative_traced(x)), 2.0f64)?;
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
+        &ArrayScalarEngine::<f64>::new(),
+        |x| Ok(hessian_style_second_derivative_traced(x)),
+        2.0f64,
+    )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", &compiled)?])
 }
 
 /// Emits the staged reverse-over-batching scalar benchmark.
 fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
-        |x: JitTracer<ArrayType, f64>| {
-            let gradient: JitTracer<ArrayType, f64> = grad(
+        |x| {
+            let gradient: Tracer<ArrayType, f64> = grad(
                 &ArrayScalarEngine::<f64>::new(),
-                |y: JitTracer<ArrayType, f64>| {
-                    let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
-                        |batch: Batch<JitTracer<ArrayType, f64>>| batch.clone() * batch.clone() + batch.sin(),
+                |y| {
+                    let outputs: Vec<Tracer<ArrayType, f64>> = vmap(
+                        |batch: Batch<Tracer<ArrayType, f64>>| batch.clone() * batch.clone() + batch.sin(),
                         vec![y.clone(), y],
                     )
                     .unwrap_or_else(|error| {
@@ -243,14 +246,15 @@ fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
 
 /// Emits the staged batching-over-reverse scalar benchmark.
 fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
+    let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
         &ArrayScalarEngine::<f64>::new(),
-        |x: JitTracer<ArrayType, f64>| {
-            let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
-                |batch: Batch<JitTracer<ArrayType, f64>>| {
-                    let lanes = unstack::<JitTracer<ArrayType, f64>, JitTracer<ArrayType, f64>>(batch).unwrap_or_else(
-                        |error| panic!("scalar vmap-of-grad IR benchmark should unstack the batch: {error}"),
-                    );
+        |x| {
+            let outputs: Vec<Tracer<ArrayType, f64>> = vmap(
+                |batch: Batch<Tracer<ArrayType, f64>>| {
+                    let lanes =
+                        unstack::<Tracer<ArrayType, f64>, Tracer<ArrayType, f64>>(batch).unwrap_or_else(|error| {
+                            panic!("scalar vmap-of-grad IR benchmark should unstack the batch: {error}")
+                        });
                     let gradients = lanes
                         .into_iter()
                         .map(|lane| {
@@ -259,7 +263,7 @@ fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
                             })
                         })
                         .collect::<Vec<_>>();
-                    stack::<JitTracer<ArrayType, f64>, JitTracer<ArrayType, f64>>(gradients).unwrap_or_else(|error| {
+                    stack::<Tracer<ArrayType, f64>, Tracer<ArrayType, f64>>(gradients).unwrap_or_else(|error| {
                         panic!("scalar vmap-of-grad IR benchmark should restack lane gradients: {error}")
                     })
                 },
@@ -309,12 +313,12 @@ fn hessian_style_matrix_inputs() -> (Array2<f64>, Array2<f64>, Array2<f64>, Arra
 #[cfg(feature = "ndarray")]
 fn first_matrix_gradient_traced(
     inputs: (
-        JitTracer<ArrayType, Array2<f64>>,
-        JitTracer<ArrayType, Array2<f64>>,
-        JitTracer<ArrayType, Array2<f64>>,
-        JitTracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
     ),
-) -> JitTracer<ArrayType, Array2<f64>> {
+) -> Tracer<ArrayType, Array2<f64>> {
     let (x_bar, _, _, _) = grad(&Array2Engine::<f64>::new(), three_matmul_sine, inputs)
         .expect("nested matrix gradient benchmark should stage");
     x_bar
@@ -323,12 +327,12 @@ fn first_matrix_gradient_traced(
 #[cfg(feature = "ndarray")]
 fn matrix_hessian_style_second_derivative(
     inputs: (
-        JitTracer<ArrayType, Array2<f64>>,
-        JitTracer<ArrayType, Array2<f64>>,
-        JitTracer<ArrayType, Array2<f64>>,
-        JitTracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
+        Tracer<ArrayType, Array2<f64>>,
     ),
-) -> JitTracer<ArrayType, Array2<f64>> {
+) -> Tracer<ArrayType, Array2<f64>> {
     let seeds = (inputs.0.one_like(), inputs.1.zero_like(), inputs.2.zero_like(), inputs.3.zero_like());
     jvp(&Array2Engine::<f64>::new(), first_matrix_gradient_traced, inputs, seeds)
         .expect("matrix Hessian-style benchmark should succeed")
@@ -339,7 +343,7 @@ fn matrix_hessian_style_second_derivative(
 #[cfg(feature = "ndarray")]
 fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, compiled): (Array2<f64>, Program<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>), Array2<f64>>) =
-        trace_program(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
+        interpret_and_trace(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
     Ok(vec![tracing_record("matrix_matmul_jit", "jit", &compiled)?])
 }
 
@@ -357,7 +361,7 @@ fn emit_matrix_three_matmul_sine_hessian_style() -> Result<Vec<IrBenchmarkRecord
     let (_, compiled): (
         Array2<f64>,
         Program<ArrayType, Array2<f64>, (Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), Array2<f64>>,
-    ) = trace_program(
+    ) = interpret_and_trace(
         &Array2Engine::<f64>::new(),
         matrix_hessian_style_second_derivative,
         hessian_style_matrix_inputs(),

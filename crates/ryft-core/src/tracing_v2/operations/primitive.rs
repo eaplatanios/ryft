@@ -22,7 +22,7 @@ use crate::{
         batch::Batch,
         engine::Engine,
         forward::JvpTracer,
-        jit::JitTracer,
+        jit::Tracer,
         linear::LinearTerm,
         operations::{
             AddOp, CosOp, LeftMatMulOp, MatMulOp, MatrixTransposeOp, MulOp, NegOp, ReshapeOp, RightMatMulOp, ScaleOp,
@@ -425,7 +425,7 @@ impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOp<ArrayType, V> {
     }
 }
 
-/// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: Traceable<ArrayType>`.
+/// [`Op`] for [`PrimitiveOp`] requires NO value-type bounds â€” shape validation works for any `V: Traceable<ArrayType>`.
 impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
     fn name(&self) -> &'static str {
         match self {
@@ -500,7 +500,7 @@ impl<V: Traceable<ArrayType>> Op for PrimitiveOp<ArrayType, V> {
     }
 }
 
-/// [`Op`] for [`LinearPrimitiveOp`] requires NO value-type bounds — shape validation works for any `V: Traceable<ArrayType>`.
+/// [`Op`] for [`LinearPrimitiveOp`] requires NO value-type bounds â€” shape validation works for any `V: Traceable<ArrayType>`.
 impl<V: Traceable<ArrayType>> Op for LinearPrimitiveOp<ArrayType, V> {
     fn name(&self) -> &'static str {
         match self {
@@ -673,7 +673,7 @@ where
     }
 }
 
-/// Linearized JIT replay: evaluates staged operations on [`Linearized<JitTracer<V>>`] values.
+/// Linearized JIT replay: evaluates staged operations on [`Linearized<Tracer<V>>`] values.
 ///
 /// For pure (non-capturing) ops, this is covered by their generic [`InterpretableOp<V>`] implementations
 /// because [`JvpTracer`] already implements all necessary arithmetic, matrix, and reshape traits.
@@ -682,7 +682,7 @@ where
 /// [`RematerializeOp`](crate::tracing_v2::operations::RematerializeOp)) provide dedicated
 /// [`InterpretableOp`] implementations that lift captured constants into the JIT trace.
 ///
-/// [`Linearized<JitTracer<V>>`]: crate::tracing_v2::linear::Linearized
+/// [`Linearized<Tracer<V>>`]: crate::tracing_v2::linear::Linearized
 /// [`ScaleOp`]: crate::tracing_v2::operations::ScaleOp
 /// [`LeftMatMulOp`]: crate::tracing_v2::operations::LeftMatMulOp
 /// [`RightMatMulOp`]: crate::tracing_v2::operations::RightMatMulOp
@@ -698,16 +698,37 @@ impl<
         + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>
-    for PrimitiveOp<ArrayType, V>
+    E: Engine<
+            Type = ArrayType,
+            Value = V,
+            TracingOperation = PrimitiveOp<ArrayType, V>,
+            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+        > + ?Sized
+        + 'static,
+>
+    InterpretableOp<
+        ArrayType,
+        crate::tracing_v2::linear::Linearized<
+            Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
+        >,
+    > for PrimitiveOp<ArrayType, V>
 where
     V::ParameterStructure: Clone + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<
+            Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
+        >],
+    ) -> Result<
+        Vec<
+            crate::tracing_v2::linear::Linearized<
+                Tracer<ArrayType, V, PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, E>,
+            >,
+        >,
+        TraceError,
+    > {
         match self {
             Self::Add => AddOp.interpret(inputs),
             Self::Mul => MulOp.interpret(inputs),

@@ -7,8 +7,8 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp,
-    TraceError, VectorizableOp,
+    CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp,
+    TraceError, Tracer, VectorizableOp,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -67,6 +67,7 @@ impl WithShardingConstraintOp {
                 XlaPrimitiveOp,
                 LinearPrimitiveOp<ArrayType, ShardMapTensor>,
                 LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+                crate::experimental::engine::XlaEngine<'static>,
                 _,
             >(self.clone())
             .with_extension(self.clone())
@@ -186,7 +187,7 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingCons
     fn interpret(&self, inputs: &[Linearized<ShardMapTracer>]) -> Result<Vec<Linearized<ShardMapTracer>>, TraceError> {
         expect_input_count(inputs.len(), 1)?;
         let input = &inputs[0];
-        let primal = JitTracer::apply_staged_op(
+        let primal = Tracer::apply_staged_op(
             std::slice::from_ref(&input.primal),
             XlaPrimitiveOp::WithShardingConstraint(self.clone()),
         )?
@@ -283,11 +284,11 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<ArrayType, V
     }
 }
 
-impl InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, ShardMapTracer>>> for WithShardingConstraintOp {
+impl InterpretableOp<ArrayType, Linearized<Tracer<ArrayType, ShardMapTracer>>> for WithShardingConstraintOp {
     fn interpret(
         &self,
-        _inputs: &[Linearized<JitTracer<ArrayType, ShardMapTracer>>],
-    ) -> Result<Vec<Linearized<JitTracer<ArrayType, ShardMapTracer>>>, TraceError> {
+        _inputs: &[Linearized<Tracer<ArrayType, ShardMapTracer>>],
+    ) -> Result<Vec<Linearized<Tracer<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: "linearized JIT evaluation for 'with_sharding_constraint' at the JIT-tracer level is not \

@@ -15,43 +15,44 @@ pub fn compile_grad<E, F, Input, V>(
     example_primals: Input,
 ) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
+    E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation>>
+        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation, E>>
         + Op<ArrayType>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
-        CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>:
+        CoreLinearProgramOp<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     Input::To<ArrayType>: Parameterized<
             ArrayType,
-            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = Input::To<
-                JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Input::To<
+                Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
             >,
         >,
     V::To<ArrayType>: Parameterized<
             ArrayType,
-            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = JitTracer<
+            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
                 ArrayType,
                 V,
                 E::TracingOperation,
                 E::LinearOperation,
+                E,
             >,
         >,
     F: Fn(
-        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    ) -> Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = trace_program(
+    let (_, compiled) = interpret_and_trace(
         _engine,
-        |primals: Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
+        |primals: Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
             let staged_input_types = Input::To::<ArrayType>::from_parameters(
                 input_structure.clone(),
@@ -64,10 +65,15 @@ where
                     V,
                     E::TracingOperation,
                     E::LinearOperation,
+                    E,
                     _,
                 >(|staged_input| Ok(function(staged_input)), &traced_primals, staged_input_types)?;
-            let (_, traced_gradient) = reverse_mode_scalar_traced_program(&traced_program, traced_primals)?;
-            Input::To::<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>::from_parameters(
+            let (_, traced_gradient) =
+                reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
+                    &traced_program,
+                    traced_primals,
+                )?;
+            Input::To::<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>::from_parameters(
                 input_structure.clone(),
                 traced_gradient,
             )
@@ -109,7 +115,7 @@ pub enum RematerializationPolicy {
 /// This generalizes [`compile_grad`] by letting the caller control how forward-pass intermediates are handled
 /// during the backward pass:
 ///
-///   - [`RematerializationPolicy::SaveAll`]: identical to [`compile_grad`] — no rematerialization boundaries are
+///   - [`RematerializationPolicy::SaveAll`]: identical to [`compile_grad`] â€” no rematerialization boundaries are
 ///     inserted, so the XLA compiler decides which intermediates to save.
 ///   - [`RematerializationPolicy::RecomputeAll`]: the entire forward body is wrapped in a single
 ///     [`rematerialize`] boundary, forcing the backward pass to recompute all intermediates from inputs.
@@ -124,39 +130,40 @@ pub fn compile_grad_with_policy<E, F, Input, V>(
     policy: RematerializationPolicy,
 ) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
+    E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation>>
+        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation, E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Op<ArrayType>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
-        CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>:
+        CoreLinearProgramOp<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     Input::To<ArrayType>: Parameterized<
             ArrayType,
-            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = Input::To<
-                JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Input::To<
+                Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
             >,
         >,
     V::To<ArrayType>: Parameterized<
             ArrayType,
-            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = JitTracer<
+            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
                 ArrayType,
                 V,
                 E::TracingOperation,
                 E::LinearOperation,
+                E,
             >,
         >,
     F: Fn(
-        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    ) -> Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
 {
     match policy {
         RematerializationPolicy::SaveAll => compile_grad(engine, &function, example_primals),
@@ -176,8 +183,8 @@ where
 /// (equivalent to [`RematerializationPolicy::RecomputeAll`]). When `Some(s)`, the program is
 /// partitioned into segments of at most `s` equations, each wrapped in its own [`RematerializeOp`].
 ///
-/// Internally, this replicates the flow of `grad` for [`JitTracer`]-level inputs — trace, linearize,
-/// transpose, stage pullback — but inserts a segmentation step between tracing and linearization so
+/// Internally, this replicates the flow of `grad` for [`Tracer`]-level inputs â€” trace, linearize,
+/// transpose, stage pullback â€” but inserts a segmentation step between tracing and linearization so
 /// that the differentiation transform sees and respects the rematerialization boundaries.
 fn compile_grad_segmented<E, F, Input, V>(
     engine: &E,
@@ -186,44 +193,45 @@ fn compile_grad_segmented<E, F, Input, V>(
     segment_size: Option<usize>,
 ) -> Result<Program<ArrayType, V, Input, Input, E::TracingOperation>, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
+    E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation>>
+        + InterpretableOp<ArrayType, LinearizedTracedValue<V, E::TracingOperation, E::LinearOperation, E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Op<ArrayType>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>:
-        CoreLinearProgramOp<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    LinearProgramOpRef<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>:
+        CoreLinearProgramOp<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<ArrayType>
-        + ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+        + ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     Input::To<ArrayType>: Parameterized<
             ArrayType,
-            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = Input::To<
-                JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Input::To<
+                Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
             >,
         >,
     V::To<ArrayType>: Parameterized<
             ArrayType,
-            To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>> = JitTracer<
+            To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>> = Tracer<
                 ArrayType,
                 V,
                 E::TracingOperation,
                 E::LinearOperation,
+                E,
             >,
         >,
     F: Fn(
-        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    ) -> JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>,
+        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    ) -> Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = trace_program(
+    let (_, compiled) = interpret_and_trace(
         engine,
-        |primals: Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>| {
+        |primals: Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
 
             // Step 1: Trace the function at the base V level to get a program.
@@ -238,6 +246,7 @@ where
                     V,
                     E::TracingOperation,
                     E::LinearOperation,
+                    E,
                     _,
                 >(|staged_input| Ok(function(staged_input)), &traced_primals, staged_input_types)?;
 
@@ -248,11 +257,15 @@ where
             };
 
             // Step 3: Linearize and transpose the segmented program to produce the pullback.
-            // `linearize_traced_program` replays the program at the JitTracer level (staging
+            // `linearize_traced_program` replays the program at the Tracer level (staging
             // both forward and backward equations in the outer JIT builder) and returns the
             // primal outputs alongside the linear pushforward map.
-            let (_, traced_gradient) = reverse_mode_scalar_traced_program(&segmented_program, traced_primals)?;
-            Input::To::<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>::from_parameters(
+            let (_, traced_gradient) =
+                reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
+                    &segmented_program,
+                    traced_primals,
+                )?;
+            Input::To::<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>::from_parameters(
                 input_structure.clone(),
                 traced_gradient,
             )
@@ -290,7 +303,7 @@ where
     let representative_inputs = program.representative_input_values(engine)?;
     let equations = program.equations();
 
-    // If the program has fewer equations than a single segment, no segmentation is needed — wrap the
+    // If the program has fewer equations than a single segment, no segmentation is needed â€” wrap the
     // whole thing in a single RematerializeOp.
     if equations.len() <= segment_size {
         return wrap_program_in_rematerialize(engine, program);

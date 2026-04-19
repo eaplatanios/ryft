@@ -69,8 +69,8 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::operations::{AddOp, MatMulOp, MatrixTransposeOp, MulOp};
 use ryft_core::tracing_v2::{
-    Cos, JitTracer, LinearPrimitiveOp, Linearized, MatrixOps, OneLike, Op, Program, Sin, TraceError, Traceable, Value,
-    ZeroLike, trace_program_from_types,
+    Cos, LinearPrimitiveOp, Linearized, MatrixOps, OneLike, Op, Program, Sin, TraceError, Traceable, Tracer, Value,
+    ZeroLike, trace as trace_types,
 };
 
 use crate::experimental::operations::WithShardingConstraintOp;
@@ -464,7 +464,7 @@ impl MatrixOps for ShardMapTensor {
 
 /// Tracer alias used while staging XLA programs directly from types.
 pub(crate) type ShardMapTracer =
-    JitTracer<ArrayType, ShardMapTensor, XlaPrimitiveOp, LinearPrimitiveOp<ArrayType, ShardMapTensor>>;
+    Tracer<ArrayType, ShardMapTensor, XlaPrimitiveOp, LinearPrimitiveOp<ArrayType, ShardMapTensor>, XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, Input, Output, XlaPrimitiveOp>;
@@ -575,7 +575,7 @@ where
             }
             .into());
         }
-        Ok(JitTracer::apply_staged_op(std::slice::from_ref(&input), XlaPrimitiveOp::WithShardingConstraint(op))?
+        Ok(Tracer::apply_staged_op(std::slice::from_ref(&input), XlaPrimitiveOp::WithShardingConstraint(op))?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))
@@ -888,7 +888,7 @@ impl ShardMap {
         context.shardy_manual_axes(self.manual_axes())
     }
 
-    /// Traces a shard-map body over local body tensor types using `tracing_v2::trace_program_from_types`.
+    /// Traces a shard-map body over local body tensor types using `tracing_v2::trace`.
     ///
     /// # Parameters
     ///
@@ -1238,8 +1238,7 @@ where
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
         {
-            let (output_types, program) =
-                trace_program_from_types(&engine, |input| Ok(function(input)), cloned_input_types)?;
+            let (output_types, program) = trace_types(&engine, |input| Ok(function(input)), cloned_input_types)?;
             (output_types, program.simplify()?)
         }
     };

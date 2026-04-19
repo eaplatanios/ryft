@@ -6,32 +6,32 @@
 //!
 //! # Module layout
 //!
-//! - `ops::core` — foundational operation traits: [`Op`], [`InterpretableOp`],
+//! - `ops::core` Ã¢â‚¬â€ foundational operation traits: [`Op`], [`InterpretableOp`],
 //!   [`LinearOperation`], [`DifferentiableOp`], [`VectorizableOp`]. Every op carrier implements
 //!   these; transforms consume them.
-//! - `ops::staging` — small hidden capability traits (`AddTracingOperation`,
+//! - `ops::staging` Ã¢â‚¬â€ small hidden capability traits (`AddTracingOperation`,
 //!   `MatMulLinearOperation`, etc.) that the transforms bound themselves on. Backends implement
 //!   one per op they stage.
-//! - `ops::primitive` — the built-in [`PrimitiveOp`] / [`LinearPrimitiveOp`] carriers that
+//! - `ops::primitive` Ã¢â‚¬â€ the built-in [`PrimitiveOp`] / [`LinearPrimitiveOp`] carriers that
 //!   provide a ready-to-use op-set for the default tracing pipeline.
-//! - `ops::custom` — the [`CustomPrimitive`] / [`LinearCustomPrimitive`] subsystem for
+//! - `ops::custom` Ã¢â‚¬â€ the [`CustomPrimitive`] / [`LinearCustomPrimitive`] subsystem for
 //!   layering user-supplied ops onto any backend carrier without modifying the built-in enums.
-//! - `programs` — the shared staging container plus the surface [`Program`] /
+//! - `programs` Ã¢â‚¬â€ the shared staging container plus the surface [`Program`] /
 //!   [`LinearProgram`] types. [`Traceable`] and [`Value`] live alongside them as the leaf-value
 //!   traits.
-//! - [`engine`] — the [`Engine`] trait backends implement. It pins the concrete op-set via
+//! - [`engine`] Ã¢â‚¬â€ the [`Engine`] trait backends implement. It pins the concrete op-set via
 //!   [`Engine::TracingOperation`] and [`Engine::LinearOperation`] associated types, which is how
 //!   op selection is surfaced to transforms rather than via umbrella capability bundles.
 //!
 //! # Transforms
 //!
-//! - [`forward`] — forward-mode AD via [`jvp`], producing [`Dual`] tangents and the underlying
+//! - [`forward`] Ã¢â‚¬â€ forward-mode AD via [`jvp`], producing [`Dual`] tangents and the underlying
 //!   [`JvpTracer`].
-//! - [`linear`] — linearization, transposition, and reverse-mode AD: [`jvp_program`], [`vjp`],
+//! - [`linear`] Ã¢â‚¬â€ linearization, transposition, and reverse-mode AD: [`jvp_program`], [`vjp`],
 //!   [`grad`], [`value_and_grad`], plus [`jacrev`] / [`jacfwd`] / [`hessian`] helpers.
-//! - `batch` — vectorization via [`vmap`], [`stack`], [`unstack`].
-//! - [`jit`](mod@self::jit) — staged-program capture via [`trace_program`] and compilation via
-//!   [`trace_program_from_types`] when only abstract input metadata is available.
+//! - `batch` Ã¢â‚¬â€ vectorization via [`vmap`], [`stack`], [`unstack`].
+//! - [`jit`](mod@self::jit) Ã¢â‚¬â€ staged-program capture via [`interpret_and_trace`] and compilation via
+//!   [`trace`] when only abstract input metadata is available.
 
 use thiserror::Error;
 
@@ -55,7 +55,7 @@ mod values;
 pub use batch::{Batch, stack, unstack, vmap};
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub use jit::{JitTracer, trace_program, trace_program_from_types};
+pub use jit::{Tracer, interpret_and_trace, trace};
 pub use linear::{
     CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
     grad, hessian, jacfwd, jacrev, jvp_program, value_and_grad, vjp,

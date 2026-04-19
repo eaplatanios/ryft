@@ -7,13 +7,13 @@ use crate::tracing_v2::{
     batch::Batch as BatchedValue,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
-    jit::JitTracer,
+    jit::Tracer,
     linear::LinearTerm,
 };
 use crate::types::{ArrayType, Type, Typed};
 
 use super::{
-    DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearOperation, Op, VectorizableOp,
+    DifferentiableOp, InterpretableOp, LinearOperation, Op, TracerLinearOperation, VectorizableOp,
     add::LinearAddOperation,
     expect_input_count, lift_jit_constant,
     matmul::MatMulTracingOperation,
@@ -128,14 +128,17 @@ impl<
     V: Traceable<ArrayType> + MatrixOps + ZeroLike,
     O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
     OuterLinearOperation: Clone + 'static,
-    InnerLinearOperation: JitTracerLinearOperation<V, O, OuterLinearOperation>
-        + LinearLeftMatMulOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
-        + LinearRightMatMulOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
-        + LinearMatrixTransposeOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
+        + ?Sized
+        + 'static,
+    InnerLinearOperation: TracerLinearOperation<V, O, OuterLinearOperation, E>
+        + LinearLeftMatMulOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
+        + LinearRightMatMulOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
+        + LinearMatrixTransposeOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>,
 >
     InterpretableOp<
         ArrayType,
-        crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O, OuterLinearOperation>, InnerLinearOperation>,
+        crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>,
     > for LeftMatMulOp<V>
 where
     O: Op<ArrayType>,
@@ -143,13 +146,13 @@ where
     fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<
-            JitTracer<ArrayType, V, O, OuterLinearOperation>,
+            Tracer<ArrayType, V, O, OuterLinearOperation, E>,
             InnerLinearOperation,
         >],
     ) -> Result<
         Vec<
             crate::tracing_v2::linear::Linearized<
-                JitTracer<ArrayType, V, O, OuterLinearOperation>,
+                Tracer<ArrayType, V, O, OuterLinearOperation, E>,
                 InnerLinearOperation,
             >,
         >,

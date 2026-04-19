@@ -231,15 +231,15 @@ pub fn jacfwd<E, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
+    E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    Input::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    Output::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     F: FnOnce(
-        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    ) -> Result<Output::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
+        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    ) -> Result<Output::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -282,15 +282,15 @@ pub fn jacrev<E, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
+    E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    Output::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    Input::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    Output::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     F: FnOnce(
-        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    ) -> Result<Output::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
+        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    ) -> Result<Output::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,
@@ -330,13 +330,13 @@ pub fn hessian<E, F, Input, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TraceError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
+    E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
+    Input::Family: ParameterizedFamily<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
     F: FnOnce(
-        Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>,
-    ) -> Result<Input::To<JitTracer<ArrayType, V, E::TracingOperation, E::LinearOperation>>, TraceError>,
+        Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>,
+    ) -> Result<Input::To<Tracer<ArrayType, V, E::TracingOperation, E::LinearOperation, E>>, TraceError>,
     E::TracingOperation: InterpretableOp<ArrayType, V>,
     E::TracingOperation: DifferentiableOp<
             ArrayType,

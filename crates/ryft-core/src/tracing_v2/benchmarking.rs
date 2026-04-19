@@ -303,7 +303,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{JitTracer, OneLike, Program, Sin, engine::ArrayScalarEngine, trace_program};
+    use crate::tracing_v2::{OneLike, Program, Sin, Tracer, engine::ArrayScalarEngine, interpret_and_trace};
 
     use super::*;
 
@@ -311,9 +311,9 @@ mod tests {
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
+        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
             &engine,
-            |x: JitTracer<ArrayType, f64>| {
+            |x| {
                 let with_constant = x.clone() + x.one_like();
                 with_constant.sin()
             },

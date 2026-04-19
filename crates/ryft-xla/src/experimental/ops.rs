@@ -240,8 +240,14 @@ impl
             Self::Reshape { input_type, output_type } => {
                 ReshapeOp::new(input_type.clone(), output_type.clone()).jvp(engine, inputs)
             }
-            Self::VMap(vmap) => vmap.jvp(engine, inputs),
-            Self::Rematerialize(remat) => remat.jvp(engine, inputs),
+            Self::VMap(vmap) => Err(TraceError::HigherOrderOpFailure {
+                op: "linearize_program",
+                message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
+            }),
+            Self::Rematerialize(remat) => Err(TraceError::HigherOrderOpFailure {
+                op: "linearize_program",
+                message: format!("JVP rule for staged op '{}' is not implemented", remat.name()),
+            }),
             Self::ShardMap(op) => op.jvp(engine, inputs),
             Self::WithShardingConstraint(op) => op.jvp(engine, inputs),
             Self::Custom(op) => op.jvp(engine, inputs),

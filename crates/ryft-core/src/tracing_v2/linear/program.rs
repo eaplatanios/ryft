@@ -358,32 +358,29 @@ where
     })
 }
 
-fn lift_traced_constant<V, O: Clone, L: Clone>(
+fn lift_traced_constant<V, O: Clone, L: Clone, E>(
     constant: &V,
-    inputs: &[JitTracer<ArrayType, V, O, L>],
-) -> Result<JitTracer<ArrayType, V, O, L>, TraceError>
+    inputs: &[Tracer<ArrayType, V, O, L, E>],
+) -> Result<Tracer<ArrayType, V, O, L, E>, TraceError>
 where
     V: Traceable<ArrayType>,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
 {
     let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
     let atom = exemplar.builder_handle().borrow_mut().add_constant(constant.clone());
-    Ok(JitTracer::from_staged_parts(
-        atom,
-        exemplar.builder_handle(),
-        exemplar.staging_error_handle(),
-        exemplar.engine(),
-    ))
+    Ok(Tracer::from_staged_parts(atom, exemplar.builder_handle(), exemplar.staging_error_handle(), exemplar.engine()))
 }
 
-pub(crate) fn lift_linearized_traced_constant<V, O: Clone + 'static, L: Clone + 'static>(
+pub(crate) fn lift_linearized_traced_constant<V, O: Clone + 'static, L: Clone + 'static, E>(
     constant: &V,
-    inputs: &[LinearizedTracedValue<V, O, L>],
-) -> Result<LinearizedTracedValue<V, O, L>, TraceError>
+    inputs: &[LinearizedTracedValue<V, O, L, E>],
+) -> Result<LinearizedTracedValue<V, O, L, E>, TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
 {
     let exemplar = inputs.first().ok_or(TraceError::EmptyParameterizedValue)?;
-    let primal = lift_traced_constant(constant, std::slice::from_ref(&exemplar.primal))?;
+    let primal = lift_traced_constant::<V, O, L, E>(constant, std::slice::from_ref(&exemplar.primal))?;
     let tangent_atom = exemplar.tangent.builder_handle().borrow_mut().add_constant(primal.zero_like());
     let tangent = LinearTerm::from_staged_parts(tangent_atom, exemplar.tangent.builder_handle());
     Ok(Linearized { primal, tangent })

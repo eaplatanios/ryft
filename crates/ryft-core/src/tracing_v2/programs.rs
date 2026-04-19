@@ -175,9 +175,9 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Adds a staged equation using pre-computed output values, performing abstract-eval validation,
     /// algebraic identity elimination, and constant folding.
     ///
-    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`InterpretableOp::eval`] —
+    /// Unlike [`add_equation`](Self::add_equation) this method does **not** call [`InterpretableOp::eval`] â€”
     /// the caller supplies the concrete output values directly. Use this when the caller has already
-    /// computed the outputs (e.g., inside [`JitTracer`](crate::tracing_v2::JitTracer) staging
+    /// computed the outputs (e.g., inside [`Tracer`](crate::tracing_v2::Tracer) staging
     /// methods).
     pub fn add_equation_with_output_values(
         &mut self,

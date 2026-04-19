@@ -10,7 +10,7 @@ use crate::tracing_v2::{
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
-    jit::JitTracer,
+    jit::Tracer,
 };
 use crate::types::{ArrayType, Type};
 
@@ -107,8 +107,12 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
     }
 }
 
-impl<V: Traceable<ArrayType> + Cos, O: CosTracingOperation<ArrayType, V>, L: Clone> Cos
-    for JitTracer<ArrayType, V, O, L>
+impl<
+    V: Traceable<ArrayType> + Cos,
+    O: CosTracingOperation<ArrayType, V>,
+    L: Clone,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Cos for Tracer<ArrayType, V, O, L, E>
 where
     O: Op<ArrayType>,
 {

@@ -10,7 +10,9 @@ use std::ops::{Add, Mul, Neg};
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        JitTracer, OneLike, Program, TraceError, Traceable, ZeroLike,
+        OneLike, Program, TraceError, Traceable, ZeroLike,
+        engine::Engine,
+        jit::Tracer,
         operations::{
             AddOp, FlatTracedVMap, InterpretableOp, MulOp, NegOp, Op, VMapOp, VMapTracingOperation, VectorizableOp,
         },
@@ -184,7 +186,7 @@ pub(crate) trait VMapInvocationLeaf<
 /// over the batched representation, and unstacks the result back into per-lane outputs.
 ///
 /// No op-capability (`Sin` / `Cos` / `MatrixOps` / `ReshapeOps`) bounds on `V` are required here because the body
-/// of `invoke` never exercises them — it stacks / unstacks / invokes the user's closure on
+/// of `invoke` never exercises them â€” it stacks / unstacks / invokes the user's closure on
 /// `Batch<V>` values, and any capability the closure actually uses is enforced at the call site
 /// through the conditional op-local trait impls on [`Batch`].
 impl<
@@ -206,37 +208,44 @@ where
 }
 
 /// Already-traced dispatch for [`vmap`]: stages a compact higher-order [`VMapOp`] in the enclosing
-/// [`JitTracer`] scope instead of eagerly duplicating the scalar program per lane. The body is traced
+/// [`Tracer`] scope instead of eagerly duplicating the scalar program per lane. The body is traced
 /// once at a single-lane exemplar and captured as a [`Program`] that lowering can later
 /// emit as packed StableHLO.
 impl<
+    E,
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq, To<Self> = Input>,
-    Output: Parameterized<Self, ParameterStructure: Clone, To<Self> = Output>,
-    O: Clone + Op<ArrayType>,
+    Input: Parameterized<
+            Tracer<ArrayType, V, O, L, E>,
+            ParameterStructure: Clone + PartialEq,
+            To<Tracer<ArrayType, V, O, L, E>> = Input,
+        >,
+    Output: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone, To<Tracer<ArrayType, V, O, L, E>> = Output>,
+    O: Clone + Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
     L: Clone,
-> VMapInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, O, L>
+> VMapInvocationLeaf<Input, Output> for Tracer<ArrayType, V, O, L, E>
 where
-    Input::Family: ParameterizedFamily<Batch<Self>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<Batch<Self>>
-        + ParameterizedFamily<Self>
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    Input::Family: ParameterizedFamily<Batch<Tracer<ArrayType, V, O, L, E>>>
         + ParameterizedFamily<V>
         + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Self> = Input, To<V> = Input::To<V>>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<Self> = Output, To<V> = Output::To<V>>,
+    Output::Family: ParameterizedFamily<Batch<Tracer<ArrayType, V, O, L, E>>>
+        + ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>
+        + ParameterizedFamily<V>
+        + ParameterizedFamily<ArrayType>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Input, To<V> = Input::To<V>>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Output, To<V> = Output::To<V>>,
     V: Parameterized<
             V,
-            To<JitTracer<ArrayType, V, O, L>> = JitTracer<ArrayType, V, O, L>,
+            To<Tracer<ArrayType, V, O, L, E>> = Tracer<ArrayType, V, O, L, E>,
             ParameterStructure: Clone + PartialEq,
         >,
-    V::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
+    V::Family: ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>,
     Vec<V>: Parameterized<
             V,
-            To<JitTracer<ArrayType, V, O, L>> = Vec<JitTracer<ArrayType, V, O, L>>,
+            To<Tracer<ArrayType, V, O, L, E>> = Vec<Tracer<ArrayType, V, O, L, E>>,
             ParameterStructure = Vec<Placeholder>,
         >,
-    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<JitTracer<ArrayType, V, O, L>>,
-    O: InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
+    <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<Tracer<ArrayType, V, O, L, E>>,
 {
     fn invoke<F>(function: F, inputs: Vec<Input>) -> Result<Vec<Output>, TraceError>
     where
@@ -264,10 +273,10 @@ where
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,
             Program<ArrayType, V, Input::To<V>, Output::To<V>, O>,
-        ) = crate::tracing_v2::jit::trace_program_from_types(
+        ) = crate::tracing_v2::jit::trace(
             exemplar_engine,
             |lane_inputs| {
-                let batched_inputs = Input::To::<Batch<JitTracer<ArrayType, V, O, L>>>::from_parameters(
+                let batched_inputs = Input::To::<Batch<Tracer<ArrayType, V, O, L, E>>>::from_parameters(
                     lane_inputs.parameter_structure(),
                     lane_inputs.into_parameters().map(|input| Batch::new(vec![input])),
                 )?;
@@ -307,7 +316,7 @@ where
         );
 
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
-        let staged_outputs = JitTracer::apply_staged_op(staged_inputs.as_slice(), O::vmap_op(VMapOp::new(body)))?;
+        let staged_outputs = Tracer::apply_staged_op(staged_inputs.as_slice(), O::vmap_op(VMapOp::new(body)))?;
         (0..lane_count)
             .map(|lane_index| {
                 let start = lane_index * output_leaf_count;
@@ -326,7 +335,7 @@ where
 /// concrete implementation handles each lane directly.
 ///
 /// Capability-trait bounds (`Sin` / `Cos` / `MatrixOps` / `ReshapeOps`) on `V` are deliberately omitted: the
-/// body only stacks, unstacks, and invokes the user's closure — any capability the closure uses on
+/// body only stacks, unstacks, and invokes the user's closure â€” any capability the closure uses on
 /// `Batch<Batch<V>>` is enforced through the conditional blanket impls on `Batch<_>`.
 impl<
     V: Traceable<ArrayType>,
@@ -367,7 +376,7 @@ where
 mod tests {
     use indoc::indoc;
 
-    use crate::tracing_v2::{JitTracer, Sin, engine::ArrayScalarEngine, test_support};
+    use crate::tracing_v2::{LinearPrimitiveOp, PrimitiveOp, Sin, Tracer, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -414,13 +423,18 @@ mod tests {
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = crate::tracing_v2::trace_program(
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = crate::tracing_v2::interpret_and_trace(
             &engine,
-            |x: JitTracer<ArrayType, f64>| {
-                let outputs: Vec<JitTracer<ArrayType, f64>> = vmap(
-                    |batch: Batch<JitTracer<ArrayType, f64>>| batch.clone() + batch.one_like(),
-                    vec![x.clone(), x],
-                )?;
+            |x| {
+                let outputs: Vec<
+                    Tracer<
+                        ArrayType,
+                        f64,
+                        PrimitiveOp<ArrayType, f64>,
+                        LinearPrimitiveOp<ArrayType, f64>,
+                        ArrayScalarEngine<f64>,
+                    >,
+                > = vmap(|batch| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
                 Ok(outputs[0].clone() + outputs[1].clone())
             },
             2.0f64,
@@ -452,7 +466,7 @@ mod tests {
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let gradients: Vec<f64> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::grad(&engine, |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(), batch)
+                crate::tracing_v2::grad(&engine, |x| x.clone() * x.clone() + x.sin(), batch)
                     .expect("batched grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
@@ -471,12 +485,8 @@ mod tests {
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let results: Vec<(f64, f64)> = vmap(
             |batch: Batch<f64>| {
-                crate::tracing_v2::value_and_grad(
-                    &engine,
-                    |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(),
-                    batch,
-                )
-                .expect("batched value_and_grad should succeed")
+                crate::tracing_v2::value_and_grad(&engine, |x| x.clone() * x.clone() + x.sin(), batch)
+                    .expect("batched value_and_grad should succeed")
             },
             vec![1.0f64, 2.0, 3.0],
         )
@@ -496,13 +506,8 @@ mod tests {
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let results: Vec<(f64, f64)> = vmap(
             |(primals, tangents): (Batch<f64>, Batch<f64>)| {
-                crate::tracing_v2::jvp(
-                    &engine,
-                    |x: JitTracer<ArrayType, f64>| x.clone() * x.clone() + x.sin(),
-                    primals,
-                    tangents,
-                )
-                .expect("batched jvp should succeed")
+                crate::tracing_v2::jvp(&engine, |x| x.clone() * x.clone() + x.sin(), primals, tangents)
+                    .expect("batched jvp should succeed")
             },
             vec![(1.0f64, 1.0f64), (2.0, 0.5), (3.0, 2.0)],
         )
@@ -516,9 +521,9 @@ mod tests {
     }
 
     /// Pins the user-facing property the quick-win in this module delivers: a concrete leaf type
-    /// that implements only `Traceable + Value + Add + ZeroLike + OneLike` — without `Sin`,
+    /// that implements only `Traceable + Value + Add + ZeroLike + OneLike` â€” without `Sin`,
     /// `Cos`,
-    /// `MatrixOps`, or `ReshapeOps` — must still be usable through [`vmap`] for programs that only
+    /// `MatrixOps`, or `ReshapeOps` â€” must still be usable through [`vmap`] for programs that only
     /// exercise `Add`. Previously, the concrete [`VMapInvocationLeaf`] impl carried the full
     /// `Add + Mul + Neg + Sin + Cos + MatrixOps + ReshapeOps` union and rejected this case at
     /// compile time. The impl

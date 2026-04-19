@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        JitTracer, LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, Value, ZeroLike,
+        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, Tracer, Value, ZeroLike,
         engine::Engine,
         linear::{
             linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
@@ -169,25 +169,26 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike, O: Clone>
-    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>
-    for RematerializeOp<ArrayType, V, O>
+impl<E, V: Traceable<ArrayType> + ZeroLike, O: Clone, L: Clone>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>
+    for RematerializeOp<ArrayType, V, O, L>
 where
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType>,
     O: InterpretableOp<ArrayType, V>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>,
-    O: RematerializeTracingOperation<ArrayType, V, LinearProgramOpRef<V>>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>,
+    O: RematerializeTracingOperation<ArrayType, V, L>,
+    LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>: CoreLinearProgramOp<Tracer<ArrayType, V, O, L, E>>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = JitTracer::apply_staged_op(primal_inputs.as_slice(), O::rematerialize_op(self.clone()))?;
+        let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::rematerialize_op(self.clone()))?;
         let tangent_outputs =
-            replay_program_linearized_jit::<_, _, _, O, LinearProgramOpRef<V>>(self.body().program(), inputs.to_vec())?;
+            replay_program_linearized_jit::<_, _, _, O, L, E>(self.body().program(), inputs.to_vec())?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs.into_iter().map(|output| output.tangent))
@@ -203,9 +204,9 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
     O: InterpretableOp<ArrayType, V>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
+    LinearProgramOpRef<Tracer<ArrayType, V, O>>: CoreLinearProgramOp<Tracer<ArrayType, V, O>>,
 {
     fn jvp(
         &self,
@@ -228,16 +229,14 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone> InterpretableOp<ArrayType, JitTracer<ArrayType, V, O>>
-    for RematerializeOp<ArrayType, V, O>
+impl<V: Traceable<ArrayType>, O: Clone, L: Clone> InterpretableOp<ArrayType, Tracer<ArrayType, V, O, L>>
+    for RematerializeOp<ArrayType, V, O, L>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    O: Op<ArrayType>
-        + InterpretableOp<ArrayType, V>
-        + RematerializeTracingOperation<ArrayType, V, LinearProgramOpRef<V>>,
+    O: Op<ArrayType> + InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
-    fn interpret(&self, inputs: &[JitTracer<ArrayType, V, O>]) -> Result<Vec<JitTracer<ArrayType, V, O>>, TraceError> {
-        JitTracer::apply_staged_op(inputs, O::rematerialize_op(self.clone()))
+    fn interpret(&self, inputs: &[Tracer<ArrayType, V, O, L>]) -> Result<Vec<Tracer<ArrayType, V, O, L>>, TraceError> {
+        Tracer::apply_staged_op(inputs, O::rematerialize_op(self.clone()))
     }
 }
 
@@ -345,9 +344,9 @@ where
     O: Clone + Op<ArrayType> + 'static,
     O: InterpretableOp<ArrayType, V>,
     O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
+    LinearProgramOpRef<Tracer<ArrayType, V, O>>: CoreLinearProgramOp<Tracer<ArrayType, V, O>>,
 {
     let output_primals = body.program.call(input_primals.clone())?;
     let pushforward = linearize_program(engine, body.program(), input_primals)?;
@@ -400,20 +399,22 @@ impl<
 }
 
 /// Already-traced dispatch for [`rematerialize`]: traces the body function into a sub-program and
-/// stages a [`RematerializeOp`] in the enclosing [`JitTracer`] scope. The sub-program is traced
+/// stages a [`RematerializeOp`] in the enclosing [`Tracer`] scope. The sub-program is traced
 /// once over exemplar values and captured as a [`Program`] that lowering can later handle.
 impl<
+    E,
     V: Traceable<ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Clone, To<Self> = Input>,
-    Output: Parameterized<Self, ParameterStructure: Clone, To<Self> = Output>,
+    Input: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone, To<Tracer<ArrayType, V, O, L, E>> = Input>,
+    Output: Parameterized<Tracer<ArrayType, V, O, L, E>, ParameterStructure: Clone, To<Tracer<ArrayType, V, O, L, E>> = Output>,
     O: Clone + Op<ArrayType>,
     L: Clone,
-> RematerializeInvocationLeaf<Input, Output> for JitTracer<ArrayType, V, O, L>
+> RematerializeInvocationLeaf<Input, Output> for Tracer<ArrayType, V, O, L, E>
 where
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<JitTracer<ArrayType, V, O, L>> = Input, To<V> = Input::To<V>>,
-    Output::To<ArrayType>: Parameterized<ArrayType, To<JitTracer<ArrayType, V, O, L>> = Output, To<V> = Output::To<V>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Input, To<V> = Input::To<V>>,
+    Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<ArrayType, V, O, L, E>> = Output, To<V> = Output::To<V>>,
     O: InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TraceError>
@@ -428,7 +429,7 @@ where
             traced_inputs.iter().map(|input| input.tpe().into_owned()).collect::<Vec<_>>(),
         )?;
         let (exemplar_output_types, body_program) =
-            trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, _>(
+            trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
                 |staged_input| Ok(function(staged_input)),
                 traced_inputs.as_slice(),
                 exemplar_input_types,
@@ -452,7 +453,7 @@ where
         );
 
         let staged_outputs =
-            JitTracer::apply_staged_op(traced_inputs.as_slice(), O::rematerialize_op(RematerializeOp::new(body)))?;
+            Tracer::apply_staged_op(traced_inputs.as_slice(), O::rematerialize_op(RematerializeOp::new(body)))?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TraceError::from)
     }
 }
@@ -491,10 +492,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing_v2::{
-        JitTracer, Program, Sin,
+        Program, Sin,
         engine::ArrayScalarEngine,
+        interpret_and_trace,
         linear::{compile_grad, grad, value_and_grad},
-        trace_program,
     };
 
     use super::*;
@@ -515,12 +516,8 @@ mod tests {
     fn test_rematerialize_jit_produces_traced_op() {
         // When used inside jit, rematerialize should produce a "rematerialize" op in the program.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
-            &engine,
-            |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
-            2.0f64,
-        )
-        .unwrap();
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) =
+            interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         approx_eq(output, 2.0f64.sin());
         let ir = program.to_string();
@@ -531,12 +528,8 @@ mod tests {
     fn test_rematerialize_jit_program_rendering() {
         // Check the exact rendering of the jit-traced program containing a rematerialize op.
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, program): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
-            &engine,
-            |x: JitTracer<ArrayType, f64>| Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap()),
-            2.0f64,
-        )
-        .unwrap();
+        let (_, program): (f64, Program<ArrayType, f64, f64, f64>) =
+            interpret_and_trace(&engine, |x| Ok(rematerialize(|y| y.sin(), x).unwrap()), 2.0f64).unwrap();
 
         assert_eq!(
             program.to_string(),
@@ -553,12 +546,7 @@ mod tests {
     fn test_rematerialize_grad_computes_correct_gradient() {
         // grad of rematerialize(sin, x) should be cos(x).
         let engine = ArrayScalarEngine::<f64>::new();
-        let gradient: f64 = grad(
-            &engine,
-            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
-            2.0f64,
-        )
-        .unwrap();
+        let gradient: f64 = grad(&engine, |x| rematerialize(|y| y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         approx_eq(gradient, 2.0f64.cos());
     }
@@ -567,12 +555,8 @@ mod tests {
     fn test_rematerialize_value_and_grad_returns_both() {
         // value_and_grad of rematerialize(sin, x) should give (sin(x), cos(x)).
         let engine = ArrayScalarEngine::<f64>::new();
-        let (value, gradient): (f64, f64) = value_and_grad(
-            &engine,
-            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
-            2.0f64,
-        )
-        .unwrap();
+        let (value, gradient): (f64, f64) =
+            value_and_grad(&engine, |x| rematerialize(|y| y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         approx_eq(value, 2.0f64.sin());
         approx_eq(gradient, 2.0f64.cos());
@@ -582,12 +566,7 @@ mod tests {
     fn test_rematerialize_compile_grad_produces_reusable_gradient() {
         // compile_grad with rematerialize should produce a symbolic gradient program.
         let engine = ArrayScalarEngine::<f64>::new();
-        let compiled = compile_grad(
-            &engine,
-            |x: JitTracer<ArrayType, f64>| rematerialize(|y: JitTracer<ArrayType, f64>| y.sin(), x).unwrap(),
-            2.0f64,
-        )
-        .unwrap();
+        let compiled = compile_grad(&engine, |x| rematerialize(|y| y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         // Verify at the original primal point: d/dx sin(x) = cos(x).
         let grad_at_2 = compiled.call(2.0f64).unwrap();
@@ -605,14 +584,8 @@ mod tests {
     fn test_rematerialize_grad_of_quadratic_plus_sin() {
         // grad of rematerialize(x^2 + sin(x), x) should be 2x + cos(x).
         let engine = ArrayScalarEngine::<f64>::new();
-        let gradient: f64 = grad(
-            &engine,
-            |x: JitTracer<ArrayType, f64>| {
-                rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
-            },
-            2.0f64,
-        )
-        .unwrap();
+        let gradient: f64 =
+            grad(&engine, |x| rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         approx_eq(gradient, 2.0 * 2.0 + 2.0f64.cos());
     }
@@ -621,14 +594,8 @@ mod tests {
     fn test_rematerialize_compile_grad_quadratic_plus_sin() {
         // compile_grad with rematerialize wrapping a multi-op body.
         let engine = ArrayScalarEngine::<f64>::new();
-        let compiled = compile_grad(
-            &engine,
-            |x: JitTracer<ArrayType, f64>| {
-                rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap()
-            },
-            2.0f64,
-        )
-        .unwrap();
+        let compiled =
+            compile_grad(&engine, |x| rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap(), 2.0f64).unwrap();
 
         // d/dx(x^2 + sin(x)) = 2x + cos(x)
         let grad_at_2 = compiled.call(2.0f64).unwrap();
@@ -644,17 +611,14 @@ mod tests {
         let without: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
             let (output, _): (f64, Program<ArrayType, f64, f64, f64>) =
-                trace_program(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 3.0f64)
-                    .unwrap();
+                interpret_and_trace(&engine, |x| Ok(x.clone() * x.clone() + x.sin()), 3.0f64).unwrap();
             output
         };
         let with: f64 = {
             let engine = ArrayScalarEngine::<f64>::new();
-            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
+            let (output, _): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
                 &engine,
-                |x: JitTracer<ArrayType, f64>| {
-                    Ok(rematerialize(|y: JitTracer<ArrayType, f64>| y.clone() * y.clone() + y.sin(), x).unwrap())
-                },
+                |x| Ok(rematerialize(|y| y.clone() * y.clone() + y.sin(), x).unwrap()),
                 3.0f64,
             )
             .unwrap();

@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::{
-        JitTracer, LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, ZeroLike,
+        LinearProgramOpRef, LinearTerm, Program, ProgramOpRef, TraceError, Traceable, Tracer, ZeroLike,
         engine::Engine,
         linear::{linearize_program, replay_program_linearized_jit, transpose_linear_program_with_output_examples},
     },
@@ -201,30 +201,29 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + ZeroLike, O: Clone>
-    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>
-    for VMapOp<ArrayType, V, O>
+impl<E, V: Traceable<ArrayType> + ZeroLike, O: Clone, L: Clone>
+    InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>
+    for VMapOp<ArrayType, V, O, L>
 where
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: Op<ArrayType>,
     O: InterpretableOp<ArrayType, V>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>,
-    O: VMapTracingOperation<ArrayType, V, LinearProgramOpRef<V>>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>,
+    O: VMapTracingOperation<ArrayType, V, L>,
+    LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>: CoreLinearProgramOp<Tracer<ArrayType, V, O, L, E>>,
 {
     fn interpret(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>, TraceError> {
+        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>],
+    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, L, E>>>, TraceError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = JitTracer::apply_staged_op(primal_inputs.as_slice(), O::vmap_op(self.clone()))?;
+        let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::vmap_op(self.clone()))?;
         let lane_input_count = self.body().input_types().len();
         let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
-            let lane_outputs = replay_program_linearized_jit::<_, _, _, O, LinearProgramOpRef<V>>(
-                self.body().program(),
-                lane_inputs.to_vec(),
-            )?;
+            let lane_outputs =
+                replay_program_linearized_jit::<_, _, _, O, L, E>(self.body().program(), lane_inputs.to_vec())?;
             tangent_outputs.extend(lane_outputs.into_iter().map(|output| output.tangent));
         }
         Ok(primal_outputs
@@ -242,9 +241,9 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
     O: InterpretableOp<ArrayType, V>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
+    LinearProgramOpRef<Tracer<ArrayType, V, O>>: CoreLinearProgramOp<Tracer<ArrayType, V, O>>,
 {
     fn jvp(
         &self,
@@ -269,14 +268,14 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone> InterpretableOp<ArrayType, JitTracer<ArrayType, V, O>>
-    for VMapOp<ArrayType, V, O>
+impl<V: Traceable<ArrayType>, O: Clone, L: Clone> InterpretableOp<ArrayType, Tracer<ArrayType, V, O, L>>
+    for VMapOp<ArrayType, V, O, L>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, LinearProgramOpRef<V>>,
+    O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
-    fn interpret(&self, inputs: &[JitTracer<ArrayType, V, O>]) -> Result<Vec<JitTracer<ArrayType, V, O>>, TraceError> {
-        JitTracer::apply_staged_op(inputs, O::vmap_op(self.clone()))
+    fn interpret(&self, inputs: &[Tracer<ArrayType, V, O, L>]) -> Result<Vec<Tracer<ArrayType, V, O, L>>, TraceError> {
+        Tracer::apply_staged_op(inputs, O::vmap_op(self.clone()))
     }
 }
 
@@ -387,9 +386,9 @@ where
     O: Clone + Op<ArrayType> + 'static,
     O: InterpretableOp<ArrayType, V>,
     O: DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, LinearProgramOpRef<V>>, O, LinearProgramOpRef<V>>,
-    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O>>>,
+    O: InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O>>>,
     LinearProgramOpRef<V>: CoreLinearProgramOp<V>,
-    LinearProgramOpRef<JitTracer<ArrayType, V, O>>: CoreLinearProgramOp<JitTracer<ArrayType, V, O>>,
+    LinearProgramOpRef<Tracer<ArrayType, V, O>>: CoreLinearProgramOp<Tracer<ArrayType, V, O>>,
 {
     let output_primals = body.program.call(input_primals.clone())?;
     let pushforward = linearize_program(engine, body.program(), input_primals)?;

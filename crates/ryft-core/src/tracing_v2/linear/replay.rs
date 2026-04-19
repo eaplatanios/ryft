@@ -63,37 +63,39 @@ where
         .collect()
 }
 
-pub(crate) fn replay_program_linearized_jit<ProgramInput, ProgramOutput, V, O, L>(
+pub(crate) fn replay_program_linearized_jit<ProgramInput, ProgramOutput, V, O, L, E>(
     program: &Program<ArrayType, V, ProgramInput, ProgramOutput, O>,
-    inputs: Vec<LinearizedTracedValue<V, O, L>>,
-) -> Result<Vec<LinearizedTracedValue<V, O, L>>, TraceError>
+    inputs: Vec<LinearizedTracedValue<V, O, L, E>>,
+) -> Result<Vec<LinearizedTracedValue<V, O, L, E>>, TraceError>
 where
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType> + ZeroLike,
     L: Clone + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<V, O, L>> + Clone,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    O: InterpretableOp<ArrayType, LinearizedTracedValue<V, O, L, E>> + Clone,
 {
-    replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L>, |op, values| {
-        InterpretableOp::<ArrayType, LinearizedTracedValue<V, O, L>>::interpret(op, &values)
+    replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L, E>, |op, values| {
+        InterpretableOp::<ArrayType, LinearizedTracedValue<V, O, L, E>>::interpret(op, &values)
     })
 }
 
-pub(crate) fn linearize_traced_program<V, O, L>(
+pub(crate) fn linearize_traced_program<V, O, L, E>(
     program: &Program<ArrayType, V, Vec<V>, Vec<V>, O>,
-    primals: Vec<JitTracer<ArrayType, V, O, L>>,
-) -> Result<(Vec<JitTracer<ArrayType, V, O, L>>, TracedLinearProgram<V, O, L>), TraceError>
+    primals: Vec<Tracer<ArrayType, V, O, L, E>>,
+) -> Result<(Vec<Tracer<ArrayType, V, O, L, E>>, TracedLinearProgram<V, O, L, E>), TraceError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     O: Clone + Op<ArrayType> + 'static,
     L: Clone + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<V, O, L>> + Clone,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    O: InterpretableOp<ArrayType, LinearizedTracedValue<V, O, L, E>> + Clone,
 {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TraceError::EmptyParameterizedValue)?;
     let input_count = primals.len();
     let builder = Rc::new(RefCell::new(LinearProgramBuilder::<
-        JitTracer<ArrayType, V, O, L>,
-        LinearProgramOpRef<JitTracer<ArrayType, V, O, L>>,
+        Tracer<ArrayType, V, O, L, E>,
+        LinearProgramOpRef<Tracer<ArrayType, V, O, L, E>>,
     >::new()));
     let traced_input = primals
         .into_iter()
@@ -102,7 +104,7 @@ where
             Linearized { primal, tangent: LinearTerm::from_staged_parts(atom, builder.clone()) }
         })
         .collect::<Vec<_>>();
-    let traced_output = replay_program_linearized_jit::<_, _, _, O, L>(program, traced_input)?;
+    let traced_output = replay_program_linearized_jit::<_, _, _, O, L, E>(program, traced_input)?;
     let primal_outputs = traced_output.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
     let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom()).collect::<Vec<_>>();
     drop(traced_output);
@@ -113,7 +115,7 @@ where
         }
     };
     let program = builder
-        .build::<Vec<JitTracer<ArrayType, V, O, L>>, Vec<JitTracer<ArrayType, V, O, L>>>(
+        .build::<Vec<Tracer<ArrayType, V, O, L, E>>, Vec<Tracer<ArrayType, V, O, L, E>>>(
             tangent_outputs,
             vec![Placeholder; input_count],
             vec![Placeholder; primal_outputs.len()],

@@ -1,6 +1,6 @@
 //! Just-in-time staging support for `tracing_v2`.
 //!
-//! The current [`trace_program`] transform captures a program of staged primitive applications and replays that
+//! The current [`interpret_and_trace`] transform captures a program of staged primitive applications and replays that
 //! program with the built-in interpreter. This keeps the API shape close to the eventual compiled-backend design while
 //! remaining easy to test in pure Rust.
 
@@ -24,31 +24,75 @@ use crate::{
 };
 
 /// Tracer used while staging JIT programs.
-#[derive(Clone)]
-pub struct JitTracer<
+pub struct Tracer<
     T: Type + Display,
     V: Traceable<T> + Parameter,
     O: Clone + 'static = ProgramOpRef<V>,
     L: Clone + 'static = crate::tracing_v2::LinearProgramOpRef<V>,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized = dyn Engine<
+        Type = T,
+        Value = V,
+        TracingOperation = O,
+        LinearOperation = L,
+    >,
 > {
     atom: AtomId,
     builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
     staging_error: Rc<RefCell<Option<TraceError>>>,
-    engine: *const dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
+    engine: *const E,
     marker: PhantomData<fn() -> L>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> Parameter for JitTracer<T, V, O, L> {}
-
-impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> std::fmt::Debug
-    for JitTracer<T, V, O, L>
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Clone for Tracer<T, V, O, L, E>
 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("JitTracer").field("atom", &self.atom).finish_non_exhaustive()
+    fn clone(&self) -> Self {
+        Self {
+            atom: self.atom,
+            builder: self.builder.clone(),
+            staging_error: self.staging_error.clone(),
+            engine: self.engine,
+            marker: PhantomData,
+        }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> JitTracer<T, V, O, L> {
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Parameter for Tracer<T, V, O, L, E>
+{
+}
+
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> std::fmt::Debug for Tracer<T, V, O, L, E>
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
+    }
+}
+
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Tracer<T, V, O, L, E>
+{
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -66,7 +110,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
     }
 
     #[inline]
-    pub fn engine(&self) -> &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> {
+    pub fn engine(&self) -> &E {
         // Safe because traced values are confined to the tracing scope: all public tracing entry
         // points require the shared builder to be uniquely reclaimed before they return, so no
         // tracer can outlive the borrowed engine captured here.
@@ -78,7 +122,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
+        engine: &E,
     ) -> Self {
         Self::from_staged_parts(atom, builder, staging_error, engine)
     }
@@ -88,17 +132,12 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
         staging_error: Rc<RefCell<Option<TraceError>>>,
-        engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
+        engine: &E,
     ) -> Self {
         // Safe because traced values are confined to the tracing scope and all public tracing
         // entry points require reclaiming the shared builder before they return, so no staged
         // tracer can outlive the engine reference captured here.
-        let engine = unsafe {
-            std::mem::transmute::<
-                &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
-                *const dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
-            >(engine)
-        };
+        let engine = engine as *const E;
         Self { atom, builder, staging_error, engine, marker: PhantomData }
     }
 
@@ -114,12 +153,12 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
         let staging_error = inputs[0].staging_error.clone();
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
             return Err(TraceError::InternalInvariantViolation(
-                "jit tracer inputs for one staged op must share the same builder",
+                "tracer inputs for one staged op must share the same builder",
             ));
         }
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&staging_error, &input.staging_error)) {
             return Err(TraceError::InternalInvariantViolation(
-                "jit tracer inputs for one staged op must share the same staging error handle",
+                "tracer inputs for one staged op must share the same staging error handle",
             ));
         }
 
@@ -130,7 +169,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
                 input_atoms
                     .iter()
                     .map(|input| {
-                        builder_borrow.atom(*input).expect("jit tracer input atoms should exist").tpe().into_owned()
+                        builder_borrow.atom(*input).expect("tracer input atoms should exist").tpe().into_owned()
                     })
                     .collect::<Vec<_>>()
                     .as_slice(),
@@ -193,26 +232,45 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> Typed<T> for JitTracer<T, V, O, L> {
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Typed<T> for Tracer<T, V, O, L, E>
+{
     #[inline]
     fn tpe(&self) -> Cow<'_, T> {
         Cow::Owned(
             self.builder
                 .borrow()
                 .atom(self.atom)
-                .expect("jit tracer atom should exist in its staging builder")
+                .expect("tracer atom should exist in its staging builder")
                 .tpe()
                 .into_owned(),
         )
     }
 }
 
-impl<T: Type + Display + 'static, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> Traceable<T>
-    for JitTracer<T, V, O, L>
+impl<
+    T: Type + Display + 'static,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+> Traceable<T> for Tracer<T, V, O, L, E>
 {
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> ZeroLike for JitTracer<T, V, O, L> {
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> ZeroLike for Tracer<T, V, O, L, E>
+{
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.tpe().into_owned());
@@ -227,7 +285,14 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static> OneLike for JitTracer<T, V, O, L> {
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> OneLike for Tracer<T, V, O, L, E>
+{
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.tpe().into_owned());
@@ -242,8 +307,13 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + 'static, L: Clone + 'static>
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: AddTracingOperation<T, V> + 'static, L: Clone + 'static> Add
-    for JitTracer<T, V, O, L>
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: AddTracingOperation<T, V> + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Add for Tracer<T, V, O, L, E>
 where
     O: Op<T>,
 {
@@ -255,8 +325,13 @@ where
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: MulTracingOperation<T, V> + 'static, L: Clone + 'static> Mul
-    for JitTracer<T, V, O, L>
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: MulTracingOperation<T, V> + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Mul for Tracer<T, V, O, L, E>
 where
     O: Op<T>,
 {
@@ -268,8 +343,13 @@ where
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: NegTracingOperation<T, V> + 'static, L: Clone + 'static> Neg
-    for JitTracer<T, V, O, L>
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: NegTracingOperation<T, V> + 'static,
+    L: Clone + 'static,
+    E: Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> Neg for Tracer<T, V, O, L, E>
 where
     O: Op<T>,
 {
@@ -281,22 +361,32 @@ where
     }
 }
 
-/// Stages `function` using the staged op set selected by `engine`.
-pub fn trace_program<F, Input, Output, T, V, O, L>(
-    engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
+pub(crate) type ConcreteTracer<E> = Tracer<
+    <E as Engine>::Type,
+    <E as Engine>::Value,
+    <E as Engine>::TracingOperation,
+    <E as Engine>::LinearOperation,
+    E,
+>;
+
+/// Stages `function`, interprets the resulting program on the supplied concrete inputs, and returns
+/// both the interpreted output and the staged program.
+pub fn interpret_and_trace<E, F, Input, Output>(
+    engine: &E,
     function: F,
     input: Input,
-) -> Result<(Output, Program<T, V, Input, Output, O>), TraceError>
+) -> Result<(Output, Program<E::Type, E::Value, Input, Output, E::TracingOperation>), TraceError>
 where
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    O: Clone + 'static + InterpretableOp<T, V>,
-    L: Clone + 'static,
-    Input: Parameterized<V, ParameterStructure: Clone>,
-    Output: Parameterized<V, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
-    Output::Family: ParameterizedFamily<JitTracer<T, V, O, L>>,
-    F: FnOnce(Input::To<JitTracer<T, V, O, L>>) -> Result<Output::To<JitTracer<T, V, O, L>>, TraceError>,
+    E: Engine + ?Sized + 'static,
+    E::Type: Type + Display + Parameter,
+    E::Value: Traceable<E::Type>,
+    E::TracingOperation: Clone + 'static + InterpretableOp<E::Type, E::Value>,
+    E::LinearOperation: Clone + 'static,
+    Input: Parameterized<E::Value, ParameterStructure: Clone>,
+    Output: Parameterized<E::Value, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<ConcreteTracer<E>>,
+    Output::Family: ParameterizedFamily<ConcreteTracer<E>>,
+    F: FnOnce(Input::To<ConcreteTracer<E>>) -> Result<Output::To<ConcreteTracer<E>>, TraceError>,
     Input::ParameterStructure: PartialEq,
     Output::ParameterStructure: Clone,
 {
@@ -304,52 +394,60 @@ where
     let input_values = input.into_parameters().collect::<Vec<_>>();
     let input_types = input_values.iter().map(|value| value.tpe().into_owned()).collect::<Vec<_>>();
     let mut output_structure = None;
-    let (_, flat_program): (Vec<T>, Program<T, V, Vec<V>, Vec<V>, O>) = trace_program_from_types(
+    let (_, flat_program): (
+        Vec<E::Type>,
+        Program<E::Type, E::Value, Vec<E::Value>, Vec<E::Value>, E::TracingOperation>,
+    ) = trace(
         engine,
         |flat_traced_input| {
             let traced_input =
-                Input::To::<JitTracer<T, V, O, L>>::from_parameters(input_structure.clone(), flat_traced_input)?;
+                Input::To::<ConcreteTracer<E>>::from_parameters(input_structure.clone(), flat_traced_input)?;
             let traced_output = function(traced_input)?;
             output_structure = Some(traced_output.parameter_structure());
             Ok(traced_output.into_parameters().collect::<Vec<_>>())
         },
         input_types,
     )?;
-    let output_structure = output_structure
-        .ok_or(TraceError::InternalInvariantViolation("trace_program did not record the staged output structure"))?;
+    let output_structure = output_structure.ok_or(TraceError::InternalInvariantViolation(
+        "interpret_and_trace did not record the staged output structure",
+    ))?;
     let program = flat_program.clone_with_structures::<Input, Output>(input_structure, output_structure).simplify()?;
     let concrete_input = Input::from_parameters(program.input_structure().clone(), input_values)?;
     Ok((program.call(concrete_input)?, program))
 }
 
-/// Stages `function` directly from type metadata using one explicit staged ordinary operation type.
+/// Stages `function` directly from type metadata using the staged op set selected by `engine`.
 ///
 /// This captures the raw staged program without applying post-trace simplification so callers can
 /// decide whether to keep the unsimplified form or run [`Program::simplify`] themselves.
-pub fn trace_program_from_types<F, Input, Output, T, V, O, L>(
-    engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
+pub fn trace<E, F, Input, Output>(
+    engine: &E,
     function: F,
     input_types: Input,
-) -> Result<(Output, Program<T, V, Input::To<V>, Output::To<V>, O>), TraceError>
+) -> Result<
+    (Output, Program<E::Type, E::Value, Input::To<E::Value>, Output::To<E::Value>, E::TracingOperation>),
+    TraceError,
+>
 where
-    T: Type + Display + Parameter,
-    V: Traceable<T>,
-    O: Clone + 'static + Op<T>,
-    L: Clone + 'static,
-    Input: Parameterized<T, ParameterStructure: Clone>,
-    Output: Parameterized<T, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<JitTracer<T, V, O, L>>,
-    F: FnOnce(Input::To<JitTracer<T, V, O, L>>) -> Result<Output::To<JitTracer<T, V, O, L>>, TraceError>,
+    E: Engine + ?Sized + 'static,
+    E::Type: Type + Display + Parameter,
+    E::Value: Traceable<E::Type>,
+    E::TracingOperation: Clone + 'static + Op<E::Type>,
+    E::LinearOperation: Clone + 'static,
+    Input: Parameterized<E::Type, ParameterStructure: Clone>,
+    Output: Parameterized<E::Type, ParameterStructure: Clone>,
+    Input::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<ConcreteTracer<E>>,
+    Output::Family: ParameterizedFamily<E::Value> + ParameterizedFamily<ConcreteTracer<E>>,
+    F: FnOnce(Input::To<ConcreteTracer<E>>) -> Result<Output::To<ConcreteTracer<E>>, TraceError>,
 {
     let input_structure = input_types.parameter_structure();
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<O, T, V>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::TracingOperation, E::Type, E::Value>::new()));
     let staging_error = Rc::new(RefCell::new(None));
-    let traced_input = Input::To::<JitTracer<T, V, O, L>>::from_parameters(
+    let traced_input = Input::To::<ConcreteTracer<E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
             let atom = builder.borrow_mut().add_input_abstract(r#type);
-            JitTracer::<T, V, O, L>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
+            ConcreteTracer::<E>::from_engine(atom, builder.clone(), staging_error.clone(), engine)
         }),
     )
     .map_err(TraceError::from)?;
@@ -374,7 +472,8 @@ where
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TraceError::InternalInvariantViolation("jit builder escaped the tracing scope")),
     };
-    let program = builder.build::<Input::To<V>, Output::To<V>>(outputs, input_structure, output_structure);
+    let program =
+        builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure);
     Ok((output_types, program))
 }
 
@@ -398,7 +497,8 @@ mod tests {
         let staging_error = Rc::new(RefCell::new(None));
         let atom = builder.borrow_mut().add_input(&3.0f64);
         let engine = ArrayScalarEngine::<f64>::new();
-        let tracer: JitTracer<ArrayType, f64> = JitTracer::from_engine(atom, builder, staging_error, &engine);
+        let tracer: ConcreteTracer<ArrayScalarEngine<f64>> =
+            ConcreteTracer::from_engine(atom, builder, staging_error, &engine);
         let zero = tracer.zero_like();
         assert_eq!(zero.tpe().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
         assert!(zero.atom > atom);
@@ -418,9 +518,9 @@ mod tests {
     #[test]
     fn staged_program_replays_graphs() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = trace_program(
+        let (output, program): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
             &engine,
-            |x: JitTracer<ArrayType, f64>| {
+            |x: ConcreteTracer<ArrayScalarEngine<f64>>| {
                 let squared = x.clone() * x.clone();
                 Ok(squared + x.sin())
             },
@@ -445,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_program_supports_non_array_types() {
+    fn test_interpret_and_trace_supports_non_array_types() {
         use std::fmt;
 
         use ryft_macros::Parameter;
@@ -588,12 +688,9 @@ mod tests {
 
         let scalar_type = TestType("test_scalar");
         let (output, program): (TestValue, Program<TestType, TestValue, (TestValue, TestValue), TestValue, TestAddOp>) =
-            trace_program(
+            interpret_and_trace(
                 &TestEngine,
-                |inputs: (
-                    JitTracer<TestType, TestValue, TestAddOp, TestAddOp>,
-                    JitTracer<TestType, TestValue, TestAddOp, TestAddOp>,
-                )| {
+                |inputs: (ConcreteTracer<TestEngine>, ConcreteTracer<TestEngine>)| {
                     let sum = inputs.0.clone() + inputs.1;
                     let stabilized = sum + inputs.0.zero_like();
                     Ok(stabilized + inputs.0.one_like())
@@ -730,11 +827,9 @@ mod tests {
                 Program<ArrayType, TestAbstractValue, (TestAbstractValue, TestAbstractValue), TestAbstractValue>,
             ),
             TraceError,
-        > = trace_program(
+        > = interpret_and_trace(
             &TestEngine,
-            |inputs: (JitTracer<ArrayType, TestAbstractValue>, JitTracer<ArrayType, TestAbstractValue>)| {
-                Ok(inputs.0 + inputs.1)
-            },
+            |inputs: (ConcreteTracer<TestEngine>, ConcreteTracer<TestEngine>)| Ok(inputs.0 + inputs.1),
             (
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F32) },
                 TestAbstractValue { r#type: ArrayType::scalar(DataType::F64) },
@@ -747,8 +842,12 @@ mod tests {
     #[test]
     fn staged_program_display_renders_the_staged_program() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) =
-            trace_program(&engine, |x: JitTracer<ArrayType, f64>| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
+        let (_, compiled): (f64, Program<ArrayType, f64, f64, f64>) = interpret_and_trace(
+            &engine,
+            |x: ConcreteTracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
+            2.0f64,
+        )
+        .unwrap();
 
         assert_eq!(
             compiled.to_string(),

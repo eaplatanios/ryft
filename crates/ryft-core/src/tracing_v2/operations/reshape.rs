@@ -19,7 +19,7 @@ use crate::{
         batch::Batch,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
-        jit::JitTracer,
+        jit::Tracer,
         linear::LinearTerm,
     },
     types::{ArrayType, Shape, Size, Type, Typed},
@@ -260,8 +260,12 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<V: Traceable<ArrayType>, O: ReshapeTracingOperation<ArrayType, V>, L: Clone> ReshapeOps
-    for JitTracer<ArrayType, V, O, L>
+impl<
+    V: Traceable<ArrayType>,
+    O: ReshapeTracingOperation<ArrayType, V>,
+    L: Clone,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+> ReshapeOps for Tracer<ArrayType, V, O, L, E>
 where
     O: Op<ArrayType>,
 {
@@ -271,7 +275,7 @@ where
         if input_type == output_type {
             return Ok(self);
         }
-        Ok(JitTracer::apply_staged_op(std::slice::from_ref(&self), O::reshape_op(input_type, output_type))?
+        Ok(Tracer::apply_staged_op(std::slice::from_ref(&self), O::reshape_op(input_type, output_type))?
             .into_iter()
             .next()
             .expect("reshape should produce one traced output"))
@@ -464,7 +468,7 @@ mod tests {
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing_v2::{
-            JitTracer, LinearProgramBuilder, Program, operations::matrix::ndarray_support::Array2Engine, trace_program,
+            LinearProgramBuilder, Program, interpret_and_trace, operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},
     };
@@ -694,14 +698,8 @@ mod tests {
         let (_, compiled): (
             ndarray::Array2<f64>,
             Program<ArrayType, ndarray::Array2<f64>, ndarray::Array2<f64>, ndarray::Array2<f64>>,
-        ) = trace_program(
-            &engine,
-            |x: JitTracer<ArrayType, ndarray::Array2<f64>>| {
-                x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)]))
-            },
-            input,
-        )
-        .unwrap();
+        ) = interpret_and_trace(&engine, |x| x.reshape(Shape::new(vec![Size::Static(1), Size::Static(4)])), input)
+            .unwrap();
 
         assert_eq!(
             compiled.to_string(),

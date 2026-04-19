@@ -11,9 +11,9 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, JitTracer, LinearOperation, LinearPrimitiveOp,
+        AtomId, Cos, CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp,
         LinearProgramBuilder, LinearTerm, Linearized, MatrixOps, OneLike, Op, PrimitiveOp, Program, ProgramBuilder,
-        Sin, TraceError, Traceable, ZeroLike, engine::Engine, forward::JvpTracer,
+        Sin, TraceError, Traceable, Tracer, ZeroLike, engine::Engine, forward::JvpTracer,
     },
     types::{ArrayType, Typed},
 };
@@ -60,7 +60,7 @@ pub enum LinearShardMapEvalMode {
 ///
 /// `captured_global_primals` holds the staging-program atom ids of the primals captured at linearization time. The
 /// vector is empty for tensor-leaf shard-map ops (where captures are never read) and populated with atom ids for
-/// tracer-leaf ops, where `ShardMapOp<ShardMapTracer>::interpret` reifies each atom back into a `JitTracer`.
+/// tracer-leaf ops, where `ShardMapOp<ShardMapTracer>::interpret` reifies each atom back into a `Tracer`.
 #[derive(Clone)]
 struct LinearShardMapState {
     captured_global_primals: Vec<AtomId>,
@@ -169,6 +169,7 @@ impl ShardMapOp<ShardMapTensor> {
                 XlaPrimitiveOp,
                 LinearPrimitiveOp<ArrayType, ShardMapTensor>,
                 LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+                crate::experimental::engine::XlaEngine<'static>,
                 _,
             >(self.clone())
             .with_extension(self.clone())
@@ -369,7 +370,7 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for ShardMapOp<Shard
             primal_inputs.iter().map(|input| ShardMapTensor::new(input.tpe().into_owned())).collect::<Vec<_>>();
         let _primal_output_values = InterpretableOp::interpret(self, primal_values.as_slice())?;
         let primal_outputs =
-            JitTracer::apply_staged_op(primal_inputs.as_slice(), XlaPrimitiveOp::ShardMap(Box::new(self.clone())))?;
+            Tracer::apply_staged_op(primal_inputs.as_slice(), XlaPrimitiveOp::ShardMap(Box::new(self.clone())))?;
 
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let tangent_outputs = LinearTerm::apply_staged_op(
@@ -501,11 +502,11 @@ impl
     }
 }
 
-impl InterpretableOp<ArrayType, Linearized<JitTracer<ArrayType, ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
+impl InterpretableOp<ArrayType, Linearized<Tracer<ArrayType, ShardMapTracer>>> for ShardMapOp<ShardMapTracer> {
     fn interpret(
         &self,
-        _inputs: &[Linearized<JitTracer<ArrayType, ShardMapTracer>>],
-    ) -> Result<Vec<Linearized<JitTracer<ArrayType, ShardMapTracer>>>, TraceError> {
+        _inputs: &[Linearized<Tracer<ArrayType, ShardMapTracer>>],
+    ) -> Result<Vec<Linearized<Tracer<ArrayType, ShardMapTracer>>>, TraceError> {
         Err(TraceError::HigherOrderOpFailure {
             op: "eval_linearized_jit",
             message: format!(
@@ -572,7 +573,7 @@ fn reify_captured_global_primals(
     let staging_error = exemplar.staging_error_handle();
     Ok(captured_global_primals
         .iter()
-        .map(|atom| JitTracer::from_staged_parts(*atom, builder.clone(), staging_error.clone(), exemplar.engine()))
+        .map(|atom| Tracer::from_staged_parts(*atom, builder.clone(), staging_error.clone(), exemplar.engine()))
         .collect())
 }
 
@@ -990,8 +991,8 @@ fn factorize_transpose_shard_map_body(
 
 /// Builds one linear shard-map op over abstract tensor leaves.
 ///
-/// Tensor-leaf linear shard-map ops do not read `captured_global_primals` during interpretation or MLIR lowering —
-/// the bodies themselves already encode everything the downstream consumers need — so the capture vector is left
+/// Tensor-leaf linear shard-map ops do not read `captured_global_primals` during interpretation or MLIR lowering â€”
+/// the bodies themselves already encode everything the downstream consumers need â€” so the capture vector is left
 /// empty here.
 fn make_linear_tensor_shard_map(body: &FlatTracedShardMap) -> Result<ShardMapOp<ShardMapTensor>, ShardMapTraceError> {
     let linear_bodies = trace_linear_shard_map_bodies(body)?;
@@ -1066,11 +1067,8 @@ fn apply_flat_traced_shard_map(
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
-    JitTracer::apply_staged_op(
-        traced_inputs.as_slice(),
-        XlaPrimitiveOp::ShardMap(Box::new(ShardMapOp::new(body.clone()))),
-    )
-    .map_err(ShardMapTraceError::from)
+    Tracer::apply_staged_op(traced_inputs.as_slice(), XlaPrimitiveOp::ShardMap(Box::new(ShardMapOp::new(body.clone()))))
+        .map_err(ShardMapTraceError::from)
 }
 
 fn replay_traced_xla_program<
@@ -1262,7 +1260,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             Vec<ShardMapTensor>,
             XlaPrimitiveOp,
         >,
-    ) = ryft_core::tracing_v2::trace_program(
+    ) = ryft_core::tracing_v2::interpret_and_trace(
         &XlaEngine::token(),
         {
             let body = body.clone();
@@ -1301,7 +1299,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             Vec<ShardMapTensor>,
             XlaPrimitiveOp,
         >,
-    ) = ryft_core::tracing_v2::trace_program(
+    ) = ryft_core::tracing_v2::interpret_and_trace(
         &XlaEngine::token(),
         {
             let body = body.clone();
@@ -1383,7 +1381,7 @@ impl ReplayShardMapValue for ShardMapTracer {
         let builder = exemplar.builder_handle();
         let staging_error = exemplar.staging_error_handle();
         let atom = builder.borrow_mut().add_constant(constant.clone());
-        Ok(JitTracer::from_staged_parts(atom, builder, staging_error, exemplar.engine()))
+        Ok(Tracer::from_staged_parts(atom, builder, staging_error, exemplar.engine()))
     }
 
     fn apply_flat_body(body: FlatTracedShardMap, inputs: Vec<Self>) -> Result<Vec<Self>, ShardMapTraceError> {
@@ -1442,7 +1440,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
-    let staged_outputs = JitTracer::apply_staged_op(
+    let staged_outputs = Tracer::apply_staged_op(
         traced_inputs.as_slice(),
         XlaPrimitiveOp::ShardMap(Box::new(ShardMapOp::new(traced.clone()))),
     )?;

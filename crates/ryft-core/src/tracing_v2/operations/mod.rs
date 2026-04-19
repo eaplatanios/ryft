@@ -3,13 +3,13 @@
 //! This module owns the operation universe used by `tracing_v2`. It bundles three layers:
 //!
 //! - **Core traits** ([`Op`], [`InterpretableOp`], [`LinearOperation`], [`DifferentiableOp`],
-//!   [`VectorizableOp`]) — the operation-neutral dispatch interfaces every staged primitive must
+//!   [`VectorizableOp`]) â€” the operation-neutral dispatch interfaces every staged primitive must
 //!   satisfy in order to participate in program construction, replay, and the various transforms.
-//! - **Per-primitive submodules** ([`add`], [`mul`], [`neg`], …) — the concrete semantic op types
-//!   ([`AddOp`], [`MulOp`], …) and their associated hidden staging traits
+//! - **Per-primitive submodules** ([`add`], [`mul`], [`neg`], â€¦) â€” the concrete semantic op types
+//!   ([`AddOp`], [`MulOp`], â€¦) and their associated hidden staging traits
 //!   ([`AddTracingOperation`](add::AddTracingOperation), [`MulTracingOperation`](mul::MulTracingOperation),
 //!   etc.) used to construct closed staged op carriers.
-//! - **Closed default carriers** ([`primitive`], [`custom`]) — [`PrimitiveOp`] / [`LinearPrimitiveOp`]
+//! - **Closed default carriers** ([`primitive`], [`custom`]) â€” [`PrimitiveOp`] / [`LinearPrimitiveOp`]
 //!   and the rule-based [`CustomPrimitive`] / [`LinearCustomPrimitive`] escape hatch.
 //!
 //! # Trait hierarchy
@@ -31,8 +31,8 @@
 //! # Op selection through `Engine`
 //!
 //! The public tracing surface ([`jvp`](crate::tracing_v2::jvp), [`vjp`](crate::tracing_v2::vjp),
-//! [`trace_program`](crate::tracing_v2::trace_program),
-//! [`trace_program_from_types`](crate::tracing_v2::trace_program_from_types), and friends) is
+//! [`interpret_and_trace`](crate::tracing_v2::interpret_and_trace),
+//! [`trace`](crate::tracing_v2::trace), and friends) is
 //! parameterized by an [`Engine`], and the staged op carriers used inside those
 //! transforms are picked by that engine via [`Engine::TracingOperation`] and
 //! [`Engine::LinearOperation`]. This is what keeps the op universe open: a backend contributes
@@ -44,8 +44,8 @@
 //! might need" onto a single bound. Per-op staging is expressed through the small hidden
 //! capability traits that live next to each operation (for example, `add::AddTracingOperation`
 //! and `mul::MulTracingOperation`), and transform code should bound itself on the concrete
-//! engine-selected carrier or on the specific per-op capability traits it actually exercises —
-//! never on a catch-all façade. The [`TracingOperation`] and [`LinearProgramOp`] bundles defined
+//! engine-selected carrier or on the specific per-op capability traits it actually exercises â€”
+//! never on a catch-all faÃ§ade. The [`TracingOperation`] and [`LinearProgramOp`] bundles defined
 //! in this module are additive aliases used only to name the bundle locally; they are not an
 //! extension point and should not grow new "is-supported" requirements.
 
@@ -59,7 +59,7 @@ use crate::{
     parameters::{Parameter, Parameterized},
     sharding::Sharding,
     tracing_v2::{
-        TraceError, Traceable, batch::Batch, engine::Engine, forward::JvpTracer, jit::JitTracer, linear::LinearTerm,
+        TraceError, Traceable, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
     },
     types::{ArrayType, Type, Typed},
 };
@@ -181,13 +181,16 @@ pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<
 }
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
-pub fn lift_jit_constant<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static>(
+pub fn lift_jit_constant<V: Traceable<ArrayType>, O: Clone + 'static, L: Clone + 'static, E>(
     constant: &V,
-    exemplar: &JitTracer<ArrayType, V, O, L>,
-) -> JitTracer<ArrayType, V, O, L> {
+    exemplar: &Tracer<ArrayType, V, O, L, E>,
+) -> Tracer<ArrayType, V, O, L, E>
+where
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+{
     let builder = exemplar.builder_handle();
     let atom = builder.borrow_mut().add_constant(constant.clone());
-    JitTracer::from_staged_parts(atom, builder, exemplar.staging_error_handle(), exemplar.engine())
+    Tracer::from_staged_parts(atom, builder, exemplar.staging_error_handle(), exemplar.engine())
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.
@@ -371,8 +374,8 @@ pub trait VectorizableOp<T: Type, V: Typed<T>>: Op<T> {
 /// Capability bundle for the ordinary staged operation type stored in traced programs.
 ///
 /// A [`TracingOperation`] is the operation flavor carried by the ordinary staged program produced by
-/// transforms like [`trace_program`](crate::tracing_v2::trace_program) and
-/// [`trace_program_from_types`](crate::tracing_v2::trace_program_from_types). In practice this is
+/// transforms like [`interpret_and_trace`](crate::tracing_v2::interpret_and_trace) and
+/// [`trace`](crate::tracing_v2::trace). In practice this is
 /// usually one backend-owned closed
 /// enum such as [`PrimitiveOp`] or `XlaPrimitiveOp`, but the trait is written as an additive bundle
 /// so any type that provides the same capabilities can serve as the carrier.
@@ -404,7 +407,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone, Operation> TracingO
 
 /// Capability bundle for operations that can appear in a staged linear program.
 ///
-/// Like [`TracingOperation`], this is additive — any op that already satisfies the three supertraits
+/// Like [`TracingOperation`], this is additive â€” any op that already satisfies the three supertraits
 /// automatically satisfies [`LinearProgramOp`]. The bundle lists what a linear program needs from
 /// each stored op: shape metadata ([`Op`]), concrete interpretation for replay
 /// ([`InterpretableOp`]), and the reverse-mode transpose rule ([`LinearOperation`]).
@@ -444,33 +447,50 @@ impl<V: Traceable<ArrayType>, O: Clone> CoreLinearProgramOp<V> for O where
 {
 }
 
-/// Capability bundle gathering the linear staging traits needed to drive `JitTracer` replay.
+/// Capability bundle gathering the linear staging traits needed to drive `Tracer` replay.
 ///
 /// This bundle is `'static` because it must satisfy the `'static` requirements imposed by the JIT
-/// tracer's storage of staged equations and is bounded over the [`JitTracer`] flavor that backs
+/// tracer's storage of staged equations and is bounded over the [`Tracer`] flavor that backs
 /// linearized JIT replay rules. Any inner linear operation type that implements
 /// [`LinearAddOperation`](add::LinearAddOperation),
 /// [`LinearNegOperation`](neg::LinearNegOperation), and
-/// [`LinearScaleOperation`](scale::LinearScaleOperation) for the appropriate JitTracer leaf
+/// [`LinearScaleOperation`](scale::LinearScaleOperation) for the appropriate Tracer leaf
 /// automatically satisfies it.
 #[doc(hidden)]
-pub trait JitTracerLinearOperation<V: Traceable<ArrayType>, O: Clone + 'static, OuterLinearOperation: Clone + 'static>:
-    Clone
+pub trait TracerLinearOperation<
+    V: Traceable<ArrayType>,
+    O: Clone + 'static,
+    OuterLinearOperation: Clone + 'static,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation> + ?Sized
+        + 'static = dyn Engine<
+            Type = ArrayType,
+            Value = V,
+            TracingOperation = O,
+            LinearOperation = OuterLinearOperation,
+        >,
+>: Clone
     + 'static
-    + add::LinearAddOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
-    + neg::LinearNegOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
-    + scale::LinearScaleOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
+    + add::LinearAddOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
+    + neg::LinearNegOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
+    + scale::LinearScaleOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
 {
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + 'static, OuterLinearOperation: Clone + 'static, InnerLinearOperation>
-    JitTracerLinearOperation<V, O, OuterLinearOperation> for InnerLinearOperation
+impl<
+    V: Traceable<ArrayType>,
+    O: Clone + 'static,
+    OuterLinearOperation: Clone + 'static,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
+        + ?Sized
+        + 'static,
+    InnerLinearOperation,
+> TracerLinearOperation<V, O, OuterLinearOperation, E> for InnerLinearOperation
 where
     InnerLinearOperation: Clone
         + 'static
-        + add::LinearAddOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
-        + neg::LinearNegOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>
-        + scale::LinearScaleOperation<ArrayType, JitTracer<ArrayType, V, O, OuterLinearOperation>>,
+        + add::LinearAddOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
+        + neg::LinearNegOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>
+        + scale::LinearScaleOperation<ArrayType, Tracer<ArrayType, V, O, OuterLinearOperation, E>>,
 {
 }
 

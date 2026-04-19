@@ -3,17 +3,17 @@
 //! This module defines two closely related but distinct traits that together govern which types can participate in
 //! the tracing system:
 //!
-//! - [`Traceable`] — the base trait for **any** type that can appear as a leaf in a traced computation, whether it
-//!   holds concrete data (like `f64`) or is itself a tracing wrapper (like [`JitTracer<V>`](crate::tracing_v2::JitTracer)).
+//! - [`Traceable`] â€” the base trait for **any** type that can appear as a leaf in a traced computation, whether it
+//!   holds concrete data (like `f64`) or is itself a tracing wrapper (like [`Tracer<V>`](crate::tracing_v2::Tracer)).
 //!   Every leaf in a staged program implements this trait.
 //!
-//! - [`Value`] — a marker subtrait of [`Traceable`] that identifies **concrete, non-tracer** leaves. Types like `f32`,
+//! - [`Value`] â€” a marker subtrait of [`Traceable`] that identifies **concrete, non-tracer** leaves. Types like `f32`,
 //!   `f64`, or backend-backed arrays implement [`Value`]; tracing wrappers like
-//!   [`JitTracer`](crate::tracing_v2::JitTracer) deliberately do **not**. This distinction exists to resolve Rust
+//!   [`Tracer`](crate::tracing_v2::Tracer) deliberately do **not**. This distinction exists to resolve Rust
 //!   trait-coherence conflicts: transforms such as `jvp`, `grad`, and `vmap` each provide two blanket implementations
-//!   of their dispatch trait — one for concrete leaves (`V: Value`) that performs eager evaluation, and one for
-//!   `JitTracer<V>` that stages the operation symbolically. Without the [`Value`] marker, both impls would match
-//!   `JitTracer<V>` (since it implements [`Traceable`]), and the compiler would reject the overlap.
+//!   of their dispatch trait â€” one for concrete leaves (`V: Value`) that performs eager evaluation, and one for
+//!   `Tracer<V>` that stages the operation symbolically. Without the [`Value`] marker, both impls would match
+//!   `Tracer<V>` (since it implements [`Traceable`]), and the compiler would reject the overlap.
 //!
 //! The traits are intentionally small so that future tensor-like leaf types, including PJRT-backed arrays, can adopt
 //! the tracing machinery by implementing a compact set of behaviors.
@@ -27,24 +27,24 @@ use crate::{
 
 /// Marker trait that identifies concrete, non-tracer leaves.
 ///
-/// [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real data — scalars like `f32`, dense
-/// arrays, backend-backed tensors, etc. Tracing wrappers such as [`JitTracer`](crate::tracing_v2::JitTracer) must
+/// [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real data â€” scalars like `f32`, dense
+/// arrays, backend-backed tensors, etc. Tracing wrappers such as [`Tracer`](crate::tracing_v2::Tracer) must
 /// **not** implement this trait.
 ///
 /// The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket impls apart.
 /// Each composable transform (e.g., `jvp`, `grad`, `vmap`) provides:
 ///
-/// 1. an impl for `V: Value<T>` — eager dispatch that evaluates the transform on concrete data, and
-/// 2. an impl for `JitTracer<V>` — symbolic dispatch that stages the transform into the enclosing traced program.
+/// 1. an impl for `V: Value<T>` â€” eager dispatch that evaluates the transform on concrete data, and
+/// 2. an impl for `Tracer<V>` â€” symbolic dispatch that stages the transform into the enclosing traced program.
 ///
-/// Because `JitTracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
+/// Because `Tracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
 pub trait Value<T: Type>: Traceable<T> {}
 
 /// Base trait for any leaf type that can participate in traced computations.
 ///
-/// [`Traceable`] is implemented by **every** type that can appear as a leaf in a staged program — both concrete data
+/// [`Traceable`] is implemented by **every** type that can appear as a leaf in a staged program â€” both concrete data
 /// types (e.g., `f32`, `f64`, backend arrays) and tracing wrappers (e.g.,
-/// [`JitTracer`](crate::tracing_v2::JitTracer)). It ties each leaf to a type descriptor `T` via [`Typed`], while
+/// [`Tracer`](crate::tracing_v2::Tracer)). It ties each leaf to a type descriptor `T` via [`Typed`], while
 /// deliberately not implying eager numeric operations such as [`Sin`](crate::tracing_v2::Sin) or
 /// differentiation-specific capabilities
 /// such as [`ZeroLike`]. Those requirements live on the primitive operations and transforms that actually need them.
@@ -69,13 +69,13 @@ pub trait Value<T: Type>: Traceable<T> {}
 ///
 /// # Implementing [`Traceable`] for new leaf types
 ///
-/// The bound is rarely a real constraint — in practice, the rule is simply "own your data":
+/// The bound is rarely a real constraint â€” in practice, the rule is simply "own your data":
 ///
 /// - Small [`Copy`] scalars (`f32`, `i32`, `half::bf16`, ...) satisfy `'static` trivially and can implement
 ///   [`Traceable`] directly, as the built-in scalar impls below illustrate.
 /// - Heavier payloads (array buffers, tensors, device allocations) should wrap the underlying handle in
 ///   [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded cases). This keeps the leaf cheaply
-///   cloneable — which the [`Clone`] supertrait also demands — and severs any tie to a caller's scope. PJRT-backed
+///   cloneable â€” which the [`Clone`] supertrait also demands â€” and severs any tie to a caller's scope. PJRT-backed
 ///   arrays and similar backend values all take this shape.
 ///
 /// Avoid leaf types that borrow from external state: a reference-carrying wrapper cannot be baked into a staged
@@ -86,12 +86,12 @@ pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> + 'static {
     /// Returns `true` if every element of this value is exactly zero.
     ///
     /// The program builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)
-    /// to detect and eliminate algebraic identities at staging time — for example, folding `x + 0` into `x` or `x * 0`
+    /// to detect and eliminate algebraic identities at staging time â€” for example, folding `x + 0` into `x` or `x * 0`
     /// into `0` without emitting the operation into the staged program.
     ///
     /// The default returns `false`, which is always safe: it simply opts the value out of identity-based
     /// simplification. Concrete leaf types that can inspect their contents (e.g., `f32`, dense arrays) should override
-    /// this to return an accurate answer. Tracing wrappers like [`JitTracer`](crate::tracing_v2::JitTracer) cannot
+    /// this to return an accurate answer. Tracing wrappers like [`Tracer`](crate::tracing_v2::Tracer) cannot
     /// meaningfully inspect their contents at staging time and therefore keep the default.
     #[inline]
     fn is_zero(&self) -> bool {

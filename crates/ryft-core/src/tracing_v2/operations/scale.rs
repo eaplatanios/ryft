@@ -13,14 +13,14 @@ use crate::tracing_v2::{
     batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
-    jit::JitTracer,
+    jit::Tracer,
     linear::LinearTerm,
 };
 use crate::types::{ArrayType, Type, Typed};
 
 use super::{
-    DifferentiableOp, InterpretableOp, JitTracerLinearOperation, LinearOperation, Op, VectorizableOp,
-    expect_input_count, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
+    DifferentiableOp, InterpretableOp, LinearOperation, Op, TracerLinearOperation, VectorizableOp, expect_input_count,
+    lift_jit_constant, mul::MulTracingOperation, unary_abstract,
 };
 
 /// Hidden staging trait for the scaling primitive.
@@ -117,11 +117,14 @@ impl<
     V: Traceable<ArrayType> + ZeroLike + Mul<Output = V>,
     O: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V>,
     OuterLinearOperation: Clone + 'static,
-    InnerLinearOperation: JitTracerLinearOperation<V, O, OuterLinearOperation>,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
+        + ?Sized
+        + 'static,
+    InnerLinearOperation: TracerLinearOperation<V, O, OuterLinearOperation, E>,
 >
     InterpretableOp<
         ArrayType,
-        crate::tracing_v2::linear::Linearized<JitTracer<ArrayType, V, O, OuterLinearOperation>, InnerLinearOperation>,
+        crate::tracing_v2::linear::Linearized<Tracer<ArrayType, V, O, OuterLinearOperation, E>, InnerLinearOperation>,
     > for ScaleOp<ArrayType, V>
 where
     O: Op<ArrayType>,
@@ -129,13 +132,13 @@ where
     fn interpret(
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<
-            JitTracer<ArrayType, V, O, OuterLinearOperation>,
+            Tracer<ArrayType, V, O, OuterLinearOperation, E>,
             InnerLinearOperation,
         >],
     ) -> Result<
         Vec<
             crate::tracing_v2::linear::Linearized<
-                JitTracer<ArrayType, V, O, OuterLinearOperation>,
+                Tracer<ArrayType, V, O, OuterLinearOperation, E>,
                 InnerLinearOperation,
             >,
         >,
