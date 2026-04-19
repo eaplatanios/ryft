@@ -150,55 +150,6 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
     }
 
-    /// Evaluates every atom in the program on the supplied flat input values.
-    ///
-    /// This is the lowest-level replay helper in the module. [`Program::call`] builds on it to
-    /// translate between structured parameterized values and the flat leaf vectors stored by the IR.
-    pub fn evaluate_atom_values(&self, input_values: Vec<V>) -> Result<Vec<V>, TracingError>
-    where
-        O: InterpretableOp<T, V>,
-    {
-        if input_values.len() != self.input_ids.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: input_values.len() });
-        }
-
-        let mut values = vec![None; self.atoms.len()];
-        for (atom, value) in self.input_ids.iter().copied().zip(input_values) {
-            values[atom.index] = Some(value);
-        }
-
-        for (atom_index, atom) in self.atoms.iter().enumerate() {
-            if let Atom::Constant(value) = atom {
-                values[atom_index] = Some(value.clone());
-            }
-        }
-
-        for instruction in &self.instructions {
-            let inputs = instruction
-                .inputs
-                .iter()
-                .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
-                .collect::<Result<Vec<_>, _>>()?;
-            let outputs = instruction.operation.interpret(inputs.as_slice())?;
-            if outputs.len() != instruction.outputs.len() {
-                return Err(TracingError::InvalidOutputCount {
-                    expected: instruction.outputs.len(),
-                    got: outputs.len(),
-                });
-            }
-
-            for (atom, value) in instruction.outputs.iter().copied().zip(outputs) {
-                values[atom.index] = Some(value);
-            }
-        }
-
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(atom_index, value)| value.ok_or(TracingError::UnboundAtomId { id: AtomId { index: atom_index } }))
-            .collect()
-    }
-
     /// Clones this program while replacing only the typed input/output structures.
     ///
     /// Many transforms trace or linearize through a flattened `Vec<V>` view of a structured input.
@@ -239,7 +190,46 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             return Err(TracingError::MismatchedParameterStructure);
         }
 
-        let values = self.evaluate_atom_values(input.into_parameters().collect::<Vec<_>>())?;
+        let input_values = input.into_parameters().collect::<Vec<_>>();
+        if input_values.len() != self.input_ids.len() {
+            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: input_values.len() });
+        }
+
+        let mut values = vec![None; self.atoms.len()];
+        for (atom, value) in self.input_ids.iter().copied().zip(input_values) {
+            values[atom.index] = Some(value);
+        }
+
+        for (atom_index, atom) in self.atoms.iter().enumerate() {
+            if let Atom::Constant(value) = atom {
+                values[atom_index] = Some(value.clone());
+            }
+        }
+
+        for instruction in &self.instructions {
+            let inputs = instruction
+                .inputs
+                .iter()
+                .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = instruction.operation.interpret(inputs.as_slice())?;
+            if outputs.len() != instruction.outputs.len() {
+                return Err(TracingError::InvalidOutputCount {
+                    expected: instruction.outputs.len(),
+                    got: outputs.len(),
+                });
+            }
+
+            for (atom, value) in instruction.outputs.iter().copied().zip(outputs) {
+                values[atom.index] = Some(value);
+            }
+        }
+
+        let values = values
+            .into_iter()
+            .enumerate()
+            .map(|(atom_index, value)| value.ok_or(TracingError::UnboundAtomId { id: AtomId { index: atom_index } }))
+            .collect::<Result<Vec<_>, _>>()?;
         let outputs = self.output_ids.iter().map(|output| values[output.index].clone()).collect::<Vec<_>>();
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
