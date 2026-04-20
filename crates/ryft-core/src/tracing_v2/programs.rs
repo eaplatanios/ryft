@@ -660,8 +660,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     /// [`Engine`](crate::tracing_v2::Engine).
     #[inline]
     pub fn add_input(&mut self, r#type: T) -> AtomId {
-        let id = AtomId { index: self.atoms.len() };
-        self.atoms.push(Atom::Variable(r#type));
+        let id = self.add_variable(r#type);
         self.input_ids.push(id);
         id
     }
@@ -677,6 +676,17 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         id
     }
 
+    /// Adds a non-constant variable atom retaining only its abstract type.
+    ///
+    /// This is the common helper used by input staging and by instruction staging paths that need
+    /// to materialize fresh variable outputs in the atom table.
+    #[inline]
+    pub fn add_variable(&mut self, r#type: T) -> AtomId {
+        let id = AtomId { index: self.atoms.len() };
+        self.atoms.push(Atom::Variable(r#type));
+        id
+    }
+
     /// Adds a staged instruction without running abstract or concrete evaluation.
     ///
     /// This is intended for linear program construction where the output types are already known.
@@ -684,16 +694,9 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         &mut self,
         operation: O,
         inputs: Vec<AtomId>,
-        output_abstracts: Vec<T>,
+        output_types: Vec<T>,
     ) -> Vec<AtomId> {
-        let outputs = output_abstracts
-            .into_iter()
-            .map(|r#type| {
-                let id = AtomId { index: self.atoms.len() };
-                self.atoms.push(Atom::Variable(r#type));
-                id
-            })
-            .collect::<Vec<_>>();
+        let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
         self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
         outputs
     }
