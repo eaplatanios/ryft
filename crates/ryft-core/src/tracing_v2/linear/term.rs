@@ -59,10 +59,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
         let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
         let mut borrow = builder.borrow_mut();
         let output_abstracts = op.abstract_eval(
-            &input_atoms
-                .iter()
-                .map(|id| borrow.atom(*id).expect("staged input should exist").r#type().into_owned())
-                .collect::<Vec<_>>(),
+            &input_atoms.iter().map(|id| borrow.atoms[id.index].r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let output_atoms = borrow.add_instruction_prevalidated(op, input_atoms, output_abstracts);
         drop(borrow);
@@ -79,7 +76,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
     #[inline]
     pub fn apply_linear_op(self, op: O) -> Self {
         let mut borrow = self.builder.borrow_mut();
-        let input_atom = borrow.atom(self.atom).expect("staged input should exist");
+        let input_atom = &borrow.atoms[self.atom.index];
         let abstract_value = input_atom.r#type().into_owned();
         let atom = borrow.add_instruction_prevalidated(op, vec![self.atom], vec![abstract_value])[0];
         drop(borrow);
@@ -94,7 +91,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         let mut borrow = self.builder.borrow_mut();
-        let input_atom = borrow.atom(self.atom).expect("staged input should exist");
+        let input_atom = &borrow.atoms[self.atom.index];
         let abstract_value = input_atom.r#type().into_owned();
         let atom =
             borrow.add_instruction_prevalidated(O::linear_add_op(), vec![self.atom, rhs.atom], vec![abstract_value])[0];
@@ -131,7 +128,7 @@ impl<
     fn add(lhs: Self, rhs: Self) -> Self {
         debug_assert!(Rc::ptr_eq(&lhs.builder, &rhs.builder));
         let mut borrow = lhs.builder.borrow_mut();
-        let input_atom = borrow.atom(lhs.atom).expect("staged input should exist");
+        let input_atom = &borrow.atoms[lhs.atom.index];
         let abstract_value = input_atom.r#type().into_owned();
         let atom =
             borrow.add_instruction_prevalidated(O::linear_add_op(), vec![lhs.atom, rhs.atom], vec![abstract_value])[0];

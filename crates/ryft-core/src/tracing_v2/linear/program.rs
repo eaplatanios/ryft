@@ -293,8 +293,7 @@ where
         adjoints[atom.index] = Some(match adjoints[atom.index] {
             Some(existing) => {
                 let mut builder_borrow = builder.borrow_mut();
-                let abstract_value =
-                    builder_borrow.atom(existing).expect("adjoint atom should exist").r#type().into_owned();
+                let abstract_value = builder_borrow.atoms[existing.index].r#type().into_owned();
                 builder_borrow.add_instruction_prevalidated(
                     O::linear_add_op(),
                     vec![existing, contribution],

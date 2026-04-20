@@ -106,25 +106,27 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
             let builder_borrow = builder.borrow();
             input_atoms
                 .iter()
-                .map(|input| {
-                    builder_borrow.atom(*input).expect("tracer input atoms should exist").r#type().into_owned()
-                })
+                .map(|input| builder_borrow.atoms[input.index].r#type().into_owned())
                 .collect::<Vec<_>>()
         };
         let output_count = match op.abstract_eval(input_types.as_slice()) {
             Ok(outputs) => outputs.len(),
             Err(error) => {
-                builder.borrow_mut().record_error_if_absent(error);
+                if builder.borrow().error.is_none() {
+                    builder.borrow_mut().error = Some(error);
+                }
                 1
             }
         };
-        let output_atoms = if builder.borrow().has_error() {
+        let output_atoms = if builder.borrow().error.is_some() {
             vec![inputs[0].atom; output_count]
         } else {
             match builder.borrow_mut().add_instruction(op, input_atoms) {
                 Ok(outputs) => outputs,
                 Err(error) => {
-                    builder.borrow_mut().record_error_if_absent(error);
+                    if builder.borrow().error.is_none() {
+                        builder.borrow_mut().error = Some(error);
+                    }
                     vec![inputs[0].atom; output_count]
                 }
             }
@@ -167,14 +169,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 {
     #[inline]
     fn r#type(&self) -> Cow<'_, E::Type> {
-        Cow::Owned(
-            self.builder
-                .borrow()
-                .atom(self.atom)
-                .expect("tracer atom should exist in its staging builder")
-                .r#type()
-                .into_owned(),
-        )
+        Cow::Owned(self.builder.borrow().atoms[self.atom.index].r#type().into_owned())
     }
 }
 
@@ -303,7 +298,7 @@ where
         (output_structure, output_types, outputs)
     };
 
-    if let Some(tracing_error) = builder.borrow_mut().take_error() {
+    if let Some(tracing_error) = builder.borrow_mut().error.take() {
         return Err(tracing_error);
     }
     let builder = match Rc::try_unwrap(builder) {

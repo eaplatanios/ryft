@@ -630,16 +630,16 @@ impl<
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Operation<T>> {
     /// Atom table accumulated so far, including inputs, constants, and derived outputs.
-    atoms: Vec<Atom<T, V>>,
+    pub atoms: Vec<Atom<T, V>>,
 
     /// Input atom ids in parameter order.
-    input_ids: Vec<AtomId>,
+    pub input_ids: Vec<AtomId>,
 
     /// Instructions recorded so far in execution order.
-    instructions: Vec<Instruction<O>>,
+    pub instructions: Vec<Instruction<O>>,
 
     /// First staging failure recorded while this builder was used for traced execution.
-    error: Option<TracingError>,
+    pub error: Option<TracingError>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
@@ -650,12 +650,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     #[inline]
     pub fn new() -> Self {
         Self { atoms: Vec::new(), input_ids: Vec::new(), instructions: Vec::new(), error: None }
-    }
-
-    /// Returns the [`Atom`] with the provided [`AtomId`] in this [`ProgramBuilder`], if one exists.
-    #[inline]
-    pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
-        self.atoms.get(id.index)
     }
 
     /// Adds a new input atom retaining only its abstract type.
@@ -704,32 +698,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         outputs
     }
 
-    /// Returns the number of instructions added so far.
-    #[inline]
-    pub fn instruction_count(&self) -> usize {
-        self.instructions.len()
-    }
-
-    /// Returns `true` when traced execution has already recorded a staging failure on this builder.
-    #[inline]
-    pub(crate) fn has_error(&self) -> bool {
-        self.error.is_some()
-    }
-
-    /// Records the first staging failure encountered by traced execution on this builder.
-    #[inline]
-    pub(crate) fn record_error_if_absent(&mut self, error: TracingError) {
-        if self.error.is_none() {
-            self.error = Some(error);
-        }
-    }
-
-    /// Removes and returns the first staging failure recorded on this builder, if any.
-    #[inline]
-    pub(crate) fn take_error(&mut self) -> Option<TracingError> {
-        self.error.take()
-    }
-
     /// Adds a staged instruction using abstract evaluation and local algebraic simplification.
     ///
     /// This validates the input atoms through [`Operation::abstract_eval`], applies any local
@@ -739,15 +707,16 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         let input_abstracts = inputs
             .iter()
             .map(|input| {
-                self.atom(*input)
+                self.atoms
+                    .get(input.index)
                     .map(|atom| atom.r#type().into_owned())
                     .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_abstracts = operation.abstract_eval(input_abstracts.as_slice())?;
 
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
+        let is_zero = |id: AtomId| matches!(self.atoms.get(id.index), Some(Atom::Constant(value)) if value.is_zero());
+        let is_one = |id: AtomId| matches!(self.atoms.get(id.index), Some(Atom::Constant(value)) if value.is_one());
         if let Some(simplified) = operation.try_simplify(&inputs, &is_zero, &is_one) {
             return Ok(simplified);
         }
@@ -879,15 +848,15 @@ mod tests {
         // Builder staging stays symbolic even for constant-only instructions.
         let folded = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap();
         assert_eq!(folded.len(), 1);
-        assert!(matches!(builder.atom(folded[0]).unwrap(), Atom::Variable(_)));
-        assert_eq!(builder.instruction_count(), 1);
+        assert!(matches!(builder.atoms.get(folded[0].index), Some(Atom::Variable(_))));
+        assert_eq!(builder.instructions.len(), 1);
 
         // Introduce a non-constant input and combine with the symbolic sum.
         let x = builder.add_input(10.0f64.r#type().into_owned());
         let result = builder.add_instruction(PrimitiveOperation::Mul, vec![folded[0], x]).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Variable(_)));
-        assert_eq!(builder.instruction_count(), 2);
+        assert!(matches!(builder.atoms.get(result[0].index), Some(Atom::Variable(_))));
+        assert_eq!(builder.instructions.len(), 2);
 
         // `with_folded_constants` folds the constant-only sum but leaves dead constants in place.
         let program = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
@@ -934,10 +903,10 @@ mod tests {
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
 
         assert!(
-            matches!(builder.atom(x).unwrap(), Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64))
+            matches!(builder.atoms.get(x.index), Some(Atom::Variable(r#type)) if *r#type == ArrayType::scalar(DataType::F64))
         );
-        assert!(matches!(builder.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
-        assert!(matches!(builder.atom(sum).unwrap(), Atom::Variable(_)));
+        assert!(matches!(builder.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
+        assert!(matches!(builder.atoms.get(sum.index), Some(Atom::Variable(_))));
 
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
         assert!(
@@ -1051,12 +1020,12 @@ mod tests {
 
         let simplified_add = builder.add_instruction(PrimitiveOperation::Add, vec![x, zero]).unwrap();
         assert_eq!(simplified_add, vec![x]);
-        assert_eq!(builder.instruction_count(), 0);
+        assert_eq!(builder.instructions.len(), 0);
 
         let simplified_scale = builder
             .add_instruction(PrimitiveOperation::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
             .unwrap();
         assert_eq!(simplified_scale, vec![x]);
-        assert_eq!(builder.instruction_count(), 0);
+        assert_eq!(builder.instructions.len(), 0);
     }
 }
