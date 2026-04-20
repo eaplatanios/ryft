@@ -2793,7 +2793,7 @@ mod tests {
         let mut builder =
             ProgramBuilder::<ArrayType, ShardMapTensor, crate::experimental::ops::XlaPrimitiveOperation>::new();
         let input = builder.add_input(input_type.clone());
-        let output = builder.add_instruction(op, vec![input], true).unwrap()[0];
+        let output = builder.add_instruction(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)
     }
 

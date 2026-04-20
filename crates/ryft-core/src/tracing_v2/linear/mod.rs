@@ -108,7 +108,7 @@ where
         output_structure: flat_leaf_parameter_structure(output_leaf_count),
         marker: std::marker::PhantomData,
     }
-    .simplify()?;
+    .simplified()?;
     Ok((output_types, traced_program))
 }
 

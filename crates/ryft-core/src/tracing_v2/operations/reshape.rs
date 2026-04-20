@@ -279,7 +279,7 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > ReshapeOps for Tracer<'engine, E>
 where
-    O: InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();

@@ -145,7 +145,7 @@ impl<
 > InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
     for ScaleOperation<ArrayType, V>
 where
-    O: InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn interpret(
         &self,

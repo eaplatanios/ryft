@@ -128,7 +128,7 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > Cos for Tracer<'engine, E>
 where
-    O: InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     #[inline]
     fn cos(self) -> Self {

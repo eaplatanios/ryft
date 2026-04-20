@@ -104,7 +104,7 @@ fn summarize_nested_body(
     label: &'static str,
     body: &FlatTracedShardMap,
 ) -> Result<IrNestedRegionSummary, BenchmarkError> {
-    let program = body.program.simplify()?;
+    let program = body.program.with_folded_constants()?;
     Ok(nested_region(label, summarize_xla_program(&program)?))
 }
 
@@ -176,7 +176,7 @@ where
     Input::Family: ParameterizedFamily<ShardMapTensor>,
     Output::Family: ParameterizedFamily<ShardMapTensor>,
 {
-    let program = traced.program().simplify()?;
+    let program = traced.program().with_folded_constants()?;
     let summary = summarize_xla_program(&program)?;
     Ok(vec![record(
         case_id,

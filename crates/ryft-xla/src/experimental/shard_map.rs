@@ -985,7 +985,7 @@ where
     ///
     ///   - `function_name`: Symbol name to use for the outer `func.func`.
     pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, ShardMapTraceError> {
-        let simplified_program = self.program.simplify()?;
+        let simplified_program = self.program.with_folded_constants()?;
         super::lowering::to_mlir_module(
             &self.shard_map,
             &simplified_program,
@@ -1030,7 +1030,7 @@ where
     ///
     ///   - `function_name`: Symbol name to use for the outer `func.func`.
     pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, ShardMapTraceError> {
-        let simplified_program = self.program.simplify()?;
+        let simplified_program = self.program.with_folded_constants()?;
         super::lowering::to_mlir_module_for_program(
             &simplified_program,
             &self.global_input_types,
@@ -1116,7 +1116,7 @@ impl FlatTracedShardMap {
             self.local_input_types.clone(),
             self.global_output_types.clone(),
             self.local_output_types.clone(),
-            self.program.simplify()?,
+            self.program.with_folded_constants()?,
         ))
     }
 }
@@ -1281,7 +1281,7 @@ where
         )?;
         {
             let (output_types, program) = trace_types(engine, |input| Ok(function(input)), cloned_input_types)?;
-            (output_types, program.simplify()?)
+            (output_types, program.with_folded_constants()?)
         }
     };
     Ok((output_types, program))

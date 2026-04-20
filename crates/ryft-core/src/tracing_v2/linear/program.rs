@@ -242,7 +242,7 @@ where
     Ok(LinearProgram {
         program: builder
             .build::<Input, Output>(output_tangents, program.input_structure.clone(), program.output_structure.clone())
-            .simplify()?,
+            .simplified()?,
         zero,
         marker: PhantomData,
     })
@@ -353,7 +353,7 @@ where
     Ok(LinearProgram {
         program: builder
             .build::<Output, Input>(outputs, linear_body.output_structure.clone(), linear_body.input_structure.clone())
-            .simplify()?,
+            .simplified()?,
         zero: program.zero.clone(),
         marker: PhantomData,
     })

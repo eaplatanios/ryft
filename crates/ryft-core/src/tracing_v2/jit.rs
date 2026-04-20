@@ -112,7 +112,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     /// determine the output arity, and records the instruction unless the scope has already failed.
     pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TracingError>
     where
-        E::TracingOperation: InterpretableOperation<E::Type, E::Value> + Operation<E::Type>,
+        E::TracingOperation: Operation<E::Type>,
     {
         if inputs.is_empty() {
             return Err(TracingError::EmptyParameterizedValue);
@@ -145,7 +145,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
         let output_atoms = if builder.borrow().has_error() {
             vec![inputs[0].atom; output_count]
         } else {
-            match builder.borrow_mut().add_instruction(op, input_atoms, false) {
+            match builder.borrow_mut().add_instruction(op, input_atoms) {
                 Ok(outputs) => outputs,
                 Err(error) => {
                     builder.borrow_mut().record_error_if_absent(error);
@@ -163,7 +163,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     /// Stages a single-input primitive application and returns its unique output.
     pub fn unary(self, op: E::TracingOperation) -> Self
     where
-        E::TracingOperation: InterpretableOperation<E::Type, E::Value> + Operation<E::Type>,
+        E::TracingOperation: Operation<E::Type>,
     {
         Self::apply_staged_op(std::slice::from_ref(&self), op)
             .expect("unary traced staging should preserve non-empty inputs")
@@ -175,7 +175,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     /// Stages a two-input primitive application and returns its unique output.
     pub fn binary(self, rhs: Self, op: E::TracingOperation) -> Self
     where
-        E::TracingOperation: InterpretableOperation<E::Type, E::Value> + Operation<E::Type>,
+        E::TracingOperation: Operation<E::Type>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         Self::apply_staged_op(&[self, rhs], op)
@@ -231,12 +231,8 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 
 impl<
     'engine,
-    E: Engine<
-            Value: Traceable<E::Type>,
-            TracingOperation: AddTracingOperation<E::Type, E::Value>
-                                  + InterpretableOperation<E::Type, E::Value>
-                                  + Operation<E::Type>,
-        > + ?Sized,
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: AddTracingOperation<E::Type, E::Value> + Operation<E::Type>>
+        + ?Sized,
 > Add for Tracer<'engine, E>
 {
     type Output = Self;
@@ -249,12 +245,8 @@ impl<
 
 impl<
     'engine,
-    E: Engine<
-            Value: Traceable<E::Type>,
-            TracingOperation: MulTracingOperation<E::Type, E::Value>
-                                  + InterpretableOperation<E::Type, E::Value>
-                                  + Operation<E::Type>,
-        > + ?Sized,
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: MulTracingOperation<E::Type, E::Value> + Operation<E::Type>>
+        + ?Sized,
 > Mul for Tracer<'engine, E>
 {
     type Output = Self;
@@ -267,12 +259,8 @@ impl<
 
 impl<
     'engine,
-    E: Engine<
-            Value: Traceable<E::Type>,
-            TracingOperation: NegTracingOperation<E::Type, E::Value>
-                                  + InterpretableOperation<E::Type, E::Value>
-                                  + Operation<E::Type>,
-        > + ?Sized,
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: NegTracingOperation<E::Type, E::Value> + Operation<E::Type>>
+        + ?Sized,
 > Neg for Tracer<'engine, E>
 {
     type Output = Self;
@@ -292,7 +280,7 @@ impl<
 ///
 /// The returned pair contains both the structured output metadata inferred during tracing and the
 /// unsimplified staged program itself. Callers that want the canonical simplified form can invoke
-/// [`Program::simplify`](crate::tracing_v2::Program::simplify) afterward.
+/// [`Program::with_folded_constants`](crate::tracing_v2::Program::with_folded_constants) afterward.
 pub fn trace<'engine, E, F, Input, Output>(
     engine: &'engine E,
     function: F,
@@ -404,7 +392,7 @@ where
         output_structure,
         marker: std::marker::PhantomData,
     }
-    .simplify()?;
+    .with_folded_constants()?;
     let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
     Ok((program.interpret(concrete_input)?, program))
 }

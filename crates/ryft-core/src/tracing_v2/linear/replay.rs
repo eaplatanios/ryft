@@ -146,6 +146,6 @@ where
             vec![Placeholder; input_count],
             vec![Placeholder; primal_outputs.len()],
         )
-        .simplify()?;
+        .simplified()?;
     Ok((primal_outputs.clone(), LinearProgram::from_program(program, zero)))
 }
