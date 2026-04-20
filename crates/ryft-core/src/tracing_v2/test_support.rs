@@ -10,7 +10,7 @@ use crate::{
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
         interpret_and_trace(&engine, |x| Ok(x.sin()), 2.0f64).unwrap();
 
     assert_eq!(
@@ -25,10 +25,10 @@ pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
 }
 
 pub(crate) fn assert_reference_program_rendering() {
-    let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+    let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
     let x = builder.add_input(&1.0f64);
     let three = builder.add_constant(3.0f64);
-    let sum = builder.add_instruction(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
+    let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
     let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
     assert_eq!(
@@ -59,8 +59,10 @@ where
 
 pub(crate) fn assert_bilinear_pushforward_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, (f64, f64), f64, LinearPrimitiveOp<ArrayType, f64>>) =
-        jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
+    let (_, pushforward): (
+        f64,
+        LinearProgram<ArrayType, f64, (f64, f64), f64, LinearPrimitiveOperation<ArrayType, f64>>,
+    ) = jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
@@ -79,7 +81,7 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
 
 pub(crate) fn assert_bilinear_jit_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, (f64, f64), f64>) =
+    let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, (f64, f64), f64>) =
         interpret_and_trace(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
@@ -97,7 +99,7 @@ pub(crate) fn assert_bilinear_jit_rendering() {
 
 pub(crate) fn assert_quadratic_pushforward_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64, LinearPrimitiveOp<ArrayType, f64>>) =
+    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64, LinearPrimitiveOperation<ArrayType, f64>>) =
         jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
     assert_eq!(

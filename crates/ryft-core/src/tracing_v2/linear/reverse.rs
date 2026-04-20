@@ -31,9 +31,9 @@ where
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::LinearOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
+    E::LinearOperation: Clone + Operation<ArrayType>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<
             ArrayType,
             V,
             LinearTerm<ArrayType, V, E::LinearOperation>,
@@ -70,15 +70,18 @@ where
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + PartialEq>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
-    O: Clone + Op<ArrayType> + 'static,
-    L: Clone + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
+    L: Clone + Operation<ArrayType> + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
-    O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
+    O: InterpretableOperation<
+            ArrayType,
+            Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>,
+        >,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearReplayOperation<Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
     if primals.parameter_structure() != tangents.parameter_structure() {
@@ -126,16 +129,16 @@ where
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::LinearOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
+    E::LinearOperation: Clone + Operation<ArrayType>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<
             ArrayType,
             V,
             LinearTerm<ArrayType, V, E::LinearOperation>,
             E::TracingOperation,
             E::LinearOperation,
         >,
-    E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
+    E::LinearOperation: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V>,
 {
     let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
@@ -191,15 +194,15 @@ where
     V: for<'engine> Parameterized<V, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
     Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     V::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<
             ArrayType,
             V,
             LinearTerm<ArrayType, V, E::LinearOperation>,
             E::TracingOperation,
             E::LinearOperation,
         >,
-    E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
+    E::LinearOperation: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V>,
 {
     type Value = V;
     type FunctionInput<'engine>
@@ -238,10 +241,12 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    E::TracingOperation:
-        InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
-    E::LinearOperation: Clone + Op<ArrayType> + 'static,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    E::TracingOperation: InterpretableOperation<
+            ArrayType,
+            Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>,
+        >,
+    E::LinearOperation: Clone + Operation<ArrayType> + 'static,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
     type Value = Tracer<'engine, E>;
     type FunctionInput<'call>
@@ -378,9 +383,10 @@ where
                         >>,
             >,
         >,
-    E::TracingOperation: Clone + Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: for<'engine> InterpretableOp<
+    E::TracingOperation: Clone + Operation<ArrayType>,
+    E::LinearOperation: Operation<ArrayType>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: for<'engine> InterpretableOperation<
             ArrayType,
             Linearized<
                 Tracer<'engine, dyn Engine<
@@ -389,7 +395,7 @@ where
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
-                LinearPrimitiveOp<
+                LinearPrimitiveOperation<
                     ArrayType,
                     Tracer<'engine, dyn Engine<
                                 Type = ArrayType,
@@ -400,7 +406,7 @@ where
                 >,
             >,
         >,
-    for<'engine> LinearPrimitiveOp<
+    for<'engine> LinearPrimitiveOperation<
         ArrayType,
         Tracer<'engine, dyn Engine<
                     Type = ArrayType,
@@ -408,7 +414,7 @@ where
                     TracingOperation = E::TracingOperation,
                     LinearOperation = E::LinearOperation,
                 >>,
-    >: CoreLinearProgramOp<
+    >: CoreLinearProgramOperation<
         Tracer<'engine, dyn Engine<
                     Type = ArrayType,
                     Value = V,

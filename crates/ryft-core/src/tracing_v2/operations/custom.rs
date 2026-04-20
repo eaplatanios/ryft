@@ -2,9 +2,9 @@
 //!
 //! [`CustomPrimitive`] is the rule-based escape hatch that lets user code (or downstream backends)
 //! introduce new staged operations without touching the closed
-//! [`PrimitiveOp`](super::PrimitiveOp) carrier. Each primitive carries a required base op for
+//! [`PrimitiveOperation`](super::PrimitiveOperation) carrier. Each primitive carries a required base op for
 //! shape metadata and concrete interpretation, plus optional rules for the various transforms
-//! ([`LinearOperation`] for transpose, [`DifferentiableOp`] for JVP, [`VectorizableOp`] for
+//! ([`LinearOperation`] for transpose, [`DifferentiableOperation`] for JVP, [`VectorizableOperation`] for
 //! batching, and an optional linearized-JIT replay rule for nested transforms).
 //!
 //! [`LinearCustomPrimitive`] is the linear-only sibling that guarantees a transpose rule is
@@ -31,9 +31,9 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearAddOperation, LinearNegOperation, LinearOperation, LinearScaleOperation,
-    Op, VectorizableOp,
-    primitive::{LinearPrimitiveOp, PrimitiveOp},
+    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
+    LinearScaleOperation, Operation, VectorizableOperation,
+    primitive::{LinearPrimitiveOperation, PrimitiveOperation},
 };
 
 /// Hidden staging trait for the custom-primitive escape hatch.
@@ -91,9 +91,10 @@ impl<T: Type, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
 /// bound is required at construction time but does not appear on the outer [`CustomPrimitive`] struct.
 struct LinearizedJitRule<
     V: Traceable<ArrayType> + ZeroLike,
-    O: Clone + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
     OuterLinearOperation: Clone + 'static,
     InnerLinearOperation: Clone
+        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'static, E>>
         + LinearNegOperation<ArrayType, Tracer<'static, E>>
         + LinearScaleOperation<ArrayType, Tracer<'static, E>>
@@ -101,13 +102,14 @@ struct LinearizedJitRule<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
->(Arc<dyn InterpretableOp<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>>>);
+>(Arc<dyn InterpretableOperation<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>>>);
 
 impl<
     V: Traceable<ArrayType> + ZeroLike,
-    O: Clone + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
     OuterLinearOperation: Clone + 'static,
     InnerLinearOperation: Clone
+        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'static, E>>
         + LinearNegOperation<ArrayType, Tracer<'static, E>>
         + LinearScaleOperation<ArrayType, Tracer<'static, E>>
@@ -132,19 +134,19 @@ struct CanonicalLinearizedJitRule<
     E: Engine<
             Type = ArrayType,
             Value = V,
-            TracingOperation = PrimitiveOp<ArrayType, V>,
-            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+            TracingOperation = PrimitiveOperation<ArrayType, V>,
+            LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
         > + ?Sized
         + 'static,
->(Arc<dyn for<'engine> InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>>>>);
+>(Arc<dyn for<'engine> InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>>>);
 
 impl<
     V: Value<ArrayType> + ZeroLike,
     E: Engine<
             Type = ArrayType,
             Value = V,
-            TracingOperation = PrimitiveOp<ArrayType, V>,
-            LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+            TracingOperation = PrimitiveOperation<ArrayType, V>,
+            LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
         > + ?Sized
         + 'static,
 > CanonicalLinearizedJitRule<V, E>
@@ -158,40 +160,40 @@ impl<
 }
 
 /// Type-erased wrapper for a staged-carrier-specific JVP rule stored inside [`CustomPrimitiveExtensions`].
-struct JvpRule<T: Type + Display, V: Traceable<T> + Parameter, O: Clone, L: Clone>(
-    Arc<dyn DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L>>,
+struct JvpRule<T: Type + Display, V: Traceable<T> + Parameter, O: Clone, L: Clone + Operation<T>>(
+    Arc<dyn DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L>>,
 );
 
-impl<T: Type + Display, V: Traceable<T> + Parameter, O: Clone, L: Clone> JvpRule<T, V, O, L> {
-    fn rule(&self) -> &dyn DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L> {
+impl<T: Type + Display, V: Traceable<T> + Parameter, O: Clone, L: Clone + Operation<T>> JvpRule<T, V, O, L> {
+    fn rule(&self) -> &dyn DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L> {
         self.0.as_ref()
     }
 }
 
-trait CustomBaseOp<T: Type, V: Typed<T>>: Op<T> + InterpretableOp<T, V> {}
+trait CustomBaseOperation<T: Type, V: Typed<T>>: Operation<T> + InterpretableOperation<T, V> {}
 
-impl<Ty: Type, V: Traceable<Ty>, O: Op<Ty> + InterpretableOp<Ty, V>> CustomBaseOp<Ty, V> for O {}
+impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V>> CustomBaseOperation<Ty, V> for O {}
 
-/// Rule-based registration object used by [`PrimitiveOp::Custom`].
+/// Rule-based registration object used by [`PrimitiveOperation::Custom`].
 ///
 /// [`CustomPrimitive`] is the main extensibility seam for the operation system. The base op always
 /// supplies shape metadata and eager interpretation; optional transform rules are registered using
 /// the existing tracing traits directly:
 ///
 /// - [`LinearOperation<ArrayType, V>`] for reverse-mode transpose,
-/// - [`DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V>>`] for forward-mode JVP,
-/// - [`VectorizableOp<ArrayType, V>`] for `vmap`, and
-/// - [`InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>>>`] for fully general linearized-JIT replay.
+/// - [`DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V>>`] for forward-mode JVP,
+/// - [`VectorizableOperation<ArrayType, V>`] for `vmap`, and
+/// - [`InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
 pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Required base op providing abstract evaluation and eager interpretation.
-    base: Arc<dyn CustomBaseOp<T, V>>,
+    base: Arc<dyn CustomBaseOperation<T, V>>,
 
     /// Optional reverse-mode transpose rule for the primitive.
     transpose_rule: Option<Arc<dyn LinearOperation<T, V>>>,
 
     /// Optional batching rule for the primitive.
-    vectorization_rule: Option<Arc<dyn VectorizableOp<T, V>>>,
+    vectorization_rule: Option<Arc<dyn VectorizableOperation<T, V>>>,
 
     /// Typed extension registry carrying backend- or transform-specific extra rules.
     extensions: CustomPrimitiveExtensions<T, V>,
@@ -201,7 +203,7 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
     /// Creates one custom primitive from its required base operation.
     pub fn new<Base>(base: Base) -> Self
     where
-        Base: Op<T> + InterpretableOp<T, V> + 'static,
+        Base: Operation<T> + InterpretableOperation<T, V> + 'static,
     {
         Self {
             base: Arc::new(base),
@@ -224,8 +226,8 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
     pub fn with_jvp_rule_for<O, L, Rule>(mut self, rule: Rule) -> Self
     where
         O: Clone + 'static,
-        L: Clone + 'static,
-        Rule: DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L> + 'static,
+        L: Clone + Operation<T> + 'static,
+        Rule: DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L> + 'static,
     {
         self.extensions.insert(JvpRule::<T, V, O, L>(Arc::new(rule)));
         self
@@ -234,7 +236,7 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
     /// Registers one batching rule.
     pub fn with_vectorization_rule<Rule>(mut self, rule: Rule) -> Self
     where
-        Rule: VectorizableOp<T, V> + 'static,
+        Rule: VectorizableOperation<T, V> + 'static,
     {
         self.vectorization_rule = Some(Arc::new(rule));
         self
@@ -247,17 +249,18 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         rule: Rule,
     ) -> Self
     where
-        O: Clone + 'static,
+        O: Clone + Operation<ArrayType> + 'static,
         OuterLinearOperation: Clone + 'static,
         E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
             + ?Sized
             + 'static,
         InnerLinearOperation: Clone
+            + Operation<ArrayType>
             + LinearAddOperation<ArrayType, Tracer<'static, E>>
             + LinearNegOperation<ArrayType, Tracer<'static, E>>
             + LinearScaleOperation<ArrayType, Tracer<'static, E>>
             + 'static,
-        Rule: InterpretableOp<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>> + 'static,
+        Rule: InterpretableOperation<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>> + 'static,
         Linearized<Tracer<'static, E>, InnerLinearOperation>: Traceable<ArrayType>,
         V: Traceable<ArrayType> + ZeroLike,
     {
@@ -292,9 +295,9 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         TracingError::MissingCustomRule { op: self.base.name(), transform }
     }
 
-    fn jvp_rule<O: Clone + 'static, L: Clone + 'static>(
+    fn jvp_rule<O: Clone + 'static, L: Clone + Operation<T> + 'static>(
         &self,
-    ) -> Result<&dyn DifferentiableOp<T, V, LinearTerm<T, V, L>, O, L>, TracingError> {
+    ) -> Result<&dyn DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L>, TracingError> {
         self.extensions
             .get::<JvpRule<T, V, O, L>>()
             .map(JvpRule::rule)
@@ -306,15 +309,15 @@ impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<A
     /// Registers one forward-mode JVP rule for the canonical core staged carriers.
     pub fn with_jvp_rule<Rule>(self, rule: Rule) -> Self
     where
-        Rule: DifferentiableOp<
+        Rule: DifferentiableOperation<
                 ArrayType,
                 V,
                 LinearTerm<ArrayType, V>,
-                PrimitiveOp<ArrayType, V>,
-                LinearPrimitiveOp<ArrayType, V>,
+                PrimitiveOperation<ArrayType, V>,
+                LinearPrimitiveOperation<ArrayType, V>,
             > + 'static,
     {
-        self.with_jvp_rule_for::<PrimitiveOp<ArrayType, V>, LinearPrimitiveOp<ArrayType, V>, _>(rule)
+        self.with_jvp_rule_for::<PrimitiveOperation<ArrayType, V>, LinearPrimitiveOperation<ArrayType, V>, _>(rule)
     }
 
     /// Registers one linearized-JIT replay rule for the canonical core staged carriers.
@@ -325,11 +328,11 @@ impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<A
         E: Engine<
                 Type = ArrayType,
                 Value = V,
-                TracingOperation = PrimitiveOp<ArrayType, V>,
-                LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                TracingOperation = PrimitiveOperation<ArrayType, V>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
             > + ?Sized
             + 'static,
-        Rule: for<'engine> InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>>> + 'static,
+        Rule: for<'engine> InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>> + 'static,
         for<'engine> Linearized<Tracer<'engine, E>>: Traceable<ArrayType>,
     {
         self.extensions.insert(CanonicalLinearizedJitRule::<V, E>(Arc::new(rule)));
@@ -347,8 +350,8 @@ impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<A
         E: Engine<
                 Type = ArrayType,
                 Value = V,
-                TracingOperation = PrimitiveOp<ArrayType, V>,
-                LinearOperation = LinearPrimitiveOp<ArrayType, V>,
+                TracingOperation = PrimitiveOperation<ArrayType, V>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
             > + ?Sized
             + 'static,
     {
@@ -371,7 +374,7 @@ impl<T: Type + Display, V: Traceable<T>> Display for CustomPrimitive<T, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Op for CustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation for CustomPrimitive<ArrayType, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.base.name()
@@ -393,7 +396,7 @@ impl<V: Traceable<ArrayType>> Op for CustomPrimitive<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> InterpretableOp<ArrayType, V> for CustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for CustomPrimitive<ArrayType, V> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.base.interpret(inputs)
@@ -412,14 +415,14 @@ impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for Custom
     }
 }
 
-impl<V: Traceable<ArrayType> + 'static> VectorizableOp<ArrayType, V> for CustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType> + 'static> VectorizableOperation<ArrayType, V> for CustomPrimitive<ArrayType, V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         self.vectorization_rule.as_deref().ok_or_else(|| self.missing_rule("vectorize"))?.batch(inputs)
     }
 }
 
-impl<V: Traceable<ArrayType> + 'static, O: Clone + 'static, L: Clone + 'static>
-    DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for CustomPrimitive<ArrayType, V>
+impl<V: Traceable<ArrayType> + 'static, O: Clone + 'static, L: Clone + Operation<ArrayType> + 'static>
+    DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for CustomPrimitive<ArrayType, V>
 {
     fn jvp(
         &self,
@@ -432,17 +435,19 @@ impl<V: Traceable<ArrayType> + 'static, O: Clone + 'static, L: Clone + 'static>
 
 impl<
     V: Value<ArrayType> + ZeroLike + 'static,
-    O: Clone + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
     OuterLinearOperation: Clone + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
         + ?Sized
         + 'static,
     InnerLinearOperation: Clone
+        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'static, E>>
         + LinearNegOperation<ArrayType, Tracer<'static, E>>
         + LinearScaleOperation<ArrayType, Tracer<'static, E>>
         + 'static,
-> InterpretableOp<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>> for CustomPrimitive<ArrayType, V>
+> InterpretableOperation<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>>
+    for CustomPrimitive<ArrayType, V>
 where
     Linearized<Tracer<'static, E>, InnerLinearOperation>: Traceable<ArrayType>,
 {
@@ -493,7 +498,7 @@ impl<T: Type + Display, V: Traceable<T>> Display for LinearCustomPrimitive<T, V>
     }
 }
 
-impl<V: Traceable<ArrayType>> Op for LinearCustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation for LinearCustomPrimitive<ArrayType, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.primitive.name()
@@ -515,7 +520,7 @@ impl<V: Traceable<ArrayType>> Op for LinearCustomPrimitive<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> InterpretableOp<ArrayType, V> for LinearCustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for LinearCustomPrimitive<ArrayType, V> {
     #[inline]
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         self.primitive.interpret(inputs)
@@ -543,7 +548,7 @@ mod tests {
 
     use super::*;
     use crate::tracing_v2::{
-        Batch, LinearPrimitiveOp, OneLike, PrimitiveOp, Program, ProgramBuilder, Tracer, TracingError,
+        Batch, LinearPrimitiveOperation, OneLike, PrimitiveOperation, Program, ProgramBuilder, Tracer, TracingError,
         engine::ArrayScalarEngine, grad, interpret_and_trace, jvp, vmap,
     };
     use crate::types::{ArrayType, DataType, Shape};
@@ -567,7 +572,7 @@ mod tests {
         }
     }
 
-    impl Op for ShiftOp {
+    impl Operation for ShiftOp {
         fn name(&self) -> &'static str {
             "test_shift"
         }
@@ -580,7 +585,7 @@ mod tests {
         }
     }
 
-    impl InterpretableOp<ArrayType, f64> for ShiftOp {
+    impl InterpretableOperation<ArrayType, f64> for ShiftOp {
         fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
             if inputs.len() != 1 {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
@@ -602,12 +607,12 @@ mod tests {
     }
 
     impl
-        DifferentiableOp<
+        DifferentiableOperation<
             ArrayType,
             f64,
             LinearTerm<ArrayType, f64>,
-            PrimitiveOp<ArrayType, f64>,
-            LinearPrimitiveOp<ArrayType, f64>,
+            PrimitiveOperation<ArrayType, f64>,
+            LinearPrimitiveOperation<ArrayType, f64>,
         > for ShiftOp
     {
         fn jvp(
@@ -615,8 +620,8 @@ mod tests {
             _engine: &dyn Engine<
                 Type = ArrayType,
                 Value = f64,
-                TracingOperation = PrimitiveOp<ArrayType, f64>,
-                LinearOperation = LinearPrimitiveOp<ArrayType, f64>,
+                TracingOperation = PrimitiveOperation<ArrayType, f64>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, f64>,
             >,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
@@ -627,7 +632,7 @@ mod tests {
         }
     }
 
-    impl VectorizableOp<ArrayType, f64> for ShiftOp {
+    impl VectorizableOperation<ArrayType, f64> for ShiftOp {
         fn batch(&self, inputs: &[Batch<f64>]) -> Result<Vec<Batch<f64>>, TracingError> {
             if inputs.len() != 1 {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
@@ -636,13 +641,13 @@ mod tests {
         }
     }
 
-    impl<'engine, E> InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>>> for ShiftOp
+    impl<'engine, E> InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>> for ShiftOp
     where
         E: Engine<
                 Type = ArrayType,
                 Value = f64,
-                TracingOperation = PrimitiveOp<ArrayType, f64>,
-                LinearOperation = LinearPrimitiveOp<ArrayType, f64>,
+                TracingOperation = PrimitiveOperation<ArrayType, f64>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, f64>,
             > + ?Sized
             + 'static,
     {
@@ -670,12 +675,12 @@ mod tests {
         E: Engine<
                 Type = ArrayType,
                 Value = f64,
-                TracingOperation = PrimitiveOp<ArrayType, f64>,
-                LinearOperation = LinearPrimitiveOp<ArrayType, f64>,
+                TracingOperation = PrimitiveOperation<ArrayType, f64>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, f64>,
             > + ?Sized
             + 'static,
     {
-        Ok(Tracer::apply_staged_op(std::slice::from_ref(&input), PrimitiveOp::Custom(Arc::new(primitive)))?
+        Ok(Tracer::apply_staged_op(std::slice::from_ref(&input), PrimitiveOperation::Custom(Arc::new(primitive)))?
             .into_iter()
             .next()
             .expect("unary custom primitive should produce one output"))
@@ -690,8 +695,8 @@ mod tests {
         E: Engine<
                 Type = ArrayType,
                 Value = f64,
-                TracingOperation = PrimitiveOp<ArrayType, f64>,
-                LinearOperation = LinearPrimitiveOp<ArrayType, f64>,
+                TracingOperation = PrimitiveOperation<ArrayType, f64>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, f64>,
             > + ?Sized
             + 'static,
     {
@@ -703,7 +708,7 @@ mod tests {
         input: Batch<f64>,
         primitive: CustomPrimitive<ArrayType, f64>,
     ) -> Result<Batch<f64>, TracingError> {
-        Ok(VectorizableOp::batch(&PrimitiveOp::Custom(Arc::new(primitive)), &[input])?
+        Ok(VectorizableOperation::batch(&PrimitiveOperation::Custom(Arc::new(primitive)), &[input])?
             .into_iter()
             .next()
             .expect("unary custom primitive should produce one batched output"))
@@ -728,7 +733,7 @@ mod tests {
     fn test_custom_primitive_base_execution_replays_without_optional_rules() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
             interpret_and_trace(
                 &engine,
                 {
@@ -746,7 +751,8 @@ mod tests {
     #[test]
     fn test_custom_primitive_missing_transpose_rule_reports_targeted_error() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new()));
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
         let cotangent_atom = builder.borrow_mut().add_input(&0.0);
         let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder);
 
@@ -777,7 +783,7 @@ mod tests {
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
-        let result: Result<(f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>), TracingError> =
+        let result: Result<(f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>), TracingError> =
             interpret_and_trace(
                 &engine,
                 {
@@ -823,7 +829,7 @@ mod tests {
             Ok(1.0f64),
         );
 
-        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+        let (output, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
             interpret_and_trace(
                 &engine,
                 {

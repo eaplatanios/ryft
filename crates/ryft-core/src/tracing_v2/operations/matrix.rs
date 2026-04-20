@@ -24,8 +24,8 @@ use crate::{
 
 use super::{
     LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation, LinearNegOperation,
-    LinearRightMatMulOperation, LinearScaleOperation, MatMulOp, MatMulTracingOperation, MatrixTransposeOp,
-    MatrixTransposeTracingOperation, Op, VectorizableOp,
+    LinearRightMatMulOperation, LinearScaleOperation, MatMulOperation, MatMulTracingOperation,
+    MatrixTransposeOperation, MatrixTransposeTracingOperation, Operation, VectorizableOperation,
 };
 
 /// Matrix operations required by the tracing prototype.
@@ -232,7 +232,7 @@ impl<
     E: crate::tracing_v2::Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > MatrixOps for Tracer<'engine, E>
 where
-    O: Op<ArrayType>,
+    O: Operation<ArrayType>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
@@ -251,7 +251,7 @@ where
 impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        single_batch_output(MatMulOp.batch(&[self, rhs]).expect("batched matmul rule should succeed"), "matmul")
+        single_batch_output(MatMulOperation.batch(&[self, rhs]).expect("batched matmul rule should succeed"), "matmul")
     }
 
     #[inline]
@@ -260,7 +260,7 @@ impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
             return self;
         }
         single_batch_output(
-            MatrixTransposeOp.batch(&[self]).expect("batched transpose rule should succeed"),
+            MatrixTransposeOperation.batch(&[self]).expect("batched transpose rule should succeed"),
             "matrix_transpose",
         )
     }
@@ -271,6 +271,7 @@ impl<
     O: LinearLeftMatMulOperation<ArrayType, V>
         + LinearAddOperation<ArrayType, V>
         + LinearNegOperation<ArrayType, V>
+        + Operation<ArrayType>
         + LinearRightMatMulOperation<ArrayType, V>
         + LinearScaleOperation<ArrayType, V>
         + LinearMatrixTransposeOperation<ArrayType, V>,
@@ -303,7 +304,8 @@ pub mod ndarray_support {
     use crate::{
         parameters::Parameter,
         tracing_v2::{
-            CoordinateValue, Cos, LinearPrimitiveOp, OneLike, PrimitiveOp, Sin, Traceable, ZeroLike, engine::Engine,
+            CoordinateValue, Cos, LinearPrimitiveOperation, OneLike, PrimitiveOperation, Sin, Traceable, ZeroLike,
+            engine::Engine,
         },
         types::{ArrayType, DataType, Typed},
     };
@@ -338,8 +340,8 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f32> {
         type Type = ArrayType;
         type Value = Array2<f32>;
-        type TracingOperation = PrimitiveOp<ArrayType, Array2<f32>>;
-        type LinearOperation = LinearPrimitiveOp<ArrayType, Array2<f32>>;
+        type TracingOperation = PrimitiveOperation<ArrayType, Array2<f32>>;
+        type LinearOperation = LinearPrimitiveOperation<ArrayType, Array2<f32>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f32> {
@@ -355,8 +357,8 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f64> {
         type Type = ArrayType;
         type Value = Array2<f64>;
-        type TracingOperation = PrimitiveOp<ArrayType, Array2<f64>>;
-        type LinearOperation = LinearPrimitiveOp<ArrayType, Array2<f64>>;
+        type TracingOperation = PrimitiveOperation<ArrayType, Array2<f64>>;
+        type LinearOperation = LinearPrimitiveOperation<ArrayType, Array2<f64>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Array2<f64> {

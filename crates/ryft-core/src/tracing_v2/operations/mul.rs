@@ -1,6 +1,6 @@
 //! Multiplication primitive for [`crate::tracing_v2`].
 //!
-//! `MulOp` is the bilinear counterpart to [`super::AddOp`]. It is used directly in user programs
+//! `MulOperation` is the bilinear counterpart to [`super::AddOperation`]. It is used directly in user programs
 //! and indirectly inside derivative rules for many other primitives, so its docs are a good place
 //! to understand how one primitive threads through staging, replay, batching, and JVP evaluation.
 
@@ -18,8 +18,8 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOp, InterpretableOp, Op, VectorizableOp, binary_same_abstract, expect_batch_sizes_match,
-    expect_input_count,
+    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, binary_same_abstract,
+    expect_batch_sizes_match, expect_input_count,
 };
 
 /// Hidden staging trait for the multiplication primitive.
@@ -32,23 +32,23 @@ pub trait MulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// Elementwise multiplication primitive.
 ///
 /// Multiplication is both a user-visible primitive and a building block for derivative rules such
-/// as the JVP of [`super::SinOp`] and the replay of captured scale factors.
+/// as the JVP of [`super::SinOperation`] and the replay of captured scale factors.
 #[derive(Clone, Default)]
-pub struct MulOp;
+pub struct MulOperation;
 
-impl Debug for MulOp {
+impl Debug for MulOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Mul")
     }
 }
 
-impl Display for MulOp {
+impl Display for MulOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "mul")
     }
 }
 
-impl Op for MulOp {
+impl Operation for MulOperation {
     fn name(&self) -> &'static str {
         "mul"
     }
@@ -81,7 +81,7 @@ impl Op for MulOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> for MulOp {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
@@ -89,7 +89,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> fo
 }
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for MulOp
+    DifferentiableOperation<ArrayType, V, T, O, L> for MulOperation
 {
     fn jvp(
         &self,
@@ -109,7 +109,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOp<ArrayType, V> for MulOp {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType, V> for MulOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;
@@ -139,14 +139,14 @@ mod tests {
     #[test]
     fn test_mul_jvp_matches_the_product_rule() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let output = DifferentiableOp::<
+        let output = DifferentiableOperation::<
             ArrayType,
             f64,
             f64,
-            crate::tracing_v2::PrimitiveOp<ArrayType, f64>,
-            crate::tracing_v2::LinearPrimitiveOp<ArrayType, f64>,
+            crate::tracing_v2::PrimitiveOperation<ArrayType, f64>,
+            crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>,
         >::jvp(
-            &MulOp,
+            &MulOperation,
             &engine,
             &[JvpTracer { primal: 2.0f64, tangent: 3.0f64 }, JvpTracer { primal: 5.0f64, tangent: -1.0f64 }],
         )

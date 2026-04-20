@@ -23,9 +23,9 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing_v2::{
-        AtomId, InterpretableOp, OneLike, Program, ProgramBuilder, Traceable, TracingError, ZeroLike,
+        AtomId, InterpretableOperation, OneLike, Program, ProgramBuilder, Traceable, TracingError, ZeroLike,
         engine::Engine,
-        operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Op},
+        operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Operation},
     },
     types::Typed,
 };
@@ -39,30 +39,34 @@ use crate::{
 /// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
 /// always instances of this type.
 #[derive(Parameter)]
-pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> {
+pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> {
     /// Atom id representing this traced leaf inside the shared staged program.
     atom: AtomId,
 
     /// Shared builder that owns the staged program currently being traced.
-    builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
+    builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
 
     /// Engine borrowed by this tracing scope for metadata-driven value synthesis.
     engine: &'engine E,
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Clone for Tracer<'engine, E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> Clone
+    for Tracer<'engine, E>
+{
     fn clone(&self) -> Self {
         Self { atom: self.atom, builder: self.builder.clone(), engine: self.engine }
     }
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> std::fmt::Debug for Tracer<'engine, E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> std::fmt::Debug
+    for Tracer<'engine, E>
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
     }
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> Tracer<'engine, E> {
     #[doc(hidden)]
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -74,7 +78,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// Higher-order transforms use this to stage additional instructions into the same trace without
     /// exposing the builder mutably through the public API surface.
     #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>> {
         self.builder.clone()
     }
 
@@ -94,7 +98,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     #[inline]
     pub fn from_engine(
         atom: AtomId,
-        builder: Rc<RefCell<ProgramBuilder<E::TracingOperation, E::Type, E::Value>>>,
+        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
         engine: &'engine E,
     ) -> Self {
         Self { atom, builder, engine }
@@ -108,7 +112,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// determine the output arity, and records the instruction unless the scope has already failed.
     pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TracingError>
     where
-        E::TracingOperation: Op<E::Type>,
+        E::TracingOperation: Operation<E::Type>,
     {
         if inputs.is_empty() {
             return Err(TracingError::EmptyParameterizedValue);
@@ -159,7 +163,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// Stages a single-input primitive application and returns its unique output.
     pub fn unary(self, op: E::TracingOperation) -> Self
     where
-        E::TracingOperation: Op<E::Type>,
+        E::TracingOperation: Operation<E::Type>,
     {
         Self::apply_staged_op(std::slice::from_ref(&self), op)
             .expect("unary traced staging should preserve non-empty inputs")
@@ -171,7 +175,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     /// Stages a two-input primitive application and returns its unique output.
     pub fn binary(self, rhs: Self, op: E::TracingOperation) -> Self
     where
-        E::TracingOperation: Op<E::Type>,
+        E::TracingOperation: Operation<E::Type>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         Self::apply_staged_op(&[self, rhs], op)
@@ -182,7 +186,9 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Tracer<'engine, E> 
     }
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Typed<E::Type> for Tracer<'engine, E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> Typed<E::Type>
+    for Tracer<'engine, E>
+{
     #[inline]
     fn r#type(&self) -> Cow<'_, E::Type> {
         Cow::Owned(
@@ -196,9 +202,14 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Typed<E::Type> for 
     }
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> Traceable<E::Type> for Tracer<'engine, E> {}
+impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> Traceable<E::Type>
+    for Tracer<'engine, E>
+{
+}
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer<'engine, E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> ZeroLike
+    for Tracer<'engine, E>
+{
     #[inline]
     fn zero_like(&self) -> Self {
         let value = self.engine().zero(&self.r#type().into_owned());
@@ -207,7 +218,9 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> ZeroLike for Tracer
     }
 }
 
-impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<'engine, E> {
+impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> OneLike
+    for Tracer<'engine, E>
+{
     #[inline]
     fn one_like(&self) -> Self {
         let value = self.engine().one(&self.r#type().into_owned());
@@ -218,7 +231,8 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>> + ?Sized> OneLike for Tracer<
 
 impl<
     'engine,
-    E: Engine<Value: Traceable<E::Type>, TracingOperation: AddTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: AddTracingOperation<E::Type, E::Value> + Operation<E::Type>>
+        + ?Sized,
 > Add for Tracer<'engine, E>
 {
     type Output = Self;
@@ -231,7 +245,8 @@ impl<
 
 impl<
     'engine,
-    E: Engine<Value: Traceable<E::Type>, TracingOperation: MulTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: MulTracingOperation<E::Type, E::Value> + Operation<E::Type>>
+        + ?Sized,
 > Mul for Tracer<'engine, E>
 {
     type Output = Self;
@@ -244,7 +259,8 @@ impl<
 
 impl<
     'engine,
-    E: Engine<Value: Traceable<E::Type>, TracingOperation: NegTracingOperation<E::Type, E::Value> + Op<E::Type>> + ?Sized,
+    E: Engine<Value: Traceable<E::Type>, TracingOperation: NegTracingOperation<E::Type, E::Value> + Operation<E::Type>>
+        + ?Sized,
 > Neg for Tracer<'engine, E>
 {
     type Output = Self;
@@ -274,7 +290,7 @@ pub fn trace<'engine, E, F, Input, Output>(
     TracingError,
 >
 where
-    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: Op<E::Type>> + ?Sized,
+    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized,
     Input: Parameterized<
             E::Type,
             ParameterStructure: Clone,
@@ -288,7 +304,7 @@ where
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     let input_structure = input_types.parameter_structure();
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::TracingOperation, E::Type, E::Value>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, E::Value, E::TracingOperation>::new()));
     let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
@@ -339,7 +355,7 @@ pub fn interpret_and_trace<'engine, E, F, Input, Output>(
     input: Input,
 ) -> Result<(Output, Program<E::Type, E::Value, E::TracingOperation, Input, Output>), TracingError>
 where
-    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOp<E::Type, E::Value>>
+    E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOperation<E::Type, E::Value>>
         + ?Sized,
     Input:
         Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<'engine, E>>>,
@@ -389,7 +405,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{PrimitiveOp, ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
+        tracing_v2::{PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
         types::ArrayType,
     };
 
@@ -397,7 +413,8 @@ mod tests {
 
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new()));
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
         let atom = builder.borrow_mut().add_input(&3.0f64);
         let engine = ArrayScalarEngine::<f64>::new();
         let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, &engine);
@@ -420,7 +437,7 @@ mod tests {
     #[test]
     fn staged_program_replays_graphs() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
             interpret_and_trace(
                 &engine,
                 |x: Tracer<ArrayScalarEngine<f64>>| {
@@ -526,7 +543,7 @@ mod tests {
             }
         }
 
-        impl Op<TestType> for TestAddOp {
+        impl Operation<TestType> for TestAddOp {
             fn name(&self) -> &'static str {
                 "test_add"
             }
@@ -560,7 +577,7 @@ mod tests {
             }
         }
 
-        impl InterpretableOp<TestType, TestValue> for TestAddOp {
+        impl InterpretableOperation<TestType, TestValue> for TestAddOp {
             fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
                 if inputs.len() != 2 {
                     return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
@@ -712,8 +729,8 @@ mod tests {
         impl crate::tracing_v2::engine::Engine for TestEngine {
             type Type = ArrayType;
             type Value = TestAbstractValue;
-            type TracingOperation = crate::tracing_v2::PrimitiveOp<ArrayType, TestAbstractValue>;
-            type LinearOperation = crate::tracing_v2::LinearPrimitiveOp<ArrayType, TestAbstractValue>;
+            type TracingOperation = crate::tracing_v2::PrimitiveOperation<ArrayType, TestAbstractValue>;
+            type LinearOperation = crate::tracing_v2::LinearPrimitiveOperation<ArrayType, TestAbstractValue>;
 
             fn zero(&self, r#type: &ArrayType) -> TestAbstractValue {
                 TestAbstractValue { r#type: r#type.clone() }
@@ -730,7 +747,7 @@ mod tests {
                 Program<
                     ArrayType,
                     TestAbstractValue,
-                    crate::tracing_v2::PrimitiveOp<ArrayType, TestAbstractValue>,
+                    crate::tracing_v2::PrimitiveOperation<ArrayType, TestAbstractValue>,
                     (TestAbstractValue, TestAbstractValue),
                     TestAbstractValue,
                 >,
@@ -751,12 +768,13 @@ mod tests {
     #[test]
     fn staged_program_display_renders_the_staged_program() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) = interpret_and_trace(
-            &engine,
-            |x: Tracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
-            2.0f64,
-        )
-        .unwrap();
+        let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
+            interpret_and_trace(
+                &engine,
+                |x: Tracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
+                2.0f64,
+            )
+            .unwrap();
 
         assert_eq!(
             compiled.to_string(),

@@ -21,7 +21,7 @@ where
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType>,
-    O: Clone,
+    O: Clone + Operation<ArrayType>,
     R: Clone,
     LiftConstant: Fn(&V, &[R]) -> Result<R, TracingError>,
     ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TracingError>,
@@ -90,12 +90,12 @@ where
     ProgramInput: Parameterized<V>,
     ProgramOutput: Parameterized<V>,
     V: Traceable<ArrayType> + ZeroLike,
-    L: Clone + 'static,
+    L: Clone + Operation<ArrayType> + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>> + Clone + 'static,
+    O: InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>> + Clone + 'static,
 {
     replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L, E>, |op, values| {
-        InterpretableOp::<ArrayType, LinearizedTracedValue<'engine, E>>::interpret(op, &values)
+        InterpretableOperation::<ArrayType, LinearizedTracedValue<'engine, E>>::interpret(op, &values)
     })
 }
 
@@ -111,17 +111,17 @@ pub(crate) fn linearize_traced_program<'engine, V, O, L, E>(
 ) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
-    O: Clone + Op<ArrayType> + 'static,
-    L: Clone + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
+    L: Clone + Operation<ArrayType> + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>> + Clone,
+    O: InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>> + Clone,
 {
     let zero = primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let input_count = primals.len();
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
-        LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>,
         ArrayType,
         Tracer<'engine, E>,
+        LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>,
     >::new()));
     let traced_input = primals
         .into_iter()

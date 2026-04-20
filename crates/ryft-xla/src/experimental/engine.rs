@@ -16,11 +16,11 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
-use ryft_core::tracing_v2::{LinearPrimitiveOp, engine::Engine};
+use ryft_core::tracing_v2::{LinearPrimitiveOperation, engine::Engine};
 use ryft_core::types::ArrayType;
 
 use super::arrays::{Array, ArrayError};
-use super::ops::XlaPrimitiveOp;
+use super::ops::XlaPrimitiveOperation;
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 
 #[cfg(test)]
@@ -133,8 +133,8 @@ impl<'c> XlaEngine<'c> {
 impl<'c> Engine for XlaEngine<'c> {
     type Type = ArrayType;
     type Value = ShardMapTensor;
-    type TracingOperation = XlaPrimitiveOp;
-    type LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTensor>;
+    type TracingOperation = XlaPrimitiveOperation;
+    type LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>;
 
     fn zero(&self, array_type: &ArrayType) -> ShardMapTensor {
         ShardMapTensor::zero(array_type.clone())

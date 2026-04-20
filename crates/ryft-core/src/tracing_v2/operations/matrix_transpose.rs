@@ -12,7 +12,8 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, VectorizableOp, expect_input_count,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation,
+    VectorizableOperation, expect_input_count,
     matrix::{MatrixOps, MatrixValue, transpose_abstract},
 };
 
@@ -32,24 +33,24 @@ pub trait LinearMatrixTransposeOperation<T: Type + Display, V: Traceable<T>>: Cl
 
 /// Primitive representing matrix transposition.
 ///
-/// [`MatrixTransposeOp`] is stored directly in traced programs whenever a matrix leaf is
+/// [`MatrixTransposeOperation`] is stored directly in traced programs whenever a matrix leaf is
 /// transposed symbolically.
 #[derive(Clone, Default)]
-pub struct MatrixTransposeOp;
+pub struct MatrixTransposeOperation;
 
-impl Debug for MatrixTransposeOp {
+impl Debug for MatrixTransposeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "MatrixTranspose")
     }
 }
 
-impl Display for MatrixTransposeOp {
+impl Display for MatrixTransposeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "matrix_transpose")
     }
 }
 
-impl Op for MatrixTransposeOp {
+impl Operation for MatrixTransposeOperation {
     fn name(&self) -> &'static str {
         "matrix_transpose"
     }
@@ -60,14 +61,14 @@ impl Op for MatrixTransposeOp {
     }
 }
 
-impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatrixTransposeOp {
+impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOp {
+impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOperation {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -76,7 +77,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOp {
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
                 std::slice::from_ref(&output_cotangents[0]),
-                LinearPrimitiveOp::MatrixTranspose,
+                LinearPrimitiveOperation::MatrixTranspose,
                 1,
             )?
             .into_iter()
@@ -87,7 +88,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOp {
 }
 
 impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for MatrixTransposeOp
+    DifferentiableOperation<ArrayType, V, T, O, L> for MatrixTransposeOperation
 {
     fn jvp(
         &self,
@@ -99,7 +100,7 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone
     }
 }
 
-impl<V: MatrixValue> VectorizableOp<ArrayType, V> for MatrixTransposeOp {
+impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for MatrixTransposeOperation {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])

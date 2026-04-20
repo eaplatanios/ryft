@@ -1,6 +1,6 @@
 //! Addition primitive for [`crate::tracing_v2`].
 //!
-//! `AddOp` is the simplest example of how one semantic primitive participates in every layer of
+//! `AddOperation` is the simplest example of how one semantic primitive participates in every layer of
 //! the tracing stack: it provides abstract evaluation for staging, eager interpretation for replay,
 //! a transpose rule for linear programs, a JVP rule for forward-mode AD, and a batching rule for
 //! `vmap`.
@@ -20,14 +20,14 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp, binary_same_abstract,
-    expect_batch_sizes_match, expect_input_count,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
+    binary_same_abstract, expect_batch_sizes_match, expect_input_count,
 };
 
 /// Hidden staging trait for the addition primitive.
 ///
-/// Backend-owned closed op carriers (such as [`PrimitiveOp`](super::PrimitiveOp) and the XLA backend's
-/// `XlaPrimitiveOp`) implement this trait so that generic transform code can stage `AddOp` without
+/// Backend-owned closed op carriers (such as [`PrimitiveOperation`](super::PrimitiveOperation) and the XLA backend's
+/// `XlaPrimitiveOperation`) implement this trait so that generic transform code can stage `AddOperation` without
 /// knowing which carrier is in use.
 #[doc(hidden)]
 pub trait AddTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
@@ -44,24 +44,24 @@ pub trait LinearAddOperation<T: Type + Display, V: Traceable<T>>: Clone {
 
 /// Elementwise addition primitive.
 ///
-/// In the larger architecture, [`AddOp`] is the canonical "fully supported" primitive: nearly
+/// In the larger architecture, [`AddOperation`] is the canonical "fully supported" primitive: nearly
 /// every transform depends on addition being available in its staged carrier.
 #[derive(Clone, Default)]
-pub struct AddOp;
+pub struct AddOperation;
 
-impl Debug for AddOp {
+impl Debug for AddOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Add")
     }
 }
 
-impl Display for AddOp {
+impl Display for AddOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "add")
     }
 }
 
-impl Op for AddOp {
+impl Operation for AddOperation {
     fn name(&self) -> &'static str {
         "add"
     }
@@ -90,14 +90,14 @@ impl Op for AddOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOp<ArrayType, V> for AddOp {
+impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for AddOp {
+impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for AddOperation {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -108,7 +108,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
 }
 
 impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for AddOp
+    DifferentiableOperation<ArrayType, V, T, O, L> for AddOperation
 {
     fn jvp(
         &self,
@@ -123,7 +123,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>> VectorizableOp<ArrayType, V> for AddOp {
+impl<V: Traceable<ArrayType> + Add<Output = V>> VectorizableOperation<ArrayType, V> for AddOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;
@@ -152,9 +152,11 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_rejects_incompatible_inputs() {
-        let error =
-            <AddOp as Op>::abstract_eval(&AddOp, &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)])
-                .unwrap_err();
+        let error = <AddOperation as Operation>::abstract_eval(
+            &AddOperation,
+            &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap_err();
 
         assert_eq!(error, TracingError::IncompatibleAbstractValues { op: "add" });
         test_support::assert_reference_program_rendering();
@@ -162,8 +164,8 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_drops_layout_when_inputs_disagree() {
-        let output = <AddOp as Op>::abstract_eval(
-            &AddOp,
+        let output = <AddOperation as Operation>::abstract_eval(
+            &AddOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None)
                     .unwrap(),
@@ -177,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_add_batch_requires_matching_lane_counts() {
-        let error = AddOp.batch(&[Batch::new(vec![1.0f64, 2.0f64]), Batch::new(vec![3.0f64])]).unwrap_err();
+        let error = AddOperation.batch(&[Batch::new(vec![1.0f64, 2.0f64]), Batch::new(vec![3.0f64])]).unwrap_err();
 
         assert_eq!(error, TracingError::MismatchedBatchSize);
         test_support::assert_reference_scalar_sine_jit_rendering();

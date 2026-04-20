@@ -7,20 +7,20 @@ use std::{
 
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, Tracer,
-    TracingError, VectorizableOp,
+    CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation,
+    Operation, PrimitiveOperation, Tracer, TracingError, VectorizableOperation,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
     operations::{expect_input_count, unary_abstract},
 };
 use ryft_core::types::ArrayType;
-use ryft_mlir::{Block, Operation, Value};
+use ryft_mlir::{Block, Operation as MlirOperation, Value};
 
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
-use crate::experimental::ops::XlaPrimitiveOp;
+use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 
 type JitShardMapTracer = Tracer<
@@ -28,20 +28,20 @@ type JitShardMapTracer = Tracer<
     dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
-            LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+            TracingOperation = PrimitiveOperation<ArrayType, ShardMapTracer>,
+            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
         >,
 >;
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
 #[derive(Clone)]
-pub struct WithShardingConstraintOp {
+pub struct WithShardingConstraintOperation {
     /// Requested sharding that the input leaf must satisfy after lowering.
     sharding: Sharding,
 }
 
-impl WithShardingConstraintOp {
+impl WithShardingConstraintOperation {
     /// Creates one sharding-constraint op with the provided target sharding.
     #[inline]
     pub fn new(sharding: Sharding) -> Self {
@@ -58,9 +58,9 @@ impl WithShardingConstraintOp {
     where
         V: ryft_core::tracing_v2::Traceable<ArrayType> + 'static,
         Self: Clone
-            + InterpretableOp<ArrayType, V>
+            + InterpretableOperation<ArrayType, V>
             + LinearOperation<ArrayType, V>
-            + VectorizableOp<ArrayType, V>
+            + VectorizableOperation<ArrayType, V>
             + Send
             + Sync
             + 'static,
@@ -73,11 +73,11 @@ impl WithShardingConstraintOp {
     /// Returns the tensor-leaf custom primitive registration for this op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive::<ShardMapTensor>()
-            .with_jvp_rule_for::<XlaPrimitiveOp, LinearPrimitiveOp<ArrayType, ShardMapTensor>, _>(self.clone())
+            .with_jvp_rule_for::<XlaPrimitiveOperation, LinearPrimitiveOperation<ArrayType, ShardMapTensor>, _>(self.clone())
             .with_linearized_jit_rule_for::<
-                XlaPrimitiveOp,
-                LinearPrimitiveOp<ArrayType, ShardMapTensor>,
-                LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+                XlaPrimitiveOperation,
+                LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
+                LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
                 crate::experimental::engine::XlaEngine<'static>,
                 _,
             >(self.clone())
@@ -90,33 +90,33 @@ impl WithShardingConstraintOp {
         self.base_custom_primitive::<ShardMapTracer>()
             .with_jvp_rule(self.clone())
             .with_linearized_jit_rule_for::<
-                PrimitiveOp<ArrayType, ShardMapTracer>,
-                LinearPrimitiveOp<ArrayType, ShardMapTracer>,
-                LinearPrimitiveOp<ArrayType, JitShardMapTracer>,
+                PrimitiveOperation<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOperation<ArrayType, JitShardMapTracer>,
                 dyn Engine<
                         Type = ArrayType,
                         Value = ShardMapTracer,
-                        TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
-                        LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+                        TracingOperation = PrimitiveOperation<ArrayType, ShardMapTracer>,
+                        LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
                     >,
                 _,
             >(self.clone())
     }
 }
 
-impl Debug for WithShardingConstraintOp {
+impl Debug for WithShardingConstraintOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "WithShardingConstraint")
     }
 }
 
-impl Display for WithShardingConstraintOp {
+impl Display for WithShardingConstraintOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "with_sharding_constraint")
     }
 }
 
-impl Op for WithShardingConstraintOp {
+impl Operation for WithShardingConstraintOperation {
     fn name(&self) -> &'static str {
         "with_sharding_constraint"
     }
@@ -137,14 +137,14 @@ impl Op for WithShardingConstraintOp {
     }
 }
 
-impl InterpretableOp<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
+impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
+impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
@@ -152,7 +152,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
-            LinearPrimitiveOp::custom(self.to_tensor_custom_primitive())?,
+            LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -163,31 +163,31 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOp {
 }
 
 impl
-    DifferentiableOp<
+    DifferentiableOperation<
         ArrayType,
         ShardMapTensor,
-        LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
-        XlaPrimitiveOp,
-        LinearPrimitiveOp<ArrayType, ShardMapTensor>,
-    > for WithShardingConstraintOp
+        LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
+        XlaPrimitiveOperation,
+        LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
+    > for WithShardingConstraintOperation
 {
     fn jvp(
         &self,
         _engine: &dyn Engine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            TracingOperation = XlaPrimitiveOp,
-            LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTensor>,
+            TracingOperation = XlaPrimitiveOperation,
+            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
         >,
         inputs: &[JvpTracer<
             ShardMapTensor,
-            LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
+            LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
         >],
     ) -> Result<
         Vec<
             JvpTracer<
                 ShardMapTensor,
-                LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOp<ArrayType, ShardMapTensor>>,
+                LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
             >,
         >,
         TracingError,
@@ -195,7 +195,7 @@ impl
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
-            LinearPrimitiveOp::custom(self.to_tensor_custom_primitive())?,
+            LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -205,7 +205,7 @@ impl
     }
 }
 
-impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingConstraintOp {
+impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for WithShardingConstraintOperation {
     fn interpret(
         &self,
         inputs: &[Linearized<ShardMapTracer>],
@@ -214,14 +214,14 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingCons
         let input = &inputs[0];
         let primal = Tracer::apply_staged_op(
             std::slice::from_ref(&input.primal),
-            XlaPrimitiveOp::WithShardingConstraint(self.clone()),
+            XlaPrimitiveOperation::WithShardingConstraint(self.clone()),
         )?
         .into_iter()
         .next()
         .expect("sharding constraint should produce one primal output");
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&input.tangent),
-            LinearPrimitiveOp::custom(self.to_tracer_custom_primitive())?,
+            LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -231,14 +231,14 @@ impl InterpretableOp<ArrayType, Linearized<ShardMapTracer>> for WithShardingCons
     }
 }
 
-impl InterpretableOp<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
+impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone()])
     }
 }
 
-impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
+impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
@@ -246,7 +246,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
         expect_input_count(output_cotangents.len(), 1)?;
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
-            LinearPrimitiveOp::custom(self.to_tracer_custom_primitive())?,
+            LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -257,31 +257,31 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOp {
 }
 
 impl
-    DifferentiableOp<
+    DifferentiableOperation<
         ArrayType,
         ShardMapTracer,
-        LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
-        PrimitiveOp<ArrayType, ShardMapTracer>,
-        LinearPrimitiveOp<ArrayType, ShardMapTracer>,
-    > for WithShardingConstraintOp
+        LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
+        PrimitiveOperation<ArrayType, ShardMapTracer>,
+        LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+    > for WithShardingConstraintOperation
 {
     fn jvp(
         &self,
         _engine: &dyn Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            TracingOperation = PrimitiveOp<ArrayType, ShardMapTracer>,
-            LinearOperation = LinearPrimitiveOp<ArrayType, ShardMapTracer>,
+            TracingOperation = PrimitiveOperation<ArrayType, ShardMapTracer>,
+            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
         >,
         inputs: &[JvpTracer<
             ShardMapTracer,
-            LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
+            LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
         >],
     ) -> Result<
         Vec<
             JvpTracer<
                 ShardMapTracer,
-                LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOp<ArrayType, ShardMapTracer>>,
+                LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
             >,
         >,
         TracingError,
@@ -289,7 +289,7 @@ impl
         expect_input_count(inputs.len(), 1)?;
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
-            LinearPrimitiveOp::custom(self.to_tracer_custom_primitive())?,
+            LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
             1,
         )?
         .into_iter()
@@ -299,7 +299,9 @@ impl
     }
 }
 
-impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<ArrayType, V> for WithShardingConstraintOp {
+impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOperation<ArrayType, V>
+    for WithShardingConstraintOperation
+{
     fn batch(
         &self,
         inputs: &[ryft_core::tracing_v2::Batch<V>],
@@ -309,7 +311,7 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOp<ArrayType, V
     }
 }
 
-impl InterpretableOp<ArrayType, Linearized<JitShardMapTracer>> for WithShardingConstraintOp {
+impl InterpretableOperation<ArrayType, Linearized<JitShardMapTracer>> for WithShardingConstraintOperation {
     fn interpret(
         &self,
         _inputs: &[Linearized<JitShardMapTracer>],
@@ -323,7 +325,7 @@ impl InterpretableOp<ArrayType, Linearized<JitShardMapTracer>> for WithShardingC
     }
 }
 
-impl StableHloCustomLowering<ShardMapTensor> for WithShardingConstraintOp {
+impl StableHloCustomLowering<ShardMapTensor> for WithShardingConstraintOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         _op: &CustomPrimitive<ArrayType, ShardMapTensor>,
@@ -348,7 +350,7 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOp, LinearTerm, ProgramBuilder};
+    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -365,10 +367,10 @@ mod tests {
     fn test_with_sharding_constraint_abstract_eval_attaches_sharding() {
         let mesh = test_mesh();
         let sharding = test_sharding(&mesh);
-        let op = WithShardingConstraintOp::new(sharding.clone());
+        let op = WithShardingConstraintOperation::new(sharding.clone());
 
         assert_eq!(
-            <WithShardingConstraintOp as Op>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::abstract_eval(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap()],
             ),
@@ -388,10 +390,10 @@ mod tests {
             ["x"],
         )
         .unwrap();
-        let op = WithShardingConstraintOp::new(target_sharding);
+        let op = WithShardingConstraintOperation::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOp as Op>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::abstract_eval(
                 &op,
                 &[
                     ArrayType::new(
@@ -436,10 +438,10 @@ mod tests {
         let input_sharding =
             Sharding::with_manual_axes(mesh.clone(), vec![ShardingDimension::replicated()], ["y"], ["z"], ["x"])
                 .unwrap();
-        let op = WithShardingConstraintOp::new(target_sharding);
+        let op = WithShardingConstraintOperation::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOp as Op>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::abstract_eval(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(input_sharding),)
                     .unwrap()],
@@ -468,10 +470,10 @@ mod tests {
     #[test]
     fn test_with_sharding_constraint_abstract_eval_rejects_rank_mismatch() {
         let mesh = test_mesh();
-        let op = WithShardingConstraintOp::new(test_sharding(&mesh));
+        let op = WithShardingConstraintOperation::new(test_sharding(&mesh));
 
         assert_eq!(
-            <WithShardingConstraintOp as Op>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::abstract_eval(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)
                     .unwrap()],
@@ -487,14 +489,14 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            LinearPrimitiveOp<ArrayType, ShardMapTensor>,
             ArrayType,
             ShardMapTensor,
+            LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&ShardMapTensor::new(input_type.clone()));
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution =
-            LinearOperation::transpose(&WithShardingConstraintOp::new(sharding.clone()), &[output_cotangent])
+            LinearOperation::transpose(&WithShardingConstraintOperation::new(sharding.clone()), &[output_cotangent])
                 .unwrap()
                 .into_iter()
                 .next()

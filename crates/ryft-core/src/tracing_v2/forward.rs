@@ -19,12 +19,12 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        LinearPrimitiveOp, Program, Traceable, TracingError, Value, ZeroLike,
+        LinearPrimitiveOperation, Program, Traceable, TracingError, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
         linear::{LinearProgram, Linearized, jvp_program, jvp_traced, linearize_traced_program},
-        operations::{CoreLinearReplayOp, DifferentiableOp, InterpretableOp, Op},
+        operations::{CoreLinearReplayOperation, DifferentiableOperation, InterpretableOperation, Operation},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -200,15 +200,15 @@ where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<
             ArrayType,
             V,
             crate::tracing_v2::LinearTerm<ArrayType, V, E::LinearOperation>,
             E::TracingOperation,
             E::LinearOperation,
         >,
-    E::LinearOperation: InterpretableOp<ArrayType, V> + Op<ArrayType>,
+    E::LinearOperation: InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
 {
     type FunctionInput<'engine>
         = Input::To<Tracer<'engine, E>>
@@ -255,10 +255,12 @@ where
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
-    E::TracingOperation:
-        InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
-    E::LinearOperation: Clone + Op<ArrayType> + 'static,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearReplayOp<Tracer<'engine, E>>,
+    E::TracingOperation: InterpretableOperation<
+            ArrayType,
+            Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>,
+        >,
+    E::LinearOperation: Clone + Operation<ArrayType> + 'static,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearReplayOperation<Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input
@@ -406,9 +408,10 @@ where
                         LinearOperation = E::LinearOperation,
                     >>,
         >,
-    E::TracingOperation: Op<ArrayType>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: for<'engine> InterpretableOp<
+    E::TracingOperation: Operation<ArrayType>,
+    E::LinearOperation: Operation<ArrayType>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: for<'engine> InterpretableOperation<
             ArrayType,
             Linearized<
                 Tracer<'engine, dyn Engine<
@@ -417,7 +420,7 @@ where
                             TracingOperation = E::TracingOperation,
                             LinearOperation = E::LinearOperation,
                         >>,
-                LinearPrimitiveOp<
+                LinearPrimitiveOperation<
                     ArrayType,
                     Tracer<'engine, dyn Engine<
                                 Type = ArrayType,
@@ -428,7 +431,7 @@ where
                 >,
             >,
         >,
-    for<'engine> LinearPrimitiveOp<
+    for<'engine> LinearPrimitiveOperation<
         ArrayType,
         Tracer<'engine, dyn Engine<
                     Type = ArrayType,
@@ -436,7 +439,7 @@ where
                     TracingOperation = E::TracingOperation,
                     LinearOperation = E::LinearOperation,
                 >>,
-    >: CoreLinearReplayOp<
+    >: CoreLinearReplayOperation<
         Tracer<'engine, dyn Engine<
                     Type = ArrayType,
                     Value = V,

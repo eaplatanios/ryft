@@ -78,7 +78,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
     /// Returns `true` if every element of this value is exactly zero.
     ///
-    /// The program builder calls this on constant atoms during [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify)
+    /// The program builder calls this on constant atoms during [`Operation::try_simplify`](crate::tracing_v2::Operation::try_simplify)
     /// to detect and eliminate algebraic identities at staging time â€” for example, folding `x + 0` into `x` or `x * 0`
     /// into `0` without emitting the operation into the staged program.
     ///
@@ -94,7 +94,7 @@ pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
     /// Returns `true` if every element of this value is exactly one.
     ///
     /// This is the multiplicative-identity counterpart of [`Traceable::is_zero`]. The program builder uses it during
-    /// [`Op::try_simplify`](crate::tracing_v2::Op::try_simplify) to fold operations like `x * 1` into `x` or
+    /// [`Operation::try_simplify`](crate::tracing_v2::Operation::try_simplify) to fold operations like `x * 1` into `x` or
     /// `scale(x, 1)` into `x`.
     ///
     /// The same defaulting rationale applies: `false` is always safe, and only concrete leaf types that can inspect

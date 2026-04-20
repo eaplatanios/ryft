@@ -16,7 +16,7 @@
 //!
 //! Engines are intentionally kept small: they expose metadata-only synthesis (zero and one) and
 //! also choose the staged ordinary and linear operation carriers used by user-facing tracing
-//! transforms. Per-instruction evaluation paths (`InterpretableOp::interpret`, `abstract_eval`, and
+//! transforms. Per-instruction evaluation paths (`InterpretableOperation::interpret`, `abstract_eval`, and
 //! similar) remain engine-free so that the common fast path is never forced through a dispatch
 //! layer.
 //!
@@ -30,7 +30,7 @@
 use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
-    tracing_v2::{LinearPrimitiveOp, PrimitiveOp},
+    tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation},
     types::{ArrayType, Type},
 };
 
@@ -125,8 +125,8 @@ macro_rules! impl_engine_for_array_scalar_engine {
         impl Engine for ArrayScalarEngine<$ty> {
             type Type = ArrayType;
             type Value = $ty;
-            type TracingOperation = PrimitiveOp<ArrayType, $ty>;
-            type LinearOperation = LinearPrimitiveOp<ArrayType, $ty>;
+            type TracingOperation = PrimitiveOperation<ArrayType, $ty>;
+            type LinearOperation = LinearPrimitiveOperation<ArrayType, $ty>;
 
             #[inline]
             fn zero(&self, _type: &ArrayType) -> $ty {

@@ -68,14 +68,14 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing_v2::operations::{AddOp, MatMulOp, MatrixTransposeOp, MulOp};
+use ryft_core::tracing_v2::operations::{AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation};
 use ryft_core::tracing_v2::{
-    Cos, Linearized, MatrixOps, OneLike, Op, Program, Sin, Traceable, Tracer, TracingError, Value, ZeroLike,
+    Cos, Linearized, MatrixOps, OneLike, Operation, Program, Sin, Traceable, Tracer, TracingError, Value, ZeroLike,
     trace as trace_types,
 };
 
-use crate::experimental::operations::WithShardingConstraintOp;
-use crate::experimental::ops::XlaPrimitiveOp;
+use crate::experimental::operations::WithShardingConstraintOperation;
+use crate::experimental::ops::XlaPrimitiveOperation;
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
@@ -369,7 +369,7 @@ impl Add for ShardMapTensor {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        let output_type = AddOp
+        let output_type = AddOperation
             .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
             .expect("abstract shard-map add should preserve compatible types")
             .into_iter()
@@ -387,7 +387,7 @@ impl Mul for ShardMapTensor {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        let output_type = MulOp
+        let output_type = MulOperation
             .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
             .expect("abstract shard-map mul should preserve compatible types")
             .into_iter()
@@ -438,7 +438,7 @@ impl Cos for ShardMapTensor {
 
 impl MatrixOps for ShardMapTensor {
     fn matmul(self, rhs: Self) -> Self {
-        let output_type = MatMulOp
+        let output_type = MatMulOperation
             .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
             .expect("abstract shard-map matmul should preserve compatible types")
             .into_iter()
@@ -454,7 +454,7 @@ impl MatrixOps for ShardMapTensor {
     }
 
     fn transpose_matrix(self) -> Self {
-        let output_type = MatrixTransposeOp
+        let output_type = MatrixTransposeOperation
             .abstract_eval(&[self.array_type.clone()])
             .expect("abstract shard-map transpose should preserve compatible types")
             .into_iter()
@@ -468,7 +468,7 @@ impl MatrixOps for ShardMapTensor {
 pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
-pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, Input, Output>;
+pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>;
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
@@ -567,7 +567,7 @@ where
     Input::Family: ParameterizedFamily<Sharding>,
 {
     fn constrain_leaf(input: ShardMapTracer, sharding: Sharding) -> Result<ShardMapTracer, ShardMapTraceError> {
-        let op = WithShardingConstraintOp::new(sharding.clone());
+        let op = WithShardingConstraintOperation::new(sharding.clone());
         let input_type = input.r#type();
         if op.sharding().rank() != input_type.rank() {
             return Err(ShardingError::ShardingRankMismatch {
@@ -576,7 +576,7 @@ where
             }
             .into());
         }
-        Ok(Tracer::apply_staged_op(std::slice::from_ref(&input), XlaPrimitiveOp::WithShardingConstraint(op))?
+        Ok(Tracer::apply_staged_op(std::slice::from_ref(&input), XlaPrimitiveOperation::WithShardingConstraint(op))?
             .into_iter()
             .next()
             .expect("with_sharding_constraint should produce one output per input leaf"))

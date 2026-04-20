@@ -10,7 +10,8 @@ use crate::tracing_v2::{Traceable, TracingError, batch::Batch as BatchedValue, e
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOp, InterpretableOp, Op, VectorizableOp, expect_batch_sizes_match, expect_input_count,
+    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, expect_batch_sizes_match,
+    expect_input_count,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
 };
 
@@ -23,25 +24,25 @@ pub trait MatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 
 /// Primitive representing matrix multiplication.
 ///
-/// [`MatMulOp`] is the matrix-valued analogue of the core scalar arithmetic primitives. Its JVP
+/// [`MatMulOperation`] is the matrix-valued analogue of the core scalar arithmetic primitives. Its JVP
 /// rule delegates to the matrix tangent-space helpers so the same op can be reused for concrete
 /// execution, traced execution, and batching.
 #[derive(Clone, Default)]
-pub struct MatMulOp;
+pub struct MatMulOperation;
 
-impl Debug for MatMulOp {
+impl Debug for MatMulOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "MatMul")
     }
 }
 
-impl Display for MatMulOp {
+impl Display for MatMulOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "matmul")
     }
 }
 
-impl Op for MatMulOp {
+impl Operation for MatMulOperation {
     fn name(&self) -> &'static str {
         "matmul"
     }
@@ -52,7 +53,7 @@ impl Op for MatMulOp {
     }
 }
 
-impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatMulOp {
+impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
@@ -60,7 +61,7 @@ impl<V: MatrixValue> InterpretableOp<ArrayType, V> for MatMulOp {
 }
 
 impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for MatMulOp
+    DifferentiableOperation<ArrayType, V, T, O, L> for MatMulOperation
 {
     fn jvp(
         &self,
@@ -72,7 +73,7 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone
     }
 }
 
-impl<V: MatrixValue> VectorizableOp<ArrayType, V> for MatMulOp {
+impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for MatMulOperation {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
         expect_input_count(inputs.len(), 2)?;
         expect_batch_sizes_match(&inputs[0], &inputs[1])?;

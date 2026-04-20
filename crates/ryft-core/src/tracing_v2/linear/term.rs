@@ -8,21 +8,25 @@ use super::*;
 /// in a shared linear-program builder and stages new linear instructions as it is combined with other
 /// terms.
 #[derive(Clone, Parameter)]
-pub struct LinearTerm<T: Type + Display, V: Traceable<T> + Parameter, O: Clone = LinearPrimitiveOp<ArrayType, V>> {
+pub struct LinearTerm<
+    T: Type + Display,
+    V: Traceable<T> + Parameter,
+    O: Clone + Operation<T> = LinearPrimitiveOperation<ArrayType, V>,
+> {
     /// Atom id representing this symbolic tangent or cotangent inside the shared linear builder.
     atom: AtomId,
 
     /// Shared builder that owns the staged linear program currently being assembled.
-    builder: Rc<RefCell<ProgramBuilder<O, T, V>>>,
+    builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone> std::fmt::Debug for LinearTerm<T, V, O> {
+impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> std::fmt::Debug for LinearTerm<T, V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("LinearTerm").field("atom", &self.atom).finish()
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
+impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, V, O> {
     /// Returns the atom id backing this symbolic linear term.
     #[inline]
     pub fn atom(&self) -> AtomId {
@@ -31,7 +35,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
 
     /// Returns a clone of the shared builder that owns this term.
     #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<O, T, V>>> {
+    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<T, V, O>>> {
         self.builder.clone()
     }
 
@@ -40,18 +44,18 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
     /// This is mainly used by the linearization and transpose helpers when they need to hand
     /// primitive rules a symbolic tangent view over existing builder state.
     #[inline]
-    pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<O, T, V>>>) -> Self {
+    pub fn from_staged_parts(atom: AtomId, builder: Rc<RefCell<ProgramBuilder<T, V, O>>>) -> Self {
         Self { atom, builder }
     }
 
     /// Stages a multi-input operation in the tangent program builder.
     ///
-    /// Shape validation is performed via [`Op::abstract_eval`]. Concrete evaluation is intentionally
+    /// Shape validation is performed via [`Operation::abstract_eval`]. Concrete evaluation is intentionally
     /// skipped because tangent-program outputs remain abstract until the staged linear program is
     /// replayed on concrete tangents.
     pub fn apply_staged_op(inputs: &[Self], op: O, output_count: usize) -> Result<Vec<Self>, TracingError>
     where
-        O: Op<T>,
+        O: Operation<T>,
     {
         if inputs.is_empty() {
             return Err(TracingError::EmptyParameterizedValue);
@@ -132,7 +136,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> LinearTerm<T, V, O> {
 impl<
     T: Type + Display,
     V: Traceable<T> + ZeroLike,
-    O: LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V>,
+    O: LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V> + Operation<T>,
 > TangentSpace<T, V> for LinearTerm<T, V, O>
 {
     #[inline]
@@ -170,4 +174,4 @@ impl<
 /// This is the default tangent payload fed into primitive JVP rules during linearization: the
 /// primal component is an ordinary leaf `V`, while the tangent component is a symbolic
 /// [`LinearTerm`] staged into the linear builder.
-pub type Linearized<V, O = LinearPrimitiveOp<ArrayType, V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;
+pub type Linearized<V, O = LinearPrimitiveOperation<ArrayType, V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;

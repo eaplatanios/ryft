@@ -24,16 +24,16 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        Atom, AtomId, Instruction, LinearPrimitiveOp, OneLike, Program, ProgramBuilder, Traceable, TracingError, Value,
-        ZeroLike,
+        Atom, AtomId, Instruction, LinearPrimitiveOperation, OneLike, Program, ProgramBuilder, Traceable, TracingError,
+        Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::{Tracer, interpret_and_trace},
         operations::{
-            CoreLinearProgramOp, CoreLinearReplayOp, DifferentiableOp, InterpretableOp, LinearAddOperation,
-            LinearNegOperation, LinearScaleOperation, Op, RematerializeTracingOperation,
-            rematerialize::{FlatTracedRematerialize, RematerializeOp},
+            CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, InterpretableOperation,
+            LinearAddOperation, LinearNegOperation, LinearScaleOperation, Operation, RematerializeTracingOperation,
+            rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
     },
     types::{ArrayType, Type, Typed},
@@ -58,14 +58,14 @@ pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit}
 pub(crate) use reverse::jvp_traced;
 
 type LinearizedTracedValue<'engine, E> =
-    Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>;
+    Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>;
 
 type TracedLinearProgram<'engine, E> = LinearProgram<
     ArrayType,
     Tracer<'engine, E>,
     Vec<Tracer<'engine, E>>,
     Vec<Tracer<'engine, E>>,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>,
 >;
 
 #[inline]
@@ -90,8 +90,8 @@ where
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    O: Clone + Op<ArrayType> + 'static,
-    L: Clone + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
+    L: Clone + Operation<ArrayType> + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
@@ -124,11 +124,14 @@ fn reverse_mode_scalar_traced_program<'engine, V, O, L, E>(
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
-    O: Clone + Op<ArrayType> + 'static,
-    L: Clone + 'static,
+    O: Clone + Operation<ArrayType> + 'static,
+    L: Clone + Operation<ArrayType> + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOp<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>>>,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    O: InterpretableOperation<
+            ArrayType,
+            Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>,
+        >,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
     let (outputs, pushforward) = linearize_traced_program::<V, O, L, E>(traced_program, traced_primals)?;
     if outputs.len() != 1 {
@@ -154,8 +157,9 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing_v2::{
-            CustomPrimitive, DifferentiableOp, InterpretableOp, LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp,
-            ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support,
+            CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearOperation,
+            LinearPrimitiveOperation, Operation, PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine,
+            test_support,
         },
         types::{ArrayType, DataType},
     };
@@ -196,7 +200,7 @@ mod tests {
         }
     }
 
-    impl Op for PanicReplayOp {
+    impl Operation for PanicReplayOp {
         fn name(&self) -> &'static str {
             "panic_replay"
         }
@@ -209,7 +213,7 @@ mod tests {
         }
     }
 
-    impl InterpretableOp<ArrayType, f64> for PanicReplayOp {
+    impl InterpretableOperation<ArrayType, f64> for PanicReplayOp {
         fn interpret(&self, _inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
             panic!("panic_replay interpret should not run during this transform")
         }
@@ -228,12 +232,12 @@ mod tests {
     }
 
     impl
-        DifferentiableOp<
+        DifferentiableOperation<
             ArrayType,
             f64,
             LinearTerm<ArrayType, f64>,
-            PrimitiveOp<ArrayType, f64>,
-            LinearPrimitiveOp<ArrayType, f64>,
+            PrimitiveOperation<ArrayType, f64>,
+            LinearPrimitiveOperation<ArrayType, f64>,
         > for PanicReplayOp
     {
         fn jvp(
@@ -241,8 +245,8 @@ mod tests {
             _engine: &dyn Engine<
                 Type = ArrayType,
                 Value = f64,
-                TracingOperation = PrimitiveOp<ArrayType, f64>,
-                LinearOperation = LinearPrimitiveOp<ArrayType, f64>,
+                TracingOperation = PrimitiveOperation<ArrayType, f64>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, f64>,
             >,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
@@ -302,10 +306,10 @@ mod tests {
     #[test]
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
-        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let input = builder.add_input(&3.0f64);
         let output = builder.add_instruction_prevalidated(
-            PrimitiveOp::Custom(Arc::new(primitive)),
+            PrimitiveOperation::Custom(Arc::new(primitive)),
             vec![input],
             vec![ArrayType::scalar(DataType::F64)],
         );
@@ -318,11 +322,11 @@ mod tests {
 
     #[test]
     fn transpose_linear_program_does_not_replay_the_forward_linear_program_to_recover_representatives() {
-        let primitive = LinearPrimitiveOp::custom(
+        let primitive = LinearPrimitiveOperation::custom(
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new();
         let input = builder.add_input(&0.0f64);
         let output =
             builder.add_instruction_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
@@ -526,7 +530,7 @@ mod tests {
     #[test]
     fn test_compile_grad_checkpoint_large_segment_wraps_whole_program() {
         // Checkpoint with a segment_size larger than the number of instructions should wrap
-        // the entire program in a single RematerializeOp, equivalent to RecomputeAll.
+        // the entire program in a single RematerializeOperation, equivalent to RecomputeAll.
         let engine = ArrayScalarEngine::<f64>::new();
         let compiled = compile_grad_with_policy(
             &engine,

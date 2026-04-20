@@ -17,7 +17,10 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type};
 
-use super::{DifferentiableOp, InterpretableOp, Op, VectorizableOp, cos::Cos, expect_input_count, unary_abstract};
+use super::{
+    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, cos::Cos, expect_input_count,
+    unary_abstract,
+};
 
 /// Hidden staging trait for the sine primitive.
 #[doc(hidden)]
@@ -51,25 +54,25 @@ impl Sin for f64 {
 
 /// Elementwise sine primitive.
 ///
-/// [`SinOp`] is the staged-program representation of the sine primitive. Ordinary traced programs
+/// [`SinOperation`] is the staged-program representation of the sine primitive. Ordinary traced programs
 /// store this op (or a backend-specific carrier that wraps it), while JVP and batching rules
 /// delegate through its semantic implementation.
 #[derive(Clone, Default)]
-pub struct SinOp;
+pub struct SinOperation;
 
-impl Debug for SinOp {
+impl Debug for SinOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Sin")
     }
 }
 
-impl Display for SinOp {
+impl Display for SinOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "sin")
     }
 }
 
-impl Op for SinOp {
+impl Operation for SinOperation {
     fn name(&self) -> &'static str {
         "sin"
     }
@@ -79,7 +82,7 @@ impl Op for SinOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin> InterpretableOp<ArrayType, V> for SinOp {
+impl<V: Traceable<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for SinOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().sin()])
@@ -87,7 +90,7 @@ impl<V: Traceable<ArrayType> + Sin> InterpretableOp<ArrayType, V> for SinOp {
 }
 
 impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for SinOp
+    DifferentiableOperation<ArrayType, V, T, O, L> for SinOperation
 {
     fn jvp(
         &self,
@@ -103,7 +106,7 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, O: Clon
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin> VectorizableOp<ArrayType, V> for SinOp {
+impl<V: Traceable<ArrayType> + Sin> VectorizableOperation<ArrayType, V> for SinOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.sin()).collect())])
@@ -125,7 +128,7 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > Sin for Tracer<'engine, E>
 where
-    O: Op<ArrayType>,
+    O: Operation<ArrayType>,
 {
     #[inline]
     fn sin(self) -> Self {
@@ -136,7 +139,7 @@ where
 impl<V: Traceable<ArrayType> + Sin> Sin for Batch<V> {
     #[inline]
     fn sin(self) -> Self {
-        let outputs = SinOp.batch(&[self]).expect("sin batching rule should succeed");
+        let outputs = SinOperation.batch(&[self]).expect("sin batching rule should succeed");
         debug_assert_eq!(outputs.len(), 1, "sin should produce one batched output");
         outputs.into_iter().next().expect("sin batching should return one output")
     }

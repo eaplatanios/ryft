@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::parameters::Parameterized;
 use crate::types::ArrayType;
 
-use super::{Atom, Op, Program, Traceable, TracingError};
+use super::{Atom, Operation, Program, Traceable, TracingError};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -228,7 +228,7 @@ where
     V: Traceable<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Clone + Display + Op,
+    O: Clone + Display + Operation,
     F: Fn(&O) -> Result<Vec<IrNestedRegionSummary>, BenchmarkError>,
 {
     let mut op_histogram = BTreeMap::new();
@@ -315,16 +315,18 @@ mod tests {
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOp<ArrayType, f64>, f64, f64>) =
-            interpret_and_trace(
-                &engine,
-                |x| {
-                    let with_constant = x.clone() + x.one_like();
-                    with_constant.sin()
-                },
-                2.0f64,
-            )
-            .unwrap();
+        let (_, compiled): (
+            f64,
+            Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<ArrayType, f64>, f64, f64>,
+        ) = interpret_and_trace(
+            &engine,
+            |x| {
+                let with_constant = x.clone() + x.one_like();
+                with_constant.sin()
+            },
+            2.0f64,
+        )
+        .unwrap();
 
         let summary = summarize_program(&compiled, |_| Ok(Vec::new())).unwrap();
         assert_eq!(

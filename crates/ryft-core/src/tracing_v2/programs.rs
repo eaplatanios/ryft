@@ -22,7 +22,7 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{InterpretableOp, Op, Traceable, TracingError},
+    tracing_v2::{InterpretableOperation, Operation, Traceable, TracingError},
     types::{Type, Typed},
 };
 
@@ -91,7 +91,8 @@ pub struct Instruction<O> {
 /// the ordered list of instructions, and the structured input/output metadata needed to turn flat leaf
 /// evaluation back into user-facing structured values. Both ordinary JIT traces and higher-order
 /// transforms exchange programs in this form.
-pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
+pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+{
     /// Final atom table of the staged program.
     pub atoms: Vec<Atom<T, V>>,
 
@@ -115,7 +116,7 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
 }
 
 impl<
-    O: Clone,
+    O: Clone + Operation<T>,
     T: Type,
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -135,7 +136,7 @@ impl<
     }
 }
 
-impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
     /// Returns the program input atoms in parameter order.
@@ -157,7 +158,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// and then rebuilds the structured output.
     pub fn interpret(&self, input: Input) -> Result<Output, TracingError>
     where
-        O: InterpretableOp<T, V>,
+        O: InterpretableOperation<T, V>,
         Input::ParameterStructure: PartialEq,
         Output::ParameterStructure: Clone,
     {
@@ -212,11 +213,16 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     /// Eliminates dead constants and instructions that do not contribute to the program outputs.
     pub fn simplify(&self) -> Result<Self, TracingError>
     where
-        O: Op<T>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
+        fn mark_live<
+            O: Clone + Operation<T>,
+            T: Type,
+            V: Traceable<T>,
+            Input: Parameterized<V>,
+            Output: Parameterized<V>,
+        >(
             program: &Program<T, V, O, Input, Output>,
             atom_id: AtomId,
             live_atoms: &mut [bool],
@@ -242,13 +248,13 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
         fn remap_atom<O, T, V, Input, Output>(
             atom_id: AtomId,
             program: &Program<T, V, O, Input, Output>,
-            builder: &mut ProgramBuilder<O, T, V>,
+            builder: &mut ProgramBuilder<T, V, O>,
             atom_mapping: &mut HashMap<AtomId, AtomId>,
             live_instructions: &[bool],
             instruction_by_output: &[Option<usize>],
         ) -> Result<AtomId, TracingError>
         where
-            O: Clone + Op<T>,
+            O: Clone + Operation<T>,
             T: Type,
             V: Traceable<T>,
             Input: Parameterized<V>,
@@ -321,7 +327,7 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
             );
         }
 
-        let mut builder = ProgramBuilder::<O, T, V>::new();
+        let mut builder = ProgramBuilder::<T, V, O>::new();
         let mut atom_mapping = HashMap::new();
         for input_atom in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_atom.index).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
@@ -354,8 +360,13 @@ impl<O: Clone, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parame
     }
 }
 
-impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for Program<T, V, O, Input, Output>
+impl<
+    T: Type + Display,
+    V: Traceable<T>,
+    O: Clone + Display + Operation<T>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+> Display for Program<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let format_atom = |id: AtomId| format!("%{id}");
@@ -431,7 +442,7 @@ impl<O: Clone + Display, T: Type + Display, V: Traceable<T>, Input: Parameterize
 /// stop recording new instructions even though the surrounding closure cannot immediately return
 /// `Result`.
 #[derive(Clone, Debug)]
-pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
+pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Operation<T>> {
     /// Atom table accumulated so far, including inputs, constants, and derived outputs.
     atoms: Vec<Atom<T, V>>,
 
@@ -448,7 +459,7 @@ pub struct ProgramBuilder<O, T: Type, V: Typed<T>> {
     error: Option<TracingError>,
 }
 
-impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> {
     /// Creates an empty builder.
     ///
     /// Fresh builders contain no atoms, instructions, or retained exemplars and are typically owned
@@ -579,7 +590,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// Adds a staged instruction using pre-computed output values, performing abstract-eval validation,
     /// algebraic identity elimination, and constant folding.
     ///
-    /// Unlike [`add_instruction`](Self::add_instruction), this method does not call [`InterpretableOp::eval`].
+    /// Unlike [`add_instruction`](Self::add_instruction), this method does not call [`InterpretableOperation::eval`].
     /// the caller supplies the concrete output values directly. Use this when the caller has already
     /// computed the outputs (e.g., inside [`Tracer`](crate::tracing_v2::Tracer) staging
     /// methods).
@@ -588,10 +599,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
         operation: O,
         inputs: Vec<AtomId>,
         output_values: Vec<V>,
-    ) -> Result<Vec<AtomId>, TracingError>
-    where
-        O: Op<T>,
-    {
+    ) -> Result<Vec<AtomId>, TracingError> {
         let input_abstracts = inputs
             .iter()
             .map(|input| {
@@ -637,10 +645,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     ///
     /// This is the staging path used by type-directed tracing and any traced replay that does not
     /// have representative concrete values available for the participating atoms.
-    pub fn add_instruction_abstract(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
-    where
-        O: Op<T>,
-    {
+    pub fn add_instruction_abstract(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError> {
         let input_abstracts = inputs
             .iter()
             .map(|input| {
@@ -667,7 +672,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     /// recorded as constants and no instruction is added to the program.
     pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
     where
-        O: InterpretableOp<T, V>,
+        O: InterpretableOperation<T, V>,
     {
         let input_examples = inputs
             .iter()
@@ -702,7 +707,7 @@ impl<O: Clone, T: Type, V: Traceable<T>> ProgramBuilder<O, T, V> {
     }
 }
 
-impl<O: Clone, T: Type, V: Traceable<T>> Default for ProgramBuilder<O, T, V> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuilder<T, V, O> {
     fn default() -> Self {
         Self::new()
     }
@@ -717,7 +722,7 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOp, Sin, TracingError, Value, ZeroLike, test_support},
+        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOperation, Sin, TracingError, Value, ZeroLike, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 
@@ -725,12 +730,12 @@ mod tests {
 
     #[test]
     fn program_builder_tracks_atom_kinds_and_executes() {
-        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let x = builder.add_input(&2.0f64);
         let y = builder.add_input(&3.0f64);
         let two = builder.add_constant(2.0f64);
-        let scaled_x = builder.add_instruction(PrimitiveOp::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
-        let sum = builder.add_instruction(PrimitiveOp::Add, vec![scaled_x, y]).unwrap()[0];
+        let scaled_x = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_x, y]).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(program.atoms.get(x.index), Some(Atom::Variable(_))));
@@ -751,10 +756,10 @@ mod tests {
 
     #[test]
     fn program_display_uses_typed_jaxpr_like_rendering() {
-        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let x = builder.add_input(&1.0f64);
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_instruction(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
         assert_eq!(
@@ -771,8 +776,8 @@ mod tests {
 
     #[test]
     fn program_builder_rejects_unbound_inputs() {
-        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
-        let result = builder.add_instruction(PrimitiveOp::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let result = builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
         assert!(matches!(
             result,
             Err(TracingError::UnboundAtomId { id }) if id == AtomId { index: 42 }
@@ -782,19 +787,19 @@ mod tests {
 
     #[test]
     fn test_constant_folding_eliminates_instructions() {
-        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
 
         // Adding two constants should fold: no instruction, output is constant.
-        let folded = builder.add_instruction(PrimitiveOp::Add, vec![a, b]).unwrap();
+        let folded = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap();
         assert_eq!(folded.len(), 1);
         assert!(matches!(builder.atom(folded[0]).unwrap(), Atom::Constant(_)));
         assert_eq!(builder.instruction_count(), 0);
 
         // Introduce a non-constant input and combine with the folded constant.
         let x = builder.add_input(&10.0f64);
-        let result = builder.add_instruction(PrimitiveOp::Mul, vec![folded[0], x]).unwrap();
+        let result = builder.add_instruction(PrimitiveOperation::Mul, vec![folded[0], x]).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Variable(_)));
         assert_eq!(builder.instruction_count(), 1);
@@ -818,13 +823,13 @@ mod tests {
 
     #[test]
     fn test_constant_folding_program_call_produces_correct_results() {
-        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
-        let folded_sum = builder.add_instruction(PrimitiveOp::Add, vec![a, b]).unwrap()[0];
+        let folded_sum = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap()[0];
 
         let x = builder.add_input(&10.0f64);
-        let product = builder.add_instruction(PrimitiveOp::Mul, vec![folded_sum, x]).unwrap()[0];
+        let product = builder.add_instruction(PrimitiveOperation::Mul, vec![folded_sum, x]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
 
         // folded_sum = 2.0 + 3.0 = 5.0, product = 5.0 * input
@@ -835,10 +840,10 @@ mod tests {
 
     #[test]
     fn built_program_drops_derived_stored_values_but_remains_executable() {
-        let mut builder = ProgramBuilder::<PrimitiveOp<ArrayType, f64>, ArrayType, f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let x = builder.add_input(&2.0f64);
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_instruction(PrimitiveOp::Add, vec![x, three]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
 
         assert!(
             matches!(builder.atom(x).unwrap(), Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64))
@@ -954,16 +959,16 @@ mod tests {
         }
 
         let mut builder =
-            ProgramBuilder::<PrimitiveOp<ArrayType, TestIdentityValue>, ArrayType, TestIdentityValue>::new();
+            ProgramBuilder::<ArrayType, TestIdentityValue, PrimitiveOperation<ArrayType, TestIdentityValue>>::new();
         let x = builder.add_input(&TestIdentityValue::scalar(5.0));
         let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
 
-        let simplified_add = builder.add_instruction(PrimitiveOp::Add, vec![x, zero]).unwrap();
+        let simplified_add = builder.add_instruction(PrimitiveOperation::Add, vec![x, zero]).unwrap();
         assert_eq!(simplified_add, vec![x]);
         assert_eq!(builder.instruction_count(), 0);
 
         let simplified_scale = builder
-            .add_instruction(PrimitiveOp::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
+            .add_instruction(PrimitiveOperation::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
             .unwrap();
         assert_eq!(simplified_scale, vec![x]);
         assert_eq!(builder.instruction_count(), 0);

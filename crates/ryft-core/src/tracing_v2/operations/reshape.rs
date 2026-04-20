@@ -28,8 +28,8 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp, add::LinearAddOperation,
-    expect_input_count, neg::LinearNegOperation, scale::LinearScaleOperation,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
+    add::LinearAddOperation, expect_input_count, neg::LinearNegOperation, scale::LinearScaleOperation,
 };
 
 /// Hidden staging trait for the reshape primitive.
@@ -242,7 +242,7 @@ impl<
         + LinearScaleOperation<ArrayType, V>,
 > ReshapeTangentSpace<V> for LinearTerm<ArrayType, V, O>
 where
-    O: Op<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TracingError> {
         if input_type == output_type {
@@ -279,7 +279,7 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > ReshapeOps for Tracer<'engine, E>
 where
-    O: Op<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -367,14 +367,14 @@ mod ndarray_support {
 
 /// Primitive representing one reshape from `input_type` to `output_type`.
 #[derive(Clone)]
-pub struct ReshapeOp {
+pub struct ReshapeOperation {
     /// Abstract type expected for the operand.
     input_type: ArrayType,
     /// Abstract type produced by the reshape.
     output_type: ArrayType,
 }
 
-impl ReshapeOp {
+impl ReshapeOperation {
     /// Creates a reshape op with explicit input and output abstract types.
     pub fn new(input_type: ArrayType, output_type: ArrayType) -> Self {
         Self { input_type, output_type }
@@ -391,19 +391,19 @@ impl ReshapeOp {
     }
 }
 
-impl Debug for ReshapeOp {
+impl Debug for ReshapeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Reshape")
     }
 }
 
-impl Display for ReshapeOp {
+impl Display for ReshapeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "reshape{}", self.output_type().shape)
     }
 }
 
-impl Op for ReshapeOp {
+impl Operation for ReshapeOperation {
     fn name(&self) -> &'static str {
         "reshape"
     }
@@ -417,14 +417,14 @@ impl Op for ReshapeOp {
     }
 }
 
-impl<V: ReshapeValue> InterpretableOp<ArrayType, V> for ReshapeOp {
+impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
 }
 
-impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType, V> for ReshapeOp {
+impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType, V> for ReshapeOperation {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -445,12 +445,12 @@ impl<
     V: ReshapeValue + ZeroLike + OneLike + MatrixOps,
     O: Clone,
     L: Clone
-        + Op<ArrayType>
+        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, V>
         + LinearNegOperation<ArrayType, V>
         + LinearReshapeOperation<ArrayType, V>
         + LinearScaleOperation<ArrayType, V>,
-> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for ReshapeOp
+> DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for ReshapeOperation
 {
     fn jvp(
         &self,
@@ -462,7 +462,7 @@ impl<
     }
 }
 
-impl<V: ReshapeValue> VectorizableOp<ArrayType, V> for ReshapeOp {
+impl<V: ReshapeValue> VectorizableOperation<ArrayType, V> for ReshapeOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
@@ -480,7 +480,7 @@ mod tests {
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing_v2::{
-            LinearPrimitiveOp, PrimitiveOp, Program, ProgramBuilder, interpret_and_trace,
+            LinearPrimitiveOperation, PrimitiveOperation, Program, ProgramBuilder, interpret_and_trace,
             operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},
@@ -713,7 +713,7 @@ mod tests {
             Program<
                 ArrayType,
                 ndarray::Array2<f64>,
-                PrimitiveOp<ArrayType, ndarray::Array2<f64>>,
+                PrimitiveOperation<ArrayType, ndarray::Array2<f64>>,
                 ndarray::Array2<f64>,
                 ndarray::Array2<f64>,
             >,
@@ -737,13 +737,13 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]), None, None).unwrap();
         let output_value = arr2(&[[1.0f64, 2.0, 3.0, 4.0]]);
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            LinearPrimitiveOp<ArrayType, ndarray::Array2<f64>>,
             ArrayType,
             ndarray::Array2<f64>,
+            LinearPrimitiveOperation<ArrayType, ndarray::Array2<f64>>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&output_value);
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let contribution = ReshapeOp::new(
+        let contribution = ReshapeOperation::new(
             input_type.clone(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap(),
         )

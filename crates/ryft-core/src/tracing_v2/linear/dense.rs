@@ -275,15 +275,15 @@ where
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<
             ArrayType,
             V,
             LinearTerm<ArrayType, V, E::LinearOperation>,
             E::TracingOperation,
             E::LinearOperation,
         >,
-    E::LinearOperation: CoreLinearReplayOp<V>,
+    E::LinearOperation: CoreLinearReplayOperation<V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -327,15 +327,15 @@ where
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<
             ArrayType,
             V,
             LinearTerm<ArrayType, V, E::LinearOperation>,
             E::TracingOperation,
             E::LinearOperation,
         >,
-    E::LinearOperation: CoreLinearProgramOp<V> + LinearAddOperation<ArrayType, V>,
+    E::LinearOperation: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -371,15 +371,15 @@ where
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TracingError>,
-    E::TracingOperation: InterpretableOp<ArrayType, V>,
-    E::TracingOperation: DifferentiableOp<
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<
             ArrayType,
             V,
             LinearTerm<ArrayType, V, E::LinearOperation>,
             E::TracingOperation,
             E::LinearOperation,
         >,
-    E::LinearOperation: CoreLinearReplayOp<V>,
+    E::LinearOperation: CoreLinearReplayOperation<V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)
 }

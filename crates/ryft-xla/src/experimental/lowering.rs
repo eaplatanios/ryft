@@ -6,23 +6,25 @@ use std::collections::HashMap;
 use ndarray::Array2;
 use ryft_mlir::dialects::{func, shardy, stable_hlo, stable_hlo::Accuracy, stable_hlo::Precision};
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef, Operation,
-    Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
+    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
+    Operation as MlirOperation, Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
 };
 
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
-    Atom, AtomId, CustomPrimitive, LinearPrimitiveOp, MatrixOps, Op, PrimitiveOp, Program, Traceable,
+    Atom, AtomId, CustomPrimitive, LinearPrimitiveOperation, MatrixOps, Operation, PrimitiveOperation, Program,
+    Traceable,
     operations::{
-        AddOp, CosOp, FlatTracedVMap, LeftMatMulOp, LinearRematerializeOp, LinearVMapOp, MatMulOp, MatrixTransposeOp,
-        MulOp, NegOp, RematerializeOp, ReshapeOp, RightMatMulOp, ScaleOp, SinOp, VMapOp,
+        AddOperation, CosOperation, FlatTracedVMap, LeftMatMulOperation, LinearRematerializeOperation,
+        LinearVMapOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
+        RematerializeOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation, VMapOperation,
     },
 };
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
-use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp, WithShardingConstraintOp};
-use crate::experimental::ops::XlaPrimitiveOp;
+use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOperation, WithShardingConstraintOperation};
+use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapConstantKind, ShardMapError, ShardMapTensor};
@@ -132,7 +134,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOp<V>>(
+    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
         &mut self,
         body: &FlatTracedVMap<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -142,13 +144,13 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOp<V>, L: Clone>(
+    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone>(
         &mut self,
-        remat_op: &RematerializeOp<ArrayType, V, O, L>,
+        remat_op: &RematerializeOperation<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
-            remat_op.body().program(),
+            &remat_op.body().program(),
             input_values,
             &mut self.block,
             self.context,
@@ -196,10 +198,10 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Implementing this trait makes an operation eligible for MLIR lowering via
-/// [`to_mlir_module_for_plain_program`] and related entry points. The core [`PrimitiveOp`] and
-/// [`LinearPrimitiveOp`] enums provide the default blanket implementations, and backends can add
+/// [`to_mlir_module_for_plain_program`] and related entry points. The core [`PrimitiveOperation`] and
+/// [`LinearPrimitiveOperation`] enums provide the default blanket implementations, and backends can add
 /// their own closed op carriers by implementing this trait for those enums.
-pub(crate) trait XlaOp<V: MlirLowerableValue>: ryft_core::tracing_v2::Op {
+pub(crate) trait XlaOperation<V: MlirLowerableValue>: ryft_core::tracing_v2::Operation {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -210,7 +212,7 @@ pub(crate) trait XlaOp<V: MlirLowerableValue>: ryft_core::tracing_v2::Op {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for AddOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for AddOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -224,7 +226,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for AddOp {
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for MulOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for MulOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -240,7 +242,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for MulOp {
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for NegOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for NegOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -253,7 +255,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for NegOp {
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for SinOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for SinOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -269,7 +271,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for SinOp {
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for CosOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for CosOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -285,7 +287,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for CosOp {
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for MatrixTransposeOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for MatrixTransposeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -298,7 +300,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for MatrixTransposeOp {
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for MatMulOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for MatMulOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -321,7 +323,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for MatMulOp {
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for ScaleOp<ArrayType, V> {
+impl<V: MlirLowerableValue> XlaOperation<V> for ScaleOperation<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -359,7 +361,7 @@ impl<V: MlirLowerableValue> XlaOp<V> for ScaleOp<ArrayType, V> {
     }
 }
 
-impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for LeftMatMulOp<V> {
+impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOperation<V> for LeftMatMulOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -390,7 +392,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for Left
     }
 }
 
-impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for RightMatMulOp<V> {
+impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOperation<V> for RightMatMulOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -421,7 +423,7 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOp<V> for Righ
     }
 }
 
-impl<V: MlirLowerableValue> XlaOp<V> for ReshapeOp {
+impl<V: MlirLowerableValue> XlaOperation<V> for ReshapeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -439,7 +441,9 @@ impl<V: MlirLowerableValue> XlaOp<V> for ReshapeOp {
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + XlaOp<V>, L: Clone> XlaOp<V> for VMapOp<ArrayType, V, O, L> {
+impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone> XlaOperation<V>
+    for VMapOperation<ArrayType, V, O, L>
+{
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -451,7 +455,7 @@ impl<V: MlirLowerableValue, O: Clone + XlaOp<V>, L: Clone> XlaOp<V> for VMapOp<A
     }
 }
 
-impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
+impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -460,59 +464,91 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
-            Self::Add => {
-                <AddOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer)
-            }
-            Self::Mul => {
-                <MulOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&MulOp, input_values, output_types, mode, lowerer)
-            }
-            Self::Neg => {
-                <NegOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&NegOp, input_values, output_types, mode, lowerer)
-            }
-            Self::Sin => {
-                <SinOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&SinOp, input_values, output_types, mode, lowerer)
-            }
-            Self::Cos => {
-                <CosOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&CosOp, input_values, output_types, mode, lowerer)
-            }
-            Self::MatMul => {
-                <MatMulOp as XlaOp<ShardMapTensor>>::lower_to_mlir(&MatMulOp, input_values, output_types, mode, lowerer)
-            }
-            Self::MatrixTranspose => <MatrixTransposeOp as XlaOp<ShardMapTensor>>::lower_to_mlir(
-                &MatrixTransposeOp,
+            Self::Add => <AddOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &AddOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            Self::Scale { factor } => <ScaleOp<ArrayType, ShardMapTensor> as XlaOp<ShardMapTensor>>::lower_to_mlir(
-                &ScaleOp::new(factor.clone()),
+            Self::Mul => <MulOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &MulOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            Self::LeftMatMul { factor } => <LeftMatMulOp<ShardMapTensor> as XlaOp<ShardMapTensor>>::lower_to_mlir(
-                &LeftMatMulOp::new(factor.clone()),
+            Self::Neg => <NegOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &NegOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            Self::RightMatMul { factor } => <RightMatMulOp<ShardMapTensor> as XlaOp<ShardMapTensor>>::lower_to_mlir(
-                &RightMatMulOp::new(factor.clone()),
+            Self::Sin => <SinOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &SinOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            Self::Reshape { input_type, output_type } => <ReshapeOp as XlaOp<ShardMapTensor>>::lower_to_mlir(
-                &ReshapeOp::new(input_type.clone(), output_type.clone()),
+            Self::Cos => <CosOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &CosOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
+            Self::MatMul => <MatMulOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &MatMulOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::MatrixTranspose => <MatrixTransposeOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                &MatrixTransposeOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Scale { factor } => {
+                <ScaleOperation<ArrayType, ShardMapTensor> as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                    &ScaleOperation::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            Self::LeftMatMul { factor } => {
+                <LeftMatMulOperation<ShardMapTensor> as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                    &LeftMatMulOperation::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            Self::RightMatMul { factor } => {
+                <RightMatMulOperation<ShardMapTensor> as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                    &RightMatMulOperation::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            Self::Reshape { input_type, output_type } => {
+                <ReshapeOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             Self::VMap(vmap) => lowerer.lower_vmap(vmap.body(), input_values),
             Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
             Self::ShardMap(shard_map_op) => {
@@ -561,7 +597,7 @@ impl XlaOp<ShardMapTensor> for XlaPrimitiveOp {
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + XlaOp<V>> XlaOp<V> for LinearVMapOp<ArrayType, V, O> {
+impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V> for LinearVMapOperation<ArrayType, V, O> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -580,7 +616,9 @@ impl<V: MlirLowerableValue, O: Clone + XlaOp<V>> XlaOp<V> for LinearVMapOp<Array
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + XlaOp<V>> XlaOp<V> for LinearRematerializeOp<ArrayType, V, O> {
+impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V>
+    for LinearRematerializeOperation<ArrayType, V, O>
+{
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -589,7 +627,7 @@ impl<V: MlirLowerableValue, O: Clone + XlaOp<V>> XlaOp<V> for LinearRematerializ
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
-            self.body().program(),
+            &self.body().program(),
             input_values,
             &mut lowerer.block,
             lowerer.context,
@@ -598,7 +636,7 @@ impl<V: MlirLowerableValue, O: Clone + XlaOp<V>> XlaOp<V> for LinearRematerializ
     }
 }
 
-impl<V: MlirLowerableValue + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V> {
+impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -607,61 +645,101 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOp<V> for PrimitiveOp<ArrayType, V> {
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
-            PrimitiveOp::Add => <AddOp as XlaOp<V>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer),
-            PrimitiveOp::Mul => <MulOp as XlaOp<V>>::lower_to_mlir(&MulOp, input_values, output_types, mode, lowerer),
-            PrimitiveOp::Neg => <NegOp as XlaOp<V>>::lower_to_mlir(&NegOp, input_values, output_types, mode, lowerer),
-            PrimitiveOp::Sin => <SinOp as XlaOp<V>>::lower_to_mlir(&SinOp, input_values, output_types, mode, lowerer),
-            PrimitiveOp::Cos => <CosOp as XlaOp<V>>::lower_to_mlir(&CosOp, input_values, output_types, mode, lowerer),
-            PrimitiveOp::MatrixTranspose => <MatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
-                &MatrixTransposeOp,
+            PrimitiveOperation::Add => <AddOperation as XlaOperation<V>>::lower_to_mlir(
+                &AddOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            PrimitiveOp::MatMul => {
-                <MatMulOp as XlaOp<V>>::lower_to_mlir(&MatMulOp, input_values, output_types, mode, lowerer)
+            PrimitiveOperation::Mul => <MulOperation as XlaOperation<V>>::lower_to_mlir(
+                &MulOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::Neg => <NegOperation as XlaOperation<V>>::lower_to_mlir(
+                &NegOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::Sin => <SinOperation as XlaOperation<V>>::lower_to_mlir(
+                &SinOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::Cos => <CosOperation as XlaOperation<V>>::lower_to_mlir(
+                &CosOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::MatrixTranspose => <MatrixTransposeOperation as XlaOperation<V>>::lower_to_mlir(
+                &MatrixTransposeOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::MatMul => <MatMulOperation as XlaOperation<V>>::lower_to_mlir(
+                &MatMulOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::Scale { factor } => <ScaleOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
+                &ScaleOperation::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::LeftMatMul { factor } => <LeftMatMulOperation<V> as XlaOperation<V>>::lower_to_mlir(
+                &LeftMatMulOperation::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::RightMatMul { factor } => <RightMatMulOperation<V> as XlaOperation<V>>::lower_to_mlir(
+                &RightMatMulOperation::new(factor.clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::Reshape { input_type, output_type } => {
+                <ReshapeOperation as XlaOperation<V>>::lower_to_mlir(
+                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
-            PrimitiveOp::Scale { factor } => <ScaleOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(
-                &ScaleOp::new(factor.clone()),
+            PrimitiveOperation::VMap(vmap) => <VMapOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
+                vmap,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            PrimitiveOp::LeftMatMul { factor } => <LeftMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
-                &LeftMatMulOp::new(factor.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            PrimitiveOp::RightMatMul { factor } => <RightMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
-                &RightMatMulOp::new(factor.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            PrimitiveOp::Reshape { input_type, output_type } => <ReshapeOp as XlaOp<V>>::lower_to_mlir(
-                &ReshapeOp::new(input_type.clone(), output_type.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            PrimitiveOp::VMap(vmap) => {
-                <VMapOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
-            }
-            PrimitiveOp::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
-            PrimitiveOp::Custom(_) => {
-                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Op::name(self).to_string() })
+            PrimitiveOperation::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
+            PrimitiveOperation::Custom(_) => {
+                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Operation::name(self).to_string() })
             }
         }
     }
 }
 
-impl<V: MlirLowerableValue + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayType, V> {
+impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOperation<ArrayType, V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -670,52 +748,74 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayType
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
-            LinearPrimitiveOp::Add => {
-                <AddOp as XlaOp<V>>::lower_to_mlir(&AddOp, input_values, output_types, mode, lowerer)
+            LinearPrimitiveOperation::Add => <AddOperation as XlaOperation<V>>::lower_to_mlir(
+                &AddOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOperation::Neg => <NegOperation as XlaOperation<V>>::lower_to_mlir(
+                &NegOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOperation::MatrixTranspose => <MatrixTransposeOperation as XlaOperation<V>>::lower_to_mlir(
+                &MatrixTransposeOperation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearPrimitiveOperation::Scale { factor } => {
+                <ScaleOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
+                    &ScaleOperation::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
-            LinearPrimitiveOp::Neg => {
-                <NegOp as XlaOp<V>>::lower_to_mlir(&NegOp, input_values, output_types, mode, lowerer)
+            LinearPrimitiveOperation::LeftMatMul { factor } => {
+                <LeftMatMulOperation<V> as XlaOperation<V>>::lower_to_mlir(
+                    &LeftMatMulOperation::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
-            LinearPrimitiveOp::MatrixTranspose => <MatrixTransposeOp as XlaOp<V>>::lower_to_mlir(
-                &MatrixTransposeOp,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearPrimitiveOp::Scale { factor } => <ScaleOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(
-                &ScaleOp::new(factor.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearPrimitiveOp::LeftMatMul { factor } => <LeftMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
-                &LeftMatMulOp::new(factor.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearPrimitiveOp::RightMatMul { factor } => <RightMatMulOp<V> as XlaOp<V>>::lower_to_mlir(
-                &RightMatMulOp::new(factor.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearPrimitiveOp::Reshape { input_type, output_type } => <ReshapeOp as XlaOp<V>>::lower_to_mlir(
-                &ReshapeOp::new(input_type.clone(), output_type.clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearPrimitiveOp::VMap(vmap) => {
-                <LinearVMapOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(vmap, input_values, output_types, mode, lowerer)
+            LinearPrimitiveOperation::RightMatMul { factor } => {
+                <RightMatMulOperation<V> as XlaOperation<V>>::lower_to_mlir(
+                    &RightMatMulOperation::new(factor.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
             }
-            LinearPrimitiveOp::Rematerialize(remat) => {
-                <LinearRematerializeOp<ArrayType, V> as XlaOp<V>>::lower_to_mlir(
+            LinearPrimitiveOperation::Reshape { input_type, output_type } => {
+                <ReshapeOperation as XlaOperation<V>>::lower_to_mlir(
+                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            LinearPrimitiveOperation::VMap(vmap) => {
+                <LinearVMapOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
+                    vmap,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            LinearPrimitiveOperation::Rematerialize(remat) => {
+                <LinearRematerializeOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
                     remat,
                     input_values,
                     output_types,
@@ -723,8 +823,8 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOp<V> for LinearPrimitiveOp<ArrayType
                     lowerer,
                 )
             }
-            LinearPrimitiveOp::Custom(_) => {
-                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Op::name(self).to_string() })
+            LinearPrimitiveOperation::Custom(_) => {
+                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Operation::name(self).to_string() })
             }
         }
     }
@@ -752,7 +852,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOp<V>>(
+    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
         &mut self,
         body: &FlatTracedVMap<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -762,13 +862,13 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
 
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
-    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOp<V>, L: Clone>(
+    pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone>(
         &mut self,
-        remat_op: &RematerializeOp<ArrayType, V, O, L>,
+        remat_op: &RematerializeOperation<ArrayType, V, O, L>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
-            remat_op.body().program(),
+            &remat_op.body().program(),
             input_values,
             &mut self.block,
             self.context,
@@ -784,7 +884,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         &mut self,
         outer_inputs: &[ValueRef<'b, 'c, 't>],
         shard_map: &ShardMap,
-        program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
+        program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
         local_input_types: &[ArrayType],
         global_output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
@@ -819,7 +919,7 @@ pub(crate) fn to_mlir_module<
     S: AsRef<str>,
 >(
     shard_map: &ShardMap,
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
     global_input_types: &Input,
     local_input_types: &Input,
     global_output_types: &Output,
@@ -910,7 +1010,7 @@ pub(crate) fn to_mlir_module<
 
 /// Lowers an arbitrary traced XLA program to a textual StableHLO/Shardy MLIR module.
 pub(crate) fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOutput, S>(
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
     global_input_types: &Input,
     global_output_types: &Output,
     function_name: S,
@@ -1081,7 +1181,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Clone + XlaOp<V>,
+    O: Clone + XlaOperation<V>,
     S: AsRef<str>,
 >(
     program: &Program<ArrayType, V, O, Input, Output>,
@@ -1144,7 +1244,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
 }
 
 fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
     existing: Option<LogicalMesh>,
 ) -> Result<Option<LogicalMesh>, LoweringError>
 where
@@ -1154,7 +1254,7 @@ where
     let mut mesh = existing;
     for instruction in &program.instructions {
         match &instruction.operation {
-            XlaPrimitiveOp::ShardMap(shard_map_op) => {
+            XlaPrimitiveOperation::ShardMap(shard_map_op) => {
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
                     mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
                 } else {
@@ -1167,7 +1267,7 @@ where
                     mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
                 }
             }
-            XlaPrimitiveOp::WithShardingConstraint(sharding_constraint_op) => {
+            XlaPrimitiveOperation::WithShardingConstraint(sharding_constraint_op) => {
                 mesh = Some(match mesh.take() {
                     Some(existing_mesh) => {
                         merge_logical_meshes(&existing_mesh, &sharding_constraint_op.sharding().mesh)?
@@ -1175,8 +1275,8 @@ where
                     None => sharding_constraint_op.sharding().mesh.clone(),
                 });
             }
-            XlaPrimitiveOp::Custom(custom_op) => {
-                if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
+            XlaPrimitiveOperation::Custom(custom_op) => {
+                if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOperation<ShardMapTensor>>() {
                     if let Some(eval_mode) = shard_map_op.eval_mode() {
                         mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
                     } else {
@@ -1188,7 +1288,9 @@ where
                         });
                         mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
                     }
-                } else if let Some(sharding_constraint_op) = custom_op.extensions().get::<WithShardingConstraintOp>() {
+                } else if let Some(sharding_constraint_op) =
+                    custom_op.extensions().get::<WithShardingConstraintOperation>()
+                {
                     mesh = Some(match mesh.take() {
                         Some(existing_mesh) => {
                             merge_logical_meshes(&existing_mesh, &sharding_constraint_op.sharding().mesh)?
@@ -1574,7 +1676,7 @@ fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
-    O: Clone + XlaOp<V>,
+    O: Clone + XlaOperation<V>,
     L: Location<'c, 't> + Copy,
 {
     fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
@@ -1588,7 +1690,7 @@ where
     ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
     where
         B: Block<'b, 'c, 't>,
-        O: Clone + XlaOp<V>,
+        O: Clone + XlaOperation<V>,
         V: MlirLowerableValue,
         L: Location<'c, 't> + Copy,
     {
@@ -1690,7 +1792,7 @@ fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
 where
     B: Block<'b, 'c, 't>,
     V: MlirLowerableValue,
-    O: Clone + XlaOp<V>,
+    O: Clone + XlaOperation<V>,
     L: Location<'c, 't> + Copy,
 {
     let lane_count = body.lane_count();
@@ -1721,7 +1823,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     let packed_outputs =
-        lower_packed_program_outputs(body.program(), packed_inputs.as_slice(), lane_count, block, context, location)?;
+        lower_packed_program_outputs(&body.program(), packed_inputs.as_slice(), lane_count, block, context, location)?;
     debug_assert_eq!(packed_outputs.len(), logical_output_count);
 
     let unpacked_by_output = packed_outputs
@@ -1759,7 +1861,7 @@ fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + XlaOp<V>,
+    O: Clone + XlaOperation<V>,
 {
     let mut atom_values = vec![None; program.atoms.len()];
     for (atom_id, mlir_value) in program.input_ids.iter().copied().zip(input_values.iter().copied()) {
@@ -1833,7 +1935,7 @@ fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + XlaOp<V>,
+    O: Clone + XlaOperation<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1891,7 +1993,7 @@ where
 
 /// Lowers one traced program to values inside a block.
 fn lower_program_outputs<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1958,7 +2060,7 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     shard_map: &ShardMap,
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
@@ -2140,18 +2242,18 @@ where
 
 /// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
 fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
-    op: &XlaPrimitiveOp,
+    op: &XlaPrimitiveOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     match op {
-        XlaPrimitiveOp::Add => {
+        XlaPrimitiveOperation::Add => {
             let result =
                 lowerer.block.append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
         }
-        XlaPrimitiveOp::Mul => {
+        XlaPrimitiveOperation::Mul => {
             let result = lowerer.block.append_operation(stable_hlo::multiply(
                 input_values[0],
                 input_values[1],
@@ -2159,18 +2261,18 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
-        XlaPrimitiveOp::Neg => {
+        XlaPrimitiveOperation::Neg => {
             let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
         }
-        XlaPrimitiveOp::Sin => {
+        XlaPrimitiveOperation::Sin => {
             let result =
                 lowerer
                     .block
                     .append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
         }
-        XlaPrimitiveOp::Cos => {
+        XlaPrimitiveOperation::Cos => {
             let result = lowerer.block.append_operation(stable_hlo::cosine(
                 input_values[0],
                 Accuracy::Default,
@@ -2178,7 +2280,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
-        XlaPrimitiveOp::MatMul => {
+        XlaPrimitiveOperation::MatMul => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
             let result = lowerer.block.append_operation(stable_hlo::dot_general(
@@ -2192,12 +2294,12 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        XlaPrimitiveOp::MatrixTranspose => {
+        XlaPrimitiveOperation::MatrixTranspose => {
             let result =
                 lowerer.block.append_operation(stable_hlo::transpose(input_values[0], &[1, 0], lowerer.location));
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
         }
-        XlaPrimitiveOp::Scale { factor } => {
+        XlaPrimitiveOperation::Scale { factor } => {
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let factor_value =
                 lower_constant(AtomId { index: 0 }, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
@@ -2220,7 +2322,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
-        XlaPrimitiveOp::LeftMatMul { factor } => {
+        XlaPrimitiveOperation::LeftMatMul { factor } => {
             let factor_value =
                 lower_constant(AtomId { index: 0 }, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
@@ -2236,7 +2338,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        XlaPrimitiveOp::RightMatMul { factor } => {
+        XlaPrimitiveOperation::RightMatMul { factor } => {
             let factor_value =
                 lower_constant(AtomId { index: 0 }, factor, &mut lowerer.block, lowerer.context, lowerer.location)?;
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
@@ -2252,7 +2354,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        XlaPrimitiveOp::Reshape { output_type, .. } => {
+        XlaPrimitiveOperation::Reshape { output_type, .. } => {
             let output_shape = static_dimensions(output_type)?;
             let result = lowerer.block.append_operation(stable_hlo::reshape(
                 input_values[0],
@@ -2261,9 +2363,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
-        XlaPrimitiveOp::VMap(vmap_op) => lowerer.lower_vmap(vmap_op.body(), input_values),
-        XlaPrimitiveOp::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
-        XlaPrimitiveOp::ShardMap(shard_map_op) => {
+        XlaPrimitiveOperation::VMap(vmap_op) => lowerer.lower_vmap(vmap_op.body(), input_values),
+        XlaPrimitiveOperation::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
+        XlaPrimitiveOperation::ShardMap(shard_map_op) => {
             if let Some(eval_mode) = shard_map_op.eval_mode() {
                 return lowerer.lower_linear_shard_map_eval_mode(eval_mode, input_values);
             }
@@ -2279,7 +2381,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 simplified_body.global_output_types.as_slice(),
             )
         }
-        XlaPrimitiveOp::WithShardingConstraint(op) => {
+        XlaPrimitiveOperation::WithShardingConstraint(op) => {
             let operation = lowerer.block.append_operation(shardy::sharding_constraint(
                 input_values[0],
                 op.sharding().to_mlir(lowerer.location),
@@ -2287,7 +2389,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
         }
-        XlaPrimitiveOp::Custom(custom_op) => custom_op
+        XlaPrimitiveOperation::Custom(custom_op) => custom_op
             .extensions()
             .get::<StableHloCustomLoweringExtension<ShardMapTensor>>()
             .ok_or_else(|| LoweringError::MissingCustomLowering { op: op.name().to_string() })?
@@ -2308,7 +2410,7 @@ fn lower_plain_instruction<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + XlaOp<V>,
+    O: Clone + XlaOperation<V>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -2339,7 +2441,7 @@ fn lower_packed_plain_instruction<'b, 'c: 'b, 't: 'c, O, V>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
-    O: Clone + XlaOp<V>,
+    O: Clone + XlaOperation<V>,
 {
     let instruction = &program.instructions[instruction_index];
     let output_types = instruction
@@ -2358,7 +2460,7 @@ where
 
 /// Lowers one traced instruction to the corresponding StableHLO operation and returns its result value.
 fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ProgramInput, ProgramOutput>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
     instruction_index: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -2611,7 +2713,8 @@ mod tests {
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, InterpretableOp, MatrixOps, OneLike, Op, ProgramBuilder, Sin, TracingError, ZeroLike,
+        Cos, CustomPrimitive, InterpretableOperation, MatrixOps, OneLike, Operation, ProgramBuilder, Sin, TracingError,
+        ZeroLike,
     };
     use ryft_core::types::Shape;
 
@@ -2646,7 +2749,7 @@ mod tests {
         }
     }
 
-    impl Op for TestCustomLoweredOp {
+    impl Operation for TestCustomLoweredOp {
         fn name(&self) -> &'static str {
             "test_custom_lowered"
         }
@@ -2659,7 +2762,7 @@ mod tests {
         }
     }
 
-    impl InterpretableOp<ArrayType, ShardMapTensor> for TestCustomLoweredOp {
+    impl InterpretableOperation<ArrayType, ShardMapTensor> for TestCustomLoweredOp {
         fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
             if inputs.len() != 1 {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
@@ -2684,10 +2787,11 @@ mod tests {
     }
 
     fn custom_program(
-        op: XlaPrimitiveOp,
-    ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, ShardMapTensor, ShardMapTensor> {
+        op: XlaPrimitiveOperation,
+    ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilder::<crate::experimental::ops::XlaPrimitiveOp, ArrayType, ShardMapTensor>::new();
+        let mut builder =
+            ProgramBuilder::<ArrayType, ShardMapTensor, crate::experimental::ops::XlaPrimitiveOperation>::new();
         let input = builder.add_input(&ShardMapTensor::new(input_type));
         let output = builder.add_instruction(op, vec![input]).unwrap()[0];
         builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)
@@ -2774,7 +2878,7 @@ mod tests {
     fn test_to_mlir_module_for_program_uses_registered_custom_lowering() {
         let primitive = CustomPrimitive::new(TestCustomLoweredOp)
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(TestCustomLowering)));
-        let program = custom_program(XlaPrimitiveOp::Custom(Arc::new(primitive)));
+        let program = custom_program(XlaPrimitiveOperation::Custom(Arc::new(primitive)));
         let input_type = test_vector_type(4);
 
         assert_eq!(
@@ -2792,7 +2896,8 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_reports_missing_custom_lowering() {
-        let program = custom_program(XlaPrimitiveOp::Custom(Arc::new(CustomPrimitive::new(TestCustomLoweredOp))));
+        let program =
+            custom_program(XlaPrimitiveOperation::Custom(Arc::new(CustomPrimitive::new(TestCustomLoweredOp))));
         let input_type = test_vector_type(4);
 
         assert_eq!(
@@ -2827,7 +2932,7 @@ mod tests {
             ryft_core::tracing_v2::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::PrimitiveOp<ArrayType, f64>,
+                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
                 (f64, f64),
                 f64,
             >,
@@ -2862,7 +2967,7 @@ mod tests {
             ryft_core::tracing_v2::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::PrimitiveOp<ArrayType, f64>,
+                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
                 f64,
                 f64,
             >,
@@ -2903,7 +3008,7 @@ mod tests {
                 f64,
                 f64,
                 (f64, f64),
-                ryft_core::tracing_v2::LinearPrimitiveOp<ArrayType, f64>,
+                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>,
             >,
         ) = ryft_core::tracing_v2::vjp(
             &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
@@ -2931,7 +3036,7 @@ mod tests {
             ryft_core::tracing_v2::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::PrimitiveOp<ArrayType, f64>,
+                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
                 (f64, f64),
                 (f64, f64),
             >,
@@ -2971,7 +3076,7 @@ mod tests {
                 Array2<f64>,
                 Array2<f64>,
                 (Array2<f64>, Array2<f64>),
-                ryft_core::tracing_v2::LinearPrimitiveOp<ArrayType, Array2<f64>>,
+                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, Array2<f64>>,
             >,
         ) = ryft_core::tracing_v2::vjp(
             &ryft_core::tracing_v2::operations::matrix::ndarray_support::Array2Engine::<f64>::new(),

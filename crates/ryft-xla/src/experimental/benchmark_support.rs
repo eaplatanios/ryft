@@ -14,11 +14,11 @@ use ryft_core::tracing_v2::{
     grad, vmap,
 };
 
-use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOp};
+use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOperation};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
-use crate::experimental::ops::XlaPrimitiveOp;
+use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace,
 };
@@ -114,7 +114,7 @@ fn summarize_nested_body(
 ///
 ///   - `program`: Program to summarize.
 fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameterized<ShardMapTensor>>(
-    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOp, Input, Output>,
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     fn summarize_linear_eval_mode(
         label: &'static str,
@@ -130,7 +130,7 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
     }
 
     summarize_program(program, |op| {
-        if let XlaPrimitiveOp::ShardMap(shard_map_op) = op {
+        if let XlaPrimitiveOperation::ShardMap(shard_map_op) = op {
             let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
             if let Some(eval_mode) = shard_map_op.eval_mode() {
                 nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);
@@ -141,8 +141,8 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
             return Ok(nested_regions);
         }
 
-        if let XlaPrimitiveOp::Custom(custom_op) = op {
-            if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOp<ShardMapTensor>>() {
+        if let XlaPrimitiveOperation::Custom(custom_op) = op {
+            if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOperation<ShardMapTensor>>() {
                 let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
                 if let Some(eval_mode) = shard_map_op.eval_mode() {
                     nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);

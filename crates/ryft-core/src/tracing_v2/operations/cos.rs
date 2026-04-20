@@ -18,7 +18,10 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type};
 
-use super::{DifferentiableOp, InterpretableOp, Op, VectorizableOp, expect_input_count, sin::Sin, unary_abstract};
+use super::{
+    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, expect_input_count, sin::Sin,
+    unary_abstract,
+};
 
 /// Hidden staging trait for the cosine primitive.
 #[doc(hidden)]
@@ -52,24 +55,24 @@ impl Cos for f64 {
 
 /// Elementwise cosine primitive.
 ///
-/// [`CosOp`] is stored in staged programs whenever cosine is traced explicitly, and its JVP rule is
+/// [`CosOperation`] is stored in staged programs whenever cosine is traced explicitly, and its JVP rule is
 /// reused by both forward-mode evaluation and higher-order traced transforms.
 #[derive(Clone, Default)]
-pub struct CosOp;
+pub struct CosOperation;
 
-impl Debug for CosOp {
+impl Debug for CosOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Cos")
     }
 }
 
-impl Display for CosOp {
+impl Display for CosOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "cos")
     }
 }
 
-impl Op for CosOp {
+impl Operation for CosOperation {
     fn name(&self) -> &'static str {
         "cos"
     }
@@ -79,7 +82,7 @@ impl Op for CosOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Cos> InterpretableOp<ArrayType, V> for CosOp {
+impl<V: Traceable<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![inputs[0].clone().cos()])
@@ -87,7 +90,7 @@ impl<V: Traceable<ArrayType> + Cos> InterpretableOp<ArrayType, V> for CosOp {
 }
 
 impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for CosOp
+    DifferentiableOperation<ArrayType, V, T, O, L> for CosOperation
 {
     fn jvp(
         &self,
@@ -103,7 +106,7 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
     }
 }
 
-impl<V: Traceable<ArrayType> + Cos> VectorizableOp<ArrayType, V> for CosOp {
+impl<V: Traceable<ArrayType> + Cos> VectorizableOperation<ArrayType, V> for CosOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.cos()).collect())])
@@ -125,7 +128,7 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > Cos for Tracer<'engine, E>
 where
-    O: Op<ArrayType>,
+    O: Operation<ArrayType>,
 {
     #[inline]
     fn cos(self) -> Self {
@@ -136,7 +139,7 @@ where
 impl<V: Traceable<ArrayType> + Cos> Cos for Batch<V> {
     #[inline]
     fn cos(self) -> Self {
-        let outputs = CosOp.batch(&[self]).expect("cos batching rule should succeed");
+        let outputs = CosOperation.batch(&[self]).expect("cos batching rule should succeed");
         debug_assert_eq!(outputs.len(), 1, "cos should produce one batched output");
         outputs.into_iter().next().expect("cos batching should return one output")
     }

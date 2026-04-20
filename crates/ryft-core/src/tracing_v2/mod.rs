@@ -8,7 +8,7 @@
 //!
 //! The central design choice is that staged instructions store operation objects rather than a single
 //! global opcode enum. That keeps the operation universe open: the default core pipeline uses
-//! [`PrimitiveOp`] and [`LinearPrimitiveOp`], while backend crates can contribute their own closed
+//! [`PrimitiveOperation`] and [`LinearPrimitiveOperation`], while backend crates can contribute their own closed
 //! carriers through [`Engine::TracingOperation`] and [`Engine::LinearOperation`] without rewriting
 //! the tracing and differentiation logic.
 //!
@@ -83,8 +83,9 @@ pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{
-    Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOp, InterpretableOp, LinearCustomPrimitive,
-    LinearOperation, LinearPrimitiveOp, Op, PrimitiveOp, Sin, VectorizableOp,
+    Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, InterpretableOperation,
+    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, Operation, PrimitiveOperation, Sin,
+    VectorizableOperation,
 };
 pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder};
 pub use values::{OneLike, Traceable, Value, ZeroLike};

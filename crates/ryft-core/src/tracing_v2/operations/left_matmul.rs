@@ -17,14 +17,14 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, Typed};
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
     add::LinearAddOperation,
     expect_input_count, lift_jit_constant,
     matmul::MatMulTracingOperation,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
     matrix_transpose::{LinearMatrixTransposeOperation, MatrixTransposeTracingOperation},
     neg::LinearNegOperation,
-    primitive::LinearPrimitiveOp,
+    primitive::LinearPrimitiveOperation,
     right_matmul::LinearRightMatMulOperation,
     scale::LinearScaleOperation,
 };
@@ -47,15 +47,15 @@ pub trait LinearLeftMatMulOperation<T: Type + Display, V: Traceable<T>>: Clone {
 
 /// Linear map `tangent -> factor @ tangent`.
 ///
-/// [`LeftMatMulOp`] is the matrix-valued analogue of [`super::ScaleOp`]: it captures one factor in
+/// [`LeftMatMulOperation`] is the matrix-valued analogue of [`super::ScaleOperation`]: it captures one factor in
 /// the op object and applies that factor to every input it is replayed on.
 #[derive(Clone)]
-pub struct LeftMatMulOp<V: MatrixValue> {
+pub struct LeftMatMulOperation<V: MatrixValue> {
     /// Matrix factor multiplied on the left of every input.
     factor: V,
 }
 
-impl<V: MatrixValue> LeftMatMulOp<V> {
+impl<V: MatrixValue> LeftMatMulOperation<V> {
     /// Creates one left multiplication op capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
@@ -72,7 +72,7 @@ impl<V: MatrixValue> LeftMatMulOp<V> {
 /// Validates abstract inputs using the factor's abstract type without needing a concrete instance.
 ///
 /// Backend carriers use this helper when they need the metadata rule for a captured left-matmul
-/// operation without first constructing a concrete [`LeftMatMulOp`].
+/// operation without first constructing a concrete [`LeftMatMulOperation`].
 pub fn left_matmul_abstract_eval(
     factor_type: &ArrayType,
     inputs: &[ArrayType],
@@ -81,19 +81,19 @@ pub fn left_matmul_abstract_eval(
     Ok(vec![matmul_abstract(factor_type, &inputs[0], "left_matmul")?])
 }
 
-impl<V: MatrixValue> Debug for LeftMatMulOp<V> {
+impl<V: MatrixValue> Debug for LeftMatMulOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LeftMatMul")
     }
 }
 
-impl<V: MatrixValue> Display for LeftMatMulOp<V> {
+impl<V: MatrixValue> Display for LeftMatMulOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "left_matmul")
     }
 }
 
-impl<V: MatrixValue> Op for LeftMatMulOp<V> {
+impl<V: MatrixValue> Operation for LeftMatMulOperation<V> {
     fn name(&self) -> &'static str {
         "left_matmul"
     }
@@ -112,14 +112,14 @@ impl<V: MatrixValue> Op for LeftMatMulOp<V> {
     }
 }
 
-impl<V: MatrixValue> InterpretableOp<ArrayType, V> for LeftMatMulOp<V> {
+impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for LeftMatMulOperation<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor.clone().matmul(inputs[0].clone())])
     }
 }
 
-impl<V: MatrixValue> LinearOperation<ArrayType, V> for LeftMatMulOp<V> {
+impl<V: MatrixValue> LinearOperation<ArrayType, V> for LeftMatMulOperation<V> {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -128,7 +128,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for LeftMatMulOp<V> {
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
                 std::slice::from_ref(&output_cotangents[0]),
-                LinearPrimitiveOp::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
+                LinearPrimitiveOperation::LeftMatMul { factor: self.factor.clone().transpose_matrix() },
                 1,
             )?
             .into_iter()
@@ -147,16 +147,17 @@ impl<
         + ?Sized
         + 'static,
     InnerLinearOperation: Clone
+        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'engine, E>>
         + LinearNegOperation<ArrayType, Tracer<'engine, E>>
         + LinearScaleOperation<ArrayType, Tracer<'engine, E>>
         + LinearLeftMatMulOperation<ArrayType, Tracer<'engine, E>>
         + LinearRightMatMulOperation<ArrayType, Tracer<'engine, E>>
         + LinearMatrixTransposeOperation<ArrayType, Tracer<'engine, E>>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
-    for LeftMatMulOp<V>
+> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
+    for LeftMatMulOperation<V>
 where
-    O: Op<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn interpret(
         &self,
@@ -174,13 +175,14 @@ impl<
     V: MatrixValue + ZeroLike,
     O: Clone,
     L: Clone
+        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, V>
         + LinearNegOperation<ArrayType, V>
         + LinearScaleOperation<ArrayType, V>
         + LinearLeftMatMulOperation<ArrayType, V>
         + LinearRightMatMulOperation<ArrayType, V>
         + LinearMatrixTransposeOperation<ArrayType, V>,
-> DifferentiableOp<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for LeftMatMulOp<V>
+> DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for LeftMatMulOperation<V>
 {
     fn jvp(
         &self,
@@ -196,7 +198,7 @@ impl<
     }
 }
 
-impl<V: MatrixValue> VectorizableOp<ArrayType, V> for LeftMatMulOp<V> {
+impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for LeftMatMulOperation<V> {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![BatchedValue::new(

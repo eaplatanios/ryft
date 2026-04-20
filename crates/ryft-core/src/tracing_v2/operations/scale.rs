@@ -1,6 +1,6 @@
 //! Scaling primitive for [`crate::tracing_v2`].
 //!
-//! `ScaleOp` is the main example of a primitive with captured constant state. Unlike bare
+//! `ScaleOperation` is the main example of a primitive with captured constant state. Unlike bare
 //! multiplication, the scale factor is part of the op object itself, which makes this module a good
 //! reference for how traced constants move through replay, linearization, and higher-order traced
 //! execution.
@@ -24,8 +24,8 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, Typed};
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearAddOperation, LinearNegOperation, LinearOperation, Op, VectorizableOp,
-    expect_input_count, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
+    Operation, VectorizableOperation, expect_input_count, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
 };
 
 /// Hidden staging trait for the scaling primitive.
@@ -47,7 +47,7 @@ pub trait LinearScaleOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// In ordinary programs this represents "multiply by a closed-over constant." In linear programs
 /// the same semantic idea is reused to scale tangent and cotangent terms.
 #[derive(Clone)]
-pub struct ScaleOp<T: Type, V: Typed<T>> {
+pub struct ScaleOperation<T: Type, V: Typed<T>> {
     /// Captured factor applied to every input of this unary linear op.
     factor: V,
 
@@ -55,7 +55,7 @@ pub struct ScaleOp<T: Type, V: Typed<T>> {
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Type, V: Traceable<T>> ScaleOp<T, V> {
+impl<T: Type, V: Traceable<T>> ScaleOperation<T, V> {
     /// Creates a new scale operation capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
@@ -69,29 +69,29 @@ impl<T: Type, V: Traceable<T>> ScaleOp<T, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> ScaleOp<ArrayType, V> {
+impl<V: Traceable<ArrayType>> ScaleOperation<ArrayType, V> {
     /// Validates abstract inputs without needing a concrete instance.
     ///
     /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
-    /// from type information before they have committed to a concrete `ScaleOp` value.
+    /// from type information before they have committed to a concrete `ScaleOperation` value.
     pub fn abstract_eval_static(inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         Ok(vec![unary_abstract(inputs)?])
     }
 }
 
-impl<T: Type, V: Traceable<T>> Debug for ScaleOp<T, V> {
+impl<T: Type, V: Traceable<T>> Debug for ScaleOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Scale")
     }
 }
 
-impl<T: Type, V: Traceable<T>> Display for ScaleOp<T, V> {
+impl<T: Type, V: Traceable<T>> Display for ScaleOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "scale")
     }
 }
 
-impl<V: Traceable<ArrayType>> Op for ScaleOp<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation for ScaleOperation<ArrayType, V> {
     fn name(&self) -> &'static str {
         "scale"
     }
@@ -110,14 +110,16 @@ impl<V: Traceable<ArrayType>> Op for ScaleOp<ArrayType, V> {
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOp<ArrayType, V> for ScaleOp<ArrayType, V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for ScaleOperation<ArrayType, V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for ScaleOp<ArrayType, V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<ArrayType, V>
+    for ScaleOperation<ArrayType, V>
+{
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -136,13 +138,14 @@ impl<
         + ?Sized
         + 'static,
     InnerLinearOperation: Clone
+        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'engine, E>>
         + LinearNegOperation<ArrayType, Tracer<'engine, E>>
         + LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
-> InterpretableOp<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
-    for ScaleOp<ArrayType, V>
+> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
+    for ScaleOperation<ArrayType, V>
 where
-    O: Op<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn interpret(
         &self,
@@ -159,7 +162,7 @@ where
 }
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for ScaleOp<ArrayType, V>
+    DifferentiableOperation<ArrayType, V, T, O, L> for ScaleOperation<ArrayType, V>
 {
     fn jvp(
         &self,
@@ -175,7 +178,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOp<ArrayType, V> for ScaleOp<ArrayType, V> {
+impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType, V> for ScaleOperation<ArrayType, V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| self.factor().clone() * lane).collect())])
@@ -190,7 +193,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{LinearPrimitiveOp, ProgramBuilder},
+        tracing_v2::{LinearPrimitiveOperation, ProgramBuilder},
     };
 
     use super::*;
@@ -203,10 +206,10 @@ mod tests {
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<LinearPrimitiveOp<ArrayType, f64>, ArrayType, f64>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let contribution = ScaleOp::new(3.0f64)
+        let contribution = ScaleOperation::new(3.0f64)
             .transpose(&[output_cotangent])
             .unwrap()
             .into_iter()

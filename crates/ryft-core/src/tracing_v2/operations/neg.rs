@@ -19,7 +19,8 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOp, InterpretableOp, LinearOperation, Op, VectorizableOp, expect_input_count, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
+    expect_input_count, unary_abstract,
 };
 
 /// Hidden staging trait for the negation primitive.
@@ -38,24 +39,24 @@ pub trait LinearNegOperation<T: Type + Display, V: Traceable<T>>: Clone {
 
 /// Elementwise negation primitive.
 ///
-/// [`NegOp`] is the canonical example of a shape-preserving unary primitive with a nontrivial
+/// [`NegOperation`] is the canonical example of a shape-preserving unary primitive with a nontrivial
 /// transpose rule.
 #[derive(Clone, Default)]
-pub struct NegOp;
+pub struct NegOperation;
 
-impl Debug for NegOp {
+impl Debug for NegOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Neg")
     }
 }
 
-impl Display for NegOp {
+impl Display for NegOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "neg")
     }
 }
 
-impl Op for NegOp {
+impl Operation for NegOperation {
     fn name(&self) -> &'static str {
         "neg"
     }
@@ -74,14 +75,14 @@ impl Op for NegOp {
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V>> InterpretableOp<ArrayType, V> for NegOp {
+impl<V: Traceable<ArrayType> + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![-inputs[0].clone()])
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for NegOp {
+impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for NegOperation {
     fn transpose(
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
@@ -92,7 +93,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
 }
 
 impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOp<ArrayType, V, T, O, L> for NegOp
+    DifferentiableOperation<ArrayType, V, T, O, L> for NegOperation
 {
     fn jvp(
         &self,
@@ -104,7 +105,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>, O
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V>> VectorizableOp<ArrayType, V> for NegOp {
+impl<V: Traceable<ArrayType> + Neg<Output = V>> VectorizableOperation<ArrayType, V> for NegOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         expect_input_count(inputs.len(), 1)?;
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| -lane).collect())])

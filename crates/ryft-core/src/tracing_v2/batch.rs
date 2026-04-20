@@ -21,7 +21,8 @@ use crate::{
         engine::Engine,
         jit::Tracer,
         operations::{
-            AddOp, FlatTracedVMap, InterpretableOp, MulOp, NegOp, Op, VMapOp, VMapTracingOperation, VectorizableOp,
+            AddOperation, FlatTracedVMap, InterpretableOperation, MulOperation, NegOperation, Operation, VMapOperation,
+            VMapTracingOperation, VectorizableOperation,
         },
     },
     types::{ArrayType, Typed},
@@ -85,7 +86,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V>> Add for Batch<V> {
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        single_output(AddOp.batch(&[self, rhs]).expect("add batching rule should succeed"), "add")
+        single_output(AddOperation.batch(&[self, rhs]).expect("add batching rule should succeed"), "add")
     }
 }
 
@@ -94,7 +95,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> Mul for Batch<V> {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        single_output(MulOp.batch(&[self, rhs]).expect("mul batching rule should succeed"), "mul")
+        single_output(MulOperation.batch(&[self, rhs]).expect("mul batching rule should succeed"), "mul")
     }
 }
 
@@ -103,7 +104,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>> Neg for Batch<V> {
 
     #[inline]
     fn neg(self) -> Self::Output {
-        single_output(NegOp.batch(&[self]).expect("neg batching rule should succeed"), "neg")
+        single_output(NegOperation.batch(&[self]).expect("neg batching rule should succeed"), "neg")
     }
 }
 
@@ -230,7 +231,7 @@ impl<
     }
 }
 
-/// Already-traced dispatch for [`vmap`]: stages a compact higher-order [`VMapOp`] in the enclosing
+/// Already-traced dispatch for [`vmap`]: stages a compact higher-order [`VMapOperation`] in the enclosing
 /// [`Tracer`] scope instead of eagerly duplicating the scalar program per lane. The body is traced
 /// once at a single-lane exemplar and captured as a [`Program`] that lowering can later
 /// emit as packed StableHLO.
@@ -261,7 +262,7 @@ impl<
                         + ParameterizedFamily<V>
                         + ParameterizedFamily<ArrayType>,
         >,
-    O: Op<ArrayType> + InterpretableOp<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
+    O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
     L: Clone,
 > VMapInvocationLeaf<Input, Output> for Tracer<'engine, E>
 where
@@ -347,7 +348,7 @@ where
         );
 
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
-        let staged_outputs = Tracer::apply_staged_op(staged_inputs.as_slice(), O::vmap_op(VMapOp::new(body)))?;
+        let staged_outputs = Tracer::apply_staged_op(staged_inputs.as_slice(), O::vmap_op(VMapOperation::new(body)))?;
         (0..lane_count)
             .map(|lane_index| {
                 let start = lane_index * output_leaf_count;
@@ -407,7 +408,7 @@ pub fn vmap<
 mod tests {
     use indoc::indoc;
 
-    use crate::tracing_v2::{PrimitiveOp, Sin, Tracer, engine::ArrayScalarEngine, test_support};
+    use crate::tracing_v2::{PrimitiveOperation, Sin, Tracer, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -454,7 +455,7 @@ mod tests {
     #[test]
     fn traced_vmap_stages_one_higher_order_op() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOp<ArrayType, f64>, f64, f64>) =
+        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
             crate::tracing_v2::interpret_and_trace(
                 &engine,
                 |x| {

@@ -16,9 +16,11 @@ pub fn compile_grad<'engine, E, F, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation:
-        InterpretableOp<ArrayType, V> + InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>> + Op<ArrayType>,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
+        + Operation<ArrayType>,
+    E::LinearOperation: Operation<ArrayType>,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -108,11 +110,12 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>>
+    E::TracingOperation: InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
-        + Op<ArrayType>,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+        + Operation<ArrayType>,
+    E::LinearOperation: Operation<ArrayType>,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -136,9 +139,9 @@ where
 
 /// Compiles a gradient function with rematerialization boundaries inserted via program segmentation.
 ///
-/// When `segment_size` is `None`, the entire program is wrapped in a single [`RematerializeOp`]
+/// When `segment_size` is `None`, the entire program is wrapped in a single [`RematerializeOperation`]
 /// (equivalent to [`RematerializationPolicy::RecomputeAll`]). When `Some(s)`, the program is
-/// partitioned into segments of at most `s` instructions, each wrapped in its own [`RematerializeOp`].
+/// partitioned into segments of at most `s` instructions, each wrapped in its own [`RematerializeOperation`].
 ///
 /// Internally, this replicates the flow of `grad` for [`Tracer`]-level inputs Ã¢â‚¬â€ trace, linearize,
 /// transpose, stage pullback Ã¢â‚¬â€ but inserts a segmentation step between tracing and linearization so
@@ -152,11 +155,12 @@ fn compile_grad_segmented<'engine, E, F, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation: InterpretableOp<ArrayType, V>
-        + InterpretableOp<ArrayType, LinearizedTracedValue<'engine, E>>
+    E::TracingOperation: InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
-        + Op<ArrayType>,
-    LinearPrimitiveOp<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOp<Tracer<'engine, E>>,
+        + Operation<ArrayType>,
+    E::LinearOperation: Operation<ArrayType>,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -213,16 +217,16 @@ where
 
 /// Partitions a program's instructions into segments of at most `segment_size`, wrapping each
 /// segment in a
-/// [`RematerializeOp`].
+/// [`RematerializeOperation`].
 ///
 /// Given a program with N instructions and a segment size S, this produces a new program with at
-/// most `ceil(N / S)` instructions. Each instruction is a [`RematerializeOp`] whose body
+/// most `ceil(N / S)` instructions. Each instruction is a [`RematerializeOperation`] whose body
 /// sub-program contains the original instructions from that segment. Atoms crossing segment
 /// boundaries become inputs/outputs of the
 /// respective sub-programs.
 ///
 /// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
-/// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOp`]
+/// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOperation`]
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
 fn segment_program<E, V>(
     program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
@@ -231,14 +235,15 @@ fn segment_program<E, V>(
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    E::TracingOperation:
-        InterpretableOp<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation> + Op<ArrayType>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>
+        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
+        + Operation<ArrayType>,
 {
     let program = program;
     let instructions = program.instructions.as_slice();
 
     // If the program has fewer instructions than a single segment, no segmentation is needed Ã¢â‚¬â€ wrap the
-    // whole thing in a single RematerializeOp.
+    // whole thing in a single RematerializeOperation.
     if instructions.len() <= segment_size {
         return wrap_program_in_rematerialize::<E, V>(program);
     }
@@ -270,7 +275,7 @@ where
 
     // Build the outer program.
     let input_atoms = program.input_ids.as_slice();
-    let mut outer_builder: ProgramBuilder<E::TracingOperation, ArrayType, V> = ProgramBuilder::new();
+    let mut outer_builder: ProgramBuilder<ArrayType, V, E::TracingOperation> = ProgramBuilder::new();
 
     // Map from original atom IDs to outer-program atom IDs.
     let mut atom_mapping: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
@@ -335,7 +340,7 @@ where
         // Build the sub-program for this segment.
         let sub_program = build_segment_sub_program(program, *segment, &boundary_input_atoms, &boundary_output_atoms)?;
 
-        // Build the RematerializeOp.
+        // Build the RematerializeOperation.
         let input_types: Vec<_> = boundary_input_atoms
             .iter()
             .map(|&atom_id| {
@@ -358,9 +363,9 @@ where
             .collect::<Result<_, _>>()?;
 
         let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), sub_program);
-        let remat_op = RematerializeOp::new(body);
+        let remat_op = RematerializeOperation::new(body);
 
-        // Add the RematerializeOp instruction to the outer builder.
+        // Add the RematerializeOperation instruction to the outer builder.
         let outer_inputs: Vec<AtomId> = boundary_input_atoms
             .iter()
             .map(|&orig_atom| atom_mapping[orig_atom.index].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
@@ -394,14 +399,14 @@ where
     Ok(outer_program)
 }
 
-/// Wraps an entire program in a single [`RematerializeOp`] boundary.
+/// Wraps an entire program in a single [`RematerializeOperation`] boundary.
 fn wrap_program_in_rematerialize<E, V>(
     program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
 ) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TracingError>
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+    E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation> + Operation<ArrayType>,
 {
     let program = program;
     let input_types: Vec<_> = program
@@ -428,9 +433,9 @@ where
         .collect::<Result<_, _>>()?;
 
     let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), program.clone());
-    let remat_op = RematerializeOp::new(body);
+    let remat_op = RematerializeOperation::new(body);
 
-    let mut outer_builder: ProgramBuilder<E::TracingOperation, ArrayType, V> = ProgramBuilder::new();
+    let mut outer_builder: ProgramBuilder<ArrayType, V, E::TracingOperation> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> =
         input_types.iter().cloned().map(|input_type| outer_builder.add_input_abstract(input_type)).collect();
 
@@ -453,13 +458,13 @@ where
 /// The sub-program takes the boundary input atoms as its inputs and produces the boundary output atoms as its
 /// outputs. Internal atoms (produced and consumed entirely within the segment) are handled as internal constants
 /// and instructions within the sub-program.
-fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone>(
+fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     segment_instructions: &[Instruction<O>],
     boundary_input_atoms: &[AtomId],
     boundary_output_atoms: &[AtomId],
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError> {
-    let mut sub_builder: ProgramBuilder<O, ArrayType, V> = ProgramBuilder::new();
+    let mut sub_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new();
 
     // Map from original atom IDs to sub-program atom IDs.
     let mut sub_atom_mapping: std::collections::HashMap<AtomId, AtomId> = std::collections::HashMap::new();
