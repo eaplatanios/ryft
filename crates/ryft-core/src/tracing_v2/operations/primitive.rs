@@ -30,7 +30,7 @@ use crate::{
             left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
         },
     },
-    types::{ArrayType, Type, Typed},
+    types::{ArrayType, Type, TypeError, Typed},
 };
 
 use super::{
@@ -424,7 +424,7 @@ impl<V: Traceable<ArrayType>> Operation for PrimitiveOperation<ArrayType, V> {
         }
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         match self {
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),
@@ -498,7 +498,7 @@ impl<V: Traceable<ArrayType>> Operation for LinearPrimitiveOperation<ArrayType, 
         }
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         match self {
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Neg => NegOperation.infer_output_types(input_types),

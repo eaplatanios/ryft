@@ -17,7 +17,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     linear::LinearTerm,
 };
-use crate::types::{ArrayType, Type};
+use crate::types::{ArrayType, Type, TypeError};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation, unary_abstract,
@@ -61,7 +61,7 @@ impl Operation for NegOperation {
         "neg"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Ok(vec![unary_abstract(input_types)?])
     }
 

@@ -52,12 +52,11 @@ use std::{fmt::Display, sync::Arc};
 
 use crate::{
     batching::Batch,
-    macros::check_input_count,
     parameters::Parameterized,
     tracing_v2::{
         AtomId, Traceable, TracingError, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
     },
-    types::{ArrayType, Type, Typed},
+    types::{ArrayType, Type, TypeError, Typed},
 };
 
 /// Elementwise addition.
@@ -143,8 +142,10 @@ pub fn lift_jit_constant<
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.
-pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TracingError> {
-    check_input_count!(inputs, 1);
+pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
+    if inputs.len() != 1 {
+        return Err(TypeError { message: format!("expected 1 input type but got {}", inputs.len()) });
+    }
     Ok(inputs[0].clone())
 }
 
@@ -367,7 +368,7 @@ impl<O: Operation<T> + ?Sized, T: Type> Operation<T> for Arc<O> {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TracingError> {
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         (**self).infer_output_types(input_types)
     }
 

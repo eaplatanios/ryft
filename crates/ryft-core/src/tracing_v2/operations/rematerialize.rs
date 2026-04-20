@@ -19,7 +19,7 @@ use crate::{
             transpose_linear_program_with_output_examples,
         },
     },
-    types::{ArrayType, Type, Typed},
+    types::{ArrayType, Type, TypeError, Typed},
 };
 
 use super::{CoreLinearProgramOperation, DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
@@ -159,15 +159,20 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operati
         "rematerialize"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.len() != self.body.input_types.len() {
-            return Err(TracingError::InvalidInputCount {
-                expected: self.body.input_types.len(),
-                got: input_types.len(),
+            return Err(TypeError {
+                message: format!(
+                    "rematerialize expected {} input types but got {}",
+                    self.body.input_types.len(),
+                    input_types.len()
+                ),
             });
         }
         if input_types != self.body.input_types.as_slice() {
-            return Err(TracingError::IncompatibleAbstractValues { op: "rematerialize" });
+            return Err(TypeError {
+                message: "rematerialize input types do not match the captured body signature".to_string(),
+            });
         }
         Ok(self.body.output_types.clone())
     }
@@ -424,15 +429,20 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation
         "rematerialize"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.len() != self.body.input_types.len() {
-            return Err(TracingError::InvalidInputCount {
-                expected: self.body.input_types.len(),
-                got: input_types.len(),
+            return Err(TypeError {
+                message: format!(
+                    "rematerialize expected {} input types but got {}",
+                    self.body.input_types.len(),
+                    input_types.len()
+                ),
             });
         }
         if input_types != self.body.input_types.as_slice() {
-            return Err(TracingError::IncompatibleAbstractValues { op: "rematerialize" });
+            return Err(TypeError {
+                message: "rematerialize input types do not match the captured body signature".to_string(),
+            });
         }
         Ok(self.body.output_types.clone())
     }

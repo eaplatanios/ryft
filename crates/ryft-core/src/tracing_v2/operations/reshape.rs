@@ -25,7 +25,7 @@ use crate::{
         jit::Tracer,
         linear::LinearTerm,
     },
-    types::{ArrayType, Shape, Size, Type, Typed},
+    types::{ArrayType, Shape, Size, Type, TypeError, Typed},
 };
 
 use super::{
@@ -124,7 +124,7 @@ fn reshape_array_sharding(
     input: &ArrayType,
     target_shape: &Shape,
     op: &'static str,
-) -> Result<Option<Sharding>, TracingError> {
+) -> Result<Option<Sharding>, TypeError> {
     let Some(sharding) = input.sharding.clone() else {
         return Ok(None);
     };
@@ -137,9 +137,7 @@ fn reshape_array_sharding(
     let Some(groups) =
         reshape_dimension_groups(input_non_singleton_dimensions.as_slice(), output_non_singleton_dimensions.as_slice())
     else {
-        return Err(TracingError::InternalInvariantViolation(
-            "static reshape group alignment should succeed after element-count validation",
-        ));
+        return Err(TypeError { message: format!("{op} could not align static reshape dimension groups") });
     };
 
     let mut output_dimensions =
@@ -159,7 +157,7 @@ fn reshape_array_sharding(
             .map(|(index, _)| &sharding.dimensions[*index])
             .all(is_effectively_unsharded_dimension)
         {
-            return Err(TracingError::IncompatibleAbstractValues { op });
+            return Err(TypeError { message: format!("{op} cannot preserve sharding across the requested reshape") });
         }
 
         for (output_dimension_index, _) in
@@ -177,27 +175,27 @@ fn reshape_array_sharding(
         sharding.varying_manual_axes.clone(),
     )
     .map(|sharding| Some(sharding.without_auto_axes()))
-    .map_err(|_| TracingError::InternalInvariantViolation("reshape output sharding should match the target rank"))
+    .map_err(|_| TypeError { message: format!("{op} produced an invalid output sharding") })
 }
 
 /// Computes the abstract output type of one reshape application.
-pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static str) -> Result<ArrayType, TracingError> {
+pub fn reshape_abstract(input: &ArrayType, target_shape: &Shape, op: &'static str) -> Result<ArrayType, TypeError> {
     if input.shape == *target_shape {
         return Ok(input.clone());
     }
 
     let Some(input_elements) = static_shape_element_count(&input.shape) else {
-        return Err(TracingError::IncompatibleAbstractValues { op });
+        return Err(TypeError { message: format!("{op} requires statically known input element counts") });
     };
     let Some(output_elements) = static_shape_element_count(target_shape) else {
-        return Err(TracingError::IncompatibleAbstractValues { op });
+        return Err(TypeError { message: format!("{op} requires statically known output element counts") });
     };
     if input_elements != output_elements {
-        return Err(TracingError::IncompatibleAbstractValues { op });
+        return Err(TypeError { message: format!("{op} changes the number of elements") });
     }
 
     ArrayType::new(input.data_type, target_shape.clone(), None, reshape_array_sharding(input, target_shape, op)?)
-        .map_err(|_| TracingError::InternalInvariantViolation("reshape output sharding should match the target rank"))
+        .map_err(|_| TypeError { message: format!("{op} produced an invalid output type") })
 }
 
 /// Value-level reshape capability shared by concrete leaves and transform-local wrappers.
@@ -336,7 +334,7 @@ mod ndarray_support {
     use super::{ReshapeOps, reshape_abstract};
     use crate::{
         tracing_v2::TracingError,
-        types::{Shape, Size, Typed},
+        types::{Shape, Size, TypeError, Typed},
     };
 
     impl ReshapeOps for Array2<f32> {
@@ -347,11 +345,16 @@ mod ndarray_support {
                 return Ok(self);
             }
             let [Size::Static(rows), Size::Static(cols)] = output_type.shape.dimensions.as_slice() else {
-                return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
+                return Err(TracingError::Type(TypeError {
+                    message: "reshape expected a rank-2 static ndarray target shape".to_string(),
+                }));
             };
             let values = self.iter().copied().collect::<Vec<_>>();
-            Array2::from_shape_vec((*rows, *cols), values)
-                .map_err(|_| TracingError::IncompatibleAbstractValues { op: "reshape" })
+            Array2::from_shape_vec((*rows, *cols), values).map_err(|_| {
+                TracingError::Type(TypeError {
+                    message: "reshape could not realize the requested ndarray target shape".to_string(),
+                })
+            })
         }
     }
 
@@ -363,11 +366,16 @@ mod ndarray_support {
                 return Ok(self);
             }
             let [Size::Static(rows), Size::Static(cols)] = output_type.shape.dimensions.as_slice() else {
-                return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
+                return Err(TracingError::Type(TypeError {
+                    message: "reshape expected a rank-2 static ndarray target shape".to_string(),
+                }));
             };
             let values = self.iter().copied().collect::<Vec<_>>();
-            Array2::from_shape_vec((*rows, *cols), values)
-                .map_err(|_| TracingError::IncompatibleAbstractValues { op: "reshape" })
+            Array2::from_shape_vec((*rows, *cols), values).map_err(|_| {
+                TracingError::Type(TypeError {
+                    message: "reshape could not realize the requested ndarray target shape".to_string(),
+                })
+            })
         }
     }
 }
@@ -415,10 +423,14 @@ impl Operation for ReshapeOperation {
         "reshape"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(input_types, 1);
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        if input_types.len() != 1 {
+            return Err(TypeError { message: format!("reshape expected 1 input type but got {}", input_types.len()) });
+        }
         if input_types[0] != *self.input_type() {
-            return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
+            return Err(TypeError {
+                message: "reshape input type does not match the operation's captured input type".to_string(),
+            });
         }
         Ok(vec![self.output_type().clone()])
     }
@@ -620,7 +632,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(5)]), "reshape"),
-            Err(TracingError::IncompatibleAbstractValues { op: "reshape" })
+            Err(TypeError { message: "reshape changes the number of elements".to_string() })
         );
     }
 
@@ -637,7 +649,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(2), Size::Static(4)]), "reshape"),
-            Err(TracingError::IncompatibleAbstractValues { op: "reshape" })
+            Err(TypeError { message: "reshape cannot preserve sharding across the requested reshape".to_string() })
         );
     }
 
@@ -656,7 +668,7 @@ mod tests {
 
         assert_eq!(
             reshape_abstract(&input_type, &Shape::new(vec![Size::Static(8)]), "reshape"),
-            Err(TracingError::IncompatibleAbstractValues { op: "reshape" })
+            Err(TypeError { message: "reshape cannot preserve sharding across the requested reshape".to_string() })
         );
     }
 

@@ -15,7 +15,7 @@ use ryft_core::{
         LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, OneLike, Operation, PrimitiveOperation, Program,
         ProgramBuilder, Sin, Traceable, Tracer, TracingError, ZeroLike, engine::Engine, forward::JvpTracer,
     },
-    types::{ArrayType, Typed},
+    types::{ArrayType, TypeError, Typed},
 };
 
 use crate::experimental::lowering::{
@@ -299,16 +299,25 @@ impl Operation for ShardMapOperation<ShardMapTensor> {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.len() != self.input_types.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: input_types.len() });
+            return Err(TypeError {
+                message: format!(
+                    "{} expected {} input types but got {}",
+                    self.name(),
+                    self.input_types.len(),
+                    input_types.len()
+                ),
+            });
         }
         if !input_types
             .iter()
             .zip(self.input_types.iter())
             .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
         {
-            return Err(TracingError::IncompatibleAbstractValues { op: self.name() });
+            return Err(TypeError {
+                message: format!("{} input types do not match the captured shard-map boundary", self.name()),
+            });
         }
         Ok(self.output_types.clone())
     }
@@ -447,16 +456,25 @@ impl Operation for ShardMapOperation<ShardMapTracer> {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.len() != self.input_types.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: input_types.len() });
+            return Err(TypeError {
+                message: format!(
+                    "{} expected {} input types but got {}",
+                    self.name(),
+                    self.input_types.len(),
+                    input_types.len()
+                ),
+            });
         }
         if !input_types
             .iter()
             .zip(self.input_types.iter())
             .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
         {
-            return Err(TracingError::IncompatibleAbstractValues { op: self.name() });
+            return Err(TypeError {
+                message: format!("{} input types do not match the captured shard-map boundary", self.name()),
+            });
         }
         Ok(self.output_types.clone())
     }

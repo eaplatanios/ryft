@@ -122,7 +122,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
             Ok(output_types) => output_types.len(),
             Err(error) => {
                 if builder.borrow().error.is_none() {
-                    builder.borrow_mut().error = Some(error.clone());
+                    builder.borrow_mut().error = Some(TracingError::from(error.clone()));
                 }
                 let fallback_atom = fallback_atom.ok_or(error)?;
                 return Ok(vec![Self { atom: fallback_atom, builder, engine }]);
@@ -389,7 +389,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing_v2::{PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
-        types::ArrayType,
+        types::{ArrayType, TypeError},
     };
 
     use super::*;
@@ -531,12 +531,14 @@ mod tests {
                 "test_add"
             }
 
-            fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TracingError> {
+            fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
                 if input_types.len() != 2 {
-                    return Err(TracingError::InvalidInputCount { expected: 2, got: input_types.len() });
+                    return Err(TypeError {
+                        message: format!("test_add expected 2 input types but got {}", input_types.len()),
+                    });
                 }
                 if !input_types[0].is_compatible_with(&input_types[1]) {
-                    return Err(TracingError::IncompatibleAbstractValues { op: "test_add" });
+                    return Err(TypeError { message: "test_add input types are incompatible".to_string() });
                 }
                 Ok(vec![input_types[0].clone()])
             }
@@ -566,7 +568,9 @@ mod tests {
                     return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
                 }
                 if !inputs[0].r#type.is_compatible_with(&inputs[1].r#type) {
-                    return Err(TracingError::IncompatibleAbstractValues { op: "test_add" });
+                    return Err(TracingError::Type(TypeError {
+                        message: "test_add input types are incompatible".to_string(),
+                    }));
                 }
                 Ok(vec![inputs[0].clone() + inputs[1].clone()])
             }
@@ -617,7 +621,7 @@ mod tests {
 
         use crate::{
             tracing_v2::{Cos, MatrixOps, OneLike, Sin, ZeroLike, operations::reshape::ReshapeOps},
-            types::{ArrayType, DataType, Shape, Size, Typed},
+            types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
         };
 
         #[derive(Clone, Debug, Parameter)]
@@ -749,7 +753,11 @@ mod tests {
             ),
         );
 
-        assert!(matches!(result, Err(TracingError::IncompatibleAbstractValues { op: "add" })));
+        assert!(matches!(
+            result,
+            Err(TracingError::Type(TypeError { message }))
+                if message == "add input types are not broadcast-compatible"
+        ));
     }
 
     #[test]

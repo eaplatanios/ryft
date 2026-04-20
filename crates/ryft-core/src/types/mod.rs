@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use thiserror::Error;
+
 pub mod array_types;
 pub mod data_types;
 pub mod layouts;
@@ -7,6 +9,13 @@ pub mod layouts;
 pub use array_types::*;
 pub use data_types::*;
 pub use layouts::*;
+
+/// Error returned when type inference fails.
+#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
+#[error("{message}")]
+pub struct TypeError {
+    pub message: String,
+}
 
 /// Lightweight type-level description of a family of runtime values. A [`Type`] captures the structural metadata that
 /// Ryft needs to reason about values without inspecting the values themselves. Examples include scalar data types such
@@ -35,10 +44,6 @@ pub trait Typed<T: Type> {
     /// [`Cow::into_owned`] to clone on demand.
     fn r#type(&self) -> Cow<'_, T>;
 }
-
-// ---------------------------------------------------------------------------
-// Scalar Typed<ArrayType> implementations
-// ---------------------------------------------------------------------------
 
 macro_rules! impl_typed_for_scalar {
     ($ty:ty, $data_type:path) => {

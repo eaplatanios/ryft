@@ -55,6 +55,7 @@ use thiserror::Error;
 
 use crate::batching::BatchingError;
 use crate::parameters::ParameterError;
+use crate::types::TypeError;
 
 #[cfg(feature = "benchmarking")]
 pub(crate) mod benchmark_support;
@@ -114,10 +115,6 @@ pub enum TracingError {
     #[error("unbound atom ID: {id}")]
     UnboundAtomId { id: AtomId },
 
-    /// Abstract evaluation detected incompatible operand metadata for a primitive application.
-    #[error("incompatible abstract values while tracing operation '{op}'")]
-    IncompatibleAbstractValues { op: &'static str },
-
     /// A custom primitive was used by a transform without registering the required rule.
     #[error("custom primitive '{op}' does not provide a '{transform}' rule")]
     MissingCustomRule { op: &'static str, transform: &'static str },
@@ -133,6 +130,10 @@ pub enum TracingError {
     /// Wrapper around parameter-lifting failures from the `Parameterized` infrastructure.
     #[error(transparent)]
     Parameter(#[from] ParameterError),
+
+    /// Wrapper around abstract type-level reasoning failures.
+    #[error(transparent)]
+    Type(#[from] TypeError),
 
     /// Wrapper around batching- and vmapping-specific failures.
     #[error(transparent)]

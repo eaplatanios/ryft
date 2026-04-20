@@ -15,7 +15,7 @@ use ryft_core::tracing_v2::{
     linear::{LinearTerm, Linearized},
     operations::unary_abstract,
 };
-use ryft_core::types::ArrayType;
+use ryft_core::types::{ArrayType, TypeError};
 use ryft_mlir::{Block, Operation as MlirOperation, Value};
 
 use crate::experimental::lowering::{
@@ -122,10 +122,12 @@ impl Operation for WithShardingConstraintOperation {
         "with_sharding_constraint"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         let mut output = unary_abstract(input_types)?;
         if output.rank() != self.sharding().rank() {
-            return Err(TracingError::IncompatibleAbstractValues { op: "with_sharding_constraint" });
+            return Err(TypeError {
+                message: "with_sharding_constraint rank does not match the requested sharding rank".to_string(),
+            });
         }
         let mut sharding = self.sharding().clone();
         sharding.varying_manual_axes = output
@@ -486,7 +488,9 @@ mod tests {
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)
                     .unwrap()],
             ),
-            Err(TracingError::IncompatibleAbstractValues { op: "with_sharding_constraint" })
+            Err(TypeError {
+                message: "with_sharding_constraint rank does not match the requested sharding rank".to_string()
+            })
         );
     }
 

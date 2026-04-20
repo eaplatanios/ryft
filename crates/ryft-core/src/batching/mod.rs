@@ -36,7 +36,7 @@ use crate::{
             VectorizableOperation,
         },
     },
-    types::{ArrayType, Type, Typed},
+    types::{ArrayType, Type, TypeError, Typed},
 };
 
 /// Checks that all batched inputs carry the same number of lanes.
@@ -685,13 +685,15 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operati
         "vmap"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         let expected_inputs = self.body.repeated_input_types();
         if input_types.len() != expected_inputs.len() {
-            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: input_types.len() });
+            return Err(TypeError {
+                message: format!("vmap expected {} input types but got {}", expected_inputs.len(), input_types.len()),
+            });
         }
         if input_types != expected_inputs.as_slice() {
-            return Err(TracingError::IncompatibleAbstractValues { op: "vmap" });
+            return Err(TypeError { message: "vmap input types do not match the captured body signature".to_string() });
         }
         Ok(self.body.repeated_output_types())
     }
@@ -934,13 +936,15 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation for Lin
         "vmap"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         let expected_inputs = self.body.repeated_input_types();
         if input_types.len() != expected_inputs.len() {
-            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: input_types.len() });
+            return Err(TypeError {
+                message: format!("vmap expected {} input types but got {}", expected_inputs.len(), input_types.len()),
+            });
         }
         if input_types != expected_inputs.as_slice() {
-            return Err(TracingError::IncompatibleAbstractValues { op: "vmap" });
+            return Err(TypeError { message: "vmap input types do not match the captured body signature".to_string() });
         }
         Ok(self.body.repeated_output_types())
     }

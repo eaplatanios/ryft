@@ -2717,7 +2717,7 @@ mod tests {
         Cos, CustomPrimitive, InterpretableOperation, MatrixOps, OneLike, Operation, ProgramBuilder, Sin, TracingError,
         ZeroLike,
     };
-    use ryft_core::types::Shape;
+    use ryft_core::types::{Shape, TypeError};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use super::*;
@@ -2755,9 +2755,11 @@ mod tests {
             "test_custom_lowered"
         }
 
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             if input_types.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: input_types.len() });
+                return Err(TypeError {
+                    message: format!("test_custom_lowered expected 1 input type but got {}", input_types.len()),
+                });
             }
             Ok(vec![input_types[0].clone()])
         }

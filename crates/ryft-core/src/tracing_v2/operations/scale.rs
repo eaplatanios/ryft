@@ -22,7 +22,7 @@ use crate::tracing_v2::{
     jit::Tracer,
     linear::LinearTerm,
 };
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
@@ -75,7 +75,7 @@ impl<V: Traceable<ArrayType>> ScaleOperation<ArrayType, V> {
     ///
     /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
     /// from type information before they have committed to a concrete `ScaleOperation` value.
-    pub fn abstract_eval_static(inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    pub fn abstract_eval_static(inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Ok(vec![unary_abstract(inputs)?])
     }
 }
@@ -97,7 +97,7 @@ impl<V: Traceable<ArrayType>> Operation for ScaleOperation<ArrayType, V> {
         "scale"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Self::abstract_eval_static(input_types)
     }
 

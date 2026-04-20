@@ -9,7 +9,7 @@ use std::fmt::{Debug, Display};
 use crate::batching::{Batch as BatchedValue, check_batch_sizes};
 use crate::macros::check_input_count;
 use crate::tracing_v2::{Traceable, TracingError, engine::Engine, forward::JvpTracer};
-use crate::types::{ArrayType, Type};
+use crate::types::{ArrayType, Type, TypeError};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation,
@@ -48,8 +48,10 @@ impl Operation for MatMulOperation {
         "matmul"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(input_types, 2);
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        if input_types.len() != 2 {
+            return Err(TypeError { message: format!("matmul expected 2 input types but got {}", input_types.len()) });
+        }
         Ok(vec![matmul_abstract(&input_types[0], &input_types[1], "matmul")?])
     }
 }

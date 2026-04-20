@@ -23,7 +23,7 @@ use ryft_core::{
             right_matmul::right_matmul_abstract_eval,
         },
     },
-    types::{ArrayType, Typed},
+    types::{ArrayType, TypeError, Typed},
 };
 
 use crate::experimental::{
@@ -140,7 +140,7 @@ impl Operation for XlaPrimitiveOperation {
         }
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         match self {
             Self::Add => AddOperation.infer_output_types(input_types),
             Self::Mul => MulOperation.infer_output_types(input_types),

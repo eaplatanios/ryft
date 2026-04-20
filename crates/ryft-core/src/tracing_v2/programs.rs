@@ -30,7 +30,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized},
     tracing_v2::TracingError,
-    types::{ArrayType, Type, Typed},
+    types::{ArrayType, Type, TypeError, Typed},
 };
 
 /// Marker trait that identifies concrete, non-tracer leaves.
@@ -199,7 +199,7 @@ pub trait Operation<T: Type = ArrayType>: Debug + Display {
     fn name(&self) -> &'static str;
 
     /// Computes output types from input types without executing the operation.
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TracingError>;
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>;
 
     /// Returns simplified output atoms if this operation is a trivial algebraic identity.
     ///

@@ -162,7 +162,7 @@ mod tests {
             LinearPrimitiveOperation, Operation, PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine,
             test_support,
         },
-        types::{ArrayType, DataType},
+        types::{ArrayType, DataType, TypeError},
     };
 
     use super::*;
@@ -206,9 +206,11 @@ mod tests {
             "panic_replay"
         }
 
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             if input_types.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: input_types.len() });
+                return Err(TypeError {
+                    message: format!("panic_replay expected 1 input type but got {}", input_types.len()),
+                });
             }
             Ok(vec![input_types[0].clone()])
         }

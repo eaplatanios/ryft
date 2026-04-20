@@ -27,7 +27,7 @@ use crate::{
         jit::Tracer,
         linear::{LinearTerm, Linearized},
     },
-    types::{ArrayType, Type, Typed},
+    types::{ArrayType, Type, TypeError, Typed},
 };
 
 use super::{
@@ -381,7 +381,7 @@ impl<V: Traceable<ArrayType>> Operation for CustomPrimitive<ArrayType, V> {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         self.base.infer_output_types(input_types)
     }
 
@@ -505,7 +505,7 @@ impl<V: Traceable<ArrayType>> Operation for LinearCustomPrimitive<ArrayType, V> 
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         self.primitive.infer_output_types(input_types)
     }
 
@@ -578,9 +578,11 @@ mod tests {
             "test_shift"
         }
 
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             if input_types.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: input_types.len() });
+                return Err(TypeError {
+                    message: format!("test_shift expected 1 input type but got {}", input_types.len()),
+                });
             }
             Ok(vec![input_types[0].clone()])
         }

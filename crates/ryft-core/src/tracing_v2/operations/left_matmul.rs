@@ -15,7 +15,7 @@ use crate::tracing_v2::{
     jit::Tracer,
     linear::LinearTerm,
 };
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
@@ -74,11 +74,10 @@ impl<V: MatrixValue> LeftMatMulOperation<V> {
 ///
 /// Backend carriers use this helper when they need the metadata rule for a captured left-matmul
 /// operation without first constructing a concrete [`LeftMatMulOperation`].
-pub fn left_matmul_abstract_eval(
-    factor_type: &ArrayType,
-    inputs: &[ArrayType],
-) -> Result<Vec<ArrayType>, TracingError> {
-    check_input_count!(inputs, 1);
+pub fn left_matmul_abstract_eval(factor_type: &ArrayType, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    if inputs.len() != 1 {
+        return Err(TypeError { message: format!("left_matmul expected 1 input type but got {}", inputs.len()) });
+    }
     Ok(vec![matmul_abstract(factor_type, &inputs[0], "left_matmul")?])
 }
 
@@ -99,7 +98,7 @@ impl<V: MatrixValue> Operation for LeftMatMulOperation<V> {
         "left_matmul"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         left_matmul_abstract_eval(&<V as Typed<ArrayType>>::r#type(&self.factor), input_types)
     }
 

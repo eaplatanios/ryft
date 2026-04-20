@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::broadcasting::Broadcastable;
-use crate::types::{ArrayType, Type};
+use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     batching::{Batch, check_batch_sizes},
     macros::check_input_count,
@@ -54,12 +54,14 @@ impl Operation for MulOperation {
         "mul"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(input_types, 2);
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        if input_types.len() != 2 {
+            return Err(TypeError { message: format!("mul expected 2 input types but got {}", input_types.len()) });
+        }
         input_types[0]
             .broadcast(&input_types[1])
             .map(|output| vec![output])
-            .map_err(|_| TracingError::IncompatibleAbstractValues { op: "mul" })
+            .map_err(|_| TypeError { message: "mul input types are not broadcast-compatible".to_string() })
     }
 
     fn try_simplify(
@@ -197,6 +199,6 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, TracingError::IncompatibleAbstractValues { op: "mul" });
+        assert_eq!(error, TypeError { message: "mul input types are not broadcast-compatible".to_string() });
     }
 }

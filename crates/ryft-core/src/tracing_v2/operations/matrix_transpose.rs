@@ -9,7 +9,7 @@ use std::fmt::{Debug, Display};
 use crate::batching::Batch as BatchedValue;
 use crate::macros::check_input_count;
 use crate::tracing_v2::{Traceable, TracingError, engine::Engine, forward::JvpTracer, linear::LinearTerm};
-use crate::types::{ArrayType, Type};
+use crate::types::{ArrayType, Type, TypeError};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation,
@@ -55,8 +55,12 @@ impl Operation for MatrixTransposeOperation {
         "matrix_transpose"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(input_types, 1);
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        if input_types.len() != 1 {
+            return Err(TypeError {
+                message: format!("matrix_transpose expected 1 input type but got {}", input_types.len()),
+            });
+        }
         Ok(vec![transpose_abstract(&input_types[0], "matrix_transpose")?])
     }
 }

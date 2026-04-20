@@ -16,7 +16,7 @@ use crate::tracing_v2::{
     forward::{JvpTracer, TangentSpace},
     jit::Tracer,
 };
-use crate::types::{ArrayType, Type};
+use crate::types::{ArrayType, Type, TypeError};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, cos::Cos, unary_abstract,
@@ -77,7 +77,7 @@ impl Operation for SinOperation {
         "sin"
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Ok(vec![unary_abstract(input_types)?])
     }
 }
