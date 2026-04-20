@@ -22,7 +22,7 @@
 //!    [`JvpTracer`] values, or staged linear terms.
 //! 3. Primitive trait impls in [`operations`] either execute eagerly or record instructions into a
 //!    [`ProgramBuilder`].
-//! 4. The resulting [`Program`] or [`LinearProgram`] is simplified, replayed, transposed, or
+//! 4. The resulting [`Program`] is simplified, replayed, transposed, or
 //!    handed off to a backend-specific lowering layer.
 //!
 //! This is what makes JIT tracing, batching, and autodiff feel like variations on one staged IR
@@ -75,8 +75,8 @@ pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use jit::{Tracer, interpret_and_trace, trace};
 pub use linear::{
-    CoordinateValue, DenseJacobian, LinearProgram, RematerializationPolicy, compile_grad, compile_grad_with_policy,
-    grad, hessian, jacfwd, jacrev, jvp_program, value_and_grad, vjp,
+    CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad, hessian,
+    jacfwd, jacrev, jvp_program, value_and_grad, vjp,
 };
 pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};

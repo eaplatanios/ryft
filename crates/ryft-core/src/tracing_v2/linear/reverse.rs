@@ -16,13 +16,13 @@ use super::*;
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
 /// [`jvp_program`] is the staged counterpart to [`crate::tracing_v2::jvp`]. Instead of immediately
-/// applying a tangent input, it captures the Jacobian-vector product as a [`LinearProgram`] that
-/// can be replayed later on any tangent with the same parameter structure.
+/// applying a tangent input, it captures the Jacobian-vector product as a staged [`Program`] over
+/// linear operations that can be replayed later on any tangent with the same parameter structure.
 pub fn jvp_program<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>), TracingError>
+) -> Result<(Output, Program<ArrayType, V, E::LinearOperation, Input, Output>), TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Traceable<ArrayType> + ZeroLike,
@@ -103,7 +103,7 @@ where
         )?;
     let output_structure = primal_output_types.parameter_structure();
     let (traced_primal_output, pushforward) = linearize_traced_program::<V, O, L, E>(&traced_program, traced_primals)?;
-    let traced_tangent_output = pushforward.call(traced_tangents)?;
+    let traced_tangent_output = pushforward.interpret(traced_tangents)?;
     Ok((
         Output::from_parameters(output_structure.clone(), traced_primal_output)?,
         Output::from_parameters(output_structure, traced_tangent_output)?,
@@ -120,7 +120,7 @@ pub fn vjp<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, LinearProgram<ArrayType, V, Output, Input, E::LinearOperation>), TracingError>
+) -> Result<(Output, Program<ArrayType, V, E::LinearOperation, Output, Input>), TracingError>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Traceable<ArrayType> + ZeroLike + OneLike,
@@ -142,7 +142,7 @@ where
 {
     let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_examples.as_slice())?;
+    let pullback = transpose_linear_program_with_output_examples(engine, &pushforward, output_examples.as_slice())?;
     Ok((output, pullback))
 }
 
@@ -218,9 +218,9 @@ where
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
-        let (output, pullback): (V, LinearProgram<ArrayType, V, V, Input, E::LinearOperation>) =
+        let (output, pullback): (V, Program<ArrayType, V, E::LinearOperation, V, Input>) =
             vjp(engine, |input| Ok(function(input)), primals)?;
-        let gradient = pullback.call(output.one_like())?;
+        let gradient = pullback.interpret(output.one_like())?;
         Ok((output, gradient))
     }
 }
@@ -283,6 +283,7 @@ where
         )?;
         let (traced_output, traced_gradient) =
             reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
+                traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.engine,
                 &traced_program,
                 traced_primals,
             )?;
@@ -511,7 +512,7 @@ where
                                 Value = V,
                                 TracingOperation = E::TracingOperation,
                                 LinearOperation = E::LinearOperation,
-                            >>(&flat_program, jit_primals)?;
+                            >>(erased_engine, &flat_program, jit_primals)?;
                     let mut result = Vec::with_capacity(1 + gradient.len());
                     result.push(output);
                     result.extend(gradient);

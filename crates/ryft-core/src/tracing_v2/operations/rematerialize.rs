@@ -496,18 +496,10 @@ where
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
     let pushforward = linearize_program(engine, &body_program, input_primals)?;
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
+    let pullback = transpose_linear_program_with_output_examples(engine, &pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOperation::new(
-        FlatTracedRematerialize::from_parts(
-            body.input_types.clone(),
-            body.output_types.clone(),
-            pushforward.program().clone(),
-        ),
-        FlatTracedRematerialize::from_parts(
-            body.output_types.clone(),
-            body.input_types.clone(),
-            pullback.program().clone(),
-        ),
+        FlatTracedRematerialize::from_parts(body.input_types.clone(), body.output_types.clone(), pushforward.clone()),
+        FlatTracedRematerialize::from_parts(body.output_types.clone(), body.input_types.clone(), pullback.clone()),
     ))
 }
 

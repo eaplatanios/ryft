@@ -297,7 +297,7 @@ where
 
     let mut columns = Vec::with_capacity(basis_inputs.len());
     for tangent in basis_inputs {
-        columns.push(flatten_coordinates::<Output, V>(pushforward.call(tangent)?));
+        columns.push(flatten_coordinates::<Output, V>(pushforward.interpret(tangent)?));
     }
 
     DenseJacobian::from_columns(
@@ -349,7 +349,7 @@ where
 
     let mut rows = Vec::with_capacity(basis_outputs.len());
     for cotangent in basis_outputs {
-        rows.push(flatten_coordinates::<Input, V>(pullback.call(cotangent)?));
+        rows.push(flatten_coordinates::<Input, V>(pullback.interpret(cotangent)?));
     }
 
     DenseJacobian::from_rows(rows, input_structure, output_structure, input_coordinate_counts, output_coordinate_counts)

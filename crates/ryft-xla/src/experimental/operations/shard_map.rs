@@ -1073,11 +1073,16 @@ fn try_linearize_traced_shard_map_body<
 ) -> Result<
     (
         Vec<ShardMapTracer>,
-        ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+        ryft_core::tracing_v2::Program<
+            ArrayType,
+            ShardMapTracer,
+            LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+            Vec<ShardMapTracer>,
+            Vec<ShardMapTracer>,
+        >,
     ),
     TracingError,
 > {
-    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let input_structure = vec![ryft_core::parameters::Placeholder; primals.len()];
     let builder = std::rc::Rc::new(std::cell::RefCell::new(ProgramBuilder::<
         ArrayType,
@@ -1105,7 +1110,7 @@ fn try_linearize_traced_shard_map_body<
     let program =
         builder.build::<Vec<ShardMapTracer>, Vec<ShardMapTracer>>(tangent_outputs, input_structure, output_structure);
     let program = program.with_folded_constants()?.simplified()?;
-    Ok((primal_outputs.clone(), ryft_core::tracing_v2::LinearProgram::from_program(program, zero)))
+    Ok((primal_outputs.clone(), program))
 }
 
 fn try_transpose_traced_shard_map_body<
@@ -1116,13 +1121,22 @@ fn try_transpose_traced_shard_map_body<
 ) -> Result<
     (
         Vec<ShardMapTracer>,
-        ryft_core::tracing_v2::LinearProgram<ArrayType, ShardMapTracer, Vec<ShardMapTracer>, Vec<ShardMapTracer>>,
+        ryft_core::tracing_v2::Program<
+            ArrayType,
+            ShardMapTracer,
+            LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+            Vec<ShardMapTracer>,
+            Vec<ShardMapTracer>,
+        >,
     ),
     TracingError,
 > {
     let (outputs, pushforward) = try_linearize_traced_shard_map_body(function, primals)?;
-    let pullback =
-        ryft_core::tracing_v2::linear::transpose_linear_program_with_output_examples(&pushforward, outputs.as_slice())?;
+    let pullback = ryft_core::tracing_v2::linear::transpose_traced_linear_program_with_output_examples(
+        XlaEngine::token(),
+        &pushforward,
+        outputs.as_slice(),
+    )?;
     Ok((outputs, pullback))
 }
 
@@ -1345,9 +1359,10 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                 let local_tangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pushforward_program): (
                     Vec<ShardMapTracer>,
-                    ryft_core::tracing_v2::LinearProgram<
+                    ryft_core::tracing_v2::Program<
                         ArrayType,
                         ShardMapTracer,
+                        LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
                         Vec<ShardMapTracer>,
                         Vec<ShardMapTracer>,
                     >,
@@ -1360,7 +1375,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                     },
                     local_primals,
                 )?;
-                pushforward_program.call(local_tangents)
+                pushforward_program.interpret(local_tangents)
             }
         },
         pushforward_local_input_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>(),
@@ -1384,9 +1399,10 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                 let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
                 let (_, pullback_program): (
                     Vec<ShardMapTracer>,
-                    ryft_core::tracing_v2::LinearProgram<
+                    ryft_core::tracing_v2::Program<
                         ArrayType,
                         ShardMapTracer,
+                        LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
                         Vec<ShardMapTracer>,
                         Vec<ShardMapTracer>,
                     >,
@@ -1399,7 +1415,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
                     },
                     local_primals,
                 )?;
-                pullback_program.call(local_output_cotangents)
+                pullback_program.interpret(local_output_cotangents)
             }
         },
         pullback_local_input_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>(),

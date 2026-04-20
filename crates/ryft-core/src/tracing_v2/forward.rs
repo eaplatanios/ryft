@@ -23,7 +23,7 @@ use crate::{
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
-        linear::{LinearProgram, Linearized, jvp_program, jvp_traced, linearize_traced_program},
+        linear::{Linearized, jvp_program, jvp_traced, linearize_traced_program},
         operations::{CoreLinearReplayOperation, DifferentiableOperation, InterpretableOperation, Operation},
     },
     types::{ArrayType, Type, Typed},
@@ -232,9 +232,9 @@ where
             return Err(TracingError::MismatchedParameterStructure);
         }
 
-        let (primal_output, tangent_program): (Output, LinearProgram<ArrayType, V, Input, Output, E::LinearOperation>) =
+        let (primal_output, tangent_program): (Output, Program<ArrayType, V, E::LinearOperation, Input, Output>) =
             jvp_program(engine, |input| Ok(function(input)), primals)?;
-        let tangent_output = tangent_program.call(tangents)?;
+        let tangent_output = tangent_program.interpret(tangents)?;
         Ok((primal_output, tangent_output))
     }
 }
@@ -563,7 +563,7 @@ where
                             >>(&flat_program, jit_primals.to_vec())?;
 
                     // Apply the pushforward to the symbolic tangents.
-                    let tangent_outputs = pushforward.call(jit_tangents.to_vec())?;
+                    let tangent_outputs = pushforward.interpret(jit_tangents.to_vec())?;
 
                     let mut result = Vec::with_capacity(combined_output_count);
                     result.extend(primal_outputs);

@@ -4,7 +4,7 @@
 //! job is to take an ordinary staged primal program and turn it into the linear objects that power
 //! the rest of autodiff:
 //!
-//! - [`LinearProgram`] for reusable pushforwards and pullbacks,
+//! - staged [`Program`] values over linear operations for reusable pushforwards and pullbacks,
 //! - reverse-mode transforms such as [`vjp`], [`grad`], and [`value_and_grad`],
 //! - dense Jacobian and Hessian materialization helpers, and
 //! - rematerialization-aware compiled gradients.
@@ -15,7 +15,6 @@
 use std::{
     cell::RefCell,
     fmt::{Debug, Display},
-    marker::PhantomData,
     rc::Rc,
 };
 
@@ -47,8 +46,9 @@ mod reverse;
 mod term;
 
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
-pub use program::LinearProgram;
+pub use program::transpose_linear_program;
 pub use program::transpose_linear_program_with_output_examples;
+pub use program::transpose_traced_linear_program_with_output_examples;
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
 pub use reverse::{grad, jvp_program, value_and_grad, vjp};
 pub use term::{LinearTerm, Linearized};
@@ -60,12 +60,12 @@ pub(crate) use reverse::jvp_traced;
 type LinearizedTracedValue<'engine, E> =
     Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>;
 
-type TracedLinearProgram<'engine, E> = LinearProgram<
+type TracedLinearProgram<'engine, E> = Program<
     ArrayType,
     Tracer<'engine, E>,
-    Vec<Tracer<'engine, E>>,
-    Vec<Tracer<'engine, E>>,
     LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>,
+    Vec<Tracer<'engine, E>>,
+    Vec<Tracer<'engine, E>>,
 >;
 
 #[inline]
@@ -119,6 +119,7 @@ where
 /// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
 /// output and the traced gradient leaves.
 fn reverse_mode_scalar_traced_program<'engine, V, O, L, E>(
+    engine: &'engine E,
     traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     traced_primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
@@ -138,9 +139,8 @@ where
         return Err(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
     }
     let traced_output = outputs[0].clone();
-    let pullback =
-        transpose_linear_program_with_output_examples::<Tracer<'engine, E>, _, _, _>(&pushforward, outputs.as_slice())?;
-    let traced_gradient = pullback.call(vec![traced_output.one_like()])?;
+    let pullback = transpose_traced_linear_program_with_output_examples(engine, &pushforward, outputs.as_slice())?;
+    let traced_gradient = pullback.interpret(vec![traced_output.one_like()])?;
     Ok((traced_output, traced_gradient))
 }
 
@@ -263,7 +263,7 @@ mod tests {
         let (primal, pushforward) = jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
-        approx_eq(pushforward.call(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
+        approx_eq(pushforward.interpret(1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
         assert_eq!(
             pushforward.to_string(),
             indoc! {"
@@ -283,8 +283,8 @@ mod tests {
     fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
         let engine = ArrayScalarEngine::<f64>::new();
         let (primal, pushforward) = jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
-        let pullback = pushforward.transpose().unwrap();
-        let cotangent = pullback.call(1.0f64).unwrap();
+        let pullback = transpose_linear_program(&engine, &pushforward).unwrap();
+        let cotangent = pullback.interpret(1.0f64).unwrap();
 
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
         approx_eq(cotangent.0, 3.0 + 2.0f64.cos());
@@ -319,7 +319,7 @@ mod tests {
 
         let engine = ArrayScalarEngine::<f64>::new();
         let pushforward = linearize_program(&engine, &program, vec![3.0f64]).unwrap();
-        approx_eq(pushforward.call(2.5f64).unwrap(), 2.5);
+        approx_eq(pushforward.interpret(2.5f64).unwrap(), 2.5);
     }
 
     #[test]
@@ -338,16 +338,17 @@ mod tests {
         });
         let output = vec![output_atom];
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);
-        let pushforward = LinearProgram::from_program(program, 0.0f64);
+        let pushforward = program;
 
-        let pullback = super::program::transpose_linear_program(&pushforward).unwrap();
-        approx_eq(pullback.call(4.0f64).unwrap(), 4.0);
+        let pullback =
+            super::program::transpose_linear_program(&ArrayScalarEngine::<f64>::new(), &pushforward).unwrap();
+        approx_eq(pullback.interpret(4.0f64).unwrap(), 4.0);
     }
 
     #[test]
     fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64>) =
+        let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>, f64, f64>) =
             jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         assert_eq!(
@@ -363,7 +364,6 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(pushforward.to_string(), pushforward.program().to_string());
         test_support::assert_quadratic_pushforward_rendering();
     }
 

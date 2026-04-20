@@ -9,7 +9,7 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::tracing_v2::{
-    Batch, LinearProgram, OneLike, Program, Sin, Traceable, Tracer,
+    Batch, OneLike, Program, Sin, Traceable, Tracer,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
     engine::ArrayScalarEngine,
     grad, interpret_and_trace, jvp, jvp_program, stack, unstack, value_and_grad, vjp, vmap,
@@ -162,18 +162,18 @@ fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pushforward): (
         f64,
-        LinearProgram<ArrayType, f64, (f64, f64), f64, crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>>,
+        Program<ArrayType, f64, crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>, (f64, f64), f64>,
     ) = jvp_program(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
-    Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", pushforward.program())?])
+    Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", &pushforward)?])
 }
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pullback): (
         f64,
-        LinearProgram<ArrayType, f64, f64, (f64, f64), crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>>,
+        Program<ArrayType, f64, crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>, f64, (f64, f64)>,
     ) = vjp(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
-    Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", pullback.program())?])
+    Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
@@ -212,13 +212,9 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pushforward): (
         f64,
-        LinearProgram<ArrayType, f64, f64, f64, crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>>,
+        Program<ArrayType, f64, crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>, f64, f64>,
     ) = jvp_program(&ArrayScalarEngine::<f64>::new(), |x| Ok(quartic_plus_sin(x)), 2.0f64)?;
-    Ok(vec![tracing_record(
-        "scalar_quartic_plus_sin_linearize_pushforward",
-        "linearize_pushforward",
-        pushforward.program(),
-    )?])
+    Ok(vec![tracing_record("scalar_quartic_plus_sin_linearize_pushforward", "linearize_pushforward", &pushforward)?])
 }
 
 /// Emits the staged forward-over-reverse scalar benchmark.
@@ -385,15 +381,15 @@ fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 fn emit_matrix_matmul_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let (_, pullback): (
         Array2<f64>,
-        LinearProgram<
+        Program<
             ArrayType,
             Array2<f64>,
+            crate::tracing_v2::LinearPrimitiveOperation<ArrayType, Array2<f64>>,
             Array2<f64>,
             (Array2<f64>, Array2<f64>),
-            crate::tracing_v2::LinearPrimitiveOperation<ArrayType, Array2<f64>>,
         >,
     ) = vjp(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
-    Ok(vec![tracing_record("matrix_matmul_vjp_pullback", "vjp_pullback", pullback.program())?])
+    Ok(vec![tracing_record("matrix_matmul_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
 /// Emits the staged matrix Hessian-style benchmark.

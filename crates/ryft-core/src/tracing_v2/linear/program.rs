@@ -1,99 +1,5 @@
 use super::*;
 
-/// Staged linear map produced by [`jvp_program`](super::jvp_program) or [`vjp`](super::vjp).
-///
-/// [`LinearProgram`] is the reusable artifact that sits between first-order tracing and
-/// higher-order autodiff. A pushforward produced by forward-mode linearization and a pullback
-/// produced by reverse-mode transposition are represented by the same type; only the chosen input
-/// and output structures differ.
-pub struct LinearProgram<
-    T: Type + Display,
-    V: Traceable<T> + Parameter,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-    O: Clone + Operation<T> = LinearPrimitiveOperation<ArrayType, V>,
-> {
-    /// Underlying staged program that replays the linear map.
-    program: Program<T, V, O, Input, Output>,
-
-    /// Representative additive identity used when transpose logic must synthesize missing inputs.
-    zero: V,
-
-    /// Phantom marker tying the linear program to its structured input/output parameter families.
-    marker: PhantomData<fn(Input) -> Output>,
-}
-
-impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Operation<T>>
-    Clone for LinearProgram<T, V, Input, Output, O>
-where
-    Input::ParameterStructure: Clone,
-    Output::ParameterStructure: Clone,
-{
-    fn clone(&self) -> Self {
-        Self { program: self.program.clone(), zero: self.zero.clone(), marker: PhantomData }
-    }
-}
-
-impl<T: Type + Display, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Operation<T>>
-    LinearProgram<T, V, Input, Output, O>
-{
-    /// Wraps an already-built staged program as a linear map.
-    ///
-    /// Callers use this when a helper has already constructed the linear IR and just needs to tag
-    /// it with the representative zero required by later transpose logic.
-    #[inline]
-    pub fn from_program(program: Program<T, V, O, Input, Output>, zero: V) -> Self {
-        Self { program, zero, marker: PhantomData }
-    }
-
-    /// Returns the staged program backing this linear program.
-    ///
-    /// This is useful when a downstream helper needs to inspect or retag the underlying IR while
-    /// preserving the linear-map interpretation at the API boundary.
-    #[inline]
-    pub fn program(&self) -> &Program<T, V, O, Input, Output> {
-        &self.program
-    }
-
-    /// Applies the linear program to a concrete input tangent or cotangent.
-    ///
-    /// Conceptually this is no different from replaying an ordinary [`Program`], but the
-    /// documentation deliberately uses linear language because these programs represent derived
-    /// linear maps rather than original user functions.
-    pub fn call(&self, input: Input) -> Result<Output, TracingError>
-    where
-        O: InterpretableOperation<T, V>,
-        Input::ParameterStructure: PartialEq,
-        Output::ParameterStructure: Clone,
-    {
-        self.program.interpret(input)
-    }
-}
-
-impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>, O: Clone + Operation<ArrayType>>
-    LinearProgram<ArrayType, V, Input, Output, O>
-{
-    /// Transposes the linear program, turning a pushforward into a pullback.
-    #[allow(private_bounds)]
-    pub fn transpose(&self) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
-    where
-        V: ZeroLike,
-        O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
-        Input::ParameterStructure: Clone,
-        Output::ParameterStructure: Clone,
-    {
-        transpose_linear_program(self)
-    }
-}
-
-impl<V: Traceable<ArrayType>, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for LinearProgram<ArrayType, V, Input, Output>
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.program, formatter)
-    }
-}
-
 /// Applies one primitive's semantic transpose rule while transposing a staged linear program.
 ///
 /// This helper is the local handshake between IR-level transposition and primitive-level reverse
@@ -130,13 +36,13 @@ where
 /// Converts a staged primal program into a staged pushforward linear map.
 ///
 /// This is the reusable IR-level form of forward-mode differentiation. Instead of evaluating the
-/// JVP immediately, it builds a [`LinearProgram`] that can be replayed later on arbitrary tangent
-/// inputs at the same primal point.
+/// JVP immediately, it builds a staged [`Program`] over linear operations that can be replayed
+/// later on arbitrary tangent inputs at the same primal point.
 pub(crate) fn linearize_program<Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     program: &Program<ArrayType, V, O, Input, Output>,
     input_primals: Vec<V>,
-) -> Result<LinearProgram<ArrayType, V, Input, Output, L>, TracingError>
+) -> Result<Program<ArrayType, V, L, Input, Output>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -172,7 +78,6 @@ where
     if input_primals.len() != program.input_ids.len() {
         return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_primals.len() });
     }
-    let zero = input_primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, L>::new()));
     let mut primals: Vec<Option<V>> = vec![None; program.atoms.len()];
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atoms.len()];
@@ -239,45 +144,51 @@ where
             return Err(TracingError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
         }
     };
-    Ok(LinearProgram {
-        program: builder
-            .build::<Input, Output>(output_tangents, program.input_structure.clone(), program.output_structure.clone())
-            .simplified()?,
-        zero,
-        marker: PhantomData,
-    })
+    builder
+        .build::<Input, Output>(output_tangents, program.input_structure.clone(), program.output_structure.clone())
+        .simplified()
 }
 
 /// Transposes a linear pushforward program into its reverse-mode pullback.
 ///
 /// This is the IR-level core of reverse-mode AD in `tracing_v2`. Higher-level helpers such as
 /// [`vjp`](super::vjp) and [`grad`](super::grad) build on this operation after first producing a
-/// forward linear program.
+/// forward linear program. `engine` is used to synthesize zero cotangents for disconnected primal
+/// inputs.
 #[allow(private_bounds)]
-pub fn transpose_linear_program<V, Input, Output, O>(
-    program: &LinearProgram<ArrayType, V, Input, Output, O>,
-) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
+pub fn transpose_linear_program<V, Input, Output, O, E>(
+    engine: &E,
+    program: &Program<ArrayType, V, O, Input, Output>,
+) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
 where
-    V: Traceable<ArrayType> + ZeroLike,
+    V: Traceable<ArrayType>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
-    let zero = program.zero.zero_like();
-    transpose_linear_program_with_output_inputs(program, |builder: &mut ProgramBuilder<ArrayType, V, O>, _, _| {
-        Ok(builder.add_input(zero.r#type().into_owned()))
-    })
+    transpose_linear_program_with_factories(
+        program,
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, output_type, _| {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
+        },
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, input_type| {
+            Ok(builder.borrow_mut().add_constant(engine.zero(input_type)))
+        },
+    )
 }
 
-fn transpose_linear_program_with_output_inputs<V, Input, Output, O, F>(
-    program: &LinearProgram<ArrayType, V, Input, Output, O>,
+fn transpose_linear_program_with_factories<V, Input, Output, O, F, G>(
+    program: &Program<ArrayType, V, O, Input, Output>,
     mut make_output_cotangent_input: F,
-) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
+    mut make_missing_input_cotangent: G,
+) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
 where
-    V: Traceable<ArrayType> + ZeroLike,
+    V: Traceable<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    F: FnMut(&mut ProgramBuilder<ArrayType, V, O>, &ArrayType, usize) -> Result<AtomId, TracingError>,
+    F: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType, usize) -> Result<AtomId, TracingError>,
+    G: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType) -> Result<AtomId, TracingError>,
     O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
     fn accumulate<V, O>(
@@ -307,22 +218,20 @@ where
         Ok(())
     }
 
-    let linear_body = &program.program;
     let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new()));
-    let mut output_cotangent_inputs = Vec::with_capacity(linear_body.output_ids.len());
-    for (output_index, output) in linear_body.output_ids.iter().enumerate() {
-        let output_atom = linear_body.atoms.get(output.index).ok_or(TracingError::UnboundAtomId { id: *output })?;
-        let cotangent_input =
-            make_output_cotangent_input(&mut builder.borrow_mut(), &output_atom.r#type(), output_index)?;
+    let mut output_cotangent_inputs = Vec::with_capacity(program.output_ids.len());
+    for (output_index, output) in program.output_ids.iter().enumerate() {
+        let output_atom = program.atoms.get(output.index).ok_or(TracingError::UnboundAtomId { id: *output })?;
+        let cotangent_input = make_output_cotangent_input(&builder, &output_atom.r#type(), output_index)?;
         output_cotangent_inputs.push(cotangent_input);
     }
 
-    let mut adjoints = vec![None; linear_body.atoms.len()];
-    for (cotangent, output) in output_cotangent_inputs.into_iter().zip(linear_body.output_ids.iter().copied()) {
+    let mut adjoints = vec![None; program.atoms.len()];
+    for (cotangent, output) in output_cotangent_inputs.into_iter().zip(program.output_ids.iter().copied()) {
         accumulate(&builder, adjoints.as_mut_slice(), output, cotangent)?;
     }
 
-    for instruction in linear_body.instructions.iter().rev() {
+    for instruction in program.instructions.iter().rev() {
         let instruction_output_cotangents =
             instruction.outputs.iter().map(|output| adjoints[output.index]).collect::<Option<Vec<_>>>();
         let Some(instruction_output_cotangents) = instruction_output_cotangents else {
@@ -336,13 +245,17 @@ where
         }
     }
 
-    let zero_atom = builder.borrow_mut().add_constant(program.zero.clone());
-    let outputs = linear_body
+    let outputs = program
         .input_ids
         .iter()
         .copied()
-        .map(|input| adjoints[input.index].unwrap_or(zero_atom))
-        .collect::<Vec<_>>();
+        .map(|input| {
+            Ok(match adjoints[input.index] {
+                Some(adjoints) => adjoints,
+                None => make_missing_input_cotangent(&builder, &program.atoms[input.index].r#type())?,
+            })
+        })
+        .collect::<Result<Vec<_>, TracingError>>()?;
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
@@ -351,13 +264,9 @@ where
             ));
         }
     };
-    Ok(LinearProgram {
-        program: builder
-            .build::<Output, Input>(outputs, linear_body.output_structure.clone(), linear_body.input_structure.clone())
-            .simplified()?,
-        zero: program.zero.clone(),
-        marker: PhantomData,
-    })
+    builder
+        .build::<Output, Input>(outputs, program.output_structure.clone(), program.input_structure.clone())
+        .simplified()
 }
 
 /// Transposes a linear program using concrete output examples to seed the cotangent inputs.
@@ -365,26 +274,68 @@ where
 /// This variant is useful when the linear program's leaf type cannot be synthesized from bare
 /// [`ArrayType`] metadata alone, but the caller still has representative output values available.
 /// It plays the same architectural role as [`transpose_linear_program`], but swaps metadata-driven
-/// cotangent synthesis for exemplar-driven synthesis.
+/// cotangent synthesis for exemplar-driven synthesis. `engine` is still used to create zero
+/// cotangents for disconnected primal inputs.
 #[allow(private_bounds)]
-pub fn transpose_linear_program_with_output_examples<V, Input, Output, O>(
-    program: &LinearProgram<ArrayType, V, Input, Output, O>,
+pub fn transpose_linear_program_with_output_examples<V, Input, Output, O, E>(
+    engine: &E,
+    program: &Program<ArrayType, V, O, Input, Output>,
     output_examples: &[V],
-) -> Result<LinearProgram<ArrayType, V, Output, Input, O>, TracingError>
+) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
 where
-    V: Traceable<ArrayType> + ZeroLike,
+    V: Traceable<ArrayType>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
-    let expected_output_count = program.program().output_ids.len();
+    let expected_output_count = program.output_ids.len();
     if output_examples.len() != expected_output_count {
         return Err(TracingError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }
-    transpose_linear_program_with_output_inputs(
+    transpose_linear_program_with_factories(
         program,
-        |builder: &mut ProgramBuilder<ArrayType, V, O>, _, output_index| {
-            Ok(builder.add_input(output_examples[output_index].r#type().into_owned()))
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, _, output_index| {
+            Ok(builder.borrow_mut().add_input(output_examples[output_index].r#type().into_owned()))
+        },
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, input_type| {
+            Ok(builder.borrow_mut().add_constant(engine.zero(input_type)))
+        },
+    )
+}
+
+/// Transposes a traced linear program using traced output examples to seed the cotangent inputs.
+///
+/// This variant is the traced analogue of [`transpose_linear_program_with_output_examples`]. It
+/// uses `engine` plus one of the traced output examples to synthesize new zero tracers for
+/// disconnected primal inputs without storing backend state on the linear program itself.
+#[allow(private_bounds)]
+pub fn transpose_traced_linear_program_with_output_examples<'engine, Input, Output, V, O, E>(
+    engine: &'engine E,
+    program: &Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
+    output_examples: &[Tracer<'engine, E>],
+) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Output, Input>, TracingError>
+where
+    V: Traceable<ArrayType>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
+    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
+    O: CoreLinearProgramOperation<Tracer<'engine, E>> + LinearAddOperation<ArrayType, Tracer<'engine, E>> + Clone,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation: Operation<ArrayType>> + ?Sized + 'static,
+{
+    let expected_output_count = program.output_ids.len();
+    if output_examples.len() != expected_output_count {
+        return Err(TracingError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
+    }
+    transpose_linear_program_with_factories(
+        program,
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, _, output_index| {
+            Ok(builder.borrow_mut().add_input(output_examples[output_index].r#type().into_owned()))
+        },
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, input_type| {
+            let exemplar = output_examples.first().ok_or(TracingError::EmptyParameterizedValue)?;
+            let zero_atom = exemplar.builder.borrow_mut().add_constant(engine.zero(input_type));
+            let zero_tracer = Tracer::from_engine(zero_atom, exemplar.builder.clone(), engine);
+            Ok(builder.borrow_mut().add_constant(zero_tracer))
         },
     )
 }

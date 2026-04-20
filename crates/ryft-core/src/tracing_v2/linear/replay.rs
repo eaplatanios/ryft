@@ -116,7 +116,6 @@ where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     O: InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>> + Clone,
 {
-    let zero = primals.first().map(ZeroLike::zero_like).ok_or(TracingError::EmptyParameterizedValue)?;
     let input_count = primals.len();
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
         ArrayType,
@@ -147,5 +146,5 @@ where
             vec![Placeholder; primal_outputs.len()],
         )
         .simplified()?;
-    Ok((primal_outputs.clone(), LinearProgram::from_program(program, zero)))
+    Ok((primal_outputs.clone(), program))
 }

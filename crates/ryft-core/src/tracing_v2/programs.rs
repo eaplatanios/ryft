@@ -3,7 +3,8 @@
 //!
 //! This module owns the IR that all of `tracing_v2` is built on top of. Whether we are capturing a
 //! user closure with [`trace`](crate::tracing_v2::trace), replaying a staged program with
-//! [`Program::interpret`], or linearizing a primal program into a [`LinearProgram`](crate::tracing_v2::LinearProgram),
+//! [`Program::interpret`], or linearizing a primal program into another staged [`Program`] over
+//! linear operations,
 //! we keep coming back to the same core pieces:
 //!
 //! - [`Traceable`] and [`Value`] define which leaf values can participate in staged programs.

@@ -59,10 +59,8 @@ where
 
 pub(crate) fn assert_bilinear_pushforward_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, pushforward): (
-        f64,
-        LinearProgram<ArrayType, f64, (f64, f64), f64, LinearPrimitiveOperation<ArrayType, f64>>,
-    ) = jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
+    let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>, (f64, f64), f64>) =
+        jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
 
     assert_eq!(
         pushforward.to_string(),
@@ -99,7 +97,7 @@ pub(crate) fn assert_bilinear_jit_rendering() {
 
 pub(crate) fn assert_quadratic_pushforward_rendering() {
     let engine = ArrayScalarEngine::<f64>::new();
-    let (_, pushforward): (f64, LinearProgram<ArrayType, f64, f64, f64, LinearPrimitiveOperation<ArrayType, f64>>) =
+    let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>, f64, f64>) =
         jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
     assert_eq!(

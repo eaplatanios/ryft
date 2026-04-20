@@ -544,19 +544,19 @@ where
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
     let pushforward = linearize_program(engine, &body_program, input_primals)?;
-    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
+    let pullback = transpose_linear_program_with_output_examples(engine, &pushforward, output_primals.as_slice())?;
     Ok(LinearVMapOperation::new(
         FlatTracedVMap::from_parts(
             body.lane_count,
             body.input_types.clone(),
             body.output_types.clone(),
-            pushforward.program().clone(),
+            pushforward.clone(),
         ),
         FlatTracedVMap::from_parts(
             body.lane_count,
             body.output_types.clone(),
             body.input_types.clone(),
-            pullback.program().clone(),
+            pullback.clone(),
         ),
     ))
 }

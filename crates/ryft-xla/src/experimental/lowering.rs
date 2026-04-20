@@ -3003,12 +3003,12 @@ mod tests {
         // Standalone pullback â€” specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
         let (_, pullback): (
             f64,
-            ryft_core::tracing_v2::LinearProgram<
+            ryft_core::tracing_v2::Program<
                 ArrayType,
                 f64,
+                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>,
                 f64,
                 (f64, f64),
-                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>,
             >,
         ) = ryft_core::tracing_v2::vjp(
             &ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new(),
@@ -3017,7 +3017,7 @@ mod tests {
         )
         .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(pullback.program(), "main").unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
 
         // Pullback takes one cotangent, returns two cotangent outputs (for x and y).
@@ -3071,12 +3071,12 @@ mod tests {
         let right = arr2(&[[5.0f64, 6.0], [7.0, 8.0]]);
         let (_, pullback): (
             Array2<f64>,
-            ryft_core::tracing_v2::LinearProgram<
+            ryft_core::tracing_v2::Program<
                 ArrayType,
                 Array2<f64>,
+                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, Array2<f64>>,
                 Array2<f64>,
                 (Array2<f64>, Array2<f64>),
-                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, Array2<f64>>,
             >,
         ) = ryft_core::tracing_v2::vjp(
             &ryft_core::tracing_v2::operations::matrix::ndarray_support::Array2Engine::<f64>::new(),
@@ -3086,7 +3086,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            to_mlir_module_for_plain_program(pullback.program(), "main").unwrap(),
+            to_mlir_module_for_plain_program(&pullback, "main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2x2xf64>) -> (tensor<2x2xf64>, tensor<2x2xf64>) {
