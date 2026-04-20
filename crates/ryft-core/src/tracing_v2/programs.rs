@@ -536,15 +536,9 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     #[inline]
     pub fn add_input(&mut self, example: &V) -> AtomId {
         let abstract_value = <V as Typed<T>>::r#type(example).into_owned();
-        self.add_input_with_example(abstract_value, example.clone())
-    }
-
-    /// Adds a new input atom with the supplied abstract type and a caller-supplied exemplar value.
-    #[inline]
-    fn add_input_with_example(&mut self, abstract_value: T, example_value: V) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
         self.atoms.push(Atom::Variable(abstract_value));
-        self.intermediates.push(Some(example_value));
+        self.intermediates.push(Some(example.clone()));
         self.input_ids.push(id);
         id
     }
