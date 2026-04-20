@@ -99,10 +99,6 @@ pub use values::{OneLike, ZeroLike};
 /// participates inside a tracing flow.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TracingError {
-    /// Structured inputs or outputs did not have the same `Parameterized` shape.
-    #[error("mismatched parameter structures")]
-    MismatchedParameterStructure,
-
     /// A primitive or staged program received the wrong number of inputs.
     #[error("invalid number of inputs; expected {expected} but got {got}")]
     InvalidInputCount { expected: usize, got: usize },

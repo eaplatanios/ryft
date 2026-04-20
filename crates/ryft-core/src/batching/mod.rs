@@ -619,7 +619,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
     pub(crate) fn eval_lanes(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>
     where
         O: InterpretableOperation<T, V>,
-        Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+        Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     {
         if inputs.len() != self.total_input_count() {
             return Err(TracingError::InvalidInputCount { expected: self.total_input_count(), got: inputs.len() });
@@ -702,7 +702,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operati
 impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> InterpretableOperation<ArrayType, V>
     for VMapOperation<ArrayType, V, O, L>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     O: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -717,7 +717,7 @@ impl<'engine, E, V: Value<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + 
     for VMapOperation<ArrayType, V, O, L>
 where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     O: Operation<ArrayType>,
     O: InterpretableOperation<ArrayType, V>,
     O: InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
@@ -774,7 +774,7 @@ impl<V: Value<ArrayType> + ZeroLike + 'static, O: Clone + 'static>
         LinearPrimitiveOperation<ArrayType, V>,
     > for VMapOperation<ArrayType, V, O>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     O: DifferentiableOperation<
             ArrayType,
             V,
@@ -868,7 +868,7 @@ impl<
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > InterpretableOperation<ArrayType, Tracer<'engine, E>> for VMapOperation<ArrayType, V, O, L>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
@@ -953,7 +953,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation for Lin
 impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> InterpretableOperation<ArrayType, V>
     for LinearVMapOperation<ArrayType, V, O>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     O: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
@@ -1009,7 +1009,7 @@ pub(crate) fn make_linear_vmap<'engine, V, O>(
 ) -> Result<LinearVMapOperation<ArrayType, V>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + 'static,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     O: Clone + Operation<ArrayType> + 'static,
     O: InterpretableOperation<ArrayType, V>,
     O: DifferentiableOperation<

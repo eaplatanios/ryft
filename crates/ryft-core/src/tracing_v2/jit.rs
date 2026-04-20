@@ -339,8 +339,11 @@ pub fn interpret_and_trace<'engine, E, F, Input, Output>(
 where
     E: Engine<Type: Parameter, Value: Traceable<E::Type>, TracingOperation: InterpretableOperation<E::Type, E::Value>>
         + ?Sized,
-    Input:
-        Parameterized<E::Value, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Tracer<'engine, E>>>,
+    Input: Parameterized<
+            E::Value,
+            ParameterStructure: Clone + std::fmt::Debug + PartialEq,
+            Family: ParameterizedFamily<Tracer<'engine, E>>,
+        >,
     Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<'engine, E>>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {

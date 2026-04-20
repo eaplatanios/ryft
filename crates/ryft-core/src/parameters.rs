@@ -36,10 +36,13 @@ pub enum ParameterError {
     MissingParameters { expected_count: usize, paths: Option<Vec<String>> },
 
     #[error(
-        "got ambiguous parameter values while combining parameterized values; conflicting values: {}",
+        "got ambiguous parameter values while combining parameterized values: {}",
         values.iter().map(|value| format!("'{value}'")).collect::<Vec<_>>().join(", "),
     )]
     AmbiguousParameterCombination { values: Vec<String> },
+
+    #[error("mismatched parameter structures: {left_structure} and {right_structure}")]
+    MismatchedParameterStructure { left_structure: String, right_structure: String },
 }
 
 /// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].

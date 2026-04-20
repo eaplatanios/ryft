@@ -13,6 +13,7 @@
 
 use super::*;
 use crate::batching::{Batch, BatchingError, stack, unstack};
+use crate::parameters::ParameterError;
 
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
@@ -27,7 +28,7 @@ pub fn jvp_program<'engine, E, F, Input, Output, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Traceable<ArrayType> + ZeroLike,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
@@ -69,7 +70,7 @@ pub(crate) fn jvp_traced<'engine, F, Input, Output, V, O, L, E>(
 ) -> Result<(Output, Output), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     O: Clone + Operation<ArrayType> + 'static,
     L: Clone + Operation<ArrayType> + 'static,
@@ -85,11 +86,17 @@ where
     LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearReplayOperation<Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
-    if primals.parameter_structure() != tangents.parameter_structure() {
-        return Err(TracingError::MismatchedParameterStructure);
+    let primal_structure = primals.parameter_structure();
+    let tangent_structure = tangents.parameter_structure();
+    if primal_structure != tangent_structure {
+        return Err(ParameterError::MismatchedParameterStructure {
+            left_structure: format!("{primal_structure:?}"),
+            right_structure: format!("{tangent_structure:?}"),
+        }
+        .into());
     }
 
-    let input_structure = primals.parameter_structure();
+    let input_structure = primal_structure;
     let traced_primals = primals.into_parameters().collect::<Vec<_>>();
     let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
     let Some(exemplar_traced_primal) = traced_primals.first() else {
@@ -137,7 +144,7 @@ pub fn vjp<'engine, E, F, Input, Output, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Traceable<ArrayType> + ZeroLike + OneLike,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
@@ -170,7 +177,7 @@ where
 pub trait ValueAndGradInvocationLeaf<E, Input>: Parameter + Sized
 where
     E: Engine<Type = ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Self, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     /// Primal scalar output value produced for the corresponding input regime.
     type Value;
@@ -199,8 +206,8 @@ where
 /// pulls back a unit seed to obtain both the primal scalar output and its gradient.
 impl<
     E,
-    V: Value<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    V: Value<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input> for V
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
@@ -245,7 +252,7 @@ impl<
     'engine,
     E,
     V: Traceable<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input> for Tracer<'engine, E>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
@@ -319,7 +326,7 @@ where
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + OneLike + 'static,
-    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Batch<V>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input> for Batch<V>
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
@@ -387,7 +394,7 @@ where
     Input::To<V>: Clone
         + for<'engine> Parameterized<
             V,
-            ParameterStructure: Clone + PartialEq,
+            ParameterStructure: Clone + std::fmt::Debug + PartialEq,
             To<Batch<V>> = Input,
             To<
                 Tracer<'engine, dyn Engine<
@@ -583,7 +590,7 @@ pub fn value_and_grad<'engine, E, F, Input, Leaf>(
 where
     E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,
-    Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Leaf, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     F: FnOnce(
         <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionInput<'engine>,
     ) -> <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionOutput<'engine>,
@@ -600,7 +607,7 @@ pub fn grad<'engine, E, F, Input, Leaf>(engine: &'engine E, function: F, primals
 where
     E: Engine<Type = ArrayType>,
     Leaf: ValueAndGradInvocationLeaf<E, Input>,
-    Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Leaf, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     F: FnOnce(
         <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionInput<'engine>,
     ) -> <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionOutput<'engine>,

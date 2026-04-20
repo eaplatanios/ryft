@@ -12,6 +12,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
+    fmt::Debug,
     ops::{Add, Mul, Neg},
     rc::Rc,
 };
@@ -20,7 +21,7 @@ use ryft_macros::Parameter;
 
 use crate::{
     batching::{Batch, BatchingError, stack, unstack},
-    parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
+    parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         LinearPrimitiveOperation, Program, ProgramBuilder, Traceable, TracingError, Value, ZeroLike,
         engine::Engine,
@@ -136,7 +137,7 @@ pub type Dual<V> = JvpTracer<V, V>;
 pub trait JvpInvocationLeaf<E, Input, Output>: Parameter + Sized
 where
     E: Engine<Type = ArrayType>,
-    Input: Parameterized<Self, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Self, ParameterStructure: Clone + Debug + PartialEq>,
     Output: Parameterized<Self, ParameterStructure: Clone>,
 {
     /// Input type expected by the user-provided function.
@@ -195,7 +196,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<Array
 impl<
     E,
     V: Value<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > JvpInvocationLeaf<E, Input, Output> for V
 where
@@ -230,8 +231,14 @@ where
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
-        if primals.parameter_structure() != tangents.parameter_structure() {
-            return Err(TracingError::MismatchedParameterStructure);
+        let primal_structure = primals.parameter_structure();
+        let tangent_structure = tangents.parameter_structure();
+        if primal_structure != tangent_structure {
+            return Err(ParameterError::MismatchedParameterStructure {
+                left_structure: format!("{primal_structure:?}"),
+                right_structure: format!("{tangent_structure:?}"),
+            }
+            .into());
         }
 
         let (primal_output, tangent_program): (Output, Program<ArrayType, V, E::LinearOperation, Input, Output>) =
@@ -248,7 +255,7 @@ impl<
     'engine,
     E,
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + PartialEq, To<Tracer<'engine, E>> = Input>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + Debug + PartialEq, To<Tracer<'engine, E>> = Input>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
 > JvpInvocationLeaf<E, Input, Output> for Tracer<'engine, E>
 where
@@ -300,7 +307,7 @@ where
 impl<
     E,
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq> + 'static,
-    Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Batch<V>, ParameterStructure: Clone + Debug + PartialEq>,
     Output: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq>,
 > JvpInvocationLeaf<E, Input, Output> for Batch<V>
 where
@@ -355,7 +362,7 @@ where
     Input::To<V>: Clone
         + for<'engine> Parameterized<
             V,
-            ParameterStructure: Clone + PartialEq,
+            ParameterStructure: Clone + Debug + PartialEq,
             To<Batch<V>> = Input,
             To<
                 Tracer<'engine, dyn Engine<
@@ -482,8 +489,14 @@ where
     where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>,
     {
-        if primals.parameter_structure() != tangents.parameter_structure() {
-            return Err(TracingError::MismatchedParameterStructure);
+        let primal_structure = primals.parameter_structure();
+        let tangent_structure = tangents.parameter_structure();
+        if primal_structure != tangent_structure {
+            return Err(ParameterError::MismatchedParameterStructure {
+                left_structure: format!("{primal_structure:?}"),
+                right_structure: format!("{tangent_structure:?}"),
+            }
+            .into());
         }
 
         let erased_engine: &dyn Engine<
@@ -636,7 +649,7 @@ pub fn jvp<'engine, E, F, Input, Output, Leaf>(
 where
     E: Engine<Type = ArrayType>,
     Leaf: JvpInvocationLeaf<E, Input, Output>,
-    Input: Parameterized<Leaf, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<Leaf, ParameterStructure: Clone + Debug + PartialEq>,
     Output: Parameterized<Leaf, ParameterStructure: Clone>,
     F: FnOnce(
         <Leaf as JvpInvocationLeaf<E, Input, Output>>::FunctionInput<'engine>,
@@ -655,6 +668,7 @@ mod tests {
 
     use ryft_macros::Parameter;
 
+    use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing_v2::{OneLike, engine::ArrayScalarEngine, test_support};
     use crate::types::{Type, Typed};
 
@@ -678,7 +692,14 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let result: Result<(f64, f64), TracingError> =
             jvp(&engine, |xs| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
-        assert!(matches!(result, Err(TracingError::MismatchedParameterStructure)));
+        assert!(matches!(
+            result,
+            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructure {
+                left_structure,
+                right_structure,
+            })) if left_structure == format!("{:?}", vec![2.0f64].parameter_structure())
+                && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
+        ));
         test_support::assert_quadratic_pushforward_rendering();
     }
 

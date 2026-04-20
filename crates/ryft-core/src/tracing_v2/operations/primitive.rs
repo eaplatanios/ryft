@@ -570,7 +570,7 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps,
 > InterpretableOperation<ArrayType, V> for PrimitiveOperation<ArrayType, V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -604,7 +604,7 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps,
 > InterpretableOperation<ArrayType, V> for LinearPrimitiveOperation<ArrayType, V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         match self {
@@ -635,7 +635,7 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps,
 > LinearOperation<ArrayType, V> for LinearPrimitiveOperation<ArrayType, V>
 where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     fn transpose(
         &self,
@@ -695,8 +695,8 @@ impl<
 > InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>
     for PrimitiveOperation<ArrayType, V>
 where
-    V::ParameterStructure: Clone + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     fn interpret(
         &self,
@@ -745,8 +745,8 @@ impl<
         LinearPrimitiveOperation<ArrayType, V>,
     > for PrimitiveOperation<ArrayType, V>
 where
-    V::ParameterStructure: Clone + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     fn jvp(
         &self,

@@ -270,7 +270,7 @@ pub fn jacfwd<'engine, E, F, Input, Output, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
@@ -322,8 +322,8 @@ pub fn jacrev<'engine, E, F, Input, Output, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Output: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
@@ -368,7 +368,7 @@ pub fn hessian<'engine, E, F, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
-    Input: Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TracingError>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,

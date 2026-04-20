@@ -28,7 +28,7 @@ use std::{
 use ryft_macros::Parameter;
 
 use crate::{
-    parameters::{Parameter, Parameterized},
+    parameters::{Parameter, ParameterError, Parameterized},
     tracing_v2::TracingError,
     types::{ArrayType, Type, TypeError, Typed},
 };
@@ -317,11 +317,16 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
     pub fn interpret(&self, input: Input) -> Result<Output, TracingError>
     where
         O: InterpretableOperation<T, V>,
-        Input::ParameterStructure: PartialEq,
+        Input::ParameterStructure: Debug + PartialEq,
         Output::ParameterStructure: Clone,
     {
-        if input.parameter_structure() != self.input_structure {
-            return Err(TracingError::MismatchedParameterStructure);
+        let input_structure = input.parameter_structure();
+        if input_structure != self.input_structure {
+            return Err(ParameterError::MismatchedParameterStructure {
+                left_structure: format!("{:?}", self.input_structure),
+                right_structure: format!("{input_structure:?}"),
+            }
+            .into());
         }
 
         let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -763,7 +768,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::{
-        parameters::{Parameter, Placeholder},
+        parameters::{Parameter, ParameterError, Parameterized, Placeholder},
         tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOperation, Sin, TracingError, Value, ZeroLike, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
@@ -808,6 +813,22 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn program_interpret_rejects_mismatched_parameter_structures() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let x = builder.add_input(1.0f64.r#type().into_owned());
+        let program = builder.build::<Vec<f64>, f64>(vec![x], vec![Placeholder], Placeholder);
+
+        assert!(matches!(
+            program.interpret(vec![1.0f64, 2.0f64]),
+            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructure {
+                left_structure,
+                right_structure,
+            })) if left_structure == format!("{:?}", vec![Placeholder])
+                && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
+        ));
     }
 
     #[test]
