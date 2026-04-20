@@ -680,10 +680,15 @@ mod tests {
             > + ?Sized
             + 'static,
     {
-        Ok(Tracer::apply_staged_op(std::slice::from_ref(&input), PrimitiveOperation::Custom(Arc::new(primitive)))?
-            .into_iter()
-            .next()
-            .expect("unary custom primitive should produce one output"))
+        Ok(Tracer::apply_staged_op(
+            input.engine,
+            input.builder.clone(),
+            std::slice::from_ref(&input),
+            PrimitiveOperation::Custom(Arc::new(primitive)),
+        )?
+        .into_iter()
+        .next()
+        .expect("unary custom primitive should produce one output"))
     }
 
     /// Applies one unary custom primitive to one traced scalar and expects staging to succeed.

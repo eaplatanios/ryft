@@ -86,18 +86,23 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     /// higher-order transforms that need to inject backend-selected operations manually. The method
     /// validates that all inputs belong to the same tracing scope, runs abstract evaluation to
     /// determine the output arity, and records the instruction unless the scope has already failed.
-    pub fn apply_staged_op(inputs: &[Self], op: E::TracingOperation) -> Result<Vec<Self>, TracingError>
+    pub fn apply_staged_op(
+        engine: &'engine E,
+        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
+        inputs: &[Self],
+        op: E::TracingOperation,
+    ) -> Result<Vec<Self>, TracingError>
     where
         E::TracingOperation: Operation<E::Type>,
     {
-        if inputs.is_empty() {
-            return Err(TracingError::EmptyParameterizedValue);
-        }
-
-        let builder = inputs[0].builder.clone();
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
             return Err(TracingError::InternalInvariantViolation(
                 "tracer inputs for one staged op must share the same builder",
+            ));
+        }
+        if inputs.iter().any(|input| !std::ptr::eq(input.engine, engine)) {
+            return Err(TracingError::InternalInvariantViolation(
+                "tracer inputs for one staged op must share the same engine",
             ));
         }
 
@@ -109,33 +114,39 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
                 .map(|input| builder_borrow.atoms[input.index].r#type().into_owned())
                 .collect::<Vec<_>>()
         };
+        let fallback_atom = inputs
+            .first()
+            .map(|input| input.atom)
+            .or_else(|| builder.borrow().atoms.first().map(|_| AtomId { index: 0 }));
         let output_count = match op.infer_output_types(input_types.as_slice()) {
-            Ok(outputs) => outputs.len(),
+            Ok(output_types) => output_types.len(),
             Err(error) => {
                 if builder.borrow().error.is_none() {
-                    builder.borrow_mut().error = Some(error);
+                    builder.borrow_mut().error = Some(error.clone());
                 }
-                1
+                let fallback_atom = fallback_atom.ok_or(error)?;
+                return Ok(vec![Self { atom: fallback_atom, builder, engine }]);
             }
         };
         let output_atoms = if builder.borrow().error.is_some() {
-            vec![inputs[0].atom; output_count]
+            let fallback_atom = fallback_atom.ok_or(TracingError::InternalInvariantViolation(
+                "failed traced staging must have one fallback atom available",
+            ))?;
+            vec![fallback_atom; output_count]
         } else {
             match builder.borrow_mut().add_instruction(op, input_atoms) {
                 Ok(outputs) => outputs,
                 Err(error) => {
                     if builder.borrow().error.is_none() {
-                        builder.borrow_mut().error = Some(error);
+                        builder.borrow_mut().error = Some(error.clone());
                     }
-                    vec![inputs[0].atom; output_count]
+                    let fallback_atom = fallback_atom.ok_or(error)?;
+                    vec![fallback_atom; output_count]
                 }
             }
         };
 
-        Ok(output_atoms
-            .into_iter()
-            .map(|atom| Self { atom, builder: builder.clone(), engine: inputs[0].engine })
-            .collect())
+        Ok(output_atoms.into_iter().map(|atom| Self { atom, builder: builder.clone(), engine }).collect())
     }
 
     /// Stages a single-input primitive application and returns its unique output.
@@ -143,7 +154,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     where
         E::TracingOperation: Operation<E::Type>,
     {
-        Self::apply_staged_op(std::slice::from_ref(&self), op)
+        Self::apply_staged_op(self.engine, self.builder.clone(), std::slice::from_ref(&self), op)
             .expect("unary traced staging should preserve non-empty inputs")
             .into_iter()
             .next()
@@ -156,7 +167,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
         E::TracingOperation: Operation<E::Type>,
     {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
-        Self::apply_staged_op(&[self, rhs], op)
+        Self::apply_staged_op(self.engine, self.builder.clone(), &[self, rhs], op)
             .expect("binary traced staging should preserve non-empty inputs")
             .into_iter()
             .next()

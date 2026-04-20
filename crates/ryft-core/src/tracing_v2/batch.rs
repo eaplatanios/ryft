@@ -348,7 +348,13 @@ where
         );
 
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
-        let staged_outputs = Tracer::apply_staged_op(staged_inputs.as_slice(), O::vmap_op(VMapOperation::new(body)))?;
+        let exemplar_input = staged_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        let staged_outputs = Tracer::apply_staged_op(
+            exemplar_input.engine,
+            exemplar_input.builder.clone(),
+            staged_inputs.as_slice(),
+            O::vmap_op(VMapOperation::new(body)),
+        )?;
         (0..lane_count)
             .map(|lane_index| {
                 let start = lane_index * output_leaf_count;

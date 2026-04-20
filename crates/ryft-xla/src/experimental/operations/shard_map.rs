@@ -340,6 +340,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for ShardMapOperation<ShardMapTe
             });
         }
         let contributions = LinearTerm::apply_staged_op(
+            output_cotangents[0].builder.clone(),
             output_cotangents,
             LinearPrimitiveOperation::custom(self.transpose_op()?.to_tensor_custom_primitive())?,
             self.input_types.len(),
@@ -388,6 +389,7 @@ impl
         let primal_outputs = InterpretableOperation::interpret(self, primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_inputs[0].builder.clone(),
             tangent_inputs.as_slice(),
             LinearPrimitiveOperation::custom(
                 make_linear_tensor_shard_map(self.body())
@@ -415,11 +417,16 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for ShardMapO
             .map(|input| ShardMapTensor::new(input.r#type().into_owned()))
             .collect::<Vec<_>>();
         let _primal_output_values = InterpretableOperation::interpret(self, primal_values.as_slice())?;
-        let primal_outputs =
-            Tracer::apply_staged_op(primal_inputs.as_slice(), XlaPrimitiveOperation::ShardMap(Box::new(self.clone())))?;
+        let primal_outputs = Tracer::apply_staged_op(
+            primal_inputs[0].engine,
+            primal_inputs[0].builder.clone(),
+            primal_inputs.as_slice(),
+            XlaPrimitiveOperation::ShardMap(Box::new(self.clone())),
+        )?;
 
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_inputs[0].builder.clone(),
             tangent_inputs.as_slice(),
             LinearPrimitiveOperation::custom(
                 self.to_linearized_jit_tracer_op(primal_inputs.as_slice())?.to_tracer_custom_primitive(),
@@ -503,6 +510,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for ShardMapOperation<ShardMapTr
             });
         }
         let contributions = LinearTerm::apply_staged_op(
+            output_cotangents[0].builder.clone(),
             output_cotangents,
             LinearPrimitiveOperation::custom(self.transpose_op()?.to_tracer_custom_primitive())?,
             self.input_types.len(),
@@ -1122,7 +1130,10 @@ fn apply_flat_traced_shard_map(
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
+    let exemplar_input = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
     Tracer::apply_staged_op(
+        exemplar_input.engine,
+        exemplar_input.builder.clone(),
         traced_inputs.as_slice(),
         XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
     )
@@ -1439,6 +1450,7 @@ pub(crate) fn apply_linearized_flat_shard_map(
     let traced_tangents = traced_inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
     let primal_outputs = apply_flat_traced_shard_map(body.clone(), traced_primals.clone())?;
     let tangent_outputs = LinearTerm::apply_staged_op(
+        traced_tangents.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone(),
         traced_tangents.as_slice(),
         LinearPrimitiveOperation::custom(make_linear_shard_map(&body, traced_primals)?.to_tracer_custom_primitive())?,
         body.global_output_types.len(),
@@ -1514,7 +1526,10 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
+    let exemplar_input = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
     let staged_outputs = Tracer::apply_staged_op(
+        exemplar_input.engine,
+        exemplar_input.builder.clone(),
         traced_inputs.as_slice(),
         XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
     )?;

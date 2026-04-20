@@ -127,6 +127,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOperation<V> {
         check_input_count!(output_cotangents, 1);
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
+                output_cotangents[0].builder.clone(),
                 std::slice::from_ref(&output_cotangents[0]),
                 LinearPrimitiveOperation::RightMatMul { factor: self.factor.clone().transpose_matrix() },
                 1,

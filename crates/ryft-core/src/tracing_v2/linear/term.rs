@@ -41,16 +41,16 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
     /// Shape validation is performed via [`Operation::infer_output_types`]. Concrete evaluation is
     /// intentionally skipped because tangent-program outputs remain abstract until the staged
     /// linear program is replayed on concrete tangents.
-    pub fn apply_staged_op(inputs: &[Self], op: O, output_count: usize) -> Result<Vec<Self>, TracingError>
+    pub fn apply_staged_op(
+        builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
+        inputs: &[Self],
+        op: O,
+        output_count: usize,
+    ) -> Result<Vec<Self>, TracingError>
     where
         O: Operation<T>,
     {
-        if inputs.is_empty() {
-            return Err(TracingError::EmptyParameterizedValue);
-        }
-
-        let builder = inputs[0].builder.clone();
-        if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
+        if inputs.iter().any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
             return Err(TracingError::InternalInvariantViolation(
                 "linear tracer inputs for one staged op must share the same builder",
             ));

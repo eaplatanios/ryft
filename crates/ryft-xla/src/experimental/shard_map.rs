@@ -576,10 +576,15 @@ where
             }
             .into());
         }
-        Ok(Tracer::apply_staged_op(std::slice::from_ref(&input), XlaPrimitiveOperation::WithShardingConstraint(op))?
-            .into_iter()
-            .next()
-            .expect("with_sharding_constraint should produce one output per input leaf"))
+        Ok(Tracer::apply_staged_op(
+            input.engine,
+            input.builder.clone(),
+            std::slice::from_ref(&input),
+            XlaPrimitiveOperation::WithShardingConstraint(op),
+        )?
+        .into_iter()
+        .next()
+        .expect("with_sharding_constraint should produce one output per input leaf"))
     }
 
     let structure = input.parameter_structure();

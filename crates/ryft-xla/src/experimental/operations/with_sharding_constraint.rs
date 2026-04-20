@@ -152,6 +152,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperat
     ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TracingError> {
         check_input_count!(output_cotangents, 1);
         let contribution = LinearTerm::apply_staged_op(
+            output_cotangents[0].builder.clone(),
             std::slice::from_ref(&output_cotangents[0]),
             LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
             1,
@@ -195,6 +196,7 @@ impl
     > {
         check_input_count!(inputs, 1);
         let tangent = LinearTerm::apply_staged_op(
+            inputs[0].tangent.builder.clone(),
             std::slice::from_ref(&inputs[0].tangent),
             LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
             1,
@@ -214,6 +216,8 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for WithShard
         check_input_count!(inputs, 1);
         let input = &inputs[0];
         let primal = Tracer::apply_staged_op(
+            input.primal.engine,
+            input.primal.builder.clone(),
             std::slice::from_ref(&input.primal),
             XlaPrimitiveOperation::WithShardingConstraint(self.clone()),
         )?
@@ -221,6 +225,7 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for WithShard
         .next()
         .expect("sharding constraint should produce one primal output");
         let tangent = LinearTerm::apply_staged_op(
+            input.tangent.builder.clone(),
             std::slice::from_ref(&input.tangent),
             LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
             1,
@@ -246,6 +251,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperat
     ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TracingError> {
         check_input_count!(output_cotangents, 1);
         let contribution = LinearTerm::apply_staged_op(
+            output_cotangents[0].builder.clone(),
             std::slice::from_ref(&output_cotangents[0]),
             LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
             1,
@@ -289,6 +295,7 @@ impl
     > {
         check_input_count!(inputs, 1);
         let tangent = LinearTerm::apply_staged_op(
+            inputs[0].tangent.builder.clone(),
             std::slice::from_ref(&inputs[0].tangent),
             LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
             1,

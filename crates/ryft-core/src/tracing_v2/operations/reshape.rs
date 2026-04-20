@@ -250,6 +250,7 @@ where
             return Ok(tangent);
         }
         Ok(LinearTerm::apply_staged_op(
+            tangent.builder.clone(),
             std::slice::from_ref(&tangent),
             O::linear_reshape_op(input_type.clone(), output_type.clone()),
             1,
@@ -288,10 +289,15 @@ where
         if input_type == output_type {
             return Ok(self);
         }
-        Ok(Tracer::apply_staged_op(std::slice::from_ref(&self), O::reshape_op(input_type, output_type))?
-            .into_iter()
-            .next()
-            .expect("reshape should produce one traced output"))
+        Ok(Tracer::apply_staged_op(
+            self.engine,
+            self.builder.clone(),
+            std::slice::from_ref(&self),
+            O::reshape_op(input_type, output_type),
+        )?
+        .into_iter()
+        .next()
+        .expect("reshape should produce one traced output"))
     }
 }
 

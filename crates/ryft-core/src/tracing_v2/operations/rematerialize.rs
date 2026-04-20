@@ -203,7 +203,13 @@ where
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::rematerialize_op(self.clone()))?;
+        let exemplar_primal_input = primal_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        let primal_outputs = Tracer::apply_staged_op(
+            exemplar_primal_input.engine,
+            exemplar_primal_input.builder.clone(),
+            primal_inputs.as_slice(),
+            O::rematerialize_op(self.clone()),
+        )?;
         let body_program = self.body().program();
         let tangent_outputs = replay_program_linearized_jit::<_, _, _, O, L, E>(&body_program, inputs.to_vec())?;
         Ok(primal_outputs
@@ -286,7 +292,9 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
+        let tangent_builder = tangent_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone();
         let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_builder,
             tangent_inputs.as_slice(),
             LinearPrimitiveOperation::Rematerialize(Box::new(make_linear_rematerialize(
                 engine,
@@ -315,7 +323,13 @@ where
     O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
-        Tracer::apply_staged_op(inputs, O::rematerialize_op(self.clone()))
+        let exemplar_input = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        Tracer::apply_staged_op(
+            exemplar_input.engine,
+            exemplar_input.builder.clone(),
+            inputs,
+            O::rematerialize_op(self.clone()),
+        )
     }
 }
 
@@ -403,7 +417,9 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerial
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         let transpose = self.transpose_op();
+        let exemplar_output_cotangent = output_cotangents.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
         Ok(LinearTerm::apply_staged_op(
+            exemplar_output_cotangent.builder.clone(),
             output_cotangents,
             LinearPrimitiveOperation::Rematerialize(Box::new(transpose)),
             self.body.input_types().len(),
@@ -588,8 +604,13 @@ where
             },
         );
 
-        let staged_outputs =
-            Tracer::apply_staged_op(traced_inputs.as_slice(), O::rematerialize_op(RematerializeOperation::new(body)))?;
+        let exemplar_traced_input = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        let staged_outputs = Tracer::apply_staged_op(
+            exemplar_traced_input.engine,
+            exemplar_traced_input.builder.clone(),
+            traced_inputs.as_slice(),
+            O::rematerialize_op(RematerializeOperation::new(body)),
+        )?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TracingError::from)
     }
 }

@@ -248,7 +248,13 @@ where
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = Tracer::apply_staged_op(primal_inputs.as_slice(), O::vmap_op(self.clone()))?;
+        let exemplar_primal_input = primal_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        let primal_outputs = Tracer::apply_staged_op(
+            exemplar_primal_input.engine,
+            exemplar_primal_input.builder.clone(),
+            primal_inputs.as_slice(),
+            O::vmap_op(self.clone()),
+        )?;
         let lane_input_count = self.body().input_types().len();
         let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
@@ -338,7 +344,9 @@ where
         let primal_outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
         let lane_input_count = self.body.input_types().len();
         let lane_primals = primal_inputs.iter().take(lane_input_count).cloned().collect::<Vec<_>>();
+        let tangent_builder = tangent_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone();
         let tangent_outputs = LinearTerm::apply_staged_op(
+            tangent_builder,
             tangent_inputs.as_slice(),
             LinearPrimitiveOperation::VMap(Box::new(make_linear_vmap(engine, &self.body, lane_primals)?)),
             self.body.total_output_count(),
@@ -363,7 +371,8 @@ where
     O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
-        Tracer::apply_staged_op(inputs, O::vmap_op(self.clone()))
+        let exemplar_input = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        Tracer::apply_staged_op(exemplar_input.engine, exemplar_input.builder.clone(), inputs, O::vmap_op(self.clone()))
     }
 }
 
@@ -457,7 +466,9 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearVMapOperat
             });
         }
         let transpose = self.transpose_op();
+        let exemplar_output_cotangent = output_cotangents.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
         Ok(LinearTerm::apply_staged_op(
+            exemplar_output_cotangent.builder.clone(),
             output_cotangents,
             LinearPrimitiveOperation::VMap(Box::new(transpose)),
             self.body.total_input_count(),
