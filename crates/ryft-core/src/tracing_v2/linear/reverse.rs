@@ -91,18 +91,23 @@ where
     let input_structure = primals.parameter_structure();
     let traced_primals = primals.into_parameters().collect::<Vec<_>>();
     let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
+    let Some(exemplar_traced_primal) = traced_primals.first() else {
+        return Err(TracingError::HigherOrderOpFailure {
+            op: "jvp",
+            message: "traced jvp requires at least one input leaf to recover the staging context".to_string(),
+        });
+    };
     let staged_input_types = Input::To::<ArrayType>::from_parameters(
         input_structure.clone(),
         traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
     let (primal_output_types, traced_program) =
         trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
-            traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.engine,
+            exemplar_traced_primal.engine,
             move |staged_input| function(staged_input),
             staged_input_types,
         )?;
     let output_structure = primal_output_types.parameter_structure();
-    let exemplar_traced_primal = traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?;
     let tracing_builder = exemplar_traced_primal.builder.clone();
     let (traced_primal_output, pushforward) = linearize_traced_program::<V, O, L, E>(
         exemplar_traced_primal.engine,
@@ -271,27 +276,31 @@ where
     {
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
+        if traced_primals.is_empty() {
+            return Err(TracingError::HigherOrderOpFailure {
+                op: "value_and_grad",
+                message: "traced reverse-mode requires at least one input leaf to recover the staging context"
+                    .to_string(),
+            });
+        }
         let staged_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let (_, traced_program) = trace_flat_program_from_input_types::<
-            Input::To<ArrayType>,
-            V::To<ArrayType>,
-            V,
-            E::TracingOperation,
-            E::LinearOperation,
-            E,
-            _,
-        >(
-            traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.engine,
-            |staged_input| Ok(function(staged_input)),
-            staged_input_types,
-        )?;
+        let (_, traced_program) =
+            trace_flat_program_from_input_types::<
+                Input::To<ArrayType>,
+                V::To<ArrayType>,
+                V,
+                E::TracingOperation,
+                E::LinearOperation,
+                E,
+                _,
+            >(traced_primals[0].engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
         let (traced_output, traced_gradient) =
             reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
-                traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.engine,
-                traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone(),
+                traced_primals[0].engine,
+                traced_primals[0].builder.clone(),
                 &traced_program,
                 traced_primals,
             )?;
@@ -511,11 +520,15 @@ where
                                 LinearOperation = E::LinearOperation,
                             >>,
                 >| {
-                    let tracing_builder = jit_primals
-                        .first()
-                        .ok_or(TracingError::EmptyParameterizedValue)?
-                        .builder
-                        .clone();
+                    let Some(first_jit_primal) = jit_primals.first() else {
+                        return Err(TracingError::HigherOrderOpFailure {
+                            op: "value_and_grad",
+                            message:
+                                "traced reverse-mode replay requires at least one input leaf to recover the staging context"
+                                    .to_string(),
+                        });
+                    };
+                    let tracing_builder = first_jit_primal.builder.clone();
                     let (output, gradient) = reverse_mode_scalar_traced_program::<
                         V,
                         E::TracingOperation,
@@ -540,7 +553,9 @@ where
         for lane in lane_primals {
             let flat: Vec<V> = lane.into_parameters().collect();
             let flat_result = compiled_vg.interpret(flat)?;
-            let (value, grad_flat) = flat_result.split_first().ok_or(TracingError::EmptyParameterizedValue)?;
+            let Some((value, grad_flat)) = flat_result.split_first() else {
+                return Err(TracingError::InvalidOutputCount { expected: 1, got: 0 });
+            };
             lane_values.push(value.clone());
             lane_grads.push(
                 Input::To::<V>::from_parameters(input_structure.clone(), grad_flat.to_vec())

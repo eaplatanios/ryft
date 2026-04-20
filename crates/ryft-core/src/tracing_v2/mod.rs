@@ -107,10 +107,6 @@ pub enum TracingError {
     #[error("encountered an empty batch")]
     EmptyBatch,
 
-    /// A transform needed a seed value but the parameterized value contained no leaves.
-    #[error("encountered an empty parameterized value while a seed value was required")]
-    EmptyParameterizedValue,
-
     /// Different batched leaves disagreed on the number of lanes they carried.
     #[error("mismatched batch sizes across batched leaves")]
     MismatchedBatchSize,

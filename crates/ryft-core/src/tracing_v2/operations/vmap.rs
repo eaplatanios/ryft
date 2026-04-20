@@ -247,9 +247,19 @@ where
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
+        if inputs.is_empty() {
+            return if self.body.total_output_count() == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(TracingError::HigherOrderOpFailure {
+                    op: "vmap",
+                    message: "traced vmap requires at least one input leaf to recover the staging context".to_string(),
+                })
+            };
+        }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let exemplar_primal_input = primal_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
-        let linear_builder = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.tangent.builder.clone();
+        let exemplar_primal_input = primal_inputs[0].clone();
+        let linear_builder = inputs[0].tangent.builder.clone();
         let primal_outputs = Tracer::apply_staged_op(
             exemplar_primal_input.engine,
             exemplar_primal_input.builder.clone(),
@@ -351,7 +361,17 @@ where
         let primal_outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
         let lane_input_count = self.body.input_types().len();
         let lane_primals = primal_inputs.iter().take(lane_input_count).cloned().collect::<Vec<_>>();
-        let tangent_builder = tangent_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone();
+        let tangent_builder = if let Some(first_tangent) = tangent_inputs.first() {
+            first_tangent.builder.clone()
+        } else if self.body.total_output_count() == 0 {
+            return Ok(Vec::new());
+        } else {
+            return Err(TracingError::HigherOrderOpFailure {
+                op: "vmap",
+                message: "linear vmap replay requires at least one tangent leaf to recover the staging context"
+                    .to_string(),
+            });
+        };
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_builder,
             tangent_inputs.as_slice(),
@@ -378,7 +398,17 @@ where
     O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
-        let exemplar_input = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        if inputs.is_empty() {
+            return if self.body.total_output_count() == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(TracingError::HigherOrderOpFailure {
+                    op: "vmap",
+                    message: "traced vmap requires at least one input leaf to recover the staging context".to_string(),
+                })
+            };
+        }
+        let exemplar_input = inputs[0].clone();
         Tracer::apply_staged_op(exemplar_input.engine, exemplar_input.builder.clone(), inputs, O::vmap_op(self.clone()))
     }
 }
@@ -473,7 +503,19 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearVMapOperat
             });
         }
         let transpose = self.transpose_op();
-        let exemplar_output_cotangent = output_cotangents.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        if output_cotangents.is_empty() {
+            return if self.body.total_input_count() == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(TracingError::HigherOrderOpFailure {
+                    op: "vmap",
+                    message:
+                        "linear vmap transpose requires at least one output cotangent leaf to recover the staging context"
+                            .to_string(),
+                })
+            };
+        }
+        let exemplar_output_cotangent = output_cotangents[0].clone();
         Ok(LinearTerm::apply_staged_op(
             exemplar_output_cotangent.builder.clone(),
             output_cotangents,

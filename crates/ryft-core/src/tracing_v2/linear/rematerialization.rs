@@ -35,6 +35,13 @@ where
         _engine,
         |primals: Input::To<Tracer<'engine, E>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
+            if traced_primals.is_empty() {
+                return Err(TracingError::HigherOrderOpFailure {
+                    op: "compile_grad",
+                    message: "traced compiled gradients require at least one input leaf to recover the staging context"
+                        .to_string(),
+                });
+            }
             let staged_input_types = Input::To::<ArrayType>::from_parameters(
                 input_structure.clone(),
                 traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
@@ -52,7 +59,7 @@ where
             let (_, traced_gradient) =
                 reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
                     _engine,
-                    traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone(),
+                    traced_primals[0].builder.clone(),
                     &traced_program,
                     traced_primals,
                 )?;
@@ -177,6 +184,13 @@ where
         engine,
         |primals: Input::To<Tracer<'engine, E>>| {
             let traced_primals = primals.into_parameters().collect::<Vec<_>>();
+            if traced_primals.is_empty() {
+                return Err(TracingError::HigherOrderOpFailure {
+                    op: "compile_grad",
+                    message: "traced compiled gradients require at least one input leaf to recover the staging context"
+                        .to_string(),
+                });
+            }
 
             // Step 1: Trace the function at the base V level to get a program.
             let staged_input_types = Input::To::<ArrayType>::from_parameters(
@@ -207,7 +221,7 @@ where
             let (_, traced_gradient) =
                 reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
                     engine,
-                    traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone(),
+                    traced_primals[0].builder.clone(),
                     &segmented_program,
                     traced_primals,
                 )?;

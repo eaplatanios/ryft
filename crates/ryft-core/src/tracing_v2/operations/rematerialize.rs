@@ -202,9 +202,20 @@ where
         &self,
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
+        if inputs.is_empty() {
+            return if self.body.output_types().is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(TracingError::HigherOrderOpFailure {
+                    op: "rematerialize",
+                    message: "traced rematerialize requires at least one input leaf to recover the staging context"
+                        .to_string(),
+                })
+            };
+        }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let exemplar_primal_input = primal_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
-        let linear_builder = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.tangent.builder.clone();
+        let exemplar_primal_input = primal_inputs[0].clone();
+        let linear_builder = inputs[0].tangent.builder.clone();
         let primal_outputs = Tracer::apply_staged_op(
             exemplar_primal_input.engine,
             exemplar_primal_input.builder.clone(),
@@ -299,7 +310,18 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
-        let tangent_builder = tangent_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone();
+        let tangent_builder = if let Some(first_tangent) = tangent_inputs.first() {
+            first_tangent.builder.clone()
+        } else if self.body.output_types.is_empty() {
+            return Ok(Vec::new());
+        } else {
+            return Err(TracingError::HigherOrderOpFailure {
+                op: "rematerialize",
+                message:
+                    "linear rematerialize replay requires at least one tangent leaf to recover the staging context"
+                        .to_string(),
+            });
+        };
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_builder,
             tangent_inputs.as_slice(),
@@ -330,7 +352,18 @@ where
     O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
-        let exemplar_input = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        if inputs.is_empty() {
+            return if self.body.output_types().is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(TracingError::HigherOrderOpFailure {
+                    op: "rematerialize",
+                    message: "traced rematerialize requires at least one input leaf to recover the staging context"
+                        .to_string(),
+                })
+            };
+        }
+        let exemplar_input = inputs[0].clone();
         Tracer::apply_staged_op(
             exemplar_input.engine,
             exemplar_input.builder.clone(),
@@ -424,7 +457,19 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerial
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         let transpose = self.transpose_op();
-        let exemplar_output_cotangent = output_cotangents.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        if output_cotangents.is_empty() {
+            return if self.body.input_types().is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(TracingError::HigherOrderOpFailure {
+                    op: "rematerialize",
+                    message:
+                        "linear rematerialize transpose requires at least one output cotangent leaf to recover the staging context"
+                            .to_string(),
+                })
+            };
+        }
+        let exemplar_output_cotangent = output_cotangents[0].clone();
         Ok(LinearTerm::apply_staged_op(
             exemplar_output_cotangent.builder.clone(),
             output_cotangents,
@@ -574,7 +619,13 @@ where
             input_structure.clone(),
             traced_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let exemplar_traced_input = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        let Some(exemplar_traced_input) = traced_inputs.first().cloned() else {
+            return Err(TracingError::HigherOrderOpFailure {
+                op: "rematerialize",
+                message: "traced rematerialize requires at least one input leaf to recover the staging context"
+                    .to_string(),
+            });
+        };
         let (exemplar_output_types, body_program) =
             trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
                 exemplar_traced_input.engine,
