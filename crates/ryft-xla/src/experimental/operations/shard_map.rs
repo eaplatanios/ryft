@@ -1131,11 +1131,15 @@ fn try_transpose_traced_shard_map_body<
     ),
     TracingError,
 > {
+    let tracing_builder = primals.first().map(|primal| primal.builder.clone());
     let (outputs, pushforward) = try_linearize_traced_shard_map_body(function, primals)?;
-    let pullback = ryft_core::tracing_v2::linear::transpose_traced_linear_program_with_output_examples(
+    let tracing_builder = tracing_builder
+        .or_else(|| outputs.first().map(|output| output.builder.clone()))
+        .ok_or(TracingError::EmptyParameterizedValue)?;
+    let pullback = ryft_core::tracing_v2::linear::transpose_traced_linear_program(
         XlaEngine::token(),
+        tracing_builder,
         &pushforward,
-        outputs.as_slice(),
     )?;
     Ok((outputs, pullback))
 }

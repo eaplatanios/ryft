@@ -48,7 +48,7 @@ mod term;
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 pub use program::transpose_linear_program;
 pub use program::transpose_linear_program_with_output_examples;
-pub use program::transpose_traced_linear_program_with_output_examples;
+pub use program::transpose_traced_linear_program;
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
 pub use reverse::{grad, jvp_program, value_and_grad, vjp};
 pub use term::{LinearTerm, Linearized};
@@ -120,6 +120,7 @@ where
 /// output and the traced gradient leaves.
 fn reverse_mode_scalar_traced_program<'engine, V, O, L, E>(
     engine: &'engine E,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
     traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     traced_primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
@@ -134,12 +135,13 @@ where
         >,
     LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
-    let (outputs, pushforward) = linearize_traced_program::<V, O, L, E>(traced_program, traced_primals)?;
+    let (outputs, pushforward) =
+        linearize_traced_program::<V, O, L, E>(engine, tracing_builder, traced_program, traced_primals)?;
     if outputs.len() != 1 {
         return Err(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
     }
     let traced_output = outputs[0].clone();
-    let pullback = transpose_traced_linear_program_with_output_examples(engine, &pushforward, outputs.as_slice())?;
+    let pullback = transpose_traced_linear_program(engine, traced_output.builder.clone(), &pushforward)?;
     let traced_gradient = pullback.interpret(vec![traced_output.one_like()])?;
     Ok((traced_output, traced_gradient))
 }

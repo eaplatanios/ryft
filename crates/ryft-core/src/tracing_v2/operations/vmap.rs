@@ -249,6 +249,7 @@ where
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let exemplar_primal_input = primal_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
+        let linear_builder = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.tangent.builder.clone();
         let primal_outputs = Tracer::apply_staged_op(
             exemplar_primal_input.engine,
             exemplar_primal_input.builder.clone(),
@@ -259,7 +260,13 @@ where
         let mut tangent_outputs = Vec::with_capacity(self.body().total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
             let lane_program = self.body().program();
-            let lane_outputs = replay_program_linearized_jit::<_, _, _, O, L, E>(&lane_program, lane_inputs.to_vec())?;
+            let lane_outputs = replay_program_linearized_jit::<_, _, _, O, L, E>(
+                exemplar_primal_input.engine,
+                exemplar_primal_input.builder.clone(),
+                linear_builder.clone(),
+                &lane_program,
+                lane_inputs.to_vec(),
+            )?;
             tangent_outputs.extend(lane_outputs.into_iter().map(|output| output.tangent));
         }
         Ok(primal_outputs

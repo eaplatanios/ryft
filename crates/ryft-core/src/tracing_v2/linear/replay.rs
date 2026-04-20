@@ -23,7 +23,7 @@ where
     V: Traceable<ArrayType>,
     O: Clone + Operation<ArrayType>,
     R: Clone,
-    LiftConstant: Fn(&V, &[R]) -> Result<R, TracingError>,
+    LiftConstant: Fn(&V) -> Result<R, TracingError>,
     ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TracingError>,
 {
     let mut values = vec![None; program.atoms.len()];
@@ -46,11 +46,7 @@ where
         let atom = &program.atoms[atom_index];
         match atom {
             Atom::Constant(value) => {
-                let seed_inputs = inputs.iter().cloned().chain(values.iter().flatten().cloned()).collect::<Vec<_>>();
-                if seed_inputs.is_empty() {
-                    return Err(TracingError::EmptyParameterizedValue);
-                }
-                values[atom_index] = Some(lift_constant(value, seed_inputs.as_slice())?);
+                values[atom_index] = Some(lift_constant(value)?);
             }
             Atom::Variable(_) if input_atom_flags[atom_index] => {}
             Atom::Variable(_) => {
@@ -83,6 +79,11 @@ where
 /// This is the key helper that lets higher-order transforms symbolically replay an already-traced
 /// body while preserving both its primal outputs and its staged tangent propagation.
 pub(crate) fn replay_program_linearized_jit<'engine, ProgramInput, ProgramOutput, V, O, L, E>(
+    engine: &'engine E,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
+    linear_builder: Rc<
+        RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>>,
+    >,
     program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     inputs: Vec<LinearizedTracedValue<'engine, E>>,
 ) -> Result<Vec<LinearizedTracedValue<'engine, E>>, TracingError>
@@ -94,9 +95,18 @@ where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     O: InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>> + Clone + 'static,
 {
-    replay_program_with(program, inputs, super::program::lift_linearized_traced_constant::<V, O, L, E>, |op, values| {
-        InterpretableOperation::<ArrayType, LinearizedTracedValue<'engine, E>>::interpret(op, &values)
-    })
+    replay_program_with(
+        program,
+        inputs,
+        |constant| {
+            let primal_atom = tracing_builder.borrow_mut().add_constant(constant.clone());
+            let primal = Tracer::from_engine(primal_atom, tracing_builder.clone(), engine);
+            let tangent_atom = linear_builder.borrow_mut().add_constant(primal.zero_like());
+            let tangent = LinearTerm::from_staged_parts(tangent_atom, linear_builder.clone());
+            Ok(Linearized { primal, tangent })
+        },
+        |op, values| InterpretableOperation::<ArrayType, LinearizedTracedValue<'engine, E>>::interpret(op, &values),
+    )
 }
 
 /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
@@ -106,6 +116,8 @@ where
 /// linear program immediately, it works inside an outer JIT trace and stages the resulting
 /// pushforward symbolically.
 pub(crate) fn linearize_traced_program<'engine, V, O, L, E>(
+    engine: &'engine E,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TracingError>
@@ -129,7 +141,13 @@ where
             Linearized { primal, tangent: LinearTerm::from_staged_parts(atom, builder.clone()) }
         })
         .collect::<Vec<_>>();
-    let traced_output = replay_program_linearized_jit::<_, _, _, O, L, E>(program, traced_input)?;
+    let traced_output = replay_program_linearized_jit::<_, _, _, O, L, E>(
+        engine,
+        tracing_builder,
+        builder.clone(),
+        program,
+        traced_input,
+    )?;
     let primal_outputs = traced_output.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
     let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
     drop(traced_output);

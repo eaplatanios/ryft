@@ -49,12 +49,13 @@ where
                     E,
                     _,
                 >(_engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
-            let (_, traced_gradient) = reverse_mode_scalar_traced_program::<
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-            >(_engine, &traced_program, traced_primals)?;
+            let (_, traced_gradient) =
+                reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
+                    _engine,
+                    traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone(),
+                    &traced_program,
+                    traced_primals,
+                )?;
             Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), traced_gradient)
                 .map_err(TracingError::from)
         },
@@ -203,12 +204,13 @@ where
             // `linearize_traced_program` replays the program at the Tracer level (staging
             // both forward and backward instructions in the outer JIT builder) and returns the
             // primal outputs alongside the linear pushforward map.
-            let (_, traced_gradient) = reverse_mode_scalar_traced_program::<
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-            >(engine, &segmented_program, traced_primals)?;
+            let (_, traced_gradient) =
+                reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
+                    engine,
+                    traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone(),
+                    &segmented_program,
+                    traced_primals,
+                )?;
             Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), traced_gradient)
                 .map_err(TracingError::from)
         },

@@ -304,16 +304,17 @@ where
     )
 }
 
-/// Transposes a traced linear program using traced output examples to seed the cotangent inputs.
+/// Transposes a traced linear program using an explicit outer tracing builder.
 ///
-/// This variant is the traced analogue of [`transpose_linear_program_with_output_examples`]. It
-/// uses `engine` plus one of the traced output examples to synthesize new zero tracers for
-/// disconnected primal inputs without storing backend state on the linear program itself.
+/// This is the traced analogue of [`transpose_linear_program`]. The transpose program itself is
+/// still staged in a fresh linear-program builder, but disconnected primal inputs need zero
+/// cotangents represented as traced leaves in the enclosing outer trace. `tracing_builder` is that
+/// outer traced-program builder.
 #[allow(private_bounds)]
-pub fn transpose_traced_linear_program_with_output_examples<'engine, Input, Output, V, O, E>(
+pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E>(
     engine: &'engine E,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::TracingOperation>>>,
     program: &Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
-    output_examples: &[Tracer<'engine, E>],
 ) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Output, Input>, TracingError>
 where
     V: Traceable<ArrayType>,
@@ -322,55 +323,15 @@ where
     O: CoreLinearProgramOperation<Tracer<'engine, E>> + LinearAddOperation<ArrayType, Tracer<'engine, E>> + Clone,
     E: Engine<Type = ArrayType, Value = V, TracingOperation: Operation<ArrayType>> + ?Sized + 'static,
 {
-    let expected_output_count = program.output_ids.len();
-    if output_examples.len() != expected_output_count {
-        return Err(TracingError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
-    }
     transpose_linear_program_with_factories(
         program,
-        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, _, output_index| {
-            Ok(builder.borrow_mut().add_input(output_examples[output_index].r#type().into_owned()))
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, output_type, _| {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
         },
         |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, input_type| {
-            let exemplar = output_examples.first().ok_or(TracingError::EmptyParameterizedValue)?;
-            let zero_atom = exemplar.builder.borrow_mut().add_constant(engine.zero(input_type));
-            let zero_tracer = Tracer::from_engine(zero_atom, exemplar.builder.clone(), engine);
+            let zero_atom = tracing_builder.borrow_mut().add_constant(engine.zero(input_type));
+            let zero_tracer = Tracer::from_engine(zero_atom, tracing_builder.clone(), engine);
             Ok(builder.borrow_mut().add_constant(zero_tracer))
         },
     )
-}
-
-fn lift_traced_constant<'engine, V, O: Clone + Operation<ArrayType>, L: Clone, E>(
-    constant: &V,
-    inputs: &[Tracer<'engine, E>],
-) -> Result<Tracer<'engine, E>, TracingError>
-where
-    V: Traceable<ArrayType>,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-{
-    let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
-    let builder = exemplar.builder.clone();
-    let atom = builder.borrow_mut().add_constant(constant.clone());
-    Ok(Tracer::from_engine(atom, builder, exemplar.engine))
-}
-
-pub(crate) fn lift_linearized_traced_constant<
-    'engine,
-    V,
-    O: Clone + Operation<ArrayType> + 'static,
-    L: Clone + Operation<ArrayType> + 'static,
-    E,
->(
-    constant: &V,
-    inputs: &[LinearizedTracedValue<'engine, E>],
-) -> Result<LinearizedTracedValue<'engine, E>, TracingError>
-where
-    V: Traceable<ArrayType> + ZeroLike,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-{
-    let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
-    let primal = lift_traced_constant::<V, O, L, E>(constant, std::slice::from_ref(&exemplar.primal))?;
-    let tangent_atom = exemplar.tangent.builder.borrow_mut().add_constant(primal.zero_like());
-    let tangent = LinearTerm::from_staged_parts(tangent_atom, exemplar.tangent.builder.clone());
-    Ok(Linearized { primal, tangent })
 }

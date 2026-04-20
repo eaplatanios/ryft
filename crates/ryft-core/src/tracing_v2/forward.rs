@@ -11,7 +11,9 @@
 
 use std::{
     borrow::Cow,
+    cell::RefCell,
     ops::{Add, Mul, Neg},
+    rc::Rc,
 };
 
 use ryft_macros::Parameter;
@@ -19,7 +21,7 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        LinearPrimitiveOperation, Program, Traceable, TracingError, Value, ZeroLike,
+        LinearPrimitiveOperation, Program, ProgramBuilder, Traceable, TracingError, Value, ZeroLike,
         batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
@@ -537,46 +539,62 @@ where
         let combined_input_count = input_parameter_count * 2;
         let combined_output_count = output_parameter_count * 2;
 
-        let (_, compiled_jvp): (Vec<V>, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>) =
-            interpret_and_trace(
-                erased_engine,
-                |jit_combined: Vec<
-                    Tracer<'engine, dyn Engine<
-                                Type = ArrayType,
-                                Value = V,
-                                TracingOperation = E::TracingOperation,
-                                LinearOperation = E::LinearOperation,
-                            >>,
-                >| {
-                    let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
+        let combined_input_0 = {
+            let mut combined = Vec::with_capacity(combined_input_count);
+            combined.extend(lane_primals[0].clone().into_parameters());
+            combined.extend(lane_tangents[0].clone().into_parameters());
+            combined
+        };
+        let compiled_jvp_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::TracingOperation>::new()));
+        let compiled_jvp_output_atoms = {
+            let jit_combined = combined_input_0
+                .iter()
+                .map(|value| {
+                    let atom = compiled_jvp_builder.borrow_mut().add_input(value.r#type().into_owned());
+                    Tracer::from_engine(atom, compiled_jvp_builder.clone(), erased_engine)
+                })
+                .collect::<Vec<_>>();
+            let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);
 
-                    // Replay the forward pass symbolically and linearize at the symbolic primals.
-                    let (primal_outputs, pushforward) = linearize_traced_program::<
-                        V,
-                        E::TracingOperation,
-                        E::LinearOperation,
-                        dyn Engine<
-                                Type = ArrayType,
-                                Value = V,
-                                TracingOperation = E::TracingOperation,
-                                LinearOperation = E::LinearOperation,
-                            >>(&flat_program, jit_primals.to_vec())?;
+            // Replay the forward pass symbolically and linearize at the symbolic primals.
+            let (primal_outputs, pushforward) = linearize_traced_program::<
+                V,
+                E::TracingOperation,
+                E::LinearOperation,
+                dyn Engine<
+                        Type = ArrayType,
+                        Value = V,
+                        TracingOperation = E::TracingOperation,
+                        LinearOperation = E::LinearOperation,
+                    >,
+            >(erased_engine, compiled_jvp_builder.clone(), &flat_program, jit_primals.to_vec())?;
 
-                    // Apply the pushforward to the symbolic tangents.
-                    let tangent_outputs = pushforward.interpret(jit_tangents.to_vec())?;
+            // Apply the pushforward to the symbolic tangents.
+            let tangent_outputs = pushforward.interpret(jit_tangents.to_vec())?;
 
-                    let mut result = Vec::with_capacity(combined_output_count);
-                    result.extend(primal_outputs);
-                    result.extend(tangent_outputs);
-                    Ok(result)
-                },
-                {
-                    let mut combined = Vec::with_capacity(combined_input_count);
-                    combined.extend(lane_primals[0].clone().into_parameters());
-                    combined.extend(lane_tangents[0].clone().into_parameters());
-                    combined
-                },
-            )?;
+            let mut compiled_jvp_outputs = Vec::with_capacity(combined_output_count);
+            compiled_jvp_outputs.extend(primal_outputs);
+            compiled_jvp_outputs.extend(tangent_outputs);
+            compiled_jvp_outputs.into_iter().map(|output| output.atom).collect::<Vec<_>>()
+        };
+        if let Some(tracing_error) = compiled_jvp_builder.borrow_mut().error.take() {
+            return Err(tracing_error);
+        }
+        let compiled_jvp_builder = match Rc::try_unwrap(compiled_jvp_builder) {
+            Ok(compiled_jvp_builder) => compiled_jvp_builder.into_inner(),
+            Err(_) => {
+                return Err(TracingError::InternalInvariantViolation("batched jvp builder escaped the tracing scope"));
+            }
+        };
+        let compiled_jvp = compiled_jvp_builder
+            .build::<Vec<V>, Vec<V>>(
+                compiled_jvp_output_atoms,
+                vec![Placeholder; combined_input_count],
+                vec![Placeholder; combined_output_count],
+            )
+            .with_folded_constants()?
+            .simplified()?;
 
         // Apply per-lane and split into (primal_output, tangent_output).
         let mut lane_primal_outputs = Vec::with_capacity(lane_primals.len());

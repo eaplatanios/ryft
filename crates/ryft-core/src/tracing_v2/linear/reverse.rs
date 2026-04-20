@@ -102,7 +102,14 @@ where
             staged_input_types,
         )?;
     let output_structure = primal_output_types.parameter_structure();
-    let (traced_primal_output, pushforward) = linearize_traced_program::<V, O, L, E>(&traced_program, traced_primals)?;
+    let exemplar_traced_primal = traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?;
+    let tracing_builder = exemplar_traced_primal.builder.clone();
+    let (traced_primal_output, pushforward) = linearize_traced_program::<V, O, L, E>(
+        exemplar_traced_primal.engine,
+        tracing_builder,
+        &traced_program,
+        traced_primals,
+    )?;
     let traced_tangent_output = pushforward.interpret(traced_tangents)?;
     Ok((
         Output::from_parameters(output_structure.clone(), traced_primal_output)?,
@@ -284,6 +291,7 @@ where
         let (traced_output, traced_gradient) =
             reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
                 traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.engine,
+                traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.builder.clone(),
                 &traced_program,
                 traced_primals,
             )?;
@@ -503,6 +511,11 @@ where
                                 LinearOperation = E::LinearOperation,
                             >>,
                 >| {
+                    let tracing_builder = jit_primals
+                        .first()
+                        .ok_or(TracingError::EmptyParameterizedValue)?
+                        .builder
+                        .clone();
                     let (output, gradient) = reverse_mode_scalar_traced_program::<
                         V,
                         E::TracingOperation,
@@ -512,7 +525,7 @@ where
                                 Value = V,
                                 TracingOperation = E::TracingOperation,
                                 LinearOperation = E::LinearOperation,
-                            >>(erased_engine, &flat_program, jit_primals)?;
+                            >>(erased_engine, tracing_builder, &flat_program, jit_primals)?;
                     let mut result = Vec::with_capacity(1 + gradient.len());
                     result.push(output);
                     result.extend(gradient);
