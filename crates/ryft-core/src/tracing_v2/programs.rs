@@ -6,6 +6,7 @@
 //! [`Program::interpret`], or linearizing a primal program into a [`LinearProgram`](crate::tracing_v2::LinearProgram),
 //! we keep coming back to the same core pieces:
 //!
+//! - [`Traceable`] and [`Value`] define which leaf values can participate in staged programs.
 //! - [`Atom`] values describe the leaves of the staged program.
 //! - [`Instruction`] values connect atoms through concrete operation objects.
 //! - [`ProgramBuilder`] incrementally stages those instructions while keeping variable atoms purely
@@ -16,15 +17,107 @@
 //! The generic parameters stay intentionally open so that the same IR can represent both ordinary
 //! programs and tangent/cotangent programs over backend-specific op carriers.
 
-use std::{borrow::Cow, collections::HashMap, fmt::Display, marker::PhantomData};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt::{Debug, Display},
+    marker::PhantomData,
+};
 
 use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{InterpretableOperation, Operation, Traceable, TracingError},
-    types::{Type, Typed},
+    tracing_v2::{TracingError, operations::InterpretableOperation},
+    types::{ArrayType, Type, Typed},
 };
+
+/// Marker trait that identifies concrete, non-tracer leaves.
+///
+/// [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real data, such as
+/// scalars, dense arrays, and backend-backed tensors. Tracing wrappers such as
+/// [`Tracer`](crate::tracing_v2::Tracer) must not implement this trait.
+///
+/// The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket
+/// impls apart. Each composable transform such as `jvp`, `grad`, and `vmap` provides:
+///
+/// 1. an impl for `V: Value<T>` that evaluates the transform on concrete data, and
+/// 2. an impl for `Tracer<V>` that stages the transform into the enclosing traced program.
+///
+/// Because `Tracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
+pub trait Value<T: Type>: Traceable<T> {}
+
+/// Base trait for any leaf type that can participate in traced computations.
+///
+/// [`Traceable`] is implemented by every type that can appear as a leaf in a staged program: both
+/// concrete data types such as `f32`, `f64`, and backend arrays, and tracing wrappers such as
+/// [`Tracer`](crate::tracing_v2::Tracer). It ties each leaf to a type descriptor `T` via
+/// [`Typed`], while deliberately not implying eager numeric operations such as
+/// [`Sin`](crate::tracing_v2::Sin) or differentiation-specific capabilities such as
+/// [`crate::tracing_v2::ZeroLike`]. Those requirements live on the primitive operations and
+/// transforms that actually need them.
+///
+/// The type parameter `T` determines the abstract metadata used to describe leaf shapes and element
+/// types. The primary instantiation is [`ArrayType`](crate::types::ArrayType), used throughout the
+/// core tracing infrastructure.
+///
+/// Concrete leaves that support exact algebraic identity detection should override
+/// [`Traceable::is_zero`] and [`Traceable::is_one`]. The default implementations return `false`,
+/// which keeps purely abstract or traced leaves valid while opting them out of
+/// constant-identity simplification.
+///
+/// [`Traceable`] itself does not require `'static`. Borrowed leaf wrappers such as
+/// [`Tracer`](crate::tracing_v2::Tracer) are therefore free to model real engine borrows
+/// explicitly. Individual APIs that store traceable values behind [`Any`](std::any::Any), inside
+/// long-lived registries, or in staged artifacts that intentionally escape the current scope should
+/// add `'static` at those specific seams instead of imposing it on every traceable leaf globally.
+///
+/// # Implementing [`Traceable`] for new leaf types
+///
+/// Most concrete runtime values should still own their data:
+///
+/// - Small [`Copy`] scalars (`f32`, `i32`, `half::bf16`, ...) can implement [`Traceable`] directly,
+///   as the built-in scalar impls illustrate.
+/// - Heavier payloads (array buffers, tensors, device allocations) should typically wrap the
+///   underlying handle in [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded
+///   cases) so the leaf stays cheaply cloneable.
+///
+/// Borrowing leaf types is still valid when the borrow is semantically tied to the surrounding
+/// tracing scope; they simply cannot be stored in APIs that later add a `'static` requirement.
+///
+/// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing
+/// wrappers.
+pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
+    /// Returns `true` if every element of this value is exactly zero.
+    ///
+    /// The program builder calls this on constant atoms during
+    /// [`Operation::try_simplify`](crate::tracing_v2::Operation::try_simplify) to detect and
+    /// eliminate algebraic identities at staging time, for example folding `x + 0` into `x` or
+    /// `x * 0` into `0` without emitting the operation into the staged program.
+    ///
+    /// The default returns `false`, which is always safe: it simply opts the value out of
+    /// identity-based simplification. Concrete leaf types that can inspect their contents should
+    /// override this to return an accurate answer. Tracing wrappers like
+    /// [`Tracer`](crate::tracing_v2::Tracer) cannot meaningfully inspect their contents at staging
+    /// time and therefore keep the default.
+    #[inline]
+    fn is_zero(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` if every element of this value is exactly one.
+    ///
+    /// This is the multiplicative-identity counterpart of [`Traceable::is_zero`]. The program
+    /// builder uses it during [`Operation::try_simplify`](crate::tracing_v2::Operation::try_simplify)
+    /// to fold operations like `x * 1` into `x` or `scale(x, 1)` into `x`.
+    ///
+    /// The same defaulting rationale applies: `false` is always safe, and only concrete leaf types
+    /// that can inspect their contents should override this.
+    #[inline]
+    fn is_one(&self) -> bool {
+        false
+    }
+}
 
 /// Staged atom carrying abstract metadata.
 ///
@@ -85,6 +178,40 @@ pub struct AtomId {
 impl Display for AtomId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.index)
+    }
+}
+
+/// Shape-level operation interface for staged programs.
+///
+/// This trait covers the metadata surface needed for program construction, display, simplification,
+/// and backend lowering. Concrete execution is provided by the separate
+/// [`InterpretableOperation`] trait. Staged-program differentiation rules are split between
+/// [`crate::tracing_v2::LinearOperation`] (transpose/replay) and
+/// [`crate::tracing_v2::DifferentiableOperation`] (forward-mode JVP).
+///
+/// The type parameter `T` determines which abstract type descriptor is used for shape-level
+/// reasoning. The default is [`ArrayType`], which covers the entire core tracing infrastructure.
+/// Future instantiations with different type descriptors can reuse the same trait without
+/// modifying existing implementations.
+pub trait Operation<T: Type = ArrayType>: Debug + Display {
+    /// Returns the stable primitive name used in diagnostics and pretty-printing.
+    fn name(&self) -> &'static str;
+
+    /// Computes abstract output types from abstract input types without executing the operation.
+    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TracingError>;
+
+    /// Returns simplified output atoms if this operation is a trivial algebraic identity.
+    ///
+    /// Called during program construction to eliminate no-op operations like `x + 0`, `x * 1`, or
+    /// `scale(x, 1)`. The callbacks check whether an input atom is a constant zero or one. Returns
+    /// [`None`] if no simplification applies.
+    fn try_simplify(
+        &self,
+        _inputs: &[AtomId],
+        _is_zero_constant: &dyn Fn(AtomId) -> bool,
+        _is_one_constant: &dyn Fn(AtomId) -> bool,
+    ) -> Option<Vec<AtomId>> {
+        None
     }
 }
 

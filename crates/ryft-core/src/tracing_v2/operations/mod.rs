@@ -1,6 +1,6 @@
 //! Concrete staged operations and core operation traits for [`crate::tracing_v2`].
 //!
-//! This module owns the operation universe used by `tracing_v2`. It bundles three layers:
+//! This module owns the concrete operation universe used by `tracing_v2`. It bundles three layers:
 //!
 //! - **Core traits** ([`Operation`], [`InterpretableOperation`], [`LinearOperation`], [`DifferentiableOperation`],
 //!   [`VectorizableOperation`]) Ã¢â‚¬â€ the operation-neutral dispatch interfaces every staged primitive must
@@ -45,14 +45,10 @@
 //! capability traits that live next to each operation (for example, `add::AddTracingOperation`
 //! and `mul::MulTracingOperation`), and transform code should bound itself on the concrete
 //! engine-selected carrier or on the specific per-op capability traits it actually exercises Ã¢â‚¬â€
-//! never on a catch-all faÃƒÂ§ade. The [`TracingOperation`] and [`LinearProgramOperation`] bundles defined
-//! in this module are additive aliases used only to name the bundle locally; they are not an
-//! extension point and should not grow new "is-supported" requirements.
+//! never on a catch-all faÃƒÆ’Ã‚Â§ade. When a path needs several capabilities, spell those concrete
+//! supertraits directly at that boundary instead of hiding them behind another additive bundle trait.
 
-use std::{
-    fmt::{Debug, Display},
-    sync::Arc,
-};
+use std::{fmt::Display, sync::Arc};
 
 use crate::{
     macros::check_input_count,
@@ -112,6 +108,7 @@ pub mod sin;
 /// Traced `vmap` operations.
 pub mod vmap;
 
+pub use crate::tracing_v2::programs::Operation;
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
 pub use cos::{Cos, CosOperation, CosTracingOperation};
 pub use custom::{
@@ -153,37 +150,6 @@ pub fn lift_jit_constant<
 pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TracingError> {
     check_input_count!(inputs, 1);
     Ok(inputs[0].clone())
-}
-
-/// Shape-level operation interface for staged programs.
-///
-/// This trait covers the metadata surface needed for program construction, display, simplification, and MLIR lowering.
-/// Concrete execution is provided by the separate [`InterpretableOperation`] trait. Staged-program differentiation rules
-/// are split between [`LinearOperation`] (transpose/replay) and [`DifferentiableOperation`] (forward-mode JVP).
-///
-/// The type parameter `T` determines which abstract type descriptor is used for shape-level reasoning. The default
-/// is [`ArrayType`], which covers the entire core tracing infrastructure. Future instantiations with different type
-/// descriptors can reuse the same trait without modifying existing implementations.
-pub trait Operation<T: Type = ArrayType>: Debug + Display {
-    /// Returns the stable primitive name used in diagnostics and pretty-printing.
-    fn name(&self) -> &'static str;
-
-    /// Computes abstract output types from abstract input types without executing the operation.
-    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TracingError>;
-
-    /// Returns simplified output atoms if this operation is a trivial algebraic identity.
-    ///
-    /// Called during program construction to eliminate no-op operations like `x + 0`, `x * 1`,
-    /// or `scale(x, 1)`. The callbacks check whether an input atom is a constant zero or one.
-    /// Returns `None` if no simplification applies.
-    fn try_simplify(
-        &self,
-        _inputs: &[AtomId],
-        _is_zero_constant: &dyn Fn(AtomId) -> bool,
-        _is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        None
-    }
 }
 
 /// Concrete execution capability for staged operations.
@@ -320,65 +286,18 @@ pub trait VectorizableOperation<T: Type, V: Typed<T>>: Operation<T> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError>;
 }
 
-/// Capability bundle for the ordinary staged operation type stored in traced programs.
-///
-/// A [`TracingOperation`] is the operation flavor carried by the ordinary staged program produced by
-/// transforms like [`interpret_and_trace`](crate::tracing_v2::interpret_and_trace) and
-/// [`trace`](crate::tracing_v2::trace). In practice this is
-/// usually one backend-owned closed
-/// enum such as [`PrimitiveOperation`] or `XlaPrimitiveOperation`, but the trait is written as an additive bundle
-/// so any type that provides the same capabilities can serve as the carrier.
-///
-/// The required capabilities are exactly what replaying and transforming an ordinary staged
-/// program need:
-///
-/// - [`Operation`] for abstract evaluation and shape-level reasoning,
-/// - [`InterpretableOperation`] for concrete replay on example values, and
-/// - [`DifferentiableOperation`] for linearization/JVP construction.
-///
-/// Any op type that already implements those supertraits automatically implements
-/// [`TracingOperation`] via the blanket impl below. The trait exists so that downstream code can
-/// talk about "the ordinary staged operation type" in one place instead of repeating the full
-/// bundle at every boundary.
-///
-/// [`VectorizableOperation`] is intentionally **not** part of the bundle: `batch()` is only invoked on
-/// concrete ops while `vmap` traces through a Rust closure, never on ops stored in an ordinary
-/// program, so pinning it here would unnecessarily restrict which op types can satisfy the bundle.
-pub trait TracingOperation<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone + Operation<T>>:
-    Operation<T> + InterpretableOperation<T, V> + DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L>
-{
-}
-
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone,
-    L: Clone + Operation<T>,
-    Carrier: Operation<T> + InterpretableOperation<T, V> + DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L>,
-> TracingOperation<T, V, O, L> for Carrier
-{
-}
-
-/// Capability bundle for operations that can appear in a staged linear program.
-///
-/// Like [`TracingOperation`], this is additive Ã¢â‚¬â€ any op that already satisfies the three supertraits
-/// automatically satisfies [`LinearProgramOperation`]. The bundle lists what a linear program needs from
-/// each stored op: shape metadata ([`Operation`]), concrete interpretation for replay
-/// ([`InterpretableOperation`]), and the reverse-mode transpose rule ([`LinearOperation`]).
-pub trait LinearProgramOperation<T: Type + Display, V: Traceable<T>>:
-    Clone + Operation<T> + InterpretableOperation<T, V> + LinearOperation<T, V, Self>
-{
-}
-
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + Operation<T> + InterpretableOperation<T, V> + LinearOperation<T, V, O>,
-> LinearProgramOperation<T, V> for O
-{
-}
-
 /// Default linear-op carrier capability: eager replay on concrete values.
+/// Default linear-op carrier capability: eager replay on concrete values.
+///
+/// This captures the minimum replay surface a stored linear carrier needs: shape metadata through
+/// [`Operation`] and concrete evaluation through [`InterpretableOperation`].
+///
+/// It is intentionally narrower than the ordinary staged carrier used during tracing: linear
+/// programs only need metadata reasoning plus concrete replay, not forward-mode differentiation or
+/// batching.
+///
+/// The linear-program surface consists of shape metadata through [`Operation`], concrete replay
+/// through [`InterpretableOperation`], and a separate transpose rule through [`LinearOperation`].
 pub(crate) trait CoreLinearReplayOperation<V: Traceable<ArrayType>>:
     Operation<ArrayType> + InterpretableOperation<ArrayType, V>
 where

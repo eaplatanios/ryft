@@ -31,11 +31,11 @@
 //! # Module Layout
 //!
 //! - [`operations`] defines the semantic primitive traits and the built-in operation carriers.
-//! - The internal programs module owns the staged IR itself: atoms, instructions, builders, and
-//!   executable programs.
-//! - The internal values module defines the leaf-level contracts ([`Traceable`], [`Value`],
-//!   [`ZeroLike`], [`OneLike`]) that let the same transform code work over concrete values and
-//!   tracer wrappers.
+//! - The internal programs module owns the staged IR itself and the core leaf contracts
+//!   ([`Traceable`], [`Value`]): atoms, instructions, builders, executable programs, and the traits
+//!   that tie leaf values to them.
+//! - The internal values module defines the remaining value-level identity helpers
+//!   ([`ZeroLike`], [`OneLike`]) and the built-in scalar leaf impls.
 //! - [`engine`] defines the backend token that selects op carriers and synthesizes representative
 //!   values from abstract metadata.
 //! - [`jit`](self::jit) captures ordinary staged programs from traced execution.
@@ -84,11 +84,10 @@ pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{
     Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, InterpretableOperation,
-    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, Operation, PrimitiveOperation, Sin,
-    VectorizableOperation,
+    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin, VectorizableOperation,
 };
-pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder};
-pub use values::{OneLike, Traceable, Value, ZeroLike};
+pub use programs::{Atom, AtomId, Instruction, Operation, Program, ProgramBuilder, Traceable, Value};
+pub use values::{OneLike, ZeroLike};
 
 /// Error type shared by the `tracing_v2` staging and transform pipeline.
 ///
