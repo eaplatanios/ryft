@@ -307,7 +307,7 @@ mod tests {
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
-        let input = builder.add_input(&3.0f64);
+        let input = builder.add_input(3.0f64.r#type().into_owned());
         let output = builder.add_instruction_prevalidated(
             PrimitiveOperation::Custom(Arc::new(primitive)),
             vec![input],
@@ -327,7 +327,7 @@ mod tests {
         )
         .unwrap();
         let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new();
-        let input = builder.add_input(&0.0f64);
+        let input = builder.add_input(0.0f64.r#type().into_owned());
         let output =
             builder.add_instruction_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);

@@ -773,7 +773,7 @@ fn project_flat_shard_map_program(
     let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
     let mut input_mapping = std::collections::HashMap::new();
     for atom_id in kept_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input_abstract(program.atoms[atom_id.index].r#type().into_owned());
+        let mapped_atom = builder.add_input(program.atoms[atom_id.index].r#type().into_owned());
         input_mapping.insert(atom_id, mapped_atom);
     }
 
@@ -885,11 +885,11 @@ fn build_factorized_apply_program(
     let mut replacement_inputs = std::collections::HashMap::new();
 
     for atom_id in cotangent_input_atoms.iter().copied() {
-        let mapped_atom = builder.add_input_abstract(program.atoms[atom_id.index].r#type().into_owned());
+        let mapped_atom = builder.add_input(program.atoms[atom_id.index].r#type().into_owned());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
     for atom_id in residual_atoms.iter().copied() {
-        let mapped_atom = builder.add_input_abstract(program.atoms[atom_id.index].r#type().into_owned());
+        let mapped_atom = builder.add_input(program.atoms[atom_id.index].r#type().into_owned());
         replacement_inputs.insert(atom_id, mapped_atom);
     }
 
@@ -1073,7 +1073,7 @@ fn try_linearize_traced_shard_map_body<
     let traced_input = primals
         .into_iter()
         .map(|primal| {
-            let atom = builder.borrow_mut().add_input(&primal);
+            let atom = builder.borrow_mut().add_input(primal.r#type().into_owned());
             Linearized { primal, tangent: LinearTerm::from_staged_parts(atom, builder.clone()) }
         })
         .collect::<Vec<_>>();

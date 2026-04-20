@@ -288,7 +288,7 @@ where
             .ok_or(TracingError::UnboundAtomId { id: input_atom })?
             .r#type()
             .into_owned();
-        let outer_atom = outer_builder.add_input_abstract(input_type);
+        let outer_atom = outer_builder.add_input(input_type);
         atom_mapping[input_atom.index] = Some(outer_atom);
     }
 
@@ -437,7 +437,7 @@ where
 
     let mut outer_builder: ProgramBuilder<ArrayType, V, E::TracingOperation> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> =
-        input_types.iter().cloned().map(|input_type| outer_builder.add_input_abstract(input_type)).collect();
+        input_types.iter().cloned().map(|input_type| outer_builder.add_input(input_type)).collect();
 
     let outer_outputs = outer_builder.add_instruction_prevalidated(
         E::TracingOperation::rematerialize_op(remat_op),
@@ -477,7 +477,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
             .ok_or(TracingError::UnboundAtomId { id: input_atom })?
             .r#type()
             .into_owned();
-        let sub_atom = sub_builder.add_input_abstract(input_type);
+        let sub_atom = sub_builder.add_input(input_type);
         sub_atom_mapping.insert(input_atom, sub_atom);
     }
 

@@ -5,7 +5,7 @@ use indoc::indoc;
 use crate::{
     parameters::Placeholder,
     tracing_v2::{engine::ArrayScalarEngine, *},
-    types::ArrayType,
+    types::{ArrayType, Typed},
 };
 
 pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
@@ -26,7 +26,7 @@ pub(crate) fn assert_reference_scalar_sine_jit_rendering() {
 
 pub(crate) fn assert_reference_program_rendering() {
     let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
-    let x = builder.add_input(&1.0f64);
+    let x = builder.add_input(1.0f64.r#type().into_owned());
     let three = builder.add_constant(3.0f64);
     let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
     let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);

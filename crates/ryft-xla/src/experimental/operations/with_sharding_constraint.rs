@@ -493,7 +493,7 @@ mod tests {
             ShardMapTensor,
             LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
         >::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&ShardMapTensor::new(input_type.clone()));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution =
             LinearOperation::transpose(&WithShardingConstraintOperation::new(sharding.clone()), &[output_cotangent])

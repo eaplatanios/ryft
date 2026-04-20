@@ -308,7 +308,7 @@ where
     let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
-            let atom = builder.borrow_mut().add_input_abstract(r#type);
+            let atom = builder.borrow_mut().add_input(r#type);
             Tracer::from_engine(atom, builder.clone(), engine)
         }),
     )
@@ -415,7 +415,7 @@ mod tests {
     fn jit_tracer_zero_like_adds_constant_atoms() {
         let builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
-        let atom = builder.borrow_mut().add_input(&3.0f64);
+        let atom = builder.borrow_mut().add_input(3.0f64.r#type().into_owned());
         let engine = ArrayScalarEngine::<f64>::new();
         let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, &engine);
         let zero = tracer.zero_like();

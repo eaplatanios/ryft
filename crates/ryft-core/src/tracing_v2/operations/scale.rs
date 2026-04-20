@@ -207,7 +207,7 @@ mod tests {
     fn test_scale_transpose_scales_output_cotangents() {
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&1.0f64);
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ScaleOperation::new(3.0f64)
             .transpose(&[output_cotangent])

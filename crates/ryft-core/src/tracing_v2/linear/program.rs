@@ -177,7 +177,7 @@ where
     let mut primals: Vec<Option<V>> = vec![None; program.atoms.len()];
     let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atoms.len()];
     for (input_atom, input_primal) in program.input_ids.iter().copied().zip(input_primals.into_iter()) {
-        let tangent_atom = builder.borrow_mut().add_input(&input_primal.zero_like());
+        let tangent_atom = builder.borrow_mut().add_input(input_primal.r#type().into_owned());
         tangents[input_atom.index] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
         primals[input_atom.index] = Some(input_primal);
     }
@@ -265,7 +265,7 @@ where
 {
     let zero = program.zero.zero_like();
     transpose_linear_program_with_output_inputs(program, |builder: &mut ProgramBuilder<ArrayType, V, O>, _, _| {
-        Ok(builder.add_input(&zero))
+        Ok(builder.add_input(zero.r#type().into_owned()))
     })
 }
 
@@ -383,7 +383,7 @@ where
     transpose_linear_program_with_output_inputs(
         program,
         |builder: &mut ProgramBuilder<ArrayType, V, O>, _, output_index| {
-            Ok(builder.add_input(&output_examples[output_index].zero_like()))
+            Ok(builder.add_input(output_examples[output_index].r#type().into_owned()))
         },
     )
 }

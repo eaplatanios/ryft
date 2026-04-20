@@ -126,7 +126,7 @@ where
     let traced_input = primals
         .into_iter()
         .map(|primal| {
-            let atom = builder.borrow_mut().add_input(&primal);
+            let atom = builder.borrow_mut().add_input(primal.r#type().into_owned());
             Linearized { primal, tangent: LinearTerm::from_staged_parts(atom, builder.clone()) }
         })
         .collect::<Vec<_>>();

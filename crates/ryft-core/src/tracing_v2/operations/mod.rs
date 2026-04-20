@@ -285,7 +285,7 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
 ///
 ///   let builder =
 ///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
-///   let cotangent_atom = builder.borrow_mut().add_input(&1.0f64);
+///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
 ///   let contributions = ScaleOperation::new(3.0f64).transpose(&[cotangent]).unwrap();
@@ -301,7 +301,7 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
 ///
 ///   let builder =
 ///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
-///   let cotangent_atom = builder.borrow_mut().add_input(&1.0f64);
+///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
 ///   let contributions = AddOperation.transpose(&[cotangent]).unwrap();
@@ -322,7 +322,7 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
 ///   let builder = Rc::new(RefCell::new(
 ///       ProgramBuilder::<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ArrayType, ndarray::Array2<f64>>>::new(),
 ///   ));
-///   let cotangent_atom = builder.borrow_mut().add_input(&arr2(&[[1.0, 2.0], [3.0, 4.0]]));
+///   let cotangent_atom = builder.borrow_mut().add_input(arr2(&[[1.0, 2.0], [3.0, 4.0]]).r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
 ///   let contributions = MatrixTransposeOperation.transpose(&[cotangent]).unwrap();

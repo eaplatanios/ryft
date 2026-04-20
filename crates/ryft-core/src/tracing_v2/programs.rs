@@ -8,8 +8,8 @@
 //!
 //! - [`Atom`] values describe the leaves of the staged program.
 //! - [`Instruction`] values connect atoms through concrete operation objects.
-//! - [`ProgramBuilder`] incrementally stages those instructions while optionally retaining eager
-//!   exemplars for simplification and validation.
+//! - [`ProgramBuilder`] incrementally stages those instructions while keeping variable atoms purely
+//!   type-directed.
 //! - [`Program`] is the persistent, executable artifact shared between JIT tracing, linearization,
 //!   transposition, and backend lowering.
 //!
@@ -36,9 +36,7 @@ pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant value that appears in a [`Program`].
     Constant(V),
 
-    /// Non-constant program variable carrying only its abstract type. Any builder-time exemplar
-    /// lives in the owning [`ProgramBuilder`]'s side table and is discarded when the program is
-    /// finalized.
+    /// Non-constant program variable carrying only its abstract type.
     Variable(T),
 }
 
@@ -358,7 +356,7 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
                     "staged program input atom did not retain a type",
                 ));
             };
-            let mapped = builder.add_input_abstract(r#type.clone());
+            let mapped = builder.add_input(r#type.clone());
             atom_mapping.insert(input_atom, mapped);
         }
 
@@ -449,15 +447,8 @@ impl<
 /// Builder for staged programs.
 ///
 /// [`ProgramBuilder`] is the mutable workhorse used by the tracing entry points and by the
-/// linearization helpers. It is deliberately more stateful than [`Program`]: while staging, it can
-/// retain eager exemplar values for variable atoms so that primitive applications can be
-/// validated immediately, constants can be folded, and algebraic identities can be removed before
-/// they ever enter the final IR.
-///
-/// The builder keeps one entry in [`Self::intermediates`] for every atom: `Some` for
-/// non-constant atoms whose value has been eagerly computed during staging, `None` otherwise.
-/// Those intermediates are an implementation detail of tracing and are discarded when the builder
-/// is finalized via [`Self::build`].
+/// linearization helpers. It mirrors the final [`Program`] IR closely: variable atoms retain only
+/// their abstract types, while concrete values are kept only for literal constants.
 ///
 /// During traced execution the builder also carries the first staging failure encountered in that
 /// tracing scope. This lets infallible operator syntax like `x + y` poison the shared trace and
@@ -467,9 +458,6 @@ impl<
 pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Operation<T>> {
     /// Atom table accumulated so far, including inputs, constants, and derived outputs.
     atoms: Vec<Atom<T, V>>,
-
-    /// Optional eager exemplars retained for non-constant atoms while staging.
-    intermediates: Vec<Option<V>>,
 
     /// Input atom ids in parameter order.
     input_ids: Vec<AtomId>,
@@ -484,17 +472,11 @@ pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Operation<T>> {
 impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     /// Creates an empty builder.
     ///
-    /// Fresh builders contain no atoms, instructions, or retained exemplars and are typically owned
-    /// by one tracing scope.
+    /// Fresh builders contain no atoms or instructions and are typically owned by one tracing
+    /// scope.
     #[inline]
     pub fn new() -> Self {
-        Self {
-            atoms: Vec::new(),
-            intermediates: Vec::new(),
-            input_ids: Vec::new(),
-            instructions: Vec::new(),
-            error: None,
-        }
+        Self { atoms: Vec::new(), input_ids: Vec::new(), instructions: Vec::new(), error: None }
     }
 
     /// Returns the [`Atom`] with the provided [`AtomId`] in this [`ProgramBuilder`], if one exists.
@@ -503,42 +485,16 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         self.atoms.get(id.index)
     }
 
-    /// Returns the builder-time stored exemplar associated with the provided atom, if one exists.
-    ///
-    /// For [`Atom::Constant`] this returns the retained literal value. For [`Atom::Variable`] this
-    /// returns the eagerly computed exemplar stored in the builder side table, which exists only
-    /// while the program is still being staged.
-    #[inline]
-    pub(crate) fn value(&self, id: AtomId) -> Option<&V> {
-        match self.atoms.get(id.index)? {
-            Atom::Constant(value) => Some(value),
-            Atom::Variable(_) => self.intermediates.get(id.index).and_then(Option::as_ref),
-        }
-    }
-
-    /// Adds a new input atom retaining only its abstract type, without recording any exemplar in
-    /// the builder's side table.
+    /// Adds a new input atom retaining only its abstract type.
     ///
     /// Intended for program transforms that rebuild structure without needing intermediate values
     /// (for example [`Program::simplify`]). Callers that later need a representative value for this
     /// atom should synthesize it from the retained input type through an
     /// [`Engine`](crate::tracing_v2::Engine).
     #[inline]
-    pub fn add_input_abstract(&mut self, abstract_value: T) -> AtomId {
+    pub fn add_input(&mut self, r#type: T) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
-        self.atoms.push(Atom::Variable(abstract_value));
-        self.intermediates.push(None);
-        self.input_ids.push(id);
-        id
-    }
-
-    /// Adds a new input atom using the abstract type and value of `example`.
-    #[inline]
-    pub fn add_input(&mut self, example: &V) -> AtomId {
-        let abstract_value = <V as Typed<T>>::r#type(example).into_owned();
-        let id = AtomId { index: self.atoms.len() };
-        self.atoms.push(Atom::Variable(abstract_value));
-        self.intermediates.push(Some(example.clone()));
+        self.atoms.push(Atom::Variable(r#type));
         self.input_ids.push(id);
         id
     }
@@ -551,7 +507,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
         self.atoms.push(Atom::Constant(value));
-        self.intermediates.push(None);
         id
     }
 
@@ -569,7 +524,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
             .map(|r#type| {
                 let id = AtomId { index: self.atoms.len() };
                 self.atoms.push(Atom::Variable(r#type));
-                self.intermediates.push(None);
                 id
             })
             .collect::<Vec<_>>();
@@ -603,60 +557,6 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         self.error.take()
     }
 
-    /// Adds a staged instruction using pre-computed output values, performing abstract-eval validation,
-    /// algebraic identity elimination, and constant folding.
-    ///
-    /// Unlike [`add_instruction`](Self::add_instruction), this method does not call [`InterpretableOperation::eval`].
-    /// the caller supplies the concrete output values directly. Use this when the caller has already
-    /// computed the outputs (e.g., inside [`Tracer`](crate::tracing_v2::Tracer) staging
-    /// methods).
-    pub fn add_instruction_with_output_values(
-        &mut self,
-        operation: O,
-        inputs: Vec<AtomId>,
-        output_values: Vec<V>,
-    ) -> Result<Vec<AtomId>, TracingError> {
-        let input_abstracts = inputs
-            .iter()
-            .map(|input| {
-                self.atom(*input)
-                    .map(|atom| atom.r#type().into_owned())
-                    .ok_or(TracingError::UnboundAtomId { id: *input })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = operation.abstract_eval(input_abstracts.as_slice())?;
-
-        // Algebraic identity elimination: eliminate trivial ops like scale-by-1, add-by-0, mul-by-1.
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
-        if let Some(simplified) = operation.try_simplify(&inputs, &is_zero, &is_one) {
-            return Ok(simplified);
-        }
-
-        let all_constant = inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant(_))));
-
-        let outputs = output_abstracts
-            .into_iter()
-            .zip(output_values)
-            .map(|(r#type, output_value)| {
-                let id = self.atoms.len();
-                if all_constant {
-                    self.atoms.push(Atom::Constant(output_value));
-                    self.intermediates.push(None);
-                } else {
-                    self.atoms.push(Atom::Variable(r#type));
-                    self.intermediates.push(Some(output_value));
-                }
-                AtomId { index: id }
-            })
-            .collect::<Vec<_>>();
-
-        if !all_constant {
-            self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
-        }
-        Ok(outputs)
-    }
-
     /// Adds a staged instruction using only abstract evaluation.
     ///
     /// This is the staging path used by type-directed tracing and any traced replay that does not
@@ -683,24 +583,56 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
 
     /// Adds a staged instruction, validating its inputs through abstract evaluation first.
     ///
-    /// When every input atom is an [`Atom::Constant`], the operation is folded at program-construction
-    /// time: `abstract_eval` and `eval` are still executed for validation, but the output atoms are
-    /// recorded as constants and no instruction is added to the program.
+    /// When every input atom is an [`Atom::Constant`], the operation is folded at
+    /// program-construction time: `abstract_eval` and `interpret` are executed for validation, the
+    /// output atoms are recorded as constants, and no instruction is added to the program.
+    /// Otherwise the builder records only the abstract output types and stages one instruction.
     pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
     where
         O: InterpretableOperation<T, V>,
     {
-        let input_examples = inputs
+        let input_abstracts = inputs
             .iter()
-            .map(|input| self.value(*input).cloned().ok_or(TracingError::UnboundAtomId { id: *input }))
+            .map(|input| {
+                self.atom(*input)
+                    .map(|atom| atom.r#type().into_owned())
+                    .ok_or(TracingError::UnboundAtomId { id: *input })
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let output_values = operation.interpret(input_examples.as_slice())?;
-        self.add_instruction_with_output_values(operation, inputs, output_values)
+        let output_abstracts = operation.abstract_eval(input_abstracts.as_slice())?;
+
+        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
+        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
+        if let Some(simplified) = operation.try_simplify(&inputs, &is_zero, &is_one) {
+            return Ok(simplified);
+        }
+
+        if inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant(_)))) {
+            let input_constants = inputs
+                .iter()
+                .map(|input| {
+                    self.atom(*input)
+                        .and_then(Atom::as_constant)
+                        .cloned()
+                        .ok_or(TracingError::UnboundAtomId { id: *input })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let output_values = operation.interpret(input_constants.as_slice())?;
+            let outputs = output_values
+                .into_iter()
+                .map(|output_value| {
+                    let id = AtomId { index: self.atoms.len() };
+                    self.atoms.push(Atom::Constant(output_value));
+                    id
+                })
+                .collect::<Vec<_>>();
+            return Ok(outputs);
+        }
+
+        Ok(self.add_instruction_prevalidated(operation, inputs, output_abstracts))
     }
 
-    /// Finalizes the builder into a program with the given input/output structures. The builder's
-    /// intermediate values are discarded; the resulting program retains only the atoms, instructions,
-    /// and input/output structure.
+    /// Finalizes the builder into a program with the given input/output structures.
     pub fn build<Input, Output>(
         self,
         outputs: Vec<AtomId>,
@@ -761,8 +693,8 @@ mod tests {
     #[test]
     fn program_builder_tracks_atom_kinds_and_executes() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
-        let x = builder.add_input(&2.0f64);
-        let y = builder.add_input(&3.0f64);
+        let x = builder.add_input(2.0f64.r#type().into_owned());
+        let y = builder.add_input(3.0f64.r#type().into_owned());
         let two = builder.add_constant(2.0f64);
         let scaled_x = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_x, y]).unwrap()[0];
@@ -787,7 +719,7 @@ mod tests {
     #[test]
     fn program_display_uses_typed_jaxpr_like_rendering() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
-        let x = builder.add_input(&1.0f64);
+        let x = builder.add_input(1.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
@@ -828,7 +760,7 @@ mod tests {
         assert_eq!(builder.instruction_count(), 0);
 
         // Introduce a non-constant input and combine with the folded constant.
-        let x = builder.add_input(&10.0f64);
+        let x = builder.add_input(10.0f64.r#type().into_owned());
         let result = builder.add_instruction(PrimitiveOperation::Mul, vec![folded[0], x]).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Variable(_)));
@@ -858,7 +790,7 @@ mod tests {
         let b = builder.add_constant(3.0f64);
         let folded_sum = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap()[0];
 
-        let x = builder.add_input(&10.0f64);
+        let x = builder.add_input(10.0f64.r#type().into_owned());
         let product = builder.add_instruction(PrimitiveOperation::Mul, vec![folded_sum, x]).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
 
@@ -869,9 +801,9 @@ mod tests {
     }
 
     #[test]
-    fn built_program_drops_derived_stored_values_but_remains_executable() {
+    fn program_builder_tracks_only_types_for_variable_atoms() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
-        let x = builder.add_input(&2.0f64);
+        let x = builder.add_input(2.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
 
@@ -880,8 +812,6 @@ mod tests {
         );
         assert!(matches!(builder.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
         assert!(matches!(builder.atom(sum).unwrap(), Atom::Variable(_)));
-        assert_eq!(builder.value(x), Some(&2.0));
-        assert_eq!(builder.value(sum), Some(&5.0));
 
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
         assert!(
@@ -990,7 +920,7 @@ mod tests {
 
         let mut builder =
             ProgramBuilder::<ArrayType, TestIdentityValue, PrimitiveOperation<ArrayType, TestIdentityValue>>::new();
-        let x = builder.add_input(&TestIdentityValue::scalar(5.0));
+        let x = builder.add_input(TestIdentityValue::scalar(5.0).r#type().into_owned());
         let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
 
         let simplified_add = builder.add_instruction(PrimitiveOperation::Add, vec![x, zero]).unwrap();

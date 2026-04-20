@@ -741,7 +741,7 @@ mod tests {
             ndarray::Array2<f64>,
             LinearPrimitiveOperation<ArrayType, ndarray::Array2<f64>>,
         >::new()));
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(&output_value);
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ReshapeOperation::new(
             input_type.clone(),
