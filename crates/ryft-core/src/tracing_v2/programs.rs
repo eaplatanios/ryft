@@ -33,14 +33,36 @@ use crate::{
 /// [`Program::input_ids`] list and instruction outputs rather than in the atom enum itself.
 #[derive(Clone, Debug)]
 pub enum Atom<T: Type, V: Typed<T>> {
-    /// Literal constant folded or supplied at trace time. Constants retain their value so the
-    /// interpreter and MLIR lowering can emit them.
+    /// Literal constant value that appears in a [`Program`].
     Constant(V),
 
     /// Non-constant program variable carrying only its abstract type. Any builder-time exemplar
     /// lives in the owning [`ProgramBuilder`]'s side table and is discarded when the program is
     /// finalized.
     Variable(T),
+}
+
+impl<T: Type, V: Typed<T>> Atom<T, V> {
+    /// Returns `true` if this [`Atom`] is a [`Atom::Constant`].
+    #[inline]
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Self::Constant(_))
+    }
+
+    /// Returns `true` if this [`Atom`] is a [`Atom::Variable`].
+    #[inline]
+    pub fn is_variable(&self) -> bool {
+        matches!(self, Self::Variable(_))
+    }
+
+    /// Returns the underlying constant value if this atom is a [`Atom::Constant`] and [`None`] otherwise.
+    #[inline]
+    pub fn as_constant(&self) -> Option<&V> {
+        match self {
+            Self::Constant(value) => Some(value),
+            Self::Variable(_) => None,
+        }
+    }
 }
 
 impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
@@ -459,7 +481,7 @@ pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Operation<T>> {
     error: Option<TracingError>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     /// Creates an empty builder.
     ///
     /// Fresh builders contain no atoms, instructions, or retained exemplars and are typically owned
@@ -475,19 +497,19 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
         }
     }
 
-    /// Returns the atom with the provided identifier.
+    /// Returns the [`Atom`] with the provided [`AtomId`] in this [`ProgramBuilder`], if one exists.
     #[inline]
     pub fn atom(&self, id: AtomId) -> Option<&Atom<T, V>> {
         self.atoms.get(id.index)
     }
 
-    /// Returns the concrete value associated with the provided atom, if one is available.
+    /// Returns the builder-time stored exemplar associated with the provided atom, if one exists.
     ///
-    /// For [`Atom::Constant`] this returns the retained value. For [`Atom::Variable`] this returns
-    /// the eagerly computed exemplar stored in the builder's
-    /// side table, or `None` if none is available.
+    /// For [`Atom::Constant`] this returns the retained literal value. For [`Atom::Variable`] this
+    /// returns the eagerly computed exemplar stored in the builder side table, which exists only
+    /// while the program is still being staged.
     #[inline]
-    pub(crate) fn stored_value(&self, id: AtomId) -> Option<&V> {
+    pub(crate) fn value(&self, id: AtomId) -> Option<&V> {
         match self.atoms.get(id.index)? {
             Atom::Constant(value) => Some(value),
             Atom::Variable(_) => self.intermediates.get(id.index).and_then(Option::as_ref),
@@ -676,7 +698,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
     {
         let input_examples = inputs
             .iter()
-            .map(|input| self.stored_value(*input).cloned().ok_or(TracingError::UnboundAtomId { id: *input }))
+            .map(|input| self.value(*input).cloned().ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
         let output_values = operation.interpret(input_examples.as_slice())?;
         self.add_instruction_with_output_values(operation, inputs, output_values)
@@ -707,7 +729,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuilder<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> {
     fn default() -> Self {
         Self::new()
     }
@@ -727,6 +749,20 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn atom_as_constant_returns_only_literal_values() {
+        let constant = Atom::<ArrayType, f64>::Constant(3.0);
+        let variable = Atom::<ArrayType, f64>::Variable(ArrayType::scalar(DataType::F64));
+
+        assert!(constant.is_constant());
+        assert!(!constant.is_variable());
+        assert_eq!(constant.as_constant(), Some(&3.0));
+
+        assert!(!variable.is_constant());
+        assert!(variable.is_variable());
+        assert_eq!(variable.as_constant(), None);
+    }
 
     #[test]
     fn program_builder_tracks_atom_kinds_and_executes() {
@@ -850,8 +886,8 @@ mod tests {
         );
         assert!(matches!(builder.atom(three).unwrap(), Atom::Constant(value) if *value == 3.0));
         assert!(matches!(builder.atom(sum).unwrap(), Atom::Variable(_)));
-        assert_eq!(builder.stored_value(x), Some(&2.0));
-        assert_eq!(builder.stored_value(sum), Some(&5.0));
+        assert_eq!(builder.value(x), Some(&2.0));
+        assert_eq!(builder.value(sum), Some(&5.0));
 
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
         assert!(
