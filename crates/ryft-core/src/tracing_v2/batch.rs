@@ -12,12 +12,16 @@
 //! That split is what lets the public API stay simple while still preserving enough structure for
 //! backend lowering to emit packed batched programs.
 
-use std::ops::{Add, Mul, Neg};
+use std::{
+    cell::RefCell,
+    ops::{Add, Mul, Neg},
+    rc::Rc,
+};
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        OneLike, Program, Traceable, TracingError, ZeroLike,
+        OneLike, Program, ProgramBuilder, Traceable, TracingError, ZeroLike,
         engine::Engine,
         jit::Tracer,
         operations::{
@@ -197,13 +201,18 @@ pub fn unstack<
 /// and [`grad`](crate::tracing_v2::grad): the public transform stays small while the concrete,
 /// traced, and nested-batch execution strategies each get their own implementation.
 #[doc(hidden)]
-pub(crate) trait VMapInvocationLeaf<
+pub(crate) trait VMapInvocationLeaf<'engine, E, Input, Output>: Parameter + Sized
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: Traceable<ArrayType>,
+    E::TracingOperation: Operation<ArrayType>,
     Input: Parameterized<Self, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<Self>>>,
     Output: Parameterized<Self, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<Self>>>,
->: Parameter + Sized
 {
     /// Invokes [`vmap`] for one concrete leaf regime.
-    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+    fn vmap<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        engine: &'engine E,
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::TracingOperation>>>,
         function: F,
         inputs: Vec<Input>,
     ) -> Result<Vec<Output>, TracingError>;
@@ -213,16 +222,23 @@ pub(crate) trait VMapInvocationLeaf<
 /// over the batched representation, and unstacks the result back into per-lane outputs.
 ///
 /// No op-capability (`Sin` / `Cos` / `MatrixOps` / `ReshapeOps`) bounds on `V` are required here because the body
-/// of `invoke` never exercises them â€” it stacks / unstacks / invokes the user's closure on
+/// of `vmap` never exercises them â€” it stacks / unstacks / invokes the user's closure on
 /// `Batch<V>` values, and any capability the closure actually uses is enforced at the call site
 /// through the conditional op-local trait impls on [`Batch`].
 impl<
+    'engine,
+    E: Engine<Type = ArrayType> + ?Sized,
     V: Traceable<ArrayType> + crate::tracing_v2::Value<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<V>>>,
     Output: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<V>>>,
-> VMapInvocationLeaf<Input, Output> for V
+> VMapInvocationLeaf<'engine, E, Input, Output> for V
+where
+    E::Value: Traceable<ArrayType>,
+    E::TracingOperation: Operation<ArrayType>,
 {
-    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+    fn vmap<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        _engine: &'engine E,
+        _builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::TracingOperation>>>,
         function: F,
         inputs: Vec<Input>,
     ) -> Result<Vec<Output>, TracingError> {
@@ -264,14 +280,16 @@ impl<
         >,
     O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + VMapTracingOperation<ArrayType, V, L>,
     L: Clone,
-> VMapInvocationLeaf<Input, Output> for Tracer<'engine, E>
+> VMapInvocationLeaf<'engine, E, Input, Output> for Tracer<'engine, E>
 where
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output, To<V> = Output::To<V>>,
     Vec<V>: Parameterized<V, To<Tracer<'engine, E>> = Vec<Tracer<'engine, E>>, ParameterStructure = Vec<Placeholder>>,
     <Vec<V> as Parameterized<V>>::Family: ParameterizedFamily<Tracer<'engine, E>>,
 {
-    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+    fn vmap<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        engine: &'engine E,
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::TracingOperation>>>,
         function: F,
         inputs: Vec<Input>,
     ) -> Result<Vec<Output>, TracingError> {
@@ -292,13 +310,11 @@ where
             input_structure.clone(),
             traced_inputs[0].iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let exemplar_engine = traced_inputs[0].first().ok_or(TracingError::EmptyParameterizedValue)?.engine;
-
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,
             Program<ArrayType, V, O, Input::To<V>, Output::To<V>>,
         ) = crate::tracing_v2::jit::trace(
-            exemplar_engine,
+            engine,
             |lane_inputs| {
                 let batched_inputs = Input::To::<Batch<Tracer<'engine, E>>>::from_parameters(
                     lane_inputs.parameter_structure(),
@@ -348,13 +364,8 @@ where
         );
 
         let staged_inputs = traced_inputs.into_iter().flatten().collect::<Vec<_>>();
-        let exemplar_input = staged_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
-        let staged_outputs = Tracer::apply_staged_op(
-            exemplar_input.engine,
-            exemplar_input.builder.clone(),
-            staged_inputs.as_slice(),
-            O::vmap_op(VMapOperation::new(body)),
-        )?;
+        let staged_outputs =
+            Tracer::apply_staged_op(engine, builder, staged_inputs.as_slice(), O::vmap_op(VMapOperation::new(body)))?;
         (0..lane_count)
             .map(|lane_index| {
                 let start = lane_index * output_leaf_count;
@@ -376,12 +387,19 @@ where
 /// body only stacks, unstacks, and invokes the user's closure â€” any capability the closure uses on
 /// `Batch<Batch<V>>` is enforced through the conditional blanket impls on `Batch<_>`.
 impl<
+    'engine,
+    E: Engine<Type = ArrayType> + ?Sized,
     V: Traceable<ArrayType>,
     Input: Parameterized<Batch<V>, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<Batch<V>>>>,
     Output: Parameterized<Batch<V>, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<Batch<V>>>>,
-> VMapInvocationLeaf<Input, Output> for Batch<V>
+> VMapInvocationLeaf<'engine, E, Input, Output> for Batch<V>
+where
+    E::Value: Traceable<ArrayType>,
+    E::TracingOperation: Operation<ArrayType>,
 {
-    fn invoke<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+    fn vmap<F: FnOnce(Input::To<Batch<Self>>) -> Output::To<Batch<Self>>>(
+        _engine: &'engine E,
+        _builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::TracingOperation>>>,
         function: F,
         inputs: Vec<Input>,
     ) -> Result<Vec<Output>, TracingError> {
@@ -397,24 +415,42 @@ impl<
 /// then unstacking the result back into one output per lane. For traced inputs it instead stages a
 /// compact higher-order `vmap` operation so later transforms and lowerings can treat batching as a
 /// first-class program construct.
+///
+/// # Parameters
+///
+///   - `engine`: backend engine used when tracing or interpreting the batched body.
+///   - `builder`: enclosing staged-program builder that receives the higher-order `vmap`
+///     instruction when the inputs are already traced. Concrete execution paths ignore it.
+///   - `function`: batched body to run or trace.
+///   - `inputs`: one structured input per batch lane.
 #[allow(private_bounds)]
 pub fn vmap<
+    'engine,
+    E: Engine<Type = ArrayType> + ?Sized,
     F: FnOnce(Input::To<Batch<V>>) -> Output::To<Batch<V>>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<V>>>,
     Output: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<V>>>,
-    V: VMapInvocationLeaf<Input, Output>,
+    V: VMapInvocationLeaf<'engine, E, Input, Output>,
 >(
+    engine: &'engine E,
+    builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::TracingOperation>>>,
     function: F,
     inputs: Vec<Input>,
-) -> Result<Vec<Output>, TracingError> {
-    V::invoke(function, inputs)
+) -> Result<Vec<Output>, TracingError>
+where
+    E::Value: Traceable<ArrayType>,
+    E::TracingOperation: Operation<ArrayType>,
+{
+    V::vmap(engine, builder, function, inputs)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use indoc::indoc;
 
-    use crate::tracing_v2::{PrimitiveOperation, Sin, Tracer, engine::ArrayScalarEngine, test_support};
+    use crate::tracing_v2::{PrimitiveOperation, ProgramBuilder, Sin, Tracer, engine::ArrayScalarEngine, test_support};
 
     use super::*;
 
@@ -446,7 +482,11 @@ mod tests {
 
     #[test]
     fn vmap_exposes_batch_axis_size() {
+        let engine = ArrayScalarEngine::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let outputs: Vec<f64> = vmap(
+            &engine,
+            builder,
             |inputs: Batch<f64>| {
                 assert_eq!(inputs.len(), 3);
                 inputs.clone() + inputs.one_like()
@@ -465,8 +505,9 @@ mod tests {
             crate::tracing_v2::interpret_and_trace(
                 &engine,
                 |x| {
+                    let builder = x.builder.clone();
                     let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> =
-                        vmap(|batch| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
+                        vmap(&engine, builder, |batch| batch.clone() + batch.one_like(), vec![x.clone(), x])?;
                     Ok(outputs[0].clone() + outputs[1].clone())
                 },
                 2.0f64,
@@ -496,7 +537,10 @@ mod tests {
     fn test_vmap_of_grad_computes_per_lane_gradients() {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let gradients: Vec<f64> = vmap(
+            &engine,
+            builder,
             |batch: Batch<f64>| {
                 crate::tracing_v2::grad(&engine, |x| x.clone() * x.clone() + x.sin(), batch)
                     .expect("batched grad should succeed")
@@ -515,7 +559,10 @@ mod tests {
     fn test_vmap_of_value_and_grad_returns_batched_values_and_gradients() {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let results: Vec<(f64, f64)> = vmap(
+            &engine,
+            builder,
             |batch: Batch<f64>| {
                 crate::tracing_v2::value_and_grad(&engine, |x| x.clone() * x.clone() + x.sin(), batch)
                     .expect("batched value_and_grad should succeed")
@@ -536,7 +583,10 @@ mod tests {
         // f(x) = x^2 + sin(x), df/dx = 2x + cos(x)
         // jvp at x with tangent t gives (f(x), (2x + cos(x)) * t)
         let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let results: Vec<(f64, f64)> = vmap(
+            &engine,
+            builder,
             |(primals, tangents): (Batch<f64>, Batch<f64>)| {
                 crate::tracing_v2::jvp(&engine, |x| x.clone() * x.clone() + x.sin(), primals, tangents)
                     .expect("batched jvp should succeed")
@@ -602,8 +652,11 @@ mod tests {
             }
         }
 
+        let engine = ArrayScalarEngine::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let outputs: Vec<Int64> =
-            vmap(|batch: Batch<Int64>| batch.clone() + batch, vec![Int64(1), Int64(2), Int64(3)]).unwrap();
+            vmap(&engine, builder, |batch: Batch<Int64>| batch.clone() + batch, vec![Int64(1), Int64(2), Int64(3)])
+                .unwrap();
         assert_eq!(outputs, vec![Int64(2), Int64(4), Int64(6)]);
     }
 }

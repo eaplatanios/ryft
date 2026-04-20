@@ -234,14 +234,18 @@ fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>
 
 /// Emits the staged reverse-over-batching scalar benchmark.
 fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
+    let engine = ArrayScalarEngine::<f64>::new();
     let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<ArrayType, f64>, f64, f64>) =
         interpret_and_trace(
-            &ArrayScalarEngine::<f64>::new(),
+            &engine,
             |x| {
                 let gradient: Tracer<ArrayScalarEngine<f64>> = grad(
-                    &ArrayScalarEngine::<f64>::new(),
+                    &engine,
                     |y| {
+                        let builder = y.builder.clone();
                         let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
+                            &engine,
+                            builder,
                             |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| batch.clone() * batch.clone() + batch.sin(),
                             vec![y.clone(), y],
                         )
@@ -261,11 +265,15 @@ fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> 
 
 /// Emits the staged batching-over-reverse scalar benchmark.
 fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
+    let engine = ArrayScalarEngine::<f64>::new();
     let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<ArrayType, f64>, f64, f64>) =
         interpret_and_trace(
-            &ArrayScalarEngine::<f64>::new(),
+            &engine,
             |x| {
+                let builder = x.builder.clone();
                 let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
+                    &engine,
+                    builder,
                     |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| {
                         let lanes = unstack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(batch)
                             .unwrap_or_else(|error| {

@@ -48,7 +48,7 @@ where
                     E::LinearOperation,
                     E,
                     _,
-                >(|staged_input| Ok(function(staged_input)), &traced_primals, staged_input_types)?;
+                >(_engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
             let (_, traced_gradient) =
                 reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
                     &traced_program,
@@ -190,7 +190,7 @@ where
                     E::LinearOperation,
                     E,
                     _,
-                >(|staged_input| Ok(function(staged_input)), &traced_primals, staged_input_types)?;
+                >(engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
 
             // Step 2: Segment the traced program to insert rematerialization boundaries.
             let segmented_program = match segment_size {

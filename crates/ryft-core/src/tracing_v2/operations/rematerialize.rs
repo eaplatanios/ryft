@@ -575,10 +575,11 @@ where
             input_structure.clone(),
             traced_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
+        let exemplar_traced_input = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
         let (exemplar_output_types, body_program) =
             trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
+                exemplar_traced_input.engine,
                 |staged_input| Ok(function(staged_input)),
-                traced_inputs.as_slice(),
                 exemplar_input_types,
             )?;
 
@@ -604,7 +605,6 @@ where
             },
         );
 
-        let exemplar_traced_input = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.clone();
         let staged_outputs = Tracer::apply_staged_op(
             exemplar_traced_input.engine,
             exemplar_traced_input.builder.clone(),

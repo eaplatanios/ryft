@@ -97,8 +97,8 @@ where
     )?;
     let (primal_output_types, traced_program) =
         trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
+            traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.engine,
             move |staged_input| function(staged_input),
-            &traced_primals,
             staged_input_types,
         )?;
     let output_structure = primal_output_types.parameter_structure();
@@ -268,16 +268,19 @@ where
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let (_, traced_program) =
-            trace_flat_program_from_input_types::<
-                Input::To<ArrayType>,
-                V::To<ArrayType>,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-                _,
-            >(|staged_input| Ok(function(staged_input)), &traced_primals, staged_input_types)?;
+        let (_, traced_program) = trace_flat_program_from_input_types::<
+            Input::To<ArrayType>,
+            V::To<ArrayType>,
+            V,
+            E::TracingOperation,
+            E::LinearOperation,
+            E,
+            _,
+        >(
+            traced_primals.first().ok_or(TracingError::EmptyParameterizedValue)?.engine,
+            |staged_input| Ok(function(staged_input)),
+            staged_input_types,
+        )?;
         let (traced_output, traced_gradient) =
             reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
                 &traced_program,

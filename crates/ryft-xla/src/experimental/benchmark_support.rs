@@ -370,7 +370,10 @@ fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, Benc
                         .unwrap_or_else(|error| {
                             panic!("shard_map grad+vmap IR benchmark should trace the inner gradient: {error}")
                         });
+                        let builder = gradient.builder.clone();
                         let lanes: Vec<ShardMapTracer> = vmap(
+                            crate::experimental::engine::XlaEngine::token(),
+                            builder,
                             |batch: ryft_core::tracing_v2::Batch<ShardMapTracer>| batch.clone() + batch.one_like(),
                             vec![gradient.clone(), gradient],
                         )

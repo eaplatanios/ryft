@@ -3079,7 +3079,10 @@ mod tests {
                 let gradient: ShardMapTracer =
                     grad(crate::experimental::engine::XlaEngine::token(), |y: ShardMapTracer| y.sin(), x.clone())
                         .expect("gradient inside shard_map should succeed");
+                let builder = gradient.builder.clone();
                 let lanes: Vec<ShardMapTracer> = vmap(
+                    crate::experimental::engine::XlaEngine::token(),
+                    builder,
                     |y: ryft_core::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
                     vec![gradient.clone(), gradient],
                 )

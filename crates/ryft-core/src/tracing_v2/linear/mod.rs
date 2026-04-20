@@ -80,8 +80,8 @@ fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
 /// between those worlds: it traces the structured function once, then retags the captured program
 /// so downstream reverse-mode code can operate on a canonical `Vec<V>` representation.
 pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, O, L, E, F>(
+    engine: &'engine E,
     function: F,
-    traced_inputs: &[Tracer<'engine, E>],
     input_types: Input,
 ) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TracingError>
 where
@@ -95,16 +95,16 @@ where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    let exemplar_engine = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.engine;
+    let input_leaf_count = input_types.parameter_structure().parameter_count();
     let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
-        crate::tracing_v2::jit::trace(exemplar_engine, function, input_types)?;
+        crate::tracing_v2::jit::trace(engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let traced_program = Program {
         atoms: traced_program.atoms.clone(),
         input_ids: traced_program.input_ids.clone(),
         output_ids: traced_program.output_ids.clone(),
         instructions: traced_program.instructions.clone(),
-        input_structure: flat_leaf_parameter_structure(traced_inputs.len()),
+        input_structure: flat_leaf_parameter_structure(input_leaf_count),
         output_structure: flat_leaf_parameter_structure(output_leaf_count),
         marker: std::marker::PhantomData,
     }

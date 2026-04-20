@@ -874,9 +874,13 @@ mod tests {
     fn test_custom_primitive_batch_rule_participates_in_vmap() {
         let primitive =
             CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_vectorization_rule(ShiftOp::new(2.0));
+        let engine = ArrayScalarEngine::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
 
         assert_eq!(
             vmap(
+                &engine,
+                builder,
                 {
                     let primitive = primitive.clone();
                     move |batch: Batch<f64>| apply_custom_batched_unary(batch, primitive.clone()).unwrap()
