@@ -557,37 +557,19 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         self.error.take()
     }
 
-    /// Adds a staged instruction using only abstract evaluation.
+    /// Adds a staged instruction, optionally constant-folding literal-constant inputs.
     ///
-    /// This is the staging path used by type-directed tracing and any traced replay that does not
-    /// have representative concrete values available for the participating atoms.
-    pub fn add_instruction_abstract(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError> {
-        let input_abstracts = inputs
-            .iter()
-            .map(|input| {
-                self.atom(*input)
-                    .map(|atom| atom.r#type().into_owned())
-                    .ok_or(TracingError::UnboundAtomId { id: *input })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = operation.abstract_eval(input_abstracts.as_slice())?;
-
-        let is_zero = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_zero());
-        let is_one = |id: AtomId| matches!(self.atom(id), Some(Atom::Constant(value)) if value.is_one());
-        if let Some(simplified) = operation.try_simplify(&inputs, &is_zero, &is_one) {
-            return Ok(simplified);
-        }
-
-        Ok(self.add_instruction_prevalidated(operation, inputs, output_abstracts))
-    }
-
-    /// Adds a staged instruction, validating its inputs through abstract evaluation first.
-    ///
-    /// When every input atom is an [`Atom::Constant`], the operation is folded at
-    /// program-construction time: `abstract_eval` and `interpret` are executed for validation, the
-    /// output atoms are recorded as constants, and no instruction is added to the program.
-    /// Otherwise the builder records only the abstract output types and stages one instruction.
-    pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError>
+    /// When `fold_constants` is `true` and every input atom is an [`Atom::Constant`], the
+    /// operation is folded at program-construction time: `abstract_eval` and `interpret` are
+    /// executed for validation, the output atoms are recorded as constants, and no instruction is
+    /// added to the program. Otherwise the builder records only the abstract output types and
+    /// stages one instruction.
+    pub fn add_instruction(
+        &mut self,
+        operation: O,
+        inputs: Vec<AtomId>,
+        fold_constants: bool,
+    ) -> Result<Vec<AtomId>, TracingError>
     where
         O: InterpretableOperation<T, V>,
     {
@@ -607,7 +589,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
             return Ok(simplified);
         }
 
-        if inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant(_)))) {
+        if fold_constants && inputs.iter().all(|input| matches!(self.atom(*input), Some(Atom::Constant(_)))) {
             let input_constants = inputs
                 .iter()
                 .map(|input| {
@@ -696,8 +678,8 @@ mod tests {
         let x = builder.add_input(2.0f64.r#type().into_owned());
         let y = builder.add_input(3.0f64.r#type().into_owned());
         let two = builder.add_constant(2.0f64);
-        let scaled_x = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![x]).unwrap()[0];
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_x, y]).unwrap()[0];
+        let scaled_x = builder.add_instruction(PrimitiveOperation::Scale { factor: 2.0 }, vec![x], true).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![scaled_x, y], true).unwrap()[0];
         let program = builder.build::<(f64, f64), f64>(vec![sum], (Placeholder, Placeholder), Placeholder);
 
         assert!(matches!(program.atoms.get(x.index), Some(Atom::Variable(_))));
@@ -721,7 +703,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three], true).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![sum], Placeholder, Placeholder);
 
         assert_eq!(
@@ -739,7 +721,8 @@ mod tests {
     #[test]
     fn program_builder_rejects_unbound_inputs() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
-        let result = builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
+        let result =
+            builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }], true);
         assert!(matches!(
             result,
             Err(TracingError::UnboundAtomId { id }) if id == AtomId { index: 42 }
@@ -754,14 +737,14 @@ mod tests {
         let b = builder.add_constant(3.0f64);
 
         // Adding two constants should fold: no instruction, output is constant.
-        let folded = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap();
+        let folded = builder.add_instruction(PrimitiveOperation::Add, vec![a, b], true).unwrap();
         assert_eq!(folded.len(), 1);
         assert!(matches!(builder.atom(folded[0]).unwrap(), Atom::Constant(_)));
         assert_eq!(builder.instruction_count(), 0);
 
         // Introduce a non-constant input and combine with the folded constant.
         let x = builder.add_input(10.0f64.r#type().into_owned());
-        let result = builder.add_instruction(PrimitiveOperation::Mul, vec![folded[0], x]).unwrap();
+        let result = builder.add_instruction(PrimitiveOperation::Mul, vec![folded[0], x], true).unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Variable(_)));
         assert_eq!(builder.instruction_count(), 1);
@@ -788,10 +771,10 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
-        let folded_sum = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap()[0];
+        let folded_sum = builder.add_instruction(PrimitiveOperation::Add, vec![a, b], true).unwrap()[0];
 
         let x = builder.add_input(10.0f64.r#type().into_owned());
-        let product = builder.add_instruction(PrimitiveOperation::Mul, vec![folded_sum, x]).unwrap()[0];
+        let product = builder.add_instruction(PrimitiveOperation::Mul, vec![folded_sum, x], true).unwrap()[0];
         let program = builder.build::<f64, f64>(vec![product], Placeholder, Placeholder);
 
         // folded_sum = 2.0 + 3.0 = 5.0, product = 5.0 * input
@@ -805,7 +788,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let x = builder.add_input(2.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
-        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three], true).unwrap()[0];
 
         assert!(
             matches!(builder.atom(x).unwrap(), Atom::Variable(r#type) if *r#type == ArrayType::scalar(DataType::F64))
@@ -923,12 +906,12 @@ mod tests {
         let x = builder.add_input(TestIdentityValue::scalar(5.0).r#type().into_owned());
         let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
 
-        let simplified_add = builder.add_instruction(PrimitiveOperation::Add, vec![x, zero]).unwrap();
+        let simplified_add = builder.add_instruction(PrimitiveOperation::Add, vec![x, zero], true).unwrap();
         assert_eq!(simplified_add, vec![x]);
         assert_eq!(builder.instruction_count(), 0);
 
         let simplified_scale = builder
-            .add_instruction(PrimitiveOperation::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
+            .add_instruction(PrimitiveOperation::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x], true)
             .unwrap();
         assert_eq!(simplified_scale, vec![x]);
         assert_eq!(builder.instruction_count(), 0);

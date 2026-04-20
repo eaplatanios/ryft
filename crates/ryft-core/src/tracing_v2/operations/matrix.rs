@@ -23,8 +23,8 @@ use crate::{
 };
 
 use super::{
-    LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation, LinearNegOperation,
-    LinearRightMatMulOperation, LinearScaleOperation, MatMulOperation, MatMulTracingOperation,
+    InterpretableOperation, LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation,
+    LinearNegOperation, LinearRightMatMulOperation, LinearScaleOperation, MatMulOperation, MatMulTracingOperation,
     MatrixTransposeOperation, MatrixTransposeTracingOperation, Operation, VectorizableOperation,
 };
 
@@ -232,7 +232,7 @@ impl<
     E: crate::tracing_v2::Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 > MatrixOps for Tracer<'engine, E>
 where
-    O: Operation<ArrayType>,
+    O: InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
