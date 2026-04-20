@@ -1,3 +1,4 @@
+pub mod batching;
 pub mod broadcasting;
 pub mod errors;
 pub mod macros;

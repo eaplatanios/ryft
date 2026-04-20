@@ -15,11 +15,11 @@ use std::{
 use indoc::indoc;
 
 use crate::{
+    batching::Batch,
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
         MatrixOps, OneLike, Traceable, TracingError, ZeroLike,
-        batch::Batch,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,

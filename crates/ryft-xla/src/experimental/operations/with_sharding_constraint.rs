@@ -312,8 +312,8 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOperation<Array
 {
     fn batch(
         &self,
-        inputs: &[ryft_core::tracing_v2::Batch<V>],
-    ) -> Result<Vec<ryft_core::tracing_v2::Batch<V>>, TracingError> {
+        inputs: &[ryft_core::batching::Batch<V>],
+    ) -> Result<Vec<ryft_core::batching::Batch<V>>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone()])
     }

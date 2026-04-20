@@ -9,10 +9,10 @@ use std::{
     ops::Neg,
 };
 
+use crate::batching::Batch;
 use crate::macros::check_input_count;
 use crate::tracing_v2::{
     Traceable, TracingError,
-    batch::Batch,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::Tracer,

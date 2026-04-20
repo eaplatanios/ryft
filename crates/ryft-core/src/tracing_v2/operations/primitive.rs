@@ -16,10 +16,10 @@ use std::{
 };
 
 use crate::{
+    batching::{Batch, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation},
     parameters::{Parameter, Parameterized},
     tracing_v2::{
         AtomId, Cos, MatrixOps, OneLike, Sin, Traceable, TracingError, Value, ZeroLike,
-        batch::Batch,
         engine::Engine,
         forward::JvpTracer,
         jit::Tracer,
@@ -48,7 +48,6 @@ use super::{
     right_matmul::{LinearRightMatMulOperation, RightMatMulTracingOperation},
     scale::{LinearScaleOperation, ScaleTracingOperation},
     sin::SinTracingOperation,
-    vmap::{LinearVMapCarrierOperation, VMapTracingOperation},
 };
 
 /// Closed set of built-in staged operations.
@@ -93,16 +92,7 @@ pub enum PrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
     Reshape { input_type: T, output_type: T },
 
     /// Higher-order `vmap` carrying a compiled per-lane body and optional transpose body.
-    VMap(
-        Box<
-            crate::tracing_v2::operations::VMapOperation<
-                T,
-                V,
-                PrimitiveOperation<T, V>,
-                LinearPrimitiveOperation<T, V>,
-            >,
-        >,
-    ),
+    VMap(Box<VMapOperation<T, V, PrimitiveOperation<T, V>, LinearPrimitiveOperation<T, V>>>),
 
     /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
     Rematerialize(
@@ -149,7 +139,7 @@ pub enum LinearPrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter
     Reshape { input_type: T, output_type: T },
 
     /// Higher-order `vmap` restricted to linear bodies and linear transpose bodies.
-    VMap(Box<crate::tracing_v2::operations::LinearVMapOperation<T, V, LinearPrimitiveOperation<T, V>>>),
+    VMap(Box<LinearVMapOperation<T, V, LinearPrimitiveOperation<T, V>>>),
 
     /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
     Rematerialize(
@@ -253,7 +243,7 @@ impl<T: Type + Display, V: Traceable<T>> VMapTracingOperation<T, V, LinearPrimit
     for PrimitiveOperation<T, V>
 {
     #[inline]
-    fn vmap_op(op: crate::tracing_v2::operations::VMapOperation<T, V, Self, LinearPrimitiveOperation<T, V>>) -> Self {
+    fn vmap_op(op: VMapOperation<T, V, Self, LinearPrimitiveOperation<T, V>>) -> Self {
         PrimitiveOperation::VMap(Box::new(op))
     }
 }
@@ -327,7 +317,7 @@ impl<T: Type + Display, V: Traceable<T>> LinearReshapeOperation<T, V> for Linear
 
 impl<T: Type + Display, V: Traceable<T>> LinearVMapCarrierOperation<T, V> for LinearPrimitiveOperation<T, V> {
     #[inline]
-    fn linear_vmap_op(op: crate::tracing_v2::operations::LinearVMapOperation<T, V, Self>) -> Self {
+    fn linear_vmap_op(op: LinearVMapOperation<T, V, Self>) -> Self {
         LinearPrimitiveOperation::VMap(Box::new(op))
     }
 }
@@ -673,7 +663,7 @@ where
 /// For pure (non-capturing) ops, this is covered by their generic [`InterpretableOperation<V>`] implementations
 /// because [`JvpTracer`] already implements all necessary arithmetic, matrix, and reshape traits.
 /// Capturing ops ([`ScaleOperation`], [`LeftMatMulOperation`], [`RightMatMulOperation`]) and higher-order ops
-/// ([`VMapOperation`](crate::tracing_v2::operations::VMapOperation),
+/// ([`VMapOperation`](crate::batching::VMapOperation),
 /// [`RematerializeOperation`](crate::tracing_v2::operations::RematerializeOperation)) provide dedicated
 /// [`InterpretableOperation`] implementations that lift captured constants into the JIT trace.
 ///

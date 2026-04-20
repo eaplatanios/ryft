@@ -42,7 +42,7 @@ pub trait LinearRematerializeCarrierOperation<T: Type + Display, V: Traceable<T>
 
 /// Erased traced body for a rematerialization boundary.
 ///
-/// Like [`crate::tracing_v2::operations::FlatTracedVMap`], this stores a flattened traced body that
+/// Like [`crate::batching::FlatTracedVMap`], this stores a flattened traced body that
 /// higher-order op nodes can carry around independently of the caller's original parameter shapes.
 #[derive(Clone)]
 pub struct FlatTracedRematerialize<T: Type, V: Traceable<T>, O = PrimitiveOperation<ArrayType, V>> {

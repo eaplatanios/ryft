@@ -11,15 +11,17 @@ use std::{
 };
 
 use crate::broadcasting::Broadcastable;
-use crate::macros::{check_batch_sizes, check_input_count};
-use crate::tracing_v2::{
-    AtomId, Traceable, TracingError, ZeroLike,
-    batch::Batch,
-    engine::Engine,
-    forward::{JvpTracer, TangentSpace},
-    linear::LinearTerm,
-};
 use crate::types::{ArrayType, Type};
+use crate::{
+    batching::{Batch, check_batch_sizes},
+    macros::check_input_count,
+    tracing_v2::{
+        AtomId, Traceable, TracingError, ZeroLike,
+        engine::Engine,
+        forward::{JvpTracer, TangentSpace},
+        linear::LinearTerm,
+    },
+};
 
 use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation};
 
@@ -147,6 +149,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::{
+        batching::BatchingError,
         tracing_v2::test_support,
         types::{DataType, Layout, Shape, Size, StridedLayout},
     };
@@ -206,7 +209,7 @@ mod tests {
     fn test_add_batch_requires_matching_lane_counts() {
         let error = AddOperation.batch(&[Batch::new(vec![1.0f64, 2.0f64]), Batch::new(vec![3.0f64])]).unwrap_err();
 
-        assert_eq!(error, TracingError::MismatchedBatchSize);
+        assert_eq!(error, TracingError::Batching(BatchingError::MismatchedBatchSize));
         test_support::assert_reference_scalar_sine_jit_rendering();
     }
 }

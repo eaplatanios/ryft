@@ -19,10 +19,10 @@ use std::{
 use ryft_macros::Parameter;
 
 use crate::{
+    batching::{Batch, BatchingError, stack, unstack},
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
         LinearPrimitiveOperation, Program, ProgramBuilder, Traceable, TracingError, Value, ZeroLike,
-        batch::{Batch, stack, unstack},
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
         linear::{Linearized, jvp_program, jvp_traced, linearize_traced_program},
@@ -496,7 +496,7 @@ where
         let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
         let lane_tangents: Vec<Input::To<V>> = unstack(tangents)?;
         if lane_primals.is_empty() {
-            return Err(TracingError::EmptyBatch);
+            return Err(BatchingError::EmptyBatch.into());
         }
 
         let lane0_primals = lane_primals[0].clone();

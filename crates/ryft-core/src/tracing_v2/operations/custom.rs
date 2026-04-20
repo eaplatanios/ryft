@@ -18,10 +18,10 @@ use std::{
 };
 
 use crate::{
+    batching::Batch,
     parameters::Parameter,
     tracing_v2::{
         AtomId, Traceable, TracingError, Value, ZeroLike,
-        batch::Batch,
         engine::Engine,
         forward::JvpTracer,
         jit::Tracer,
@@ -547,9 +547,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::batching::{Batch, vmap};
     use crate::tracing_v2::{
-        Batch, LinearPrimitiveOperation, OneLike, PrimitiveOperation, Program, ProgramBuilder, Tracer, TracingError,
-        engine::ArrayScalarEngine, grad, interpret_and_trace, jvp, vmap,
+        LinearPrimitiveOperation, OneLike, PrimitiveOperation, Program, ProgramBuilder, Tracer, TracingError,
+        engine::ArrayScalarEngine, grad, interpret_and_trace, jvp,
     };
     use crate::types::{ArrayType, DataType, Shape};
 

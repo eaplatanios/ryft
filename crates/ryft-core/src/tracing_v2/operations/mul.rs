@@ -10,14 +10,16 @@ use std::{
 };
 
 use crate::broadcasting::Broadcastable;
-use crate::macros::{check_batch_sizes, check_input_count};
-use crate::tracing_v2::{
-    AtomId, Traceable, TracingError,
-    batch::Batch,
-    engine::Engine,
-    forward::{JvpTracer, TangentSpace},
-};
 use crate::types::{ArrayType, Type};
+use crate::{
+    batching::{Batch, check_batch_sizes},
+    macros::check_input_count,
+    tracing_v2::{
+        AtomId, Traceable, TracingError,
+        engine::Engine,
+        forward::{JvpTracer, TangentSpace},
+    },
+};
 
 use super::{DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation};
 

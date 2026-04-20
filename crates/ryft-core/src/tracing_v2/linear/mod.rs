@@ -25,7 +25,6 @@ use crate::{
     tracing_v2::{
         Atom, AtomId, Instruction, LinearPrimitiveOperation, OneLike, Program, ProgramBuilder, Traceable, TracingError,
         Value, ZeroLike,
-        batch::{Batch, stack, unstack},
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::{Tracer, interpret_and_trace},

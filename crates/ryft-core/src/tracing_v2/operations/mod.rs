@@ -51,11 +51,11 @@
 use std::{fmt::Display, sync::Arc};
 
 use crate::{
+    batching::Batch,
     macros::check_input_count,
     parameters::Parameterized,
     tracing_v2::{
-        AtomId, Traceable, TracingError, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer,
-        linear::LinearTerm,
+        AtomId, Traceable, TracingError, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
     },
     types::{ArrayType, Type, Typed},
 };
@@ -105,9 +105,6 @@ pub mod scale;
 /// Elementwise sine.
 pub mod sin;
 
-/// Traced `vmap` operations.
-pub mod vmap;
-
 pub use crate::tracing_v2::programs::{InterpretableOperation, Operation};
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
 pub use cos::{Cos, CosOperation, CosTracingOperation};
@@ -128,7 +125,6 @@ pub use reshape::{LinearReshapeOperation, ReshapeOperation, ReshapeTracingOperat
 pub use right_matmul::{LinearRightMatMulOperation, RightMatMulOperation, RightMatMulTracingOperation};
 pub use scale::{LinearScaleOperation, ScaleOperation, ScaleTracingOperation};
 pub use sin::{Sin, SinOperation, SinTracingOperation};
-pub use vmap::{FlatTracedVMap, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation};
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
 pub fn lift_jit_constant<
@@ -262,7 +258,8 @@ pub trait DifferentiableOperation<T: Type + Display, V: Traceable<T>, Tangent, O
     /// Applies the forward-mode JVP rule.
     ///
     /// The `engine` argument carries the context needed to synthesize zero values for higher-order
-    /// ops that replay staged sub-programs (such as [`RematerializeOperation`] and [`VMapOperation`]). Pure
+    /// ops that replay staged sub-programs (such as
+    /// [`RematerializeOperation`] and [`crate::batching::VMapOperation`]). Pure
     /// arithmetic ops ignore it.
     fn jvp(
         &self,

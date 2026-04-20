@@ -11,10 +11,10 @@ use std::{
 };
 
 use crate::{
+    batching::Batch as BatchedValue,
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
         Traceable, TracingError, ZeroLike,
-        batch::Batch as BatchedValue,
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,
         linear::LinearTerm,

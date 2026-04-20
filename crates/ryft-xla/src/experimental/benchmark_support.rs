@@ -3,6 +3,7 @@
 //! This module owns the Rust-side benchmark cases that exercise the XLA tracing path and the
 //! higher-order `shard_map` operation.
 
+use ryft_core::batching::vmap;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing_v2::{
@@ -11,7 +12,7 @@ use ryft_core::tracing_v2::{
         BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region,
         record, summarize_program,
     },
-    grad, vmap,
+    grad,
 };
 
 use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOperation};
@@ -374,7 +375,7 @@ fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, Benc
                         let lanes: Vec<ShardMapTracer> = vmap(
                             crate::experimental::engine::XlaEngine::token(),
                             builder,
-                            |batch: ryft_core::tracing_v2::Batch<ShardMapTracer>| batch.clone() + batch.one_like(),
+                            |batch: ryft_core::batching::Batch<ShardMapTracer>| batch.clone() + batch.one_like(),
                             vec![gradient.clone(), gradient],
                         )
                         .unwrap_or_else(|error| {

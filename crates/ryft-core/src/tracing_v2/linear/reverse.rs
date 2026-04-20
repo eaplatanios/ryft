@@ -12,6 +12,7 @@
 //! the final replay happens.
 
 use super::*;
+use crate::batching::{Batch, BatchingError, stack, unstack};
 
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
@@ -483,7 +484,7 @@ where
 
         let lane_primals: Vec<Input::To<V>> = unstack(primals)?;
         if lane_primals.is_empty() {
-            return Err(TracingError::EmptyBatch);
+            return Err(BatchingError::EmptyBatch.into());
         }
 
         let lane0 = lane_primals[0].clone();

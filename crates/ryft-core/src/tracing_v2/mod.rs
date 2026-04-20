@@ -16,10 +16,11 @@
 //!
 //! A typical `tracing_v2` flow looks like this:
 //!
-//! 1. A transform such as [`interpret_and_trace`], [`jvp`], [`vjp`], or [`vmap`] receives a Rust
+//! 1. A transform such as [`interpret_and_trace`], [`jvp`], [`vjp`], or
+//!    [`crate::batching::vmap`] receives a Rust
 //!    closure.
-//! 2. The transform chooses a leaf regime: concrete values, [`Tracer`] values, [`Batch`] values,
-//!    [`JvpTracer`] values, or staged linear terms.
+//! 2. The transform chooses a leaf regime: concrete values, [`Tracer`] values,
+//!    [`crate::batching::Batch`] values, [`JvpTracer`] values, or staged linear terms.
 //! 3. Primitive trait impls in [`operations`] either execute eagerly or record instructions into a
 //!    [`ProgramBuilder`].
 //! 4. The resulting [`Program`] is simplified, replayed, transposed, or
@@ -42,8 +43,7 @@
 //! - [`forward`] layers forward-mode differentiation on top of the same staging model.
 //! - [`linear`] turns staged primal programs into linear maps, pullbacks, dense Jacobians, and
 //!   compiled gradients.
-//! - [`Batch`] together with [`stack`], [`unstack`], and [`vmap`] provides the explicit batching
-//!   surface.
+//! - [`crate::batching`] owns the explicit batching surface and traced `vmap` operation types.
 //!
 //! # Role In The Library
 //!
@@ -53,9 +53,9 @@
 
 use thiserror::Error;
 
+use crate::batching::BatchingError;
 use crate::parameters::ParameterError;
 
-pub(crate) mod batch;
 #[cfg(feature = "benchmarking")]
 pub(crate) mod benchmark_support;
 #[cfg(feature = "benchmarking")]
@@ -70,7 +70,6 @@ pub(crate) mod programs;
 pub(crate) mod test_support;
 mod values;
 
-pub use batch::{Batch, stack, unstack, vmap};
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use jit::{Tracer, interpret_and_trace, trace};
@@ -93,23 +92,15 @@ pub use values::{OneLike, ZeroLike};
 
 /// Error type shared by the `tracing_v2` staging and transform pipeline.
 ///
-/// [`TracingError`] intentionally spans the whole subsystem: primitive abstract evaluation, staged
-/// program construction, batching, higher-order transform synthesis, and program replay. Keeping
-/// the error vocabulary in one place lets the public transform APIs stay small while still
-/// preserving the failure modes that matter when debugging tracing behavior.
+/// [`TracingError`] intentionally spans the tracing subsystem: primitive abstract evaluation,
+/// staged program construction, higher-order transform synthesis, and program replay. The
+/// batching-specific failures now live in [`BatchingError`] and are wrapped here when batching
+/// participates inside a tracing flow.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TracingError {
     /// Structured inputs or outputs did not have the same `Parameterized` shape.
     #[error("mismatched parameter structures")]
     MismatchedParameterStructure,
-
-    /// A batching transform encountered zero lanes and therefore could not infer a batch size.
-    #[error("encountered an empty batch")]
-    EmptyBatch,
-
-    /// Different batched leaves disagreed on the number of lanes they carried.
-    #[error("mismatched batch sizes across batched leaves")]
-    MismatchedBatchSize,
 
     /// A primitive or staged program received the wrong number of inputs.
     #[error("invalid number of inputs; expected {expected} but got {got}")]
@@ -142,4 +133,8 @@ pub enum TracingError {
     /// Wrapper around parameter-lifting failures from the `Parameterized` infrastructure.
     #[error(transparent)]
     Parameter(#[from] ParameterError),
+
+    /// Wrapper around batching- and vmapping-specific failures.
+    #[error(transparent)]
+    Batching(#[from] BatchingError),
 }

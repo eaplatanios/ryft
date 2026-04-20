@@ -8,14 +8,15 @@ use std::ops::{Add, Mul, Neg};
 #[cfg(feature = "ndarray")]
 use ndarray::{Array2, arr2};
 
-use crate::tracing_v2::{
-    Batch, OneLike, Program, Sin, Traceable, Tracer,
-    benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
-    engine::ArrayScalarEngine,
-    grad, interpret_and_trace, jvp, jvp_program, stack, unstack, value_and_grad, vjp, vmap,
-};
+use crate::batching::{Batch, stack, unstack, vmap};
 #[cfg(feature = "ndarray")]
 use crate::tracing_v2::{MatrixOps, ZeroLike, operations::matrix::ndarray_support::Array2Engine};
+use crate::tracing_v2::{
+    OneLike, Program, Sin, Traceable, Tracer,
+    benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
+    engine::ArrayScalarEngine,
+    grad, interpret_and_trace, jvp, jvp_program, value_and_grad, vjp,
+};
 use crate::types::ArrayType;
 
 /// Returns the tracing-only IR benchmark cases.

@@ -6,10 +6,9 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::batching::Batch as BatchedValue;
 use crate::macros::check_input_count;
-use crate::tracing_v2::{
-    Traceable, TracingError, batch::Batch as BatchedValue, engine::Engine, forward::JvpTracer, linear::LinearTerm,
-};
+use crate::tracing_v2::{Traceable, TracingError, engine::Engine, forward::JvpTracer, linear::LinearTerm};
 use crate::types::{ArrayType, Type};
 
 use super::{

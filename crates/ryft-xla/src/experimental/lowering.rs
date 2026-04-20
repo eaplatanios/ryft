@@ -10,15 +10,16 @@ use ryft_mlir::{
     Operation as MlirOperation, Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
 };
 
+use ryft_core::batching::{FlatTracedVMap, LinearVMapOperation, VMapOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing_v2::{
     Atom, AtomId, CustomPrimitive, LinearPrimitiveOperation, MatrixOps, Operation, PrimitiveOperation, Program,
     Traceable,
     operations::{
-        AddOperation, CosOperation, FlatTracedVMap, LeftMatMulOperation, LinearRematerializeOperation,
-        LinearVMapOperation, MatMulOperation, MatrixTransposeOperation, MulOperation, NegOperation,
-        RematerializeOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation, VMapOperation,
+        AddOperation, CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
+        MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
+        RightMatMulOperation, ScaleOperation, SinOperation,
     },
 };
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};

@@ -6,6 +6,7 @@ use std::{
 };
 
 use ryft_core::{
+    batching::{VMapOperation, VMapTracingOperation},
     tracing_v2::{
         AtomId, CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearPrimitiveOperation, LinearTerm,
         Operation, TracingError,
@@ -18,8 +19,8 @@ use ryft_core::{
             MatrixTransposeOperation, MatrixTransposeTracingOperation, MulOperation, MulTracingOperation, NegOperation,
             NegTracingOperation, RematerializeOperation, RematerializeTracingOperation, ReshapeOperation,
             ReshapeTracingOperation, RightMatMulOperation, RightMatMulTracingOperation, ScaleOperation,
-            ScaleTracingOperation, SinOperation, SinTracingOperation, VMapOperation, VMapTracingOperation,
-            left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
+            ScaleTracingOperation, SinOperation, SinTracingOperation, left_matmul::left_matmul_abstract_eval,
+            right_matmul::right_matmul_abstract_eval,
         },
     },
     types::{ArrayType, Typed},

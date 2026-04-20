@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::batching::BatchingError;
 use crate::broadcasting::BroadcastingError;
 use crate::parameters::ParameterError;
 use crate::sharding::ShardingError;
@@ -19,6 +20,9 @@ pub enum Error {
 
     #[error(transparent)]
     Broadcasting(#[from] BroadcastingError),
+
+    #[error(transparent)]
+    Batching(#[from] BatchingError),
 
     #[error(transparent)]
     Sharding(#[from] ShardingError),

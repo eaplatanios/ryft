@@ -1809,8 +1809,9 @@ mod tests {
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
+    use ryft_core::batching::vmap;
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{OneLike, Sin, grad, vmap};
+    use ryft_core::tracing_v2::{OneLike, Sin, grad};
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;
@@ -3083,7 +3084,7 @@ mod tests {
                 let lanes: Vec<ShardMapTracer> = vmap(
                     crate::experimental::engine::XlaEngine::token(),
                     builder,
-                    |y: ryft_core::tracing_v2::Batch<ShardMapTracer>| y.clone() + y.one_like(),
+                    |y: ryft_core::batching::Batch<ShardMapTracer>| y.clone() + y.one_like(),
                     vec![gradient.clone(), gradient],
                 )
                 .expect("vmap should succeed");
