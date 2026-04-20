@@ -969,7 +969,8 @@ fn factorize_transpose_shard_map_body(
     let primal_input_atoms = program.input_ids[..primal_input_count].to_vec();
     let residual_program =
         project_flat_shard_map_program(program, primal_input_atoms.as_slice(), residual_atoms.as_slice())?
-            .with_folded_constants()?;
+            .with_folded_constants()?
+            .simplified()?;
     let residual_local_output_types = residual_atoms
         .iter()
         .map(|atom_id| program.atoms[atom_id.index].r#type().into_owned())
@@ -999,7 +1000,8 @@ fn factorize_transpose_shard_map_body(
 
     let apply_program =
         build_factorized_apply_program(&simplified_body, residual_atoms.as_slice(), depends_on_cotangent.as_slice())?
-            .with_folded_constants()?;
+            .with_folded_constants()?
+            .simplified()?;
     let residual_global_output_types = residual_body.global_output_types.clone();
     let residual_local_output_types = residual_body.local_output_types.clone();
     let apply_shard_map = crate::experimental::shard_map::ShardMap::from_shardings(
@@ -1090,7 +1092,7 @@ fn try_linearize_traced_shard_map_body<
     };
     let program =
         builder.build::<Vec<ShardMapTracer>, Vec<ShardMapTracer>>(tangent_outputs, input_structure, output_structure);
-    let program = program.with_folded_constants()?;
+    let program = program.with_folded_constants()?.simplified()?;
     Ok((primal_outputs.clone(), ryft_core::tracing_v2::LinearProgram::from_program(program, zero)))
 }
 

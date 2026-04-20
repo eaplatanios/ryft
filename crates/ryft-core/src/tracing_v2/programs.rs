@@ -369,168 +369,60 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
         Ok(builder.build::<Input, Output>(outputs, self.input_structure.clone(), self.output_structure.clone()))
     }
 
-    /// Rebuilds the program after folding any live instruction whose remapped inputs are all constants.
+    /// Folds any instruction whose inputs are all currently-known constants.
+    ///
+    /// This pass preserves the surrounding program structure. It removes the instructions that it
+    /// successfully folds and rewrites their output atoms to [`Atom::Constant`], but it does not
+    /// perform dead-code elimination or liveness-based cleanup afterward.
     pub fn with_folded_constants(&self) -> Result<Self, TracingError>
     where
         O: InterpretableOperation<T, V>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<
-            O: Clone + Operation<T>,
-            T: Type,
-            V: Traceable<T>,
-            Input: Parameterized<V>,
-            Output: Parameterized<V>,
-        >(
-            program: &Program<T, V, O, Input, Output>,
-            atom_id: AtomId,
-            live_atoms: &mut [bool],
-            live_instructions: &mut [bool],
-            instruction_by_output: &[Option<usize>],
-        ) {
-            if live_atoms[atom_id.index] {
-                return;
-            }
-            live_atoms[atom_id.index] = true;
-            if let Some(instruction_index) = instruction_by_output[atom_id.index] {
-                if live_instructions[instruction_index] {
-                    return;
-                }
-                live_instructions[instruction_index] = true;
-                let instruction = &program.instructions[instruction_index];
-                for input in instruction.inputs.iter().copied() {
-                    mark_live(program, input, live_atoms, live_instructions, instruction_by_output);
-                }
-            }
-        }
+        let mut atoms = self.atoms.clone();
+        let mut instructions = Vec::with_capacity(self.instructions.len());
 
-        fn remap_atom<
-            O: Clone + InterpretableOperation<T, V> + Operation<T>,
-            T: Type,
-            V: Traceable<T>,
-            Input: Parameterized<V>,
-            Output: Parameterized<V>,
-        >(
-            atom_id: AtomId,
-            program: &Program<T, V, O, Input, Output>,
-            builder: &mut ProgramBuilder<T, V, O>,
-            atom_mapping: &mut HashMap<AtomId, AtomId>,
-            live_instructions: &[bool],
-            instruction_by_output: &[Option<usize>],
-        ) -> Result<AtomId, TracingError> {
-            if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
-                return Ok(*mapped_atom);
+        for instruction in self.instructions.iter() {
+            let mut input_constants = Vec::with_capacity(instruction.inputs.len());
+            let mut all_inputs_constant = true;
+            for input in instruction.inputs.iter().copied() {
+                let atom = atoms.get(input.index).ok_or(TracingError::UnboundAtomId { id: input })?;
+                let Some(value) = atom.as_constant() else {
+                    all_inputs_constant = false;
+                    break;
+                };
+                input_constants.push(value.clone());
             }
 
-            let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-            let mapped_atom = match atom {
-                Atom::Constant(value) => builder.add_constant(value.clone()),
-                Atom::Variable(_) => {
-                    let instruction_index = instruction_by_output[atom_id.index]
-                        .ok_or(TracingError::InternalInvariantViolation("variable atom had no owning instruction"))?;
-                    if !live_instructions[instruction_index] {
-                        return Err(TracingError::InternalInvariantViolation(
-                            "attempted to remap a dead variable atom during constant folding",
-                        ));
-                    }
-                    let instruction = &program.instructions[instruction_index];
-                    let remapped_inputs = instruction
-                        .inputs
-                        .iter()
-                        .copied()
-                        .map(|input| {
-                            remap_atom(input, program, builder, atom_mapping, live_instructions, instruction_by_output)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let remapped_outputs = if remapped_inputs
-                        .iter()
-                        .all(|input| matches!(builder.atom(*input), Some(Atom::Constant(_))))
-                    {
-                        let input_constants = remapped_inputs
-                            .iter()
-                            .map(|input| {
-                                builder
-                                    .atom(*input)
-                                    .and_then(Atom::as_constant)
-                                    .cloned()
-                                    .ok_or(TracingError::UnboundAtomId { id: *input })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        instruction
-                            .operation
-                            .interpret(input_constants.as_slice())?
-                            .into_iter()
-                            .map(|output| builder.add_constant(output))
-                            .collect::<Vec<_>>()
-                    } else {
-                        builder.add_instruction(instruction.operation.clone(), remapped_inputs)?
-                    };
-                    for (old_output, new_output) in
-                        instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
-                    {
-                        atom_mapping.insert(old_output, new_output);
-                    }
-                    *atom_mapping
-                        .get(&atom_id)
-                        .ok_or(TracingError::InternalInvariantViolation("failed to record remapped program outputs"))?
-                }
-            };
-            atom_mapping.entry(atom_id).or_insert(mapped_atom);
-            Ok(mapped_atom)
-        }
+            if !all_inputs_constant {
+                instructions.push(instruction.clone());
+                continue;
+            }
 
-        let mut instruction_by_output = vec![None; self.atoms.len()];
-        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
-            for output in instruction.outputs.iter().copied() {
-                instruction_by_output[output.index] = Some(instruction_index);
+            let output_constants = instruction.operation.interpret(input_constants.as_slice())?;
+            if output_constants.len() != instruction.outputs.len() {
+                return Err(TracingError::InvalidOutputCount {
+                    expected: instruction.outputs.len(),
+                    got: output_constants.len(),
+                });
+            }
+
+            for (output_atom, output_value) in instruction.outputs.iter().copied().zip(output_constants.into_iter()) {
+                let atom = atoms.get_mut(output_atom.index).ok_or(TracingError::UnboundAtomId { id: output_atom })?;
+                *atom = Atom::Constant(output_value);
             }
         }
 
-        let mut live_atoms = vec![false; self.atoms.len()];
-        let mut live_instructions = vec![false; self.instructions.len()];
-        for output in self.output_ids.iter().copied() {
-            mark_live(
-                self,
-                output,
-                live_atoms.as_mut_slice(),
-                live_instructions.as_mut_slice(),
-                instruction_by_output.as_slice(),
-            );
-        }
-
-        let mut builder = ProgramBuilder::<T, V, O>::new();
-        let mut atom_mapping = HashMap::new();
-        for input_atom in self.input_ids.iter().copied() {
-            let input = self.atoms.get(input_atom.index).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
-            let Atom::Variable(r#type) = input else {
-                return Err(TracingError::InternalInvariantViolation(
-                    "staged program input atom did not retain a type",
-                ));
-            };
-            let mapped = builder.add_input(r#type.clone());
-            atom_mapping.insert(input_atom, mapped);
-        }
-
-        let outputs = self
-            .output_ids
-            .iter()
-            .copied()
-            .map(|output| {
-                remap_atom(
-                    output,
-                    self,
-                    &mut builder,
-                    &mut atom_mapping,
-                    live_instructions.as_slice(),
-                    instruction_by_output.as_slice(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let folded_program =
-            builder.build::<Input, Output>(outputs, self.input_structure.clone(), self.output_structure.clone());
-        folded_program.simplified()
+        Ok(Self {
+            atoms,
+            input_ids: self.input_ids.clone(),
+            output_ids: self.output_ids.clone(),
+            instructions,
+            input_structure: self.input_structure.clone(),
+            output_structure: self.output_structure.clone(),
+            marker: PhantomData,
+        })
     }
 }
 
@@ -870,11 +762,13 @@ mod tests {
         assert!(matches!(builder.atom(result[0]).unwrap(), Atom::Variable(_)));
         assert_eq!(builder.instruction_count(), 2);
 
-        // `with_folded_constants` folds the constant-only sum and removes the now-dead add instruction.
+        // `with_folded_constants` folds the constant-only sum but leaves dead constants in place.
         let program = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
         assert_eq!(program.instructions.len(), 2);
         let program = program.with_folded_constants().unwrap();
         assert_eq!(program.instructions.len(), 1);
+        assert_eq!(program.atoms.len(), 5);
+        let program = program.simplified().unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

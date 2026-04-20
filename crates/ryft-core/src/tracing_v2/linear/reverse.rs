@@ -484,7 +484,8 @@ where
             output_structure: flat_leaf_parameter_structure(1),
             marker: std::marker::PhantomData,
         }
-        .with_folded_constants()?;
+        .with_folded_constants()?
+        .simplified()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
         let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>) =

@@ -322,7 +322,7 @@ where
             },
             exemplar_input_types,
         )?;
-        let body_program = body_program.with_folded_constants()?;
+        let body_program = body_program.with_folded_constants()?.simplified()?;
 
         let output_structure = exemplar_output_types.parameter_structure();
         let output_leaf_count = output_structure.parameter_count();

@@ -528,7 +528,8 @@ where
             output_structure: vec![Placeholder; output_parameter_count],
             marker: std::marker::PhantomData,
         }
-        .with_folded_constants()?;
+        .with_folded_constants()?
+        .simplified()?;
 
         // Compile the full JVP into a reusable program. Inside the JIT scope, the program is
         // replayed symbolically with `linearize_traced_program`, which produces both the

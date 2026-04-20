@@ -392,7 +392,8 @@ where
         output_structure,
         marker: std::marker::PhantomData,
     }
-    .with_folded_constants()?;
+    .with_folded_constants()?
+    .simplified()?;
     let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
     Ok((program.interpret(concrete_input)?, program))
 }
