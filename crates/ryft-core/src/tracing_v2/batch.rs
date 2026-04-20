@@ -292,7 +292,7 @@ where
             input_structure.clone(),
             traced_inputs[0].iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let exemplar_engine = traced_inputs[0].first().ok_or(TracingError::EmptyParameterizedValue)?.engine();
+        let exemplar_engine = traced_inputs[0].first().ok_or(TracingError::EmptyParameterizedValue)?.engine;
 
         let (exemplar_output_types, body_program): (
             Output::To<ArrayType>,

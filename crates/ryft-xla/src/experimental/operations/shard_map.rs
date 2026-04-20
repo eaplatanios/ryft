@@ -209,7 +209,7 @@ impl ShardMapOperation<ShardMapTensor> {
         &self,
         primals: &[ShardMapTracer],
     ) -> Result<ShardMapOperation<ShardMapTracer>, TracingError> {
-        let captured_atoms = primals.iter().map(|primal| primal.atom()).collect::<Vec<_>>();
+        let captured_atoms = primals.iter().map(|primal| primal.atom).collect::<Vec<_>>();
         match &self.linear_state {
             Some(linear_state) => Ok(ShardMapOperation::new_linear(
                 self.body.clone(),
@@ -615,10 +615,10 @@ fn reify_captured_global_primals(
     inputs: &[ShardMapTracer],
 ) -> Result<Vec<ShardMapTracer>, TracingError> {
     let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
-    let builder = exemplar.builder_handle();
+    let builder = exemplar.builder.clone();
     Ok(captured_global_primals
         .iter()
-        .map(|atom| Tracer::from_engine(*atom, builder.clone(), exemplar.engine()))
+        .map(|atom| Tracer::from_engine(*atom, builder.clone(), exemplar.engine))
         .collect())
 }
 
@@ -1250,7 +1250,7 @@ fn make_linear_shard_map(
     };
     Ok(ShardMapOperation::new_linear(
         body.clone(),
-        captured_global_primals.into_iter().map(|primal| primal.atom()).collect::<Vec<_>>(),
+        captured_global_primals.into_iter().map(|primal| primal.atom).collect::<Vec<_>>(),
         body.global_input_types.clone(),
         body.global_output_types.clone(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),
@@ -1449,9 +1449,9 @@ pub(crate) fn apply_linearized_flat_shard_map(
 impl ReplayShardMapValue for ShardMapTracer {
     fn lift_constant(constant: &ShardMapTensor, inputs: &[Self]) -> Result<Self, TracingError> {
         let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
-        let builder = exemplar.builder_handle();
+        let builder = exemplar.builder.clone();
         let atom = builder.borrow_mut().add_constant(constant.clone());
-        Ok(Tracer::from_engine(atom, builder, exemplar.engine()))
+        Ok(Tracer::from_engine(atom, builder, exemplar.engine))
     }
 
     fn apply_flat_body(body: FlatTracedShardMap, inputs: Vec<Self>) -> Result<Vec<Self>, ShardMapTraceError> {

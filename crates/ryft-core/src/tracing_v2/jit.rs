@@ -41,13 +41,13 @@ use crate::{
 #[derive(Parameter)]
 pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> {
     /// Atom id representing this traced leaf inside the shared staged program.
-    atom: AtomId,
+    pub atom: AtomId,
 
     /// Shared builder that owns the staged program currently being traced.
-    builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
+    pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
 
     /// Engine borrowed by this tracing scope for metadata-driven value synthesis.
-    engine: &'engine E,
+    pub engine: &'engine E,
 }
 
 impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> Clone
@@ -67,30 +67,6 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 }
 
 impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> Tracer<'engine, E> {
-    #[doc(hidden)]
-    #[inline]
-    pub fn atom(&self) -> AtomId {
-        self.atom
-    }
-
-    /// Returns a clone of the shared builder that owns this tracer's staged atom.
-    ///
-    /// Higher-order transforms use this to stage additional instructions into the same trace without
-    /// exposing the builder mutably through the public API surface.
-    #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>> {
-        self.builder.clone()
-    }
-
-    /// Returns the engine borrowed by this tracing scope.
-    ///
-    /// The engine gives traced values access to metadata-driven zero/one synthesis and identifies
-    /// the staged operation carriers being recorded.
-    #[inline]
-    pub fn engine(&self) -> &'engine E {
-        self.engine
-    }
-
     /// Constructs a traced leaf from an existing tracing scope.
     ///
     /// This is the standard constructor used by entry points such as [`trace`] when they turn one
@@ -212,7 +188,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 {
     #[inline]
     fn zero_like(&self) -> Self {
-        let value = self.engine().zero(&self.r#type().into_owned());
+        let value = self.engine.zero(&self.r#type().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
         Self { atom, builder: self.builder.clone(), engine: self.engine }
     }
@@ -223,7 +199,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 {
     #[inline]
     fn one_like(&self) -> Self {
-        let value = self.engine().one(&self.r#type().into_owned());
+        let value = self.engine.one(&self.r#type().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
         Self { atom, builder: self.builder.clone(), engine: self.engine }
     }
@@ -322,7 +298,7 @@ where
             output_structure.clone(),
             traced_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let outputs = traced_outputs.into_iter().map(|output| output.atom()).collect::<Vec<_>>();
+        let outputs = traced_outputs.into_iter().map(|output| output.atom).collect::<Vec<_>>();
         let output_structure = output_types.parameter_structure();
         (output_structure, output_types, outputs)
     };

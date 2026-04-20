@@ -397,8 +397,9 @@ where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
 {
     let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
-    let atom = exemplar.builder_handle().borrow_mut().add_constant(constant.clone());
-    Ok(Tracer::from_engine(atom, exemplar.builder_handle(), exemplar.engine()))
+    let builder = exemplar.builder.clone();
+    let atom = builder.borrow_mut().add_constant(constant.clone());
+    Ok(Tracer::from_engine(atom, builder, exemplar.engine))
 }
 
 pub(crate) fn lift_linearized_traced_constant<

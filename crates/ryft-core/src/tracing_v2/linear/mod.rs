@@ -95,7 +95,7 @@ where
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
-    let exemplar_engine = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.engine();
+    let exemplar_engine = traced_inputs.first().ok_or(TracingError::EmptyParameterizedValue)?.engine;
     let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
         crate::tracing_v2::jit::trace(exemplar_engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();

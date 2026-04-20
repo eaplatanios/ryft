@@ -502,7 +502,7 @@ mod tests {
                 .next()
                 .expect("transpose should return one contribution")
                 .expect("transpose should produce one cotangent contribution");
-        let contribution_atom = contribution.atom();
+        let contribution_atom = contribution.atom;
         drop(contribution);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)
