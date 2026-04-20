@@ -635,7 +635,7 @@ mod tests {
 
         use crate::{
             tracing_v2::{Cos, MatrixOps, OneLike, Sin, ZeroLike, operations::reshape::ReshapeOps},
-            types::{ArrayType, DataType, Typed},
+            types::{ArrayType, DataType, Shape, Size, Typed},
         };
 
         #[derive(Clone, Debug, Parameter)]
@@ -758,8 +758,12 @@ mod tests {
             &TestEngine,
             |inputs: (Tracer<TestEngine>, Tracer<TestEngine>)| Ok(inputs.0 + inputs.1),
             (
-                TestAbstractValue { r#type: ArrayType::scalar(DataType::F32) },
-                TestAbstractValue { r#type: ArrayType::scalar(DataType::F64) },
+                TestAbstractValue {
+                    r#type: ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
+                },
+                TestAbstractValue {
+                    r#type: ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
+                },
             ),
         );
 

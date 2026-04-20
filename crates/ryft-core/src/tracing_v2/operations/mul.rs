@@ -9,6 +9,7 @@ use std::{
     ops::Mul,
 };
 
+use crate::broadcasting::Broadcastable;
 use crate::tracing_v2::{
     AtomId, Traceable, TracingError,
     batch::Batch,
@@ -18,8 +19,8 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, binary_same_abstract,
-    expect_batch_sizes_match, expect_input_count,
+    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, expect_batch_sizes_match,
+    expect_input_count,
 };
 
 /// Hidden staging trait for the multiplication primitive.
@@ -54,7 +55,11 @@ impl Operation for MulOperation {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        Ok(vec![binary_same_abstract("mul", inputs)?])
+        expect_input_count(inputs.len(), 2)?;
+        inputs[0]
+            .broadcast(&inputs[1])
+            .map(|output| vec![output])
+            .map_err(|_| TracingError::IncompatibleAbstractValues { op: "mul" })
     }
 
     fn try_simplify(
@@ -127,7 +132,10 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType,
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use crate::tracing_v2::{engine::ArrayScalarEngine, test_support};
+    use crate::types::{DataType, Shape, Size};
 
     use super::*;
 
@@ -157,5 +165,38 @@ mod tests {
         approx_eq(output.primal, 10.0);
         approx_eq(output.tangent, 13.0);
         test_support::assert_bilinear_pushforward_rendering();
+    }
+
+    #[test]
+    fn test_mul_abstract_eval_broadcasts_and_promotes_inputs() {
+        let output = <MulOperation as Operation>::abstract_eval(
+            &MulOperation,
+            &[
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(3)]), None, None).unwrap(),
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            vec![
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None,).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mul_abstract_eval_rejects_non_broadcastable_inputs() {
+        let error = <MulOperation as Operation>::abstract_eval(
+            &MulOperation,
+            &[
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TracingError::IncompatibleAbstractValues { op: "mul" });
     }
 }

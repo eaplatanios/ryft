@@ -10,6 +10,7 @@ use std::{
     ops::Add,
 };
 
+use crate::broadcasting::Broadcastable;
 use crate::tracing_v2::{
     AtomId, Traceable, TracingError, ZeroLike,
     batch::Batch,
@@ -21,7 +22,7 @@ use crate::types::{ArrayType, Type};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
-    binary_same_abstract, expect_batch_sizes_match, expect_input_count,
+    expect_batch_sizes_match, expect_input_count,
 };
 
 /// Hidden staging trait for the addition primitive.
@@ -67,7 +68,11 @@ impl Operation for AddOperation {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        Ok(vec![binary_same_abstract("add", inputs)?])
+        expect_input_count(inputs.len(), 2)?;
+        inputs[0]
+            .broadcast(&inputs[1])
+            .map(|output| vec![output])
+            .map_err(|_| TracingError::IncompatibleAbstractValues { op: "add" })
     }
 
     fn try_simplify(
@@ -145,16 +150,38 @@ mod tests {
 
     use crate::{
         tracing_v2::test_support,
-        types::{DataType, Layout, Shape, StridedLayout},
+        types::{DataType, Layout, Shape, Size, StridedLayout},
     };
 
     use super::*;
 
     #[test]
-    fn test_add_abstract_eval_rejects_incompatible_inputs() {
+    fn test_add_abstract_eval_broadcasts_and_promotes_inputs() {
+        let output = <AddOperation as Operation>::abstract_eval(
+            &AddOperation,
+            &[
+                ArrayType::scalar(DataType::F32),
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            vec![
+                ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]), None, None,).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_add_abstract_eval_rejects_non_broadcastable_inputs() {
         let error = <AddOperation as Operation>::abstract_eval(
             &AddOperation,
-            &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
+            &[
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
+                ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)]), None, None).unwrap(),
+            ],
         )
         .unwrap_err();
 
