@@ -77,8 +77,8 @@ impl Operation for SinOperation {
         "sin"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        Ok(vec![unary_abstract(inputs)?])
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        Ok(vec![unary_abstract(input_types)?])
     }
 }
 

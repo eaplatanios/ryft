@@ -56,9 +56,9 @@ impl Operation for MatrixTransposeOperation {
         "matrix_transpose"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![transpose_abstract(&inputs[0], "matrix_transpose")?])
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        check_input_count!(input_types, 1);
+        Ok(vec![transpose_abstract(&input_types[0], "matrix_transpose")?])
     }
 }
 

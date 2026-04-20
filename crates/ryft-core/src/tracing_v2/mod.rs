@@ -83,10 +83,12 @@ pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{
-    Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, InterpretableOperation,
-    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin, VectorizableOperation,
+    Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, LinearCustomPrimitive, LinearOperation,
+    LinearPrimitiveOperation, PrimitiveOperation, Sin, VectorizableOperation,
 };
-pub use programs::{Atom, AtomId, Instruction, Operation, Program, ProgramBuilder, Traceable, Value};
+pub use programs::{
+    Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, Value,
+};
 pub use values::{OneLike, ZeroLike};
 
 /// Error type shared by the `tracing_v2` staging and transform pipeline.

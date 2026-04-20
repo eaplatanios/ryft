@@ -205,11 +205,11 @@ mod tests {
             "panic_replay"
         }
 
-        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+            if input_types.len() != 1 {
+                return Err(TracingError::InvalidInputCount { expected: 1, got: input_types.len() });
             }
-            Ok(vec![inputs[0].clone()])
+            Ok(vec![input_types[0].clone()])
         }
     }
 
@@ -308,11 +308,13 @@ mod tests {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let input = builder.add_input(3.0f64.r#type().into_owned());
-        let output = builder.add_instruction_prevalidated(
-            PrimitiveOperation::Custom(Arc::new(primitive)),
-            vec![input],
-            vec![ArrayType::scalar(DataType::F64)],
-        );
+        let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
+        builder.instructions.push(Instruction {
+            operation: PrimitiveOperation::Custom(Arc::new(primitive)),
+            inputs: vec![input],
+            outputs: vec![output_atom],
+        });
+        let output = vec![output_atom];
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);
 
         let engine = ArrayScalarEngine::<f64>::new();
@@ -328,8 +330,13 @@ mod tests {
         .unwrap();
         let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new();
         let input = builder.add_input(0.0f64.r#type().into_owned());
-        let output =
-            builder.add_instruction_prevalidated(primitive, vec![input], vec![ArrayType::scalar(DataType::F64)]);
+        let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
+        builder.instructions.push(Instruction {
+            operation: primitive,
+            inputs: vec![input],
+            outputs: vec![output_atom],
+        });
+        let output = vec![output_atom];
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder);
         let pushforward = LinearProgram::from_program(program, 0.0f64);
 

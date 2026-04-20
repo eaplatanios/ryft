@@ -159,11 +159,14 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operati
         "rematerialize"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        if inputs.len() != self.body.input_types.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.body.input_types.len(), got: inputs.len() });
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        if input_types.len() != self.body.input_types.len() {
+            return Err(TracingError::InvalidInputCount {
+                expected: self.body.input_types.len(),
+                got: input_types.len(),
+            });
         }
-        if inputs != self.body.input_types.as_slice() {
+        if input_types != self.body.input_types.as_slice() {
             return Err(TracingError::IncompatibleAbstractValues { op: "rematerialize" });
         }
         Ok(self.body.output_types.clone())
@@ -178,7 +181,7 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         self.body.program().interpret(inputs.to_vec())
     }
 }
@@ -367,11 +370,14 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation
         "rematerialize"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        if inputs.len() != self.body.input_types.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.body.input_types.len(), got: inputs.len() });
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        if input_types.len() != self.body.input_types.len() {
+            return Err(TracingError::InvalidInputCount {
+                expected: self.body.input_types.len(),
+                got: input_types.len(),
+            });
         }
-        if inputs != self.body.input_types.as_slice() {
+        if input_types != self.body.input_types.as_slice() {
             return Err(TracingError::IncompatibleAbstractValues { op: "rematerialize" });
         }
         Ok(self.body.output_types.clone())
@@ -386,7 +392,7 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         self.body.program().interpret(inputs.to_vec())
     }
 }

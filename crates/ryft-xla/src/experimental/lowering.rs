@@ -2754,11 +2754,11 @@ mod tests {
             "test_custom_lowered"
         }
 
-        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+            if input_types.len() != 1 {
+                return Err(TracingError::InvalidInputCount { expected: 1, got: input_types.len() });
             }
-            Ok(vec![inputs[0].clone()])
+            Ok(vec![input_types[0].clone()])
         }
     }
 

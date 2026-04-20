@@ -409,9 +409,9 @@ impl Operation for ReshapeOperation {
         "reshape"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(inputs, 1);
-        if inputs[0] != *self.input_type() {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        check_input_count!(input_types, 1);
+        if input_types[0] != *self.input_type() {
             return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
         }
         Ok(vec![self.output_type().clone()])

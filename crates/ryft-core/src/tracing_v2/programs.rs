@@ -28,7 +28,7 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing_v2::{TracingError, operations::InterpretableOperation},
+    tracing_v2::TracingError,
     types::{ArrayType, Type, Typed},
 };
 
@@ -197,8 +197,8 @@ pub trait Operation<T: Type = ArrayType>: Debug + Display {
     /// Returns the stable primitive name used in diagnostics and pretty-printing.
     fn name(&self) -> &'static str;
 
-    /// Computes abstract output types from abstract input types without executing the operation.
-    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TracingError>;
+    /// Computes output types from input types without executing the operation.
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TracingError>;
 
     /// Returns simplified output atoms if this operation is a trivial algebraic identity.
     ///
@@ -213,6 +213,16 @@ pub trait Operation<T: Type = ArrayType>: Debug + Display {
     ) -> Option<Vec<AtomId>> {
         None
     }
+}
+
+/// Concrete execution capability for staged operations.
+///
+/// Separated from [`Operation`] so that program construction, display, and simplification can work
+/// without value-type bounds. Only code paths that actually execute operations, such as program
+/// replay and JIT example propagation, require this trait.
+pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
+    /// Executes the operation on concrete values.
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 
 /// Single instruction in a staged program.
@@ -687,23 +697,9 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         id
     }
 
-    /// Adds a staged instruction without running abstract or concrete evaluation.
-    ///
-    /// This is intended for linear program construction where the output types are already known.
-    pub fn add_instruction_prevalidated(
-        &mut self,
-        operation: O,
-        inputs: Vec<AtomId>,
-        output_types: Vec<T>,
-    ) -> Vec<AtomId> {
-        let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
-        self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
-        outputs
-    }
-
     /// Adds a staged instruction using abstract evaluation and local algebraic simplification.
     ///
-    /// This validates the input atoms through [`Operation::abstract_eval`], applies any local
+    /// This validates the input atoms through [`Operation::infer_output_types`], applies any local
     /// `try_simplify` rewrite exposed by the operation, and otherwise stages one variable-output
     /// instruction.
     pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError> {
@@ -716,7 +712,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
                     .ok_or(TracingError::UnboundAtomId { id: *input })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output_abstracts = operation.abstract_eval(input_abstracts.as_slice())?;
+        let output_abstracts = operation.infer_output_types(input_abstracts.as_slice())?;
 
         let is_zero = |id: AtomId| matches!(self.atoms.get(id.index), Some(Atom::Constant(value)) if value.is_zero());
         let is_one = |id: AtomId| matches!(self.atoms.get(id.index), Some(Atom::Constant(value)) if value.is_one());
@@ -724,7 +720,9 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
             return Ok(simplified);
         }
 
-        Ok(self.add_instruction_prevalidated(operation, inputs, output_abstracts))
+        let outputs = output_abstracts.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
+        self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
+        Ok(outputs)
     }
 
     /// Finalizes the builder into a program with the given input/output structures.

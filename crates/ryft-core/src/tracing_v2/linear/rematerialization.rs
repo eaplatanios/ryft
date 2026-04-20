@@ -370,11 +370,13 @@ where
             .iter()
             .map(|&orig_atom| atom_mapping[orig_atom.index].ok_or(TracingError::UnboundAtomId { id: orig_atom }))
             .collect::<Result<_, _>>()?;
-        let outer_outputs = outer_builder.add_instruction_prevalidated(
-            E::TracingOperation::rematerialize_op(remat_op),
-            outer_inputs,
-            output_types,
-        );
+        let outer_outputs =
+            output_types.into_iter().map(|r#type| outer_builder.add_variable(r#type)).collect::<Vec<_>>();
+        outer_builder.instructions.push(Instruction {
+            operation: E::TracingOperation::rematerialize_op(remat_op),
+            inputs: outer_inputs,
+            outputs: outer_outputs.clone(),
+        });
 
         // Map the boundary output atoms to their outer-program counterparts.
         for (orig_atom, outer_atom) in boundary_output_atoms.iter().zip(outer_outputs.iter()) {
@@ -439,11 +441,12 @@ where
     let outer_inputs: Vec<AtomId> =
         input_types.iter().cloned().map(|input_type| outer_builder.add_input(input_type)).collect();
 
-    let outer_outputs = outer_builder.add_instruction_prevalidated(
-        E::TracingOperation::rematerialize_op(remat_op),
-        outer_inputs.clone(),
-        output_types,
-    );
+    let outer_outputs = output_types.into_iter().map(|r#type| outer_builder.add_variable(r#type)).collect::<Vec<_>>();
+    outer_builder.instructions.push(Instruction {
+        operation: E::TracingOperation::rematerialize_op(remat_op),
+        inputs: outer_inputs.clone(),
+        outputs: outer_outputs.clone(),
+    });
 
     let outer_program = outer_builder.build::<Vec<V>, Vec<V>>(
         outer_outputs,
@@ -517,7 +520,12 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
             })
             .collect::<Result<_, _>>()?;
         let sub_outputs =
-            sub_builder.add_instruction_prevalidated(instruction.operation.clone(), sub_inputs, output_abstracts);
+            output_abstracts.into_iter().map(|r#type| sub_builder.add_variable(r#type)).collect::<Vec<_>>();
+        sub_builder.instructions.push(Instruction {
+            operation: instruction.operation.clone(),
+            inputs: sub_inputs,
+            outputs: sub_outputs.clone(),
+        });
 
         for (orig_atom, sub_atom) in instruction.outputs.iter().zip(sub_outputs.iter()) {
             sub_atom_mapping.insert(*orig_atom, *sub_atom);

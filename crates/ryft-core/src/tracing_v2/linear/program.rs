@@ -294,11 +294,13 @@ where
             Some(existing) => {
                 let mut builder_borrow = builder.borrow_mut();
                 let abstract_value = builder_borrow.atoms[existing.index].r#type().into_owned();
-                builder_borrow.add_instruction_prevalidated(
-                    O::linear_add_op(),
-                    vec![existing, contribution],
-                    vec![abstract_value],
-                )[0]
+                let output = builder_borrow.add_variable(abstract_value);
+                builder_borrow.instructions.push(Instruction {
+                    operation: O::linear_add_op(),
+                    inputs: vec![existing, contribution],
+                    outputs: vec![output],
+                });
+                output
             }
             None => contribution,
         });

@@ -97,8 +97,8 @@ impl<V: Traceable<ArrayType>> Operation for ScaleOperation<ArrayType, V> {
         "scale"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        Self::abstract_eval_static(inputs)
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        Self::abstract_eval_static(input_types)
     }
 
     fn try_simplify(

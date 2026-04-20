@@ -38,9 +38,9 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
 
     /// Stages a multi-input operation in the tangent program builder.
     ///
-    /// Shape validation is performed via [`Operation::abstract_eval`]. Concrete evaluation is intentionally
-    /// skipped because tangent-program outputs remain abstract until the staged linear program is
-    /// replayed on concrete tangents.
+    /// Shape validation is performed via [`Operation::infer_output_types`]. Concrete evaluation is
+    /// intentionally skipped because tangent-program outputs remain abstract until the staged
+    /// linear program is replayed on concrete tangents.
     pub fn apply_staged_op(inputs: &[Self], op: O, output_count: usize) -> Result<Vec<Self>, TracingError>
     where
         O: Operation<T>,
@@ -58,10 +58,13 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
 
         let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
         let mut borrow = builder.borrow_mut();
-        let output_abstracts = op.abstract_eval(
+        let output_abstracts = op.infer_output_types(
             &input_atoms.iter().map(|id| borrow.atoms[id.index].r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let output_atoms = borrow.add_instruction_prevalidated(op, input_atoms, output_abstracts);
+        let output_atoms = output_abstracts.into_iter().map(|r#type| borrow.add_variable(r#type)).collect::<Vec<_>>();
+        borrow
+            .instructions
+            .push(Instruction { operation: op, inputs: input_atoms, outputs: output_atoms.clone() });
         drop(borrow);
         if output_atoms.len() != output_count {
             return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_atoms.len() });
@@ -78,7 +81,10 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
         let mut borrow = self.builder.borrow_mut();
         let input_atom = &borrow.atoms[self.atom.index];
         let abstract_value = input_atom.r#type().into_owned();
-        let atom = borrow.add_instruction_prevalidated(op, vec![self.atom], vec![abstract_value])[0];
+        let atom = borrow.add_variable(abstract_value);
+        borrow
+            .instructions
+            .push(Instruction { operation: op, inputs: vec![self.atom], outputs: vec![atom] });
         drop(borrow);
         Self { atom, builder: self.builder }
     }
@@ -93,8 +99,12 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
         let mut borrow = self.builder.borrow_mut();
         let input_atom = &borrow.atoms[self.atom.index];
         let abstract_value = input_atom.r#type().into_owned();
-        let atom =
-            borrow.add_instruction_prevalidated(O::linear_add_op(), vec![self.atom, rhs.atom], vec![abstract_value])[0];
+        let atom = borrow.add_variable(abstract_value);
+        borrow.instructions.push(Instruction {
+            operation: O::linear_add_op(),
+            inputs: vec![self.atom, rhs.atom],
+            outputs: vec![atom],
+        });
         drop(borrow);
         Self { atom, builder: self.builder }
     }
@@ -130,8 +140,12 @@ impl<
         let mut borrow = lhs.builder.borrow_mut();
         let input_atom = &borrow.atoms[lhs.atom.index];
         let abstract_value = input_atom.r#type().into_owned();
-        let atom =
-            borrow.add_instruction_prevalidated(O::linear_add_op(), vec![lhs.atom, rhs.atom], vec![abstract_value])[0];
+        let atom = borrow.add_variable(abstract_value);
+        borrow.instructions.push(Instruction {
+            operation: O::linear_add_op(),
+            inputs: vec![lhs.atom, rhs.atom],
+            outputs: vec![atom],
+        });
         drop(borrow);
         Self { atom, builder: lhs.builder }
     }

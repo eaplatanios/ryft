@@ -109,7 +109,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
                 .map(|input| builder_borrow.atoms[input.index].r#type().into_owned())
                 .collect::<Vec<_>>()
         };
-        let output_count = match op.abstract_eval(input_types.as_slice()) {
+        let output_count = match op.infer_output_types(input_types.as_slice()) {
             Ok(outputs) => outputs.len(),
             Err(error) => {
                 if builder.borrow().error.is_none() {
@@ -520,14 +520,14 @@ mod tests {
                 "test_add"
             }
 
-            fn abstract_eval(&self, inputs: &[TestType]) -> Result<Vec<TestType>, TracingError> {
-                if inputs.len() != 2 {
-                    return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
+            fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TracingError> {
+                if input_types.len() != 2 {
+                    return Err(TracingError::InvalidInputCount { expected: 2, got: input_types.len() });
                 }
-                if !inputs[0].is_compatible_with(&inputs[1]) {
+                if !input_types[0].is_compatible_with(&input_types[1]) {
                     return Err(TracingError::IncompatibleAbstractValues { op: "test_add" });
                 }
-                Ok(vec![inputs[0].clone()])
+                Ok(vec![input_types[0].clone()])
             }
 
             fn try_simplify(

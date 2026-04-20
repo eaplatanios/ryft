@@ -11,7 +11,7 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, Cos, CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearOperation,
+        AtomId, Cos, CustomPrimitive, DifferentiableOperation, Instruction, InterpretableOperation, LinearOperation,
         LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, OneLike, Operation, PrimitiveOperation, Program,
         ProgramBuilder, Sin, Traceable, Tracer, TracingError, ZeroLike, engine::Engine, forward::JvpTracer,
     },
@@ -299,11 +299,11 @@ impl Operation for ShardMapOperation<ShardMapTensor> {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        if inputs.len() != self.input_types.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        if input_types.len() != self.input_types.len() {
+            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: input_types.len() });
         }
-        if !inputs
+        if !input_types
             .iter()
             .zip(self.input_types.iter())
             .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
@@ -317,7 +317,7 @@ impl Operation for ShardMapOperation<ShardMapTensor> {
 impl InterpretableOperation<ArrayType, ShardMapTensor> for ShardMapOperation<ShardMapTensor> {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         Ok(self.output_types.iter().cloned().map(ShardMapTensor::new).collect::<Vec<_>>())
     }
 }
@@ -440,11 +440,11 @@ impl Operation for ShardMapOperation<ShardMapTracer> {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        if inputs.len() != self.input_types.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: inputs.len() });
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        if input_types.len() != self.input_types.len() {
+            return Err(TracingError::InvalidInputCount { expected: self.input_types.len(), got: input_types.len() });
         }
-        if !inputs
+        if !input_types
             .iter()
             .zip(self.input_types.iter())
             .all(|(actual, expected)| shard_map_boundary_types_match(actual, expected))
@@ -458,7 +458,7 @@ impl Operation for ShardMapOperation<ShardMapTracer> {
 impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<ShardMapTracer> {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         match &self.linear_state {
             None => apply_flat_traced_shard_map(self.body.clone(), inputs.to_vec()).map_err(trace_error_from_shard_map),
             Some(linear_state) => match &linear_state.eval_mode {
@@ -749,11 +749,13 @@ fn project_flat_shard_map_program(
                     .iter()
                     .map(|output| program.atoms[output.index].r#type().into_owned())
                     .collect::<Vec<_>>();
-                let remapped_outputs = builder.add_instruction_prevalidated(
-                    instruction.operation.clone(),
-                    remapped_inputs,
-                    output_abstracts,
-                );
+                let remapped_outputs =
+                    output_abstracts.into_iter().map(|r#type| builder.add_variable(r#type)).collect::<Vec<_>>();
+                builder.instructions.push(Instruction {
+                    operation: instruction.operation.clone(),
+                    inputs: remapped_inputs,
+                    outputs: remapped_outputs.clone(),
+                });
                 for (old_output, new_output) in
                     instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
                 {
@@ -857,11 +859,13 @@ fn build_factorized_apply_program(
                     .iter()
                     .map(|output| program.atoms[output.index].r#type().into_owned())
                     .collect::<Vec<_>>();
-                let remapped_outputs = builder.add_instruction_prevalidated(
-                    instruction.operation.clone(),
-                    remapped_inputs,
-                    output_abstracts,
-                );
+                let remapped_outputs =
+                    output_abstracts.into_iter().map(|r#type| builder.add_variable(r#type)).collect::<Vec<_>>();
+                builder.instructions.push(Instruction {
+                    operation: instruction.operation.clone(),
+                    inputs: remapped_inputs,
+                    outputs: remapped_outputs.clone(),
+                });
                 for (old_output, new_output) in
                     instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
                 {

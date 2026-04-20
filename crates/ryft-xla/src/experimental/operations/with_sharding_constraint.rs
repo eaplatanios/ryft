@@ -122,8 +122,8 @@ impl Operation for WithShardingConstraintOperation {
         "with_sharding_constraint"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        let mut output = unary_abstract(inputs)?;
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        let mut output = unary_abstract(input_types)?;
         if output.rank() != self.sharding().rank() {
             return Err(TracingError::IncompatibleAbstractValues { op: "with_sharding_constraint" });
         }
@@ -371,7 +371,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(sharding.clone());
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::infer_output_types(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap()],
             ),
@@ -394,7 +394,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::infer_output_types(
                 &op,
                 &[
                     ArrayType::new(
@@ -442,7 +442,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::infer_output_types(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(input_sharding),)
                     .unwrap()],
@@ -474,7 +474,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(test_sharding(&mesh));
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::abstract_eval(
+            <WithShardingConstraintOperation as Operation>::infer_output_types(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)
                     .unwrap()],

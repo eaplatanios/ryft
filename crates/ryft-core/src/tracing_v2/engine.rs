@@ -16,9 +16,9 @@
 //!
 //! Engines are intentionally kept small: they expose metadata-only synthesis (zero and one) and
 //! also choose the staged ordinary and linear operation carriers used by user-facing tracing
-//! transforms. Per-instruction evaluation paths (`InterpretableOperation::interpret`, `abstract_eval`, and
-//! similar) remain engine-free so that the common fast path is never forced through a dispatch
-//! layer.
+//! transforms. Per-instruction evaluation paths (`InterpretableOperation::interpret`,
+//! `Operation::infer_output_types`, and similar) remain engine-free so that the common fast path
+//! is never forced through a dispatch layer.
 //!
 //! ## Performance
 //!

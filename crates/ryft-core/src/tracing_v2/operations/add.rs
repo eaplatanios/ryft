@@ -65,10 +65,10 @@ impl Operation for AddOperation {
         "add"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(inputs, 2);
-        inputs[0]
-            .broadcast(&inputs[1])
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        check_input_count!(input_types, 2);
+        input_types[0]
+            .broadcast(&input_types[1])
             .map(|output| vec![output])
             .map_err(|_| TracingError::IncompatibleAbstractValues { op: "add" })
     }
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_broadcasts_and_promotes_inputs() {
-        let output = <AddOperation as Operation>::abstract_eval(
+        let output = <AddOperation as Operation>::infer_output_types(
             &AddOperation,
             &[
                 ArrayType::scalar(DataType::F32),
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_rejects_non_broadcastable_inputs() {
-        let error = <AddOperation as Operation>::abstract_eval(
+        let error = <AddOperation as Operation>::infer_output_types(
             &AddOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_drops_layout_when_inputs_disagree() {
-        let output = <AddOperation as Operation>::abstract_eval(
+        let output = <AddOperation as Operation>::infer_output_types(
             &AddOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None)

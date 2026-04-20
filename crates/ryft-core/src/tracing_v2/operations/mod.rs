@@ -108,7 +108,7 @@ pub mod sin;
 /// Traced `vmap` operations.
 pub mod vmap;
 
-pub use crate::tracing_v2::programs::Operation;
+pub use crate::tracing_v2::programs::{InterpretableOperation, Operation};
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
 pub use cos::{Cos, CosOperation, CosTracingOperation};
 pub use custom::{
@@ -150,15 +150,6 @@ pub fn lift_jit_constant<
 pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TracingError> {
     check_input_count!(inputs, 1);
     Ok(inputs[0].clone())
-}
-
-/// Concrete execution capability for staged operations.
-///
-/// Separated from [`Operation`] so that program construction, display, and simplification can work without value-type bounds.
-/// Only code paths that actually execute operations (program replay, JIT example propagation) require this trait.
-pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
-    /// Executes the operation on concrete values.
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 
 /// Semantic contract for staged operations that can live in linear programs.
@@ -379,8 +370,8 @@ impl<O: Operation<T> + ?Sized, T: Type> Operation<T> for Arc<O> {
     }
 
     #[inline]
-    fn abstract_eval(&self, inputs: &[T]) -> Result<Vec<T>, TracingError> {
-        (**self).abstract_eval(inputs)
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TracingError> {
+        (**self).infer_output_types(input_types)
     }
 
     #[inline]

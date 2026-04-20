@@ -99,8 +99,8 @@ impl<V: MatrixValue> Operation for LeftMatMulOperation<V> {
         "left_matmul"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        left_matmul_abstract_eval(&<V as Typed<ArrayType>>::r#type(&self.factor), inputs)
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        left_matmul_abstract_eval(&<V as Typed<ArrayType>>::r#type(&self.factor), input_types)
     }
 
     fn try_simplify(

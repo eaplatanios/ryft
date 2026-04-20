@@ -47,9 +47,9 @@ impl Operation for MatMulOperation {
         "matmul"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(inputs, 2);
-        Ok(vec![matmul_abstract(&inputs[0], &inputs[1], "matmul")?])
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        check_input_count!(input_types, 2);
+        Ok(vec![matmul_abstract(&input_types[0], &input_types[1], "matmul")?])
     }
 }
 

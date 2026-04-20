@@ -206,12 +206,12 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operati
         "vmap"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         let expected_inputs = self.body.repeated_input_types();
-        if inputs.len() != expected_inputs.len() {
-            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
+        if input_types.len() != expected_inputs.len() {
+            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: input_types.len() });
         }
-        if inputs != expected_inputs.as_slice() {
+        if input_types != expected_inputs.as_slice() {
             return Err(TracingError::IncompatibleAbstractValues { op: "vmap" });
         }
         Ok(self.body.repeated_output_types())
@@ -226,7 +226,7 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }
 }
@@ -420,12 +420,12 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation for Lin
         "vmap"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         let expected_inputs = self.body.repeated_input_types();
-        if inputs.len() != expected_inputs.len() {
-            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: inputs.len() });
+        if input_types.len() != expected_inputs.len() {
+            return Err(TracingError::InvalidInputCount { expected: expected_inputs.len(), got: input_types.len() });
         }
-        if inputs != expected_inputs.as_slice() {
+        if input_types != expected_inputs.as_slice() {
             return Err(TracingError::IncompatibleAbstractValues { op: "vmap" });
         }
         Ok(self.body.repeated_output_types())
@@ -440,7 +440,7 @@ where
 {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let _ = self.abstract_eval(abstract_inputs.as_slice())?;
+        let _ = self.infer_output_types(abstract_inputs.as_slice())?;
         self.body.eval_lanes(inputs)
     }
 }

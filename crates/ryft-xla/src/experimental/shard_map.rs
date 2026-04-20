@@ -370,7 +370,7 @@ impl Add for ShardMapTensor {
 
     fn add(self, rhs: Self) -> Self::Output {
         let output_type = AddOperation
-            .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
+            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
             .expect("abstract shard-map add should preserve compatible types")
             .into_iter()
             .next()
@@ -388,7 +388,7 @@ impl Mul for ShardMapTensor {
 
     fn mul(self, rhs: Self) -> Self::Output {
         let output_type = MulOperation
-            .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
+            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
             .expect("abstract shard-map mul should preserve compatible types")
             .into_iter()
             .next()
@@ -439,7 +439,7 @@ impl Cos for ShardMapTensor {
 impl MatrixOps for ShardMapTensor {
     fn matmul(self, rhs: Self) -> Self {
         let output_type = MatMulOperation
-            .abstract_eval(&[self.array_type.clone(), rhs.array_type.clone()])
+            .infer_output_types(&[self.array_type.clone(), rhs.array_type.clone()])
             .expect("abstract shard-map matmul should preserve compatible types")
             .into_iter()
             .next()
@@ -455,7 +455,7 @@ impl MatrixOps for ShardMapTensor {
 
     fn transpose_matrix(self) -> Self {
         let output_type = MatrixTransposeOperation
-            .abstract_eval(&[self.array_type.clone()])
+            .infer_output_types(&[self.array_type.clone()])
             .expect("abstract shard-map transpose should preserve compatible types")
             .into_iter()
             .next()

@@ -52,10 +52,10 @@ impl Operation for MulOperation {
         "mul"
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        check_input_count!(inputs, 2);
-        inputs[0]
-            .broadcast(&inputs[1])
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        check_input_count!(input_types, 2);
+        input_types[0]
+            .broadcast(&input_types[1])
             .map(|output| vec![output])
             .map_err(|_| TracingError::IncompatibleAbstractValues { op: "mul" })
     }
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_mul_abstract_eval_broadcasts_and_promotes_inputs() {
-        let output = <MulOperation as Operation>::abstract_eval(
+        let output = <MulOperation as Operation>::infer_output_types(
             &MulOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(3)]), None, None).unwrap(),
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_mul_abstract_eval_rejects_non_broadcastable_inputs() {
-        let error = <MulOperation as Operation>::abstract_eval(
+        let error = <MulOperation as Operation>::infer_output_types(
             &MulOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),

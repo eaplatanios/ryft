@@ -381,8 +381,8 @@ impl<V: Traceable<ArrayType>> Operation for CustomPrimitive<ArrayType, V> {
     }
 
     #[inline]
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        self.base.abstract_eval(inputs)
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        self.base.infer_output_types(input_types)
     }
 
     #[inline]
@@ -505,8 +505,8 @@ impl<V: Traceable<ArrayType>> Operation for LinearCustomPrimitive<ArrayType, V> 
     }
 
     #[inline]
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        self.primitive.abstract_eval(inputs)
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+        self.primitive.infer_output_types(input_types)
     }
 
     #[inline]
@@ -577,11 +577,11 @@ mod tests {
             "test_shift"
         }
 
-        fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+            if input_types.len() != 1 {
+                return Err(TracingError::InvalidInputCount { expected: 1, got: input_types.len() });
             }
-            Ok(vec![inputs[0].clone()])
+            Ok(vec![input_types[0].clone()])
         }
     }
 
@@ -886,6 +886,6 @@ mod tests {
     fn test_custom_primitive_abstract_eval_uses_the_registered_base_op() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
 
-        assert_eq!(primitive.abstract_eval(&[scalar_type()]), Ok(vec![scalar_type()]));
+        assert_eq!(primitive.infer_output_types(&[scalar_type()]), Ok(vec![scalar_type()]));
     }
 }

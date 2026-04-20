@@ -139,26 +139,26 @@ impl Operation for XlaPrimitiveOperation {
         }
     }
 
-    fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
         match self {
-            Self::Add => AddOperation.abstract_eval(inputs),
-            Self::Mul => MulOperation.abstract_eval(inputs),
-            Self::Neg => NegOperation.abstract_eval(inputs),
-            Self::Sin => SinOperation.abstract_eval(inputs),
-            Self::Cos => CosOperation.abstract_eval(inputs),
-            Self::MatMul => MatMulOperation.abstract_eval(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.abstract_eval(inputs),
-            Self::Scale { .. } => ScaleOperation::<ArrayType, ShardMapTensor>::abstract_eval_static(inputs),
-            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), inputs),
-            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), inputs),
+            Self::Add => AddOperation.infer_output_types(input_types),
+            Self::Mul => MulOperation.infer_output_types(input_types),
+            Self::Neg => NegOperation.infer_output_types(input_types),
+            Self::Sin => SinOperation.infer_output_types(input_types),
+            Self::Cos => CosOperation.infer_output_types(input_types),
+            Self::MatMul => MatMulOperation.infer_output_types(input_types),
+            Self::MatrixTranspose => MatrixTransposeOperation.infer_output_types(input_types),
+            Self::Scale { .. } => ScaleOperation::<ArrayType, ShardMapTensor>::abstract_eval_static(input_types),
+            Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), input_types),
+            Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), input_types),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).abstract_eval(inputs)
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).infer_output_types(input_types)
             }
-            Self::VMap(vmap) => vmap.abstract_eval(inputs),
-            Self::Rematerialize(remat) => remat.abstract_eval(inputs),
-            Self::ShardMap(op) => op.abstract_eval(inputs),
-            Self::WithShardingConstraint(op) => op.abstract_eval(inputs),
-            Self::Custom(op) => op.abstract_eval(inputs),
+            Self::VMap(vmap) => vmap.infer_output_types(input_types),
+            Self::Rematerialize(remat) => remat.infer_output_types(input_types),
+            Self::ShardMap(op) => op.infer_output_types(input_types),
+            Self::WithShardingConstraint(op) => op.infer_output_types(input_types),
+            Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
 
