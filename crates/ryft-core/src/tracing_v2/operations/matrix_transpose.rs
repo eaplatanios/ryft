@@ -6,6 +6,7 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::macros::check_input_count;
 use crate::tracing_v2::{
     Traceable, TracingError, batch::Batch as BatchedValue, engine::Engine, forward::JvpTracer, linear::LinearTerm,
 };
@@ -13,7 +14,7 @@ use crate::types::{ArrayType, Type};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation,
-    VectorizableOperation, expect_input_count,
+    VectorizableOperation,
     matrix::{MatrixOps, MatrixValue, transpose_abstract},
 };
 
@@ -56,14 +57,14 @@ impl Operation for MatrixTransposeOperation {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![transpose_abstract(&inputs[0], "matrix_transpose")?])
     }
 }
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
@@ -73,7 +74,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOperation 
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
                 std::slice::from_ref(&output_cotangents[0]),
@@ -95,14 +96,14 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().transpose_matrix()])
     }
 }
 
 impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for MatrixTransposeOperation {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])
     }
 }

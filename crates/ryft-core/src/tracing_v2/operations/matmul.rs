@@ -6,12 +6,12 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::macros::{check_batch_sizes, check_input_count};
 use crate::tracing_v2::{Traceable, TracingError, batch::Batch as BatchedValue, engine::Engine, forward::JvpTracer};
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, expect_batch_sizes_match,
-    expect_input_count,
+    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
 };
 
@@ -48,14 +48,14 @@ impl Operation for MatMulOperation {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         Ok(vec![matmul_abstract(&inputs[0], &inputs[1], "matmul")?])
     }
 }
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
 }
@@ -68,15 +68,15 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }
 }
 
 impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for MatMulOperation {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
-        expect_batch_sizes_match(&inputs[0], &inputs[1])?;
+        check_input_count!(inputs, 2);
+        check_batch_sizes!(inputs);
         Ok(vec![BatchedValue::new(
             inputs[0]
                 .lanes()

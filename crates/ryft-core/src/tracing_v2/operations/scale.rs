@@ -13,6 +13,7 @@ use std::{
 #[cfg(test)]
 use indoc::indoc;
 
+use crate::macros::check_input_count;
 use crate::tracing_v2::{
     AtomId, Traceable, TracingError, Value, ZeroLike,
     batch::Batch,
@@ -25,7 +26,7 @@ use crate::types::{ArrayType, Type, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
-    Operation, VectorizableOperation, expect_input_count, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
+    Operation, VectorizableOperation, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
 };
 
 /// Hidden staging trait for the scaling primitive.
@@ -112,7 +113,7 @@ impl<V: Traceable<ArrayType>> Operation for ScaleOperation<ArrayType, V> {
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for ScaleOperation<ArrayType, V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![self.factor().clone() * inputs[0].clone()])
     }
 }
@@ -124,7 +125,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         Ok(vec![Some(output_cotangents[0].clone().scale(self.factor().clone()))])
     }
 }
@@ -152,7 +153,7 @@ where
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>, TracingError>
     {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         Ok(vec![JvpTracer {
             primal: factor.clone() * inputs[0].primal.clone(),
@@ -169,7 +170,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let input = &inputs[0];
         Ok(vec![JvpTracer {
             primal: self.factor().clone() * input.primal.clone(),
@@ -180,7 +181,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType, V> for ScaleOperation<ArrayType, V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| self.factor().clone() * lane).collect())])
     }
 }
@@ -216,7 +217,7 @@ mod tests {
             .next()
             .expect("transpose should return one contribution")
             .expect("transpose should produce one cotangent contribution");
-        let contribution_atom = contribution.atom();
+        let contribution_atom = contribution.atom;
         drop(contribution);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

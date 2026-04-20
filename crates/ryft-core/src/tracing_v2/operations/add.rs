@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::broadcasting::Broadcastable;
+use crate::macros::{check_batch_sizes, check_input_count};
 use crate::tracing_v2::{
     AtomId, Traceable, TracingError, ZeroLike,
     batch::Batch,
@@ -20,10 +21,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
-    expect_batch_sizes_match, expect_input_count,
-};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation};
 
 /// Hidden staging trait for the addition primitive.
 ///
@@ -68,7 +66,7 @@ impl Operation for AddOperation {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         inputs[0]
             .broadcast(&inputs[1])
             .map(|output| vec![output])
@@ -97,7 +95,7 @@ impl Operation for AddOperation {
 
 impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
     }
 }
@@ -107,7 +105,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         Ok(vec![Some(output_cotangents[0].clone()), Some(output_cotangents[0].clone())])
     }
 }
@@ -120,7 +118,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         Ok(vec![JvpTracer {
             primal: inputs[0].primal.clone() + inputs[1].primal.clone(),
             tangent: T::add(inputs[0].tangent.clone(), inputs[1].tangent.clone()),
@@ -130,8 +128,8 @@ impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O
 
 impl<V: Traceable<ArrayType> + Add<Output = V>> VectorizableOperation<ArrayType, V> for AddOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
-        expect_batch_sizes_match(&inputs[0], &inputs[1])?;
+        check_input_count!(inputs, 2);
+        check_batch_sizes!(inputs);
         Ok(vec![Batch::new(
             inputs[0]
                 .lanes()

@@ -123,7 +123,7 @@ where
     Ok(op
         .transpose(cotangent_terms.as_slice())?
         .into_iter()
-        .map(|term| term.map(|term| term.atom()))
+        .map(|term| term.map(|term| term.atom))
         .collect())
 }
 
@@ -229,7 +229,7 @@ where
         .copied()
         .map(|output_atom| {
             tangent_for_atom(program, primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
-                .map(|term| term.atom())
+                .map(|term| term.atom)
         })
         .collect::<Result<Vec<_>, _>>()?;
     drop(tangents);
@@ -418,7 +418,7 @@ where
 {
     let exemplar = inputs.first().ok_or(TracingError::EmptyParameterizedValue)?;
     let primal = lift_traced_constant::<V, O, L, E>(constant, std::slice::from_ref(&exemplar.primal))?;
-    let tangent_atom = exemplar.tangent.builder_handle().borrow_mut().add_constant(primal.zero_like());
-    let tangent = LinearTerm::from_staged_parts(tangent_atom, exemplar.tangent.builder_handle());
+    let tangent_atom = exemplar.tangent.builder.borrow_mut().add_constant(primal.zero_like());
+    let tangent = LinearTerm::from_staged_parts(tangent_atom, exemplar.tangent.builder.clone());
     Ok(Linearized { primal, tangent })
 }

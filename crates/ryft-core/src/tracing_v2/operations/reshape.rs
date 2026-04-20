@@ -15,6 +15,7 @@ use std::{
 use indoc::indoc;
 
 use crate::{
+    macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
     tracing_v2::{
         MatrixOps, OneLike, Traceable, TracingError, ZeroLike,
@@ -29,7 +30,7 @@ use crate::{
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
-    add::LinearAddOperation, expect_input_count, neg::LinearNegOperation, scale::LinearScaleOperation,
+    add::LinearAddOperation, neg::LinearNegOperation, scale::LinearScaleOperation,
 };
 
 /// Hidden staging trait for the reshape primitive.
@@ -409,7 +410,7 @@ impl Operation for ReshapeOperation {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         if inputs[0] != *self.input_type() {
             return Err(TracingError::IncompatibleAbstractValues { op: "reshape" });
         }
@@ -419,7 +420,7 @@ impl Operation for ReshapeOperation {
 
 impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
 }
@@ -429,7 +430,7 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         if self.input_type() == self.output_type() {
             return Ok(vec![Some(output_cotangents[0].clone())]);
         }
@@ -457,14 +458,14 @@ impl<
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
 }
 
 impl<V: ReshapeValue> VectorizableOperation<ArrayType, V> for ReshapeOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }
 }
@@ -753,7 +754,7 @@ mod tests {
         .next()
         .expect("transpose should return one contribution")
         .expect("transpose should produce one cotangent contribution");
-        let contribution_atom = contribution.atom();
+        let contribution_atom = contribution.atom;
         drop(contribution);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)

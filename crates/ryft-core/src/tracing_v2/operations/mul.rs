@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::broadcasting::Broadcastable;
+use crate::macros::{check_batch_sizes, check_input_count};
 use crate::tracing_v2::{
     AtomId, Traceable, TracingError,
     batch::Batch,
@@ -18,10 +19,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, expect_batch_sizes_match,
-    expect_input_count,
-};
+use super::{DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation};
 
 /// Hidden staging trait for the multiplication primitive.
 #[doc(hidden)]
@@ -55,7 +53,7 @@ impl Operation for MulOperation {
     }
 
     fn abstract_eval(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         inputs[0]
             .broadcast(&inputs[1])
             .map(|output| vec![output])
@@ -88,7 +86,7 @@ impl Operation for MulOperation {
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for MulOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone() * inputs[1].clone()])
     }
 }
@@ -101,7 +99,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
+        check_input_count!(inputs, 2);
         let left = &inputs[0];
         let right = &inputs[1];
         Ok(vec![JvpTracer {
@@ -116,8 +114,8 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
 
 impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType, V> for MulOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        expect_input_count(inputs.len(), 2)?;
-        expect_batch_sizes_match(&inputs[0], &inputs[1])?;
+        check_input_count!(inputs, 2);
+        check_batch_sizes!(inputs);
         Ok(vec![Batch::new(
             inputs[0]
                 .lanes()

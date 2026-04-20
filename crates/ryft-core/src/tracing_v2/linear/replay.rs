@@ -132,7 +132,7 @@ where
         .collect::<Vec<_>>();
     let traced_output = replay_program_linearized_jit::<_, _, _, O, L, E>(program, traced_input)?;
     let primal_outputs = traced_output.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
-    let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom()).collect::<Vec<_>>();
+    let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
     drop(traced_output);
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),

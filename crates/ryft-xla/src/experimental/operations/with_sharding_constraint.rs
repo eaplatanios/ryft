@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use ryft_core::macros::check_input_count;
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation,
@@ -12,7 +13,7 @@ use ryft_core::tracing_v2::{
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
-    operations::{expect_input_count, unary_abstract},
+    operations::unary_abstract,
 };
 use ryft_core::types::ArrayType;
 use ryft_mlir::{Block, Operation as MlirOperation, Value};
@@ -139,7 +140,7 @@ impl Operation for WithShardingConstraintOperation {
 
 impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone()])
     }
 }
@@ -149,7 +150,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperat
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
             LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
@@ -192,7 +193,7 @@ impl
         >,
         TracingError,
     > {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
             LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
@@ -210,7 +211,7 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for WithShard
         &self,
         inputs: &[Linearized<ShardMapTracer>],
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let input = &inputs[0];
         let primal = Tracer::apply_staged_op(
             std::slice::from_ref(&input.primal),
@@ -233,7 +234,7 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for WithShard
 
 impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
     fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone()])
     }
 }
@@ -243,7 +244,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperat
         &self,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         let contribution = LinearTerm::apply_staged_op(
             std::slice::from_ref(&output_cotangents[0]),
             LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
@@ -286,7 +287,7 @@ impl
         >,
         TracingError,
     > {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let tangent = LinearTerm::apply_staged_op(
             std::slice::from_ref(&inputs[0].tangent),
             LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
@@ -306,7 +307,7 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOperation<Array
         &self,
         inputs: &[ryft_core::tracing_v2::Batch<V>],
     ) -> Result<Vec<ryft_core::tracing_v2::Batch<V>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone()])
     }
 }

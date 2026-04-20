@@ -9,6 +9,7 @@ use std::{
     ops::Neg,
 };
 
+use crate::macros::check_input_count;
 use crate::tracing_v2::{
     Traceable, TracingError,
     batch::Batch,
@@ -19,8 +20,7 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, expect_input_count, sin::Sin,
-    unary_abstract,
+    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, sin::Sin, unary_abstract,
 };
 
 /// Hidden staging trait for the cosine primitive.
@@ -84,7 +84,7 @@ impl Operation for CosOperation {
 
 impl<V: Traceable<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for CosOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().cos()])
     }
 }
@@ -97,7 +97,7 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let input = &inputs[0];
         Ok(vec![JvpTracer {
             primal: input.primal.clone().cos(),
@@ -108,7 +108,7 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
 
 impl<V: Traceable<ArrayType> + Cos> VectorizableOperation<ArrayType, V> for CosOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.cos()).collect())])
     }
 }

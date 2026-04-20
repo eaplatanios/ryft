@@ -6,6 +6,7 @@
 
 use std::fmt::{Debug, Display};
 
+use crate::macros::check_input_count;
 use crate::tracing_v2::{
     AtomId, Traceable, TracingError, Value, ZeroLike,
     batch::Batch as BatchedValue,
@@ -19,7 +20,6 @@ use crate::types::{ArrayType, Type, Typed};
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
     add::LinearAddOperation,
-    expect_input_count,
     left_matmul::LinearLeftMatMulOperation,
     lift_jit_constant,
     matmul::MatMulTracingOperation,
@@ -77,7 +77,7 @@ pub fn right_matmul_abstract_eval(
     factor_type: &ArrayType,
     inputs: &[ArrayType],
 ) -> Result<Vec<ArrayType>, TracingError> {
-    expect_input_count(inputs.len(), 1)?;
+    check_input_count!(inputs, 1);
     Ok(vec![matmul_abstract(&inputs[0], factor_type, "right_matmul")?])
 }
 
@@ -114,7 +114,7 @@ impl<V: MatrixValue> Operation for RightMatMulOperation<V> {
 
 impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for RightMatMulOperation<V> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().matmul(self.factor.clone())])
     }
 }
@@ -124,7 +124,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOperation<V> {
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         Ok(vec![Some(
             LinearTerm::apply_staged_op(
                 std::slice::from_ref(&output_cotangents[0]),
@@ -164,7 +164,7 @@ where
         inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>],
     ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>, TracingError>
     {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
         let factor = JvpTracer { primal: factor.clone(), tangent: LinearTerm::zero_like(&factor, &inputs[0].tangent) };
         Ok(vec![inputs[0].clone().matmul(factor)])
@@ -189,7 +189,7 @@ impl<
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         let factor = JvpTracer {
             primal: self.factor().clone(),
             tangent: TangentSpace::zero_like(&self.factor, &inputs[0].tangent),
@@ -200,7 +200,7 @@ impl<
 
 impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for RightMatMulOperation<V> {
     fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![BatchedValue::new(
             inputs[0].lanes().iter().cloned().map(|lane| lane.matmul(self.factor.clone())).collect(),
         )])

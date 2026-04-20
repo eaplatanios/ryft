@@ -14,10 +14,10 @@ pub struct LinearTerm<
     O: Clone + Operation<T> = LinearPrimitiveOperation<ArrayType, V>,
 > {
     /// Atom id representing this symbolic tangent or cotangent inside the shared linear builder.
-    atom: AtomId,
+    pub atom: AtomId,
 
     /// Shared builder that owns the staged linear program currently being assembled.
-    builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
+    pub builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> std::fmt::Debug for LinearTerm<T, V, O> {
@@ -27,18 +27,6 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> std::fmt::Debu
 }
 
 impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, V, O> {
-    /// Returns the atom id backing this symbolic linear term.
-    #[inline]
-    pub fn atom(&self) -> AtomId {
-        self.atom
-    }
-
-    /// Returns a clone of the shared builder that owns this term.
-    #[inline]
-    pub fn builder_handle(&self) -> Rc<RefCell<ProgramBuilder<T, V, O>>> {
-        self.builder.clone()
-    }
-
     /// Reconstructs a linear term from already-staged parts.
     ///
     /// This is mainly used by the linearization and transpose helpers when they need to hand

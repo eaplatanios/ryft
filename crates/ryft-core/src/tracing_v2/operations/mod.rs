@@ -55,6 +55,7 @@ use std::{
 };
 
 use crate::{
+    macros::check_input_count,
     parameters::Parameterized,
     tracing_v2::{
         AtomId, Traceable, TracingError, batch::Batch, engine::Engine, forward::JvpTracer, jit::Tracer,
@@ -132,16 +133,6 @@ pub use scale::{LinearScaleOperation, ScaleOperation, ScaleTracingOperation};
 pub use sin::{Sin, SinOperation, SinTracingOperation};
 pub use vmap::{FlatTracedVMap, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation};
 
-/// Returns an input-count error when one staged op receives the wrong arity.
-pub fn expect_input_count(inputs: usize, expected: usize) -> Result<(), TracingError> {
-    if inputs == expected { Ok(()) } else { Err(TracingError::InvalidInputCount { expected, got: inputs }) }
-}
-
-/// Returns a batch-size error when two batched inputs disagree on their lane count.
-pub fn expect_batch_sizes_match<V>(left: &Batch<V>, right: &Batch<V>) -> Result<(), TracingError> {
-    if left.len() == right.len() { Ok(()) } else { Err(TracingError::MismatchedBatchSize) }
-}
-
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
 pub fn lift_jit_constant<
     'engine,
@@ -160,7 +151,7 @@ pub fn lift_jit_constant<
 
 /// Propagates one unary input type through a shape-preserving staged op.
 pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TracingError> {
-    expect_input_count(inputs.len(), 1)?;
+    check_input_count!(inputs, 1);
     Ok(inputs[0].clone())
 }
 

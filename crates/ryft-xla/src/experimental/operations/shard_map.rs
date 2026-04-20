@@ -1082,7 +1082,7 @@ fn try_linearize_traced_shard_map_body<
     let traced_output = function(traced_input)?;
     let output_structure = vec![ryft_core::parameters::Placeholder; traced_output.len()];
     let primal_outputs = traced_output.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
-    let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom()).collect::<Vec<_>>();
+    let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
     drop(traced_output);
     let builder = match std::rc::Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
@@ -1465,7 +1465,7 @@ impl ReplayShardMapValue for Linearized<ShardMapTracer> {
         let primal =
             <ShardMapTracer as ReplayShardMapValue>::lift_constant(constant, std::slice::from_ref(&exemplar.primal))?;
         let zero = primal.zero_like();
-        let linear_builder = exemplar.tangent.builder_handle();
+        let linear_builder = exemplar.tangent.builder.clone();
         let tangent_atom = linear_builder.borrow_mut().add_constant(zero);
         let tangent = LinearTerm::from_staged_parts(tangent_atom, linear_builder);
         Ok(Linearized { primal, tangent })

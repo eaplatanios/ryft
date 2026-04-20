@@ -9,6 +9,7 @@ use std::{
     ops::Neg,
 };
 
+use crate::macros::check_input_count;
 use crate::tracing_v2::{
     AtomId, Traceable, TracingError, ZeroLike,
     batch::Batch,
@@ -19,8 +20,7 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
-    expect_input_count, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation, unary_abstract,
 };
 
 /// Hidden staging trait for the negation primitive.
@@ -77,7 +77,7 @@ impl Operation for NegOperation {
 
 impl<V: Traceable<ArrayType> + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![-inputs[0].clone()])
     }
 }
@@ -87,7 +87,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
         &self,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
-        expect_input_count(output_cotangents.len(), 1)?;
+        check_input_count!(output_cotangents, 1);
         Ok(vec![Some(output_cotangents[0].clone().neg())])
     }
 }
@@ -100,14 +100,14 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>, O
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, T>],
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: T::neg(inputs[0].tangent.clone()) }])
     }
 }
 
 impl<V: Traceable<ArrayType> + Neg<Output = V>> VectorizableOperation<ArrayType, V> for NegOperation {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        expect_input_count(inputs.len(), 1)?;
+        check_input_count!(inputs, 1);
         Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| -lane).collect())])
     }
 }
