@@ -840,10 +840,13 @@ where
                     LinearPrimitiveOperation<ArrayType, V>,
                 >::jvp(&ReshapeOperation::new(input_type.clone(), output_type.clone()), engine, inputs)
             }
-            Self::VMap(vmap) => Err(TracingError::HigherOrderOpFailure {
-                op: "linearize_program",
-                message: format!("JVP rule for staged op '{}' is not implemented", vmap.name()),
-            }),
+            Self::VMap(vmap) => DifferentiableOperation::<
+                ArrayType,
+                V,
+                LinearTerm<ArrayType, V>,
+                PrimitiveOperation<ArrayType, V>,
+                LinearPrimitiveOperation<ArrayType, V>,
+            >::jvp(vmap.as_ref(), engine, inputs),
             Self::Rematerialize(remat) => DifferentiableOperation::<
                 ArrayType,
                 V,

@@ -1238,6 +1238,28 @@ mod tests {
     }
 
     #[test]
+    fn test_jvp_through_staged_vmap_propagates_tangents() {
+        let engine = crate::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
+        let (primal, tangent): (f64, f64) = crate::tracing_v2::jvp(
+            &engine,
+            |x| {
+                let builder = x.builder.clone();
+                let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> =
+                    vmap(&engine, builder, |batch| batch.clone() * batch.clone() + batch.sin(), vec![x.clone(), x])
+                        .unwrap();
+                outputs[0].clone() + outputs[1].clone()
+            },
+            2.0f64,
+            1.5f64,
+        )
+        .unwrap();
+
+        approx_eq(primal, 2.0 * (2.0f64 * 2.0f64 + 2.0f64.sin()));
+        approx_eq(tangent, 2.0 * (2.0 * 2.0f64 + 2.0f64.cos()) * 1.5);
+        test_support::assert_reference_scalar_sine_jit_rendering();
+    }
+
+    #[test]
     fn test_vmap_compiles_for_leaf_without_float_matrix_or_reshape_ext_traits() {
         use std::borrow::Cow;
         use std::ops::Add;
