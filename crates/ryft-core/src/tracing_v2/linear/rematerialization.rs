@@ -1,5 +1,54 @@
 use super::*;
 
+fn build_traced_gradient_program<'engine, E, Input, V>(
+    engine: &'engine E,
+    input_structure: Input::ParameterStructure,
+    traced_program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
+) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
+where
+    E: Engine<Type = ArrayType, Value = V> + 'static,
+    V: Value<ArrayType> + ZeroLike + OneLike,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
+        + Operation<ArrayType>,
+    E::LinearOperation: Operation<ArrayType>,
+    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+{
+    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::TracingOperation>::new()));
+    let traced_primals = traced_program
+        .input_ids
+        .iter()
+        .map(|input_atom| {
+            let atom = traced_primal_builder
+                .borrow_mut()
+                .add_input(traced_program.atoms[input_atom.index].r#type().into_owned());
+            Tracer::from_engine(atom, traced_primal_builder.clone(), engine)
+        })
+        .collect::<Vec<_>>();
+    let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
+        engine,
+        traced_primal_builder.clone(),
+        traced_program,
+        traced_primals,
+    )?;
+    if let Some(tracing_error) = traced_primal_builder.borrow_mut().error.take() {
+        return Err(tracing_error);
+    }
+    let gradient_output_atoms =
+        traced_gradient.into_iter().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
+    let traced_primal_builder = match Rc::try_unwrap(traced_primal_builder) {
+        Ok(traced_primal_builder) => traced_primal_builder.into_inner(),
+        Err(_) => {
+            return Err(TracingError::EscapedProgramBuilder);
+        }
+    };
+    traced_primal_builder
+        .build::<Input, Input>(gradient_output_atoms, input_structure.clone(), input_structure)
+        .with_folded_constants()?
+        .simplified()
+}
+
 /// Compiles a reverse-mode gradient function into a reusable staged program.
 ///
 /// Unlike [`grad`](super::grad), which returns concrete gradient values at one primal point, this
@@ -31,44 +80,20 @@ where
     F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = interpret_and_trace(
-        _engine,
-        |primals: Input::To<Tracer<'engine, E>>| {
-            let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-            if traced_primals.is_empty() {
-                return Err(TracingError::HigherOrderOpFailure {
-                    op: "compile_grad",
-                    message: "traced compiled gradients require at least one input leaf to recover the staging context"
-                        .to_string(),
-                });
-            }
-            let staged_input_types = Input::To::<ArrayType>::from_parameters(
-                input_structure.clone(),
-                traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
-            )?;
-            let (_, traced_program) =
-                trace_flat_program_from_input_types::<
-                    Input::To<ArrayType>,
-                    V::To<ArrayType>,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    E,
-                    _,
-                >(_engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
-            let (_, traced_gradient) =
-                reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
-                    _engine,
-                    traced_primals[0].builder.clone(),
-                    &traced_program,
-                    traced_primals,
-                )?;
-            Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), traced_gradient)
-                .map_err(TracingError::from)
-        },
-        example_primals,
+    let staged_input_types = Input::To::<ArrayType>::from_parameters(
+        input_structure.clone(),
+        example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    Ok(compiled)
+    let (_, traced_program) = trace_flat_program_from_input_types::<
+        Input::To<ArrayType>,
+        V::To<ArrayType>,
+        V,
+        E::TracingOperation,
+        E::LinearOperation,
+        E,
+        _,
+    >(_engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
+    build_traced_gradient_program(_engine, input_structure, &traced_program)
 }
 
 /// Policy controlling how forward-pass intermediates are handled during reverse-mode differentiation.
@@ -180,57 +205,24 @@ where
     F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
 {
     let input_structure = example_primals.parameter_structure();
-    let (_, compiled) = interpret_and_trace(
-        engine,
-        |primals: Input::To<Tracer<'engine, E>>| {
-            let traced_primals = primals.into_parameters().collect::<Vec<_>>();
-            if traced_primals.is_empty() {
-                return Err(TracingError::HigherOrderOpFailure {
-                    op: "compile_grad",
-                    message: "traced compiled gradients require at least one input leaf to recover the staging context"
-                        .to_string(),
-                });
-            }
-
-            // Step 1: Trace the function at the base V level to get a program.
-            let staged_input_types = Input::To::<ArrayType>::from_parameters(
-                input_structure.clone(),
-                traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
-            )?;
-            let (_, traced_program) =
-                trace_flat_program_from_input_types::<
-                    Input::To<ArrayType>,
-                    V::To<ArrayType>,
-                    V,
-                    E::TracingOperation,
-                    E::LinearOperation,
-                    E,
-                    _,
-                >(engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
-
-            // Step 2: Segment the traced program to insert rematerialization boundaries.
-            let segmented_program = match segment_size {
-                None => wrap_program_in_rematerialize::<E, V>(&traced_program)?,
-                Some(size) => segment_program::<E, V>(&traced_program, size)?,
-            };
-
-            // Step 3: Linearize and transpose the segmented program to produce the pullback.
-            // `linearize_traced_program` replays the program at the Tracer level (staging
-            // both forward and backward instructions in the outer JIT builder) and returns the
-            // primal outputs alongside the linear pushforward map.
-            let (_, traced_gradient) =
-                reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
-                    engine,
-                    traced_primals[0].builder.clone(),
-                    &segmented_program,
-                    traced_primals,
-                )?;
-            Input::To::<Tracer<'engine, E>>::from_parameters(input_structure.clone(), traced_gradient)
-                .map_err(TracingError::from)
-        },
-        example_primals,
+    let staged_input_types = Input::To::<ArrayType>::from_parameters(
+        input_structure.clone(),
+        example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    Ok(compiled)
+    let (_, traced_program) = trace_flat_program_from_input_types::<
+        Input::To<ArrayType>,
+        V::To<ArrayType>,
+        V,
+        E::TracingOperation,
+        E::LinearOperation,
+        E,
+        _,
+    >(engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
+    let segmented_program = match segment_size {
+        None => wrap_program_in_rematerialize::<E, V>(&traced_program)?,
+        Some(size) => segment_program::<E, V>(&traced_program, size)?,
+    };
+    build_traced_gradient_program(engine, input_structure, &segmented_program)
 }
 
 /// Partitions a program's instructions into segments of at most `segment_size`, wrapping each
@@ -564,4 +556,25 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
         flat_leaf_parameter_structure(boundary_output_atoms.len()),
     );
     Ok(sub_program)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parameters::Placeholder;
+    use crate::tracing_v2::{PrimitiveOperation, ProgramBuilder, engine::ArrayScalarEngine};
+
+    use super::*;
+
+    #[test]
+    fn test_build_traced_gradient_program_handles_nullary_scalar_programs() {
+        let engine = ArrayScalarEngine::<f64>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let output_atom = builder.add_constant(3.0f64);
+        let traced_program =
+            builder.build::<Vec<f64>, Vec<f64>>(vec![output_atom], Vec::<Placeholder>::new(), vec![Placeholder]);
+
+        let gradient_program = build_traced_gradient_program::<_, (), f64>(&engine, (), &traced_program).unwrap();
+
+        assert_eq!(gradient_program.interpret(()).unwrap(), ());
+    }
 }

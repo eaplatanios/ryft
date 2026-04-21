@@ -517,43 +517,53 @@ where
         .simplified()?;
 
         // Compile both the forward evaluation and gradient into a reusable program.
-        let (_, compiled_vg): (Vec<V>, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>) =
-            interpret_and_trace(
-                erased_engine,
-                |jit_primals: Vec<
-                    Tracer<'engine, dyn Engine<
-                                Type = ArrayType,
-                                Value = V,
-                                TracingOperation = E::TracingOperation,
-                                LinearOperation = E::LinearOperation,
-                            >>,
-                >| {
-                    let Some(first_jit_primal) = jit_primals.first() else {
-                        return Err(TracingError::HigherOrderOpFailure {
-                            op: "value_and_grad",
-                            message:
-                                "traced reverse-mode replay requires at least one input leaf to recover the staging context"
-                                    .to_string(),
-                        });
-                    };
-                    let tracing_builder = first_jit_primal.builder.clone();
-                    let (output, gradient) = reverse_mode_scalar_traced_program::<
-                        V,
-                        E::TracingOperation,
-                        E::LinearOperation,
-                        dyn Engine<
-                                Type = ArrayType,
-                                Value = V,
-                                TracingOperation = E::TracingOperation,
-                                LinearOperation = E::LinearOperation,
-                            >>(erased_engine, tracing_builder, &flat_program, jit_primals)?;
-                    let mut result = Vec::with_capacity(1 + gradient.len());
-                    result.push(output);
-                    result.extend(gradient);
-                    Ok(result)
-                },
-                lane0_flat,
-            )?;
+        let compiled_vg_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::TracingOperation>::new()));
+        let compiled_vg_outputs = {
+            let jit_primals = lane0_flat
+                .iter()
+                .map(|value| {
+                    let atom = compiled_vg_builder.borrow_mut().add_input(value.r#type().into_owned());
+                    Tracer::from_engine(atom, compiled_vg_builder.clone(), erased_engine)
+                })
+                .collect::<Vec<_>>();
+            let (output, gradient) = reverse_mode_scalar_traced_program::<
+                V,
+                E::TracingOperation,
+                E::LinearOperation,
+                dyn Engine<
+                        Type = ArrayType,
+                        Value = V,
+                        TracingOperation = E::TracingOperation,
+                        LinearOperation = E::LinearOperation,
+                    >,
+            >(erased_engine, compiled_vg_builder.clone(), &flat_program, jit_primals)?;
+            let mut compiled_vg_outputs = Vec::with_capacity(1 + gradient.len());
+            compiled_vg_outputs.push(output);
+            compiled_vg_outputs.extend(gradient);
+            compiled_vg_outputs
+        };
+        if let Some(tracing_error) = compiled_vg_builder.borrow_mut().error.take() {
+            return Err(tracing_error);
+        }
+        let compiled_vg_output_atoms = compiled_vg_outputs
+            .into_iter()
+            .map(|output| output.atom_id())
+            .collect::<Result<Vec<_>, _>>()?;
+        let compiled_vg_builder = match Rc::try_unwrap(compiled_vg_builder) {
+            Ok(compiled_vg_builder) => compiled_vg_builder.into_inner(),
+            Err(_) => {
+                return Err(TracingError::EscapedProgramBuilder);
+            }
+        };
+        let compiled_vg = compiled_vg_builder
+            .build::<Vec<V>, Vec<V>>(
+                compiled_vg_output_atoms,
+                flat_leaf_parameter_structure(parameter_count),
+                flat_leaf_parameter_structure(1 + parameter_count),
+            )
+            .with_folded_constants()?
+            .simplified()?;
 
         // Apply per-lane and split into (value, gradient).
         let mut lane_values = Vec::with_capacity(lane_primals.len());
