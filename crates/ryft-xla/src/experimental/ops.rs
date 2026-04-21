@@ -281,10 +281,7 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for XlaPrimit
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
             Self::WithShardingConstraint(op) => op.interpret(inputs),
-            Self::Custom(_) => Err(TracingError::HigherOrderOpFailure {
-                op: "eval_linearized_jit",
-                message: "linearized JIT replay for custom XLA ops is not supported".to_string(),
-            }),
+            Self::Custom(op) => op.interpret(inputs),
         }
     }
 }
@@ -372,5 +369,53 @@ impl RightMatMulTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOper
 impl ReshapeTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
     fn reshape_op(input_type: ArrayType, output_type: ArrayType) -> Self {
         XlaPrimitiveOperation::Reshape { input_type, output_type }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fmt::Display, sync::Arc};
+
+    use ryft_core::tracing_v2::operations::CustomOperationError;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct TestCustomXlaOp;
+
+    impl Display for TestCustomXlaOp {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "test_custom_xla")
+        }
+    }
+
+    impl Operation for TestCustomXlaOp {
+        fn name(&self) -> &'static str {
+            "test_custom_xla"
+        }
+
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(input_types.to_vec())
+        }
+    }
+
+    impl InterpretableOperation<ArrayType, ShardMapTensor> for TestCustomXlaOp {
+        fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
+            Ok(inputs.to_vec())
+        }
+    }
+
+    #[test]
+    fn test_custom_xla_op_missing_linearized_jit_rule_reports_missing_rule() {
+        let operation = XlaPrimitiveOperation::Custom(Arc::new(CustomPrimitive::new(TestCustomXlaOp)));
+        let inputs: Vec<Linearized<ShardMapTracer>> = vec![];
+
+        assert!(matches!(
+            operation.interpret(&inputs),
+            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                op: "test_custom_xla",
+                transform: "linearized JIT replay",
+            }))
+        ));
     }
 }
