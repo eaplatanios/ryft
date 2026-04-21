@@ -15,13 +15,13 @@ use ryft_core::tracing_v2::{
     grad,
 };
 
-use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOperation};
+use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
 use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::experimental::shard_map::{
-    FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, shard_map, trace,
+    FlatTracedShardMap, ShardMapTensor, ShardMapTracer, TracedXlaProgram, fold_xla_program_constants, shard_map, trace,
 };
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -105,7 +105,7 @@ fn summarize_nested_body(
     label: &'static str,
     body: &FlatTracedShardMap,
 ) -> Result<IrNestedRegionSummary, BenchmarkError> {
-    let program = body.program.with_folded_constants()?.simplified()?;
+    let program = fold_xla_program_constants(&body.program)?.simplified()?;
     Ok(nested_region(label, summarize_xla_program(&program)?))
 }
 
@@ -132,27 +132,39 @@ fn summarize_xla_program<Input: Parameterized<ShardMapTensor>, Output: Parameter
 
     summarize_program(program, |op| {
         if let XlaPrimitiveOperation::ShardMap(shard_map_op) = op {
+            return Ok(vec![summarize_nested_body("shard_map.body", shard_map_op.body())?]);
+        }
+
+        if let XlaPrimitiveOperation::LinearShardMap(shard_map_op) = op {
             let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
-            if let Some(eval_mode) = shard_map_op.eval_mode() {
-                nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);
-            }
-            if let Some(transpose_mode) = shard_map_op.transpose_mode() {
-                nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.transpose_body", transpose_mode)?);
+            nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", shard_map_op.eval_mode())?);
+            #[cfg(feature = "benchmarking")]
+            {
+                nested_regions.extend(summarize_linear_eval_mode(
+                    "linear_shard_map.transpose_body",
+                    shard_map_op.transpose_mode(),
+                )?);
             }
             return Ok(nested_regions);
         }
 
         if let XlaPrimitiveOperation::Custom(custom_op) = op {
-            if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOperation<ShardMapTensor>>() {
+            if let Some(shard_map_op) = custom_op.extensions().get::<LinearShardMapOperation<ShardMapTensor>>() {
                 let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
-                if let Some(eval_mode) = shard_map_op.eval_mode() {
-                    nested_regions.extend(summarize_linear_eval_mode("linear_shard_map.eval_body", eval_mode)?);
-                }
-                if let Some(transpose_mode) = shard_map_op.transpose_mode() {
-                    nested_regions
-                        .extend(summarize_linear_eval_mode("linear_shard_map.transpose_body", transpose_mode)?);
+                nested_regions
+                    .extend(summarize_linear_eval_mode("linear_shard_map.eval_body", shard_map_op.eval_mode())?);
+                #[cfg(feature = "benchmarking")]
+                {
+                    nested_regions.extend(summarize_linear_eval_mode(
+                        "linear_shard_map.transpose_body",
+                        shard_map_op.transpose_mode(),
+                    )?);
                 }
                 return Ok(nested_regions);
+            }
+
+            if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOperation<ShardMapTensor>>() {
+                return Ok(vec![summarize_nested_body("shard_map.body", shard_map_op.body())?]);
             }
         }
 
@@ -177,7 +189,7 @@ where
     Input::Family: ParameterizedFamily<ShardMapTensor>,
     Output::Family: ParameterizedFamily<ShardMapTensor>,
 {
-    let program = traced.program().with_folded_constants()?.simplified()?;
+    let program = fold_xla_program_constants(traced.program())?.simplified()?;
     let summary = summarize_xla_program(&program)?;
     Ok(vec![record(
         case_id,

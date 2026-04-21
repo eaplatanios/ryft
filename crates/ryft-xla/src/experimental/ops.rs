@@ -27,7 +27,7 @@ use ryft_core::{
 };
 
 use crate::experimental::{
-    operations::{ShardMapOperation, WithShardingConstraintOperation},
+    operations::{LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation},
     shard_map::{ShardMapTensor, ShardMapTracer},
 };
 
@@ -129,6 +129,9 @@ pub enum XlaPrimitiveOperation {
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<ShardMapTensor>>),
 
+    /// XLA-specific `linear_shard_map`.
+    LinearShardMap(Box<LinearShardMapOperation<ShardMapTensor>>),
+
     /// XLA-specific sharding constraint.
     WithShardingConstraint(WithShardingConstraintOperation),
 
@@ -153,6 +156,7 @@ impl Debug for XlaPrimitiveOperation {
             Self::VMap(vmap) => Debug::fmt(vmap, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::ShardMap(op) => Debug::fmt(op, formatter),
+            Self::LinearShardMap(op) => Debug::fmt(op, formatter),
             Self::WithShardingConstraint(op) => Debug::fmt(op, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
         }
@@ -185,6 +189,7 @@ impl Operation for XlaPrimitiveOperation {
             Self::VMap(vmap) => vmap.name(),
             Self::Rematerialize(remat) => remat.name(),
             Self::ShardMap(op) => op.name(),
+            Self::LinearShardMap(op) => op.name(),
             Self::WithShardingConstraint(op) => op.name(),
             Self::Custom(op) => op.name(),
         }
@@ -208,6 +213,7 @@ impl Operation for XlaPrimitiveOperation {
             Self::VMap(vmap) => vmap.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::ShardMap(op) => op.infer_output_types(input_types),
+            Self::LinearShardMap(op) => op.infer_output_types(input_types),
             Self::WithShardingConstraint(op) => op.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
@@ -253,6 +259,7 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation
             Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
+            Self::LinearShardMap(op) => op.interpret(inputs),
             Self::WithShardingConstraint(op) => op.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
         }
@@ -346,6 +353,7 @@ impl
                     .collect::<Vec<_>>())
             }
             Self::ShardMap(op) => op.jvp(engine, inputs),
+            Self::LinearShardMap(op) => op.jvp(engine, inputs),
             Self::WithShardingConstraint(op) => op.jvp(engine, inputs),
             Self::Custom(op) => op.jvp(engine, inputs),
         }
@@ -374,6 +382,7 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for XlaPrimit
             Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
+            Self::LinearShardMap(op) => op.interpret(inputs),
             Self::WithShardingConstraint(op) => op.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
         }

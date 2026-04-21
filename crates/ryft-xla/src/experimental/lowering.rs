@@ -24,7 +24,9 @@ use ryft_core::tracing_v2::{
 };
 use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
-use crate::experimental::operations::{LinearShardMapEvalMode, ShardMapOperation, WithShardingConstraintOperation};
+use crate::experimental::operations::{
+    LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation,
+};
 use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::mlir::ToMlir;
 
@@ -553,15 +555,6 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
             Self::VMap(vmap) => lowerer.lower_vmap(vmap.body(), input_values),
             Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
             Self::ShardMap(shard_map_op) => {
-                if let Some(eval_mode) = shard_map_op.eval_mode() {
-                    return lower_linear_shard_map_eval_mode(
-                        eval_mode,
-                        input_values,
-                        &mut lowerer.block,
-                        lowerer.context,
-                        lowerer.location,
-                    );
-                }
                 let simplified_body = shard_map_op
                     .body()
                     .simplified()
@@ -577,6 +570,14 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
                     lowerer.location,
                 )
             }
+            Self::LinearShardMap(shard_map_op) => lower_linear_shard_map_eval_mode(
+                shard_map_op.eval_mode(),
+                &[],
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             Self::WithShardingConstraint(op) => {
                 let operation = lowerer.block.append_operation(shardy::sharding_constraint(
                     input_values[0],
@@ -905,9 +906,17 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     pub(crate) fn lower_linear_shard_map_eval_mode(
         &mut self,
         eval_mode: &LinearShardMapEvalMode,
+        captured_values: &[ValueRef<'b, 'c, 't>],
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_linear_shard_map_eval_mode(eval_mode, input_values, &mut self.block, self.context, self.location)
+        lower_linear_shard_map_eval_mode(
+            eval_mode,
+            captured_values,
+            input_values,
+            &mut self.block,
+            self.context,
+            self.location,
+        )
     }
 }
 
@@ -1256,17 +1265,14 @@ where
     for instruction in &program.instructions {
         match &instruction.operation {
             XlaPrimitiveOperation::ShardMap(shard_map_op) => {
-                if let Some(eval_mode) = shard_map_op.eval_mode() {
-                    mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
-                } else {
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => {
-                            merge_logical_meshes(&existing_mesh, shard_map_op.body().shard_map.mesh())?
-                        }
-                        None => shard_map_op.body().shard_map.mesh().clone(),
-                    });
-                    mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
-                }
+                mesh = Some(match mesh.take() {
+                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, shard_map_op.body().shard_map.mesh())?,
+                    None => shard_map_op.body().shard_map.mesh().clone(),
+                });
+                mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
+            }
+            XlaPrimitiveOperation::LinearShardMap(shard_map_op) => {
+                mesh = collect_nested_linear_shard_map_mesh(shard_map_op.eval_mode(), mesh)?;
             }
             XlaPrimitiveOperation::WithShardingConstraint(sharding_constraint_op) => {
                 mesh = Some(match mesh.take() {
@@ -1277,18 +1283,16 @@ where
                 });
             }
             XlaPrimitiveOperation::Custom(custom_op) => {
-                if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOperation<ShardMapTensor>>() {
-                    if let Some(eval_mode) = shard_map_op.eval_mode() {
-                        mesh = collect_nested_linear_shard_map_mesh(eval_mode, mesh)?;
-                    } else {
-                        mesh = Some(match mesh.take() {
-                            Some(existing_mesh) => {
-                                merge_logical_meshes(&existing_mesh, shard_map_op.body().shard_map.mesh())?
-                            }
-                            None => shard_map_op.body().shard_map.mesh().clone(),
-                        });
-                        mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
-                    }
+                if let Some(shard_map_op) = custom_op.extensions().get::<LinearShardMapOperation<ShardMapTensor>>() {
+                    mesh = collect_nested_linear_shard_map_mesh(shard_map_op.eval_mode(), mesh)?;
+                } else if let Some(shard_map_op) = custom_op.extensions().get::<ShardMapOperation<ShardMapTensor>>() {
+                    mesh = Some(match mesh.take() {
+                        Some(existing_mesh) => {
+                            merge_logical_meshes(&existing_mesh, shard_map_op.body().shard_map.mesh())?
+                        }
+                        None => shard_map_op.body().shard_map.mesh().clone(),
+                    });
+                    mesh = collect_nested_sharding_mesh(&shard_map_op.body().program, mesh)?;
                 } else if let Some(sharding_constraint_op) =
                     custom_op.extensions().get::<WithShardingConstraintOperation>()
                 {
@@ -1320,7 +1324,15 @@ fn collect_nested_linear_shard_map_mesh(
             collect_nested_sharding_mesh(&body.program, mesh)
         }
         LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
-            let mesh = collect_nested_sharding_mesh(&factorized.residual_body.program, existing)?;
+            let mesh = Some(match existing {
+                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, factorized.residual_body.shard_map.mesh())?,
+                None => factorized.residual_body.shard_map.mesh().clone(),
+            });
+            let mesh = collect_nested_sharding_mesh(&factorized.residual_body.program, mesh)?;
+            let mesh = Some(match mesh {
+                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, factorized.apply_body.shard_map.mesh())?,
+                None => factorized.apply_body.shard_map.mesh().clone(),
+            });
             collect_nested_sharding_mesh(&factorized.apply_body.program, mesh)
         }
     }
@@ -2038,8 +2050,15 @@ where
                     .iter()
                     .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
                     .collect::<Result<Vec<_>, _>>()?;
-                let lowered_outputs =
-                    lower_instruction(program, instruction_index, inputs.as_slice(), block, context, location)?;
+                let lowered_outputs = lower_instruction(
+                    program,
+                    instruction_index,
+                    atom_values.as_slice(),
+                    inputs.as_slice(),
+                    block,
+                    context,
+                    location,
+                )?;
                 for (output_atom, lowered_output) in
                     instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
                 {
@@ -2110,6 +2129,7 @@ where
 /// Lowers one linear shard-map evaluation mode and returns its resulting values.
 fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
     eval_mode: &LinearShardMapEvalMode,
+    captured_values: &[ValueRef<'b, 'c, 't>],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -2120,9 +2140,11 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
             let simplified_body = body
                 .simplified()
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
+            let combined_inputs =
+                captured_values.iter().copied().chain(input_values.iter().copied()).collect::<Vec<_>>();
             lower_manual_computation(
                 block,
-                input_values,
+                combined_inputs.as_slice(),
                 &simplified_body.shard_map,
                 &simplified_body.program,
                 simplified_body.local_input_types.as_slice(),
@@ -2138,7 +2160,7 @@ fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
                 .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
             let residual_results = lower_manual_computation(
                 block,
-                &input_values[..residual_body.global_input_types.len()],
+                &captured_values[..residual_body.global_input_types.len()],
                 &residual_body.shard_map,
                 &residual_body.program,
                 residual_body.local_input_types.as_slice(),
@@ -2244,6 +2266,7 @@ where
 /// Dispatches shard-map StableHLO lowering for one traced operation by matching on primitive variants.
 fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
     op: &XlaPrimitiveOperation,
+    captured_values: &[ValueRef<'b, 'c, 't>],
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     lowerer: &mut ShardMapMlirLowerer<'b, 'c, 't>,
@@ -2367,9 +2390,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaPrimitiveOperation::VMap(vmap_op) => lowerer.lower_vmap(vmap_op.body(), input_values),
         XlaPrimitiveOperation::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
         XlaPrimitiveOperation::ShardMap(shard_map_op) => {
-            if let Some(eval_mode) = shard_map_op.eval_mode() {
-                return lowerer.lower_linear_shard_map_eval_mode(eval_mode, input_values);
-            }
             let simplified_body = shard_map_op
                 .body()
                 .simplified()
@@ -2381,6 +2401,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 simplified_body.local_input_types.as_slice(),
                 simplified_body.global_output_types.as_slice(),
             )
+        }
+        XlaPrimitiveOperation::LinearShardMap(shard_map_op) => {
+            lowerer.lower_linear_shard_map_eval_mode(shard_map_op.eval_mode(), captured_values, input_values)
         }
         XlaPrimitiveOperation::WithShardingConstraint(op) => {
             let operation = lowerer.block.append_operation(shardy::sharding_constraint(
@@ -2463,6 +2486,7 @@ where
 fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ProgramInput, ProgramOutput>,
     instruction_index: usize,
+    atom_values: &[Option<ValueRef<'b, 'c, 't>>],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -2478,8 +2502,22 @@ where
         .iter()
         .map(|output| program.atoms[output.index].r#type().into_owned())
         .collect::<Vec<_>>();
+    let captured_values = match &instruction.operation {
+        XlaPrimitiveOperation::LinearShardMap(shard_map_op) => shard_map_op
+            .captured_global_primals()
+            .iter()
+            .map(|atom_id| atom_values[atom_id.index].ok_or(LoweringError::MissingAtomValue { atom_id: *atom_id }))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => Vec::new(),
+    };
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
-    dispatch_lower_shard_map_mlir(&instruction.operation, input_values, output_types.as_slice(), &mut lowerer)
+    dispatch_lower_shard_map_mlir(
+        &instruction.operation,
+        captured_values.as_slice(),
+        input_values,
+        output_types.as_slice(),
+        &mut lowerer,
+    )
 }
 
 /// Normalizes a user-provided MLIR symbol name.

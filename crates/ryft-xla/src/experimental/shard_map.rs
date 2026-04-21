@@ -70,8 +70,8 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::operations::{AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation};
 use ryft_core::tracing_v2::{
-    AtomId, Cos, Linearized, MatrixOps, OneLike, Operation, Program, Sin, Traceable, Tracer, TracingError, Value,
-    ZeroLike, trace as trace_types,
+    Atom, AtomId, Cos, InterpretableOperation, Linearized, MatrixOps, OneLike, Operation, Program, Sin, Traceable,
+    Tracer, TracingError, Value, ZeroLike, trace as trace_types,
 };
 
 use crate::experimental::operations::WithShardingConstraintOperation;
@@ -490,6 +490,81 @@ pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>;
+
+fn xla_op_supports_constant_folding(op: &XlaPrimitiveOperation) -> bool {
+    matches!(
+        op,
+        XlaPrimitiveOperation::Add
+            | XlaPrimitiveOperation::Mul
+            | XlaPrimitiveOperation::Neg
+            | XlaPrimitiveOperation::Sin
+            | XlaPrimitiveOperation::Cos
+            | XlaPrimitiveOperation::MatMul
+            | XlaPrimitiveOperation::MatrixTranspose
+            | XlaPrimitiveOperation::Scale { .. }
+            | XlaPrimitiveOperation::LeftMatMul { .. }
+            | XlaPrimitiveOperation::RightMatMul { .. }
+            | XlaPrimitiveOperation::Reshape { .. }
+    )
+}
+
+/// Folds literal-only first-order XLA instructions while keeping higher-order XLA ops staged.
+pub(crate) fn fold_xla_program_constants<Input, Output>(
+    program: &XlaProgram<Input, Output>,
+) -> Result<XlaProgram<Input, Output>, TracingError>
+where
+    Input: Parameterized<ShardMapTensor, ParameterStructure: Clone>,
+    Output: Parameterized<ShardMapTensor, ParameterStructure: Clone>,
+{
+    let mut atoms = program.atoms.clone();
+    let mut instructions = Vec::with_capacity(program.instructions.len());
+
+    for instruction in program.instructions.iter() {
+        if !xla_op_supports_constant_folding(&instruction.operation) {
+            instructions.push(instruction.clone());
+            continue;
+        }
+
+        let mut input_constants = Vec::with_capacity(instruction.inputs.len());
+        let mut all_inputs_constant = true;
+        for input in instruction.inputs.iter().copied() {
+            let atom = atoms.get(input.index).ok_or(TracingError::UnboundAtomId { id: input })?;
+            let Some(value) = atom.as_constant() else {
+                all_inputs_constant = false;
+                break;
+            };
+            input_constants.push(value.clone());
+        }
+
+        if !all_inputs_constant {
+            instructions.push(instruction.clone());
+            continue;
+        }
+
+        let output_constants = instruction.operation.interpret(input_constants.as_slice())?;
+        if output_constants.len() != instruction.outputs.len() {
+            return Err(TracingError::InvalidOutputCount {
+                expected: instruction.outputs.len(),
+                got: output_constants.len(),
+            });
+        }
+
+        for (output_atom, output_value) in instruction.outputs.iter().copied().zip(output_constants.into_iter()) {
+            let atom = atoms.get_mut(output_atom.index).ok_or(TracingError::UnboundAtomId { id: output_atom })?;
+            *atom = Atom::Constant(output_value);
+        }
+    }
+
+    Ok(Program {
+        atoms,
+        input_ids: program.input_ids.clone(),
+        output_ids: program.output_ids.clone(),
+        instructions,
+        input_structure: program.input_structure.clone(),
+        output_structure: program.output_structure.clone(),
+        marker: std::marker::PhantomData,
+    })
+}
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
@@ -1011,7 +1086,7 @@ where
     ///
     ///   - `function_name`: Symbol name to use for the outer `func.func`.
     pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, ShardMapTraceError> {
-        let simplified_program = self.program.with_folded_constants()?.simplified()?;
+        let simplified_program = fold_xla_program_constants(&self.program)?.simplified()?;
         super::lowering::to_mlir_module(
             &self.shard_map,
             &simplified_program,
@@ -1056,7 +1131,7 @@ where
     ///
     ///   - `function_name`: Symbol name to use for the outer `func.func`.
     pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, ShardMapTraceError> {
-        let simplified_program = self.program.with_folded_constants()?.simplified()?;
+        let simplified_program = fold_xla_program_constants(&self.program)?.simplified()?;
         super::lowering::to_mlir_module_for_program(
             &simplified_program,
             &self.global_input_types,
@@ -1142,7 +1217,7 @@ impl FlatTracedShardMap {
             self.local_input_types.clone(),
             self.global_output_types.clone(),
             self.local_output_types.clone(),
-            self.program.with_folded_constants()?.simplified()?,
+            fold_xla_program_constants(&self.program)?.simplified()?,
         ))
     }
 }
@@ -1307,7 +1382,7 @@ where
         )?;
         {
             let (output_types, program) = trace_types(engine, |input| Ok(function(input)), cloned_input_types)?;
-            (output_types, program.with_folded_constants()?.simplified()?)
+            (output_types, fold_xla_program_constants(&program)?.simplified()?)
         }
     };
     Ok((output_types, program))
@@ -3299,12 +3374,15 @@ mod tests {
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
                     %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
                     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<8xf32>
-                    %1 = sdy.manual_computation(%arg0, %0) in_shardings=[<@mesh, [{"x"}]>, <@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>, %arg2: tensor<2xf32>) {
-                      %2 = stablehlo.cosine %arg1 : tensor<2xf32>
-                      %3 = stablehlo.multiply %2, %arg2 : tensor<2xf32>
+                    %1 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %3 = stablehlo.cosine %arg1 : tensor<2xf32>
+                      sdy.return %3 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    %2 = sdy.manual_computation(%0, %1) in_shardings=[<@mesh, [{"x"}]>, <@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>, %arg2: tensor<2xf32>) {
+                      %3 = stablehlo.multiply %arg2, %arg1 : tensor<2xf32>
                       sdy.return %3 : tensor<2xf32>
                     } : (tensor<8xf32>, tensor<8xf32>) -> tensor<8xf32>
-                    return %1 : tensor<8xf32>
+                    return %2 : tensor<8xf32>
                   }
                 }
             "#}
