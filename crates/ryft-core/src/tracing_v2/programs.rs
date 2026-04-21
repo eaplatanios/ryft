@@ -431,12 +431,11 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
                 Atom::Constant(value) => builder.add_constant(value.clone()),
                 Atom::Variable(_) => {
                     let instruction_index = instruction_by_output[atom_id.index]
-                        .ok_or(TracingError::InternalInvariantViolation("variable atom had no owning instruction"))?;
-                    if !live_instructions[instruction_index] {
-                        return Err(TracingError::InternalInvariantViolation(
-                            "attempted to remap a dead variable atom during program simplification",
-                        ));
-                    }
+                        .ok_or(TracingError::MalformedProgram("variable atom had no owning instruction"))?;
+                    assert!(
+                        live_instructions[instruction_index],
+                        "attempted to remap a dead variable atom during program simplification"
+                    );
                     let instruction = &program.instructions[instruction_index];
                     let remapped_inputs = instruction
                         .inputs
@@ -447,14 +446,18 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let remapped_outputs = builder.add_instruction(instruction.operation.clone(), remapped_inputs)?;
+                    if remapped_outputs.len() != instruction.outputs.len() {
+                        return Err(TracingError::InvalidOutputCount {
+                            expected: instruction.outputs.len(),
+                            got: remapped_outputs.len(),
+                        });
+                    }
                     for (old_output, new_output) in
                         instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
                     {
                         atom_mapping.insert(old_output, new_output);
                     }
-                    *atom_mapping
-                        .get(&atom_id)
-                        .ok_or(TracingError::InternalInvariantViolation("failed to record remapped program outputs"))?
+                    *atom_mapping.get(&atom_id).expect("remapped instruction outputs should populate the atom mapping")
                 }
             };
             atom_mapping.entry(atom_id).or_insert(mapped_atom);
@@ -485,9 +488,7 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
         for input_atom in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_atom.index).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             let Atom::Variable(r#type) = input else {
-                return Err(TracingError::InternalInvariantViolation(
-                    "staged program input atom did not retain a type",
-                ));
+                return Err(TracingError::MalformedProgram("program input atom was not a variable"));
             };
             let mapped = builder.add_input(r#type.clone());
             atom_mapping.insert(input_atom, mapped);
