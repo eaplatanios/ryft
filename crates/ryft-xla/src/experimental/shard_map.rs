@@ -70,8 +70,8 @@ use ryft_core::parameters::{Parameter, ParameterError, Parameterized, Parameteri
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing_v2::operations::{AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation};
 use ryft_core::tracing_v2::{
-    Cos, Linearized, MatrixOps, OneLike, Operation, Program, Sin, Traceable, Tracer, TracingError, Value, ZeroLike,
-    trace as trace_types,
+    AtomId, Cos, Linearized, MatrixOps, OneLike, Operation, Program, Sin, Traceable, Tracer, TracingError, Value,
+    ZeroLike, trace as trace_types,
 };
 
 use crate::experimental::operations::WithShardingConstraintOperation;
@@ -214,6 +214,27 @@ pub enum ShardMapTraceError {
     /// Error returned when reconstructing a global output shape overflows `usize`.
     #[error("overflow while {context}")]
     Overflow { context: String },
+
+    /// Error returned when shard-map transpose factorization references one projected atom that is
+    /// neither kept as an input nor produced by an instruction.
+    #[error(
+        "projected shard_map program referenced atom {atom_id} that was neither kept as an input nor produced by an instruction"
+    )]
+    ProjectedProgramMissingSourceAtom { atom_id: AtomId },
+
+    /// Error returned when factorized apply reconstruction references one cotangent-independent
+    /// atom that should have been materialized as a residual first.
+    #[error(
+        "factorized shard_map apply program referenced cotangent-independent atom {atom_id} that was not materialized as a residual"
+    )]
+    FactorizedApplyMissingResidualForCotangentIndependentAtom { atom_id: AtomId },
+
+    /// Error returned when factorized apply reconstruction references one primal input that should
+    /// have been materialized as a residual first.
+    #[error(
+        "factorized shard_map apply program referenced primal input atom {atom_id} that was not materialized as a residual"
+    )]
+    FactorizedApplyMissingResidualForPrimalInput { atom_id: AtomId },
 }
 
 impl From<LoweringError> for ShardMapTraceError {

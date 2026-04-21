@@ -119,10 +119,6 @@ pub enum TracingError {
     #[error("encountered malformed program: {0}")]
     MalformedProgram(&'static str),
 
-    /// An internal tracing invariant was violated while constructing or replaying a program.
-    #[error("{0}")]
-    InternalInvariantViolation(&'static str),
-
     /// A higher-order traced operation failed while deriving or replaying its internal program.
     #[error("higher-order op '{op}' failed: {message}")]
     HigherOrderOpFailure { op: &'static str, message: String },

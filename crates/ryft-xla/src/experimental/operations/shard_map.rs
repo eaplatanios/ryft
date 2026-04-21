@@ -786,7 +786,7 @@ fn project_flat_shard_map_program(
     program: &FlatShardMapProgram,
     kept_input_atoms: &[AtomId],
     output_atoms: &[AtomId],
-) -> Result<FlatShardMapProgram, TracingError> {
+) -> Result<FlatShardMapProgram, ShardMapTraceError> {
     fn remap_atom(
         atom_id: AtomId,
         program: &FlatShardMapProgram,
@@ -794,7 +794,7 @@ fn project_flat_shard_map_program(
         atom_mapping: &mut std::collections::HashMap<AtomId, AtomId>,
         kept_input_atoms: &std::collections::HashMap<AtomId, AtomId>,
         instruction_by_output: &[Option<usize>],
-    ) -> Result<AtomId, TracingError> {
+    ) -> Result<AtomId, ShardMapTraceError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
             return Ok(*mapped_atom);
         }
@@ -808,9 +808,7 @@ fn project_flat_shard_map_program(
             ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
             ryft_core::tracing_v2::Atom::Variable(_) => {
                 let instruction_index = instruction_by_output[atom_id.index]
-                    .ok_or(TracingError::InternalInvariantViolation(
-                        "projected flat shard-map program referenced a removed input or a variable atom without an owning instruction",
-                    ))?;
+                    .ok_or(ShardMapTraceError::ProjectedProgramMissingSourceAtom { atom_id })?;
                 let instruction = &program.instructions[instruction_index];
                 let remapped_inputs = instruction
                     .inputs
@@ -837,9 +835,9 @@ fn project_flat_shard_map_program(
                 {
                     atom_mapping.insert(old_output, new_output);
                 }
-                *atom_mapping.get(&atom_id).ok_or(TracingError::InternalInvariantViolation(
-                    "failed to record projected flat shard-map program outputs",
-                ))?
+                *atom_mapping
+                    .get(&atom_id)
+                    .expect("projected shard_map instruction outputs should populate the atom mapping")
             }
         };
 
@@ -882,7 +880,7 @@ fn build_factorized_apply_program(
     body: &FlatTracedShardMap,
     residual_atoms: &[AtomId],
     depends_on_cotangent: &[bool],
-) -> Result<FlatShardMapProgram, TracingError> {
+) -> Result<FlatShardMapProgram, ShardMapTraceError> {
     fn remap_atom(
         atom_id: AtomId,
         program: &FlatShardMapProgram,
@@ -891,7 +889,7 @@ fn build_factorized_apply_program(
         replacement_inputs: &std::collections::HashMap<AtomId, AtomId>,
         depends_on_cotangent: &[bool],
         instruction_by_output: &[Option<usize>],
-    ) -> Result<AtomId, TracingError> {
+    ) -> Result<AtomId, ShardMapTraceError> {
         if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
             return Ok(*mapped_atom);
         }
@@ -905,14 +903,12 @@ fn build_factorized_apply_program(
             ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
             ryft_core::tracing_v2::Atom::Variable(_) => {
                 if !depends_on_cotangent[atom_id.index] {
-                    return Err(TracingError::InternalInvariantViolation(
-                        "factorized apply program referenced a cotangent-independent atom that was not materialized as a residual",
-                    ));
+                    return Err(ShardMapTraceError::FactorizedApplyMissingResidualForCotangentIndependentAtom {
+                        atom_id,
+                    });
                 }
-                let instruction_index =
-                    instruction_by_output[atom_id.index].ok_or(TracingError::InternalInvariantViolation(
-                        "factorized apply program referenced a primal input that was not materialized as a residual",
-                    ))?;
+                let instruction_index = instruction_by_output[atom_id.index]
+                    .ok_or(ShardMapTraceError::FactorizedApplyMissingResidualForPrimalInput { atom_id })?;
                 let instruction = &program.instructions[instruction_index];
                 let remapped_inputs = instruction
                     .inputs
@@ -947,9 +943,9 @@ fn build_factorized_apply_program(
                 {
                     atom_mapping.insert(old_output, new_output);
                 }
-                *atom_mapping.get(&atom_id).ok_or(TracingError::InternalInvariantViolation(
-                    "failed to record factorized apply program outputs",
-                ))?
+                *atom_mapping
+                    .get(&atom_id)
+                    .expect("factorized shard_map apply instruction outputs should populate the atom mapping")
             }
         };
 
@@ -1873,5 +1869,120 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
         )?;
         let staged_outputs = apply_linearized_flat_shard_map(traced, traced_inputs)?;
         Ok(Output::To::<Linearized<ShardMapTracer>>::from_parameters(output_structure, staged_outputs)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::marker::PhantomData;
+
+    use ryft_core::{
+        parameters::Placeholder,
+        sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
+        tracing_v2::{Atom, AtomId, Program},
+        types::{ArrayType, DataType},
+    };
+
+    use crate::experimental::ops::XlaPrimitiveOperation;
+    use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap, ShardMapTensor, ShardMapTraceError};
+
+    use super::{build_factorized_apply_program, project_flat_shard_map_program};
+
+    fn test_array_type() -> ArrayType {
+        ArrayType::scalar(DataType::F32)
+    }
+
+    fn test_shard_map() -> ShardMap {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        ShardMap::from_shardings(
+            mesh.clone(),
+            vec![Sharding::replicated(mesh.clone(), 0)],
+            vec![Sharding::replicated(mesh, 0)],
+            vec!["x".to_string()],
+            true,
+        )
+    }
+
+    #[test]
+    fn test_project_flat_shard_map_program_rejects_unmapped_variable_atom() {
+        let array_type = test_array_type();
+        let atom_id = AtomId { index: 0 };
+        let program: Program<
+            ArrayType,
+            ShardMapTensor,
+            XlaPrimitiveOperation,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
+        > = Program {
+            atoms: vec![Atom::Variable(array_type)],
+            input_ids: Vec::new(),
+            output_ids: vec![atom_id],
+            instructions: Vec::new(),
+            input_structure: Vec::<Placeholder>::new(),
+            output_structure: vec![Placeholder],
+            marker: PhantomData,
+        };
+
+        assert!(matches!(
+            project_flat_shard_map_program(&program, &[], &[atom_id]),
+            Err(ShardMapTraceError::ProjectedProgramMissingSourceAtom { atom_id: actual_atom_id })
+                if actual_atom_id == atom_id
+        ));
+    }
+
+    #[test]
+    fn test_build_factorized_apply_program_rejects_missing_residual_for_cotangent_independent_atom() {
+        let array_type = test_array_type();
+        let body = FlatTracedShardMap::from_parts(
+            test_shard_map(),
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            Program {
+                atoms: vec![Atom::Variable(array_type.clone()), Atom::Variable(array_type)],
+                input_ids: vec![AtomId { index: 0 }],
+                output_ids: vec![AtomId { index: 1 }],
+                instructions: Vec::new(),
+                input_structure: vec![Placeholder],
+                output_structure: vec![Placeholder],
+                marker: PhantomData,
+            },
+        );
+
+        assert!(matches!(
+            build_factorized_apply_program(&body, &[], &[false, false]),
+            Err(ShardMapTraceError::FactorizedApplyMissingResidualForCotangentIndependentAtom {
+                atom_id: AtomId { index: 1 },
+            })
+        ));
+    }
+
+    #[test]
+    fn test_build_factorized_apply_program_rejects_missing_residual_for_primal_input() {
+        let array_type = test_array_type();
+        let atom_id = AtomId { index: 0 };
+        let body = FlatTracedShardMap::from_parts(
+            test_shard_map(),
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+            Program {
+                atoms: vec![Atom::Variable(array_type)],
+                input_ids: vec![atom_id],
+                output_ids: vec![atom_id],
+                instructions: Vec::new(),
+                input_structure: vec![Placeholder],
+                output_structure: vec![Placeholder],
+                marker: PhantomData,
+            },
+        );
+
+        assert!(matches!(
+            build_factorized_apply_program(&body, &[], &[true]),
+            Err(ShardMapTraceError::FactorizedApplyMissingResidualForPrimalInput { atom_id: actual_atom_id })
+                if actual_atom_id == atom_id
+        ));
     }
 }
