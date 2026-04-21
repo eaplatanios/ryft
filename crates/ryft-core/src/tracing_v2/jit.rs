@@ -96,14 +96,10 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
         E::TracingOperation: Operation<E::Type>,
     {
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
-            return Err(TracingError::InternalInvariantViolation(
-                "tracer inputs for one staged op must share the same builder",
-            ));
+            return Err(TracingError::MismatchedProgramBuilders);
         }
         if inputs.iter().any(|input| !std::ptr::eq(input.engine, engine)) {
-            return Err(TracingError::InternalInvariantViolation(
-                "tracer inputs for one staged op must share the same engine",
-            ));
+            return Err(TracingError::MismatchedEngines);
         }
 
         let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
@@ -391,7 +387,10 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing_v2::{PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine, test_support},
+        tracing_v2::{
+            Engine, LinearPrimitiveOperation, PrimitiveOperation, ProgramBuilder, Sin, TracingError,
+            engine::ArrayScalarEngine, test_support,
+        },
         types::{ArrayType, TypeError},
     };
 
@@ -418,6 +417,41 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn traced_apply_staged_op_rejects_mismatched_program_builders() {
+        let builder_a =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder_b =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
+        let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
+        let engine = TaggedEngine { id: 1 };
+        let tracer_a = Tracer::from_engine(atom_a, builder_a.clone(), &engine);
+        let tracer_b = Tracer::from_engine(atom_b, builder_b, &engine);
+
+        assert!(matches!(
+            Tracer::apply_staged_op(&engine, builder_a, &[tracer_a, tracer_b], PrimitiveOperation::Add),
+            Err(TracingError::MismatchedProgramBuilders),
+        ));
+    }
+
+    #[test]
+    fn traced_apply_staged_op_rejects_mismatched_engines() {
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let atom_a = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
+        let atom_b = builder.borrow_mut().add_input(2.0f64.r#type().into_owned());
+        let engine_a = TaggedEngine { id: 1 };
+        let engine_b = TaggedEngine { id: 2 };
+        let tracer_a = Tracer::from_engine(atom_a, builder.clone(), &engine_a);
+        let tracer_b = Tracer::from_engine(atom_b, builder.clone(), &engine_b);
+
+        assert!(matches!(
+            Tracer::apply_staged_op(&engine_a, builder, &[tracer_a, tracer_b], PrimitiveOperation::Add),
+            Err(TracingError::MismatchedEngines),
+        ));
     }
 
     #[test]
@@ -448,6 +482,27 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    struct TaggedEngine {
+        id: u8,
+    }
+
+    impl Engine for TaggedEngine {
+        type Type = ArrayType;
+        type Value = f64;
+        type TracingOperation = PrimitiveOperation<ArrayType, f64>;
+        type LinearOperation = LinearPrimitiveOperation<ArrayType, f64>;
+
+        fn zero(&self, _type: &ArrayType) -> f64 {
+            let _ = self.id;
+            0.0
+        }
+
+        fn one(&self, _type: &ArrayType) -> f64 {
+            let _ = self.id;
+            1.0
+        }
     }
 
     #[test]

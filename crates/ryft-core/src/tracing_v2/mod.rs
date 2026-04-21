@@ -99,15 +99,18 @@ pub use values::{OneLike, ZeroLike};
 /// participates inside a tracing flow.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TracingError {
-    /// A primitive or staged program received the wrong number of inputs.
+    #[error("tracing values that are used in the same operation must share the same tracing engine")]
+    MismatchedEngines,
+
+    #[error("tracing values that are used in the same operation must share the same program builder")]
+    MismatchedProgramBuilders,
+
     #[error("invalid number of inputs; expected {expected} but got {got}")]
     InvalidInputCount { expected: usize, got: usize },
 
-    /// A primitive or staged program produced the wrong number of outputs.
     #[error("invalid number of outputs; expected {expected} but got {got}")]
     InvalidOutputCount { expected: usize, got: usize },
 
-    /// A staged program referenced an atom that was never defined.
     #[error("unbound atom ID: {id}")]
     UnboundAtomId { id: AtomId },
 

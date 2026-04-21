@@ -89,7 +89,7 @@ where
     let primal_structure = primals.parameter_structure();
     let tangent_structure = tangents.parameter_structure();
     if primal_structure != tangent_structure {
-        return Err(ParameterError::MismatchedParameterStructure {
+        return Err(ParameterError::MismatchedParameterStructures {
             left_structure: format!("{primal_structure:?}"),
             right_structure: format!("{tangent_structure:?}"),
         }

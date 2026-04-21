@@ -51,9 +51,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
         O: Operation<T>,
     {
         if inputs.iter().any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
-            return Err(TracingError::InternalInvariantViolation(
-                "linear tracer inputs for one staged op must share the same builder",
-            ));
+            return Err(TracingError::MismatchedProgramBuilders);
         }
 
         let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
@@ -174,3 +172,30 @@ impl<
 /// primal component is an ordinary leaf `V`, while the tangent component is a symbolic
 /// [`LinearTerm`] staged into the linear builder.
 pub type Linearized<V, O = LinearPrimitiveOperation<ArrayType, V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use crate::tracing_v2::{LinearPrimitiveOperation, ProgramBuilder, TracingError};
+    use crate::types::{ArrayType, Typed};
+
+    use super::LinearTerm;
+
+    #[test]
+    fn linear_term_apply_staged_op_rejects_mismatched_program_builders() {
+        let builder_a =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
+        let builder_b =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
+        let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
+        let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
+        let term_a = LinearTerm::from_staged_parts(atom_a, builder_a.clone());
+        let term_b = LinearTerm::from_staged_parts(atom_b, builder_b);
+
+        assert!(matches!(
+            LinearTerm::apply_staged_op(builder_a, &[term_a, term_b], LinearPrimitiveOperation::Add, 1),
+            Err(TracingError::MismatchedProgramBuilders),
+        ));
+    }
+}

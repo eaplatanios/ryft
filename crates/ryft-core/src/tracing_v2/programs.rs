@@ -322,7 +322,7 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
     {
         let input_structure = input.parameter_structure();
         if input_structure != self.input_structure {
-            return Err(ParameterError::MismatchedParameterStructure {
+            return Err(ParameterError::MismatchedParameterStructures {
                 left_structure: format!("{:?}", self.input_structure),
                 right_structure: format!("{input_structure:?}"),
             }
@@ -823,7 +823,7 @@ mod tests {
 
         assert!(matches!(
             program.interpret(vec![1.0f64, 2.0f64]),
-            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructure {
+            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructures {
                 left_structure,
                 right_structure,
             })) if left_structure == format!("{:?}", vec![Placeholder])

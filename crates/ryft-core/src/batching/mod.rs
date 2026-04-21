@@ -70,7 +70,7 @@ pub use crate::check_batch_sizes;
 pub enum BatchingError {
     /// Structured lanes did not share the same `Parameterized` shape.
     #[error("mismatched parameter structures across batch lanes")]
-    MismatchedParameterStructure,
+    MismatchedParameterStructures,
 
     /// A batching transform encountered zero lanes and therefore could not infer a batch size.
     #[error("encountered an empty batch")]
@@ -218,7 +218,7 @@ pub fn stack<
 
     for input in inputs {
         if input.parameter_structure() != structure {
-            return Err(BatchingError::MismatchedParameterStructure);
+            return Err(BatchingError::MismatchedParameterStructures);
         }
 
         for (bucket, parameter) in buckets.iter_mut().zip(input.into_parameters()) {
@@ -366,7 +366,7 @@ where
         let mut traced_inputs = vec![first_input.into_parameters().collect::<Vec<_>>()];
         for input in inputs {
             if input.parameter_structure() != input_structure {
-                return Err(BatchingError::MismatchedParameterStructure.into());
+                return Err(BatchingError::MismatchedParameterStructures.into());
             }
             traced_inputs.push(input.into_parameters().collect::<Vec<_>>());
         }

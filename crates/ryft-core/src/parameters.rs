@@ -42,7 +42,7 @@ pub enum ParameterError {
     AmbiguousParameterCombination { values: Vec<String> },
 
     #[error("mismatched parameter structures: {left_structure} and {right_structure}")]
-    MismatchedParameterStructure { left_structure: String, right_structure: String },
+    MismatchedParameterStructures { left_structure: String, right_structure: String },
 }
 
 /// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].

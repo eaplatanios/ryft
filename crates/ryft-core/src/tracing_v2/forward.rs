@@ -234,7 +234,7 @@ where
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
         if primal_structure != tangent_structure {
-            return Err(ParameterError::MismatchedParameterStructure {
+            return Err(ParameterError::MismatchedParameterStructures {
                 left_structure: format!("{primal_structure:?}"),
                 right_structure: format!("{tangent_structure:?}"),
             }
@@ -492,7 +492,7 @@ where
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
         if primal_structure != tangent_structure {
-            return Err(ParameterError::MismatchedParameterStructure {
+            return Err(ParameterError::MismatchedParameterStructures {
                 left_structure: format!("{primal_structure:?}"),
                 right_structure: format!("{tangent_structure:?}"),
             }
@@ -694,7 +694,7 @@ mod tests {
             jvp(&engine, |xs| xs[0].clone(), vec![2.0f64], vec![1.0f64, 2.0f64]);
         assert!(matches!(
             result,
-            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructure {
+            Err(TracingError::Parameter(ParameterError::MismatchedParameterStructures {
                 left_structure,
                 right_structure,
             })) if left_structure == format!("{:?}", vec![2.0f64].parameter_structure())
