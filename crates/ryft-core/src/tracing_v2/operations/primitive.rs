@@ -16,7 +16,9 @@ use std::{
 };
 
 use crate::{
-    batching::{Batch, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation},
+    batching::{
+        Batch, BatchingError, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation,
+    },
     parameters::{Parameter, Parameterized},
     tracing_v2::{
         AtomId, Cos, MatrixOps, OneLike, Sin, Traceable, TracingError, Value, ZeroLike,
@@ -859,8 +861,55 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + Sin + Cos + MatrixOps + 'static>
-    VectorizableOperation<ArrayType, V> for PrimitiveOperation<ArrayType, V>
+fn batch_higher_order_operation<O, V>(operation: &O, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError>
+where
+    O: InterpretableOperation<ArrayType, V>,
+    V: Traceable<ArrayType>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+{
+    let Some(first_input) = inputs.first() else {
+        return Err(BatchingError::EmptyBatch.into());
+    };
+    crate::check_batch_sizes!(inputs);
+    if first_input.is_empty() {
+        return Err(BatchingError::EmptyBatch.into());
+    }
+
+    let lane_count = first_input.len();
+    let mut batched_outputs = Vec::<Vec<V>>::new();
+    for lane_index in 0..lane_count {
+        let lane_inputs = inputs.iter().map(|input| input.lanes()[lane_index].clone()).collect::<Vec<_>>();
+        let lane_outputs = operation.interpret(lane_inputs.as_slice())?;
+        if batched_outputs.is_empty() {
+            batched_outputs = lane_outputs.into_iter().map(|output| vec![output]).collect::<Vec<_>>();
+            continue;
+        }
+        if lane_outputs.len() != batched_outputs.len() {
+            return Err(TracingError::InvalidOutputCount { expected: batched_outputs.len(), got: lane_outputs.len() });
+        }
+        for (batched_output, lane_output) in batched_outputs.iter_mut().zip(lane_outputs) {
+            batched_output.push(lane_output);
+        }
+    }
+
+    Ok(batched_outputs.into_iter().map(Batch::new).collect())
+}
+
+impl<
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+        + 'static,
+> VectorizableOperation<ArrayType, V> for PrimitiveOperation<ArrayType, V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         match self {
@@ -871,11 +920,88 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = 
             Self::Cos => CosOperation.batch(inputs),
             Self::MatMul => MatMulOperation.batch(inputs),
             Self::MatrixTranspose => MatrixTransposeOperation.batch(inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).batch(inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).batch(inputs),
+            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).batch(inputs),
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).batch(inputs)
+            }
+            Self::VMap(vmap) => batch_higher_order_operation(vmap.as_ref(), inputs),
+            Self::Rematerialize(remat) => batch_higher_order_operation(remat.as_ref(), inputs),
             Self::Custom(op) => op.batch(inputs),
-            _ => Err(TracingError::HigherOrderOpFailure {
-                op: "vectorize",
-                message: format!("vectorization rule for staged op '{}' is not implemented", self.name()),
-            }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::{
+        batching::FlatTracedVMap,
+        parameters::Placeholder,
+        tracing_v2::{
+            Program, ProgramBuilder,
+            operations::{FlatTracedRematerialize, RematerializeOperation},
+        },
+        types::{ArrayType, DataType},
+    };
+
+    use super::*;
+
+    fn scalar_type() -> ArrayType {
+        ArrayType::scalar(DataType::F64)
+    }
+
+    fn make_double_program() -> Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, Vec<f64>, Vec<f64>> {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let input = builder.add_input(scalar_type());
+        let outputs = builder.add_instruction(PrimitiveOperation::Add, vec![input, input]).unwrap();
+        builder.build::<Vec<f64>, Vec<f64>>(outputs, vec![Placeholder], vec![Placeholder])
+    }
+
+    #[test]
+    fn test_batch_delegates_to_supported_first_order_primitive_rules() {
+        assert_eq!(
+            PrimitiveOperation::Scale { factor: 3.0f64 }.batch(&[Batch::new(vec![1.0f64, 2.0])]),
+            Ok(vec![Batch::new(vec![3.0f64, 6.0])]),
+        );
+        assert_eq!(
+            PrimitiveOperation::LeftMatMul { factor: 3.0f64 }.batch(&[Batch::new(vec![1.0f64, 2.0])]),
+            Ok(vec![Batch::new(vec![3.0f64, 6.0])]),
+        );
+        assert_eq!(
+            PrimitiveOperation::RightMatMul { factor: 3.0f64 }.batch(&[Batch::new(vec![1.0f64, 2.0])]),
+            Ok(vec![Batch::new(vec![3.0f64, 6.0])]),
+        );
+        assert_eq!(
+            PrimitiveOperation::Reshape { input_type: scalar_type(), output_type: scalar_type() }
+                .batch(&[Batch::new(vec![1.0f64, 2.0])]),
+            Ok(vec![Batch::new(vec![1.0f64, 2.0])]),
+        );
+    }
+
+    #[test]
+    fn test_batch_supports_staged_vmap_primitive() {
+        let operation = PrimitiveOperation::VMap(Box::new(VMapOperation::new(FlatTracedVMap::from_parts(
+            2,
+            vec![scalar_type()],
+            vec![scalar_type()],
+            make_double_program(),
+        ))));
+
+        assert_eq!(
+            operation.batch(&[Batch::new(vec![1.0f64, 10.0]), Batch::new(vec![2.0f64, 20.0])]),
+            Ok(vec![Batch::new(vec![2.0f64, 20.0]), Batch::new(vec![4.0f64, 40.0])]),
+        );
+    }
+
+    #[test]
+    fn test_batch_supports_staged_rematerialize_primitive() {
+        let operation = PrimitiveOperation::Rematerialize(Box::new(RematerializeOperation::new(
+            FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![scalar_type()], make_double_program()),
+        )));
+
+        assert_eq!(operation.batch(&[Batch::new(vec![1.0f64, 10.0])]), Ok(vec![Batch::new(vec![2.0f64, 20.0])]),);
     }
 }
