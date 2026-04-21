@@ -597,7 +597,7 @@ where
         let compiled_jvp_builder = match Rc::try_unwrap(compiled_jvp_builder) {
             Ok(compiled_jvp_builder) => compiled_jvp_builder.into_inner(),
             Err(_) => {
-                return Err(TracingError::InternalInvariantViolation("batched jvp builder escaped the tracing scope"));
+                return Err(TracingError::EscapedProgramBuilder);
             }
         };
         let compiled_jvp = compiled_jvp_builder

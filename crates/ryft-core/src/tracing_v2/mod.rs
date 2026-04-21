@@ -122,6 +122,9 @@ pub enum TracingError {
     #[error("higher-order op '{op}' failed: {message}")]
     HigherOrderOpFailure { op: &'static str, message: String },
 
+    #[error("encountered program builder that escaped its tracing scope")]
+    EscapedProgramBuilder,
+
     #[error(transparent)]
     Parameter(#[from] ParameterError),
 

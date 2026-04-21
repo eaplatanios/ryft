@@ -1132,7 +1132,7 @@ fn try_linearize_traced_shard_map_body<
     let builder = match std::rc::Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
-            return Err(TracingError::InternalInvariantViolation("linearization builder escaped the tracing scope"));
+            return Err(TracingError::EscapedProgramBuilder);
         }
     };
     let program =

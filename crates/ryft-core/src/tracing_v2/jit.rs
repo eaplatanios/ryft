@@ -310,7 +310,7 @@ where
     }
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
-        Err(_) => return Err(TracingError::InternalInvariantViolation("jit builder escaped the tracing scope")),
+        Err(_) => return Err(TracingError::EscapedProgramBuilder),
     };
     let program =
         builder.build::<Input::To<E::Value>, Output::To<E::Value>>(outputs, input_structure, output_structure);
