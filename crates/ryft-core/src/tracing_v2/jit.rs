@@ -30,18 +30,54 @@ use crate::{
     types::Typed,
 };
 
+/// Execution state carried by a [`Tracer`] leaf.
+///
+/// Live tracers point at a concrete staged atom in the shared program builder. Poisoned tracers
+/// arise only after the tracing scope has already recorded an error and can no longer stage new
+/// instructions safely. They still retain the inferred abstract output type so later type queries
+/// and best-effort short-circuiting can continue without manufacturing a dummy atom.
+#[derive(Clone, Eq, PartialEq)]
+pub enum TracerState<T: crate::types::Type> {
+    /// Normal traced leaf backed by a concrete atom in the staged program.
+    Live(AtomId),
+
+    /// Poisoned traced leaf that carries only abstract output type information.
+    Poison(T),
+}
+
+impl<T: crate::types::Type> TracerState<T> {
+    /// Returns the staged atom id for live tracers, if one exists.
+    #[inline]
+    pub fn live_atom(&self) -> Option<AtomId> {
+        match self {
+            Self::Live(atom) => Some(*atom),
+            Self::Poison(_) => None,
+        }
+    }
+}
+
+impl<T: crate::types::Type> std::fmt::Debug for TracerState<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Live(atom) => formatter.debug_tuple("Live").field(atom).finish(),
+            Self::Poison(_) => formatter.write_str("Poison(..)"),
+        }
+    }
+}
+
 /// Symbolic leaf used while staging ordinary traced programs.
 ///
-/// A [`Tracer`] is the value-level facade for one staged atom. Primitive trait impls on
+/// A [`Tracer`] is the value-level facade for one staged traced leaf. Primitive trait impls on
 /// [`Tracer`] do not compute numerically; instead, they add instructions to a shared
-/// [`ProgramBuilder`](crate::tracing_v2::ProgramBuilder) and return new tracers pointing at the
-/// output atoms. This makes `Tracer` the central "big picture" type for symbolic execution in
-/// `tracing_v2`: if a closure is being traced rather than eagerly evaluated, its leaves are almost
-/// always instances of this type.
+/// [`ProgramBuilder`](crate::tracing_v2::ProgramBuilder) and return new tracers for the staged
+/// outputs. When tracing has already failed, later operations return poisoned tracers that retain
+/// only abstract type metadata rather than manufacturing dummy atoms. This makes [`Tracer`] the
+/// central "big picture" type for symbolic execution in `tracing_v2`: if a closure is being
+/// traced rather than eagerly evaluated, its leaves are almost always instances of this type.
 #[derive(Parameter)]
 pub struct Tracer<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> {
-    /// Atom id representing this traced leaf inside the shared staged program.
-    pub atom: AtomId,
+    /// Execution state for this traced leaf.
+    pub state: TracerState<E::Type>,
 
     /// Shared builder that owns the staged program currently being traced.
     pub builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
@@ -54,7 +90,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     for Tracer<'engine, E>
 {
     fn clone(&self) -> Self {
-        Self { atom: self.atom, builder: self.builder.clone(), engine: self.engine }
+        Self { state: self.state.clone(), builder: self.builder.clone(), engine: self.engine }
     }
 }
 
@@ -62,7 +98,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     for Tracer<'engine, E>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Tracer").field("atom", &self.atom).finish_non_exhaustive()
+        formatter.debug_struct("Tracer").field("state", &self.state).finish_non_exhaustive()
     }
 }
 
@@ -77,7 +113,21 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
         builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
         engine: &'engine E,
     ) -> Self {
-        Self { atom, builder, engine }
+        Self { state: TracerState::Live(atom), builder, engine }
+    }
+
+    #[inline]
+    fn poison(
+        r#type: E::Type,
+        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
+        engine: &'engine E,
+    ) -> Self {
+        Self { state: TracerState::Poison(r#type), builder, engine }
+    }
+
+    /// Returns the staged atom id for this tracer when it is still live.
+    pub fn atom_id(&self) -> Result<AtomId, TracingError> {
+        self.state.live_atom().ok_or(TracingError::PoisonedTracer)
     }
 
     /// Stages one primitive application in the current trace and returns tracers for its outputs.
@@ -85,7 +135,9 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     /// This is the common helper behind both the arithmetic trait impls on [`Tracer`] and the
     /// higher-order transforms that need to inject backend-selected operations manually. The method
     /// validates that all inputs belong to the same tracing scope, runs abstract evaluation to
-    /// determine the output arity, and records the instruction unless the scope has already failed.
+    /// determine the output arity, and records the instruction unless the scope has already
+    /// failed. Once the shared builder has recorded an error, subsequent calls stop mutating the
+    /// staged program and instead return poisoned tracers carrying only inferred output types.
     pub fn apply_staged_op(
         engine: &'engine E,
         builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
@@ -102,47 +154,42 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
             return Err(TracingError::MismatchedEngines);
         }
 
-        let input_atoms = inputs.iter().map(|input| input.atom).collect::<Vec<_>>();
         let input_types = {
             let builder_borrow = builder.borrow();
-            input_atoms
+            inputs
                 .iter()
-                .map(|input| builder_borrow.atoms[input.index].r#type().into_owned())
+                .map(|input| match &input.state {
+                    TracerState::Live(atom) => builder_borrow.atoms[atom.index].r#type().into_owned(),
+                    TracerState::Poison(r#type) => r#type.clone(),
+                })
                 .collect::<Vec<_>>()
         };
-        let fallback_atom = inputs
-            .first()
-            .map(|input| input.atom)
-            .or_else(|| builder.borrow().atoms.first().map(|_| AtomId { index: 0 }));
-        let output_count = match op.infer_output_types(input_types.as_slice()) {
-            Ok(output_types) => output_types.len(),
+        let output_types = match op.infer_output_types(input_types.as_slice()) {
+            Ok(output_types) => output_types,
             Err(error) => {
                 if builder.borrow().error.is_none() {
                     builder.borrow_mut().error = Some(TracingError::from(error.clone()));
                 }
-                let fallback_atom = fallback_atom.ok_or(error)?;
-                return Ok(vec![Self { atom: fallback_atom, builder, engine }]);
+                let poison_type = input_types.first().cloned().ok_or(error)?;
+                return Ok(vec![Self::poison(poison_type, builder, engine)]);
             }
         };
-        let output_atoms = if builder.borrow().error.is_some() {
-            let fallback_atom = fallback_atom.ok_or(TracingError::InternalInvariantViolation(
-                "failed traced staging must have one fallback atom available",
-            ))?;
-            vec![fallback_atom; output_count]
-        } else {
-            match builder.borrow_mut().add_instruction(op, input_atoms) {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    if builder.borrow().error.is_none() {
-                        builder.borrow_mut().error = Some(error.clone());
-                    }
-                    let fallback_atom = fallback_atom.ok_or(error)?;
-                    vec![fallback_atom; output_count]
+        if builder.borrow().error.is_some() {
+            return Ok(output_types.into_iter().map(|r#type| Self::poison(r#type, builder.clone(), engine)).collect());
+        }
+
+        let input_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let output_states = match builder.borrow_mut().add_instruction(op, input_atoms) {
+            Ok(outputs) => outputs.into_iter().map(TracerState::Live).collect::<Vec<_>>(),
+            Err(error) => {
+                if builder.borrow().error.is_none() {
+                    builder.borrow_mut().error = Some(error.clone());
                 }
+                output_types.into_iter().map(TracerState::Poison).collect::<Vec<_>>()
             }
         };
 
-        Ok(output_atoms.into_iter().map(|atom| Self { atom, builder: builder.clone(), engine }).collect())
+        Ok(output_states.into_iter().map(|state| Self { state, builder: builder.clone(), engine }).collect())
     }
 
     /// Stages a single-input primitive application and returns its unique output.
@@ -176,7 +223,10 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 {
     #[inline]
     fn r#type(&self) -> Cow<'_, E::Type> {
-        Cow::Owned(self.builder.borrow().atoms[self.atom.index].r#type().into_owned())
+        match &self.state {
+            TracerState::Live(atom) => Cow::Owned(self.builder.borrow().atoms[atom.index].r#type().into_owned()),
+            TracerState::Poison(r#type) => Cow::Borrowed(r#type),
+        }
     }
 }
 
@@ -192,7 +242,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     fn zero_like(&self) -> Self {
         let value = self.engine.zero(&self.r#type().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { atom, builder: self.builder.clone(), engine: self.engine }
+        Self { state: TracerState::Live(atom), builder: self.builder.clone(), engine: self.engine }
     }
 }
 
@@ -203,7 +253,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     fn one_like(&self) -> Self {
         let value = self.engine.one(&self.r#type().into_owned());
         let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { atom, builder: self.builder.clone(), engine: self.engine }
+        Self { state: TracerState::Live(atom), builder: self.builder.clone(), engine: self.engine }
     }
 }
 
@@ -300,14 +350,13 @@ where
             output_structure.clone(),
             traced_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let outputs = traced_outputs.into_iter().map(|output| output.atom).collect::<Vec<_>>();
+        if let Some(tracing_error) = builder.borrow_mut().error.take() {
+            return Err(tracing_error);
+        }
+        let outputs = traced_outputs.into_iter().map(|output| output.atom_id()).collect::<Result<Vec<_>, _>>()?;
         let output_structure = output_types.parameter_structure();
         (output_structure, output_types, outputs)
     };
-
-    if let Some(tracing_error) = builder.borrow_mut().error.take() {
-        return Err(tracing_error);
-    }
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TracingError::EscapedProgramBuilder),
@@ -405,9 +454,10 @@ mod tests {
         let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, &engine);
         let zero = tracer.zero_like();
         assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(crate::types::DataType::F64));
-        assert!(zero.atom > atom);
+        let zero_atom = zero.state.live_atom().expect("zero-like tracer should remain live");
+        assert!(zero_atom > atom);
 
-        let program = zero.builder.borrow().clone().build::<f64, f64>(vec![zero.atom], Placeholder, Placeholder);
+        let program = zero.builder.borrow().clone().build::<f64, f64>(vec![zero_atom], Placeholder, Placeholder);
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -452,6 +502,39 @@ mod tests {
             Tracer::apply_staged_op(&engine_a, builder, &[tracer_a, tracer_b], PrimitiveOperation::Add),
             Err(TracingError::MismatchedEngines),
         ));
+    }
+
+    #[test]
+    fn traced_apply_staged_op_returns_poisoned_tracers_after_builder_failure() {
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
+        builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
+        let engine = TaggedEngine { id: 1 };
+        let tracer = Tracer::from_engine(atom, builder.clone(), &engine);
+
+        let outputs =
+            Tracer::apply_staged_op(&engine, builder, std::slice::from_ref(&tracer), PrimitiveOperation::Neg).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            outputs[0].state,
+            TracerState::Poison(ref output_type) if *output_type == ArrayType::scalar(crate::types::DataType::F64)
+        ));
+    }
+
+    #[test]
+    fn poisoned_tracer_atom_id_returns_poisoned_tracer_error() {
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let engine = TaggedEngine { id: 1 };
+        let tracer = Tracer {
+            state: TracerState::Poison(ArrayType::scalar(crate::types::DataType::F64)),
+            builder,
+            engine: &engine,
+        };
+
+        assert_eq!(tracer.atom_id(), Err(TracingError::PoisonedTracer));
     }
 
     #[test]

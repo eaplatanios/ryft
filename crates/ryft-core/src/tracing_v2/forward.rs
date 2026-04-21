@@ -560,7 +560,7 @@ where
         };
         let compiled_jvp_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::TracingOperation>::new()));
-        let compiled_jvp_output_atoms = {
+        let compiled_jvp_outputs = {
             let jit_combined = combined_input_0
                 .iter()
                 .map(|value| {
@@ -589,11 +589,15 @@ where
             let mut compiled_jvp_outputs = Vec::with_capacity(combined_output_count);
             compiled_jvp_outputs.extend(primal_outputs);
             compiled_jvp_outputs.extend(tangent_outputs);
-            compiled_jvp_outputs.into_iter().map(|output| output.atom).collect::<Vec<_>>()
+            compiled_jvp_outputs
         };
         if let Some(tracing_error) = compiled_jvp_builder.borrow_mut().error.take() {
             return Err(tracing_error);
         }
+        let compiled_jvp_output_atoms = compiled_jvp_outputs
+            .into_iter()
+            .map(|output| output.atom_id())
+            .collect::<Result<Vec<_>, _>>()?;
         let compiled_jvp_builder = match Rc::try_unwrap(compiled_jvp_builder) {
             Ok(compiled_jvp_builder) => compiled_jvp_builder.into_inner(),
             Err(_) => {

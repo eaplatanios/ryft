@@ -73,7 +73,7 @@ mod values;
 
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
-pub use jit::{Tracer, interpret_and_trace, trace};
+pub use jit::{Tracer, TracerState, interpret_and_trace, trace};
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad, hessian,
     jacfwd, jacrev, jvp_program, value_and_grad, vjp,
@@ -124,6 +124,9 @@ pub enum TracingError {
 
     #[error("encountered program builder that escaped its tracing scope")]
     EscapedProgramBuilder,
+
+    #[error("encountered poisoned tracer where a live tracer was required")]
+    PoisonedTracer,
 
     #[error(transparent)]
     Parameter(#[from] ParameterError),

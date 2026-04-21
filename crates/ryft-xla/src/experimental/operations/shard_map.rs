@@ -209,7 +209,7 @@ impl ShardMapOperation<ShardMapTensor> {
         &self,
         primals: &[ShardMapTracer],
     ) -> Result<ShardMapOperation<ShardMapTracer>, TracingError> {
-        let captured_atoms = primals.iter().map(|primal| primal.atom).collect::<Vec<_>>();
+        let captured_atoms = primals.iter().map(|primal| primal.atom_id()).collect::<Result<Vec<_>, _>>()?;
         match &self.linear_state {
             Some(linear_state) => Ok(ShardMapOperation::new_linear(
                 self.body.clone(),
@@ -1330,7 +1330,7 @@ fn make_linear_shard_map(
     };
     Ok(ShardMapOperation::new_linear(
         body.clone(),
-        captured_global_primals.into_iter().map(|primal| primal.atom).collect::<Vec<_>>(),
+        captured_global_primals.into_iter().map(|primal| primal.atom_id()).collect::<Result<Vec<_>, _>>()?,
         body.global_input_types.clone(),
         body.global_output_types.clone(),
         LinearShardMapEvalMode::Body(linear_bodies.pushforward),
