@@ -45,6 +45,8 @@ mod reverse;
 mod term;
 
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
+#[doc(hidden)]
+pub use program::linearize_program;
 pub use program::transpose_linear_program;
 pub use program::transpose_linear_program_with_output_examples;
 pub use program::transpose_traced_linear_program;
@@ -52,7 +54,6 @@ pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_
 pub use reverse::{grad, jvp_program, value_and_grad, vjp};
 pub use term::{LinearTerm, Linearized};
 
-pub(crate) use program::linearize_program;
 pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
 pub(crate) use reverse::jvp_traced;
 

@@ -38,7 +38,8 @@ where
 /// This is the reusable IR-level form of forward-mode differentiation. Instead of evaluating the
 /// JVP immediately, it builds a staged [`Program`] over linear operations that can be replayed
 /// later on arbitrary tangent inputs at the same primal point.
-pub(crate) fn linearize_program<Input, Output, V, O, L>(
+#[doc(hidden)]
+pub fn linearize_program<Input, Output, V, O, L>(
     engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
     program: &Program<ArrayType, V, O, Input, Output>,
     input_primals: Vec<V>,
