@@ -83,8 +83,8 @@ pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{
-    Cos, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, LinearCustomPrimitive, LinearOperation,
-    LinearPrimitiveOperation, PrimitiveOperation, Sin, VectorizableOperation,
+    Cos, CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation,
+    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin, VectorizableOperation,
 };
 pub use programs::{
     Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, Value,
@@ -111,10 +111,6 @@ pub enum TracingError {
     #[error("unbound atom ID: {id}")]
     UnboundAtomId { id: AtomId },
 
-    /// A custom primitive was used by a transform without registering the required rule.
-    #[error("custom primitive '{op}' does not provide a '{transform}' rule")]
-    MissingCustomRule { op: &'static str, transform: &'static str },
-
     /// An internal tracing invariant was violated while constructing or replaying a program.
     #[error("{0}")]
     InternalInvariantViolation(&'static str),
@@ -123,15 +119,15 @@ pub enum TracingError {
     #[error("higher-order op '{op}' failed: {message}")]
     HigherOrderOpFailure { op: &'static str, message: String },
 
-    /// Wrapper around parameter-lifting failures from the `Parameterized` infrastructure.
     #[error(transparent)]
     Parameter(#[from] ParameterError),
 
-    /// Wrapper around abstract type-level reasoning failures.
     #[error(transparent)]
     Type(#[from] TypeError),
 
-    /// Wrapper around batching- and vmapping-specific failures.
     #[error(transparent)]
     Batching(#[from] BatchingError),
+
+    #[error(transparent)]
+    CustomOperation(#[from] CustomOperationError),
 }

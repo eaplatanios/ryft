@@ -17,6 +17,8 @@ use std::{
     sync::Arc,
 };
 
+use thiserror::Error;
+
 use crate::{
     batching::Batch,
     parameters::Parameter,
@@ -35,6 +37,15 @@ use super::{
     LinearScaleOperation, Operation, VectorizableOperation,
     primitive::{LinearPrimitiveOperation, PrimitiveOperation},
 };
+
+/// Error type for rule-based custom staged operations.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum CustomOperationError {
+    /// Error returned when a custom primitive is used by a transform without registering the
+    /// required rule.
+    #[error("custom primitive '{op}' does not provide a '{transform}' rule")]
+    MissingRule { op: &'static str, transform: &'static str },
+}
 
 /// Hidden staging trait for the custom-primitive escape hatch.
 #[doc(hidden)]
@@ -291,8 +302,8 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         self.clone().into_linear()
     }
 
-    pub(super) fn missing_rule(&self, transform: &'static str) -> TracingError {
-        TracingError::MissingCustomRule { op: self.base.name(), transform }
+    pub(super) fn missing_rule(&self, transform: &'static str) -> CustomOperationError {
+        CustomOperationError::MissingRule { op: self.base.name(), transform }
     }
 
     fn jvp_rule<O: Clone + 'static, L: Clone + Operation<T> + 'static>(
@@ -301,7 +312,7 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         self.extensions
             .get::<JvpRule<T, V, O, L>>()
             .map(JvpRule::rule)
-            .ok_or_else(|| self.missing_rule("jvp"))
+            .ok_or_else(|| TracingError::from(self.missing_rule("jvp")))
     }
 }
 
@@ -357,7 +368,7 @@ impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<A
     {
         self.extensions
             .get::<CanonicalLinearizedJitRule<V, E>>()
-            .ok_or_else(|| self.missing_rule("linearized JIT replay"))?
+            .ok_or_else(|| TracingError::from(self.missing_rule("linearized JIT replay")))?
             .interpret(inputs)
     }
 }
@@ -410,14 +421,17 @@ impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for Custom
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         self.transpose_rule
             .as_deref()
-            .ok_or_else(|| self.missing_rule("transpose"))?
+            .ok_or_else(|| TracingError::from(self.missing_rule("transpose")))?
             .transpose(output_cotangents)
     }
 }
 
 impl<V: Traceable<ArrayType> + 'static> VectorizableOperation<ArrayType, V> for CustomPrimitive<ArrayType, V> {
     fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        self.vectorization_rule.as_deref().ok_or_else(|| self.missing_rule("vectorize"))?.batch(inputs)
+        self.vectorization_rule
+            .as_deref()
+            .ok_or_else(|| TracingError::from(self.missing_rule("vectorize")))?
+            .batch(inputs)
     }
 }
 
@@ -457,7 +471,7 @@ where
     ) -> Result<Vec<Linearized<Tracer<'static, E>, InnerLinearOperation>>, TracingError> {
         self.extensions
             .get::<LinearizedJitRule<V, O, OuterLinearOperation, InnerLinearOperation, E>>()
-            .ok_or_else(|| self.missing_rule("linearized JIT replay"))?
+            .ok_or_else(|| TracingError::from(self.missing_rule("linearized JIT replay")))?
             .interpret(inputs)
     }
 }
@@ -475,7 +489,10 @@ pub struct LinearCustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter>
 impl<T: Type + Display + 'static, V: Traceable<T> + 'static> LinearCustomPrimitive<T, V> {
     /// Creates one linear-only wrapper from a custom primitive that already provides a transpose rule.
     pub fn from_custom_primitive(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError> {
-        primitive.transpose_rule.as_ref().ok_or_else(|| primitive.missing_rule("transpose"))?;
+        primitive
+            .transpose_rule
+            .as_ref()
+            .ok_or_else(|| TracingError::from(primitive.missing_rule("transpose")))?;
         Ok(Self { primitive })
     }
 
@@ -733,7 +750,10 @@ mod tests {
 
         assert!(matches!(
             primitive.into_linear(),
-            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "transpose" })
+            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                op: "test_shift",
+                transform: "transpose",
+            }))
         ));
     }
 
@@ -766,7 +786,10 @@ mod tests {
 
         assert!(matches!(
             primitive.transpose(&[cotangent]),
-            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "transpose" })
+            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                op: "test_shift",
+                transform: "transpose",
+            }))
         ));
     }
 
@@ -784,7 +807,13 @@ mod tests {
             1.0f64,
         );
 
-        assert_eq!(result, Err(TracingError::MissingCustomRule { op: "test_shift", transform: "jvp" }),);
+        assert_eq!(
+            result,
+            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                op: "test_shift",
+                transform: "jvp",
+            })),
+        );
     }
 
     #[test]
@@ -814,7 +843,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "linearized JIT replay" })
+            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                op: "test_shift",
+                transform: "linearized JIT replay",
+            }))
         ));
     }
 
@@ -869,7 +901,10 @@ mod tests {
 
         assert_eq!(
             apply_custom_batched_unary(Batch::new(vec![1.0f64, 2.0]), primitive),
-            Err(TracingError::MissingCustomRule { op: "test_shift", transform: "vectorize" }),
+            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                op: "test_shift",
+                transform: "vectorize",
+            })),
         );
     }
 

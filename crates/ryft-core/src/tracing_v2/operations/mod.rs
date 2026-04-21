@@ -108,7 +108,8 @@ pub use crate::tracing_v2::programs::{InterpretableOperation, Operation};
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
 pub use cos::{Cos, CosOperation, CosTracingOperation};
 pub use custom::{
-    CustomPrimitive, CustomPrimitiveExtensions, CustomTracingOperation, LinearCustomOperation, LinearCustomPrimitive,
+    CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, CustomTracingOperation, LinearCustomOperation,
+    LinearCustomPrimitive,
 };
 pub use left_matmul::{LeftMatMulOperation, LeftMatMulTracingOperation, LinearLeftMatMulOperation};
 pub use matmul::{MatMulOperation, MatMulTracingOperation};
