@@ -294,6 +294,30 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
         }
 }
 
+/// Re-embeds one traced shard-map output type into the caller's ambient sharding envelope.
+///
+/// Traced nested `shard_map` invocations stage as ordinary higher-order ops inside an already-local
+/// caller scope. When the caller's ambient sharding envelope differs from the captured shard-map
+/// boundary, the staged result must use the ambient envelope again so downstream traced primitives
+/// see a value in the surrounding local context rather than in the nested shard-map boundary space.
+fn adapt_traced_shard_map_output_type(
+    actual_input_types: &[ArrayType],
+    captured_input_types: &[ArrayType],
+    captured_output_type: &ArrayType,
+) -> ArrayType {
+    if actual_input_types.len() == 1
+        && captured_input_types.len() == 1
+        && actual_input_types[0].sharding != captured_input_types[0].sharding
+        && actual_input_types[0].shape.rank() == captured_output_type.shape.rank()
+    {
+        let mut adapted_output_type = captured_output_type.clone();
+        adapted_output_type.sharding = actual_input_types[0].sharding.clone();
+        adapted_output_type
+    } else {
+        captured_output_type.clone()
+    }
+}
+
 impl Operation for ShardMapOperation<ShardMapTensor> {
     fn name(&self) -> &'static str {
         if self.has_linear_state() { "linear_shard_map" } else { "shard_map" }
@@ -319,7 +343,13 @@ impl Operation for ShardMapOperation<ShardMapTensor> {
                 message: format!("{} input types do not match the captured shard-map boundary", self.name()),
             });
         }
-        Ok(self.output_types.clone())
+        Ok(self
+            .output_types
+            .iter()
+            .map(|output_type| {
+                adapt_traced_shard_map_output_type(input_types, self.input_types.as_slice(), output_type)
+            })
+            .collect::<Vec<_>>())
     }
 }
 
@@ -476,7 +506,13 @@ impl Operation for ShardMapOperation<ShardMapTracer> {
                 message: format!("{} input types do not match the captured shard-map boundary", self.name()),
             });
         }
-        Ok(self.output_types.clone())
+        Ok(self
+            .output_types
+            .iter()
+            .map(|output_type| {
+                adapt_traced_shard_map_output_type(input_types, self.input_types.as_slice(), output_type)
+            })
+            .collect::<Vec<_>>())
     }
 }
 
