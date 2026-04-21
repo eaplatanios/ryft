@@ -5,6 +5,7 @@
 //! to understand how one primitive threads through staging, replay, batching, and JVP evaluation.
 
 use std::{
+    collections::BTreeSet,
     fmt::{Debug, Display},
     ops::Mul,
 };
@@ -58,10 +59,38 @@ impl Operation for MulOperation {
         if input_types.len() != 2 {
             return Err(TypeError { message: format!("mul expected 2 input types but got {}", input_types.len()) });
         }
-        input_types[0]
-            .broadcast(&input_types[1])
-            .map(|output| vec![output])
-            .map_err(|_| TypeError { message: "mul input types are not broadcast-compatible".to_string() })
+        match input_types[0].broadcast(&input_types[1]) {
+            Ok(output) => Ok(vec![output]),
+            Err(_) => {
+                // As with `add`, keep generic `ArrayType` broadcasting strict and apply the
+                // JAX-like implicit `pvary` behavior only at the primitive boundary. We retry
+                // after clearing VMA metadata, then conservatively mark the result as varying over
+                // every manual axis that either input may vary across.
+                let original_varying_manual_axes = match (&input_types[0].sharding, &input_types[1].sharding) {
+                    (None, None) => BTreeSet::new(),
+                    (Some(left), None) => left.varying_manual_axes.clone(),
+                    (None, Some(right)) => right.varying_manual_axes.clone(),
+                    (Some(left), Some(right)) => {
+                        left.varying_manual_axes.union(&right.varying_manual_axes).cloned().collect::<BTreeSet<_>>()
+                    }
+                };
+                let mut left = input_types[0].clone();
+                let mut right = input_types[1].clone();
+                if let Some(sharding) = &mut left.sharding {
+                    sharding.varying_manual_axes.clear();
+                }
+                if let Some(sharding) = &mut right.sharding {
+                    sharding.varying_manual_axes.clear();
+                }
+                let mut output = left
+                    .broadcast(&right)
+                    .map_err(|_| TypeError { message: "mul input types are not broadcast-compatible".to_string() })?;
+                if let Some(sharding) = &mut output.sharding {
+                    sharding.varying_manual_axes = original_varying_manual_axes;
+                }
+                Ok(vec![output])
+            }
+        }
     }
 
     fn try_simplify(
@@ -136,8 +165,11 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType,
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{engine::ArrayScalarEngine, test_support};
     use crate::types::{DataType, Shape, Size};
+    use crate::{
+        sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
+        tracing_v2::{engine::ArrayScalarEngine, test_support},
+    };
 
     use super::*;
 
@@ -200,5 +232,53 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, TypeError { message: "mul input types are not broadcast-compatible".to_string() });
+    }
+
+    #[test]
+    fn test_mul_abstract_eval_merges_varying_manual_axes_for_compatible_inputs() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let left = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["x"],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let right = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::with_manual_axes(
+                    mesh,
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["y"],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let output = <MulOperation as Operation>::infer_output_types(&MulOperation, &[left, right]).unwrap();
+
+        assert_eq!(
+            output[0].sharding.as_ref().unwrap().varying_manual_axes,
+            BTreeSet::from(["x".to_string(), "y".to_string()])
+        );
     }
 }

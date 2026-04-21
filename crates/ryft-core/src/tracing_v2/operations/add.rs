@@ -6,6 +6,7 @@
 //! `vmap`.
 
 use std::{
+    collections::BTreeSet,
     fmt::{Debug, Display},
     ops::Add,
 };
@@ -71,10 +72,39 @@ impl Operation for AddOperation {
         if input_types.len() != 2 {
             return Err(TypeError { message: format!("add expected 2 input types but got {}", input_types.len()) });
         }
-        input_types[0]
-            .broadcast(&input_types[1])
-            .map(|output| vec![output])
-            .map_err(|_| TypeError { message: "add input types are not broadcast-compatible".to_string() })
+        match input_types[0].broadcast(&input_types[1]) {
+            Ok(output) => Ok(vec![output]),
+            Err(_) => {
+                // JAX keeps generic shape/type broadcasting conservative and instead makes binary
+                // primitives tolerate differing VMA annotations by implicitly inserting `pvary`
+                // where needed. We model that more narrowly here: retry abstract evaluation after
+                // erasing only the varying-manual-axis metadata, then restore the union on the
+                // result instead of weakening generic `ArrayType` broadcasting everywhere.
+                let original_varying_manual_axes = match (&input_types[0].sharding, &input_types[1].sharding) {
+                    (None, None) => BTreeSet::new(),
+                    (Some(left), None) => left.varying_manual_axes.clone(),
+                    (None, Some(right)) => right.varying_manual_axes.clone(),
+                    (Some(left), Some(right)) => {
+                        left.varying_manual_axes.union(&right.varying_manual_axes).cloned().collect::<BTreeSet<_>>()
+                    }
+                };
+                let mut left = input_types[0].clone();
+                let mut right = input_types[1].clone();
+                if let Some(sharding) = &mut left.sharding {
+                    sharding.varying_manual_axes.clear();
+                }
+                if let Some(sharding) = &mut right.sharding {
+                    sharding.varying_manual_axes.clear();
+                }
+                let mut output = left
+                    .broadcast(&right)
+                    .map_err(|_| TypeError { message: "add input types are not broadcast-compatible".to_string() })?;
+                if let Some(sharding) = &mut output.sharding {
+                    sharding.varying_manual_axes = original_varying_manual_axes;
+                }
+                Ok(vec![output])
+            }
+        }
     }
 
     fn try_simplify(
@@ -152,6 +182,7 @@ mod tests {
 
     use crate::{
         batching::BatchingError,
+        sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
         tracing_v2::test_support,
         types::{DataType, Layout, Shape, Size, StridedLayout},
     };
@@ -213,5 +244,53 @@ mod tests {
 
         assert_eq!(error, TracingError::Batching(BatchingError::MismatchedBatchSize));
         test_support::assert_reference_scalar_sine_jit_rendering();
+    }
+
+    #[test]
+    fn test_add_abstract_eval_merges_varying_manual_axes_for_compatible_inputs() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let left = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::with_manual_axes(
+                    mesh.clone(),
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["x"],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let right = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Size::Static(8)]),
+            None,
+            Some(
+                Sharding::with_manual_axes(
+                    mesh,
+                    vec![ShardingDimension::sharded(["x"])],
+                    Vec::<&str>::new(),
+                    Vec::<&str>::new(),
+                    ["y"],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let output = <AddOperation as Operation>::infer_output_types(&AddOperation, &[left, right]).unwrap();
+
+        assert_eq!(
+            output[0].sharding.as_ref().unwrap().varying_manual_axes,
+            BTreeSet::from(["x".to_string(), "y".to_string()])
+        );
     }
 }

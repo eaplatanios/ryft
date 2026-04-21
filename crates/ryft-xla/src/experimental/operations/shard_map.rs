@@ -300,6 +300,10 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
 /// caller scope. When the caller's ambient sharding envelope differs from the captured shard-map
 /// boundary, the staged result must use the ambient envelope again so downstream traced primitives
 /// see a value in the surrounding local context rather than in the nested shard-map boundary space.
+///
+/// This mirrors the JAX intuition that a nested `shard_map` body returns to the enclosing
+/// per-instance context after the inner manual region finishes; the inner boundary should not leak
+/// out as the ambient type seen by surrounding primitives in the outer body.
 fn adapt_traced_shard_map_output_type(
     actual_input_types: &[ArrayType],
     captured_input_types: &[ArrayType],
