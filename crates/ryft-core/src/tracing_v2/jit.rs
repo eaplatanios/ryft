@@ -410,20 +410,19 @@ where
         },
         input_types,
     )?;
-    let output_structure = output_structure.ok_or(TracingError::InternalInvariantViolation(
-        "interpret_and_trace did not record the staged output structure",
-    ))?;
+    let output_structure = output_structure
+        .expect("interpret_and_trace should record the staged output structure before returning successfully");
+    let Program { atoms, input_ids, output_ids, instructions, .. } = flat_program;
     let program: Program<E::Type, E::Value, E::TracingOperation, Input, Output> = Program {
-        atoms: flat_program.atoms.clone(),
-        input_ids: flat_program.input_ids.clone(),
-        output_ids: flat_program.output_ids.clone(),
-        instructions: flat_program.instructions.clone(),
+        atoms,
+        input_ids,
+        output_ids,
+        instructions,
         input_structure,
         output_structure,
         marker: std::marker::PhantomData,
-    }
-    .with_folded_constants()?
-    .simplified()?;
+    };
+    let program = program.with_folded_constants()?.simplified()?;
     let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
     Ok((program.interpret(concrete_input)?, program))
 }

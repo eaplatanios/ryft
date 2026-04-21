@@ -259,9 +259,7 @@ where
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {
-            return Err(TracingError::InternalInvariantViolation(
-                "transpose builder should not have outstanding linear terms",
-            ));
+            return Err(TracingError::EscapedProgramBuilder);
         }
     };
     builder
