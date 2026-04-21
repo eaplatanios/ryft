@@ -61,6 +61,7 @@ use crate::types::TypeError;
 pub(crate) mod benchmark_support;
 #[cfg(feature = "benchmarking")]
 pub mod benchmarking;
+pub mod differentiation;
 pub mod engine;
 pub mod forward;
 pub mod jit;
@@ -71,6 +72,7 @@ pub(crate) mod programs;
 pub(crate) mod test_support;
 mod values;
 
+pub use differentiation::DifferentiationError;
 pub use engine::Engine;
 pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
 pub use jit::{Tracer, TracerState, interpret_and_trace, trace};
@@ -136,6 +138,9 @@ pub enum TracingError {
 
     #[error(transparent)]
     Type(#[from] TypeError),
+
+    #[error(transparent)]
+    Differentiation(#[from] DifferentiationError),
 
     #[error(transparent)]
     Batching(#[from] BatchingError),

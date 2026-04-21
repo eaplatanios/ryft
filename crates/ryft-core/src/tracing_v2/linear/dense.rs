@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::tracing_v2::DifferentiationError;
+
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
 ///
 /// Dense Jacobian and Hessian materialization only makes sense for leaf types with a finite,
@@ -97,16 +99,12 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure,
         let rows = output_coordinate_counts.iter().sum::<usize>();
         let cols = input_coordinate_counts.iter().sum::<usize>();
         if rows_data.len() != rows {
-            return Err(TracingError::InternalInvariantViolation(
-                "row-major Jacobian materialization produced an unexpected number of rows",
-            ));
+            return Err(DifferentiationError::InvalidJacobianRowCount { expected: rows, got: rows_data.len() }.into());
         }
         let mut values = Vec::with_capacity(rows.saturating_mul(cols));
         for row in rows_data {
             if row.len() != cols {
-                return Err(TracingError::InternalInvariantViolation(
-                    "row-major Jacobian materialization produced an unexpected row width",
-                ));
+                return Err(DifferentiationError::InvalidJacobianRowWidth { expected: cols, got: row.len() }.into());
             }
             values.extend(row);
         }
@@ -131,17 +129,17 @@ impl<S: Clone, InputStructure, OutputStructure> DenseJacobian<S, InputStructure,
         let rows = output_coordinate_counts.iter().sum::<usize>();
         let cols = input_coordinate_counts.iter().sum::<usize>();
         if columns.len() != cols {
-            return Err(TracingError::InternalInvariantViolation(
-                "column-major Jacobian materialization produced an unexpected number of columns",
-            ));
+            return Err(DifferentiationError::InvalidJacobianColumnCount { expected: cols, got: columns.len() }.into());
         }
         let mut values = Vec::with_capacity(rows.saturating_mul(cols));
         for row in 0..rows {
             for column in columns.iter() {
                 if column.len() != rows {
-                    return Err(TracingError::InternalInvariantViolation(
-                        "column-major Jacobian materialization produced an unexpected column height",
-                    ));
+                    return Err(DifferentiationError::InvalidJacobianColumnHeight {
+                        expected: rows,
+                        got: column.len(),
+                    }
+                    .into());
                 }
                 values.push(column[row].clone());
             }
@@ -382,4 +380,60 @@ where
     E::LinearOperation: CoreLinearReplayOperation<V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        parameters::Placeholder,
+        tracing_v2::{DifferentiationError, TracingError},
+    };
+
+    use super::DenseJacobian;
+
+    #[test]
+    fn test_dense_jacobian_from_rows_rejects_invalid_row_count() {
+        let result = DenseJacobian::from_rows(vec![vec![1.0]], Placeholder, Placeholder, vec![1], vec![1, 1]);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::InvalidJacobianRowCount { expected: 2, got: 1 }))
+        ));
+    }
+
+    #[test]
+    fn test_dense_jacobian_from_rows_rejects_invalid_row_width() {
+        let result = DenseJacobian::from_rows(vec![vec![1.0]], Placeholder, Placeholder, vec![2], vec![1]);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::InvalidJacobianRowWidth { expected: 2, got: 1 }))
+        ));
+    }
+
+    #[test]
+    fn test_dense_jacobian_from_columns_rejects_invalid_column_count() {
+        let result = DenseJacobian::from_columns(vec![vec![1.0]], Placeholder, Placeholder, vec![1, 1], vec![1]);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::InvalidJacobianColumnCount {
+                expected: 2,
+                got: 1,
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_dense_jacobian_from_columns_rejects_invalid_column_height() {
+        let result = DenseJacobian::from_columns(vec![vec![1.0]], Placeholder, Placeholder, vec![1], vec![1, 1]);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::InvalidJacobianColumnHeight {
+                expected: 2,
+                got: 1,
+            }))
+        ));
+    }
 }
