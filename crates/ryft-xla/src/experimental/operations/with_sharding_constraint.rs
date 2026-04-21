@@ -8,8 +8,8 @@ use std::{
 use ryft_core::macros::check_input_count;
 use ryft_core::sharding::Sharding;
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation,
-    Operation, PrimitiveOperation, Tracer, TracingError, VectorizableOperation,
+    CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearCustomPrimitive, LinearOperation,
+    LinearPrimitiveOperation, Operation, PrimitiveOperation, Tracer, TracingError, VectorizableOperation,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -23,16 +23,6 @@ use crate::experimental::lowering::{
 };
 use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
-
-type JitShardMapTracer = Tracer<
-    'static,
-    dyn Engine<
-            Type = ArrayType,
-            Value = ShardMapTracer,
-            TracingOperation = PrimitiveOperation<ArrayType, ShardMapTracer>,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
-        >,
->;
 use crate::mlir::ToMlir;
 
 /// Unary primitive that constrains one traced XLA value to a requested sharding.
@@ -86,22 +76,12 @@ impl WithShardingConstraintOperation {
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
     }
 
-    /// Returns the traced-leaf custom primitive registration for this op.
-    pub(crate) fn to_tracer_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTracer> {
-        self.base_custom_primitive::<ShardMapTracer>()
-            .with_jvp_rule(self.clone())
-            .with_linearized_jit_rule_for::<
-                PrimitiveOperation<ArrayType, ShardMapTracer>,
-                LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
-                LinearPrimitiveOperation<ArrayType, JitShardMapTracer>,
-                dyn Engine<
-                        Type = ArrayType,
-                        Value = ShardMapTracer,
-                        TracingOperation = PrimitiveOperation<ArrayType, ShardMapTracer>,
-                        LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
-                    >,
-                _,
-            >(self.clone())
+    /// Returns the traced-leaf linear custom primitive registration used by tangent programs.
+    pub(crate) fn to_tracer_linear_custom_primitive(&self) -> LinearCustomPrimitive<ArrayType, ShardMapTracer> {
+        CustomPrimitive::new(self.clone())
+            .with_transpose_rule(self.clone())
+            .into_linear()
+            .expect("with_sharding_constraint traced linear primitive should carry a transpose rule")
     }
 }
 
@@ -229,7 +209,7 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for WithShard
         let tangent = LinearTerm::apply_staged_op(
             input.tangent.builder.clone(),
             std::slice::from_ref(&input.tangent),
-            LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
+            LinearPrimitiveOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
             1,
         )?
         .into_iter()
@@ -255,7 +235,7 @@ impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperat
         let contribution = LinearTerm::apply_staged_op(
             output_cotangents[0].builder.clone(),
             std::slice::from_ref(&output_cotangents[0]),
-            LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
+            LinearPrimitiveOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
             1,
         )?
         .into_iter()
@@ -299,7 +279,7 @@ impl
         let tangent = LinearTerm::apply_staged_op(
             inputs[0].tangent.builder.clone(),
             std::slice::from_ref(&inputs[0].tangent),
-            LinearPrimitiveOperation::custom(self.to_tracer_custom_primitive())?,
+            LinearPrimitiveOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
             1,
         )?
         .into_iter()
@@ -318,20 +298,6 @@ impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOperation<Array
     ) -> Result<Vec<ryft_core::batching::Batch<V>>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone()])
-    }
-}
-
-impl InterpretableOperation<ArrayType, Linearized<JitShardMapTracer>> for WithShardingConstraintOperation {
-    fn interpret(
-        &self,
-        _inputs: &[Linearized<JitShardMapTracer>],
-    ) -> Result<Vec<Linearized<JitShardMapTracer>>, TracingError> {
-        Err(TracingError::HigherOrderOpFailure {
-            op: "eval_linearized_jit",
-            message: "linearized JIT evaluation for 'with_sharding_constraint' at the JIT-tracer level is not \
-                      supported"
-                .to_string(),
-        })
     }
 }
 
@@ -521,6 +487,44 @@ mod tests {
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
         let transpose_program = transpose_builder.build::<ShardMapTensor, ShardMapTensor>(
+            vec![contribution_atom],
+            Placeholder,
+            Placeholder,
+        );
+        assert_eq!(
+            transpose_program.to_string(),
+            format!("lambda %0:f32[8] .\nlet %1:f32[8][sharding={sharding}] = with_sharding_constraint %0\nin (%1)")
+                .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_with_sharding_constraint_traced_transpose_preserves_the_constraint() {
+        let mesh = test_mesh();
+        let sharding = test_sharding(&mesh);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
+
+        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            ShardMapTracer,
+            LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+        >::new()));
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
+        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
+        let contribution =
+            LinearOperation::transpose(&WithShardingConstraintOperation::new(sharding.clone()), &[output_cotangent])
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("transpose should return one contribution")
+                .expect("transpose should produce one cotangent contribution");
+        let contribution_atom = contribution.atom;
+        drop(contribution);
+
+        let transpose_builder = Rc::try_unwrap(transpose_builder)
+            .expect("transpose builder should not have outstanding linear terms")
+            .into_inner();
+        let transpose_program = transpose_builder.build::<ShardMapTracer, ShardMapTracer>(
             vec![contribution_atom],
             Placeholder,
             Placeholder,
