@@ -11,8 +11,8 @@ use std::marker::PhantomData;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing_v2::{
-        Atom, AtomId, Instruction, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Program, Traceable,
-        Tracer, TracingError, Value, ZeroLike,
+        Atom, AtomId, DifferentiationError, Instruction, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation,
+        Program, Traceable, Tracer, TracingError, Value, ZeroLike,
         engine::Engine,
         linear::{
             linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
@@ -211,11 +211,7 @@ where
             return if self.body.output_types().is_empty() {
                 Ok(Vec::new())
             } else {
-                Err(TracingError::HigherOrderOpFailure {
-                    op: "rematerialize",
-                    message: "traced rematerialize requires at least one input leaf to recover the staging context"
-                        .to_string(),
-                })
+                Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into())
             };
         }
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -320,12 +316,7 @@ where
         } else if self.body.output_types.is_empty() {
             return Ok(Vec::new());
         } else {
-            return Err(TracingError::HigherOrderOpFailure {
-                op: "rematerialize",
-                message:
-                    "linear rematerialize replay requires at least one tangent leaf to recover the staging context"
-                        .to_string(),
-            });
+            return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
         };
         let tangent_outputs = LinearTerm::apply_staged_op(
             tangent_builder,
@@ -361,11 +352,7 @@ where
             return if self.body.output_types().is_empty() {
                 Ok(Vec::new())
             } else {
-                Err(TracingError::HigherOrderOpFailure {
-                    op: "rematerialize",
-                    message: "traced rematerialize requires at least one input leaf to recover the staging context"
-                        .to_string(),
-                })
+                Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into())
             };
         }
         let exemplar_input = inputs[0].clone();
@@ -471,12 +458,7 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerial
             return if self.body.input_types().is_empty() {
                 Ok(Vec::new())
             } else {
-                Err(TracingError::HigherOrderOpFailure {
-                    op: "rematerialize",
-                    message:
-                        "linear rematerialize transpose requires at least one output cotangent leaf to recover the staging context"
-                            .to_string(),
-                })
+                Err(DifferentiationError::MissingLinearRematerializeTransposeCotangentLeaves.into())
             };
         }
         let exemplar_output_cotangent = output_cotangents[0].clone();
@@ -630,11 +612,7 @@ where
             traced_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let Some(exemplar_traced_input) = traced_inputs.first().cloned() else {
-            return Err(TracingError::HigherOrderOpFailure {
-                op: "rematerialize",
-                message: "traced rematerialize requires at least one input leaf to recover the staging context"
-                    .to_string(),
-            });
+            return Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into());
         };
         let (exemplar_output_types, body_program) =
             trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
@@ -709,7 +687,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing_v2::{
-        Program, Sin,
+        DifferentiationError, JvpTracer, Linearized, Program, ProgramBuilder, Sin, Tracer,
         engine::ArrayScalarEngine,
         interpret_and_trace,
         linear::{compile_grad, grad, value_and_grad},
@@ -722,11 +700,90 @@ mod tests {
         assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
     }
 
+    fn scalar_type() -> ArrayType {
+        ArrayType::scalar(crate::types::DataType::F64)
+    }
+
+    fn empty_traced_body() -> FlatTracedRematerialize<ArrayType, f64> {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let output = builder.add_constant(0.0f64);
+        let program = builder.build::<Vec<f64>, Vec<f64>>(vec![output], vec![], vec![Placeholder]);
+        FlatTracedRematerialize::from_parts(vec![], vec![scalar_type()], program)
+    }
+
+    fn empty_linear_body() -> FlatTracedRematerialize<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>> {
+        let program = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()
+            .build::<Vec<f64>, Vec<f64>>(vec![], vec![], vec![]);
+        FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![], program)
+    }
+
     #[test]
     fn test_rematerialize_concrete_is_identity() {
         // rematerialize with concrete values should just call the function.
         let result: f64 = rematerialize(|x: f64| x.sin(), 2.0f64).unwrap();
         approx_eq(result, 2.0f64.sin());
+    }
+
+    #[test]
+    fn test_linearized_traced_rematerialize_requires_input_leaves() {
+        let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
+        let inputs: Vec<Linearized<Tracer<'_, ArrayScalarEngine<f64>>>> = Vec::new();
+
+        assert!(matches!(
+            operation.interpret(inputs.as_slice()),
+            Err(TracingError::Differentiation(DifferentiationError::MissingTracedRematerializeInputLeaves))
+        ));
+    }
+
+    #[test]
+    fn test_linear_rematerialize_jvp_requires_tangent_leaves() {
+        let engine = ArrayScalarEngine::<f64>::new();
+        let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
+        let inputs: Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>> = Vec::new();
+
+        assert!(matches!(
+            operation.jvp(&engine, inputs.as_slice()),
+            Err(TracingError::Differentiation(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves))
+        ));
+    }
+
+    #[test]
+    fn test_traced_rematerialize_requires_input_leaves() {
+        let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
+        let inputs: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+
+        assert!(matches!(
+            operation.interpret(inputs.as_slice()),
+            Err(TracingError::Differentiation(DifferentiationError::MissingTracedRematerializeInputLeaves))
+        ));
+    }
+
+    #[test]
+    fn test_linear_rematerialize_transpose_requires_output_cotangent_leaves() {
+        let operation = LinearRematerializeOperation::<ArrayType, f64>::new(empty_linear_body(), empty_linear_body());
+        let output_cotangents: Vec<LinearTerm<ArrayType, f64>> = Vec::new();
+
+        assert!(matches!(
+            operation.transpose(output_cotangents.as_slice()),
+            Err(TracingError::Differentiation(
+                DifferentiationError::MissingLinearRematerializeTransposeCotangentLeaves
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_rematerialize_invocation_requires_traced_input_leaves() {
+        let input: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+
+        let result = <Tracer<'_, ArrayScalarEngine<f64>> as RematerializeInvocationLeaf<
+            Vec<Tracer<'_, ArrayScalarEngine<f64>>>,
+            Tracer<'_, ArrayScalarEngine<f64>>,
+        >>::invoke(|_inputs| panic!("closure should not run without traced inputs"), input);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::MissingTracedRematerializeInputLeaves))
+        ));
     }
 
     #[test]

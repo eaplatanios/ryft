@@ -14,6 +14,7 @@
 use super::*;
 use crate::batching::{Batch, BatchingError, stack, unstack};
 use crate::parameters::ParameterError;
+use crate::tracing_v2::DifferentiationError;
 
 /// Traces `function` once and returns both its primal output and a reusable pushforward program.
 ///
@@ -100,10 +101,7 @@ where
     let traced_primals = primals.into_parameters().collect::<Vec<_>>();
     let traced_tangents = tangents.into_parameters().collect::<Vec<_>>();
     let Some(exemplar_traced_primal) = traced_primals.first() else {
-        return Err(TracingError::HigherOrderOpFailure {
-            op: "jvp",
-            message: "traced jvp requires at least one input leaf to recover the staging context".to_string(),
-        });
+        return Err(DifferentiationError::MissingTracedJvpInputLeaves.into());
     };
     let staged_input_types = Input::To::<ArrayType>::from_parameters(
         input_structure.clone(),
@@ -285,11 +283,7 @@ where
         let input_structure = primals.parameter_structure();
         let traced_primals = primals.into_parameters().collect::<Vec<_>>();
         if traced_primals.is_empty() {
-            return Err(TracingError::HigherOrderOpFailure {
-                op: "value_and_grad",
-                message: "traced reverse-mode requires at least one input leaf to recover the staging context"
-                    .to_string(),
-            });
+            return Err(DifferentiationError::MissingTracedReverseModeInputLeaves.into());
         }
         let staged_input_types = Input::To::<ArrayType>::from_parameters(
             input_structure.clone(),
@@ -623,4 +617,44 @@ where
     ) -> <Leaf as ValueAndGradInvocationLeaf<E, Input>>::FunctionOutput<'engine>,
 {
     Leaf::invoke(engine, function, primals).map(|(_, gradient)| gradient)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tracing_v2::engine::ArrayScalarEngine;
+    use crate::tracing_v2::{DifferentiationError, Tracer};
+
+    use super::*;
+
+    #[test]
+    fn test_jvp_traced_requires_input_leaves() {
+        let empty_primals: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+        let empty_tangents: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+
+        let result =
+            jvp_traced(|inputs: Vec<Tracer<'_, ArrayScalarEngine<f64>>>| Ok(inputs), empty_primals, empty_tangents);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::MissingTracedJvpInputLeaves))
+        ));
+    }
+
+    #[test]
+    fn test_traced_value_and_grad_requires_input_leaves() {
+        let engine = ArrayScalarEngine::<f64>::new();
+        let empty_primals: Vec<Tracer<'_, ArrayScalarEngine<f64>>> = Vec::new();
+
+        let result = <Tracer<'_, ArrayScalarEngine<f64>> as ValueAndGradInvocationLeaf<
+            ArrayScalarEngine<f64>,
+            Vec<Tracer<'_, ArrayScalarEngine<f64>>>,
+        >>::invoke(
+            &engine, |_inputs| panic!("closure should not run without traced inputs"), empty_primals
+        );
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::MissingTracedReverseModeInputLeaves))
+        ));
+    }
 }
