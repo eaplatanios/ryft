@@ -20,7 +20,7 @@ use crate::{
         Batch, BatchingError, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation,
     },
     parameters::{Parameter, Parameterized},
-    tracing::{AtomId, OneLike, Traceable, TracingError, Value, ZeroLike},
+    tracing::{AtomId, Traceable, TracingError, Value},
     tracing_v2::{
         Cos, MatrixOps, Sin,
         engine::Engine,
@@ -30,7 +30,9 @@ use crate::{
         operations::{
             AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
             NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
-            left_matmul::left_matmul_abstract_eval, right_matmul::right_matmul_abstract_eval,
+            constants::{OneLike, ZeroLike},
+            left_matmul::left_matmul_abstract_eval,
+            right_matmul::right_matmul_abstract_eval,
         },
     },
     types::{ArrayType, Type, TypeError, Typed},

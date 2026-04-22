@@ -18,13 +18,14 @@ use crate::{
     batching::Batch,
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
-    tracing::{OneLike, Traceable, TracingError, ZeroLike},
+    tracing::{Traceable, TracingError},
     tracing_v2::{
         MatrixOps,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,
         linear::LinearTerm,
+        operations::constants::{OneLike, ZeroLike},
     },
     types::{ArrayType, Shape, Size, Type, TypeError, Typed},
 };

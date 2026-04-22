@@ -35,9 +35,11 @@
 //! - [`crate::tracing`] owns the staged IR itself and the core leaf contracts
 //!   ([`Traceable`](crate::tracing::Traceable), [`Value`](crate::tracing::Value)): atoms,
 //!   instructions, builders, executable programs, and the traits that tie leaf values to them.
-//! - [`crate::tracing::values`] defines the remaining value-level identity helpers
-//!   ([`ZeroLike`](crate::tracing::ZeroLike), [`OneLike`](crate::tracing::OneLike)) and the built-in
-//!   scalar leaf impls.
+//! - [`operations::constants`](crate::tracing_v2::operations::constants) defines the remaining
+//!   value-level identity helpers
+//!   ([`ZeroLike`](crate::tracing_v2::operations::constants::ZeroLike),
+//!   [`OneLike`](crate::tracing_v2::operations::constants::OneLike)) and the built-in scalar leaf
+//!   impls.
 //! - [`engine`] defines the backend token that selects op carriers and synthesizes representative
 //!   values from abstract metadata.
 //! - [`jit`](self::jit) captures ordinary staged programs from traced execution.

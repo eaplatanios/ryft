@@ -22,12 +22,13 @@ use thiserror::Error;
 use crate::{
     batching::Batch,
     parameters::Parameter,
-    tracing::{AtomId, Traceable, TracingError, Value, ZeroLike},
+    tracing::{AtomId, Traceable, TracingError, Value},
     tracing_v2::{
         engine::Engine,
         forward::JvpTracer,
         jit::Tracer,
         linear::{LinearTerm, Linearized},
+        operations::constants::ZeroLike,
     },
     types::{ArrayType, Type, TypeError, Typed},
 };
@@ -565,9 +566,10 @@ mod tests {
 
     use super::*;
     use crate::batching::{Batch, vmap};
-    use crate::tracing::{OneLike, Program, ProgramBuilder};
+    use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
-        LinearPrimitiveOperation, PrimitiveOperation, Tracer, engine::ArrayScalarEngine, grad, interpret_and_trace, jvp,
+        LinearPrimitiveOperation, PrimitiveOperation, Tracer, engine::ArrayScalarEngine, grad, interpret_and_trace,
+        jvp, operations::constants::OneLike,
     };
     use crate::types::{ArrayType, DataType, Shape};
 

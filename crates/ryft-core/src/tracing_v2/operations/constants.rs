@@ -1,9 +1,8 @@
-//! Leaf-level identity helpers and default scalar leaf impls for the tracing pipeline.
+//! Leaf-level identity helpers and default scalar leaf impls for `tracing_v2`.
 //!
 //! The core leaf contracts [`Traceable`](crate::tracing::Traceable) and
-//! [`Value`](crate::tracing::Value) live with the staged IR in [`programs`](crate::tracing::programs).
-//! This module keeps the remaining value-level helpers
-//! that build on top of those contracts:
+//! [`Value`](crate::tracing::Value) live with the staged IR in [`crate::tracing::programs`]. This
+//! module keeps the remaining value-level helpers that build on top of those contracts:
 //!
 //! - [`ZeroLike`] and [`OneLike`] for synthesizing identity values from an existing exemplar.
 //! - The built-in scalar implementations of [`Traceable`](crate::tracing::Traceable),
@@ -11,9 +10,10 @@
 
 use half::{bf16, f16};
 
-use crate::types::ArrayType;
-
-use super::programs::{Traceable, Value};
+use crate::{
+    tracing::{Traceable, Value},
+    types::ArrayType,
+};
 
 /// Returns a zero value with the same structure as an existing value.
 ///

@@ -8,12 +8,13 @@ use std::fmt::{Debug, Display};
 
 use crate::batching::Batch as BatchedValue;
 use crate::macros::check_input_count;
-use crate::tracing::{AtomId, Traceable, TracingError, Value, ZeroLike};
+use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::{
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::Tracer,
     linear::LinearTerm,
+    operations::constants::ZeroLike,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 

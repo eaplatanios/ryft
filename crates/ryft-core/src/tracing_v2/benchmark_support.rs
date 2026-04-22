@@ -9,13 +9,18 @@ use std::ops::{Add, Mul, Neg};
 use ndarray::{Array2, arr2};
 
 use crate::batching::{Batch, stack, unstack, vmap};
+use crate::tracing::{Program, Traceable};
 #[cfg(feature = "ndarray")]
-use crate::tracing_v2::{MatrixOps, ZeroLike, operations::matrix::ndarray_support::Array2Engine};
 use crate::tracing_v2::{
-    OneLike, Program, Sin, Traceable, Tracer,
+    MatrixOps,
+    operations::{constants::ZeroLike, matrix::ndarray_support::Array2Engine},
+};
+use crate::tracing_v2::{
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
     engine::ArrayScalarEngine,
-    grad, interpret_and_trace, jvp, jvp_program, value_and_grad, vjp,
+    grad, interpret_and_trace, jvp, jvp_program,
+    operations::constants::OneLike,
+    value_and_grad, vjp,
 };
 use crate::types::ArrayType;
 
@@ -96,8 +101,8 @@ where
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
-        + crate::tracing::ZeroLike
-        + crate::tracing::OneLike
+        + crate::tracing_v2::operations::constants::ZeroLike
+        + crate::tracing_v2::operations::constants::OneLike
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: crate::parameters::Parameterized<V>,

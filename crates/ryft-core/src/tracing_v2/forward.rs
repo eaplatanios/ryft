@@ -22,15 +22,16 @@ use ryft_macros::Parameter;
 use crate::{
     batching::{Batch, BatchingError, stack, unstack},
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{
-        InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable, TracingError, Value, ZeroLike,
-    },
+    tracing::{InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value},
     tracing_v2::{
         LinearPrimitiveOperation,
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
         linear::{Linearized, jvp_program, jvp_traced, linearize_traced_program},
-        operations::{CoreLinearReplayOperation, DifferentiableOperation},
+        operations::{
+            CoreLinearReplayOperation, DifferentiableOperation,
+            constants::{OneLike, ZeroLike},
+        },
     },
     types::{ArrayType, Type, Typed},
 };
@@ -674,8 +675,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing::OneLike;
-    use crate::tracing_v2::{engine::ArrayScalarEngine, test_support};
+    use crate::tracing_v2::{engine::ArrayScalarEngine, operations::constants::OneLike, test_support};
     use crate::types::{Type, Typed};
 
     use super::*;
