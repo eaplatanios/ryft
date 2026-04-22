@@ -13,9 +13,9 @@ use ryft_mlir::{
 use ryft_core::batching::{FlatTracedVMap, LinearVMapOperation, VMapOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
+use ryft_core::tracing::{Atom, AtomId, Operation, Program, Traceable};
 use ryft_core::tracing_v2::{
-    Atom, AtomId, CustomPrimitive, LinearPrimitiveOperation, MatrixOps, Operation, PrimitiveOperation, Program,
-    Traceable,
+    CustomPrimitive, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation,
     operations::{
         AddOperation, CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
         MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
@@ -204,7 +204,7 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
 /// [`to_mlir_module_for_plain_program`] and related entry points. The core [`PrimitiveOperation`] and
 /// [`LinearPrimitiveOperation`] enums provide the default blanket implementations, and backends can add
 /// their own closed op carriers by implementing this trait for those enums.
-pub(crate) trait XlaOperation<V: MlirLowerableValue>: ryft_core::tracing_v2::Operation {
+pub(crate) trait XlaOperation<V: MlirLowerableValue>: Operation {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -735,7 +735,7 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<A
             ),
             PrimitiveOperation::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
             PrimitiveOperation::Custom(_) => {
-                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Operation::name(self).to_string() })
+                Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() })
             }
         }
     }
@@ -826,7 +826,7 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
                 )
             }
             LinearPrimitiveOperation::Custom(_) => {
-                Err(LoweringError::UnsupportedOp { op: ryft_core::tracing_v2::Operation::name(self).to_string() })
+                Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() })
             }
         }
     }
@@ -2751,10 +2751,8 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::TracingError;
-    use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, InterpretableOperation, MatrixOps, OneLike, Operation, ProgramBuilder, Sin, ZeroLike,
-    };
+    use ryft_core::tracing::{InterpretableOperation, OneLike, Operation, ProgramBuilder, TracingError, ZeroLike};
+    use ryft_core::tracing_v2::{Cos, CustomPrimitive, MatrixOps, Sin};
     use ryft_core::types::{Shape, TypeError};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -2970,7 +2968,7 @@ mod tests {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             f64,
-            ryft_core::tracing_v2::Program<
+            ryft_core::tracing::Program<
                 ArrayType,
                 f64,
                 ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
@@ -3005,7 +3003,7 @@ mod tests {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             f64,
-            ryft_core::tracing_v2::Program<
+            ryft_core::tracing::Program<
                 ArrayType,
                 f64,
                 ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
@@ -3044,7 +3042,7 @@ mod tests {
         // Standalone pullback â€” specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
         let (_, pullback): (
             f64,
-            ryft_core::tracing_v2::Program<
+            ryft_core::tracing::Program<
                 ArrayType,
                 f64,
                 ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>,
@@ -3074,7 +3072,7 @@ mod tests {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             (f64, f64),
-            ryft_core::tracing_v2::Program<
+            ryft_core::tracing::Program<
                 ArrayType,
                 f64,
                 ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
@@ -3112,7 +3110,7 @@ mod tests {
         let right = arr2(&[[5.0f64, 6.0], [7.0, 8.0]]);
         let (_, pullback): (
             Array2<f64>,
-            ryft_core::tracing_v2::Program<
+            ryft_core::tracing::Program<
                 ArrayType,
                 Array2<f64>,
                 ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, Array2<f64>>,

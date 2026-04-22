@@ -7,10 +7,9 @@ use std::{
 
 use ryft_core::{
     batching::{BatchingError, FlatTracedVMap, LinearVMapOperation, VMapOperation, VMapTracingOperation},
-    tracing::TracingError,
+    tracing::{AtomId, InterpretableOperation, Operation, TracingError},
     tracing_v2::{
-        AtomId, CustomPrimitive, DifferentiableOperation, DifferentiationError, InterpretableOperation,
-        LinearPrimitiveOperation, LinearTerm, Operation,
+        CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearPrimitiveOperation, LinearTerm,
         engine::Engine,
         forward::JvpTracer,
         linear::{Linearized, linearize_program, transpose_linear_program_with_output_examples},
@@ -483,7 +482,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::parameters::Placeholder;
-    use ryft_core::tracing_v2::ProgramBuilder;
+    use ryft_core::tracing::ProgramBuilder;
     use ryft_core::tracing_v2::operations::CustomOperationError;
     use ryft_core::types::{DataType, Typed};
 

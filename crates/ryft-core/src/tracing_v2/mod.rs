@@ -3,7 +3,7 @@
 //! `tracing_v2` is the shared execution model behind the library's higher-order transforms. User
 //! code starts as ordinary Rust over structured values, and the modules here decide whether that
 //! code should run eagerly on concrete leaves, replay symbolically on [`Tracer`] leaves to capture
-//! a staged [`Program`], or replay on richer traced values such as [`JvpTracer`] and
+//! a staged [`Program`](crate::tracing::Program), or replay on richer traced values such as [`JvpTracer`] and
 //! [`LinearTerm`] to derive tangent and cotangent programs.
 //!
 //! The central design choice is that staged instructions store operation objects rather than a single
@@ -22,8 +22,8 @@
 //! 2. The transform chooses a leaf regime: concrete values, [`Tracer`] values,
 //!    [`crate::batching::Batch`] values, [`JvpTracer`] values, or staged linear terms.
 //! 3. Primitive trait impls in [`operations`] either execute eagerly or record instructions into a
-//!    [`ProgramBuilder`].
-//! 4. The resulting [`Program`] is simplified, replayed, transposed, or
+//!    [`ProgramBuilder`](crate::tracing::ProgramBuilder).
+//! 4. The resulting [`Program`](crate::tracing::Program) is simplified, replayed, transposed, or
 //!    handed off to a backend-specific lowering layer.
 //!
 //! This is what makes JIT tracing, batching, and autodiff feel like variations on one staged IR
@@ -32,11 +32,12 @@
 //! # Module Layout
 //!
 //! - [`operations`] defines the semantic primitive traits and the built-in operation carriers.
-//! - The internal programs module owns the staged IR itself and the core leaf contracts
-//!   ([`Traceable`], [`Value`]): atoms, instructions, builders, executable programs, and the traits
-//!   that tie leaf values to them.
-//! - The internal values module defines the remaining value-level identity helpers
-//!   ([`ZeroLike`], [`OneLike`]) and the built-in scalar leaf impls.
+//! - [`crate::tracing`] owns the staged IR itself and the core leaf contracts
+//!   ([`Traceable`](crate::tracing::Traceable), [`Value`](crate::tracing::Value)): atoms,
+//!   instructions, builders, executable programs, and the traits that tie leaf values to them.
+//! - [`crate::tracing::values`] defines the remaining value-level identity helpers
+//!   ([`ZeroLike`](crate::tracing::ZeroLike), [`OneLike`](crate::tracing::OneLike)) and the built-in
+//!   scalar leaf impls.
 //! - [`engine`] defines the backend token that selects op carriers and synthesizes representative
 //!   values from abstract metadata.
 //! - [`jit`](self::jit) captures ordinary staged programs from traced execution.
@@ -61,10 +62,8 @@ pub mod forward;
 pub mod jit;
 pub mod linear;
 pub mod operations;
-pub(crate) mod programs;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod values;
 
 pub use differentiation::DifferentiationError;
 pub use engine::Engine;
@@ -82,7 +81,3 @@ pub use operations::{
     Cos, CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation,
     LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin, VectorizableOperation,
 };
-pub use programs::{
-    Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, Value,
-};
-pub use values::{OneLike, ZeroLike};

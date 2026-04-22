@@ -25,10 +25,12 @@ use thiserror::Error;
 
 use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::TracingError,
+    tracing::{
+        Atom, AtomId, Instruction, InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable,
+        TracingError, Value, ZeroLike,
+    },
     tracing_v2::{
-        Atom, AtomId, Instruction, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, LinearTerm,
-        OneLike, Operation, PrimitiveOperation, Program, ProgramBuilder, Traceable, Tracer, Value, ZeroLike,
+        LinearOperation, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Tracer,
         engine::Engine,
         linear::{linearize_program, replay_program_linearized_jit, transpose_linear_program_with_output_examples},
         operations::{
@@ -297,7 +299,7 @@ where
 impl<
     'engine,
     E: Engine<Type = ArrayType> + ?Sized,
-    V: Traceable<ArrayType> + crate::tracing_v2::Value<ArrayType>,
+    V: Traceable<ArrayType> + Value<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone + PartialEq, Family: ParameterizedFamily<Batch<V>>>,
     Output: Parameterized<V, ParameterStructure: Clone, Family: ParameterizedFamily<Batch<V>>>,
 > VMapInvocationLeaf<'engine, E, Input, Output> for V
@@ -1087,9 +1089,8 @@ mod tests {
 
     use crate::{
         batching::{Batch, BatchingError, stack, unstack, vmap},
-        tracing_v2::{
-            OneLike, PrimitiveOperation, Program, ProgramBuilder, Sin, Tracer, engine::ArrayScalarEngine, test_support,
-        },
+        tracing::{OneLike, Program, ProgramBuilder},
+        tracing_v2::{PrimitiveOperation, Sin, Tracer, engine::ArrayScalarEngine, test_support},
         types::ArrayType,
     };
 
@@ -1275,8 +1276,8 @@ mod tests {
             }
         }
 
-        impl crate::tracing_v2::Traceable<ArrayType> for Int64 {}
-        impl crate::tracing_v2::Value<ArrayType> for Int64 {}
+        impl crate::tracing::Traceable<ArrayType> for Int64 {}
+        impl crate::tracing::Value<ArrayType> for Int64 {}
 
         impl Add for Int64 {
             type Output = Self;
@@ -1286,13 +1287,13 @@ mod tests {
             }
         }
 
-        impl crate::tracing_v2::ZeroLike for Int64 {
+        impl crate::tracing::ZeroLike for Int64 {
             fn zero_like(&self) -> Self {
                 Self(0)
             }
         }
 
-        impl crate::tracing_v2::OneLike for Int64 {
+        impl crate::tracing::OneLike for Int64 {
             fn one_like(&self) -> Self {
                 Self(1)
             }

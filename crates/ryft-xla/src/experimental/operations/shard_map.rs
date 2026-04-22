@@ -12,12 +12,14 @@ use std::{
 use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
-    tracing::TracingError,
+    tracing::{
+        Atom, AtomId, Instruction, InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable,
+        TracingError, ZeroLike,
+    },
     tracing_v2::{
-        AtomId, Cos, CustomOperationError, CustomPrimitive, DifferentiableOperation, Instruction,
-        InterpretableOperation, LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, LinearTerm,
-        Linearized, MatrixOps, OneLike, Operation, PrimitiveOperation, Program, ProgramBuilder, Sin, Traceable, Tracer,
-        ZeroLike, engine::Engine, forward::JvpTracer, operations::reshape::ReshapeOps,
+        Cos, CustomOperationError, CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation,
+        LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, PrimitiveOperation, Sin, Tracer, engine::Engine,
+        forward::JvpTracer, operations::reshape::ReshapeOps,
     },
     types::{ArrayType, TypeError, Typed},
 };
@@ -1076,8 +1078,8 @@ fn project_flat_shard_map_program(
 
         let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
-            ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
-            ryft_core::tracing_v2::Atom::Variable(_) => {
+            Atom::Constant(value) => builder.add_constant(value.clone()),
+            Atom::Variable(_) => {
                 let instruction_index = instruction_by_output[atom_id.index]
                     .ok_or(ShardMapTraceError::ProjectedProgramMissingSourceAtom { atom_id })?;
                 let instruction = &program.instructions[instruction_index];
@@ -1171,8 +1173,8 @@ fn build_factorized_apply_program(
 
         let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
         let mapped_atom = match atom {
-            ryft_core::tracing_v2::Atom::Constant(value) => builder.add_constant(value.clone()),
-            ryft_core::tracing_v2::Atom::Variable(_) => {
+            Atom::Constant(value) => builder.add_constant(value.clone()),
+            Atom::Variable(_) => {
                 if !depends_on_cotangent[atom_id.index] {
                     return Err(ShardMapTraceError::FactorizedApplyMissingResidualForCotangentIndependentAtom {
                         atom_id,
@@ -1415,7 +1417,7 @@ fn try_linearize_traced_shard_map_body<
 ) -> Result<
     (
         Vec<ShardMapTracer>,
-        ryft_core::tracing_v2::Program<
+        Program<
             ArrayType,
             ShardMapTracer,
             LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
@@ -1467,7 +1469,7 @@ fn try_transpose_traced_shard_map_body<
 ) -> Result<
     (
         Vec<ShardMapTracer>,
-        ryft_core::tracing_v2::Program<
+        Program<
             ArrayType,
             ShardMapTracer,
             LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
@@ -1528,11 +1530,11 @@ fn replay_traced_xla_program<
     for atom_index in 0..program.atoms.len() {
         let atom = &program.atoms[atom_index];
         match atom {
-            ryft_core::tracing_v2::Atom::Constant(value) => {
+            Atom::Constant(value) => {
                 values[atom_index] = Some(V::lift_constant(value, replay_context)?);
             }
-            ryft_core::tracing_v2::Atom::Variable(_) if input_atom_flags[atom_index] => {}
-            ryft_core::tracing_v2::Atom::Variable(_) => {
+            Atom::Variable(_) if input_atom_flags[atom_index] => {}
+            Atom::Variable(_) => {
                 let Some(instruction_index) = instruction_by_first_output[atom_index] else {
                     continue;
                 };
@@ -2239,10 +2241,10 @@ mod tests {
     use ryft_core::{
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
-        tracing::TracingError,
+        tracing::{Atom, AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, TracingError},
         tracing_v2::{
-            Atom, AtomId, CustomOperationError, CustomPrimitive, DifferentiableOperation, InterpretableOperation,
-            LinearPrimitiveOperation, LinearTerm, Operation, Program, ProgramBuilder, Tracer, forward::JvpTracer,
+            CustomOperationError, CustomPrimitive, DifferentiableOperation, LinearPrimitiveOperation, LinearTerm,
+            Tracer, forward::JvpTracer,
         },
         types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
     };

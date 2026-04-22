@@ -4,6 +4,7 @@ use indoc::indoc;
 
 use crate::{
     parameters::Placeholder,
+    tracing::{Program, ProgramBuilder},
     tracing_v2::{engine::ArrayScalarEngine, *},
     types::{ArrayType, Typed},
 };

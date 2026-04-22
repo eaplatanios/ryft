@@ -55,7 +55,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// [`Tracer`](crate::tracing_v2::Tracer). It ties each leaf to a type descriptor `T` via
 /// [`Typed`], while deliberately not implying eager numeric operations such as
 /// [`Sin`](crate::tracing_v2::Sin) or differentiation-specific capabilities such as
-/// [`crate::tracing_v2::ZeroLike`]. Those requirements live on the primitive operations and
+/// [`ZeroLike`](crate::tracing::ZeroLike). Those requirements live on the primitive operations and
 /// transforms that actually need them.
 ///
 /// The type parameter `T` determines the abstract metadata used to describe leaf shapes and element
@@ -91,8 +91,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
     /// Returns `true` if every element of this value is exactly zero.
     ///
-    /// The program builder calls this on constant atoms during
-    /// [`Operation::try_simplify`](crate::tracing_v2::Operation::try_simplify) to detect and
+    /// The program builder calls this on constant atoms during [`Operation::try_simplify`] to detect and
     /// eliminate algebraic identities at staging time, for example folding `x + 0` into `x` or
     /// `x * 0` into `0` without emitting the operation into the staged program.
     ///
@@ -109,7 +108,7 @@ pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
     /// Returns `true` if every element of this value is exactly one.
     ///
     /// This is the multiplicative-identity counterpart of [`Traceable::is_zero`]. The program
-    /// builder uses it during [`Operation::try_simplify`](crate::tracing_v2::Operation::try_simplify)
+    /// builder uses it during [`Operation::try_simplify`]
     /// to fold operations like `x * 1` into `x` or `scale(x, 1)` into `x`.
     ///
     /// The same defaulting rationale applies: `false` is always safe, and only concrete leaf types
@@ -431,7 +430,7 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
                 Atom::Constant(value) => builder.add_constant(value.clone()),
                 Atom::Variable(_) => {
                     let instruction_index = instruction_by_output[atom_id.index]
-                        .ok_or(TracingError::MalformedProgram("variable atom had no owning instruction"))?;
+                        .ok_or(TracingError::MalformedProgram("variable atom had no owning instruction".to_string()))?;
                     assert!(
                         live_instructions[instruction_index],
                         "attempted to remap a dead variable atom during program simplification"
@@ -488,7 +487,7 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
         for input_atom in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_atom.index).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             let Atom::Variable(r#type) = input else {
-                return Err(TracingError::MalformedProgram("program input atom was not a variable"));
+                return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
             };
             let mapped = builder.add_input(r#type.clone());
             atom_mapping.insert(input_atom, mapped);
@@ -771,7 +770,8 @@ mod tests {
     use crate::{
         parameters::{Parameter, ParameterError, Parameterized, Placeholder},
         tracing::TracingError,
-        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOperation, Sin, Value, ZeroLike, test_support},
+        tracing::{OneLike, Value, ZeroLike},
+        tracing_v2::{Cos, MatrixOps, PrimitiveOperation, Sin, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 

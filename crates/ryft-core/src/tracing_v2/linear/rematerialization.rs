@@ -561,7 +561,8 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
 #[cfg(test)]
 mod tests {
     use crate::parameters::Placeholder;
-    use crate::tracing_v2::{PrimitiveOperation, ProgramBuilder, engine::ArrayScalarEngine};
+    use crate::tracing::ProgramBuilder;
+    use crate::tracing_v2::{PrimitiveOperation, engine::ArrayScalarEngine};
 
     use super::*;
 

@@ -9,8 +9,11 @@ use std::fmt::{Debug, Display};
 use crate::batching::{Batch as BatchedValue, check_batch_sizes};
 use crate::macros::check_input_count;
 use crate::tracing::TracingError;
-use crate::tracing_v2::{Traceable, engine::Engine, forward::JvpTracer};
 use crate::types::{ArrayType, Type, TypeError};
+use crate::{
+    tracing::Traceable,
+    tracing_v2::{engine::Engine, forward::JvpTracer},
+};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation,

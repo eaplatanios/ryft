@@ -13,8 +13,8 @@ use std::{
 use crate::{
     batching::Batch as BatchedValue,
     sharding::{Sharding, ShardingDimension},
+    tracing::{Traceable, ZeroLike},
     tracing_v2::{
-        Traceable, ZeroLike,
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,
         linear::LinearTerm,
@@ -303,10 +303,8 @@ pub mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing_v2::{
-            CoordinateValue, Cos, LinearPrimitiveOperation, OneLike, PrimitiveOperation, Sin, Traceable, ZeroLike,
-            engine::Engine,
-        },
+        tracing::{OneLike, Traceable, Value, ZeroLike},
+        tracing_v2::{CoordinateValue, Cos, LinearPrimitiveOperation, PrimitiveOperation, Sin, engine::Engine},
         types::{ArrayType, DataType, Typed},
     };
 
@@ -419,7 +417,7 @@ pub mod ndarray_support {
         }
     }
 
-    impl crate::tracing_v2::Value<ArrayType> for Array2<f32> {}
+    impl Value<ArrayType> for Array2<f32> {}
 
     impl Typed<ArrayType> for Array2<f64> {
         #[inline]
@@ -438,7 +436,7 @@ pub mod ndarray_support {
         }
     }
 
-    impl crate::tracing_v2::Value<ArrayType> for Array2<f64> {}
+    impl Value<ArrayType> for Array2<f64> {}
 
     impl ZeroLike for Array2<f32> {
         #[inline]

@@ -15,9 +15,8 @@ use indoc::indoc;
 
 use crate::batching::Batch;
 use crate::macros::check_input_count;
-use crate::tracing::TracingError;
+use crate::tracing::{AtomId, Traceable, TracingError, Value, ZeroLike};
 use crate::tracing_v2::{
-    AtomId, Traceable, Value, ZeroLike,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::Tracer,
@@ -193,10 +192,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::{
-        parameters::Placeholder,
-        tracing_v2::{LinearPrimitiveOperation, ProgramBuilder},
-    };
+    use crate::{parameters::Placeholder, tracing::ProgramBuilder, tracing_v2::LinearPrimitiveOperation};
 
     use super::*;
 

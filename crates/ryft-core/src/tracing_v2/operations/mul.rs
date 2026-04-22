@@ -15,9 +15,8 @@ use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     batching::{Batch, check_batch_sizes},
     macros::check_input_count,
-    tracing::TracingError,
+    tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
-        AtomId, Traceable,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
     },

@@ -22,9 +22,8 @@ use thiserror::Error;
 use crate::{
     batching::Batch,
     parameters::Parameter,
-    tracing::TracingError,
+    tracing::{AtomId, Traceable, TracingError, Value, ZeroLike},
     tracing_v2::{
-        AtomId, Traceable, Value, ZeroLike,
         engine::Engine,
         forward::JvpTracer,
         jit::Tracer,
@@ -566,9 +565,9 @@ mod tests {
 
     use super::*;
     use crate::batching::{Batch, vmap};
+    use crate::tracing::{OneLike, Program, ProgramBuilder};
     use crate::tracing_v2::{
-        LinearPrimitiveOperation, OneLike, PrimitiveOperation, Program, ProgramBuilder, Tracer,
-        engine::ArrayScalarEngine, grad, interpret_and_trace, jvp,
+        LinearPrimitiveOperation, PrimitiveOperation, Tracer, engine::ArrayScalarEngine, grad, interpret_and_trace, jvp,
     };
     use crate::types::{ArrayType, DataType, Shape};
 

@@ -8,9 +8,8 @@ use std::fmt::{Debug, Display};
 
 use crate::batching::Batch as BatchedValue;
 use crate::macros::check_input_count;
-use crate::tracing::TracingError;
+use crate::tracing::{AtomId, Traceable, TracingError, Value, ZeroLike};
 use crate::tracing_v2::{
-    AtomId, Traceable, Value, ZeroLike,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::Tracer,

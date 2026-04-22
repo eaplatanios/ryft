@@ -72,7 +72,7 @@ where
     V: Traceable<ArrayType>,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
-    O: Clone + std::fmt::Display + crate::tracing_v2::Operation,
+    O: Clone + std::fmt::Display + crate::tracing::Operation,
 {
     summarize_program(program, |_| Ok(Vec::new()))
 }
@@ -96,13 +96,13 @@ where
         + Add<Output = V>
         + Mul<Output = V>
         + Neg<Output = V>
-        + crate::tracing_v2::ZeroLike
-        + crate::tracing_v2::OneLike
+        + crate::tracing::ZeroLike
+        + crate::tracing::OneLike
         + crate::tracing_v2::MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
-    O: Clone + std::fmt::Display + crate::tracing_v2::Operation,
+    O: Clone + std::fmt::Display + crate::tracing::Operation,
 {
     Ok(record(case_id, tracing_category(case_id), surface, program.to_string(), summarize_tracing_program(program)?))
 }

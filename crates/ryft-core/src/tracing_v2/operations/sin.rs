@@ -10,9 +10,8 @@ use std::fmt::{Debug, Display};
 
 use crate::batching::Batch;
 use crate::macros::check_input_count;
-use crate::tracing::TracingError;
+use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
-    Traceable,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::Tracer,

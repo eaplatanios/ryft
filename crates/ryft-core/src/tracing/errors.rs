@@ -1,18 +1,13 @@
 use thiserror::Error;
 
-use crate::{
-    batching::BatchingError,
-    parameters::ParameterError,
-    tracing_v2::{AtomId, CustomOperationError, DifferentiationError},
-    types::TypeError,
-};
+use super::programs::AtomId;
 
-/// Error type shared by the staging and transform pipeline.
-///
-/// [`TracingError`](crate::tracing::TracingError) intentionally spans the tracing subsystem:
-/// primitive abstract evaluation, staged program construction, higher-order transform synthesis,
-/// and program replay. The batching-specific failures live in [`BatchingError`] and are wrapped
-/// here when batching participates inside a tracing flow.
+use crate::batching::BatchingError;
+use crate::parameters::ParameterError;
+use crate::tracing_v2::{CustomOperationError, DifferentiationError};
+use crate::types::TypeError;
+
+/// Represents errors related to tracing in `ryft-core`.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TracingError {
     #[error("tracing values that are used in the same operation must share the same tracing engine")]
@@ -31,7 +26,7 @@ pub enum TracingError {
     UnboundAtomId { id: AtomId },
 
     #[error("encountered malformed program: {0}")]
-    MalformedProgram(&'static str),
+    MalformedProgram(String),
 
     #[error("encountered program builder that escaped its tracing scope")]
     EscapedProgramBuilder,

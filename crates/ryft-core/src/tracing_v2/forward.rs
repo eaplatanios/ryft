@@ -22,13 +22,15 @@ use ryft_macros::Parameter;
 use crate::{
     batching::{Batch, BatchingError, stack, unstack},
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::TracingError,
+    tracing::{
+        InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable, TracingError, Value, ZeroLike,
+    },
     tracing_v2::{
-        LinearPrimitiveOperation, Program, ProgramBuilder, Traceable, Value, ZeroLike,
+        LinearPrimitiveOperation,
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
         linear::{Linearized, jvp_program, jvp_traced, linearize_traced_program},
-        operations::{CoreLinearReplayOperation, DifferentiableOperation, InterpretableOperation, Operation},
+        operations::{CoreLinearReplayOperation, DifferentiableOperation},
     },
     types::{ArrayType, Type, Typed},
 };
@@ -115,9 +117,7 @@ impl<V: Traceable<ArrayType> + ZeroLike, T: TangentSpace<ArrayType, V>> ZeroLike
     }
 }
 
-impl<V: Traceable<ArrayType> + crate::tracing_v2::OneLike, T: TangentSpace<ArrayType, V>> crate::tracing_v2::OneLike
-    for JvpTracer<V, T>
-{
+impl<V: Traceable<ArrayType> + OneLike, T: TangentSpace<ArrayType, V>> OneLike for JvpTracer<V, T> {
     #[inline]
     fn one_like(&self) -> Self {
         Self { primal: self.primal.one_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
@@ -674,7 +674,8 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing_v2::{OneLike, engine::ArrayScalarEngine, test_support};
+    use crate::tracing::OneLike;
+    use crate::tracing_v2::{engine::ArrayScalarEngine, test_support};
     use crate::types::{Type, Typed};
 
     use super::*;

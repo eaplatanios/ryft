@@ -18,9 +18,9 @@ use crate::{
     batching::Batch,
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
-    tracing::TracingError,
+    tracing::{OneLike, Traceable, TracingError, ZeroLike},
     tracing_v2::{
-        MatrixOps, OneLike, Traceable, ZeroLike,
+        MatrixOps,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,
@@ -499,8 +499,9 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
+        tracing::{Program, ProgramBuilder},
         tracing_v2::{
-            LinearPrimitiveOperation, PrimitiveOperation, Program, ProgramBuilder, interpret_and_trace,
+            LinearPrimitiveOperation, PrimitiveOperation, interpret_and_trace,
             operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},

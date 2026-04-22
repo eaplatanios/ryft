@@ -3,7 +3,7 @@
 //! This module provides the tracing-backed `shard_map` surface for `ryft-core::xla`.
 //!
 //! The default public entry point is [`shard_map`], which stages a Rust closure over shard-local
-//! tensor types derived from global [`ArrayType`] metadata, lowers the resulting `tracing_v2`
+//! tensor types derived from global [`ArrayType`] metadata, lowers the resulting staged
 //! program to StableHLO/Shardy MLIR, and returns a [`TracedShardMap`] handle for inspection and
 //! lowering.
 //!
@@ -15,7 +15,7 @@
 //! - deriving body-local shapes from global shapes, and
 //! - rendering the Shardy attributes needed by `sdy.manual_computation`.
 //!
-//! [`TracedShardMap`] extends that metadata with a staged `tracing_v2` body program. The traced path
+//! [`TracedShardMap`] extends that metadata with a staged tracing body program. The traced path
 //! can derive body-local input types from global input types, trace a Rust closure over those
 //! local tensor types, and lower the resulting staged body to StableHLO/Shardy MLIR.
 //!
@@ -68,12 +68,11 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::operations::{AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation};
-use ryft_core::tracing_v2::{
-    Atom, AtomId, Cos, InterpretableOperation, Linearized, MatrixOps, OneLike, Operation, Program, Sin, Traceable,
-    Tracer, Value, ZeroLike, trace as trace_types,
+use ryft_core::tracing::{
+    Atom, AtomId, InterpretableOperation, OneLike, Operation, Program, Traceable, TracingError, Value, ZeroLike,
 };
+use ryft_core::tracing_v2::operations::{AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation};
+use ryft_core::tracing_v2::{Cos, Linearized, MatrixOps, Sin, Tracer, trace as trace_types};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaPrimitiveOperation;
@@ -1918,7 +1917,8 @@ mod tests {
 
     use ryft_core::batching::vmap;
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{OneLike, Sin, grad};
+    use ryft_core::tracing::OneLike;
+    use ryft_core::tracing_v2::{Sin, grad};
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;

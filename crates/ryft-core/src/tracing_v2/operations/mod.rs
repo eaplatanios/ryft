@@ -53,8 +53,8 @@ use std::{fmt::Display, sync::Arc};
 use crate::{
     batching::Batch,
     parameters::Parameterized,
-    tracing::TracingError,
-    tracing_v2::{AtomId, Traceable, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm},
+    tracing::{AtomId, InterpretableOperation, Operation, Traceable, TracingError},
+    tracing_v2::{engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm},
     types::{ArrayType, Type, TypeError, Typed},
 };
 
@@ -103,7 +103,6 @@ pub mod scale;
 /// Elementwise sine.
 pub mod sin;
 
-pub use crate::tracing_v2::programs::{InterpretableOperation, Operation};
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
 pub use cos::{Cos, CosOperation, CosTracingOperation};
 pub use custom::{

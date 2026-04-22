@@ -20,9 +20,9 @@ use crate::{
         Batch, BatchingError, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation,
     },
     parameters::{Parameter, Parameterized},
-    tracing::TracingError,
+    tracing::{AtomId, OneLike, Traceable, TracingError, Value, ZeroLike},
     tracing_v2::{
-        AtomId, Cos, MatrixOps, OneLike, Sin, Traceable, Value, ZeroLike,
+        Cos, MatrixOps, Sin,
         engine::Engine,
         forward::JvpTracer,
         jit::Tracer,
@@ -941,10 +941,8 @@ mod tests {
     use crate::{
         batching::FlatTracedVMap,
         parameters::Placeholder,
-        tracing_v2::{
-            Program, ProgramBuilder,
-            operations::{FlatTracedRematerialize, RematerializeOperation},
-        },
+        tracing::{Program, ProgramBuilder},
+        tracing_v2::operations::{FlatTracedRematerialize, RematerializeOperation},
         types::{ArrayType, DataType},
     };
 

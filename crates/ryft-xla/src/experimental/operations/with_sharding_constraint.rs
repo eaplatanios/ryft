@@ -7,10 +7,10 @@ use std::{
 
 use ryft_core::macros::check_input_count;
 use ryft_core::sharding::Sharding;
-use ryft_core::tracing::TracingError;
+use ryft_core::tracing::{InterpretableOperation, Operation, Traceable, TracingError};
 use ryft_core::tracing_v2::{
-    CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearCustomPrimitive, LinearOperation,
-    LinearPrimitiveOperation, Operation, PrimitiveOperation, Tracer, VectorizableOperation,
+    CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation,
+    PrimitiveOperation, Tracer, VectorizableOperation,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -49,7 +49,7 @@ impl WithShardingConstraintOperation {
 
     fn base_custom_primitive<V>(&self) -> CustomPrimitive<ArrayType, V>
     where
-        V: ryft_core::tracing_v2::Traceable<ArrayType> + 'static,
+        V: Traceable<ArrayType> + 'static,
         Self: Clone
             + InterpretableOperation<ArrayType, V>
             + LinearOperation<ArrayType, V>
@@ -295,9 +295,7 @@ impl
     }
 }
 
-impl<V: ryft_core::tracing_v2::Traceable<ArrayType>> VectorizableOperation<ArrayType, V>
-    for WithShardingConstraintOperation
-{
+impl<V: Traceable<ArrayType>> VectorizableOperation<ArrayType, V> for WithShardingConstraintOperation {
     fn batch(
         &self,
         inputs: &[ryft_core::batching::Batch<V>],
@@ -332,7 +330,8 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder};
+    use ryft_core::tracing::ProgramBuilder;
+    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, LinearTerm};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;

@@ -10,10 +10,9 @@ use std::marker::PhantomData;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::TracingError,
+    tracing::{Atom, AtomId, Instruction, Program, Traceable, TracingError, Value, ZeroLike},
     tracing_v2::{
-        Atom, AtomId, DifferentiationError, Instruction, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation,
-        Program, Traceable, Tracer, Value, ZeroLike,
+        DifferentiationError, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Tracer,
         engine::Engine,
         linear::{
             linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
@@ -687,8 +686,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
-        DifferentiationError, JvpTracer, Linearized, Program, ProgramBuilder, Sin, Tracer,
+        DifferentiationError, JvpTracer, Linearized, Sin, Tracer,
         engine::ArrayScalarEngine,
         interpret_and_trace,
         linear::{compile_grad, grad, value_and_grad},

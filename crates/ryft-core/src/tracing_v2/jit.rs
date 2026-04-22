@@ -2,7 +2,7 @@
 //!
 //! This module is the entry point for turning ordinary Rust closures into staged programs. It owns
 //! [`Tracer`], the symbolic leaf wrapper that records primitive applications into a shared
-//! [`ProgramBuilder`](crate::tracing_v2::ProgramBuilder), plus the two main capture modes:
+//! [`ProgramBuilder`](crate::tracing::ProgramBuilder), plus the two main capture modes:
 //!
 //! - [`trace`] records a program from abstract input metadata alone.
 //! - [`interpret_and_trace`] records the same program shape while also replaying it eagerly on
@@ -22,11 +22,12 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
-    tracing::TracingError,
+    tracing::{
+        AtomId, InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable, TracingError, ZeroLike,
+    },
     tracing_v2::{
-        AtomId, InterpretableOperation, OneLike, Program, ProgramBuilder, Traceable, ZeroLike,
         engine::Engine,
-        operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation, Operation},
+        operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation},
     },
     types::Typed,
 };
@@ -70,7 +71,7 @@ impl<T: crate::types::Type> std::fmt::Debug for TracerState<T> {
 ///
 /// A [`Tracer`] is the value-level facade for one staged traced leaf. Primitive trait impls on
 /// [`Tracer`] do not compute numerically; instead, they add instructions to a shared
-/// [`ProgramBuilder`](crate::tracing_v2::ProgramBuilder) and return new tracers for the staged
+/// [`ProgramBuilder`](crate::tracing::ProgramBuilder) and return new tracers for the staged
 /// outputs. When tracing has already failed, later operations return poisoned tracers that retain
 /// only abstract type metadata rather than manufacturing dummy atoms. This makes [`Tracer`] the
 /// central "big picture" type for symbolic execution in `tracing_v2`: if a closure is being
@@ -309,7 +310,7 @@ impl<
 ///
 /// The returned pair contains both the structured output metadata inferred during tracing and the
 /// unsimplified staged program itself. Callers that want the canonical simplified form can invoke
-/// [`Program::with_folded_constants`](crate::tracing_v2::Program::with_folded_constants) afterward.
+/// [`Program::with_folded_constants`](crate::tracing::Program::with_folded_constants) afterward.
 pub fn trace<'engine, E, F, Input, Output>(
     engine: &'engine E,
     function: F,
@@ -436,10 +437,9 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing::TracingError,
+        tracing::{ProgramBuilder, TracingError},
         tracing_v2::{
-            Engine, LinearPrimitiveOperation, PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine,
-            test_support,
+            Engine, LinearPrimitiveOperation, PrimitiveOperation, Sin, engine::ArrayScalarEngine, test_support,
         },
         types::{ArrayType, TypeError},
     };
@@ -642,7 +642,7 @@ mod tests {
             }
         }
 
-        impl crate::tracing_v2::Value<TestType> for TestValue {}
+        impl crate::tracing::Value<TestType> for TestValue {}
 
         impl Add for TestValue {
             type Output = Self;
@@ -762,8 +762,8 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing::TracingError,
-            tracing_v2::{Cos, MatrixOps, OneLike, Sin, ZeroLike, operations::reshape::ReshapeOps},
+            tracing::{OneLike, TracingError, ZeroLike},
+            tracing_v2::{Cos, MatrixOps, Sin, operations::reshape::ReshapeOps},
             types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
         };
 
@@ -788,7 +788,7 @@ mod tests {
             }
         }
 
-        impl crate::tracing_v2::Value<ArrayType> for TestAbstractValue {}
+        impl crate::tracing::Value<ArrayType> for TestAbstractValue {}
 
         impl Add for TestAbstractValue {
             type Output = Self;

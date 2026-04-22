@@ -22,16 +22,18 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::TracingError,
+    tracing::{
+        Atom, AtomId, Instruction, InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable,
+        TracingError, Value, ZeroLike,
+    },
     tracing_v2::{
-        Atom, AtomId, Instruction, LinearPrimitiveOperation, OneLike, Program, ProgramBuilder, Traceable, Value,
-        ZeroLike,
+        LinearPrimitiveOperation,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::{Tracer, interpret_and_trace},
         operations::{
-            CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, InterpretableOperation,
-            LinearAddOperation, LinearNegOperation, LinearScaleOperation, Operation, RematerializeTracingOperation,
+            CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, LinearAddOperation,
+            LinearNegOperation, LinearScaleOperation, RematerializeTracingOperation,
             rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
     },
@@ -159,11 +161,10 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing::TracingError,
+        tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError},
         tracing_v2::{
-            CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearOperation,
-            LinearPrimitiveOperation, Operation, PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine,
-            test_support,
+            CustomPrimitive, DifferentiableOperation, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation,
+            Sin, engine::ArrayScalarEngine, test_support,
         },
         types::{ArrayType, DataType, TypeError},
     };
