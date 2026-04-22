@@ -68,10 +68,11 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::{
-    Atom, AtomId, InterpretableOperation, OneLike, Operation, Program, Traceable, TracingError, Value, ZeroLike,
+use ryft_core::tracing::{Atom, AtomId, InterpretableOperation, Operation, Program, Traceable, TracingError, Value};
+use ryft_core::tracing_v2::operations::{
+    AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
+    constants::{OneLike, ZeroLike},
 };
-use ryft_core::tracing_v2::operations::{AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation};
 use ryft_core::tracing_v2::{Cos, Linearized, MatrixOps, Sin, Tracer, trace as trace_types};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
@@ -1917,8 +1918,7 @@ mod tests {
 
     use ryft_core::batching::vmap;
     use ryft_core::sharding::{DeviceMesh, MeshAxis, MeshAxisType, MeshDevice, Sharding, ShardingDimension};
-    use ryft_core::tracing::OneLike;
-    use ryft_core::tracing_v2::{Sin, grad};
+    use ryft_core::tracing_v2::{Sin, grad, operations::constants::OneLike};
     use ryft_core::types::data_types::DataType;
 
     use crate::mlir::ToMlir;

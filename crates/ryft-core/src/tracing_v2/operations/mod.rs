@@ -64,6 +64,9 @@ pub mod add;
 /// Elementwise cosine.
 pub mod cos;
 
+/// Value-level identity helpers and built-in scalar constant traits.
+pub mod constants;
+
 /// Custom-primitive escape hatch.
 pub mod custom;
 

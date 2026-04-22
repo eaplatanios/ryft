@@ -18,20 +18,16 @@
 //! The generic parameters stay intentionally open so that the same IR can represent both ordinary
 //! programs and tangent/cotangent programs over backend-specific op carriers.
 
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    fmt::{Debug, Display},
-    marker::PhantomData,
-};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
-use crate::{
-    parameters::{Parameter, ParameterError, Parameterized},
-    tracing::TracingError,
-    types::{ArrayType, Type, TypeError, Typed},
-};
+use crate::parameters::{Parameter, ParameterError, Parameterized};
+use crate::tracing::TracingError;
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Marker trait that identifies concrete, non-tracer leaves.
 ///
@@ -55,8 +51,8 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// [`Tracer`](crate::tracing_v2::Tracer). It ties each leaf to a type descriptor `T` via
 /// [`Typed`], while deliberately not implying eager numeric operations such as
 /// [`Sin`](crate::tracing_v2::Sin) or differentiation-specific capabilities such as
-/// [`ZeroLike`](crate::tracing::ZeroLike). Those requirements live on the primitive operations and
-/// transforms that actually need them.
+/// [`ZeroLike`](crate::tracing_v2::operations::constants::ZeroLike). Those requirements live on
+/// the primitive operations and transforms that actually need them.
 ///
 /// The type parameter `T` determines the abstract metadata used to describe leaf shapes and element
 /// types. The primary instantiation is [`ArrayType`](crate::types::ArrayType), used throughout the
@@ -769,9 +765,12 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, ParameterError, Parameterized, Placeholder},
-        tracing::TracingError,
-        tracing::{OneLike, Value, ZeroLike},
-        tracing_v2::{Cos, MatrixOps, PrimitiveOperation, Sin, test_support},
+        tracing::{TracingError, Value},
+        tracing_v2::{
+            Cos, MatrixOps, PrimitiveOperation, Sin,
+            operations::constants::{OneLike, ZeroLike},
+            test_support,
+        },
         types::{ArrayType, DataType, Shape, Typed},
     };
 

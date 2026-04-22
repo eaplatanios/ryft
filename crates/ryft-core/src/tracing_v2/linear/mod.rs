@@ -23,8 +23,8 @@ use ryft_macros::Parameter;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing::{
-        Atom, AtomId, Instruction, InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable,
-        TracingError, Value, ZeroLike,
+        Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
+        Value,
     },
     tracing_v2::{
         LinearPrimitiveOperation,
@@ -34,6 +34,7 @@ use crate::{
         operations::{
             CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, RematerializeTracingOperation,
+            constants::{OneLike, ZeroLike},
             rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
     },

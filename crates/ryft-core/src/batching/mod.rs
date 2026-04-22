@@ -26,8 +26,8 @@ use thiserror::Error;
 use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
     tracing::{
-        Atom, AtomId, Instruction, InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable,
-        TracingError, Value, ZeroLike,
+        Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
+        Value,
     },
     tracing_v2::{
         LinearOperation, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Tracer,
@@ -36,6 +36,7 @@ use crate::{
         operations::{
             AddOperation, CoreLinearProgramOperation, DifferentiableOperation, MulOperation, NegOperation,
             VectorizableOperation,
+            constants::{OneLike, ZeroLike},
         },
     },
     types::{ArrayType, Type, TypeError, Typed},
@@ -1089,8 +1090,10 @@ mod tests {
 
     use crate::{
         batching::{Batch, BatchingError, stack, unstack, vmap},
-        tracing::{OneLike, Program, ProgramBuilder},
-        tracing_v2::{PrimitiveOperation, Sin, Tracer, engine::ArrayScalarEngine, test_support},
+        tracing::{Program, ProgramBuilder},
+        tracing_v2::{
+            PrimitiveOperation, Sin, Tracer, engine::ArrayScalarEngine, operations::constants::OneLike, test_support,
+        },
         types::ArrayType,
     };
 
@@ -1287,13 +1290,13 @@ mod tests {
             }
         }
 
-        impl crate::tracing::ZeroLike for Int64 {
+        impl crate::tracing_v2::operations::constants::ZeroLike for Int64 {
             fn zero_like(&self) -> Self {
                 Self(0)
             }
         }
 
-        impl crate::tracing::OneLike for Int64 {
+        impl crate::tracing_v2::operations::constants::OneLike for Int64 {
             fn one_like(&self) -> Self {
                 Self(1)
             }

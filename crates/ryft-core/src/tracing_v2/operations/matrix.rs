@@ -13,11 +13,12 @@ use std::{
 use crate::{
     batching::Batch as BatchedValue,
     sharding::{Sharding, ShardingDimension},
-    tracing::{Traceable, ZeroLike},
+    tracing::Traceable,
     tracing_v2::{
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,
         linear::LinearTerm,
+        operations::constants::ZeroLike,
     },
     types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
 };
@@ -303,8 +304,12 @@ pub mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing::{OneLike, Traceable, Value, ZeroLike},
-        tracing_v2::{CoordinateValue, Cos, LinearPrimitiveOperation, PrimitiveOperation, Sin, engine::Engine},
+        tracing::{Traceable, Value},
+        tracing_v2::{
+            CoordinateValue, Cos, LinearPrimitiveOperation, PrimitiveOperation, Sin,
+            engine::Engine,
+            operations::constants::{OneLike, ZeroLike},
+        },
         types::{ArrayType, DataType, Typed},
     };
 

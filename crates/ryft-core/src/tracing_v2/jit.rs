@@ -22,12 +22,13 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
-    tracing::{
-        AtomId, InterpretableOperation, OneLike, Operation, Program, ProgramBuilder, Traceable, TracingError, ZeroLike,
-    },
+    tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
         engine::Engine,
-        operations::{AddTracingOperation, MulTracingOperation, NegTracingOperation},
+        operations::{
+            AddTracingOperation, MulTracingOperation, NegTracingOperation,
+            constants::{OneLike, ZeroLike},
+        },
     },
     types::Typed,
 };
@@ -762,8 +763,14 @@ mod tests {
         use ryft_macros::Parameter;
 
         use crate::{
-            tracing::{OneLike, TracingError, ZeroLike},
-            tracing_v2::{Cos, MatrixOps, Sin, operations::reshape::ReshapeOps},
+            tracing::TracingError,
+            tracing_v2::{
+                Cos, MatrixOps, Sin,
+                operations::{
+                    constants::{OneLike, ZeroLike},
+                    reshape::ReshapeOps,
+                },
+            },
             types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
         };
 

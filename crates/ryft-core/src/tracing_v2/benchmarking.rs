@@ -308,7 +308,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::tracing_v2::{OneLike, Program, Sin, Tracer, engine::ArrayScalarEngine, interpret_and_trace};
+    use crate::tracing::Program;
+    use crate::tracing_v2::{
+        Sin, Tracer, engine::ArrayScalarEngine, interpret_and_trace, operations::constants::OneLike,
+    };
 
     use super::*;
 

@@ -16,11 +16,12 @@ use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     batching::{Batch, check_batch_sizes},
     macros::check_input_count,
-    tracing::{AtomId, Traceable, TracingError, ZeroLike},
+    tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         linear::LinearTerm,
+        operations::constants::ZeroLike,
     },
 };
 
