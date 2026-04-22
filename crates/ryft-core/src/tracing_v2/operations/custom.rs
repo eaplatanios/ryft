@@ -39,7 +39,7 @@ use super::{
 };
 
 /// Error type for rule-based custom staged operations.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CustomOperationError {
     /// Error returned when a custom primitive is used by a transform without registering the
     /// required rule.

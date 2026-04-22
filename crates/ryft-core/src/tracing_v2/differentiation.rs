@@ -6,7 +6,7 @@
 use thiserror::Error;
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DifferentiationError {
     /// Traced forward-mode differentiation was invoked without any staged input leaves.
     #[error("traced jvp requires at least one input leaf to recover the staging context")]

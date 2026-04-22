@@ -7,7 +7,7 @@ use crate::sharding::ShardingError;
 use crate::types::{DataTypeError, LayoutError, TypeError};
 
 /// Represents errors that can occur in `ryft-core`.
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     #[error(transparent)]
     Parameter(#[from] ParameterError),

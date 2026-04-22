@@ -99,7 +99,7 @@ pub use values::{OneLike, ZeroLike};
 /// staged program construction, higher-order transform synthesis, and program replay. The
 /// batching-specific failures now live in [`BatchingError`] and are wrapped here when batching
 /// participates inside a tracing flow.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TracingError {
     #[error("tracing values that are used in the same operation must share the same tracing engine")]
     MismatchedEngines,
