@@ -21,6 +21,7 @@ use ryft_mlir::{Block, Operation as MlirOperation, Value};
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
+use crate::experimental::operations::shard_map::ShardMapCustomReplayExtension;
 use crate::experimental::ops::XlaPrimitiveOperation;
 use crate::experimental::shard_map::{ShardMapTensor, ShardMapTracer};
 use crate::mlir::ToMlir;
@@ -73,6 +74,10 @@ impl WithShardingConstraintOperation {
                 _,
             >(self.clone())
             .with_extension(self.clone())
+            .with_extension(ShardMapCustomReplayExtension::<ShardMapTracer>::new(|_, inputs| Ok(vec![inputs[0].clone()])))
+            .with_extension(ShardMapCustomReplayExtension::<Linearized<ShardMapTracer>>::new(|_, inputs| {
+                Ok(vec![inputs[0].clone()])
+            }))
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
     }
 

@@ -179,6 +179,16 @@ pub enum ShardMapTraceError {
     #[error("{0}")]
     ParameterError(#[from] ParameterError),
 
+    /// Error returned when traced `shard_map` staging has non-empty outputs but no traced input
+    /// leaf is available to supply the outer tracing context.
+    #[error("traced shard_map with non-empty outputs requires at least one traced input leaf")]
+    MissingTracedInvocationContext,
+
+    /// Error returned when linearized `shard_map` staging has non-empty outputs but no traced
+    /// primal/tangent leaf is available to supply the outer replay context.
+    #[error("linearized shard_map with non-empty outputs requires at least one traced input leaf")]
+    MissingLinearizedInvocationContext,
+
     /// Error returned while building StableHLO/Shardy MLIR for a traced shard-map body.
     #[error("{message}")]
     LoweringFailure { message: String },
@@ -2076,6 +2086,40 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ShardMapTraceError::MeshHasNoManualAxes)));
+    }
+
+    #[test]
+    fn test_shard_map_rejects_zero_input_traced_invocation_without_context() {
+        let mesh = test_logical_mesh_2x2();
+        let result: Result<Vec<ShardMapTracer>, ShardMapTraceError> =
+            shard_map::<_, Vec<ShardMapTracer>, Vec<ArrayType>, ShardMapTracer>(
+                |_: Vec<ShardMapTracer>| -> Vec<ShardMapTracer> {
+                    unreachable!("zero-input traced invocation should fail early")
+                },
+                Vec::<ShardMapTracer>::new(),
+                mesh.clone(),
+                Vec::<Sharding>::new(),
+                vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
+            );
+
+        assert!(matches!(result, Err(ShardMapTraceError::MissingTracedInvocationContext)));
+    }
+
+    #[test]
+    fn test_shard_map_rejects_zero_input_linearized_invocation_without_context() {
+        let mesh = test_logical_mesh_2x2();
+        let result: Result<Vec<Linearized<ShardMapTracer>>, ShardMapTraceError> =
+            shard_map::<_, Vec<Linearized<ShardMapTracer>>, Vec<ArrayType>, Linearized<ShardMapTracer>>(
+                |_: Vec<ShardMapTracer>| -> Vec<ShardMapTracer> {
+                    unreachable!("zero-input linearized invocation should fail early")
+                },
+                Vec::<Linearized<ShardMapTracer>>::new(),
+                mesh.clone(),
+                Vec::<Sharding>::new(),
+                vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
+            );
+
+        assert!(matches!(result, Err(ShardMapTraceError::MissingLinearizedInvocationContext)));
     }
 
     #[test]

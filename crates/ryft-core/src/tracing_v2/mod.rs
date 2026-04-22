@@ -119,10 +119,6 @@ pub enum TracingError {
     #[error("encountered malformed program: {0}")]
     MalformedProgram(&'static str),
 
-    /// A higher-order traced operation failed while deriving or replaying its internal program.
-    #[error("higher-order op '{op}' failed: {message}")]
-    HigherOrderOpFailure { op: &'static str, message: String },
-
     #[error("encountered program builder that escaped its tracing scope")]
     EscapedProgramBuilder,
 

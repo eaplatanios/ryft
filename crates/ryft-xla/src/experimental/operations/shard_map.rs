@@ -13,10 +13,10 @@ use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
     tracing_v2::{
-        AtomId, Cos, CustomPrimitive, DifferentiableOperation, Instruction, InterpretableOperation,
-        LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, OneLike,
-        Operation, PrimitiveOperation, Program, ProgramBuilder, Sin, Traceable, Tracer, TracingError, ZeroLike,
-        engine::Engine, forward::JvpTracer, operations::reshape::ReshapeOps,
+        AtomId, Cos, CustomOperationError, CustomPrimitive, DifferentiableOperation, Instruction,
+        InterpretableOperation, LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, LinearTerm,
+        Linearized, MatrixOps, OneLike, Operation, PrimitiveOperation, Program, ProgramBuilder, Sin, Traceable, Tracer,
+        TracingError, ZeroLike, engine::Engine, forward::JvpTracer, operations::reshape::ReshapeOps,
     },
     types::{ArrayType, TypeError, Typed},
 };
@@ -24,7 +24,6 @@ use ryft_core::{
 use crate::experimental::lowering::{
     LoweringError, ShardMapMlirLowerer, StableHloCustomLowering, StableHloCustomLoweringExtension,
 };
-use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap, fold_xla_program_constants,
@@ -36,12 +35,12 @@ type FlatShardMapProgram =
     Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>>;
 
 #[derive(Clone)]
-struct ShardMapReplayContext {
+pub(crate) struct ShardMapReplayContext {
     tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaPrimitiveOperation>>>,
 }
 
 #[derive(Clone)]
-struct LinearizedShardMapReplayContext {
+pub(crate) struct LinearizedShardMapReplayContext {
     tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaPrimitiveOperation>>>,
     linear_builder:
         Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>>>,
@@ -94,18 +93,15 @@ struct LinearShardMapState {
 }
 
 fn missing_traced_shard_map_staging_context() -> TracingError {
-    TracingError::HigherOrderOpFailure {
-        op: "shard_map",
-        message: "traced shard_map requires at least one input leaf to recover the staging context".to_string(),
-    }
+    TracingError::Type(TypeError {
+        message: "traced shard_map with non-empty outputs requires at least one traced input leaf".to_string(),
+    })
 }
 
 fn missing_linearized_shard_map_staging_context() -> TracingError {
-    TracingError::HigherOrderOpFailure {
-        op: "shard_map",
-        message: "linearized shard_map replay requires at least one tangent leaf to recover the staging context"
-            .to_string(),
-    }
+    TracingError::Type(TypeError {
+        message: "linearized shard_map with non-empty outputs requires at least one traced input leaf".to_string(),
+    })
 }
 
 /// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering.
@@ -274,6 +270,41 @@ impl LinearShardMapOperation<ShardMapTensor> {
     pub(crate) fn to_tensor_linear_custom_primitive(&self) -> LinearCustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive()
             .with_extension(self.clone())
+            .with_extension(ShardMapCustomReplayExtension::<ShardMapTracer>::new({
+                let op = self.clone();
+                move |replay_context, inputs| {
+                    let traced_op = op.to_linearized_jit_tracer_op(inputs.as_slice())?;
+                    traced_op
+                        .interpret_with_tracing_builder(replay_context.tracing_builder.clone(), inputs.as_slice())
+                        .map_err(ShardMapTraceError::TracingError)
+                }
+            }))
+            .with_extension(ShardMapCustomReplayExtension::<Linearized<ShardMapTracer>>::new({
+                let op = self.clone();
+                move |replay_context, inputs| {
+                    let traced_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+                    let traced_tangents = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+                    let traced_op = op.to_linearized_jit_tracer_op(traced_primals.as_slice())?;
+                    let primal_outputs = traced_op
+                        .interpret_with_tracing_builder(
+                            replay_context.tracing_builder.clone(),
+                            traced_primals.as_slice(),
+                        )
+                        .map_err(ShardMapTraceError::TracingError)?;
+                    let tangent_outputs = LinearTerm::apply_staged_op(
+                        replay_context.linear_builder.clone(),
+                        traced_tangents.as_slice(),
+                        LinearPrimitiveOperation::Custom(Arc::new(traced_op.to_tracer_linear_custom_primitive())),
+                        op.output_types.len(),
+                    )
+                    .map_err(ShardMapTraceError::TracingError)?;
+                    Ok(primal_outputs
+                        .into_iter()
+                        .zip(tangent_outputs)
+                        .map(|(primal, tangent)| Linearized { primal, tangent })
+                        .collect::<Vec<_>>())
+                }
+            }))
             .with_extension(StableHloCustomLoweringExtension::new(Arc::new(self.clone())))
             .into_linear()
             .expect("linear tensor shard_map primitive should carry a transpose rule")
@@ -879,7 +910,7 @@ impl StableHloCustomLowering<ShardMapTensor> for LinearShardMapOperation<ShardMa
     }
 }
 
-trait ReplayShardMapValue:
+pub(crate) trait ReplayShardMapValue:
     Clone
     + Traceable<ArrayType>
     + Add<Output = Self>
@@ -907,10 +938,34 @@ trait ReplayShardMapValue:
         shard_map_op: &LinearShardMapOperation<ShardMapTensor>,
         inputs: Vec<Self>,
     ) -> Result<Vec<Self>, ShardMapTraceError>;
+
+    fn apply_custom_operation(
+        replay_context: &Self::ReplayContext,
+        custom_op: &CustomPrimitive<ArrayType, ShardMapTensor>,
+        inputs: Vec<Self>,
+    ) -> Result<Vec<Self>, ShardMapTraceError>;
+}
+
+#[derive(Clone)]
+pub(crate) struct ShardMapCustomReplayExtension<V: ReplayShardMapValue + 'static> {
+    replay: Arc<dyn Fn(&V::ReplayContext, Vec<V>) -> Result<Vec<V>, ShardMapTraceError>>,
+}
+
+impl<V: ReplayShardMapValue + 'static> ShardMapCustomReplayExtension<V> {
+    pub(crate) fn new<F>(replay: F) -> Self
+    where
+        F: Fn(&V::ReplayContext, Vec<V>) -> Result<Vec<V>, ShardMapTraceError> + 'static,
+    {
+        Self { replay: Arc::new(replay) }
+    }
+
+    fn replay(&self, replay_context: &V::ReplayContext, inputs: Vec<V>) -> Result<Vec<V>, ShardMapTraceError> {
+        (self.replay)(replay_context, inputs)
+    }
 }
 
 fn trace_error_from_shard_map(error: ShardMapTraceError) -> TracingError {
-    TracingError::HigherOrderOpFailure { op: "shard_map", message: error.to_string() }
+    TracingError::Type(TypeError { message: error.to_string() })
 }
 
 /// Returns the number of primal inputs consumed by one transpose shard-map body.
@@ -1495,25 +1550,7 @@ fn replay_traced_xla_program<
                     }
                     XlaPrimitiveOperation::WithShardingConstraint(_) => vec![input_values[0].clone()],
                     XlaPrimitiveOperation::Custom(custom_op) => {
-                        if let Some(shard_map_op) =
-                            custom_op.extensions().get::<LinearShardMapOperation<ShardMapTensor>>()
-                        {
-                            V::apply_linear_shard_map_operation(replay_context, shard_map_op, input_values)?
-                        } else if let Some(shard_map_op) =
-                            custom_op.extensions().get::<ShardMapOperation<ShardMapTensor>>()
-                        {
-                            V::apply_shard_map_operation(replay_context, shard_map_op, input_values)?
-                        } else if custom_op.extensions().get::<WithShardingConstraintOperation>().is_some() {
-                            vec![input_values[0].clone()]
-                        } else {
-                            return Err(ShardMapTraceError::TracingError(TracingError::HigherOrderOpFailure {
-                                op: "shard_map",
-                                message: format!(
-                                    "replaying staged custom op '{}' is not supported",
-                                    instruction.operation.name()
-                                ),
-                            }));
-                        }
+                        V::apply_custom_operation(replay_context, custom_op.as_ref(), input_values)?
                     }
                     XlaPrimitiveOperation::Add => vec![input_values[0].clone() + input_values[1].clone()],
                     XlaPrimitiveOperation::Mul => vec![input_values[0].clone() * input_values[1].clone()],
@@ -1841,6 +1878,21 @@ impl ReplayShardMapValue for ShardMapTracer {
             .interpret_with_tracing_builder(replay_context.tracing_builder.clone(), inputs.as_slice())
             .map_err(ShardMapTraceError::TracingError)
     }
+
+    fn apply_custom_operation(
+        replay_context: &Self::ReplayContext,
+        custom_op: &CustomPrimitive<ArrayType, ShardMapTensor>,
+        inputs: Vec<Self>,
+    ) -> Result<Vec<Self>, ShardMapTraceError> {
+        let replay_extension =
+            custom_op.extensions().get::<ShardMapCustomReplayExtension<Self>>().ok_or_else(|| {
+                ShardMapTraceError::TracingError(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                    op: custom_op.name(),
+                    transform: "shard_map replay",
+                }))
+            })?;
+        replay_extension.replay(replay_context, inputs)
+    }
 }
 
 impl ReplayShardMapValue for Linearized<ShardMapTracer> {
@@ -1893,6 +1945,21 @@ impl ReplayShardMapValue for Linearized<ShardMapTracer> {
             .zip(tangent_outputs)
             .map(|(primal, tangent)| Linearized { primal, tangent })
             .collect::<Vec<_>>())
+    }
+
+    fn apply_custom_operation(
+        replay_context: &Self::ReplayContext,
+        custom_op: &CustomPrimitive<ArrayType, ShardMapTensor>,
+        inputs: Vec<Self>,
+    ) -> Result<Vec<Self>, ShardMapTraceError> {
+        let replay_extension =
+            custom_op.extensions().get::<ShardMapCustomReplayExtension<Self>>().ok_or_else(|| {
+                ShardMapTraceError::TracingError(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                    op: custom_op.name(),
+                    transform: "shard_map replay",
+                }))
+            })?;
+        replay_extension.replay(replay_context, inputs)
     }
 }
 
@@ -2068,7 +2135,7 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
             None if output_structure.parameter_count() == 0 => {
                 return Ok(Output::To::<ShardMapTracer>::from_parameters(output_structure, Vec::new())?);
             }
-            None => return Err(ShardMapTraceError::TracingError(missing_traced_shard_map_staging_context())),
+            None => return Err(ShardMapTraceError::MissingTracedInvocationContext),
         };
         let traced = trace_flat_shard_map::<F, Input::To<ArrayType>, Output>(
             function,
@@ -2129,14 +2196,14 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
             None if output_structure.parameter_count() == 0 => {
                 return Ok(Output::To::<Linearized<ShardMapTracer>>::from_parameters(output_structure, Vec::new())?);
             }
-            None => return Err(ShardMapTraceError::TracingError(missing_linearized_shard_map_staging_context())),
+            None => return Err(ShardMapTraceError::MissingLinearizedInvocationContext),
         };
         let linear_builder = match traced_inputs.first() {
             Some(input) => input.tangent.builder.clone(),
             None if output_structure.parameter_count() == 0 => {
                 return Ok(Output::To::<Linearized<ShardMapTracer>>::from_parameters(output_structure, Vec::new())?);
             }
-            None => return Err(ShardMapTraceError::TracingError(missing_linearized_shard_map_staging_context())),
+            None => return Err(ShardMapTraceError::MissingLinearizedInvocationContext),
         };
         let global_input_primals = Input::To::<ShardMapTracer>::from_parameters(
             input_structure.clone(),
@@ -2166,16 +2233,17 @@ impl ShardMapInvocationLeaf for Linearized<ShardMapTracer> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, marker::PhantomData, rc::Rc};
+    use std::{cell::RefCell, fmt::Display, marker::PhantomData, rc::Rc, sync::Arc};
 
     use ryft_core::{
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
         tracing_v2::{
-            Atom, AtomId, DifferentiableOperation, LinearPrimitiveOperation, LinearTerm, Program, ProgramBuilder,
-            Tracer, forward::JvpTracer,
+            Atom, AtomId, CustomOperationError, CustomPrimitive, DifferentiableOperation, InterpretableOperation,
+            LinearPrimitiveOperation, LinearTerm, Operation, Program, ProgramBuilder, Tracer, TracingError,
+            forward::JvpTracer,
         },
-        types::{ArrayType, DataType, Shape, Size, Typed},
+        types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
     };
 
     use crate::experimental::XlaEngine;
@@ -2259,6 +2327,31 @@ mod tests {
                 vec![Placeholder],
             ),
         )
+    }
+
+    #[derive(Clone, Debug)]
+    struct TestCustomReplayOp;
+
+    impl Display for TestCustomReplayOp {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "test_custom_replay")
+        }
+    }
+
+    impl Operation for TestCustomReplayOp {
+        fn name(&self) -> &'static str {
+            "test_custom_replay"
+        }
+
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(input_types.to_vec())
+        }
+    }
+
+    impl InterpretableOperation<ArrayType, ShardMapTensor> for TestCustomReplayOp {
+        fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
+            Ok(inputs.to_vec())
+        }
     }
 
     #[test]
@@ -2447,5 +2540,40 @@ mod tests {
         assert_eq!(staged_program.instructions.len(), 1);
         assert!(matches!(staged_program.instructions[0].operation, XlaPrimitiveOperation::ShardMap(_)));
         assert!(staged_program.instructions[0].inputs.is_empty());
+    }
+
+    #[test]
+    fn test_replay_traced_xla_program_missing_custom_replay_rule_reports_missing_rule() {
+        let array_type = test_array_type();
+        let program = {
+            let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+            let input = builder.add_input(array_type.clone());
+            let output = builder
+                .add_instruction(
+                    XlaPrimitiveOperation::Custom(Arc::new(CustomPrimitive::new(TestCustomReplayOp))),
+                    vec![input],
+                )
+                .expect("custom op should stage")
+                .into_iter()
+                .next()
+                .expect("custom op should produce one output");
+            builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+        };
+        let tracing_builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
+        let input_atom = tracing_builder.borrow_mut().add_input(array_type);
+        let input = Tracer::from_engine(input_atom, tracing_builder.clone(), XlaEngine::token());
+
+        assert!(matches!(
+            replay_traced_xla_program(&ShardMapReplayContext { tracing_builder }, &program, vec![input]),
+            Err(ShardMapTraceError::TracingError(TracingError::CustomOperation(CustomOperationError::MissingRule {
+                op: "test_custom_replay",
+                transform: "shard_map replay",
+            })))
+        ));
     }
 }
