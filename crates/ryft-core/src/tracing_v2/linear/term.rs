@@ -177,7 +177,8 @@ pub type Linearized<V, O = LinearPrimitiveOperation<ArrayType, V>> = JvpTracer<V
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use crate::tracing_v2::{LinearPrimitiveOperation, ProgramBuilder, TracingError};
+    use crate::tracing::TracingError;
+    use crate::tracing_v2::{LinearPrimitiveOperation, ProgramBuilder};
     use crate::types::{ArrayType, Typed};
 
     use super::LinearTerm;

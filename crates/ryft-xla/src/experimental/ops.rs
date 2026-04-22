@@ -7,9 +7,10 @@ use std::{
 
 use ryft_core::{
     batching::{BatchingError, FlatTracedVMap, LinearVMapOperation, VMapOperation, VMapTracingOperation},
+    tracing::TracingError,
     tracing_v2::{
         AtomId, CustomPrimitive, DifferentiableOperation, DifferentiationError, InterpretableOperation,
-        LinearPrimitiveOperation, LinearTerm, Operation, TracingError,
+        LinearPrimitiveOperation, LinearTerm, Operation,
         engine::Engine,
         forward::JvpTracer,
         linear::{Linearized, linearize_program, transpose_linear_program_with_output_examples},

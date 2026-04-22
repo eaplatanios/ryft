@@ -2751,9 +2751,9 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+    use ryft_core::tracing::TracingError;
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, InterpretableOperation, MatrixOps, OneLike, Operation, ProgramBuilder, Sin, TracingError,
-        ZeroLike,
+        Cos, CustomPrimitive, InterpretableOperation, MatrixOps, OneLike, Operation, ProgramBuilder, Sin, ZeroLike,
     };
     use ryft_core::types::{Shape, TypeError};
 

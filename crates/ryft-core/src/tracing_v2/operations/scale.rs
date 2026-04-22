@@ -15,8 +15,9 @@ use indoc::indoc;
 
 use crate::batching::Batch;
 use crate::macros::check_input_count;
+use crate::tracing::TracingError;
 use crate::tracing_v2::{
-    AtomId, Traceable, TracingError, Value, ZeroLike,
+    AtomId, Traceable, Value, ZeroLike,
     engine::Engine,
     forward::{JvpTracer, TangentSpace},
     jit::Tracer,

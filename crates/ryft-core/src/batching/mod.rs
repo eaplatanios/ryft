@@ -25,10 +25,10 @@ use thiserror::Error;
 
 use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
+    tracing::TracingError,
     tracing_v2::{
         Atom, AtomId, Instruction, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, LinearTerm,
-        OneLike, Operation, PrimitiveOperation, Program, ProgramBuilder, Traceable, Tracer, TracingError, Value,
-        ZeroLike,
+        OneLike, Operation, PrimitiveOperation, Program, ProgramBuilder, Traceable, Tracer, Value, ZeroLike,
         engine::Engine,
         linear::{linearize_program, replay_program_linearized_jit, transpose_linear_program_with_output_examples},
         operations::{
@@ -64,7 +64,7 @@ pub use crate::check_batch_sizes;
 ///
 /// [`BatchingError`] owns the failures that are specific to batching and vmapping semantics.
 /// Broader tracing and staged-program construction failures still live in
-/// [`TracingError`](crate::tracing_v2::TracingError), which wraps this type when batching
+/// [`TracingError`](crate::tracing::TracingError), which wraps this type when batching
 /// participates inside larger transforms.
 #[derive(Clone, Debug, Error, Eq, Hash, PartialEq)]
 pub enum BatchingError {

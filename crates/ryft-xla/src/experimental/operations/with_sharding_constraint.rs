@@ -7,9 +7,10 @@ use std::{
 
 use ryft_core::macros::check_input_count;
 use ryft_core::sharding::Sharding;
+use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearCustomPrimitive, LinearOperation,
-    LinearPrimitiveOperation, Operation, PrimitiveOperation, Tracer, TracingError, VectorizableOperation,
+    LinearPrimitiveOperation, Operation, PrimitiveOperation, Tracer, VectorizableOperation,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},

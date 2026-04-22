@@ -10,9 +10,10 @@ use std::marker::PhantomData;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
+    tracing::TracingError,
     tracing_v2::{
         Atom, AtomId, DifferentiationError, Instruction, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation,
-        Program, Traceable, Tracer, TracingError, Value, ZeroLike,
+        Program, Traceable, Tracer, Value, ZeroLike,
         engine::Engine,
         linear::{
             linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,

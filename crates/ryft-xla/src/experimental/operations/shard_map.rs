@@ -12,11 +12,12 @@ use std::{
 use ryft_core::{
     parameters::{Parameterized, ParameterizedFamily},
     sharding::{LogicalMesh, MeshAxisType, Sharding},
+    tracing::TracingError,
     tracing_v2::{
         AtomId, Cos, CustomOperationError, CustomPrimitive, DifferentiableOperation, Instruction,
         InterpretableOperation, LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, LinearTerm,
         Linearized, MatrixOps, OneLike, Operation, PrimitiveOperation, Program, ProgramBuilder, Sin, Traceable, Tracer,
-        TracingError, ZeroLike, engine::Engine, forward::JvpTracer, operations::reshape::ReshapeOps,
+        ZeroLike, engine::Engine, forward::JvpTracer, operations::reshape::ReshapeOps,
     },
     types::{ArrayType, TypeError, Typed},
 };
@@ -2238,10 +2239,10 @@ mod tests {
     use ryft_core::{
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
+        tracing::TracingError,
         tracing_v2::{
             Atom, AtomId, CustomOperationError, CustomPrimitive, DifferentiableOperation, InterpretableOperation,
-            LinearPrimitiveOperation, LinearTerm, Operation, Program, ProgramBuilder, Tracer, TracingError,
-            forward::JvpTracer,
+            LinearPrimitiveOperation, LinearTerm, Operation, Program, ProgramBuilder, Tracer, forward::JvpTracer,
         },
         types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
     };

@@ -22,9 +22,10 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
+    tracing::TracingError,
     tracing_v2::{
-        Atom, AtomId, Instruction, LinearPrimitiveOperation, OneLike, Program, ProgramBuilder, Traceable, TracingError,
-        Value, ZeroLike,
+        Atom, AtomId, Instruction, LinearPrimitiveOperation, OneLike, Program, ProgramBuilder, Traceable, Value,
+        ZeroLike,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::{Tracer, interpret_and_trace},
@@ -158,6 +159,7 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
+        tracing::TracingError,
         tracing_v2::{
             CustomPrimitive, DifferentiableOperation, InterpretableOperation, LinearOperation,
             LinearPrimitiveOperation, Operation, PrimitiveOperation, ProgramBuilder, Sin, engine::ArrayScalarEngine,

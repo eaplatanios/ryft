@@ -53,9 +53,8 @@ use std::{fmt::Display, sync::Arc};
 use crate::{
     batching::Batch,
     parameters::Parameterized,
-    tracing_v2::{
-        AtomId, Traceable, TracingError, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm,
-    },
+    tracing::TracingError,
+    tracing_v2::{AtomId, Traceable, engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm},
     types::{ArrayType, Type, TypeError, Typed},
 };
 

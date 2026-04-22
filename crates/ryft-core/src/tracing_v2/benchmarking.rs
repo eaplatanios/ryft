@@ -10,9 +10,10 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::parameters::Parameterized;
+use crate::tracing::TracingError;
 use crate::types::ArrayType;
 
-use super::{Atom, Operation, Program, Traceable, TracingError};
+use super::{Atom, Operation, Program, Traceable};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]

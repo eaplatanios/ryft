@@ -68,10 +68,11 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::operations::{AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation};
 use ryft_core::tracing_v2::{
     Atom, AtomId, Cos, InterpretableOperation, Linearized, MatrixOps, OneLike, Operation, Program, Sin, Traceable,
-    Tracer, TracingError, Value, ZeroLike, trace as trace_types,
+    Tracer, Value, ZeroLike, trace as trace_types,
 };
 
 use crate::experimental::operations::WithShardingConstraintOperation;

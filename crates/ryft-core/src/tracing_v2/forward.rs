@@ -22,8 +22,9 @@ use ryft_macros::Parameter;
 use crate::{
     batching::{Batch, BatchingError, stack, unstack},
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
+    tracing::TracingError,
     tracing_v2::{
-        LinearPrimitiveOperation, Program, ProgramBuilder, Traceable, TracingError, Value, ZeroLike,
+        LinearPrimitiveOperation, Program, ProgramBuilder, Traceable, Value, ZeroLike,
         engine::Engine,
         jit::{Tracer, interpret_and_trace},
         linear::{Linearized, jvp_program, jvp_traced, linearize_traced_program},

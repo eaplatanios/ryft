@@ -384,10 +384,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        parameters::Placeholder,
-        tracing_v2::{DifferentiationError, TracingError},
-    };
+    use crate::{parameters::Placeholder, tracing::TracingError, tracing_v2::DifferentiationError};
 
     use super::DenseJacobian;
 

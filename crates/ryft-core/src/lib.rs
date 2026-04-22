@@ -4,6 +4,7 @@ pub mod errors;
 pub mod macros;
 pub mod parameters;
 pub mod sharding;
+pub mod tracing;
 pub mod tracing_v2;
 pub mod types;
 pub mod utilities;

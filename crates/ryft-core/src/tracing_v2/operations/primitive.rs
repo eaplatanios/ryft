@@ -20,8 +20,9 @@ use crate::{
         Batch, BatchingError, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation,
     },
     parameters::{Parameter, Parameterized},
+    tracing::TracingError,
     tracing_v2::{
-        AtomId, Cos, MatrixOps, OneLike, Sin, Traceable, TracingError, Value, ZeroLike,
+        AtomId, Cos, MatrixOps, OneLike, Sin, Traceable, Value, ZeroLike,
         engine::Engine,
         forward::JvpTracer,
         jit::Tracer,

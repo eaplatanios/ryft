@@ -16,8 +16,9 @@ use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     batching::{Batch, check_batch_sizes},
     macros::check_input_count,
+    tracing::TracingError,
     tracing_v2::{
-        AtomId, Traceable, TracingError, ZeroLike,
+        AtomId, Traceable, ZeroLike,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         linear::LinearTerm,
@@ -183,6 +184,7 @@ mod tests {
     use crate::{
         batching::BatchingError,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
+        tracing::TracingError,
         tracing_v2::test_support,
         types::{DataType, Layout, Shape, Size, StridedLayout},
     };

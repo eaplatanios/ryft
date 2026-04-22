@@ -18,8 +18,9 @@ use crate::{
     batching::Batch,
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
+    tracing::TracingError,
     tracing_v2::{
-        MatrixOps, OneLike, Traceable, TracingError, ZeroLike,
+        MatrixOps, OneLike, Traceable, ZeroLike,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::Tracer,
@@ -333,7 +334,7 @@ mod ndarray_support {
 
     use super::{ReshapeOps, reshape_abstract};
     use crate::{
-        tracing_v2::TracingError,
+        tracing::TracingError,
         types::{Shape, Size, TypeError, Typed},
     };
 

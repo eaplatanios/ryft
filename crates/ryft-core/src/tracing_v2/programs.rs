@@ -29,7 +29,7 @@ use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, ParameterError, Parameterized},
-    tracing_v2::TracingError,
+    tracing::TracingError,
     types::{ArrayType, Type, TypeError, Typed},
 };
 
@@ -770,7 +770,8 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, ParameterError, Parameterized, Placeholder},
-        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOperation, Sin, TracingError, Value, ZeroLike, test_support},
+        tracing::TracingError,
+        tracing_v2::{Cos, MatrixOps, OneLike, PrimitiveOperation, Sin, Value, ZeroLike, test_support},
         types::{ArrayType, DataType, Shape, Typed},
     };
 
