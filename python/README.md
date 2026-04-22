@@ -1,0 +1,34 @@
+# `ryft` Python Utilities
+
+This directory hosts the Python utilities that support extracting information from JAX programs that helps us ensure
+that `ryft` has feature parity with JAX along certain dimensions.
+
+## Setup
+
+Run the following command to create a Python virtual environment for this project and install all of its dependencies:
+
+```bash
+uv sync
+```
+
+This will generate a virtual environment in `python/.venv`.
+
+## Scripts
+
+Run the following command to list all prespecified JAX programs that can be inspected with other scripts:
+
+```bash
+uv run python scripts/inspect_jax_programs.py --list
+```
+
+Run the following command to render the JAXPR and StableHLO for a given JAX program:
+
+```bash
+uv run python scripts/inspect_jax_programs.py --case right_mul_4_2_transpose
+```
+
+Run the following command to compare the MLIR emitted by JAX against the MLIR emitted by `ryft`:
+
+```bash
+XLA_FLAGS=--xla_force_host_platform_device_count=4 uv run python scripts/compare_reshape_mlir_with_jax.py
+```

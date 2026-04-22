@@ -14,4 +14,4 @@
 .tasks
 
 # Python
-.venv
+**/.venv
