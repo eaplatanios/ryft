@@ -1,16 +1,3 @@
-//! Just-in-time staging support for `tracing_v2`.
-//!
-//! This module is the entry point for turning ordinary Rust closures into staged programs. It owns
-//! [`Tracer`], the symbolic leaf wrapper that records primitive applications into a shared
-//! [`ProgramBuilder`](crate::tracing::ProgramBuilder), plus the two main capture modes:
-//!
-//! - [`trace`] records a program from abstract input metadata alone.
-//! - [`interpret_and_trace`] records the same program shape while also replaying it eagerly on
-//!   concrete inputs so the caller gets both the runtime result and the staged artifact.
-//!
-//! The rest of `tracing_v2` builds on these same primitives. Forward-mode, reverse-mode,
-//! rematerialization, and traced `vmap` all eventually stage through [`Tracer`].
-
 use std::{
     borrow::Cow,
     cell::RefCell,

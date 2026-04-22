@@ -1,9 +1,3 @@
-//! Right matrix-multiplication primitive for [`crate::tracing_v2`].
-//!
-//! This module specializes matrix multiplication to the linear-map form `input @ factor`. Together
-//! with [`super::left_matmul`], it gives transpose and linearization code explicit building blocks
-//! for non-commutative matrix actions.
-
 use std::fmt::{Debug, Display};
 
 use crate::batching::Batch as BatchedValue;

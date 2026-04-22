@@ -1,32 +1,3 @@
-//! Context-carrying value construction for staged program transforms.
-//!
-//! The [`Engine`] trait is the abstraction used by differentiation, rematerialization, and
-//! vectorization transforms whenever they need to *synthesize* a concrete value from abstract
-//! type metadata alone — most commonly a representative zero used as a seed when replaying a
-//! staged program.
-//!
-//! The trait exists because different leaf value types require different amounts of context to
-//! materialize a value from a [`Type`] descriptor:
-//!
-//! - Scalar-valued leaves over [`ArrayType`] metadata carry no shape beyond the type itself, so a
-//!   stateless [`ArrayScalarEngine<V>`] is sufficient.
-//! - Sharded and device-backed leaves such as [`ShardMapTensor`](crate) or PJRT-backed arrays
-//!   need additional context (a mesh handle, a device, a PJRT client) to construct a valid
-//!   concrete value. These leaves use stateful engines that carry the required handles.
-//!
-//! Engines are intentionally kept small: they expose metadata-only synthesis (zero and one) and
-//! also choose the staged ordinary and linear operation carriers used by user-facing tracing
-//! transforms. Per-instruction evaluation paths (`InterpretableOperation::interpret`,
-//! `Operation::infer_output_types`, and similar) remain engine-free so that the common fast path
-//! is never forced through a dispatch layer.
-//!
-//! ## Performance
-//!
-//! Engines are always passed by shared reference (`&E`) to user-facing transforms. Stateless
-//! engines are zero-sized types, so engine arguments cost nothing at runtime. Every concrete
-//! engine method is marked `#[inline]` so the compiler can fully elide the call at monomorphized
-//! call sites.
-
 use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
@@ -49,8 +20,13 @@ use crate::{
 /// rebuild a value from shape/type information alone; [`Engine`] is the narrow seam where
 /// backend-specific knowledge enters the otherwise backend-agnostic transform code.
 ///
-/// Implementations should be cheap to clone (the common case is a [`Copy`] zero-sized type) and
-/// must return values whose type metadata agrees with the input descriptor.
+/// Per-instruction evaluation stays outside this trait: replay and abstract-eval continue to go
+/// straight through [`crate::tracing::InterpretableOperation`] and [`crate::tracing::Operation`]
+/// so the common fast path never needs an extra dispatch layer.
+///
+/// Engines are passed by shared reference to user-facing transforms. Implementations should be
+/// cheap to clone (the common case is a [`Copy`] zero-sized type) and must return values whose type
+/// metadata agrees with the input descriptor.
 pub trait Engine {
     /// Abstract type metadata interpreted by this engine.
     ///

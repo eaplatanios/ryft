@@ -1,9 +1,3 @@
-//! Multiplication primitive for [`crate::tracing_v2`].
-//!
-//! `MulOperation` is the bilinear counterpart to [`super::AddOperation`]. It is used directly in user programs
-//! and indirectly inside derivative rules for many other primitives, so its docs are a good place
-//! to understand how one primitive threads through staging, replay, batching, and JVP evaluation.
-
 use std::{
     collections::BTreeSet,
     fmt::{Debug, Display},

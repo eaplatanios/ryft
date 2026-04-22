@@ -1,9 +1,3 @@
-//! Matrix transpose primitive for [`crate::tracing_v2`].
-//!
-//! Matrix transpose is one of the structural matrix primitives that many higher-order rules depend
-//! on. This module provides its staged semantic op so matrix-aware transforms can reuse a single
-//! abstract-eval, replay, batching, and transpose implementation.
-
 use std::fmt::{Debug, Display};
 
 use crate::batching::Batch as BatchedValue;

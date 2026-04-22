@@ -1,11 +1,9 @@
-//! CLI that emits Rust-side IR benchmark artifacts as JSON.
-
 use std::env;
 
 use ryft_core::tracing_v2::benchmarking::{benchmark_case_ids, collect_ir_benchmark_records};
 use ryft_xla::experimental::benchmark_support;
 
-/// Runs the Rust-side IR benchmark emitter.
+/// Runs the Rust-side IR benchmark emitter and prints JSON records to stdout.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xla_cases = benchmark_support::cases();
     let mut case_ids = Vec::new();

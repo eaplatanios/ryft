@@ -1,14 +1,3 @@
-//! Forward-mode differentiation primitives.
-//!
-//! This module is the forward-mode half of the autodiff story. It introduces [`JvpTracer`], the
-//! paired primal/tangent leaf wrapper used while propagating Jacobian-vector products through a
-//! computation, and it exposes [`jvp`], the public transform that evaluates a function together
-//! with the directional derivative induced by a tangent input.
-//!
-//! Primitive operations contribute their local JVP rules in [`crate::tracing_v2::operations`], but
-//! the orchestration happens here: concrete execution, traced execution inside an enclosing JIT
-//! scope, and batched execution all meet at the same dispatch seam.
-
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -645,6 +634,8 @@ where
 /// The returned pair is `(primal_output, tangent_output)`. Architecturally, [`jvp`] is the most
 /// direct forward-mode transform in the crate: it either traces the body once to build a staged
 /// pushforward or stages the whole JVP into an outer trace if the inputs are already symbolic.
+/// Primitive-specific local JVP rules live in [`crate::tracing_v2::operations`]; [`jvp`] is the
+/// orchestration layer that selects the concrete, traced, or batched execution path.
 #[allow(private_bounds, private_interfaces)]
 pub fn jvp<'engine, E, F, Input, Output, Leaf>(
     engine: &'engine E,

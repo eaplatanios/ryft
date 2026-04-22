@@ -1,5 +1,3 @@
-//! Higher-order `shard_map` operations for traced XLA programs.
-
 use std::{
     cell::RefCell,
     fmt::{Debug, Display},

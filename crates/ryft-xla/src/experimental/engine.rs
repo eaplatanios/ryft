@@ -1,14 +1,3 @@
-//! XLA backend token used for both shard-map tracing and PJRT-backed execution.
-//!
-//! [`XlaEngine`] is the single backend token for traced XLA programs and PJRT-backed execution.
-//! It materializes concrete PJRT-backed arrays, lowers traced programs to MLIR, compiles them,
-//! and executes them. Type-directed tracing stages XLA programs directly from [`ArrayType`] metadata
-//! and therefore does not require a second tracing-only engine specialization.
-//!
-//! Cloning [`Array<'c>`] is cheap because every shard buffer lives behind an [`Arc`]; this is what
-//! lets [`XlaEngine`] act as the engine value for transforms that require
-//! [`Clone`](Engine::Value).
-
 use std::{marker::PhantomData, sync::LazyLock};
 
 use ryft_pjrt::protos::CompilationOptions;
@@ -58,6 +47,10 @@ pub enum XlaEngineError {
 /// - a concrete [`DeviceMesh`] used to resolve shard placement for arrays synthesized from
 ///   [`ArrayType`] metadata, and
 /// - default [`CompilationOptions`] that [`XlaEngine::compile`] forwards to PJRT.
+///
+/// The same backend token covers both staged tracing and concrete execution. Nested traced code can
+/// switch to [`XlaEngine::tracing_only`] instead of maintaining a separate tracing-only engine
+/// specialization.
 ///
 /// Holding the mesh on the engine keeps [`Engine::zero`] and [`Engine::one`] infallible — both
 /// methods can rebuild a replicated fallback sharding from `self.mesh.logical_mesh` when the

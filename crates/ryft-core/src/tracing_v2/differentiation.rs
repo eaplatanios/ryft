@@ -1,8 +1,3 @@
-//! Error types owned by the differentiation helpers in [`crate::tracing_v2`].
-//!
-//! These errors describe shape and materialization mismatches that arise while building dense
-//! Jacobian- or Hessian-like views from traced differentiation results.
-
 use thiserror::Error;
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].

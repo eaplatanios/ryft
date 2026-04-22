@@ -1,14 +1,3 @@
-//! Closed default carriers for the built-in `tracing_v2` operation set.
-//!
-//! [`PrimitiveOperation`] is the ordinary staged-operation carrier and [`LinearPrimitiveOperation`] is the
-//! linear-only sibling used by linear programs. Both enums are zero-cost wrappers around the
-//! per-primitive op types in [`crate::tracing_v2::operations`] and use the
-//! [`Custom`](PrimitiveOperation::Custom) escape hatch for operations defined outside this crate.
-//!
-//! These carriers are the default backend choice for `ryft-core`. Other backends (for example
-//! `ryft-xla`) own their own carrier enums and implement the same staging traits from the
-//! per-operation modules to slot into the generic transform code.
-
 use std::{
     fmt::{Debug, Display},
     ops::{Add, Mul, Neg},

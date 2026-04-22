@@ -1,23 +1,3 @@
-//! Shared staged-program representation and default op-carrier aliases used by the tracing
-//! transforms.
-//!
-//! This module owns the IR that all of `tracing_v2` is built on top of. Whether we are capturing a
-//! user closure with [`trace`](crate::tracing_v2::trace), replaying a staged program with
-//! [`Program::interpret`], or linearizing a primal program into another staged [`Program`] over
-//! linear operations,
-//! we keep coming back to the same core pieces:
-//!
-//! - [`Traceable`] and [`Value`] define which leaf values can participate in staged programs.
-//! - [`Atom`] values describe the leaves of the staged program.
-//! - [`Instruction`] values connect atoms through concrete operation objects.
-//! - [`ProgramBuilder`] incrementally stages those instructions while keeping variable atoms purely
-//!   type-directed.
-//! - [`Program`] is the persistent, executable artifact shared between JIT tracing, linearization,
-//!   transposition, and backend lowering.
-//!
-//! The generic parameters stay intentionally open so that the same IR can represent both ordinary
-//! programs and tangent/cotangent programs over backend-specific op carriers.
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -243,7 +223,9 @@ pub struct Instruction<O> {
 /// [`Program`] is the persistent artifact produced by tracing. It stores the finalized atom table,
 /// the ordered list of instructions, and the structured input/output metadata needed to turn flat leaf
 /// evaluation back into user-facing structured values. Both ordinary JIT traces and higher-order
-/// transforms exchange programs in this form.
+/// transforms exchange programs in this form. The generic parameters intentionally stay open so the
+/// same IR can represent ordinary programs plus tangent and cotangent programs over backend-specific
+/// operation carriers.
 pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
 {
     /// Final atom table of the staged program.

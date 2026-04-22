@@ -1,16 +1,3 @@
-//! Reverse-mode transforms built on top of staged linear programs.
-//!
-//! This module takes the IR-level building blocks from the rest of [`super`] and assembles the
-//! user-facing reverse-mode APIs. The broad flow is:
-//!
-//! 1. trace a primal program,
-//! 2. linearize it into a pushforward,
-//! 3. transpose that pushforward into a pullback, and
-//! 4. seed the pullback appropriately to obtain gradients or value-and-gradient pairs.
-//!
-//! The concrete, traced, and batched variants all share that structure; they only differ in where
-//! the final replay happens.
-
 use super::*;
 use crate::batching::{Batch, BatchingError, stack, unstack};
 use crate::parameters::ParameterError;

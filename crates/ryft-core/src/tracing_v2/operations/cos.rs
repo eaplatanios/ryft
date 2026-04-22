@@ -1,9 +1,3 @@
-//! Cosine primitive for [`crate::tracing_v2`].
-//!
-//! This module is the cosine-side companion to [`super::sin`]. It exposes the value-level cosine
-//! capability used in generic user code and the staged primitive used by tracing, batching, and
-//! derivative construction.
-
 use std::{
     fmt::{Debug, Display},
     ops::Neg,

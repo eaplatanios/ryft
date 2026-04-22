@@ -1,8 +1,3 @@
-//! Internal IR benchmark support for traced XLA and `shard_map`.
-//!
-//! This module owns the Rust-side benchmark cases that exercise the XLA tracing path and the
-//! higher-order `shard_map` operation.
-
 use ryft_core::batching::vmap;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};

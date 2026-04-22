@@ -1,17 +1,3 @@
-//! Linearization, transposition, and higher-order differentiation utilities.
-//!
-//! This module is the "middle layer" between raw tracing and user-facing reverse-mode APIs. Its
-//! job is to take an ordinary staged primal program and turn it into the linear objects that power
-//! the rest of autodiff:
-//!
-//! - staged [`Program`] values over linear operations for reusable pushforwards and pullbacks,
-//! - reverse-mode transforms such as [`vjp`], [`grad`], and [`value_and_grad`],
-//! - dense Jacobian and Hessian materialization helpers, and
-//! - rematerialization-aware compiled gradients.
-//!
-//! In the larger architecture, this is where the system stops thinking in terms of "run the
-//! original function again" and starts reasoning about the linear maps induced by that function.
-
 use std::{
     cell::RefCell,
     fmt::{Debug, Display},
@@ -41,11 +27,17 @@ use crate::{
     types::{ArrayType, Type, Typed},
 };
 
+/// Dense Jacobian and Hessian materialization helpers.
 mod dense;
+/// Program-level linearization and transpose construction.
 mod program;
+/// Rematerialization-aware compiled-gradient helpers.
 mod rematerialization;
+/// Replay helpers that reinterpret traced programs under linearized leaf semantics.
 mod replay;
+/// Public reverse-mode APIs built from traced programs and staged pullbacks.
 mod reverse;
+/// Linear leaf wrappers and the staged linearized-value carrier.
 mod term;
 
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};

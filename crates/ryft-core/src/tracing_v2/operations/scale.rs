@@ -1,10 +1,3 @@
-//! Scaling primitive for [`crate::tracing_v2`].
-//!
-//! `ScaleOperation` is the main example of a primitive with captured constant state. Unlike bare
-//! multiplication, the scale factor is part of the op object itself, which makes this module a good
-//! reference for how traced constants move through replay, linearization, and higher-order traced
-//! execution.
-
 use std::{
     fmt::{Debug, Display},
     ops::Mul,

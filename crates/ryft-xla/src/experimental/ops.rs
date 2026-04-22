@@ -1,5 +1,3 @@
-//! Backend-owned staged op universe for traced XLA programs.
-
 use std::{
     fmt::{Debug, Display},
     sync::Arc,

@@ -1,9 +1,3 @@
-//! Left matrix-multiplication primitive for [`crate::tracing_v2`].
-//!
-//! This module specializes matrix multiplication to the common linear-map form `factor @ input`.
-//! It is used heavily by matrix transpose rules because cotangent propagation naturally produces
-//! captured left and right linear actions rather than only free-standing binary matmuls.
-
 use std::fmt::{Debug, Display};
 
 use crate::batching::Batch as BatchedValue;

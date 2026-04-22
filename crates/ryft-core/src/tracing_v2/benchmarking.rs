@@ -1,9 +1,3 @@
-//! Diagnostic IR benchmarking support for `tracing_v2`.
-//!
-//! This module collects a named suite of staged Ryft programs and emits textual MLIR artifacts plus
-//! normalized structural summaries that can be compared against external MLIR producers such as
-//! JAX StableHLO lowering.
-
 use std::{collections::BTreeMap, fmt::Display};
 
 use serde::Serialize;
@@ -91,6 +85,9 @@ pub struct IrBenchmarkSummary {
 }
 
 /// One emitted benchmark artifact.
+///
+/// Each record keeps both the raw textual IR and a normalized structural summary so Rust-side
+/// tracing artifacts can be compared against other MLIR producers.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct IrBenchmarkRecord {
     /// Stable benchmark case identifier.
@@ -132,7 +129,8 @@ pub fn benchmark_case_ids(extra_cases: &[BenchmarkCase]) -> Vec<&'static str> {
 
 /// Emits the requested benchmark records.
 ///
-/// When `case_ids` is empty, all known benchmark cases are emitted.
+/// When `case_ids` is empty, all known benchmark cases are emitted. The returned records pair raw
+/// textual IR with normalized summaries so callers can diff structure separately from printing.
 ///
 /// # Parameters
 ///

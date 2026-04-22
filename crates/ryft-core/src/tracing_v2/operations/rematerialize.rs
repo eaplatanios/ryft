@@ -1,10 +1,3 @@
-//! Higher-order `rematerialize` operation for [`crate::tracing_v2`].
-//!
-//! This module gives staged programs an explicit rematerialization boundary. The forward semantics
-//! are intentionally boring: calling a rematerialized body is the same as calling the body
-//! directly. The interesting behavior shows up later, when reverse-mode differentiation decides
-//! whether to save intermediates or recompute them.
-
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 

@@ -1,15 +1,3 @@
-//! Custom-primitive subsystem for `tracing_v2`.
-//!
-//! [`CustomPrimitive`] is the rule-based escape hatch that lets user code (or downstream backends)
-//! introduce new staged operations without touching the closed
-//! [`PrimitiveOperation`](super::PrimitiveOperation) carrier. Each primitive carries a required base op for
-//! shape metadata and concrete interpretation, plus optional rules for the various transforms
-//! ([`LinearOperation`] for transpose, [`DifferentiableOperation`] for JVP, [`VectorizableOperation`] for
-//! batching, and an optional linearized-JIT replay rule for nested transforms).
-//!
-//! [`LinearCustomPrimitive`] is the linear-only sibling that guarantees a transpose rule is
-//! present, so it can be stored in linear programs without runtime checks.
-
 use std::{
     any::{Any, TypeId},
     collections::HashMap,

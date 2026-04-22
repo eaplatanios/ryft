@@ -1,8 +1,3 @@
-//! Internal IR benchmark support for `tracing_v2`.
-//!
-//! This module owns the Rust-side benchmark cases that stay entirely within the staged
-//! `tracing_v2` program IR.
-
 use std::ops::{Add, Mul, Neg};
 
 #[cfg(feature = "ndarray")]

@@ -1,11 +1,3 @@
-//! Reshape primitive for [`crate::tracing_v2`].
-//!
-//! Reshaping is one of the places where the staged tracing model has to talk explicitly about
-//! abstract metadata. The runtime effect is "same elements, different logical shape," but whether a
-//! particular leaf type can realize that change is value-specific. This module therefore carries
-//! both the abstract reshape rule and the fallible value-level capability trait used by concrete
-//! leaves and traced wrappers.
-
 use std::{
     fmt::{Debug, Display},
     ops::{Add, Mul, Neg},

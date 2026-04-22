@@ -1,9 +1,3 @@
-//! Matrix multiplication primitive for [`crate::tracing_v2`].
-//!
-//! This module defines the staged matrix-multiplication primitive itself. The supporting matrix
-//! capability traits live in [`super::matrix`]; this file is the concrete semantic op that traced
-//! programs store once those capabilities are available.
-
 use std::fmt::{Debug, Display};
 
 use crate::batching::{Batch as BatchedValue, check_batch_sizes};

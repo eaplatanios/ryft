@@ -1,10 +1,3 @@
-//! Matrix-specific tracing extensions built on top of the core `tracing_v2` primitives.
-//!
-//! The scalar primitives in [`super`] assume commutative arithmetic, but matrix-valued tracing
-//! needs a little more structure: matrix multiplication is non-commutative, transposition matters,
-//! and reverse-mode rules need to express left and right multiplication separately. This module
-//! localizes those extra semantics so the rest of the tracing stack can stay generic.
-
 use std::{
     collections::BTreeSet,
     ops::{Add, Mul, Neg},

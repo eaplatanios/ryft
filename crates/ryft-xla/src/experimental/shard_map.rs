@@ -1,54 +1,3 @@
-//! Manual SPMD metadata for Shardy `sdy.manual_computation`.
-//!
-//! This module provides the tracing-backed `shard_map` surface for `ryft-core::xla`.
-//!
-//! The default public entry point is [`shard_map`], which stages a Rust closure over shard-local
-//! tensor types derived from global [`ArrayType`] metadata, lowers the resulting staged
-//! program to StableHLO/Shardy MLIR, and returns a [`TracedShardMap`] handle for inspection and
-//! lowering.
-//!
-//! Internally, the module keeps a small metadata model of JAX's `shard_map`: a logical mesh,
-//! per-input and per-output shardings, the active set of manual mesh axes for the region, and the
-//! `check_vma` mode. That internal metadata is responsible for:
-//!
-//! - validating manual-axis usage against a [`LogicalMesh`],
-//! - deriving body-local shapes from global shapes, and
-//! - rendering the Shardy attributes needed by `sdy.manual_computation`.
-//!
-//! [`TracedShardMap`] extends that metadata with a staged tracing body program. The traced path
-//! can derive body-local input types from global input types, trace a Rust closure over those
-//! local tensor types, and lower the resulting staged body to StableHLO/Shardy MLIR.
-//!
-//! # Relationship to existing sharding types
-//!
-//! The public [`shard_map`] function accepts structured mesh-bound [`Sharding`] values.
-//!
-//! By default the public [`shard_map`] helper treats every mesh axis whose type is
-//! [`Manual`](ryft_core::sharding::MeshAxisType::Manual) as manual for the
-//! `sdy.manual_computation` region. The more configurable [`shard_map_with_options`] helper can
-//! instead activate only a subset of those manual mesh axes, mirroring JAX's `axis_names`
-//! parameter.
-//!
-//! This matters because the surrounding mesh still determines which axes are free versus manual
-//! inside the region. When a mesh also contains free axes, `ShardMap` renders the corresponding
-//! `in_shardings` / `out_shardings` dimensions as open so that Shardy can propagate those free
-//! axes the same way JAX does.
-//!
-//! # Shardy correspondence
-//!
-//! The internal metadata helpers render the three attributes attached to
-//! `sdy.manual_computation`:
-//!
-//! | shard-map data       | Shardy attribute    |
-//! | -------------------- | ------------------- |
-//! | input shardings      | `in_shardings=[...]`  |
-//! | output shardings     | `out_shardings=[...]` |
-//! | manual mesh axes     | `manual_axes={...}`   |
-//!
-//! Refer to the [Shardy compiler API documentation](https://openxla.org/shardy/compiler_api) and
-//! the [Shardy dialect documentation](https://openxla.org/shardy/sdy_dialect) for the IR-level
-//! semantics of manual computation regions.
-
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
@@ -794,6 +743,10 @@ where
 }
 
 /// Traced shard-map program backed by a staged `tracing_v2` program.
+///
+/// [`TracedShardMap`] extends [`ShardMap`] metadata with both the traced local body program and the
+/// reconstructed global/local boundary types, making it the main inspection and lowering handle
+/// returned by [`shard_map`] and [`shard_map_with_options`].
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedShardMap<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
@@ -843,7 +796,12 @@ where
 ///
 /// The public constructors accept [`Sharding`] values and project them into
 /// traced/type-level semantics, so `Auto` mesh axes remain hidden while `Manual` axes still
-/// drive the manual-computation body.
+/// drive the manual-computation body. When the surrounding mesh also contains free axes, the
+/// rendered `in_shardings` and `out_shardings` dimensions stay open so Shardy can propagate those
+/// free axes across the manual region.
+///
+/// This metadata is ultimately rendered into the three `sdy.manual_computation` attributes:
+/// `in_shardings`, `out_shardings`, and `manual_axes`.
 ///
 /// Reference: https://docs.jax.dev/en/latest/notebooks/shard_map.html.
 #[derive(Clone, Debug, PartialEq, Eq)]

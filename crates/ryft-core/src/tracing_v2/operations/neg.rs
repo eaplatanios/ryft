@@ -1,9 +1,3 @@
-//! Negation primitive for [`crate::tracing_v2`].
-//!
-//! This module provides the unary sign-flip primitive used throughout staged arithmetic. Like the
-//! other core scalar primitives, it demonstrates the full lifecycle of one semantic operation
-//! across abstract evaluation, replay, linear transposition, forward-mode AD, and batching.
-
 use std::{
     fmt::{Debug, Display},
     ops::Neg,

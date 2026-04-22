@@ -1,5 +1,3 @@
-//! StableHLO/Shardy lowering helpers for traced XLA programs.
-
 use std::collections::HashMap;
 
 #[cfg(feature = "ndarray")]

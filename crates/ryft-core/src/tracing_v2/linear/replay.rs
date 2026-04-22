@@ -1,9 +1,3 @@
-//! Replay helpers used while turning traced programs into linear programs.
-//!
-//! These helpers sit below the public autodiff APIs and above the raw staged IR. They replay an
-//! existing traced program on specialized leaf wrappers so linearization can reuse the same program
-//! body without re-running the original user closure.
-
 use super::*;
 
 /// Replays one staged program under caller-supplied leaf semantics.

@@ -1,11 +1,3 @@
-//! Sine primitive for [`crate::tracing_v2`].
-//!
-//! This module shows the pattern used for nonlinear elementwise primitives in `tracing_v2`: a
-//! small value-level capability trait for concrete leaves, a semantic primitive type for staged
-//! programs, and glue impls that teach [`JvpTracer`](crate::tracing_v2::JvpTracer),
-//! [`Tracer`](crate::tracing_v2::Tracer), and [`Batch`](crate::batching::Batch) how to reuse the
-//! same operation in forward-mode, symbolic tracing, and batching.
-
 use std::fmt::{Debug, Display};
 
 use crate::batching::Batch;

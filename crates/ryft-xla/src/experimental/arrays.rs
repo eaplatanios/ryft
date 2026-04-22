@@ -1,20 +1,3 @@
-//! Runtime sharded-array data structures for XLA execution.
-//!
-//! This module builds on the sharding metadata from [`ryft_core::sharding`] to provide runtime
-//! array types that pair global [`ryft_core::types::ArrayType`] metadata, global shard placement
-//! metadata, and local PJRT buffers:
-//!
-//! - [`device_put`] is the higher-level `ryft` analogue of JAX's
-//!   [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) over
-//!   supported host leaves, [`Array`] leaves, and `Parameterized` trees of those leaves.
-//! - [`Array::from_host_buffer`] is the lower-level dense-host-buffer constructor used by
-//!   [`device_put`] and by tests that need explicit byte-level control.
-//! - [`Array`] corresponds to `jax.Array` / IFRT `Array`: global type and shard-placement
-//!   metadata plus local addressable device buffers.
-//! - [`ArrayShard`] corresponds to one entry in JAX's `array.global_shards`, with
-//!   [`ArrayShard::buffer`] identifying the addressable local subset.
-//! - [`ExecuteArguments`] marshals distributed arrays into per-device execution inputs for PJRT.
-
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;

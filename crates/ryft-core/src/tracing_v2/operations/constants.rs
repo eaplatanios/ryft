@@ -1,13 +1,3 @@
-//! Leaf-level identity helpers and default scalar leaf impls for `tracing_v2`.
-//!
-//! The core leaf contracts [`Traceable`](crate::tracing::Traceable) and
-//! [`Value`](crate::tracing::Value) live with the staged IR in [`crate::tracing::programs`]. This
-//! module keeps the remaining value-level helpers that build on top of those contracts:
-//!
-//! - [`ZeroLike`] and [`OneLike`] for synthesizing identity values from an existing exemplar.
-//! - The built-in scalar implementations of [`Traceable`](crate::tracing::Traceable),
-//!   [`Value`](crate::tracing::Value), [`ZeroLike`], and [`OneLike`].
-
 use half::{bf16, f16};
 
 use crate::{
@@ -22,7 +12,9 @@ use crate::{
 /// hand, it uses this trait instead of going back through abstract metadata. That is especially
 /// important for wrappers like [`Tracer`](crate::tracing_v2::Tracer) and
 /// [`JvpTracer`](crate::tracing_v2::JvpTracer), which can stage or derive a zero from their
-/// existing state even when abstract synthesis alone would be insufficient.
+/// existing state even when abstract synthesis alone would be insufficient. This module also ships
+/// the built-in scalar implementations of [`Traceable`](crate::tracing::Traceable),
+/// [`Value`](crate::tracing::Value), [`ZeroLike`], and [`OneLike`].
 pub trait ZeroLike {
     /// Returns a zero value with the same shape as `self`.
     fn zero_like(&self) -> Self;

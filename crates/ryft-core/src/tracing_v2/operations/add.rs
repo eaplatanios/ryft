@@ -1,10 +1,3 @@
-//! Addition primitive for [`crate::tracing_v2`].
-//!
-//! `AddOperation` is the simplest example of how one semantic primitive participates in every layer of
-//! the tracing stack: it provides abstract evaluation for staging, eager interpretation for replay,
-//! a transpose rule for linear programs, a JVP rule for forward-mode AD, and a batching rule for
-//! `vmap`.
-
 use std::{
     collections::BTreeSet,
     fmt::{Debug, Display},

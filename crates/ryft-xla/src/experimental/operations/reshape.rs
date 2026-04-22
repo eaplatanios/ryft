@@ -1,5 +1,3 @@
-//! Reshape support for [`ShardMapTensor`].
-
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::operations::reshape::{ReshapeOps, reshape_abstract};
 use ryft_core::types::{Shape, Typed};
