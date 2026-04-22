@@ -33,11 +33,13 @@ Run the following command to compare the MLIR emitted by JAX against the MLIR em
 XLA_FLAGS=--xla_force_host_platform_device_count=4 uv run python scripts/compare_reshape_mlir_with_jax.py
 ```
 
-Run the following command to compare the shared Rust IR benchmark suite against the corresponding JAX Shardy dumps:
+Run the following command to verify the shared Rust IR benchmark suite against the committed Python snapshots:
 
 ```bash
 uv run python scripts/compare_benchmark_mlir_with_jax.py
 ```
 
-The reusable helpers that back the benchmark comparison workflow live under `ryft.jax.ir_analysis`,
-`ryft.jax.benchmark_cases`, and `ryft.jax.benchmark_parity`.
+The committed benchmark IR snapshots live under `python/tests/snapshots/ir_benchmark`.
+
+The reusable helpers that back the benchmark snapshot workflow live under `ryft.jax.ir_analysis`,
+`ryft.jax.benchmark_cases`, `ryft.jax.benchmark_snapshots`, and `ryft.jax.benchmark_parity`.
