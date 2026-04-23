@@ -8,7 +8,7 @@ use ryft_core::sharding::Sharding;
 use ryft_core::tracing::{InterpretableOperation, Operation, Traceable, TracingError};
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation,
-    PrimitiveOperation, Tracer, VectorizableOperation,
+    PrimitiveOperation, Tracer,
     engine::Engine,
     forward::JvpTracer,
     linear::{LinearTerm, Linearized},
@@ -48,17 +48,9 @@ impl WithShardingConstraintOperation {
     fn base_custom_primitive<V>(&self) -> CustomPrimitive<ArrayType, V>
     where
         V: Traceable<ArrayType> + 'static,
-        Self: Clone
-            + InterpretableOperation<ArrayType, V>
-            + LinearOperation<ArrayType, V>
-            + VectorizableOperation<ArrayType, V>
-            + Send
-            + Sync
-            + 'static,
+        Self: Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V> + Send + Sync + 'static,
     {
-        CustomPrimitive::new(self.clone())
-            .with_transpose_rule(self.clone())
-            .with_vectorization_rule(self.clone())
+        CustomPrimitive::new(self.clone()).with_transpose_rule(self.clone())
     }
 
     /// Returns the tensor-leaf custom primitive registration for this op.
@@ -290,16 +282,6 @@ impl
         .next()
         .expect("sharding constraint should produce one tangent output");
         Ok(vec![JvpTracer { primal: inputs[0].primal.clone(), tangent }])
-    }
-}
-
-impl<V: Traceable<ArrayType>> VectorizableOperation<ArrayType, V> for WithShardingConstraintOperation {
-    fn batch(
-        &self,
-        inputs: &[ryft_core::batching::Batch<V>],
-    ) -> Result<Vec<ryft_core::batching::Batch<V>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![inputs[0].clone()])
     }
 }
 

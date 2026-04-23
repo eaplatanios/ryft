@@ -6,7 +6,6 @@ use std::{
 #[cfg(test)]
 use indoc::indoc;
 
-use crate::batching::Batch;
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::{
@@ -20,7 +19,7 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
-    Operation, VectorizableOperation, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
+    Operation, lift_jit_constant, mul::MulTracingOperation, unary_abstract,
 };
 
 /// Hidden staging trait for the scaling primitive.
@@ -170,13 +169,6 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
             primal: self.factor().clone() * input.primal.clone(),
             tangent: T::scale(self.factor().clone(), input.tangent.clone()),
         }])
-    }
-}
-
-impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType, V> for ScaleOperation<ArrayType, V> {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| self.factor().clone() * lane).collect())])
     }
 }
 

@@ -8,7 +8,6 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    batching::Batch,
     parameters::Parameter,
     tracing::{AtomId, Traceable, TracingError, Value},
     tracing_v2::{
@@ -23,7 +22,7 @@ use crate::{
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearOperation,
-    LinearScaleOperation, Operation, VectorizableOperation,
+    LinearScaleOperation, Operation,
     primitive::{LinearPrimitiveOperation, PrimitiveOperation},
 };
 
@@ -182,7 +181,6 @@ impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V
 ///
 /// - [`LinearOperation<ArrayType, V>`] for reverse-mode transpose,
 /// - [`DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V>>`] for forward-mode JVP,
-/// - [`VectorizableOperation<ArrayType, V>`] for `vmap`, and
 /// - [`InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
 pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
@@ -191,9 +189,6 @@ pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
 
     /// Optional reverse-mode transpose rule for the primitive.
     transpose_rule: Option<Arc<dyn LinearOperation<T, V>>>,
-
-    /// Optional batching rule for the primitive.
-    vectorization_rule: Option<Arc<dyn VectorizableOperation<T, V>>>,
 
     /// Typed extension registry carrying backend- or transform-specific extra rules.
     extensions: CustomPrimitiveExtensions<T, V>,
@@ -208,7 +203,6 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         Self {
             base: Arc::new(base),
             transpose_rule: None,
-            vectorization_rule: None,
             extensions: CustomPrimitiveExtensions { entries: HashMap::new(), _marker: std::marker::PhantomData },
         }
     }
@@ -230,15 +224,6 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         Rule: DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L> + 'static,
     {
         self.extensions.insert(JvpRule::<T, V, O, L>(Arc::new(rule)));
-        self
-    }
-
-    /// Registers one batching rule.
-    pub fn with_vectorization_rule<Rule>(mut self, rule: Rule) -> Self
-    where
-        Rule: VectorizableOperation<T, V> + 'static,
-    {
-        self.vectorization_rule = Some(Arc::new(rule));
         self
     }
 
@@ -415,15 +400,6 @@ impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for Custom
     }
 }
 
-impl<V: Traceable<ArrayType> + 'static> VectorizableOperation<ArrayType, V> for CustomPrimitive<ArrayType, V> {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        self.vectorization_rule
-            .as_deref()
-            .ok_or_else(|| TracingError::from(self.missing_rule("vectorize")))?
-            .batch(inputs)
-    }
-}
-
 impl<V: Traceable<ArrayType> + 'static, O: Clone + 'static, L: Clone + Operation<ArrayType> + 'static>
     DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for CustomPrimitive<ArrayType, V>
 {
@@ -553,7 +529,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::batching::{Batch, vmap};
     use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
         LinearPrimitiveOperation, PrimitiveOperation, Tracer, engine::ArrayScalarEngine, grad, interpret_and_trace,
@@ -642,15 +617,6 @@ mod tests {
         }
     }
 
-    impl VectorizableOperation<ArrayType, f64> for ShiftOp {
-        fn batch(&self, inputs: &[Batch<f64>]) -> Result<Vec<Batch<f64>>, TracingError> {
-            if inputs.len() != 1 {
-                return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
-            }
-            Ok(vec![Batch::new(inputs[0].lanes().iter().map(|lane| lane + self.amount).collect::<Vec<_>>())])
-        }
-    }
-
     impl<'engine, E> InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>> for ShiftOp
     where
         E: Engine<
@@ -716,17 +682,6 @@ mod tests {
             + 'static,
     {
         apply_custom_traced_unary(input, primitive).expect("custom primitive staging should succeed")
-    }
-
-    /// Applies one unary custom primitive to one batched scalar.
-    fn apply_custom_batched_unary(
-        input: Batch<f64>,
-        primitive: CustomPrimitive<ArrayType, f64>,
-    ) -> Result<Batch<f64>, TracingError> {
-        Ok(VectorizableOperation::batch(&PrimitiveOperation::Custom(Arc::new(primitive)), &[input])?
-            .into_iter()
-            .next()
-            .expect("unary custom primitive should produce one batched output"))
     }
 
     /// Returns one scalar array type used by these custom-primitive tests.
@@ -883,40 +838,6 @@ mod tests {
 
         assert_eq!(output, 6.0);
         assert_eq!(compiled.interpret(4.0f64), Ok(7.0));
-    }
-
-    #[test]
-    fn test_custom_primitive_batch_rule_reports_targeted_error_when_missing() {
-        let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-
-        assert_eq!(
-            apply_custom_batched_unary(Batch::new(vec![1.0f64, 2.0]), primitive),
-            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
-                op: "test_shift",
-                transform: "vectorize",
-            })),
-        );
-    }
-
-    #[test]
-    fn test_custom_primitive_batch_rule_participates_in_vmap() {
-        let primitive =
-            CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_vectorization_rule(ShiftOp::new(2.0));
-        let engine = ArrayScalarEngine::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-
-        assert_eq!(
-            vmap(
-                &engine,
-                builder,
-                {
-                    let primitive = primitive.clone();
-                    move |batch: Batch<f64>| apply_custom_batched_unary(batch, primitive.clone()).unwrap()
-                },
-                vec![1.0f64, 2.0, 3.0],
-            ),
-            Ok(vec![3.0f64, 4.0, 5.0]),
-        );
     }
 
     #[test]

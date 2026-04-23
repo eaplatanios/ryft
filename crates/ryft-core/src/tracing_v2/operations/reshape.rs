@@ -7,7 +7,6 @@ use std::{
 use indoc::indoc;
 
 use crate::{
-    batching::Batch,
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
     tracing::{Traceable, TracingError},
@@ -23,8 +22,8 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
-    add::LinearAddOperation, neg::LinearNegOperation, scale::LinearScaleOperation,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, add::LinearAddOperation,
+    neg::LinearNegOperation, scale::LinearScaleOperation,
 };
 
 /// Hidden staging trait for the reshape primitive.
@@ -293,20 +292,6 @@ where
     }
 }
 
-impl<V: ReshapeValue> ReshapeOps for Batch<V> {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        if self.lanes().iter().all(|lane| lane.r#type().shape == target_shape) {
-            return Ok(self);
-        }
-        Ok(Self::new(
-            self.into_lanes()
-                .into_iter()
-                .map(|lane| lane.reshape(target_shape.clone()))
-                .collect::<Result<Vec<_>, _>>()?,
-        ))
-    }
-}
-
 impl ReshapeOps for f32 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         reshape_abstract(&self.r#type(), &target_shape, "reshape")?;
@@ -470,13 +455,6 @@ impl<
         _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
     ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
-    }
-}
-
-impl<V: ReshapeValue> VectorizableOperation<ArrayType, V> for ReshapeOperation {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }

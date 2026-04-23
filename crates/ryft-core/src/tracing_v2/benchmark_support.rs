@@ -3,7 +3,6 @@ use std::ops::{Add, Mul, Neg};
 #[cfg(feature = "ndarray")]
 use ndarray::{Array2, arr2};
 
-use crate::batching::{Batch, stack, unstack, vmap};
 use crate::tracing::{Program, Traceable};
 #[cfg(feature = "ndarray")]
 use crate::tracing_v2::{
@@ -38,8 +37,6 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
             case_id: "scalar_quartic_plus_sin_hessian_style",
             emit: emit_scalar_quartic_plus_sin_hessian_style,
         },
-        BenchmarkCase { case_id: "scalar_grad_of_vmap", emit: emit_scalar_grad_of_vmap },
-        BenchmarkCase { case_id: "scalar_vmap_of_grad", emit: emit_scalar_vmap_of_grad },
     ];
 
     #[cfg(feature = "ndarray")]
@@ -229,76 +226,6 @@ fn emit_scalar_quartic_plus_sin_hessian_style() -> Result<Vec<IrBenchmarkRecord>
     Ok(vec![tracing_record("scalar_quartic_plus_sin_hessian_style", "hessian_style", &compiled)?])
 }
 
-/// Emits the staged reverse-over-batching scalar benchmark.
-fn emit_scalar_grad_of_vmap() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let engine = ArrayScalarEngine::<f64>::new();
-    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<ArrayType, f64>, f64, f64>) =
-        interpret_and_trace(
-            &engine,
-            |x| {
-                let gradient: Tracer<ArrayScalarEngine<f64>> = grad(
-                    &engine,
-                    |y| {
-                        let builder = y.builder.clone();
-                        let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
-                            &engine,
-                            builder,
-                            |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| batch.clone() * batch.clone() + batch.sin(),
-                            vec![y.clone(), y],
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!("scalar grad-of-vmap IR benchmark should batch identical tracer inputs: {error}")
-                        });
-                        outputs[0].clone() + outputs[1].clone()
-                    },
-                    x,
-                )?;
-                Ok(gradient)
-            },
-            2.0f64,
-        )?;
-    Ok(vec![tracing_record("scalar_grad_of_vmap", "grad", &compiled)?])
-}
-
-/// Emits the staged batching-over-reverse scalar benchmark.
-fn emit_scalar_vmap_of_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let engine = ArrayScalarEngine::<f64>::new();
-    let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<ArrayType, f64>, f64, f64>) =
-        interpret_and_trace(
-            &engine,
-            |x| {
-                let builder = x.builder.clone();
-                let outputs: Vec<Tracer<ArrayScalarEngine<f64>>> = vmap(
-                    &engine,
-                    builder,
-                    |batch: Batch<Tracer<ArrayScalarEngine<f64>>>| {
-                        let lanes = unstack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(batch)
-                            .unwrap_or_else(|error| {
-                                panic!("scalar vmap-of-grad IR benchmark should unstack the batch: {error}")
-                            });
-                        let gradients = lanes
-                            .into_iter()
-                            .map(|lane| {
-                                grad(&ArrayScalarEngine::<f64>::new(), quartic_plus_sin, lane).unwrap_or_else(|error| {
-                                    panic!("scalar vmap-of-grad IR benchmark should trace each lane gradient: {error}")
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        stack::<Tracer<ArrayScalarEngine<f64>>, Tracer<ArrayScalarEngine<f64>>>(gradients)
-                            .unwrap_or_else(|error| {
-                                panic!("scalar vmap-of-grad IR benchmark should restack lane gradients: {error}")
-                            })
-                    },
-                    vec![x.clone(), x],
-                )
-                .unwrap_or_else(|error| panic!("scalar vmap-of-grad IR benchmark should batch the gradients: {error}"));
-                Ok(outputs[0].clone() + outputs[1].clone())
-            },
-            2.0f64,
-        )?;
-    Ok(vec![tracing_record("scalar_vmap_of_grad", "vmap_of_grad", &compiled)?])
-}
-
 /// Returns the fixed matrix inputs used by the matrix benchmark cases.
 #[cfg(feature = "ndarray")]
 fn matrix_inputs() -> (Array2<f64>, Array2<f64>) {
@@ -420,15 +347,6 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     use super::*;
-
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_emit_scalar_grad_of_vmap_keeps_dynamic_cosine() {
-        let records = emit_scalar_grad_of_vmap().unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(records[0].raw_ir.contains("cos"), "grad-of-vmap IR should contain a cosine operation");
-        assert!(!records[0].raw_ir.contains("-0.41614683654714241"), "cosine should not be constant-folded");
-    }
 
     #[cfg(feature = "ndarray")]
     #[test]

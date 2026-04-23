@@ -37,5 +37,5 @@ pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
 pub use operations::{
     Cos, CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation,
-    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin, VectorizableOperation,
+    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin,
 };

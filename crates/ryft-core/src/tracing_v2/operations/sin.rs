@@ -1,6 +1,5 @@
 use std::fmt::{Debug, Display};
 
-use crate::batching::Batch;
 use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
@@ -10,9 +9,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type, TypeError};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, cos::Cos, unary_abstract,
-};
+use super::{DifferentiableOperation, InterpretableOperation, Operation, cos::Cos, unary_abstract};
 
 /// Hidden staging trait for the sine primitive.
 #[doc(hidden)]
@@ -24,7 +21,7 @@ pub trait SinTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 /// Elementwise sine capability.
 ///
 /// This trait is the value-level entry point that lets generic user code write `x.sin()` whether
-/// `x` is a concrete scalar, a traced leaf, a JVP leaf, or a batched leaf.
+/// `x` is a concrete scalar, a traced leaf, or a JVP leaf.
 pub trait Sin: Sized {
     /// Computes the elementwise sine.
     fn sin(self) -> Self;
@@ -47,8 +44,8 @@ impl Sin for f64 {
 /// Elementwise sine primitive.
 ///
 /// [`SinOperation`] is the staged-program representation of the sine primitive. Ordinary traced programs
-/// store this op (or a backend-specific carrier that wraps it), while JVP and batching rules
-/// delegate through its semantic implementation.
+/// store this op (or a backend-specific carrier that wraps it), while JVP rules delegate through
+/// its semantic implementation.
 #[derive(Clone, Default)]
 pub struct SinOperation;
 
@@ -98,13 +95,6 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, O: Clon
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin> VectorizableOperation<ArrayType, V> for SinOperation {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.sin()).collect())])
-    }
-}
-
 impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for JvpTracer<V, T> {
     #[inline]
     fn sin(self) -> Self {
@@ -125,14 +115,5 @@ where
     #[inline]
     fn sin(self) -> Self {
         self.unary(O::sin_op())
-    }
-}
-
-impl<V: Traceable<ArrayType> + Sin> Sin for Batch<V> {
-    #[inline]
-    fn sin(self) -> Self {
-        let outputs = SinOperation.batch(&[self]).expect("sin batching rule should succeed");
-        debug_assert_eq!(outputs.len(), 1, "sin should produce one batched output");
-        outputs.into_iter().next().expect("sin batching should return one output")
     }
 }

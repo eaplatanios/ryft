@@ -4,7 +4,6 @@ use std::{
 };
 
 use crate::{
-    batching::Batch as BatchedValue,
     sharding::{Sharding, ShardingDimension},
     tracing::Traceable,
     tracing_v2::{
@@ -18,8 +17,8 @@ use crate::{
 
 use super::{
     LinearAddOperation, LinearLeftMatMulOperation, LinearMatrixTransposeOperation, LinearNegOperation,
-    LinearRightMatMulOperation, LinearScaleOperation, MatMulOperation, MatMulTracingOperation,
-    MatrixTransposeOperation, MatrixTransposeTracingOperation, Operation, VectorizableOperation,
+    LinearRightMatMulOperation, LinearScaleOperation, MatMulTracingOperation, MatrixTransposeTracingOperation,
+    Operation,
 };
 
 /// Matrix operations required by the tracing prototype.
@@ -195,11 +194,6 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
     matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
 }
 
-fn single_batch_output<V: MatrixValue>(mut outputs: Vec<BatchedValue<V>>, op: &'static str) -> BatchedValue<V> {
-    debug_assert_eq!(outputs.len(), 1, "{op} should produce a single batched output");
-    outputs.pop().expect("single-output matrix primitive should return one batched output")
-}
-
 impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
@@ -239,24 +233,6 @@ where
             return self;
         }
         self.unary(O::matrix_transpose_op())
-    }
-}
-
-impl<V: MatrixValue> MatrixOps for BatchedValue<V> {
-    #[inline]
-    fn matmul(self, rhs: Self) -> Self {
-        single_batch_output(MatMulOperation.batch(&[self, rhs]).expect("batched matmul rule should succeed"), "matmul")
-    }
-
-    #[inline]
-    fn transpose_matrix(self) -> Self {
-        if self.lanes().first().map(|lane| matrix_transpose_is_identity_type(&lane.r#type())).unwrap_or(false) {
-            return self;
-        }
-        single_batch_output(
-            MatrixTransposeOperation.batch(&[self]).expect("batched transpose rule should succeed"),
-            "matrix_transpose",
-        )
     }
 }
 

@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{Atom, AtomId, Instruction, Program, Traceable, TracingError, Value},
+    tracing::{Program, Traceable, TracingError, Value},
     tracing_v2::{
         DifferentiationError, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Tracer,
         engine::Engine,
@@ -36,38 +36,25 @@ pub trait LinearRematerializeCarrierOperation<T: Type + Display, V: Traceable<T>
 
 /// Erased traced body for a rematerialization boundary.
 ///
-/// Like [`crate::batching::FlatTracedVMap`], this stores a flattened traced body that
-/// higher-order op nodes can carry around independently of the caller's original parameter shapes.
+/// This stores a flattened traced body that higher-order op nodes can carry around independently of
+/// the caller's original parameter shapes.
 #[derive(Clone)]
-pub struct FlatTracedRematerialize<T: Type, V: Traceable<T>, O = PrimitiveOperation<ArrayType, V>> {
+pub struct FlatTracedRematerialize<T: Type, V: Traceable<T>, O: Clone = PrimitiveOperation<ArrayType, V>> {
     /// Canonical input types of the body.
     input_types: Vec<T>,
 
     /// Canonical output types of the body.
     output_types: Vec<T>,
 
-    /// Atom table of the body sub-program.
-    atoms: Vec<Atom<T, V>>,
-
-    /// Input atom ids of the body sub-program.
-    input_ids: Vec<AtomId>,
-
-    /// Output atom ids of the body sub-program.
-    output_ids: Vec<AtomId>,
-
-    /// Instructions of the body sub-program.
-    instructions: Vec<Instruction<O>>,
+    /// Flat body sub-program executed by this rematerialization boundary.
+    program: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
     /// Builds one erased traced rematerialize body from explicit staged parts.
     #[inline]
-    pub fn from_parts(input_types: Vec<T>, output_types: Vec<T>, program: Program<T, V, O, Vec<V>, Vec<V>>) -> Self
-    where
-        O: Operation<T>,
-    {
-        let Program { atoms, input_ids, output_ids, instructions, .. } = program;
-        Self { input_types, output_types, atoms, input_ids, output_ids, instructions }
+    pub fn from_parts(input_types: Vec<T>, output_types: Vec<T>, program: Program<T, V, O, Vec<V>, Vec<V>>) -> Self {
+        Self { input_types, output_types, program }
     }
 
     /// Returns the canonical input types of the body.
@@ -82,21 +69,10 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedRematerialize<T, V, O> {
         self.output_types.as_slice()
     }
 
-    /// Returns a cloned body sub-program.
+    /// Returns the flat body sub-program.
     #[inline]
-    pub fn program(&self) -> Program<T, V, O, Vec<V>, Vec<V>>
-    where
-        O: Operation<T>,
-    {
-        Program {
-            atoms: self.atoms.clone(),
-            input_ids: self.input_ids.clone(),
-            output_ids: self.output_ids.clone(),
-            instructions: self.instructions.clone(),
-            input_structure: vec![Placeholder; self.input_types.len()],
-            output_structure: vec![Placeholder; self.output_types.len()],
-            marker: PhantomData,
-        }
+    pub fn program(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+        &self.program
     }
 }
 
@@ -181,13 +157,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        Program::<ArrayType, V, O, Vec<V>, Vec<V>>::interpret_from_parts(
-            self.body.atoms.as_slice(),
-            self.body.input_ids.as_slice(),
-            self.body.output_ids.as_slice(),
-            self.body.instructions.as_slice(),
-            inputs.to_vec(),
-        )
+        self.body.program().interpret(inputs.to_vec())
     }
 }
 
@@ -228,7 +198,7 @@ where
             exemplar_primal_input.engine,
             exemplar_primal_input.builder.clone(),
             linear_builder,
-            &body_program,
+            body_program,
             inputs.to_vec(),
         )?;
         Ok(primal_outputs
@@ -444,13 +414,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        Program::<ArrayType, V, O, Vec<V>, Vec<V>>::interpret_from_parts(
-            self.body.atoms.as_slice(),
-            self.body.input_ids.as_slice(),
-            self.body.output_ids.as_slice(),
-            self.body.instructions.as_slice(),
-            inputs.to_vec(),
-        )
+        self.body.program().interpret(inputs.to_vec())
     }
 }
 
@@ -545,11 +509,11 @@ where
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
-    let pushforward = linearize_program(engine, &body_program, input_primals)?;
+    let pushforward = linearize_program(engine, body_program, input_primals)?;
     let pullback = transpose_linear_program_with_output_examples(engine, &pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOperation::new(
-        FlatTracedRematerialize::from_parts(body.input_types.clone(), body.output_types.clone(), pushforward.clone()),
-        FlatTracedRematerialize::from_parts(body.output_types.clone(), body.input_types.clone(), pullback.clone()),
+        FlatTracedRematerialize::from_parts(body.input_types.clone(), body.output_types.clone(), pushforward),
+        FlatTracedRematerialize::from_parts(body.output_types.clone(), body.input_types.clone(), pullback),
     ))
 }
 
@@ -635,14 +599,15 @@ where
             .map(|id| body_program.atoms[id.index].r#type().into_owned())
             .collect::<Vec<_>>();
         let output_types = exemplar_output_types.parameters().cloned().collect::<Vec<_>>();
+        let Program { atoms, input_ids, output_ids, instructions, .. } = body_program;
         let body = FlatTracedRematerialize::from_parts(
             input_types,
             output_types,
             Program {
-                atoms: body_program.atoms.clone(),
-                input_ids: body_program.input_ids.clone(),
-                output_ids: body_program.output_ids.clone(),
-                instructions: body_program.instructions.clone(),
+                atoms,
+                input_ids,
+                output_ids,
+                instructions,
                 input_structure: vec![Placeholder; input_leaf_count],
                 output_structure: vec![Placeholder; output_leaf_count],
                 marker: std::marker::PhantomData,

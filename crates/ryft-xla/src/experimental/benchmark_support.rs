@@ -1,4 +1,3 @@
-use ryft_core::batching::vmap;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::Program;
@@ -9,7 +8,6 @@ use ryft_core::tracing_v2::{
         record, summarize_program,
     },
     grad,
-    operations::constants::OneLike,
 };
 
 use crate::experimental::operations::{LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation};
@@ -29,7 +27,6 @@ pub fn cases() -> Vec<BenchmarkCase> {
         BenchmarkCase { case_id: "shard_map_grad_inside", emit: emit_shard_map_grad_inside },
         BenchmarkCase { case_id: "grad_around_shard_map", emit: emit_grad_around_shard_map },
         BenchmarkCase { case_id: "nested_shard_map", emit: emit_nested_shard_map },
-        BenchmarkCase { case_id: "shard_map_grad_vmap_composition", emit: emit_shard_map_grad_vmap_composition },
     ]
 }
 
@@ -362,50 +359,6 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     traced_xla_records("nested_shard_map", &traced)
 }
 
-/// Emits the traced `shard_map` benchmark that composes reverse mode and batching inside the body.
-fn emit_shard_map_grad_vmap_composition() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let mesh = benchmark_mesh();
-    let sharding = sharded_1d_sharding(&mesh);
-    let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
-        {
-            let mesh = mesh.clone();
-            move |x: ShardMapTracer| {
-                shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                    |local_x: ShardMapTracer| {
-                        let gradient: ShardMapTracer = grad(
-                            crate::experimental::engine::XlaEngine::token(),
-                            |y: ShardMapTracer| y.sin(),
-                            local_x.clone(),
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!("shard_map grad+vmap IR benchmark should trace the inner gradient: {error}")
-                        });
-                        let builder = gradient.builder.clone();
-                        let lanes: Vec<ShardMapTracer> = vmap(
-                            crate::experimental::engine::XlaEngine::token(),
-                            builder,
-                            |batch: ryft_core::batching::Batch<ShardMapTracer>| batch.clone() + batch.one_like(),
-                            vec![gradient.clone(), gradient],
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!("shard_map grad+vmap IR benchmark should trace the inner batch transform: {error}")
-                        });
-                        lanes[0].clone() + lanes[1].clone()
-                    },
-                    x,
-                    mesh.clone(),
-                    sharding.clone(),
-                    sharding.clone(),
-                )
-                .unwrap_or_else(|error| panic!("shard_map grad+vmap IR benchmark should trace the shard_map: {error}"))
-            }
-        },
-        vector_type(8),
-    )
-    .map_err(|error| BenchmarkError::External(Box::new(error)))?;
-    traced_xla_records("shard_map_grad_vmap_composition", &traced)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,23 +371,5 @@ mod tests {
         assert_eq!(records[0].summary.op_histogram.get("shard_map"), Some(&1));
         assert_eq!(records[0].summary.nested_regions[0].op_histogram.get("cos"), Some(&1));
         assert_eq!(records[0].summary.nested_regions[0].op_histogram.get("mul"), Some(&1));
-    }
-
-    #[test]
-    fn test_emit_shard_map_grad_vmap_composition_uses_the_expected_broadcast_ladder() {
-        let records = emit_shard_map_grad_vmap_composition().unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(
-            records[0]
-                .raw_ir
-                .contains("stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2xf32>")
-        );
-        assert!(
-            records[0]
-                .raw_ir
-                .contains("stablehlo.broadcast_in_dim %7, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>")
-        );
-        assert!(records[0].raw_ir.contains("tensor<1x2xf32>"));
-        assert!(records[0].raw_ir.contains("dims = [0, 1] : (tensor<1x2xf32>) -> tensor<2x2xf32>"));
     }
 }

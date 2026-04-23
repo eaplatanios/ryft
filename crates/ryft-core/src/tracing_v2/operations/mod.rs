@@ -1,11 +1,10 @@
 use std::{fmt::Display, sync::Arc};
 
 use crate::{
-    batching::Batch,
     parameters::Parameterized,
     tracing::{AtomId, InterpretableOperation, Operation, Traceable, TracingError},
     tracing_v2::{engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm},
-    types::{ArrayType, Type, TypeError, Typed},
+    types::{ArrayType, Type, TypeError},
 };
 
 /// Elementwise addition.
@@ -212,20 +211,13 @@ pub trait DifferentiableOperation<T: Type + Display, V: Traceable<T>, Tangent, O
     /// Applies the forward-mode JVP rule.
     ///
     /// The `engine` argument carries the context needed to synthesize zero values for higher-order
-    /// ops that replay staged sub-programs (such as
-    /// [`RematerializeOperation`] and [`crate::batching::VMapOperation`]). Pure
-    /// arithmetic ops ignore it.
+    /// ops that replay staged sub-programs such as [`RematerializeOperation`]. Pure arithmetic ops
+    /// ignore it.
     fn jvp(
         &self,
         engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
         inputs: &[JvpTracer<V, Tangent>],
     ) -> Result<Vec<JvpTracer<V, Tangent>>, TracingError>;
-}
-
-/// Primitive operation with a batching rule used by `vmap`.
-pub trait VectorizableOperation<T: Type, V: Typed<T>>: Operation<T> {
-    /// Applies the primitive's batching rule to batched inputs.
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError>;
 }
 
 /// Default linear-op carrier capability: eager replay on concrete values.
@@ -235,8 +227,7 @@ pub trait VectorizableOperation<T: Type, V: Typed<T>>: Operation<T> {
 /// [`Operation`] and concrete evaluation through [`InterpretableOperation`].
 ///
 /// It is intentionally narrower than the ordinary staged carrier used during tracing: linear
-/// programs only need metadata reasoning plus concrete replay, not forward-mode differentiation or
-/// batching.
+/// programs only need metadata reasoning plus concrete replay, not forward-mode differentiation.
 ///
 /// The linear-program surface consists of shape metadata through [`Operation`], concrete replay
 /// through [`InterpretableOperation`], and a separate transpose rule through [`LinearOperation`].
@@ -374,12 +365,5 @@ impl<
         inputs: &[JvpTracer<V, Tangent>],
     ) -> Result<Vec<JvpTracer<V, Tangent>>, TracingError> {
         (**self).jvp(engine, inputs)
-    }
-}
-
-impl<O: VectorizableOperation<T, V> + ?Sized, T: Type, V: Traceable<T>> VectorizableOperation<T, V> for Arc<O> {
-    #[inline]
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        (**self).batch(inputs)
     }
 }

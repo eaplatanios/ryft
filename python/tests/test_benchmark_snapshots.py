@@ -110,9 +110,6 @@ class JaxBenchmarkSnapshotTest(BenchmarkSnapshotTestBase):
     def test_scalar_bilinear_sin_vjp_pullback(self) -> None:
         self.assert_case_matches_snapshot("scalar_bilinear_sin_vjp_pullback")
 
-    def test_scalar_grad_of_vmap(self) -> None:
-        self.assert_case_matches_snapshot("scalar_grad_of_vmap")
-
     def test_scalar_quartic_plus_sin_grad(self) -> None:
         self.assert_case_matches_snapshot("scalar_quartic_plus_sin_grad")
 
@@ -125,17 +122,11 @@ class JaxBenchmarkSnapshotTest(BenchmarkSnapshotTestBase):
     def test_scalar_quartic_plus_sin_value_and_grad(self) -> None:
         self.assert_case_matches_snapshot("scalar_quartic_plus_sin_value_and_grad")
 
-    def test_scalar_vmap_of_grad(self) -> None:
-        self.assert_case_matches_snapshot("scalar_vmap_of_grad")
-
     def test_shard_map_basic(self) -> None:
         self.assert_case_matches_snapshot("shard_map_basic")
 
     def test_shard_map_grad_inside(self) -> None:
         self.assert_case_matches_snapshot("shard_map_grad_inside")
-
-    def test_shard_map_grad_vmap_composition(self) -> None:
-        self.assert_case_matches_snapshot("shard_map_grad_vmap_composition")
 
     def test_shard_map_matmul(self) -> None:
         self.assert_case_matches_snapshot("shard_map_matmul")
@@ -170,9 +161,6 @@ class RyftBenchmarkSnapshotTest(BenchmarkSnapshotTestBase):
     def test_scalar_bilinear_sin_vjp_pullback(self) -> None:
         self.assert_case_matches_snapshot("scalar_bilinear_sin_vjp_pullback")
 
-    def test_scalar_grad_of_vmap(self) -> None:
-        self.assert_case_matches_snapshot("scalar_grad_of_vmap")
-
     def test_scalar_quartic_plus_sin_grad(self) -> None:
         self.assert_case_matches_snapshot("scalar_quartic_plus_sin_grad")
 
@@ -185,17 +173,11 @@ class RyftBenchmarkSnapshotTest(BenchmarkSnapshotTestBase):
     def test_scalar_quartic_plus_sin_value_and_grad(self) -> None:
         self.assert_case_matches_snapshot("scalar_quartic_plus_sin_value_and_grad")
 
-    def test_scalar_vmap_of_grad(self) -> None:
-        self.assert_case_matches_snapshot("scalar_vmap_of_grad")
-
     def test_shard_map_basic(self) -> None:
         self.assert_case_matches_snapshot("shard_map_basic")
 
     def test_shard_map_grad_inside(self) -> None:
         self.assert_case_matches_snapshot("shard_map_grad_inside")
-
-    def test_shard_map_grad_vmap_composition(self) -> None:
-        self.assert_case_matches_snapshot("shard_map_grad_vmap_composition")
 
     def test_shard_map_matmul(self) -> None:
         self.assert_case_matches_snapshot("shard_map_matmul")

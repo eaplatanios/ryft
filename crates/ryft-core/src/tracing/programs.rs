@@ -16,7 +16,7 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 /// [`Tracer`](crate::tracing_v2::Tracer) must not implement this trait.
 ///
 /// The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket
-/// impls apart. Each composable transform such as `jvp`, `grad`, and `vmap` provides:
+/// impls apart. Each composable transform such as `jvp` and `grad` provides:
 ///
 /// 1. an impl for `V: Value<T>` that evaluates the transform on concrete data, and
 /// 2. an impl for `Tracer<V>` that stages the transform into the enclosing traced program.
@@ -226,8 +226,7 @@ pub struct Instruction<O> {
 /// transforms exchange programs in this form. The generic parameters intentionally stay open so the
 /// same IR can represent ordinary programs plus tangent and cotangent programs over backend-specific
 /// operation carriers.
-pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-{
+pub struct Program<T: Type, V: Typed<T> + Parameter, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// Final atom table of the staged program.
     pub atoms: Vec<Atom<T, V>>,
 
@@ -251,7 +250,7 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O: Operation<T>, Input: Par
 }
 
 impl<
-    O: Clone + Operation<T>,
+    O: Clone,
     T: Type,
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -435,23 +434,32 @@ impl<
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
 {
-    /// Executes a *flat* [`Program`] directly given its structural parts. This helper is shared by
-    /// [`Program::interpret`] and by higher-order program payloads that store flattened body programs without wrapping
-    /// them in full [`Program`] values. It tracks the number of remaining uses for each atom so that replay can move
-    /// values into their final consumer instead of cloning them unconditionally at every edge.
-    pub(crate) fn interpret_from_parts(
-        atoms: &[Atom<T, V>],
-        input_ids: &[AtomId],
-        output_ids: &[AtomId],
-        instructions: &[Instruction<O>],
-        input_values: Vec<V>,
-    ) -> Result<Vec<V>, TracingError> {
-        if input_values.len() != input_ids.len() {
-            return Err(TracingError::InvalidInputCount { expected: input_ids.len(), got: input_values.len() });
+    /// Interprets the staged program on concrete input values.
+    ///
+    /// This is the user-facing replay entry point for staged programs. It checks that the incoming
+    /// structured value matches the program's expected parameter structure, evaluates the flat IR,
+    /// and then rebuilds the structured output.
+    pub fn interpret(&self, input: Input) -> Result<Output, TracingError>
+    where
+        Input::ParameterStructure: Debug + PartialEq,
+        Output::ParameterStructure: Clone,
+    {
+        let input_structure = input.parameter_structure();
+        if input_structure != self.input_structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{:?}", self.input_structure),
+                right_structure: format!("{input_structure:?}"),
+            }
+            .into());
         }
 
-        let mut remaining_uses = vec![0usize; atoms.len()];
-        for instruction in instructions {
+        let input_values = input.into_parameters().collect::<Vec<_>>();
+        if input_values.len() != self.input_ids.len() {
+            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: input_values.len() });
+        }
+
+        let mut remaining_uses = vec![0usize; self.atoms.len()];
+        for instruction in self.instructions.iter() {
             for input in instruction.inputs.iter().copied() {
                 let Some(use_count) = remaining_uses.get_mut(input.index) else {
                     return Err(TracingError::UnboundAtomId { id: input });
@@ -459,22 +467,22 @@ impl<
                 *use_count += 1;
             }
         }
-        for output in output_ids.iter().copied() {
+        for output in self.output_ids.iter().copied() {
             let Some(use_count) = remaining_uses.get_mut(output.index) else {
                 return Err(TracingError::UnboundAtomId { id: output });
             };
             *use_count += 1;
         }
 
-        let mut values = vec![None; atoms.len()];
-        for (atom, value) in input_ids.iter().copied().zip(input_values) {
+        let mut values = vec![None; self.atoms.len()];
+        for (atom, value) in self.input_ids.iter().copied().zip(input_values) {
             let Some(slot) = values.get_mut(atom.index) else {
                 return Err(TracingError::UnboundAtomId { id: atom });
             };
             *slot = Some(value);
         }
 
-        for (atom_index, atom) in atoms.iter().enumerate() {
+        for (atom_index, atom) in self.atoms.iter().enumerate() {
             if remaining_uses[atom_index] == 0 {
                 continue;
             }
@@ -483,9 +491,9 @@ impl<
             }
         }
 
-        let max_input_count = instructions.iter().map(|instruction| instruction.inputs.len()).max().unwrap_or(0);
+        let max_input_count = self.instructions.iter().map(|instruction| instruction.inputs.len()).max().unwrap_or(0);
         let mut instruction_inputs = Vec::with_capacity(max_input_count);
-        for instruction in instructions {
+        for instruction in self.instructions.iter() {
             instruction_inputs.clear();
             for input in instruction.inputs.iter().copied() {
                 let Some(use_count) = remaining_uses.get_mut(input.index) else {
@@ -527,8 +535,8 @@ impl<
             }
         }
 
-        let mut outputs = Vec::with_capacity(output_ids.len());
-        for output in output_ids.iter().copied() {
+        let mut outputs = Vec::with_capacity(self.output_ids.len());
+        for output in self.output_ids.iter().copied() {
             let Some(use_count) = remaining_uses.get_mut(output.index) else {
                 return Err(TracingError::UnboundAtomId { id: output });
             };
@@ -549,35 +557,7 @@ impl<
             };
             outputs.push(value);
         }
-        Ok(outputs)
-    }
 
-    /// Interprets the staged program on concrete input values.
-    ///
-    /// This is the user-facing replay entry point for staged programs. It checks that the incoming
-    /// structured value matches the program's expected parameter structure, evaluates the flat IR,
-    /// and then rebuilds the structured output.
-    pub fn interpret(&self, input: Input) -> Result<Output, TracingError>
-    where
-        Input::ParameterStructure: Debug + PartialEq,
-        Output::ParameterStructure: Clone,
-    {
-        let input_structure = input.parameter_structure();
-        if input_structure != self.input_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", self.input_structure),
-                right_structure: format!("{input_structure:?}"),
-            }
-            .into());
-        }
-
-        let outputs = Self::interpret_from_parts(
-            self.atoms.as_slice(),
-            self.input_ids.as_slice(),
-            self.output_ids.as_slice(),
-            self.instructions.as_slice(),
-            input.into_parameters().collect::<Vec<_>>(),
-        )?;
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 
@@ -712,7 +692,7 @@ impl<
 /// stop recording new instructions even though the surrounding closure cannot immediately return
 /// `Result`.
 #[derive(Clone, Debug)]
-pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Operation<T>> {
+pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Clone + Operation<T>> {
     /// Atom table accumulated so far, including inputs, constants, and derived outputs.
     pub atoms: Vec<Atom<T, V>>,
 
@@ -726,7 +706,7 @@ pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Operation<T>> {
     pub error: Option<TracingError>,
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> {
     /// Creates an empty builder.
     ///
     /// Fresh builders contain no atoms or instructions and are typically owned by one tracing
@@ -822,7 +802,7 @@ impl<T: Type, V: Traceable<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     }
 }
 
-impl<T: Type, V: Traceable<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuilder<T, V, O> {
     fn default() -> Self {
         Self::new()
     }

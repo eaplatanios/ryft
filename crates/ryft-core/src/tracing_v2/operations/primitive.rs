@@ -5,9 +5,6 @@ use std::{
 };
 
 use crate::{
-    batching::{
-        Batch, BatchingError, LinearVMapCarrierOperation, LinearVMapOperation, VMapOperation, VMapTracingOperation,
-    },
     parameters::{Parameter, Parameterized},
     tracing::{AtomId, Traceable, TracingError, Value},
     tracing_v2::{
@@ -28,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation,
     add::{AddTracingOperation, LinearAddOperation},
     cos::CosTracingOperation,
     custom::{CustomPrimitive, CustomTracingOperation, LinearCustomOperation, LinearCustomPrimitive},
@@ -85,9 +82,6 @@ pub enum PrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Reshape between two statically known shapes.
     Reshape { input_type: T, output_type: T },
 
-    /// Higher-order `vmap` carrying a compiled per-lane body and optional transpose body.
-    VMap(Box<VMapOperation<T, V, PrimitiveOperation<T, V>, LinearPrimitiveOperation<T, V>>>),
-
     /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
     Rematerialize(
         Box<
@@ -108,7 +102,7 @@ pub enum PrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
 ///
 /// [`LinearPrimitiveOperation`] is the linear-program sibling of [`PrimitiveOperation`]. It contains only the
 /// operations that make sense in tangent and cotangent programs plus the linearized higher-order
-/// ops needed by `vmap` and rematerialization.
+/// ops needed by rematerialization.
 #[derive(Clone)]
 pub enum LinearPrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
     /// Elementwise addition.
@@ -131,9 +125,6 @@ pub enum LinearPrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter
 
     /// Reshape between two statically known shapes.
     Reshape { input_type: T, output_type: T },
-
-    /// Higher-order `vmap` restricted to linear bodies and linear transpose bodies.
-    VMap(Box<LinearVMapOperation<T, V, LinearPrimitiveOperation<T, V>>>),
 
     /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
     Rematerialize(
@@ -233,15 +224,6 @@ impl<T: Type + Display, V: Traceable<T>> ReshapeTracingOperation<T, V> for Primi
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> VMapTracingOperation<T, V, LinearPrimitiveOperation<T, V>>
-    for PrimitiveOperation<T, V>
-{
-    #[inline]
-    fn vmap_op(op: VMapOperation<T, V, Self, LinearPrimitiveOperation<T, V>>) -> Self {
-        PrimitiveOperation::VMap(Box::new(op))
-    }
-}
-
 impl<T: Type + Display, V: Traceable<T>> RematerializeTracingOperation<T, V, LinearPrimitiveOperation<T, V>>
     for PrimitiveOperation<T, V>
 {
@@ -309,13 +291,6 @@ impl<T: Type + Display, V: Traceable<T>> LinearReshapeOperation<T, V> for Linear
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearVMapCarrierOperation<T, V> for LinearPrimitiveOperation<T, V> {
-    #[inline]
-    fn linear_vmap_op(op: LinearVMapOperation<T, V, Self>) -> Self {
-        LinearPrimitiveOperation::VMap(Box::new(op))
-    }
-}
-
 impl<T: Type + Display, V: Traceable<T>> LinearRematerializeCarrierOperation<T, V> for LinearPrimitiveOperation<T, V> {
     #[inline]
     fn linear_rematerialize_op(op: crate::tracing_v2::operations::LinearRematerializeOperation<T, V, Self>) -> Self {
@@ -353,7 +328,6 @@ impl<T: Type + Display, V: Traceable<T>> Debug for PrimitiveOperation<T, V> {
             Self::Reshape { input_type, output_type } => {
                 write!(formatter, "Reshape({input_type} -> {output_type})")
             }
-            Self::VMap(vmap) => Debug::fmt(vmap, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
         }
@@ -381,7 +355,6 @@ impl<T: Type + Display, V: Traceable<T>> Debug for LinearPrimitiveOperation<T, V
             Self::Reshape { input_type, output_type } => {
                 write!(formatter, "Reshape({input_type} -> {output_type})")
             }
-            Self::VMap(vmap) => Debug::fmt(vmap, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
         }
@@ -412,7 +385,6 @@ impl<V: Traceable<ArrayType>> Operation for PrimitiveOperation<ArrayType, V> {
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
-            Self::VMap(vmap) => vmap.name(),
             Self::Rematerialize(remat) => remat.name(),
             Self::Custom(op) => op.name(),
         }
@@ -434,7 +406,6 @@ impl<V: Traceable<ArrayType>> Operation for PrimitiveOperation<ArrayType, V> {
                 &ReshapeOperation::new(input_type.clone(), output_type.clone()),
                 input_types,
             ),
-            Self::VMap(vmap) => vmap.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
@@ -486,7 +457,6 @@ impl<V: Traceable<ArrayType>> Operation for LinearPrimitiveOperation<ArrayType, 
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
-            Self::VMap(vmap) => vmap.name(),
             Self::Rematerialize(remat) => remat.name(),
             Self::Custom(op) => op.name(),
         }
@@ -504,7 +474,6 @@ impl<V: Traceable<ArrayType>> Operation for LinearPrimitiveOperation<ArrayType, 
                 &ReshapeOperation::new(input_type.clone(), output_type.clone()),
                 input_types,
             ),
-            Self::VMap(vmap) => vmap.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
@@ -581,7 +550,6 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
         }
@@ -611,7 +579,6 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
         }
@@ -645,7 +612,6 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).transpose(output_cotangents)
             }
-            Self::VMap(vmap) => vmap.transpose(output_cotangents),
             Self::Rematerialize(remat) => remat.transpose(output_cotangents),
             Self::Custom(op) => op.transpose(output_cotangents),
         }
@@ -656,10 +622,10 @@ where
 ///
 /// For pure (non-capturing) ops, this is covered by their generic [`InterpretableOperation<V>`] implementations
 /// because [`JvpTracer`] already implements all necessary arithmetic, matrix, and reshape traits.
-/// Capturing ops ([`ScaleOperation`], [`LeftMatMulOperation`], [`RightMatMulOperation`]) and higher-order ops
-/// ([`VMapOperation`](crate::batching::VMapOperation),
-/// [`RematerializeOperation`](crate::tracing_v2::operations::RematerializeOperation)) provide dedicated
-/// [`InterpretableOperation`] implementations that lift captured constants into the JIT trace.
+/// Capturing ops ([`ScaleOperation`], [`LeftMatMulOperation`], [`RightMatMulOperation`]) and
+/// [`RematerializeOperation`](crate::tracing_v2::operations::RematerializeOperation) provide
+/// dedicated [`InterpretableOperation`] implementations that lift captured constants into the JIT
+/// trace.
 ///
 /// [`Linearized<Tracer<V>>`]: crate::tracing_v2::linear::Linearized
 /// [`ScaleOperation`]: crate::tracing_v2::operations::ScaleOperation
@@ -710,7 +676,6 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Custom(op) => op.interpret_linearized_jit(inputs),
         }
@@ -834,13 +799,6 @@ where
                     LinearPrimitiveOperation<ArrayType, V>,
                 >::jvp(&ReshapeOperation::new(input_type.clone(), output_type.clone()), engine, inputs)
             }
-            Self::VMap(vmap) => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(vmap.as_ref(), engine, inputs),
             Self::Rematerialize(remat) => DifferentiableOperation::<
                 ArrayType,
                 V,
@@ -853,145 +811,7 @@ where
     }
 }
 
-fn batch_higher_order_operation<O, V>(operation: &O, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError>
-where
-    O: InterpretableOperation<ArrayType, V>,
-    V: Traceable<ArrayType>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-{
-    let Some(first_input) = inputs.first() else {
-        return Err(BatchingError::EmptyBatch.into());
-    };
-    crate::check_batch_sizes!(inputs);
-    if first_input.is_empty() {
-        return Err(BatchingError::EmptyBatch.into());
-    }
-
-    let lane_count = first_input.len();
-    let mut batched_outputs = Vec::<Vec<V>>::new();
-    for lane_index in 0..lane_count {
-        let lane_inputs = inputs.iter().map(|input| input.lanes()[lane_index].clone()).collect::<Vec<_>>();
-        let lane_outputs = operation.interpret(lane_inputs.as_slice())?;
-        if batched_outputs.is_empty() {
-            batched_outputs = lane_outputs.into_iter().map(|output| vec![output]).collect::<Vec<_>>();
-            continue;
-        }
-        if lane_outputs.len() != batched_outputs.len() {
-            return Err(TracingError::InvalidOutputCount { expected: batched_outputs.len(), got: lane_outputs.len() });
-        }
-        for (batched_output, lane_output) in batched_outputs.iter_mut().zip(lane_outputs) {
-            batched_output.push(lane_output);
-        }
-    }
-
-    Ok(batched_outputs.into_iter().map(Batch::new).collect())
-}
-
-impl<
-    V: Value<ArrayType>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-        + 'static,
-> VectorizableOperation<ArrayType, V> for PrimitiveOperation<ArrayType, V>
-where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-{
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        match self {
-            Self::Add => AddOperation.batch(inputs),
-            Self::Mul => MulOperation.batch(inputs),
-            Self::Neg => NegOperation.batch(inputs),
-            Self::Sin => SinOperation.batch(inputs),
-            Self::Cos => CosOperation.batch(inputs),
-            Self::MatMul => MatMulOperation.batch(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.batch(inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).batch(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).batch(inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).batch(inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).batch(inputs)
-            }
-            Self::VMap(vmap) => batch_higher_order_operation(vmap.as_ref(), inputs),
-            Self::Rematerialize(remat) => batch_higher_order_operation(remat.as_ref(), inputs),
-            Self::Custom(op) => op.batch(inputs),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
-
-    use crate::{
-        batching::FlatTracedVMap,
-        parameters::Placeholder,
-        tracing::{Program, ProgramBuilder},
-        tracing_v2::operations::{FlatTracedRematerialize, RematerializeOperation},
-        types::{ArrayType, DataType},
-    };
-
-    use super::*;
-
-    fn scalar_type() -> ArrayType {
-        ArrayType::scalar(DataType::F64)
-    }
-
-    fn make_double_program() -> Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, Vec<f64>, Vec<f64>> {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
-        let input = builder.add_input(scalar_type());
-        let outputs = builder.add_instruction(PrimitiveOperation::Add, vec![input, input]).unwrap();
-        builder.build::<Vec<f64>, Vec<f64>>(outputs, vec![Placeholder], vec![Placeholder])
-    }
-
-    #[test]
-    fn test_batch_delegates_to_supported_first_order_primitive_rules() {
-        assert_eq!(
-            PrimitiveOperation::Scale { factor: 3.0f64 }.batch(&[Batch::new(vec![1.0f64, 2.0])]),
-            Ok(vec![Batch::new(vec![3.0f64, 6.0])]),
-        );
-        assert_eq!(
-            PrimitiveOperation::LeftMatMul { factor: 3.0f64 }.batch(&[Batch::new(vec![1.0f64, 2.0])]),
-            Ok(vec![Batch::new(vec![3.0f64, 6.0])]),
-        );
-        assert_eq!(
-            PrimitiveOperation::RightMatMul { factor: 3.0f64 }.batch(&[Batch::new(vec![1.0f64, 2.0])]),
-            Ok(vec![Batch::new(vec![3.0f64, 6.0])]),
-        );
-        assert_eq!(
-            PrimitiveOperation::Reshape { input_type: scalar_type(), output_type: scalar_type() }
-                .batch(&[Batch::new(vec![1.0f64, 2.0])]),
-            Ok(vec![Batch::new(vec![1.0f64, 2.0])]),
-        );
-    }
-
-    #[test]
-    fn test_batch_supports_staged_vmap_primitive() {
-        let operation = PrimitiveOperation::VMap(Box::new(VMapOperation::new(FlatTracedVMap::from_parts(
-            2,
-            vec![scalar_type()],
-            vec![scalar_type()],
-            make_double_program(),
-        ))));
-
-        assert_eq!(
-            operation.batch(&[Batch::new(vec![1.0f64, 10.0]), Batch::new(vec![2.0f64, 20.0])]),
-            Ok(vec![Batch::new(vec![2.0f64, 20.0]), Batch::new(vec![4.0f64, 40.0])]),
-        );
-    }
-
-    #[test]
-    fn test_batch_supports_staged_rematerialize_primitive() {
-        let operation = PrimitiveOperation::Rematerialize(Box::new(RematerializeOperation::new(
-            FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![scalar_type()], make_double_program()),
-        )));
-
-        assert_eq!(operation.batch(&[Batch::new(vec![1.0f64, 10.0])]), Ok(vec![Batch::new(vec![2.0f64, 20.0])]),);
-    }
+    // Primitive-operation behavior is exercised through the per-operation modules and transform tests.
 }

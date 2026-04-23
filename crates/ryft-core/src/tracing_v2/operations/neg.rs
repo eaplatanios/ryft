@@ -3,7 +3,6 @@ use std::{
     ops::Neg,
 };
 
-use crate::batching::Batch;
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
@@ -14,9 +13,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type, TypeError};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation, unary_abstract,
-};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, unary_abstract};
 
 /// Hidden staging trait for the negation primitive.
 #[doc(hidden)]
@@ -97,12 +94,5 @@ impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>, O
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: T::neg(inputs[0].tangent.clone()) }])
-    }
-}
-
-impl<V: Traceable<ArrayType> + Neg<Output = V>> VectorizableOperation<ArrayType, V> for NegOperation {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| -lane).collect())])
     }
 }

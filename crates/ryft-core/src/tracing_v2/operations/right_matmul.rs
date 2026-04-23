@@ -1,6 +1,5 @@
 use std::fmt::{Debug, Display};
 
-use crate::batching::Batch as BatchedValue;
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::{
@@ -13,7 +12,7 @@ use crate::tracing_v2::{
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation,
     add::LinearAddOperation,
     left_matmul::LinearLeftMatMulOperation,
     lift_jit_constant,
@@ -190,14 +189,5 @@ impl<
             tangent: TangentSpace::zero_like(&self.factor, &inputs[0].tangent),
         };
         Ok(vec![inputs[0].clone().matmul(factor)])
-    }
-}
-
-impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for RightMatMulOperation<V> {
-    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![BatchedValue::new(
-            inputs[0].lanes().iter().cloned().map(|lane| lane.matmul(self.factor.clone())).collect(),
-        )])
     }
 }

@@ -3,7 +3,6 @@ use std::{
     ops::Neg,
 };
 
-use crate::batching::Batch;
 use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
@@ -13,9 +12,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, Type, TypeError};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation, sin::Sin, unary_abstract,
-};
+use super::{DifferentiableOperation, InterpretableOperation, Operation, sin::Sin, unary_abstract};
 
 /// Hidden staging trait for the cosine primitive.
 #[doc(hidden)]
@@ -100,13 +97,6 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
     }
 }
 
-impl<V: Traceable<ArrayType> + Cos> VectorizableOperation<ArrayType, V> for CosOperation {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![Batch::new(inputs[0].lanes().iter().cloned().map(|lane| lane.cos()).collect())])
-    }
-}
-
 impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<ArrayType, V>> Cos for JvpTracer<V, T> {
     #[inline]
     fn cos(self) -> Self {
@@ -127,14 +117,5 @@ where
     #[inline]
     fn cos(self) -> Self {
         self.unary(O::cos_op())
-    }
-}
-
-impl<V: Traceable<ArrayType> + Cos> Cos for Batch<V> {
-    #[inline]
-    fn cos(self) -> Self {
-        let outputs = CosOperation.batch(&[self]).expect("cos batching rule should succeed");
-        debug_assert_eq!(outputs.len(), 1, "cos should produce one batched output");
-        outputs.into_iter().next().expect("cos batching should return one output")
     }
 }

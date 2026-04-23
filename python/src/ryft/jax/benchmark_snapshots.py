@@ -39,7 +39,6 @@ BENCHMARK_SNAPSHOT_CASES = (
     BenchmarkSnapshotCase("scalar_bilinear_sin_jit", "scalar", "jit"),
     BenchmarkSnapshotCase("scalar_bilinear_sin_jvp", "scalar", "jvp_pushforward"),
     BenchmarkSnapshotCase("scalar_bilinear_sin_vjp_pullback", "scalar", "vjp_pullback"),
-    BenchmarkSnapshotCase("scalar_grad_of_vmap", "scalar", "grad"),
     BenchmarkSnapshotCase("scalar_quartic_plus_sin_grad", "scalar", "grad"),
     BenchmarkSnapshotCase("scalar_quartic_plus_sin_hessian_style", "scalar", "hessian_style"),
     BenchmarkSnapshotCase(
@@ -48,10 +47,8 @@ BENCHMARK_SNAPSHOT_CASES = (
         "linearize_pushforward",
     ),
     BenchmarkSnapshotCase("scalar_quartic_plus_sin_value_and_grad", "scalar", "value_and_grad"),
-    BenchmarkSnapshotCase("scalar_vmap_of_grad", "scalar", "vmap_of_grad"),
     BenchmarkSnapshotCase("shard_map_basic", "xla", "program"),
     BenchmarkSnapshotCase("shard_map_grad_inside", "xla", "program"),
-    BenchmarkSnapshotCase("shard_map_grad_vmap_composition", "xla", "program"),
     BenchmarkSnapshotCase("shard_map_matmul", "xla", "program"),
 )
 

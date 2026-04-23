@@ -200,20 +200,6 @@ def build_scalar_case_emitters(
             scalar_two,
         )
 
-    def emit_scalar_grad_of_vmap() -> list[dict[str, Any]]:
-        def mapped_sum(y: Any) -> Any:
-            outputs = jax.vmap(square_plus_sin)(jnp.stack([y, y]))
-            return outputs[0] + outputs[1]
-
-        return emit("scalar_grad_of_vmap", "grad", jax.grad(mapped_sum), scalar_two)
-
-    def emit_scalar_vmap_of_grad() -> list[dict[str, Any]]:
-        def vmap_of_grad(x: Any) -> Any:
-            gradients = jax.vmap(jax.grad(quartic_plus_sin))(jnp.stack([x, x]))
-            return gradients[0] + gradients[1]
-
-        return emit("scalar_vmap_of_grad", "vmap_of_grad", vmap_of_grad, scalar_two)
-
     return {
         "scalar_bilinear_sin_jit": emit_scalar_bilinear_sin_jit,
         "scalar_bilinear_sin_jvp": emit_scalar_bilinear_sin_jvp,
@@ -222,8 +208,6 @@ def build_scalar_case_emitters(
         "scalar_quartic_plus_sin_value_and_grad": emit_scalar_quartic_plus_sin_value_and_grad,
         "scalar_quartic_plus_sin_linearize_pushforward": emit_scalar_quartic_plus_sin_linearize_pushforward,
         "scalar_quartic_plus_sin_hessian_style": emit_scalar_quartic_plus_sin_hessian_style,
-        "scalar_grad_of_vmap": emit_scalar_grad_of_vmap,
-        "scalar_vmap_of_grad": emit_scalar_vmap_of_grad,
     }
 
 
@@ -386,29 +370,12 @@ def build_shard_map_case_emitters(
         )
         return emit("nested_shard_map", outer, vector_input)
 
-    def emit_shard_map_grad_vmap_composition() -> list[dict[str, Any]]:
-        def body(x: Any) -> Any:
-            gradient = jax.grad(lambda y: jnp.sin(y).sum())(x)
-            lanes = jax.vmap(lambda y: y + jnp.ones_like(y))(
-                jnp.stack([gradient, gradient])
-            )
-            return lanes[0] + lanes[1]
-
-        sharded = shard_map_fn(
-            body,
-            mesh=mesh,
-            in_specs=partition_spec_type("x"),
-            out_specs=partition_spec_type("x"),
-        )
-        return emit("shard_map_grad_vmap_composition", sharded, vector_input)
-
     return {
         "shard_map_basic": emit_shard_map_basic,
         "shard_map_matmul": emit_shard_map_matmul,
         "shard_map_grad_inside": emit_shard_map_grad_inside,
         "grad_around_shard_map": emit_grad_around_shard_map,
         "nested_shard_map": emit_nested_shard_map,
-        "shard_map_grad_vmap_composition": emit_shard_map_grad_vmap_composition,
     }
 
 

@@ -1576,26 +1576,8 @@ fn replay_traced_xla_program<
                     XlaPrimitiveOperation::Reshape { output_type, .. } => {
                         vec![input_values[0].clone().reshape(output_type.shape.clone())?]
                     }
-                    XlaPrimitiveOperation::VMap(vmap) => {
-                        if input_values.len() != vmap.body().total_input_count() {
-                            return Err(ShardMapTraceError::TracingError(TracingError::InvalidInputCount {
-                                expected: vmap.body().total_input_count(),
-                                got: input_values.len(),
-                            }));
-                        }
-                        let lane_input_count = vmap.body().input_types().len();
-                        let mut outputs = Vec::with_capacity(vmap.body().total_output_count());
-                        for lane_inputs in input_values.chunks(lane_input_count) {
-                            outputs.extend(replay_traced_xla_program(
-                                replay_context,
-                                &vmap.body().program(),
-                                lane_inputs.to_vec(),
-                            )?);
-                        }
-                        outputs
-                    }
                     XlaPrimitiveOperation::Rematerialize(remat) => {
-                        replay_traced_xla_program(replay_context, &remat.body().program(), input_values)?
+                        replay_traced_xla_program(replay_context, remat.body().program(), input_values)?
                     }
                 };
                 for (output_atom, output_value) in instruction.outputs.iter().copied().zip(outputs) {
@@ -1801,15 +1783,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             pushforward_local_input_types,
             body.global_output_types.clone(),
             body.local_output_types.clone(),
-            Program {
-                atoms: pushforward_compiled.atoms.clone(),
-                input_ids: pushforward_compiled.input_ids.clone(),
-                output_ids: pushforward_compiled.output_ids.clone(),
-                instructions: pushforward_compiled.instructions.clone(),
-                input_structure: vec![ryft_core::parameters::Placeholder; local_input_count * 2],
-                output_structure: vec![ryft_core::parameters::Placeholder; local_output_count],
-                marker: std::marker::PhantomData,
-            },
+            pushforward_compiled,
         ),
         pullback: FlatTracedShardMap::from_parts(
             pullback_shard_map,
@@ -1817,15 +1791,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             pullback_local_input_types,
             body.global_input_types.clone(),
             body.local_input_types.clone(),
-            Program {
-                atoms: pullback_compiled.atoms.clone(),
-                input_ids: pullback_compiled.input_ids.clone(),
-                output_ids: pullback_compiled.output_ids.clone(),
-                instructions: pullback_compiled.instructions.clone(),
-                input_structure: vec![ryft_core::parameters::Placeholder; local_input_count + local_output_count],
-                output_structure: vec![ryft_core::parameters::Placeholder; local_input_count],
-                marker: std::marker::PhantomData,
-            },
+            pullback_compiled,
         ),
     })
 }

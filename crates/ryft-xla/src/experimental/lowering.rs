@@ -8,7 +8,6 @@ use ryft_mlir::{
     Operation as MlirOperation, Region, Size as MlirSize, Type, TypeAndAttributes, TypeRef, Value, ValueRef,
 };
 
-use ryft_core::batching::{FlatTracedVMap, LinearVMapOperation, VMapOperation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::sharding::{LogicalMesh, ShardingError};
 use ryft_core::tracing::{Atom, AtomId, Operation, Program, Traceable};
@@ -20,7 +19,7 @@ use ryft_core::tracing_v2::{
         RightMatMulOperation, ScaleOperation, SinOperation,
     },
 };
-use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
+use ryft_core::types::{ArrayType, DataType, Size, Typed};
 
 use crate::experimental::operations::{
     LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation, WithShardingConstraintOperation,
@@ -91,9 +90,6 @@ pub(crate) enum LoweringError {
 pub(crate) enum PlainMlirLoweringMode {
     /// Lower the program exactly as traced.
     Unpacked,
-
-    /// Lower one packed `vmap` body program with the provided lane count.
-    Packed { lane_count: usize },
 }
 
 /// Lowering helper passed to op-owned plain StableHLO lowering hooks.
@@ -125,24 +121,6 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         lower_literal_value(value, &mut self.block, self.context, self.location)
     }
 
-    /// Lowers one packed literal value inside this lowering context.
-    pub(crate) fn lower_packed_literal_value<V: MlirLowerableValue>(
-        &mut self,
-        value: &V,
-        packed_output_type: &ArrayType,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-        lower_packed_literal_value(value, packed_output_type, &mut self.block, self.context, self.location)
-    }
-
-    /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
-        &mut self,
-        body: &FlatTracedVMap<ArrayType, V, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_vmap_results(body, VMapLoweringMode::Forward, input_values, &mut self.block, self.context, self.location)
-    }
-
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
     pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone>(
@@ -151,7 +129,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
-            &remat_op.body().program(),
+            remat_op.body().program(),
             input_values,
             &mut self.block,
             self.context,
@@ -329,7 +307,7 @@ impl<V: MlirLowerableValue> XlaOperation<V> for ScaleOperation<ArrayType, V> {
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
+        _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let factor = self.factor();
@@ -337,20 +315,13 @@ impl<V: MlirLowerableValue> XlaOperation<V> for ScaleOperation<ArrayType, V> {
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let factor_type = factor.r#type();
         let factor_broadcast = if *factor_type != output_types[0] {
-            match mode {
-                PlainMlirLoweringMode::Packed { lane_count } => {
-                    lowerer.lower_packed_literal_value(factor, &packed_array_type(&factor_type, lane_count))?
-                }
-                PlainMlirLoweringMode::Unpacked => {
-                    let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
-                        factor_value,
-                        output_tensor_type,
-                        &[],
-                        lowerer.location,
-                    ));
-                    broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
-                }
-            }
+            let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
+                factor_value,
+                output_tensor_type,
+                &[],
+                lowerer.location,
+            ));
+            broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
         } else {
             factor_value
         };
@@ -367,17 +338,11 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOperation<V> f
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
+        _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let factor = self.factor();
-        let factor_value = match mode {
-            PlainMlirLoweringMode::Packed { lane_count } => {
-                let packed_type = packed_array_type(&factor.r#type(), lane_count);
-                lowerer.lower_packed_literal_value(factor, &packed_type)?
-            }
-            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
-        };
+        let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
@@ -398,17 +363,11 @@ impl<V: MlirLowerableValue + ryft_core::tracing_v2::MatrixOps> XlaOperation<V> f
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
+        _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let factor = self.factor();
-        let factor_value = match mode {
-            PlainMlirLoweringMode::Packed { lane_count } => {
-                let packed_type = packed_array_type(&factor.r#type(), lane_count);
-                lowerer.lower_packed_literal_value(factor, &packed_type)?
-            }
-            PlainMlirLoweringMode::Unpacked => lowerer.lower_literal_value(factor)?,
-        };
+        let factor_value = lowerer.lower_literal_value(factor)?;
         let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(&[], &[], &[1], &[0]);
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
@@ -439,20 +398,6 @@ impl<V: MlirLowerableValue> XlaOperation<V> for ReshapeOperation {
             lowerer.location,
         ));
         Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
-    }
-}
-
-impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone> XlaOperation<V>
-    for VMapOperation<ArrayType, V, O, L>
-{
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lowerer.lower_vmap(self.body(), input_values)
     }
 }
 
@@ -550,7 +495,6 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
                     lowerer,
                 )
             }
-            Self::VMap(vmap) => lowerer.lower_vmap(vmap.body(), input_values),
             Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
             Self::ShardMap(shard_map_op) => {
                 let simplified_body = shard_map_op
@@ -597,25 +541,6 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
     }
 }
 
-impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V> for LinearVMapOperation<ArrayType, V, O> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_vmap_results(
-            self.body(),
-            VMapLoweringMode::Transpose,
-            input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )
-    }
-}
-
 impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V>
     for LinearRematerializeOperation<ArrayType, V, O>
 {
@@ -627,7 +552,7 @@ impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V>
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
-            &self.body().program(),
+            self.body().program(),
             input_values,
             &mut lowerer.block,
             lowerer.context,
@@ -724,13 +649,6 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<A
                     lowerer,
                 )
             }
-            PrimitiveOperation::VMap(vmap) => <VMapOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
-                vmap,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
             PrimitiveOperation::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
             PrimitiveOperation::Custom(_) => {
                 Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() })
@@ -805,15 +723,6 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
                     lowerer,
                 )
             }
-            LinearPrimitiveOperation::VMap(vmap) => {
-                <LinearVMapOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
-                    vmap,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             LinearPrimitiveOperation::Rematerialize(remat) => {
                 <LinearRematerializeOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
                     remat,
@@ -851,15 +760,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         lower_tensor_type(array_type, self.context, self.location)
     }
 
-    /// Lowers one nested `vmap` op inside this lowering context.
-    pub(crate) fn lower_vmap<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
-        &mut self,
-        body: &FlatTracedVMap<ArrayType, V, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_vmap_results(body, VMapLoweringMode::Forward, input_values, &mut self.block, self.context, self.location)
-    }
-
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
     /// block.
     pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone>(
@@ -868,7 +768,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         lower_rematerialize_inline(
-            &remat_op.body().program(),
+            remat_op.body().program(),
             input_values,
             &mut self.block,
             self.context,
@@ -1350,16 +1250,6 @@ fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Resul
     LogicalMesh::new(merged_axes).map_err(LoweringError::from)
 }
 
-/// Controls how traced `vmap` bodies are packed and unpacked during MLIR lowering.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum VMapLoweringMode {
-    /// Lower ordinary staged `vmap` by packing lanes with broadcast-plus-concatenate and unpacking with reshape.
-    Forward,
-
-    /// Lower transposed linear `vmap` using the transpose-friendly pad-and-reduce structure JAX emits.
-    Transpose,
-}
-
 /// Returns the static dimensions for one tensor type.
 fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError> {
     array_type
@@ -1371,492 +1261,6 @@ fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError
             Size::Dynamic(_) => Err(LoweringError::InvalidTensorType { array_type: array_type.clone() }),
         })
         .collect()
-}
-
-/// Returns the tensor type obtained by prepending one leading batch dimension.
-fn packed_array_type(array_type: &ArrayType, lane_count: usize) -> ArrayType {
-    let mut dimensions = Vec::with_capacity(array_type.shape.dimensions.len() + 1);
-    dimensions.push(Size::Static(lane_count));
-    dimensions.extend(array_type.shape.dimensions.iter().cloned());
-    ArrayType::new(array_type.data_type, Shape::new(dimensions), None, None)
-        .expect("packed array types are constructed without sharding")
-}
-
-/// Returns the tensor type obtained by prepending a leading axis of size one.
-fn singleton_packed_array_type(array_type: &ArrayType) -> ArrayType {
-    packed_array_type(array_type, 1)
-}
-
-/// Returns the broadcast dimensions used when prepending one leading axis without permuting existing axes.
-fn leading_axis_broadcast_dimensions(rank: usize) -> Vec<usize> {
-    (1..=rank).collect::<Vec<_>>()
-}
-
-/// Returns the start indices for slicing one packed lane.
-fn packed_lane_start_indices(rank: usize, lane_index: usize) -> Vec<usize> {
-    std::iter::once(lane_index).chain(std::iter::repeat_n(0, rank)).collect::<Vec<_>>()
-}
-
-/// Returns the limit indices for slicing one packed lane.
-fn packed_lane_limit_indices(array_type: &ArrayType, lane_index: usize) -> Result<Vec<usize>, LoweringError> {
-    Ok(std::iter::once(lane_index + 1).chain(static_dimensions(array_type)?).collect::<Vec<_>>())
-}
-
-/// Lowers one scalar constant for the provided data type and constant kind.
-fn lower_scalar_constant<'b, 'c: 'b, 't: 'c, B, L>(
-    data_type: DataType,
-    constant_kind: ShardMapConstantKind,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
-    let scalar_tensor_type = context
-        .tensor_type(lower_element_type(data_type, context)?, &[], None, location)
-        .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(data_type) })?;
-    let elements = lower_constant_elements_attribute(data_type, scalar_tensor_type, constant_kind, context)?;
-    let constant = block.append_operation(stable_hlo::constant(elements, location));
-    Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
-}
-
-/// Lowers one zero constant matching the provided tensor type.
-fn lower_zero_for_array_type<'b, 'c: 'b, 't: 'c, B, L>(
-    array_type: &ArrayType,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
-    let scalar_zero =
-        lower_scalar_constant(array_type.data_type, ShardMapConstantKind::Zero, block, context, location)?;
-    if array_type.shape.dimensions.is_empty() {
-        return Ok(scalar_zero);
-    }
-
-    let tensor_type = lower_tensor_type(array_type, context, location)?;
-    let broadcast = block.append_operation(stable_hlo::broadcast(scalar_zero, tensor_type, &[], location));
-    Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
-}
-
-/// Lowers one literal value and broadcasts it to a packed tensor type when needed.
-fn lower_packed_literal_value<'b, 'c: 'b, 't: 'c, B, V, L>(
-    value: &V,
-    packed_type: &ArrayType,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue,
-    L: Location<'c, 't> + Copy,
-{
-    let lowered_value = lower_literal_value(value, block, context, location)?;
-    if *value.r#type() == *packed_type {
-        return Ok(lowered_value);
-    }
-
-    let lane_count = match packed_type.shape.dimensions.first() {
-        Some(Size::Static(value)) => *value,
-        _ => return Err(LoweringError::InvalidTensorType { array_type: packed_type.clone() }),
-    };
-    if packed_array_type(&value.r#type(), lane_count) != *packed_type {
-        return Err(LoweringError::InvalidTensorType { array_type: packed_type.clone() });
-    }
-
-    if !value.r#type().shape.dimensions.is_empty() {
-        let singleton_tensor_type =
-            lower_tensor_type(&singleton_packed_array_type(&value.r#type()), context, location)?;
-        let singleton = block.append_operation(stable_hlo::broadcast(
-            lowered_value,
-            singleton_tensor_type,
-            leading_axis_broadcast_dimensions(value.r#type().shape.dimensions.len()).as_slice(),
-            location,
-        ));
-        let singleton_value = singleton.result(0).expect("stablehlo.broadcast should return one result").as_ref();
-        if lane_count == 1 {
-            return Ok(singleton_value);
-        }
-
-        let tensor_type = lower_tensor_type(packed_type, context, location)?;
-        let broadcast_dimensions = (0..=value.r#type().shape.dimensions.len()).collect::<Vec<_>>();
-        let packed = block.append_operation(stable_hlo::broadcast(
-            singleton_value,
-            tensor_type,
-            broadcast_dimensions.as_slice(),
-            location,
-        ));
-        return Ok(packed.result(0).expect("stablehlo.broadcast should return one result").as_ref());
-    }
-
-    let tensor_type = lower_tensor_type(packed_type, context, location)?;
-    let broadcast = block.append_operation(stable_hlo::broadcast(
-        lowered_value,
-        tensor_type,
-        leading_axis_broadcast_dimensions(value.r#type().shape.dimensions.len()).as_slice(),
-        location,
-    ));
-    Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
-}
-
-/// Packs one set of per-lane inputs into one leading-axis batched tensor using forward `vmap` semantics.
-fn lower_vmap_forward_pack<'b, 'c: 'b, 't: 'c, B, L>(
-    lane_values: &[ValueRef<'b, 'c, 't>],
-    lane_type: &ArrayType,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
-    debug_assert!(!lane_values.is_empty());
-    let singleton_tensor_type = lower_tensor_type(&singleton_packed_array_type(lane_type), context, location)?;
-    let broadcast_dimensions = leading_axis_broadcast_dimensions(lane_type.shape.dimensions.len());
-    let packed_lanes = lane_values
-        .iter()
-        .map(|lane_value| {
-            let broadcast = block.append_operation(stable_hlo::broadcast(
-                *lane_value,
-                singleton_tensor_type,
-                broadcast_dimensions.as_slice(),
-                location,
-            ));
-            Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
-        })
-        .collect::<Result<Vec<_>, LoweringError>>()?;
-    if packed_lanes.len() == 1 {
-        return Ok(packed_lanes[0]);
-    }
-    let concatenate = block.append_operation(stable_hlo::concatenate(packed_lanes.as_slice(), 0, location));
-    Ok(concatenate.result(0).expect("stablehlo.concatenate should return one result").as_ref())
-}
-
-/// Packs one set of per-lane cotangents into one leading-axis batched tensor using transpose-friendly padding.
-fn lower_vmap_transpose_pack<'b, 'c: 'b, 't: 'c, B, L>(
-    lane_values: &[ValueRef<'b, 'c, 't>],
-    lane_type: &ArrayType,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
-    debug_assert!(!lane_values.is_empty());
-    let rank = lane_type.shape.dimensions.len();
-    let singleton_tensor_type = lower_tensor_type(&singleton_packed_array_type(lane_type), context, location)?;
-    let broadcast_dimensions = leading_axis_broadcast_dimensions(rank);
-    let padding_value =
-        lower_scalar_constant(lane_type.data_type, ShardMapConstantKind::Zero, block, context, location)?;
-    let mut padded_lanes = Vec::with_capacity(lane_values.len());
-    for (lane_index, lane_value) in lane_values.iter().enumerate() {
-        let singleton = block.append_operation(stable_hlo::broadcast(
-            *lane_value,
-            singleton_tensor_type,
-            broadcast_dimensions.as_slice(),
-            location,
-        ));
-        let edge_padding_low =
-            std::iter::once(lane_index as i64).chain(std::iter::repeat_n(0, rank)).collect::<Vec<_>>();
-        let edge_padding_high = std::iter::once((lane_values.len() - lane_index - 1) as i64)
-            .chain(std::iter::repeat_n(0, rank))
-            .collect::<Vec<_>>();
-        let interior_padding = std::iter::repeat_n(0usize, rank + 1).collect::<Vec<_>>();
-        let padded = block.append_operation(stable_hlo::pad(
-            singleton.result(0).expect("stablehlo.broadcast should return one result").as_ref(),
-            padding_value,
-            edge_padding_low.as_slice(),
-            edge_padding_high.as_slice(),
-            interior_padding.as_slice(),
-            location,
-        ));
-        padded_lanes.push(padded.result(0).expect("stablehlo.pad should return one result").as_ref());
-    }
-
-    let mut accumulated = padded_lanes[0];
-    for padded_lane in padded_lanes.into_iter().skip(1) {
-        let add = block.append_operation(stable_hlo::add(accumulated, padded_lane, location));
-        accumulated = add.result(0).expect("stablehlo.add should return one result").as_ref();
-    }
-    Ok(accumulated)
-}
-
-/// Unpacks one leading-axis batched tensor into one result per lane using forward `vmap` semantics.
-fn lower_vmap_forward_unpack<'b, 'c: 'b, 't: 'c, B, L>(
-    packed_value: ValueRef<'b, 'c, 't>,
-    lane_type: &ArrayType,
-    lane_count: usize,
-    block: &mut B,
-    _context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
-    let rank = lane_type.shape.dimensions.len();
-    let lane_shape = static_dimensions(lane_type)?;
-    let strides = std::iter::repeat_n(1usize, rank + 1).collect::<Vec<_>>();
-    (0..lane_count)
-        .map(|lane_index| {
-            let slice = block.append_operation(stable_hlo::slice(
-                packed_value,
-                packed_lane_start_indices(rank, lane_index).as_slice(),
-                packed_lane_limit_indices(lane_type, lane_index)?.as_slice(),
-                strides.as_slice(),
-                location,
-            ));
-            let reshape = block.append_operation(stable_hlo::reshape(
-                slice.result(0).expect("stablehlo.slice should return one result").as_ref(),
-                lane_shape.as_slice(),
-                location,
-            ));
-            Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
-        })
-        .collect()
-}
-
-/// Unpacks one leading-axis batched tensor into one result per lane using transpose-friendly reductions.
-fn lower_vmap_transpose_unpack<'b, 'c: 'b, 't: 'c, B, L>(
-    packed_value: ValueRef<'b, 'c, 't>,
-    lane_type: &ArrayType,
-    lane_count: usize,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Location<'c, 't> + Copy,
-{
-    let rank = lane_type.shape.dimensions.len();
-    let strides = std::iter::repeat_n(1usize, rank + 1).collect::<Vec<_>>();
-    let reduction_type = lower_tensor_type(lane_type, context, location)?;
-    (0..lane_count)
-        .map(|lane_index| {
-            let slice = block.append_operation(stable_hlo::slice(
-                packed_value,
-                packed_lane_start_indices(rank, lane_index).as_slice(),
-                packed_lane_limit_indices(lane_type, lane_index)?.as_slice(),
-                strides.as_slice(),
-                location,
-            ));
-            let zero = lower_zero_for_array_type(lane_type, block, context, location)?;
-            let mut computation = context.region();
-            let mut computation_block = context.block(&[(reduction_type, location), (reduction_type, location)]);
-            let add = computation_block.append_operation(stable_hlo::add(
-                computation_block.argument(0).expect("reduction lhs should exist").as_ref(),
-                computation_block.argument(1).expect("reduction rhs should exist").as_ref(),
-                location,
-            ));
-            computation_block.append_operation(stable_hlo::r#return(
-                &[add.result(0).expect("stablehlo.add should return one result").as_ref()],
-                location,
-            ));
-            computation.append_block(computation_block);
-            let reduce = block.append_operation(stable_hlo::reduce(
-                &[slice.result(0).expect("stablehlo.slice should return one result").as_ref()],
-                &[zero],
-                &[0],
-                computation.into(),
-                location,
-            ));
-            Ok(reduce.result(0).expect("stablehlo.reduce should return one result").as_ref())
-        })
-        .collect()
-}
-
-/// Lowers one packed `vmap` body program whose inputs and outputs already carry a leading batch axis.
-fn lower_packed_program_outputs<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    packed_inputs: &[ValueRef<'b, 'c, 't>],
-    lane_count: usize,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue,
-    O: Clone + XlaOperation<V>,
-    L: Location<'c, 't> + Copy,
-{
-    fn resolve_packed_atom_value<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-        program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-        atom_values: &[Option<ValueRef<'b, 'c, 't>>],
-        atom_id: AtomId,
-        lane_count: usize,
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
-    where
-        B: Block<'b, 'c, 't>,
-        O: Clone + XlaOperation<V>,
-        V: MlirLowerableValue,
-        L: Location<'c, 't> + Copy,
-    {
-        if let Some(value) = atom_values[atom_id.index] {
-            return Ok(value);
-        }
-
-        let atom = program.atoms.get(atom_id.index).ok_or(LoweringError::MissingAtomValue { atom_id })?;
-        match atom {
-            Atom::Constant(value) => lower_packed_literal_value(
-                value,
-                &packed_array_type(&atom.r#type(), lane_count),
-                block,
-                context,
-                location,
-            ),
-            _ => Err(LoweringError::MissingAtomValue { atom_id }),
-        }
-    }
-
-    let mut atom_values = vec![None; program.atoms.len()];
-    for (input_index, atom_id) in program.input_ids.iter().copied().enumerate() {
-        atom_values[atom_id.index] = Some(packed_inputs[input_index]);
-    }
-
-    let mut instruction_by_first_output = vec![None; program.atoms.len()];
-    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
-        if let Some(first_output) = instruction.outputs.first() {
-            instruction_by_first_output[first_output.index] = Some(instruction_index);
-        }
-    }
-    let mut input_atom_flags = vec![false; program.atoms.len()];
-    for input_atom in program.input_ids.iter().copied() {
-        input_atom_flags[input_atom.index] = true;
-    }
-
-    for atom_index in 0..program.atoms.len() {
-        let atom = &program.atoms[atom_index];
-        match atom {
-            Atom::Constant(_) => {}
-            Atom::Variable(_) if input_atom_flags[atom_index] => {}
-            Atom::Variable(_) => {
-                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
-                    continue;
-                };
-                let instruction = &program.instructions[instruction_index];
-                let inputs = instruction
-                    .inputs
-                    .iter()
-                    .map(|input| {
-                        resolve_packed_atom_value(
-                            program,
-                            atom_values.as_slice(),
-                            *input,
-                            lane_count,
-                            block,
-                            context,
-                            location,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut block_ref = block.as_ref();
-                let lowered_outputs = lower_packed_plain_instruction(
-                    program,
-                    instruction_index,
-                    inputs.as_slice(),
-                    lane_count,
-                    &mut block_ref,
-                    context,
-                    location.as_ref(),
-                )?;
-                for (output_atom, lowered_output) in
-                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
-                {
-                    atom_values[output_atom.index] = Some(lowered_output);
-                }
-            }
-        }
-    }
-
-    program
-        .output_ids
-        .iter()
-        .map(|output| {
-            resolve_packed_atom_value(program, atom_values.as_slice(), *output, lane_count, block, context, location)
-        })
-        .collect::<Result<Vec<_>, _>>()
-}
-
-/// Lowers one higher-order `vmap` op by explicitly packing inputs, lowering the packed body, and unpacking outputs.
-fn lower_vmap_results<'b, 'c: 'b, 't: 'c, B, O, V, L>(
-    body: &FlatTracedVMap<ArrayType, V, O>,
-    mode: VMapLoweringMode,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    V: MlirLowerableValue,
-    O: Clone + XlaOperation<V>,
-    L: Location<'c, 't> + Copy,
-{
-    let lane_count = body.lane_count();
-    let logical_input_count = body.input_types().len();
-    let logical_output_count = body.output_types().len();
-    debug_assert_eq!(input_values.len(), body.total_input_count());
-
-    let packed_inputs = (0..logical_input_count)
-        .map(|input_index| {
-            let lanes = input_values.chunks(logical_input_count).map(|chunk| chunk[input_index]).collect::<Vec<_>>();
-            match mode {
-                VMapLoweringMode::Forward => lower_vmap_forward_pack(
-                    lanes.as_slice(),
-                    &body.input_types()[input_index],
-                    block,
-                    context,
-                    location,
-                ),
-                VMapLoweringMode::Transpose => lower_vmap_transpose_pack(
-                    lanes.as_slice(),
-                    &body.input_types()[input_index],
-                    block,
-                    context,
-                    location,
-                ),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let packed_outputs =
-        lower_packed_program_outputs(&body.program(), packed_inputs.as_slice(), lane_count, block, context, location)?;
-    debug_assert_eq!(packed_outputs.len(), logical_output_count);
-
-    let unpacked_by_output = packed_outputs
-        .iter()
-        .zip(body.output_types().iter())
-        .map(|(packed_output, output_type)| match mode {
-            VMapLoweringMode::Forward => {
-                lower_vmap_forward_unpack(*packed_output, output_type, lane_count, block, context, location)
-            }
-            VMapLoweringMode::Transpose => {
-                lower_vmap_transpose_unpack(*packed_output, output_type, lane_count, block, context, location)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut results = Vec::with_capacity(body.total_output_count());
-    for lane_index in 0..lane_count {
-        for output_index in 0..logical_output_count {
-            results.push(unpacked_by_output[output_index][lane_index]);
-        }
-    }
-    Ok(results)
 }
 
 /// Inlines a rematerialize body's sub-program into the given block by mapping the provided input
@@ -2385,7 +1789,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
-        XlaPrimitiveOperation::VMap(vmap_op) => lowerer.lower_vmap(vmap_op.body(), input_values),
         XlaPrimitiveOperation::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
         XlaPrimitiveOperation::ShardMap(shard_map_op) => {
             let simplified_body = shard_map_op
@@ -2447,35 +1850,6 @@ where
         input_values,
         output_types.as_slice(),
         PlainMlirLoweringMode::Unpacked,
-        &mut lowerer,
-    )
-}
-
-/// Lowers one instruction inside a packed `vmap` body program.
-fn lower_packed_plain_instruction<'b, 'c: 'b, 't: 'c, O, V>(
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    instruction_index: usize,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    lane_count: usize,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    V: MlirLowerableValue,
-    O: Clone + XlaOperation<V>,
-{
-    let instruction = &program.instructions[instruction_index];
-    let output_types = instruction
-        .outputs
-        .iter()
-        .map(|output| packed_array_type(&program.atoms[output.index].r#type(), lane_count))
-        .collect::<Vec<_>>();
-    let mut lowerer = PlainMlirLowerer { block: *block, context, location };
-    instruction.operation.lower_to_mlir(
-        input_values,
-        output_types.as_slice(),
-        PlainMlirLoweringMode::Packed { lane_count },
         &mut lowerer,
     )
 }

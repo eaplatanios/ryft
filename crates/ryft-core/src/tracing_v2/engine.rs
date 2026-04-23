@@ -16,9 +16,9 @@ use crate::{
 ///    an exemplar but only knows a leaf's type.
 ///
 /// That second responsibility is what lets higher-order transforms stay generic. Linearization,
-/// reverse-mode transposition, rematerialization, and traced `vmap` all occasionally need to
-/// rebuild a value from shape/type information alone; [`Engine`] is the narrow seam where
-/// backend-specific knowledge enters the otherwise backend-agnostic transform code.
+/// reverse-mode transposition, and rematerialization all occasionally need to rebuild a value from
+/// shape/type information alone; [`Engine`] is the narrow seam where backend-specific knowledge
+/// enters the otherwise backend-agnostic transform code.
 ///
 /// Per-instruction evaluation stays outside this trait: replay and abstract-eval continue to go
 /// straight through [`crate::tracing::InterpretableOperation`] and [`crate::tracing::Operation`]

@@ -1,6 +1,5 @@
 use std::fmt::{Debug, Display};
 
-use crate::batching::Batch as BatchedValue;
 use crate::macros::check_input_count;
 use crate::tracing::TracingError;
 use crate::types::{ArrayType, Type, TypeError};
@@ -11,7 +10,6 @@ use crate::{
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation,
-    VectorizableOperation,
     matrix::{MatrixOps, MatrixValue, transpose_abstract},
 };
 
@@ -100,12 +98,5 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().transpose_matrix()])
-    }
-}
-
-impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for MatrixTransposeOperation {
-    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
-        check_input_count!(inputs, 1);
-        Ok(vec![BatchedValue::new(inputs[0].lanes().iter().cloned().map(MatrixOps::transpose_matrix).collect())])
     }
 }

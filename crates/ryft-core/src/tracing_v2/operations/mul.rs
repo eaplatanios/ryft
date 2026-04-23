@@ -7,7 +7,6 @@ use std::{
 use crate::broadcasting::Broadcastable;
 use crate::types::{ArrayType, Type, TypeError};
 use crate::{
-    batching::{Batch, check_batch_sizes},
     macros::check_input_count,
     tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
@@ -16,7 +15,7 @@ use crate::{
     },
 };
 
-use super::{DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation};
+use super::{DifferentiableOperation, InterpretableOperation, Operation};
 
 /// Hidden staging trait for the multiplication primitive.
 #[doc(hidden)]
@@ -136,22 +135,6 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O
                 T::scale(left.primal.clone(), right.tangent.clone()),
             ),
         }])
-    }
-}
-
-impl<V: Traceable<ArrayType> + Mul<Output = V>> VectorizableOperation<ArrayType, V> for MulOperation {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        check_input_count!(inputs, 2);
-        check_batch_sizes!(inputs);
-        Ok(vec![Batch::new(
-            inputs[0]
-                .lanes()
-                .iter()
-                .cloned()
-                .zip(inputs[1].lanes().iter().cloned())
-                .map(|(left, right)| left * right)
-                .collect(),
-        )])
     }
 }
 

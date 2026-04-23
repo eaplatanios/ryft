@@ -1,6 +1,5 @@
 use std::fmt::{Debug, Display};
 
-use crate::batching::{Batch as BatchedValue, check_batch_sizes};
 use crate::macros::check_input_count;
 use crate::tracing::TracingError;
 use crate::types::{ArrayType, Type, TypeError};
@@ -10,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, VectorizableOperation,
+    DifferentiableOperation, InterpretableOperation, Operation,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
 };
 
@@ -25,7 +24,7 @@ pub trait MatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 ///
 /// [`MatMulOperation`] is the matrix-valued analogue of the core scalar arithmetic primitives. Its JVP
 /// rule delegates to the matrix tangent-space helpers so the same op can be reused for concrete
-/// execution, traced execution, and batching.
+/// execution and traced execution.
 #[derive(Clone, Default)]
 pub struct MatMulOperation;
 
@@ -71,21 +70,5 @@ impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone
     ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
         check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
-    }
-}
-
-impl<V: MatrixValue> VectorizableOperation<ArrayType, V> for MatMulOperation {
-    fn batch(&self, inputs: &[BatchedValue<V>]) -> Result<Vec<BatchedValue<V>>, TracingError> {
-        check_input_count!(inputs, 2);
-        check_batch_sizes!(inputs);
-        Ok(vec![BatchedValue::new(
-            inputs[0]
-                .lanes()
-                .iter()
-                .cloned()
-                .zip(inputs[1].lanes().iter().cloned())
-                .map(|(left, right)| left.matmul(right))
-                .collect(),
-        )])
     }
 }

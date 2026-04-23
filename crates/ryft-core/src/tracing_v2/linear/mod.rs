@@ -95,11 +95,12 @@ where
     let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
         crate::tracing_v2::jit::trace(engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
+    let Program { atoms, input_ids, output_ids, instructions, .. } = traced_program;
     let traced_program = Program {
-        atoms: traced_program.atoms.clone(),
-        input_ids: traced_program.input_ids.clone(),
-        output_ids: traced_program.output_ids.clone(),
-        instructions: traced_program.instructions.clone(),
+        atoms,
+        input_ids,
+        output_ids,
+        instructions,
         input_structure: flat_leaf_parameter_structure(input_leaf_count),
         output_structure: flat_leaf_parameter_structure(output_leaf_count),
         marker: std::marker::PhantomData,

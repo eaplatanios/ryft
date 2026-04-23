@@ -7,7 +7,6 @@ use std::{
 use crate::broadcasting::Broadcastable;
 use crate::types::{ArrayType, Type, TypeError};
 use crate::{
-    batching::{Batch, check_batch_sizes},
     macros::check_input_count,
     tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
@@ -18,7 +17,7 @@ use crate::{
     },
 };
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, VectorizableOperation};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Hidden staging trait for the addition primitive.
 ///
@@ -154,30 +153,12 @@ impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>> VectorizableOperation<ArrayType, V> for AddOperation {
-    fn batch(&self, inputs: &[Batch<V>]) -> Result<Vec<Batch<V>>, TracingError> {
-        check_input_count!(inputs, 2);
-        check_batch_sizes!(inputs);
-        Ok(vec![Batch::new(
-            inputs[0]
-                .lanes()
-                .iter()
-                .cloned()
-                .zip(inputs[1].lanes().iter().cloned())
-                .map(|(left, right)| left + right)
-                .collect(),
-        )])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::{
-        batching::BatchingError,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
-        tracing::TracingError,
         tracing_v2::test_support,
         types::{DataType, Layout, Shape, Size, StridedLayout},
     };
@@ -231,14 +212,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
-    }
-
-    #[test]
-    fn test_add_batch_requires_matching_lane_counts() {
-        let error = AddOperation.batch(&[Batch::new(vec![1.0f64, 2.0f64]), Batch::new(vec![3.0f64])]).unwrap_err();
-
-        assert_eq!(error, TracingError::Batching(BatchingError::MismatchedBatchSize));
-        test_support::assert_reference_scalar_sine_jit_rendering();
     }
 
     #[test]

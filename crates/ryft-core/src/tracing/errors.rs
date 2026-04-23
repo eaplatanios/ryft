@@ -2,7 +2,6 @@ use thiserror::Error;
 
 use super::programs::AtomId;
 
-use crate::batching::BatchingError;
 use crate::parameters::ParameterError;
 use crate::tracing_v2::{CustomOperationError, DifferentiationError};
 use crate::types::TypeError;
@@ -42,9 +41,6 @@ pub enum TracingError {
 
     #[error(transparent)]
     Differentiation(#[from] DifferentiationError),
-
-    #[error(transparent)]
-    Batching(#[from] BatchingError),
 
     #[error(transparent)]
     CustomOperation(#[from] CustomOperationError),

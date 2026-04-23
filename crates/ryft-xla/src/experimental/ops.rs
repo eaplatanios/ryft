@@ -4,7 +4,6 @@ use std::{
 };
 
 use ryft_core::{
-    batching::{BatchingError, FlatTracedVMap, LinearVMapOperation, VMapOperation, VMapTracingOperation},
     tracing::{AtomId, InterpretableOperation, Operation, TracingError},
     tracing_v2::{
         CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearPrimitiveOperation, LinearTerm,
@@ -31,36 +30,6 @@ use crate::experimental::{
 
 type XlaLinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>;
 
-fn make_linear_xla_vmap(
-    engine: &dyn Engine<
-        Type = ArrayType,
-        Value = ShardMapTensor,
-        TracingOperation = XlaPrimitiveOperation,
-        LinearOperation = XlaLinearOperation,
-    >,
-    body: &FlatTracedVMap<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
-    input_primals: Vec<ShardMapTensor>,
-) -> Result<LinearVMapOperation<ArrayType, ShardMapTensor>, TracingError> {
-    let body_program = body.program();
-    let output_primals = body_program.interpret(input_primals.clone())?;
-    let pushforward = linearize_program(engine, &body_program, input_primals)?;
-    let pullback = transpose_linear_program_with_output_examples(engine, &pushforward, output_primals.as_slice())?;
-    Ok(LinearVMapOperation::new(
-        FlatTracedVMap::from_parts(
-            body.lane_count(),
-            body.input_types().to_vec(),
-            body.output_types().to_vec(),
-            pushforward,
-        ),
-        FlatTracedVMap::from_parts(
-            body.lane_count(),
-            body.output_types().to_vec(),
-            body.input_types().to_vec(),
-            pullback,
-        ),
-    ))
-}
-
 fn make_linear_xla_rematerialize(
     engine: &dyn Engine<
         Type = ArrayType,
@@ -73,7 +42,7 @@ fn make_linear_xla_rematerialize(
 ) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError> {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
-    let pushforward = linearize_program(engine, &body_program, input_primals)?;
+    let pushforward = linearize_program(engine, body_program, input_primals)?;
     let pullback = transpose_linear_program_with_output_examples(engine, &pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOperation::new(
         FlatTracedRematerialize::from_parts(body.input_types().to_vec(), body.output_types().to_vec(), pushforward),
@@ -118,9 +87,6 @@ pub enum XlaPrimitiveOperation {
     /// Reshape.
     Reshape { input_type: ArrayType, output_type: ArrayType },
 
-    /// Higher-order `vmap`.
-    VMap(Box<VMapOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation, XlaLinearOperation>>),
-
     /// Higher-order rematerialization.
     Rematerialize(Box<RematerializeOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation, XlaLinearOperation>>),
 
@@ -151,7 +117,6 @@ impl Debug for XlaPrimitiveOperation {
             Self::LeftMatMul { .. } => write!(formatter, "LeftMatMul"),
             Self::RightMatMul { .. } => write!(formatter, "RightMatMul"),
             Self::Reshape { input_type, output_type } => write!(formatter, "Reshape({input_type} -> {output_type})"),
-            Self::VMap(vmap) => Debug::fmt(vmap, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::ShardMap(op) => Debug::fmt(op, formatter),
             Self::LinearShardMap(op) => Debug::fmt(op, formatter),
@@ -184,7 +149,6 @@ impl Operation for XlaPrimitiveOperation {
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
-            Self::VMap(vmap) => vmap.name(),
             Self::Rematerialize(remat) => remat.name(),
             Self::ShardMap(op) => op.name(),
             Self::LinearShardMap(op) => op.name(),
@@ -208,7 +172,6 @@ impl Operation for XlaPrimitiveOperation {
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).infer_output_types(input_types)
             }
-            Self::VMap(vmap) => vmap.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::ShardMap(op) => op.infer_output_types(input_types),
             Self::LinearShardMap(op) => op.infer_output_types(input_types),
@@ -254,7 +217,6 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
             Self::LinearShardMap(op) => op.interpret(inputs),
@@ -297,31 +259,6 @@ impl
             Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, inputs),
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, inputs)
-            }
-            Self::VMap(vmap) => {
-                let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-                let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-                let primal_outputs = vmap.interpret(primal_inputs.as_slice())?;
-                let tangent_builder = if let Some(first_tangent) = tangent_inputs.first() {
-                    first_tangent.builder.clone()
-                } else if vmap.body().total_output_count() == 0 {
-                    return Ok(Vec::new());
-                } else {
-                    return Err(BatchingError::VMapMissingTangentStagingContext.into());
-                };
-                let lane_input_count = vmap.body().input_types().len();
-                let lane_primals = primal_inputs.iter().take(lane_input_count).cloned().collect::<Vec<_>>();
-                let tangent_outputs = LinearTerm::apply_staged_op(
-                    tangent_builder,
-                    tangent_inputs.as_slice(),
-                    LinearPrimitiveOperation::VMap(Box::new(make_linear_xla_vmap(engine, vmap.body(), lane_primals)?)),
-                    vmap.body().total_output_count(),
-                )?;
-                Ok(primal_outputs
-                    .into_iter()
-                    .zip(tangent_outputs)
-                    .map(|(primal, tangent)| JvpTracer { primal, tangent })
-                    .collect::<Vec<_>>())
             }
             Self::Rematerialize(remat) => {
                 let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -377,7 +314,6 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for XlaPrimit
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::VMap(vmap) => vmap.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
             Self::LinearShardMap(op) => op.interpret(inputs),
@@ -432,12 +368,6 @@ impl MatrixTransposeTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitive
 impl CustomTracingOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
     fn custom_op(primitive: Arc<CustomPrimitive<ArrayType, ShardMapTensor>>) -> Self {
         XlaPrimitiveOperation::Custom(primitive)
-    }
-}
-
-impl VMapTracingOperation<ArrayType, ShardMapTensor, XlaLinearOperation> for XlaPrimitiveOperation {
-    fn vmap_op(op: VMapOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation, XlaLinearOperation>) -> Self {
-        XlaPrimitiveOperation::VMap(Box::new(op))
     }
 }
 
@@ -515,23 +445,6 @@ mod tests {
         ArrayType::scalar(DataType::F32)
     }
 
-    fn unary_vmap_body() -> FlatTracedVMap<ArrayType, ShardMapTensor, XlaPrimitiveOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
-        let input = builder.add_input(scalar_type());
-        let output = builder
-            .add_instruction(XlaPrimitiveOperation::Sin, vec![input])
-            .expect("vmap body should stage one sine op")
-            .into_iter()
-            .next()
-            .expect("sine should produce one output");
-        let program = builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            vec![output],
-            vec![Placeholder],
-            vec![Placeholder],
-        );
-        FlatTracedVMap::from_parts(2, vec![scalar_type()], vec![scalar_type()], program)
-    }
-
     fn unary_rematerialize_body() -> FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaPrimitiveOperation> {
         let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
         let input = builder.add_input(scalar_type());
@@ -561,48 +474,6 @@ mod tests {
                 transform: "linearized JIT replay",
             }))
         ));
-    }
-
-    #[test]
-    fn test_xla_vmap_jvp_stages_a_linear_vmap() {
-        let operation = XlaPrimitiveOperation::VMap(Box::new(VMapOperation::new(unary_vmap_body())));
-        let tangent_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaLinearOperation>::new()));
-        let first_tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
-        let second_tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
-        let outputs = operation
-            .jvp(
-                crate::experimental::engine::XlaEngine::token(),
-                &[
-                    JvpTracer {
-                        primal: ShardMapTensor::new(scalar_type()),
-                        tangent: LinearTerm::from_staged_parts(first_tangent_atom, tangent_builder.clone()),
-                    },
-                    JvpTracer {
-                        primal: ShardMapTensor::new(scalar_type()),
-                        tangent: LinearTerm::from_staged_parts(second_tangent_atom, tangent_builder.clone()),
-                    },
-                ],
-            )
-            .expect("xla vmap jvp should succeed");
-        assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0].primal.r#type().into_owned(), scalar_type());
-        assert_eq!(outputs[1].primal.r#type().into_owned(), scalar_type());
-
-        let output_atoms = outputs.into_iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
-        let tangent_builder = Rc::try_unwrap(tangent_builder)
-            .expect("vmap jvp builder should not have outstanding linear terms")
-            .into_inner();
-        let tangent_program = tangent_builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            output_atoms,
-            vec![Placeholder, Placeholder],
-            vec![Placeholder, Placeholder],
-        );
-        assert!(
-            tangent_program.to_string().contains("vmap"),
-            "expected linearized xla vmap jvp to stage a linear vmap op: {}",
-            tangent_program
-        );
     }
 
     #[test]
