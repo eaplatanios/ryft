@@ -93,8 +93,9 @@ where
         program,
         inputs,
         |constant| {
+            let primal_type = constant.r#type().into_owned();
             let primal_atom = tracing_builder.borrow_mut().add_constant(constant.clone());
-            let primal = Tracer::from_engine(primal_atom, tracing_builder.clone(), engine);
+            let primal = Tracer::from_staged_parts(primal_atom, primal_type, tracing_builder.clone(), engine);
             let tangent_atom = linear_builder.borrow_mut().add_constant(primal.zero_like());
             let tangent = LinearTerm::from_staged_parts(tangent_atom, linear_builder.clone());
             Ok(Linearized { primal, tangent })

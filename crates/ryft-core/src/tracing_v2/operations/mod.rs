@@ -89,8 +89,9 @@ pub fn lift_jit_constant<
     exemplar: &Tracer<'engine, E>,
 ) -> Tracer<'engine, E> {
     let builder = exemplar.builder.clone();
+    let r#type = constant.r#type().into_owned();
     let atom = builder.borrow_mut().add_constant(constant.clone());
-    Tracer::from_engine(atom, builder, exemplar.engine)
+    Tracer::from_staged_parts(atom, r#type, builder, exemplar.engine)
 }
 
 /// Propagates one unary input type through a shape-preserving staged op.

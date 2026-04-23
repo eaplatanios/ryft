@@ -20,10 +20,9 @@ where
         .input_ids
         .iter()
         .map(|input_atom| {
-            let atom = traced_primal_builder
-                .borrow_mut()
-                .add_input(traced_program.atoms[input_atom.index].r#type().into_owned());
-            Tracer::from_engine(atom, traced_primal_builder.clone(), engine)
+            let input_type = traced_program.atoms[input_atom.index].r#type().into_owned();
+            let atom = traced_primal_builder.borrow_mut().add_input(input_type.clone());
+            Tracer::from_staged_parts(atom, input_type, traced_primal_builder.clone(), engine)
         })
         .collect::<Vec<_>>();
     let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(

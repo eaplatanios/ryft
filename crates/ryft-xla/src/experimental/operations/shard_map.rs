@@ -1728,8 +1728,8 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .iter()
             .cloned()
             .map(|input_type| {
-                let atom = pushforward_compiled_builder.borrow_mut().add_input(input_type);
-                Tracer::from_engine(atom, pushforward_compiled_builder.clone(), XlaEngine::token())
+                let atom = pushforward_compiled_builder.borrow_mut().add_input(input_type.clone());
+                Tracer::from_staged_parts(atom, input_type, pushforward_compiled_builder.clone(), XlaEngine::token())
             })
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
@@ -1764,8 +1764,8 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
             .iter()
             .cloned()
             .map(|input_type| {
-                let atom = pullback_compiled_builder.borrow_mut().add_input(input_type);
-                Tracer::from_engine(atom, pullback_compiled_builder.clone(), XlaEngine::token())
+                let atom = pullback_compiled_builder.borrow_mut().add_input(input_type.clone());
+                Tracer::from_staged_parts(atom, input_type, pullback_compiled_builder.clone(), XlaEngine::token())
             })
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
@@ -1861,8 +1861,9 @@ impl ReplayShardMapValue for ShardMapTracer {
     type ReplayContext = ShardMapReplayContext;
 
     fn lift_constant(constant: &ShardMapTensor, replay_context: &Self::ReplayContext) -> Result<Self, TracingError> {
+        let constant_type = constant.r#type().into_owned();
         let atom = replay_context.tracing_builder.borrow_mut().add_constant(constant.clone());
-        Ok(Tracer::from_engine(atom, replay_context.tracing_builder.clone(), XlaEngine::token()))
+        Ok(Tracer::from_staged_parts(atom, constant_type, replay_context.tracing_builder.clone(), XlaEngine::token()))
     }
 
     fn apply_shard_map_operation(
@@ -2505,8 +2506,8 @@ mod tests {
         };
         let tracing_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
-        let input_atom = tracing_builder.borrow_mut().add_input(input_type);
-        let input = Tracer::from_engine(input_atom, tracing_builder.clone(), XlaEngine::token());
+        let input_atom = tracing_builder.borrow_mut().add_input(input_type.clone());
+        let input = Tracer::from_staged_parts(input_atom, input_type, tracing_builder.clone(), XlaEngine::token());
 
         let outputs = replay_traced_xla_program(&ShardMapReplayContext { tracing_builder }, &program, vec![input])
             .expect("replay should support reshape inside shard_map bodies");
@@ -2570,8 +2571,8 @@ mod tests {
         };
         let tracing_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
-        let input_atom = tracing_builder.borrow_mut().add_input(array_type);
-        let input = Tracer::from_engine(input_atom, tracing_builder.clone(), XlaEngine::token());
+        let input_atom = tracing_builder.borrow_mut().add_input(array_type.clone());
+        let input = Tracer::from_staged_parts(input_atom, array_type, tracing_builder.clone(), XlaEngine::token());
 
         assert!(matches!(
             replay_traced_xla_program(&ShardMapReplayContext { tracing_builder }, &program, vec![input]),

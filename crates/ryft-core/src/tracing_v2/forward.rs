@@ -555,8 +555,9 @@ where
             let jit_combined = combined_input_0
                 .iter()
                 .map(|value| {
-                    let atom = compiled_jvp_builder.borrow_mut().add_input(value.r#type().into_owned());
-                    Tracer::from_engine(atom, compiled_jvp_builder.clone(), erased_engine)
+                    let input_type = value.r#type().into_owned();
+                    let atom = compiled_jvp_builder.borrow_mut().add_input(input_type.clone());
+                    Tracer::from_staged_parts(atom, input_type, compiled_jvp_builder.clone(), erased_engine)
                 })
                 .collect::<Vec<_>>();
             let (jit_primals, jit_tangents) = jit_combined.split_at(input_parameter_count);

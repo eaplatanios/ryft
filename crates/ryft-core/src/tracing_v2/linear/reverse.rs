@@ -504,8 +504,9 @@ where
             let jit_primals = lane0_flat
                 .iter()
                 .map(|value| {
-                    let atom = compiled_vg_builder.borrow_mut().add_input(value.r#type().into_owned());
-                    Tracer::from_engine(atom, compiled_vg_builder.clone(), erased_engine)
+                    let input_type = value.r#type().into_owned();
+                    let atom = compiled_vg_builder.borrow_mut().add_input(input_type.clone());
+                    Tracer::from_staged_parts(atom, input_type, compiled_vg_builder.clone(), erased_engine)
                 })
                 .collect::<Vec<_>>();
             let (output, gradient) = reverse_mode_scalar_traced_program::<
