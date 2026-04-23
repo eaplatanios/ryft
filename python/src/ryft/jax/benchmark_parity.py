@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -48,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_command(command: list[str], cwd: Path) -> str:
+def run_command(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
     """Runs one subprocess and returns its stdout on success."""
 
     completed = subprocess.run(
@@ -57,8 +58,21 @@ def run_command(command: list[str], cwd: Path) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
     return completed.stdout
+
+
+def python_subprocess_environment(root: Path) -> dict[str, str]:
+    """Builds the Python subprocess environment for local package execution."""
+
+    environment = os.environ.copy()
+    python_path_entries = [str(root / "python" / "src")]
+    existing_python_path = environment.get("PYTHONPATH", "").strip()
+    if existing_python_path:
+        python_path_entries.append(existing_python_path)
+    environment["PYTHONPATH"] = os.pathsep.join(python_path_entries)
+    return environment
 
 
 def rust_benchmark_command_prefix() -> list[str]:
@@ -126,11 +140,15 @@ def collect_jax_records(root: Path, case_ids: list[str]) -> list[dict[str, Any]]
             prefix="ir_benchmark_jax_",
         )
     )
+    project_root = python_root()
+    environment = python_subprocess_environment(root)
     try:
         for case_id in case_ids:
             case_dump_dir = dump_root / case_id
             command = [
-                sys.executable,
+                "uv",
+                "run",
+                "python",
                 "-m",
                 "ryft.jax.benchmark_parity",
                 "--emit-jax-case",
@@ -138,7 +156,7 @@ def collect_jax_records(root: Path, case_ids: list[str]) -> list[dict[str, Any]]
                 "--emit-jax-dump-dir",
                 str(case_dump_dir),
             ]
-            records.extend(json.loads(run_command(command, root)))
+            records.extend(json.loads(run_command(command, project_root, environment)))
     finally:
         shutil.rmtree(dump_root, ignore_errors=True)
 

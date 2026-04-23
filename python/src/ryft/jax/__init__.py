@@ -9,6 +9,7 @@ from typing import Any
 _EXPORTS = {
     "BenchmarkSnapshotCase": ("ryft.jax.benchmark_snapshots", "BenchmarkSnapshotCase"),
     "JaxprInspection": ("ryft.jax.extraction", "JaxprInspection"),
+    "PreservedDumpProgramCase": ("ryft.jax.preserved_dump_cases", "PreservedDumpProgramCase"),
     "ProgramCase": ("ryft.jax.extraction", "ProgramCase"),
     "ProgramInspection": ("ryft.jax.extraction", "ProgramInspection"),
     "benchmark_snapshot_cases": ("ryft.jax.benchmark_snapshots", "benchmark_snapshot_cases"),
@@ -16,6 +17,11 @@ _EXPORTS = {
     "inspect_program": ("ryft.jax.extraction", "inspect_program"),
     "lower_to_stablehlo": ("ryft.jax.extraction", "lower_to_stablehlo"),
     "normalize_mlir_records": ("ryft.jax.ir_analysis", "normalize_mlir_records"),
+    "preserved_dump_program_case_by_id": (
+        "ryft.jax.preserved_dump_cases",
+        "preserved_dump_program_case_by_id",
+    ),
+    "preserved_dump_program_cases": ("ryft.jax.preserved_dump_cases", "preserved_dump_program_cases"),
     "program_cases_by_name": ("ryft.jax.examples", "program_cases_by_name"),
     "render_program_inspection": ("ryft.jax.extraction", "render_program_inspection"),
     "strip_mlir_location_markers": ("ryft.jax.ir_analysis", "strip_mlir_location_markers"),

@@ -41,5 +41,18 @@ uv run python scripts/compare_benchmark_mlir_with_jax.py
 
 The committed benchmark IR snapshots live under `python/tests/snapshots/ir_benchmark`.
 
+Run the following command to verify the curated preserved historical dump corpus against the committed `syrupy`
+snapshots:
+
+```bash
+uv run pytest tests/test_preserved_dump_snapshots.py
+```
+
+The committed preserved historical dump snapshots live in
+`python/tests/__snapshots__/test_preserved_dump_snapshots.ambr`. The corresponding curated case registry lives in
+`ryft.jax.preserved_dump_cases`, and it intentionally keeps only the unique preserved programs that we still care about
+instead of mirroring the old raw artifact tree.
+
 The reusable helpers that back the benchmark snapshot workflow live under `ryft.jax.ir_analysis`,
-`ryft.jax.benchmark_cases`, `ryft.jax.benchmark_snapshots`, and `ryft.jax.benchmark_parity`.
+`ryft.jax.benchmark_cases`, `ryft.jax.benchmark_snapshots`, `ryft.jax.preserved_dump_cases`, and
+`ryft.jax.benchmark_parity`.

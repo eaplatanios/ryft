@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import difflib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -75,12 +74,6 @@ def benchmark_snapshot_root() -> Path:
     """Returns the root directory for committed benchmark snapshot files."""
 
     return python_root() / "tests" / "snapshots" / "ir_benchmark"
-
-
-def artifact_comparison_path() -> Path:
-    """Returns the canonical artifact comparison file used for snapshot import."""
-
-    return repo_root() / ".artifacts" / "ir_benchmark" / "full_parity_pass_2" / "comparison.json"
 
 
 def benchmark_snapshot_cases() -> tuple[BenchmarkSnapshotCase, ...]:
@@ -212,43 +205,15 @@ def assert_records_match_snapshot_cases(
             records_by_key[(case.case_id, case.surface)],
             snapshot_root,
         )
-
-
-def load_artifact_comparison_entries(path: Path | None = None) -> list[dict[str, Any]]:
-    """Loads the canonical artifact comparison entries used for the snapshot import."""
-
-    return json.loads((path or artifact_comparison_path()).read_text(encoding="utf-8"))
-
-
-def write_snapshot_corpus_from_artifact_entries(
-    entries: list[dict[str, Any]],
-    snapshot_root: Path | None = None,
-) -> None:
-    """Writes the committed benchmark snapshot corpus from artifact comparison entries."""
-
-    for entry in entries:
-        case = benchmark_snapshot_case_by_id(entry["case_id"])
-        for side in ("jax", "ryft"):
-            record = entry[side]
-            if record is None:
-                raise ValueError(
-                    f"artifact comparison entry for {case.case_id} / {case.surface} is missing '{side}' output"
-                )
-            write_snapshot_text(case, side, record["raw_ir"], snapshot_root)
-
-
 __all__ = [
     "BENCHMARK_SNAPSHOT_CASES",
     "BenchmarkSnapshotCase",
-    "artifact_comparison_path",
     "assert_record_matches_snapshot",
     "assert_records_match_snapshot_cases",
     "benchmark_snapshot_case_by_id",
     "benchmark_snapshot_cases",
     "benchmark_snapshot_root",
-    "load_artifact_comparison_entries",
     "load_snapshot_text",
     "normalize_text_for_snapshot",
     "repo_root",
-    "write_snapshot_corpus_from_artifact_entries",
 ]

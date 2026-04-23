@@ -19,3 +19,9 @@ packages = ["src/ryft"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "syrupy>=5.1.0",
+]
