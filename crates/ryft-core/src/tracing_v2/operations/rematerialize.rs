@@ -181,7 +181,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        Program::<ArrayType, V, O, Vec<V>, Vec<V>>::interpret_flat_program(
+        Program::<ArrayType, V, O, Vec<V>, Vec<V>>::interpret_from_parts(
             self.body.atoms.as_slice(),
             self.body.input_ids.as_slice(),
             self.body.output_ids.as_slice(),
@@ -444,7 +444,7 @@ where
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        Program::<ArrayType, V, O, Vec<V>, Vec<V>>::interpret_flat_program(
+        Program::<ArrayType, V, O, Vec<V>, Vec<V>>::interpret_from_parts(
             self.body.atoms.as_slice(),
             self.body.input_ids.as_slice(),
             self.body.output_ids.as_slice(),

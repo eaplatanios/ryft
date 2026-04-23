@@ -631,7 +631,7 @@ impl<T: Type, V: Traceable<T>, O: Clone> FlatTracedVMap<T, V, O> {
         let lane_input_count = self.input_types.len();
         let mut outputs = Vec::with_capacity(self.total_output_count());
         for lane_inputs in inputs.chunks(lane_input_count) {
-            outputs.extend(Program::<T, V, O, Vec<V>, Vec<V>>::interpret_flat_program(
+            outputs.extend(Program::<T, V, O, Vec<V>, Vec<V>>::interpret_from_parts(
                 self.atoms.as_slice(),
                 self.input_ids.as_slice(),
                 self.output_ids.as_slice(),

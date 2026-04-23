@@ -439,7 +439,7 @@ impl<
     /// [`Program::interpret`] and by higher-order program payloads that store flattened body programs without wrapping
     /// them in full [`Program`] values. It tracks the number of remaining uses for each atom so that replay can move
     /// values into their final consumer instead of cloning them unconditionally at every edge.
-    pub(crate) fn interpret_flat_program(
+    pub(crate) fn interpret_from_parts(
         atoms: &[Atom<T, V>],
         input_ids: &[AtomId],
         output_ids: &[AtomId],
@@ -571,7 +571,7 @@ impl<
             .into());
         }
 
-        let outputs = Self::interpret_flat_program(
+        let outputs = Self::interpret_from_parts(
             self.atoms.as_slice(),
             self.input_ids.as_slice(),
             self.output_ids.as_slice(),
