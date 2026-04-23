@@ -9,14 +9,9 @@ use crate::parameters::{Parameter, ParameterError, Parameterized};
 use crate::tracing::TracingError;
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-/// Marker trait that identifies concrete, non-tracer leaves.
-///
-/// [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real data, such as
-/// scalars, dense arrays, and backend-backed tensors. Tracing wrappers such as
-/// [`Tracer`](crate::tracing_v2::Tracer) must not implement this trait.
-///
-/// The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket
-/// impls apart. Each composable transform such as `jvp` and `grad` provides:
+/// Marker trait that identifies values in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by types
+/// that carry real data, such as scalar and arrays. The sole purpose of this marker is to give Rust's coherence checker
+/// a way to tell two blanket implementations apart. Each composable transform such as `jvp` and `grad` provides:
 ///
 /// 1. an impl for `V: Value<T>` that evaluates the transform on concrete data, and
 /// 2. an impl for `Tracer<V>` that stages the transform into the enclosing traced program.
