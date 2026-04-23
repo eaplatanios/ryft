@@ -16,3 +16,5 @@
 # Python
 **/.venv
 **/__pycache__
+**/.uv-cache
+**/.pytest_cache
