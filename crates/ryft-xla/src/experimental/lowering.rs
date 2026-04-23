@@ -121,8 +121,8 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         lower_literal_value(value, &mut self.block, self.context, self.location)
     }
 
-    /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
-    /// block.
+    /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current block
+    /// and placing an optimization barrier on the boundary outputs.
     pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone>(
         &mut self,
         remat_op: &RematerializeOperation<ArrayType, V, O, L>,
@@ -760,8 +760,8 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         lower_tensor_type(array_type, self.context, self.location)
     }
 
-    /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current
-    /// block.
+    /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current block
+    /// and placing an optimization barrier on the boundary outputs.
     pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone>(
         &mut self,
         remat_op: &RematerializeOperation<ArrayType, V, O, L>,
@@ -1265,8 +1265,7 @@ fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError
 
 /// Inlines a rematerialize body's sub-program into the given block by mapping the provided input
 /// MLIR values to the body's input atoms, lowering constants and instructions in topological
-/// order,
-/// and returning the MLIR values corresponding to the body's output atoms.
+/// order, and returning optimization-barrier outputs corresponding to the body's output atoms.
 fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -1332,11 +1331,23 @@ where
         }
     }
 
-    program
+    let outputs = program
         .output_ids
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()?;
+    if outputs.is_empty() {
+        return Ok(outputs);
+    }
+    let barrier = block.append_operation(stable_hlo::optimization_barrier(outputs.as_slice(), location));
+    Ok((0..outputs.len())
+        .map(|index| {
+            barrier
+                .result(index)
+                .expect("stablehlo.optimization_barrier should return one result per operand")
+                .as_ref()
+        })
+        .collect::<Vec<_>>())
 }
 
 /// Lowers one plain traced program to values inside a block.
@@ -2367,6 +2378,39 @@ mod tests {
                     %1 = stablehlo.sine %arg0 : tensor<f64>
                     %2 = stablehlo.add %0, %1 : tensor<f64>
                     return %2 : tensor<f64>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_plain_rematerialize_lowers_optimization_barrier() {
+        let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
+        let (_, compiled): (
+            f64,
+            ryft_core::tracing::Program<
+                ArrayType,
+                f64,
+                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
+                f64,
+                f64,
+            >,
+        ) = ryft_core::tracing_v2::interpret_and_trace(
+            &engine,
+            |x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()),
+            2.0f64,
+        )
+        .unwrap();
+
+        assert_eq!(
+            to_mlir_module_for_plain_program(&compiled, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.sine %arg0 : tensor<f64>
+                    %1 = stablehlo.optimization_barrier %0 : tensor<f64>
+                    return %1 : tensor<f64>
                   }
                 }
             "#}

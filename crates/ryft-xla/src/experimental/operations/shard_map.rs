@@ -667,6 +667,9 @@ impl LinearOperation<ArrayType, ShardMapTensor> for LinearShardMapOperation<Shar
                 got: output_cotangents.len(),
             });
         }
+        if output_cotangents.is_empty() {
+            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
+        }
         let contributions = LinearTerm::apply_staged_op(
             output_cotangents[0].builder.clone(),
             output_cotangents,
@@ -835,6 +838,9 @@ impl LinearOperation<ArrayType, ShardMapTracer> for LinearShardMapOperation<Shar
                 expected: self.output_types.len(),
                 got: output_cotangents.len(),
             });
+        }
+        if output_cotangents.is_empty() {
+            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
         }
         let contributions = LinearTerm::apply_staged_op(
             output_cotangents[0].builder.clone(),
@@ -2201,8 +2207,9 @@ mod tests {
     };
 
     use super::{
-        ShardMapOperation, ShardMapReplayContext, build_factorized_apply_program, make_linear_tensor_shard_map,
-        project_flat_shard_map_program, replay_traced_xla_program,
+        LinearShardMapEvalMode, LinearShardMapOperation, ShardMapOperation, ShardMapReplayContext,
+        build_factorized_apply_program, make_linear_tensor_shard_map, project_flat_shard_map_program,
+        replay_traced_xla_program,
     };
 
     fn test_array_type() -> ArrayType {
@@ -2226,6 +2233,17 @@ mod tests {
             mesh.clone(),
             Vec::new(),
             vec![Sharding::replicated(mesh, 0)],
+            vec!["x".to_string()],
+            true,
+        )
+    }
+
+    fn zero_output_test_shard_map() -> ShardMap {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        ShardMap::from_shardings(
+            mesh.clone(),
+            vec![Sharding::replicated(mesh, 0)],
+            Vec::new(),
             vec!["x".to_string()],
             true,
         )
@@ -2274,6 +2292,36 @@ mod tests {
                 Vec::<Placeholder>::new(),
                 vec![Placeholder],
             ),
+        )
+    }
+
+    fn zero_output_traced_shard_map_body() -> FlatTracedShardMap {
+        let array_type = test_array_type();
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+        builder.add_input(array_type.clone());
+        FlatTracedShardMap::from_parts(
+            zero_output_test_shard_map(),
+            vec![array_type.clone()],
+            vec![array_type],
+            Vec::new(),
+            Vec::new(),
+            builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
+                Vec::new(),
+                vec![Placeholder],
+                Vec::<Placeholder>::new(),
+            ),
+        )
+    }
+
+    fn zero_output_linear_shard_map_operation<V>() -> LinearShardMapOperation<V> {
+        let body = zero_output_traced_shard_map_body();
+        LinearShardMapOperation::new(
+            body.clone(),
+            Vec::new(),
+            vec![test_array_type()],
+            Vec::new(),
+            LinearShardMapEvalMode::Body(body.clone()),
+            LinearShardMapEvalMode::Body(body),
         )
     }
 
@@ -2421,6 +2469,28 @@ mod tests {
             "expected linear tensor shard_map jvp to stage a linear_shard_map op: {}",
             tangent_program
         );
+    }
+
+    #[test]
+    fn test_linear_tensor_shard_map_transpose_supports_zero_outputs() {
+        let operation = zero_output_linear_shard_map_operation::<ShardMapTensor>();
+
+        let contributions = ryft_core::tracing_v2::LinearOperation::transpose(&operation, &[])
+            .expect("zero-output linear shard_map transpose should succeed");
+
+        assert_eq!(contributions.len(), 1);
+        assert!(contributions[0].is_none());
+    }
+
+    #[test]
+    fn test_linear_traced_shard_map_transpose_supports_zero_outputs() {
+        let operation = zero_output_linear_shard_map_operation::<ShardMapTracer>();
+
+        let contributions = ryft_core::tracing_v2::LinearOperation::transpose(&operation, &[])
+            .expect("zero-output traced linear shard_map transpose should succeed");
+
+        assert_eq!(contributions.len(), 1);
+        assert!(contributions[0].is_none());
     }
 
     #[test]
