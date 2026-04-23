@@ -20,15 +20,13 @@ where
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::LinearOperation: Clone + Operation<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
+    E::TracingOperation: DifferentiableOperation<E>,
 {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
@@ -36,7 +34,7 @@ where
     let (primal_output, program) = interpret_and_trace(engine, function, reconstructed_primals)?;
     Ok((
         primal_output,
-        linearize_program::<Input, Output, V, E::TracingOperation, E::LinearOperation>(
+        linearize_program::<Input, Output, V, E::TracingOperation, E::LinearOperation, E>(
             engine,
             &program,
             input_primals,
@@ -135,14 +133,11 @@ where
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::LinearOperation: Clone + Operation<ArrayType>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<E>,
+    E::LinearOperation: CoreLinearProgramOperation<V>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
 {
     let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
@@ -199,14 +194,11 @@ where
     Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     V::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<
-            ArrayType,
-            V,
-            LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<E>,
+    E::LinearOperation: CoreLinearProgramOperation<V>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
 {
     type Value = V;
     type FunctionInput<'engine>

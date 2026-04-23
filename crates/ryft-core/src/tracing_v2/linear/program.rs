@@ -39,8 +39,8 @@ where
 /// JVP immediately, it builds a staged [`Program`] over linear operations that can be replayed
 /// later on arbitrary tangent inputs at the same primal point.
 #[doc(hidden)]
-pub fn linearize_program<Input, Output, V, O, L>(
-    engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
+pub fn linearize_program<Input, Output, V, O, L, E>(
+    engine: &E,
     program: &Program<ArrayType, V, O, Input, Output>,
     input_primals: Vec<V>,
 ) -> Result<Program<ArrayType, V, L, Input, Output>, TracingError>
@@ -48,8 +48,13 @@ where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    L: Clone + Operation<ArrayType>,
-    O: Clone + DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L>,
+    L: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
+    O: Clone + DifferentiableOperation<E>,
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
 {
     fn tangent_for_atom<V, Input, Output, ProgramOperation, LinearOperation>(
         _program: &Program<ArrayType, V, ProgramOperation, Input, Output>,
@@ -112,11 +117,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
-        let output_duals = DifferentiableOperation::<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L>::jvp(
-            &instruction.operation,
-            engine,
-            input_duals.as_slice(),
-        )?;
+        let output_duals = instruction.operation.jvp(engine, input_duals.as_slice())?;
         if output_duals.len() != instruction.outputs.len() {
             return Err(TracingError::InvalidOutputCount {
                 expected: instruction.outputs.len(),

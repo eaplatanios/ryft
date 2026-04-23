@@ -7,13 +7,16 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
     engine::Engine,
-    forward::{JvpTracer, TangentSpace},
+    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     linear::LinearTerm,
     operations::constants::ZeroLike,
 };
 use crate::types::{ArrayType, Type, TypeError};
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, unary_abstract};
+use super::{
+    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearOperation, LinearScaleOperation,
+    Operation, unary_abstract,
+};
 
 /// Hidden staging trait for the negation primitive.
 #[doc(hidden)]
@@ -84,15 +87,25 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOperation<ArrayType, V, T, O, L> for NegOperation
+impl<E> DifferentiableOperation<E> for NegOperation
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: Traceable<ArrayType> + Neg<Output = E::Value> + Differentiable<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, E::Value>
+        + LinearNegOperation<ArrayType, E::Value>
+        + LinearScaleOperation<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 1);
-        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent: T::neg(inputs[0].tangent.clone()) }])
+        Ok(vec![JvpTracer {
+            primal: -inputs[0].primal.clone(),
+            tangent: EngineTangent::<E>::neg(inputs[0].tangent.clone()),
+        }])
     }
 }

@@ -11,11 +11,14 @@ use crate::{
     tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
         engine::Engine,
-        forward::{JvpTracer, TangentSpace},
+        forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     },
 };
 
-use super::{DifferentiableOperation, InterpretableOperation, Operation};
+use super::{
+    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
+    Operation,
+};
 
 /// Hidden staging trait for the multiplication primitive.
 #[doc(hidden)]
@@ -117,22 +120,29 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOperation<ArrayType, V, T, O, L> for MulOperation
+impl<E> DifferentiableOperation<E> for MulOperation
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: Traceable<ArrayType> + Mul<Output = E::Value> + Differentiable<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, E::Value>
+        + LinearNegOperation<ArrayType, E::Value>
+        + LinearScaleOperation<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 2);
         let left = &inputs[0];
         let right = &inputs[1];
         Ok(vec![JvpTracer {
             primal: left.primal.clone() * right.primal.clone(),
-            tangent: T::add(
-                T::scale(right.primal.clone(), left.tangent.clone()),
-                T::scale(left.primal.clone(), right.tangent.clone()),
+            tangent: EngineTangent::<E>::add(
+                EngineTangent::<E>::scale(right.primal.clone(), left.tangent.clone()),
+                EngineTangent::<E>::scale(left.primal.clone(), right.tangent.clone()),
             ),
         }])
     }
@@ -145,7 +155,7 @@ mod tests {
     use crate::types::{DataType, Shape, Size};
     use crate::{
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
-        tracing_v2::{engine::ArrayScalarEngine, test_support},
+        tracing_v2::{engine::ArrayScalarEngine, jvp, test_support},
     };
 
     use super::*;
@@ -158,23 +168,11 @@ mod tests {
     #[test]
     fn test_mul_jvp_matches_the_product_rule() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let output = DifferentiableOperation::<
-            ArrayType,
-            f64,
-            f64,
-            crate::tracing_v2::PrimitiveOperation<ArrayType, f64>,
-            crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>,
-        >::jvp(
-            &MulOperation,
-            &engine,
-            &[JvpTracer { primal: 2.0f64, tangent: 3.0f64 }, JvpTracer { primal: 5.0f64, tangent: -1.0f64 }],
-        )
-        .unwrap()
-        .pop()
-        .unwrap();
+        let (primal, tangent) =
+            jvp(&engine, |(left, right)| left * right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
 
-        approx_eq(output.primal, 10.0);
-        approx_eq(output.tangent, 13.0);
+        approx_eq(primal, 10.0);
+        approx_eq(tangent, 13.0);
         test_support::assert_bilinear_pushforward_rendering();
     }
 

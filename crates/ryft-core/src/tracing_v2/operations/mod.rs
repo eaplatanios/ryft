@@ -3,7 +3,12 @@ use std::{fmt::Display, sync::Arc};
 use crate::{
     parameters::Parameterized,
     tracing::{AtomId, InterpretableOperation, Operation, Traceable, TracingError},
-    tracing_v2::{engine::Engine, forward::JvpTracer, jit::Tracer, linear::LinearTerm},
+    tracing_v2::{
+        engine::Engine,
+        forward::{Differentiable, EngineTangent, JvpTracer},
+        jit::Tracer,
+        linear::LinearTerm,
+    },
     types::{ArrayType, Type, TypeError},
 };
 
@@ -197,16 +202,21 @@ pub trait LinearOperation<
         LinearCarrier: Operation<T>;
 }
 
-/// Forward-mode differentiation rule, generic over the tangent type `T` and staged carrier types.
+/// Forward-mode differentiation rule keyed only by the engine that owns the staged carriers.
 ///
-/// Each operation implements this trait with the exact bounds on `T` that its JVP rule requires.
-/// For example, [`AddOperation`] only needs `T: TangentSpace<V>`, while [`MatMulOperation`] needs
-/// `T: TangentSpace<V> + MatrixTangentSpace<V>`.
-///
-/// [`TangentSpace`]: crate::tracing_v2::forward::TangentSpace
-/// [`MatrixTangentSpace`]: crate::tracing_v2::MatrixTangentSpace
-pub trait DifferentiableOperation<T: Type + Display, V: Traceable<T>, Tangent, O: Clone, L: Clone>:
-    Operation<T>
+/// Primitive JVP rules recover their tangent representation from [`Differentiable`] on
+/// `E::Value` at `E::Type`, so the operation trait no longer needs separate `T`, `V`, `O`, `L`, or
+/// tangent parameters. Per-op capability requirements still live in the individual impl blocks
+/// through bounds on `E::Value` and [`EngineTangent<E>`].
+pub trait DifferentiableOperation<E: Engine + ?Sized>: Operation<E::Type>
+where
+    E::Type: Display,
+    E::Value: Differentiable<E::Type>,
+    E::LinearOperation: Clone
+        + Operation<E::Type>
+        + LinearAddOperation<E::Type, E::Value>
+        + LinearNegOperation<E::Type, E::Value>
+        + LinearScaleOperation<E::Type, E::Value>,
 {
     /// Applies the forward-mode JVP rule.
     ///
@@ -215,9 +225,9 @@ pub trait DifferentiableOperation<T: Type + Display, V: Traceable<T>, Tangent, O
     /// ignore it.
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, Tangent>],
-    ) -> Result<Vec<JvpTracer<V, Tangent>>, TracingError>;
+        engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError>;
 }
 
 /// Default linear-op carrier capability: eager replay on concrete values.
@@ -270,18 +280,13 @@ pub trait TracerLinearOperation<
     V: Traceable<ArrayType>,
     O: Clone + Operation<ArrayType> + 'static,
     OuterLinearOperation: Clone + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation> + ?Sized
-        + 'static = dyn Engine<
-            Type = ArrayType,
-            Value = V,
-            TracingOperation = O,
-            LinearOperation = OuterLinearOperation,
-        >,
->: Clone + Operation<ArrayType> + 'static
-where
+    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
+        + ?Sized
+        + 'static,
+>: Clone + Operation<ArrayType> + 'static where
     for<'engine> Self: add::LinearAddOperation<ArrayType, Tracer<'engine, E>>
         + neg::LinearNegOperation<ArrayType, Tracer<'engine, E>>
-        + scale::LinearScaleOperation<ArrayType, Tracer<'engine, E>>
+        + scale::LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
 {
 }
 
@@ -349,21 +354,23 @@ impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type + Display, V: Tra
     }
 }
 
-impl<
-    InnerOperation: DifferentiableOperation<T, V, Tangent, O, L> + ?Sized,
-    T: Type + Display,
-    V: Traceable<T>,
-    Tangent,
-    O: Clone,
-    L: Clone,
-> DifferentiableOperation<T, V, Tangent, O, L> for Arc<InnerOperation>
+impl<InnerOperation: DifferentiableOperation<E> + ?Sized, E: Engine + ?Sized> DifferentiableOperation<E>
+    for Arc<InnerOperation>
+where
+    E::Type: Display,
+    E::Value: Differentiable<E::Type>,
+    E::LinearOperation: Clone
+        + Operation<E::Type>
+        + LinearAddOperation<E::Type, E::Value>
+        + LinearNegOperation<E::Type, E::Value>
+        + LinearScaleOperation<E::Type, E::Value>,
 {
     #[inline]
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = T, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, Tangent>],
-    ) -> Result<Vec<JvpTracer<V, Tangent>>, TracingError> {
+        engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         (**self).jvp(engine, inputs)
     }
 }

@@ -4,7 +4,7 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::{
     engine::Engine,
-    forward::{JvpTracer, TangentSpace},
+    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
     linear::LinearTerm,
     operations::constants::ZeroLike,
@@ -165,24 +165,22 @@ where
     }
 }
 
-impl<
-    V: MatrixValue + ZeroLike,
-    O: Clone,
-    L: Clone
+impl<V, E> DifferentiableOperation<E> for RightMatMulOperation<V>
+where
+    V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
+    E::LinearOperation: Clone
         + Operation<ArrayType>
         + LinearAddOperation<ArrayType, V>
         + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>
-        + LinearLeftMatMulOperation<ArrayType, V>
-        + LinearRightMatMulOperation<ArrayType, V>
-        + LinearMatrixTransposeOperation<ArrayType, V>,
-> DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for RightMatMulOperation<V>
+        + LinearScaleOperation<ArrayType, V>,
+    EngineTangent<E>: super::matrix::MatrixTangentSpace<V>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<V, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 1);
         let factor = JvpTracer {
             primal: self.factor().clone(),

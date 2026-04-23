@@ -8,7 +8,7 @@ use ryft_core::{
     tracing_v2::{
         CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearPrimitiveOperation, LinearTerm,
         engine::Engine,
-        forward::JvpTracer,
+        forward::{Differentiable, EngineTangent, JvpTracer},
         linear::{Linearized, linearize_program, transpose_linear_program_with_output_examples},
         operations::{
             AddOperation, AddTracingOperation, CosOperation, CosTracingOperation, CustomTracingOperation,
@@ -30,16 +30,19 @@ use crate::experimental::{
 
 type XlaLinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>;
 
-fn make_linear_xla_rematerialize(
-    engine: &dyn Engine<
-        Type = ArrayType,
-        Value = ShardMapTensor,
-        TracingOperation = XlaPrimitiveOperation,
-        LinearOperation = XlaLinearOperation,
-    >,
+fn make_linear_xla_rematerialize<E>(
+    engine: &E,
     body: &FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
     input_primals: Vec<ShardMapTensor>,
-) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError> {
+) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError>
+where
+    E: Engine<
+            Type = ArrayType,
+            Value = ShardMapTensor,
+            TracingOperation = XlaPrimitiveOperation,
+            LinearOperation = XlaLinearOperation,
+        > + 'static,
+{
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
     let pushforward = linearize_program(engine, body_program, input_primals)?;
@@ -226,26 +229,24 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation
     }
 }
 
-impl
-    DifferentiableOperation<
-        ArrayType,
-        ShardMapTensor,
-        LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>,
-        XlaPrimitiveOperation,
-        XlaLinearOperation,
-    > for XlaPrimitiveOperation
-{
-    fn jvp(
-        &self,
-        engine: &dyn Engine<
+impl<E> DifferentiableOperation<E> for XlaPrimitiveOperation
+where
+    E: Engine<
             Type = ArrayType,
             Value = ShardMapTensor,
             TracingOperation = XlaPrimitiveOperation,
             LinearOperation = XlaLinearOperation,
+        > + 'static,
+    ShardMapTensor: Differentiable<
+            ArrayType,
+            Tangent<XlaLinearOperation> = LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>,
         >,
-        inputs: &[JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>>>, TracingError>
-    {
+{
+    fn jvp(
+        &self,
+        engine: &E,
+        inputs: &[JvpTracer<ShardMapTensor, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, EngineTangent<E>>>, TracingError> {
         match self {
             Self::Add => AddOperation.jvp(engine, inputs),
             Self::Mul => MulOperation.jvp(engine, inputs),

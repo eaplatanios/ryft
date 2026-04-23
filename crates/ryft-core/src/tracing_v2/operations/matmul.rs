@@ -5,11 +5,15 @@ use crate::tracing::TracingError;
 use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     tracing::Traceable,
-    tracing_v2::{engine::Engine, forward::JvpTracer},
+    tracing_v2::{
+        engine::Engine,
+        forward::{Differentiable, EngineTangent, JvpTracer},
+    },
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, Operation,
+    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
+    Operation,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
 };
 
@@ -60,14 +64,22 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
     }
 }
 
-impl<V: MatrixValue, T: super::matrix::MatrixTangentSpace<V>, O: Clone, L: Clone>
-    DifferentiableOperation<ArrayType, V, T, O, L> for MatMulOperation
+impl<E> DifferentiableOperation<E> for MatMulOperation
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: MatrixValue + Differentiable<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, E::Value>
+        + LinearNegOperation<ArrayType, E::Value>
+        + LinearScaleOperation<ArrayType, E::Value>,
+    EngineTangent<E>: super::matrix::MatrixTangentSpace<E::Value>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
     }

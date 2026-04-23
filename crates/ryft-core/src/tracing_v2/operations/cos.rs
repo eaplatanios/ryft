@@ -7,12 +7,15 @@ use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
     engine::Engine,
-    forward::{JvpTracer, TangentSpace},
+    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
 };
 use crate::types::{ArrayType, Type, TypeError};
 
-use super::{DifferentiableOperation, InterpretableOperation, Operation, sin::Sin, unary_abstract};
+use super::{
+    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
+    Operation, sin::Sin, unary_abstract,
+};
 
 /// Hidden staging trait for the cosine primitive.
 #[doc(hidden)]
@@ -80,19 +83,29 @@ impl<V: Traceable<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for Cos
     }
 }
 
-impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOperation<ArrayType, V, T, O, L> for CosOperation
+impl<E> DifferentiableOperation<E> for CosOperation
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: Traceable<ArrayType> + Cos + Sin + Neg<Output = E::Value> + Differentiable<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, E::Value>
+        + LinearNegOperation<ArrayType, E::Value>
+        + LinearScaleOperation<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
         Ok(vec![JvpTracer {
             primal: input.primal.clone().cos(),
-            tangent: T::neg(T::scale(input.primal.clone().sin(), input.tangent.clone())),
+            tangent: EngineTangent::<E>::neg(EngineTangent::<E>::scale(
+                input.primal.clone().sin(),
+                input.tangent.clone(),
+            )),
         }])
     }
 }

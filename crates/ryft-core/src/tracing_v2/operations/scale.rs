@@ -10,7 +10,7 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError, Value};
 use crate::tracing_v2::{
     engine::Engine,
-    forward::{JvpTracer, TangentSpace},
+    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
     linear::LinearTerm,
     operations::constants::ZeroLike,
@@ -155,19 +155,27 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOperation<ArrayType, V, T, O, L> for ScaleOperation<ArrayType, V>
+impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
+where
+    V: Traceable<ArrayType> + Mul<Output = V>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
+    V: Differentiable<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<V, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
         Ok(vec![JvpTracer {
             primal: self.factor().clone() * input.primal.clone(),
-            tangent: T::scale(self.factor().clone(), input.tangent.clone()),
+            tangent: EngineTangent::<E>::scale(self.factor().clone(), input.tangent.clone()),
         }])
     }
 }

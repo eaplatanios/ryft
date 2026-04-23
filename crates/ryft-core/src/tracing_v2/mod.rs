@@ -25,7 +25,7 @@ pub(crate) mod test_support;
 
 pub use differentiation::DifferentiationError;
 pub use engine::Engine;
-pub use forward::{Dual, JvpTracer, TangentSpace, jvp};
+pub use forward::{Differentiable, Dual, EngineTangent, JvpTracer, TangentSpace, jvp};
 pub use jit::{Tracer, TracerState, interpret_and_trace, trace};
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad, hessian,

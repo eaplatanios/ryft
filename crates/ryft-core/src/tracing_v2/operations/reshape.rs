@@ -13,7 +13,7 @@ use crate::{
     tracing_v2::{
         MatrixOps,
         engine::Engine,
-        forward::{JvpTracer, TangentSpace},
+        forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
         jit::Tracer,
         linear::LinearTerm,
         operations::constants::{OneLike, ZeroLike},
@@ -439,22 +439,22 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType
     }
 }
 
-impl<
-    V: ReshapeValue + ZeroLike + OneLike + MatrixOps,
-    O: Clone,
-    L: Clone
+impl<E> DifferentiableOperation<E> for ReshapeOperation
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: ReshapeValue + ZeroLike + OneLike + MatrixOps + Differentiable<ArrayType>,
+    E::LinearOperation: Clone
         + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearReshapeOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
-> DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for ReshapeOperation
+        + LinearAddOperation<ArrayType, E::Value>
+        + LinearNegOperation<ArrayType, E::Value>
+        + LinearScaleOperation<ArrayType, E::Value>,
+    EngineTangent<E>: ReshapeTangentSpace<E::Value>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
     }

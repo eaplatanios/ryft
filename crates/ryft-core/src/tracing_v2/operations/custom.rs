@@ -12,7 +12,7 @@ use crate::{
     tracing::{AtomId, Traceable, TracingError, Value},
     tracing_v2::{
         engine::Engine,
-        forward::JvpTracer,
+        forward::{Differentiable, EngineTangent, JvpTracer},
         jit::Tracer,
         linear::{LinearTerm, Linearized},
         operations::constants::ZeroLike,
@@ -158,13 +158,31 @@ impl<
     }
 }
 
-/// Type-erased wrapper for a staged-carrier-specific JVP rule stored inside [`CustomPrimitiveExtensions`].
-struct JvpRule<T: Type + Display, V: Traceable<T> + Parameter, O: Clone, L: Clone + Operation<T>>(
-    Arc<dyn DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L>>,
-);
+/// Engine-keyed wrapper for one forward-mode JVP rule stored inside [`CustomPrimitiveExtensions`].
+///
+/// Custom primitives now key JVP rules by the concrete engine type instead of the `(O, L)` carrier
+/// family pair so the public differentiation surface stays fully engine-driven.
+struct JvpRule<E: Engine + 'static>(Arc<dyn DifferentiableOperation<E>>)
+where
+    E::Type: Display,
+    E::Value: Differentiable<E::Type>,
+    E::LinearOperation: Clone
+        + Operation<E::Type>
+        + LinearAddOperation<E::Type, E::Value>
+        + LinearNegOperation<E::Type, E::Value>
+        + LinearScaleOperation<E::Type, E::Value>;
 
-impl<T: Type + Display, V: Traceable<T> + Parameter, O: Clone, L: Clone + Operation<T>> JvpRule<T, V, O, L> {
-    fn rule(&self) -> &dyn DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L> {
+impl<E: Engine + 'static> JvpRule<E>
+where
+    E::Type: Display,
+    E::Value: Differentiable<E::Type>,
+    E::LinearOperation: Clone
+        + Operation<E::Type>
+        + LinearAddOperation<E::Type, E::Value>
+        + LinearNegOperation<E::Type, E::Value>
+        + LinearScaleOperation<E::Type, E::Value>,
+{
+    fn rule(&self) -> &dyn DifferentiableOperation<E> {
         self.0.as_ref()
     }
 }
@@ -180,7 +198,7 @@ impl<Ty: Type, V: Traceable<Ty>, O: Operation<Ty> + InterpretableOperation<Ty, V
 /// the existing tracing traits directly:
 ///
 /// - [`LinearOperation<ArrayType, V>`] for reverse-mode transpose,
-/// - [`DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V>>`] for forward-mode JVP,
+/// - [`DifferentiableOperation<E>`] for forward-mode JVP under engine `E`,
 /// - [`InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>>`] for fully general linearized-JIT replay.
 #[derive(Clone)]
 pub struct CustomPrimitive<T: Type + Display, V: Traceable<T> + Parameter> {
@@ -216,14 +234,16 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         self
     }
 
-    /// Registers one staged-carrier-specific forward-mode JVP rule.
-    pub fn with_jvp_rule_for<O, L, Rule>(mut self, rule: Rule) -> Self
+    /// Registers one engine-specific forward-mode JVP rule.
+    pub fn with_jvp_rule_for<E, Rule>(mut self, rule: Rule) -> Self
     where
-        O: Clone + 'static,
-        L: Clone + Operation<T> + 'static,
-        Rule: DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L> + 'static,
+        E: Engine<Type = T, Value = V> + 'static,
+        V: Differentiable<T>,
+        E::LinearOperation:
+            Clone + Operation<T> + LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V>,
+        Rule: DifferentiableOperation<E> + 'static,
     {
-        self.extensions.insert(JvpRule::<T, V, O, L>(Arc::new(rule)));
+        self.extensions.insert(JvpRule::<E>(Arc::new(rule)));
         self
     }
 
@@ -280,11 +300,15 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
         CustomOperationError::MissingRule { op: self.base.name(), transform }
     }
 
-    fn jvp_rule<O: Clone + 'static, L: Clone + Operation<T> + 'static>(
-        &self,
-    ) -> Result<&dyn DifferentiableOperation<T, V, LinearTerm<T, V, L>, O, L>, TracingError> {
+    fn jvp_rule<E>(&self) -> Result<&dyn DifferentiableOperation<E>, TracingError>
+    where
+        E: Engine<Type = T, Value = V> + 'static,
+        V: Differentiable<T>,
+        E::LinearOperation:
+            Clone + Operation<T> + LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V>,
+    {
         self.extensions
-            .get::<JvpRule<T, V, O, L>>()
+            .get::<JvpRule<E>>()
             .map(JvpRule::rule)
             .ok_or_else(|| TracingError::from(self.missing_rule("jvp")))
     }
@@ -292,17 +316,18 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Parameter + 'static> CustomP
 
 impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<ArrayType, V> {
     /// Registers one forward-mode JVP rule for the canonical core staged carriers.
-    pub fn with_jvp_rule<Rule>(self, rule: Rule) -> Self
+    pub fn with_jvp_rule<E, Rule>(self, rule: Rule) -> Self
     where
-        Rule: DifferentiableOperation<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
+        E: Engine<
+                Type = ArrayType,
+                Value = V,
+                TracingOperation = PrimitiveOperation<ArrayType, V>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
             > + 'static,
+        V: Differentiable<ArrayType>,
+        Rule: DifferentiableOperation<E> + 'static,
     {
-        self.with_jvp_rule_for::<PrimitiveOperation<ArrayType, V>, LinearPrimitiveOperation<ArrayType, V>, _>(rule)
+        self.with_jvp_rule_for::<E, _>(rule)
     }
 
     /// Registers one linearized-JIT replay rule for the canonical core staged carriers.
@@ -400,15 +425,22 @@ impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for Custom
     }
 }
 
-impl<V: Traceable<ArrayType> + 'static, O: Clone + 'static, L: Clone + Operation<ArrayType> + 'static>
-    DifferentiableOperation<ArrayType, V, LinearTerm<ArrayType, V, L>, O, L> for CustomPrimitive<ArrayType, V>
+impl<V, E> DifferentiableOperation<E> for CustomPrimitive<ArrayType, V>
+where
+    V: Traceable<ArrayType> + Parameter + Differentiable<ArrayType> + 'static,
+    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
 {
     fn jvp(
         &self,
-        engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V, L>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V, L>>>, TracingError> {
-        self.jvp_rule::<O, L>()?.jvp(engine, inputs)
+        engine: &E,
+        inputs: &[JvpTracer<V, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
+        self.jvp_rule::<E>()?.jvp(engine, inputs)
     }
 }
 
@@ -591,23 +623,10 @@ mod tests {
         }
     }
 
-    impl
-        DifferentiableOperation<
-            ArrayType,
-            f64,
-            LinearTerm<ArrayType, f64>,
-            PrimitiveOperation<ArrayType, f64>,
-            LinearPrimitiveOperation<ArrayType, f64>,
-        > for ShiftOp
-    {
+    impl DifferentiableOperation<ArrayScalarEngine<f64>> for ShiftOp {
         fn jvp(
             &self,
-            _engine: &dyn Engine<
-                Type = ArrayType,
-                Value = f64,
-                TracingOperation = PrimitiveOperation<ArrayType, f64>,
-                LinearOperation = LinearPrimitiveOperation<ArrayType, f64>,
-            >,
+            _engine: &ArrayScalarEngine<f64>,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
             if inputs.len() != 1 {
@@ -764,7 +783,8 @@ mod tests {
     #[test]
     fn test_custom_primitive_missing_linearized_jit_rule_reports_targeted_error() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0)).with_jvp_rule(ShiftOp::new(2.0));
+        let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
+            .with_jvp_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0));
         let result: Result<(f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>), TracingError> =
             interpret_and_trace(
                 &engine,
@@ -799,7 +819,7 @@ mod tests {
     fn test_custom_primitive_jvp_rule_participates_in_grad_and_linearized_jit_replay() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
-            .with_jvp_rule(ShiftOp::new(2.0))
+            .with_jvp_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0))
             .with_linearized_jit_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0));
 
         assert_eq!(

@@ -4,12 +4,15 @@ use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
     engine::Engine,
-    forward::{JvpTracer, TangentSpace},
+    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
 };
 use crate::types::{ArrayType, Type, TypeError};
 
-use super::{DifferentiableOperation, InterpretableOperation, Operation, cos::Cos, unary_abstract};
+use super::{
+    DifferentiableOperation, InterpretableOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
+    Operation, cos::Cos, unary_abstract,
+};
 
 /// Hidden staging trait for the sine primitive.
 #[doc(hidden)]
@@ -78,19 +81,26 @@ impl<V: Traceable<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for Sin
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOperation<ArrayType, V, T, O, L> for SinOperation
+impl<E> DifferentiableOperation<E> for SinOperation
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: Traceable<ArrayType> + Sin + Cos + Differentiable<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, E::Value>
+        + LinearNegOperation<ArrayType, E::Value>
+        + LinearScaleOperation<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
         Ok(vec![JvpTracer {
             primal: input.primal.clone().sin(),
-            tangent: T::scale(input.primal.clone().cos(), input.tangent.clone()),
+            tangent: EngineTangent::<E>::scale(input.primal.clone().cos(), input.tangent.clone()),
         }])
     }
 }

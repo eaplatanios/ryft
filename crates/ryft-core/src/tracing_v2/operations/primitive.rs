@@ -10,7 +10,7 @@ use crate::{
     tracing_v2::{
         Cos, MatrixOps, Sin,
         engine::Engine,
-        forward::JvpTracer,
+        forward::{Differentiable, EngineTangent, JvpTracer},
         jit::Tracer,
         linear::LinearTerm,
         operations::{
@@ -31,11 +31,12 @@ use super::{
     custom::{CustomPrimitive, CustomTracingOperation, LinearCustomOperation, LinearCustomPrimitive},
     left_matmul::{LeftMatMulTracingOperation, LinearLeftMatMulOperation},
     matmul::MatMulTracingOperation,
+    matrix::MatrixTangentSpace,
     matrix_transpose::{LinearMatrixTransposeOperation, MatrixTransposeTracingOperation},
     mul::MulTracingOperation,
     neg::{LinearNegOperation, NegTracingOperation},
     rematerialize::{LinearRematerializeCarrierOperation, RematerializeTracingOperation},
-    reshape::{LinearReshapeOperation, ReshapeTracingOperation},
+    reshape::{LinearReshapeOperation, ReshapeTangentSpace, ReshapeTracingOperation},
     right_matmul::{LinearRightMatMulOperation, RightMatMulTracingOperation},
     scale::{LinearScaleOperation, ScaleTracingOperation},
     sin::SinTracingOperation,
@@ -644,6 +645,7 @@ impl<
         + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + Differentiable<ArrayType>
         + 'static,
     E: Engine<
             Type = ArrayType,
@@ -694,118 +696,48 @@ impl<
         + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
+        + Differentiable<ArrayType>
         + 'static,
->
-    DifferentiableOperation<
-        ArrayType,
-        V,
-        LinearTerm<ArrayType, V>,
-        PrimitiveOperation<ArrayType, V>,
-        LinearPrimitiveOperation<ArrayType, V>,
-    > for PrimitiveOperation<ArrayType, V>
-where
-    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-{
-    fn jvp(
-        &self,
-        engine: &dyn Engine<
+    E: Engine<
             Type = ArrayType,
             Value = V,
             TracingOperation = PrimitiveOperation<ArrayType, V>,
             LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
+        > + 'static,
+> DifferentiableOperation<E> for PrimitiveOperation<ArrayType, V>
+where
+    V: Differentiable<
+            ArrayType,
+            Tangent<LinearPrimitiveOperation<ArrayType, V>> = LinearTerm<
+                ArrayType,
+                V,
+                LinearPrimitiveOperation<ArrayType, V>,
+            >,
         >,
-        inputs: &[JvpTracer<V, LinearTerm<ArrayType, V>>],
-    ) -> Result<Vec<JvpTracer<V, LinearTerm<ArrayType, V>>>, TracingError> {
+    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    EngineTangent<E>: MatrixTangentSpace<V> + ReshapeTangentSpace<V>,
+{
+    fn jvp(
+        &self,
+        engine: &E,
+        inputs: &[JvpTracer<V, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
         match self {
-            Self::Add => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&AddOperation, engine, inputs),
-            Self::Mul => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&MulOperation, engine, inputs),
-            Self::Neg => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&NegOperation, engine, inputs),
-            Self::Sin => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&SinOperation, engine, inputs),
-            Self::Cos => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&CosOperation, engine, inputs),
-            Self::Scale { factor } => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&ScaleOperation::new(factor.clone()), engine, inputs),
-            Self::MatMul => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&MatMulOperation, engine, inputs),
-            Self::MatrixTranspose => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&MatrixTransposeOperation, engine, inputs),
-            Self::LeftMatMul { factor } => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(&LeftMatMulOperation::new(factor.clone()), engine, inputs),
-            Self::RightMatMul { factor } => {
-                DifferentiableOperation::<
-                    ArrayType,
-                    V,
-                    LinearTerm<ArrayType, V>,
-                    PrimitiveOperation<ArrayType, V>,
-                    LinearPrimitiveOperation<ArrayType, V>,
-                >::jvp(&RightMatMulOperation::new(factor.clone()), engine, inputs)
-            }
+            Self::Add => AddOperation.jvp(engine, inputs),
+            Self::Mul => MulOperation.jvp(engine, inputs),
+            Self::Neg => NegOperation.jvp(engine, inputs),
+            Self::Sin => SinOperation.jvp(engine, inputs),
+            Self::Cos => CosOperation.jvp(engine, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, inputs),
+            Self::MatMul => MatMulOperation.jvp(engine, inputs),
+            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, inputs),
+            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, inputs),
             Self::Reshape { input_type, output_type } => {
-                DifferentiableOperation::<
-                    ArrayType,
-                    V,
-                    LinearTerm<ArrayType, V>,
-                    PrimitiveOperation<ArrayType, V>,
-                    LinearPrimitiveOperation<ArrayType, V>,
-                >::jvp(&ReshapeOperation::new(input_type.clone(), output_type.clone()), engine, inputs)
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, inputs)
             }
-            Self::Rematerialize(remat) => DifferentiableOperation::<
-                ArrayType,
-                V,
-                LinearTerm<ArrayType, V>,
-                PrimitiveOperation<ArrayType, V>,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >::jvp(remat.as_ref(), engine, inputs),
+            Self::Rematerialize(remat) => remat.as_ref().jvp(engine, inputs),
             Self::Custom(op) => op.jvp(engine, inputs),
         }
     }

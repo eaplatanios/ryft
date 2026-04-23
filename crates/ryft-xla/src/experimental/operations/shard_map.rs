@@ -17,7 +17,7 @@ use ryft_core::{
         Cos, CustomOperationError, CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation,
         LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, PrimitiveOperation, Sin, Tracer,
         engine::Engine,
-        forward::JvpTracer,
+        forward::{Differentiable, EngineTangent, JvpTracer},
         operations::{
             constants::{OneLike, ZeroLike},
             reshape::ReshapeOps,
@@ -677,36 +677,28 @@ impl LinearOperation<ArrayType, ShardMapTensor> for LinearShardMapOperation<Shar
     }
 }
 
-impl
-    DifferentiableOperation<
-        ArrayType,
-        ShardMapTensor,
-        LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
-        XlaPrimitiveOperation,
-        LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-    > for ShardMapOperation<ShardMapTensor>
-{
-    fn jvp(
-        &self,
-        _engine: &dyn Engine<
+impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTensor>
+where
+    E: Engine<
             Type = ArrayType,
             Value = ShardMapTensor,
             TracingOperation = XlaPrimitiveOperation,
             LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-        >,
-        inputs: &[JvpTracer<
-            ShardMapTensor,
-            LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
-        >],
-    ) -> Result<
-        Vec<
-            JvpTracer<
+        > + ?Sized,
+    ShardMapTensor: Differentiable<
+            ArrayType,
+            Tangent<LinearPrimitiveOperation<ArrayType, ShardMapTensor>> = LinearTerm<
+                ArrayType,
                 ShardMapTensor,
-                LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
+                LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
             >,
         >,
-        TracingError,
-    > {
+{
+    fn jvp(
+        &self,
+        _engine: &E,
+        inputs: &[JvpTracer<ShardMapTensor, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, EngineTangent<E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = InterpretableOperation::interpret(self, primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
@@ -735,36 +727,28 @@ impl
     }
 }
 
-impl
-    DifferentiableOperation<
-        ArrayType,
-        ShardMapTensor,
-        LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
-        XlaPrimitiveOperation,
-        LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-    > for LinearShardMapOperation<ShardMapTensor>
-{
-    fn jvp(
-        &self,
-        _engine: &dyn Engine<
+impl<E> DifferentiableOperation<E> for LinearShardMapOperation<ShardMapTensor>
+where
+    E: Engine<
             Type = ArrayType,
             Value = ShardMapTensor,
             TracingOperation = XlaPrimitiveOperation,
             LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-        >,
-        inputs: &[JvpTracer<
-            ShardMapTensor,
-            LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
-        >],
-    ) -> Result<
-        Vec<
-            JvpTracer<
+        > + ?Sized,
+    ShardMapTensor: Differentiable<
+            ArrayType,
+            Tangent<LinearPrimitiveOperation<ArrayType, ShardMapTensor>> = LinearTerm<
+                ArrayType,
                 ShardMapTensor,
-                LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
+                LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
             >,
         >,
-        TracingError,
-    > {
+{
+    fn jvp(
+        &self,
+        _engine: &E,
+        inputs: &[JvpTracer<ShardMapTensor, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, EngineTangent<E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = InterpretableOperation::interpret(self, primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
@@ -862,36 +846,28 @@ impl LinearOperation<ArrayType, ShardMapTracer> for LinearShardMapOperation<Shar
     }
 }
 
-impl
-    DifferentiableOperation<
-        ArrayType,
-        ShardMapTracer,
-        LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
-        PrimitiveOperation<ArrayType, ShardMapTracer>,
-        LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
-    > for ShardMapOperation<ShardMapTracer>
-{
-    fn jvp(
-        &self,
-        _engine: &dyn Engine<
+impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTracer>
+where
+    E: Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
             TracingOperation = PrimitiveOperation<ArrayType, ShardMapTracer>,
             LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
-        >,
-        _inputs: &[JvpTracer<
-            ShardMapTracer,
-            LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
-        >],
-    ) -> Result<
-        Vec<
-            JvpTracer<
+        > + ?Sized,
+    ShardMapTracer: Differentiable<
+            ArrayType,
+            Tangent<LinearPrimitiveOperation<ArrayType, ShardMapTracer>> = LinearTerm<
+                ArrayType,
                 ShardMapTracer,
-                LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
+                LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
             >,
         >,
-        TracingError,
-    > {
+{
+    fn jvp(
+        &self,
+        _engine: &E,
+        _inputs: &[JvpTracer<ShardMapTracer, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, EngineTangent<E>>>, TracingError> {
         let Some(first_input) = _inputs.first() else {
             return if self.output_types.is_empty() {
                 Ok(Vec::new())

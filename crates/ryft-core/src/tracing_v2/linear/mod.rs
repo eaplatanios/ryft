@@ -232,23 +232,10 @@ mod tests {
         }
     }
 
-    impl
-        DifferentiableOperation<
-            ArrayType,
-            f64,
-            LinearTerm<ArrayType, f64>,
-            PrimitiveOperation<ArrayType, f64>,
-            LinearPrimitiveOperation<ArrayType, f64>,
-        > for PanicReplayOp
-    {
+    impl DifferentiableOperation<ArrayScalarEngine<f64>> for PanicReplayOp {
         fn jvp(
             &self,
-            _engine: &dyn Engine<
-                Type = ArrayType,
-                Value = f64,
-                TracingOperation = PrimitiveOperation<ArrayType, f64>,
-                LinearOperation = LinearPrimitiveOperation<ArrayType, f64>,
-            >,
+            _engine: &ArrayScalarEngine<f64>,
             inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
         ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
             if inputs.len() != 1 {
@@ -306,7 +293,8 @@ mod tests {
 
     #[test]
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
-        let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_jvp_rule(PanicReplayOp);
+        let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp)
+            .with_jvp_rule::<ArrayScalarEngine<f64>, _>(PanicReplayOp);
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
         let input = builder.add_input(3.0f64.r#type().into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));

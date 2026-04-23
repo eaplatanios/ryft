@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     fmt::Debug,
+    fmt::Display,
     ops::{Add, Mul, Neg},
 };
 
@@ -15,7 +16,8 @@ use crate::{
         jit::Tracer,
         linear::{Linearized, jvp_program, jvp_traced},
         operations::{
-            CoreLinearReplayOperation, DifferentiableOperation,
+            CoreLinearReplayOperation, DifferentiableOperation, LinearAddOperation, LinearNegOperation,
+            LinearScaleOperation,
             constants::{OneLike, ZeroLike},
         },
     },
@@ -67,6 +69,42 @@ impl<T: Type, V: Traceable<T> + Add<Output = V> + Mul<Output = V> + Neg<Output =
     fn zero_like(primal: &V, _tangent: &Self) -> Self {
         primal.zero_like()
     }
+}
+
+/// Value-level differentiation metadata for one abstract type family.
+///
+/// This trait chooses how a leaf value participates in forward-mode differentiation for abstract
+/// descriptor `T`. The staged linear carrier stays a generic associated type parameter so engine
+/// choices remain in the tracing layer instead of becoming part of the value trait itself.
+pub trait Differentiable<T: Type>: Traceable<T> {
+    /// Tangent payload carried alongside `Self` during primitive-level JVP staging.
+    type Tangent<LinearOperation>: TangentSpace<T, Self>
+    where
+        T: Display,
+        LinearOperation: Clone
+            + Operation<T>
+            + LinearAddOperation<T, Self>
+            + LinearNegOperation<T, Self>
+            + LinearScaleOperation<T, Self>;
+}
+
+/// Convenience alias for the primitive-level tangent representation associated with engine `E`.
+pub type EngineTangent<E> =
+    <<E as Engine>::Value as Differentiable<<E as Engine>::Type>>::Tangent<<E as Engine>::LinearOperation>;
+
+impl<T, V> Differentiable<T> for V
+where
+    T: Type + Display,
+    V: Traceable<T> + ZeroLike,
+{
+    type Tangent<LinearOperation>
+        = crate::tracing_v2::LinearTerm<T, V, LinearOperation>
+    where
+        LinearOperation: Clone
+            + Operation<T>
+            + LinearAddOperation<T, Self>
+            + LinearNegOperation<T, Self>
+            + LinearScaleOperation<T, Self>;
 }
 
 /// Forward-mode tracer carrying both a primal and a tangent.
@@ -192,14 +230,13 @@ where
     Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<
-            ArrayType,
-            V,
-            crate::tracing_v2::LinearTerm<ArrayType, V, E::LinearOperation>,
-            E::TracingOperation,
-            E::LinearOperation,
-        >,
-    E::LinearOperation: InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
+    V: Differentiable<ArrayType>,
+    E::TracingOperation: DifferentiableOperation<E>,
+    E::LinearOperation: InterpretableOperation<ArrayType, V>
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
 {
     type FunctionInput<'engine>
         = Input::To<Tracer<'engine, E>>

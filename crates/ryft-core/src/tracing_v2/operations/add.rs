@@ -11,13 +11,16 @@ use crate::{
     tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
         engine::Engine,
-        forward::{JvpTracer, TangentSpace},
+        forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
         linear::LinearTerm,
         operations::constants::ZeroLike,
     },
 };
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
+use super::{
+    DifferentiableOperation, InterpretableOperation, LinearNegOperation, LinearOperation, LinearScaleOperation,
+    Operation,
+};
 
 /// Hidden staging trait for the addition primitive.
 ///
@@ -137,18 +140,25 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>, O: Clone, L: Clone>
-    DifferentiableOperation<ArrayType, V, T, O, L> for AddOperation
+impl<E> DifferentiableOperation<E> for AddOperation
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: Traceable<ArrayType> + Add<Output = E::Value> + Differentiable<ArrayType>,
+    E::LinearOperation: Clone
+        + Operation<ArrayType>
+        + LinearAddOperation<ArrayType, E::Value>
+        + LinearNegOperation<ArrayType, E::Value>
+        + LinearScaleOperation<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
-        _engine: &dyn Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L>,
-        inputs: &[JvpTracer<V, T>],
-    ) -> Result<Vec<JvpTracer<V, T>>, TracingError> {
+        _engine: &E,
+        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
+    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
         check_input_count!(inputs, 2);
         Ok(vec![JvpTracer {
             primal: inputs[0].primal.clone() + inputs[1].primal.clone(),
-            tangent: T::add(inputs[0].tangent.clone(), inputs[1].tangent.clone()),
+            tangent: EngineTangent::<E>::add(inputs[0].tangent.clone(), inputs[1].tangent.clone()),
         }])
     }
 }
