@@ -7,6 +7,7 @@ use std::{
 
 use ryft_macros::Parameter;
 
+use crate::types::Type;
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily},
     tracing::{AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError},
@@ -27,29 +28,37 @@ use crate::{
 /// instructions safely. They still retain the inferred abstract output type so later type queries
 /// and best-effort short-circuiting can continue without manufacturing a dummy atom.
 #[derive(Clone, Eq, PartialEq)]
-pub enum TracerState<T: crate::types::Type> {
+pub enum TracerState<T: Type> {
     /// Normal traced leaf backed by a concrete atom in the staged program.
-    Live(AtomId),
+    Live(AtomId, T),
 
     /// Poisoned traced leaf that carries only abstract output type information.
     Poison(T),
 }
 
-impl<T: crate::types::Type> TracerState<T> {
+impl<T: Type> TracerState<T> {
     /// Returns the staged atom id for live tracers, if one exists.
     #[inline]
     pub fn live_atom(&self) -> Option<AtomId> {
         match self {
-            Self::Live(atom) => Some(*atom),
+            Self::Live(atom, _) => Some(*atom),
             Self::Poison(_) => None,
+        }
+    }
+
+    /// Returns the cached abstract type carried by this tracer state.
+    #[inline]
+    pub fn r#type(&self) -> &T {
+        match self {
+            Self::Live(_, r#type) | Self::Poison(r#type) => r#type,
         }
     }
 }
 
-impl<T: crate::types::Type> std::fmt::Debug for TracerState<T> {
+impl<T: Type> std::fmt::Debug for TracerState<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Live(atom) => formatter.debug_tuple("Live").field(atom).finish(),
+            Self::Live(atom, _) => formatter.debug_tuple("Live").field(atom).finish(),
             Self::Poison(_) => formatter.write_str("Poison(..)"),
         }
     }
@@ -93,17 +102,32 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 }
 
 impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E::Type>> + ?Sized> Tracer<'engine, E> {
+    /// Constructs a traced leaf from staged tracing parts.
+    ///
+    /// Callers that already know the staged atom's abstract type should prefer this constructor so
+    /// the resulting tracer can answer future type queries without re-borrowing the shared builder.
+    #[inline]
+    pub fn from_staged_parts(
+        atom: AtomId,
+        r#type: E::Type,
+        builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
+        engine: &'engine E,
+    ) -> Self {
+        Self { state: TracerState::Live(atom, r#type), builder, engine }
+    }
+
     /// Constructs a traced leaf from an existing tracing scope.
     ///
-    /// This is the standard constructor used by entry points such as [`trace`] when they turn one
-    /// input leaf into the corresponding symbolic tracer.
+    /// This compatibility helper recovers the staged atom's abstract type from the shared builder
+    /// once up front and then delegates to [`Tracer::from_staged_parts`].
     #[inline]
     pub fn from_engine(
         atom: AtomId,
         builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
         engine: &'engine E,
     ) -> Self {
-        Self { state: TracerState::Live(atom), builder, engine }
+        let r#type = builder.borrow().atoms[atom.index].r#type().into_owned();
+        Self::from_staged_parts(atom, r#type, builder, engine)
     }
 
     #[inline]
@@ -144,16 +168,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
             return Err(TracingError::MismatchedEngines);
         }
 
-        let input_types = {
-            let builder_borrow = builder.borrow();
-            inputs
-                .iter()
-                .map(|input| match &input.state {
-                    TracerState::Live(atom) => builder_borrow.atoms[atom.index].r#type().into_owned(),
-                    TracerState::Poison(r#type) => r#type.clone(),
-                })
-                .collect::<Vec<_>>()
-        };
+        let input_types = inputs.iter().map(|input| input.state.r#type().clone()).collect::<Vec<_>>();
         let output_types = match op.infer_output_types(input_types.as_slice()) {
             Ok(output_types) => output_types,
             Err(error) => {
@@ -170,7 +185,11 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 
         let input_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
         let output_states = match builder.borrow_mut().add_instruction(op, input_atoms) {
-            Ok(outputs) => outputs.into_iter().map(TracerState::Live).collect::<Vec<_>>(),
+            Ok(outputs) => outputs
+                .into_iter()
+                .zip(output_types)
+                .map(|(atom, r#type)| TracerState::Live(atom, r#type))
+                .collect::<Vec<_>>(),
             Err(error) => {
                 if builder.borrow().error.is_none() {
                     builder.borrow_mut().error = Some(error.clone());
@@ -213,10 +232,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 {
     #[inline]
     fn r#type(&self) -> Cow<'_, E::Type> {
-        match &self.state {
-            TracerState::Live(atom) => Cow::Owned(self.builder.borrow().atoms[atom.index].r#type().into_owned()),
-            TracerState::Poison(r#type) => Cow::Borrowed(r#type),
-        }
+        Cow::Borrowed(self.state.r#type())
     }
 }
 
@@ -230,9 +246,10 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 {
     #[inline]
     fn zero_like(&self) -> Self {
-        let value = self.engine.zero(&self.r#type().into_owned());
-        let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { state: TracerState::Live(atom), builder: self.builder.clone(), engine: self.engine }
+        let r#type = self.r#type().into_owned();
+        let value = self.engine.zero(&r#type);
+        let atom = self.builder.borrow_mut().add_constant(value);
+        Self::from_staged_parts(atom, r#type, self.builder.clone(), self.engine)
     }
 }
 
@@ -241,9 +258,10 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
 {
     #[inline]
     fn one_like(&self) -> Self {
-        let value = self.engine.one(&self.r#type().into_owned());
-        let atom = self.builder.borrow_mut().add_constant(value.clone());
-        Self { state: TracerState::Live(atom), builder: self.builder.clone(), engine: self.engine }
+        let r#type = self.r#type().into_owned();
+        let value = self.engine.one(&r#type);
+        let atom = self.builder.borrow_mut().add_constant(value);
+        Self::from_staged_parts(atom, r#type, self.builder.clone(), self.engine)
     }
 }
 
@@ -326,8 +344,8 @@ where
     let traced_input = Input::To::<Tracer<'engine, E>>::from_parameters(
         input_types.parameter_structure(),
         input_types.into_parameters().map(|r#type| {
-            let atom = builder.borrow_mut().add_input(r#type);
-            Tracer::from_engine(atom, builder.clone(), engine)
+            let atom = builder.borrow_mut().add_input(r#type.clone());
+            Tracer::from_staged_parts(atom, r#type, builder.clone(), engine)
         }),
     )
     .map_err(TracingError::from)?;
@@ -419,7 +437,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
     use indoc::indoc;
 
@@ -455,6 +473,20 @@ mod tests {
                 in (%1)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn traced_live_tracer_type_borrows_cached_type() {
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let input_type = ArrayType::scalar(crate::types::DataType::F64);
+        let atom = builder.borrow_mut().add_input(input_type.clone());
+        let engine = ArrayScalarEngine::<f64>::new();
+        let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_staged_parts(atom, input_type, builder, &engine);
+
+        assert!(
+            matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(crate::types::DataType::F64))
         );
     }
 
@@ -510,6 +542,27 @@ mod tests {
             outputs[0].state,
             TracerState::Poison(ref output_type) if *output_type == ArrayType::scalar(crate::types::DataType::F64)
         ));
+    }
+
+    #[test]
+    fn traced_apply_staged_op_caches_live_output_types() {
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let input_type = ArrayType::scalar(crate::types::DataType::F64);
+        let atom = builder.borrow_mut().add_input(input_type.clone());
+        let engine = TaggedEngine { id: 1 };
+        let tracer = Tracer::from_staged_parts(atom, input_type, builder.clone(), &engine);
+
+        let outputs =
+            Tracer::apply_staged_op(&engine, builder, std::slice::from_ref(&tracer), PrimitiveOperation::Neg).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(
+            matches!(outputs[0].state, TracerState::Live(_, ref output_type) if *output_type == ArrayType::scalar(crate::types::DataType::F64))
+        );
+        assert!(
+            matches!(outputs[0].r#type(), Cow::Borrowed(r#type) if *r#type == ArrayType::scalar(crate::types::DataType::F64))
+        );
     }
 
     #[test]
@@ -583,7 +636,7 @@ mod tests {
 
         use ryft_macros::Parameter;
 
-        use crate::types::Type;
+        use Type;
 
         #[derive(Clone, Debug, Eq, PartialEq)]
         struct TestType(&'static str);
