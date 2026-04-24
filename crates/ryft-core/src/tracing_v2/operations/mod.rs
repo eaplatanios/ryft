@@ -82,13 +82,7 @@ pub use scale::{LinearScaleOperation, ScaleOperation, ScaleTracingOperation};
 pub use sin::{Sin, SinOperation, SinTracingOperation};
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
-pub fn lift_jit_constant<
-    'engine,
-    V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType>,
-    L,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
->(
+pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized>(
     constant: &V,
     exemplar: &Tracer<'engine, E>,
 ) -> Tracer<'engine, E> {
@@ -212,9 +206,7 @@ pub trait DifferentiableOperation<E: Engine + ?Sized>: Operation<E::Type>
 where
     E::Type: Display,
     E::Value: Differentiable<E::Type>,
-    E::LinearOperation: Clone
-        + Operation<E::Type>
-        + LinearAddOperation<E::Type, E::Value>
+    E::LinearOperation: LinearAddOperation<E::Type, E::Value>
         + LinearNegOperation<E::Type, E::Value>
         + LinearScaleOperation<E::Type, E::Value>,
 {
@@ -230,7 +222,6 @@ where
     ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError>;
 }
 
-/// Default linear-op carrier capability: eager replay on concrete values.
 /// Default linear-op carrier capability: eager replay on concrete values.
 ///
 /// This captures the minimum replay surface a stored linear carrier needs: shape metadata through
@@ -276,14 +267,9 @@ impl<V: Traceable<ArrayType>, O: Clone + CoreLinearReplayOperation<V> + LinearOp
 /// [`LinearScaleOperation`](scale::LinearScaleOperation) for the appropriate Tracer leaf
 /// automatically satisfies it.
 #[doc(hidden)]
-pub trait TracerLinearOperation<
-    V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType> + 'static,
-    OuterLinearOperation: Clone + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-        + ?Sized
-        + 'static,
->: Clone + Operation<ArrayType> + 'static where
+pub trait TracerLinearOperation<V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static>:
+    Clone + Operation<ArrayType> + 'static
+where
     for<'engine> Self: add::LinearAddOperation<ArrayType, Tracer<'engine, E>>
         + neg::LinearNegOperation<ArrayType, Tracer<'engine, E>>
         + scale::LinearScaleOperation<ArrayType, Tracer<'engine, E>>,
@@ -292,13 +278,9 @@ pub trait TracerLinearOperation<
 
 impl<
     V: Traceable<ArrayType>,
-    O: Clone + Operation<ArrayType> + 'static,
-    OuterLinearOperation: Clone + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-        + ?Sized
-        + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     InnerLinearOperation: Clone + Operation<ArrayType> + 'static,
-> TracerLinearOperation<V, O, OuterLinearOperation, E> for InnerLinearOperation
+> TracerLinearOperation<V, E> for InnerLinearOperation
 where
     for<'engine> InnerLinearOperation: add::LinearAddOperation<ArrayType, Tracer<'engine, E>>
         + neg::LinearNegOperation<ArrayType, Tracer<'engine, E>>
@@ -359,9 +341,7 @@ impl<InnerOperation: DifferentiableOperation<E> + ?Sized, E: Engine + ?Sized> Di
 where
     E::Type: Display,
     E::Value: Differentiable<E::Type>,
-    E::LinearOperation: Clone
-        + Operation<E::Type>
-        + LinearAddOperation<E::Type, E::Value>
+    E::LinearOperation: LinearAddOperation<E::Type, E::Value>
         + LinearNegOperation<E::Type, E::Value>
         + LinearScaleOperation<E::Type, E::Value>,
 {

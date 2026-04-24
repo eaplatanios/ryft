@@ -20,11 +20,8 @@ where
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    E::LinearOperation:
+        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
     E::TracingOperation: DifferentiableOperation<E>,
 {
@@ -32,14 +29,7 @@ where
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
     let (primal_output, program) = interpret_and_trace(engine, function, reconstructed_primals)?;
-    Ok((
-        primal_output,
-        linearize_program::<Input, Output, V, E::TracingOperation, E::LinearOperation, E>(
-            engine,
-            &program,
-            input_primals,
-        )?,
-    ))
+    Ok((primal_output, linearize_program::<Input, Output, V, E>(engine, &program, input_primals)?))
 }
 
 /// Runs forward-mode differentiation inside an existing outer trace.
@@ -48,7 +38,7 @@ where
 /// standalone linear program, it stages both the primal replay and the pushforward application into
 /// the surrounding JIT trace so higher-order transforms can keep composing symbolically.
 #[allow(private_bounds)]
-pub(crate) fn jvp_traced<'engine, F, Input, Output, V, O, L, E>(
+pub(crate) fn jvp_traced<'engine, F, Input, Output, V, E>(
     function: F,
     primals: Input,
     tangents: Input,
@@ -57,14 +47,13 @@ where
     V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
-    O: Clone + Operation<ArrayType> + 'static,
-    L: Clone + Operation<ArrayType> + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
-    O: InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
+    E::TracingOperation:
+        InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearReplayOperation<Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
@@ -89,14 +78,14 @@ where
         traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
     let (primal_output_types, traced_program) =
-        trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
+        trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, E, _>(
             exemplar_traced_primal.engine,
             move |staged_input| function(staged_input),
             staged_input_types,
         )?;
     let output_structure = primal_output_types.parameter_structure();
     let tracing_builder = exemplar_traced_primal.builder.clone();
-    let (traced_primal_output, pushforward) = linearize_traced_program::<V, O, L, E>(
+    let (traced_primal_output, pushforward) = linearize_traced_program::<V, E>(
         exemplar_traced_primal.engine,
         tracing_builder,
         &traced_program,
@@ -128,7 +117,6 @@ where
     Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::LinearOperation: Clone + Operation<ArrayType>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
     E::TracingOperation: DifferentiableOperation<E>,
     E::LinearOperation: CoreLinearProgramOperation<V>
@@ -238,7 +226,6 @@ where
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
     E::TracingOperation:
         InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
-    E::LinearOperation: Clone + Operation<ArrayType> + 'static,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
     type Value = Tracer<'engine, E>;
@@ -264,23 +251,17 @@ where
             input_structure.clone(),
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
-        let (_, traced_program) =
-            trace_flat_program_from_input_types::<
-                Input::To<ArrayType>,
-                V::To<ArrayType>,
-                V,
-                E::TracingOperation,
-                E::LinearOperation,
-                E,
-                _,
-            >(traced_primals[0].engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
-        let (traced_output, traced_gradient) =
-            reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
-                traced_primals[0].engine,
-                traced_primals[0].builder.clone(),
-                &traced_program,
-                traced_primals,
-            )?;
+        let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
+            traced_primals[0].engine,
+            |staged_input| Ok(function(staged_input)),
+            staged_input_types,
+        )?;
+        let (traced_output, traced_gradient) = reverse_mode_scalar_traced_program::<V, E>(
+            traced_primals[0].engine,
+            traced_primals[0].builder.clone(),
+            &traced_program,
+            traced_primals,
+        )?;
         Ok((traced_output, Input::from_parameters(input_structure, traced_gradient)?))
     }
 }

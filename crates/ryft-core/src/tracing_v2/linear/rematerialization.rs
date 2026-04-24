@@ -8,10 +8,8 @@ fn build_traced_gradient_program<'engine, E, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
-        + Operation<ArrayType>,
-    E::LinearOperation: Operation<ArrayType>,
+    E::TracingOperation:
+        InterpretableOperation<ArrayType, V> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
@@ -25,7 +23,7 @@ where
             Tracer::from_staged_parts(atom, input_type, traced_primal_builder.clone(), engine)
         })
         .collect::<Vec<_>>();
-    let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E::TracingOperation, E::LinearOperation, E>(
+    let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E>(
         engine,
         traced_primal_builder.clone(),
         traced_program,
@@ -64,10 +62,8 @@ pub fn compile_grad<'engine, E, F, Input, V>(
 where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
-        + Operation<ArrayType>,
-    E::LinearOperation: Operation<ArrayType>,
+    E::TracingOperation:
+        InterpretableOperation<ArrayType, V> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
@@ -83,15 +79,11 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<
-        Input::To<ArrayType>,
-        V::To<ArrayType>,
-        V,
-        E::TracingOperation,
-        E::LinearOperation,
-        E,
-        _,
-    >(_engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
+    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
+        _engine,
+        |staged_input| Ok(function(staged_input)),
+        staged_input_types,
+    )?;
     build_traced_gradient_program(_engine, input_structure, &traced_program)
 }
 
@@ -145,9 +137,7 @@ where
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation: InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
-        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
-        + Operation<ArrayType>,
-    E::LinearOperation: Operation<ArrayType>,
+        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
@@ -190,9 +180,7 @@ where
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::TracingOperation: InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
-        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
-        + Operation<ArrayType>,
-    E::LinearOperation: Operation<ArrayType>,
+        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
@@ -208,15 +196,11 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<
-        Input::To<ArrayType>,
-        V::To<ArrayType>,
-        V,
-        E::TracingOperation,
-        E::LinearOperation,
-        E,
-        _,
-    >(engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
+    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
+        engine,
+        |staged_input| Ok(function(staged_input)),
+        staged_input_types,
+    )?;
     let segmented_program = match segment_size {
         None => wrap_program_in_rematerialize::<E, V>(&traced_program)?,
         Some(size) => segment_program::<E, V>(&traced_program, size)?,
@@ -244,9 +228,8 @@ fn segment_program<E, V>(
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>
-        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
-        + Operation<ArrayType>,
+    E::TracingOperation:
+        InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
     let instructions = program.instructions.as_slice();
@@ -417,7 +400,7 @@ fn wrap_program_in_rematerialize<E, V>(
 where
     E: Engine<Type = ArrayType, Value = V>,
     V: Traceable<ArrayType>,
-    E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation> + Operation<ArrayType>,
+    E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
     let input_types: Vec<_> = program

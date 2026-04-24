@@ -9,40 +9,25 @@ use crate::parameters::{Parameter, ParameterError, Parameterized};
 use crate::tracing::TracingError;
 use crate::types::{Type, TypeError, Typed};
 
-/// Marker trait that identifies values in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by types
-/// that carry real data, such as scalar and arrays. The sole purpose of this marker is to give Rust's coherence checker
-/// a way to tell two blanket implementations apart. Each composable transform such as `jvp` and `grad` provides:
+/// Identifies values in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by types that carry real
+/// data, such as arrays. The sole purpose of this marker is to give Rust's coherence checker a way to tell two blanket
+/// implementations apart. Each composable transform (e.g., for just-in-time compilation or automatic differentiation)
+/// provides:
 ///
-/// 1. an impl for `V: Value<T>` that evaluates the transform on concrete data, and
-/// 2. an impl for `Tracer<V>` that stages the transform into the enclosing traced program.
+///   1. an implementation for `V: Value<T>` that evaluates the transform on concrete data, and
+///   2. an implementation for `Tracer<V>` that stages the transform into the enclosing traced [`Program`].
 ///
-/// Because `Tracer<V>` implements [`Traceable`] but not [`Value`], the two impls never overlap.
+/// Because `Tracer<V>` implements [`Traceable`] but not [`Value`], these two implementations never overlap.
 pub trait Value<T: Type>: Traceable<T> {}
 
-/// Base trait for any leaf type that can participate in traced computations.
+/// Represents leaf values that can participate in traced [`Program`]s. [`Traceable`] is implemented by every type that
+/// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
+/// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`], but
+/// does not imply any other requirements for the underlying values.
 ///
-/// [`Traceable`] is implemented by every type that can appear as a leaf in a staged program: both
-/// concrete data types such as `f32`, `f64`, and backend arrays, and tracing wrappers such as
-/// [`Tracer`](crate::tracing_v2::Tracer). It ties each leaf to a type descriptor `T` via
-/// [`Typed`], while deliberately not implying eager numeric operations such as
-/// [`Sin`](crate::tracing_v2::Sin) or differentiation-specific capabilities such as
-/// [`ZeroLike`](crate::tracing_v2::operations::constants::ZeroLike). Those requirements live on
-/// the primitive operations and transforms that actually need them.
-///
-/// The type parameter `T` determines the abstract metadata used to describe leaf shapes and element
-/// types. The primary instantiation is [`ArrayType`](crate::types::ArrayType), used throughout the
-/// core tracing infrastructure.
-///
-/// Concrete leaves that support exact algebraic identity detection should override
-/// [`Traceable::is_zero`] and [`Traceable::is_one`]. The default implementations return `false`,
-/// which keeps purely abstract or traced leaves valid while opting them out of
-/// constant-identity simplification.
-///
-/// [`Traceable`] itself does not require `'static`. Borrowed leaf wrappers such as
-/// [`Tracer`](crate::tracing_v2::Tracer) are therefore free to model real engine borrows
-/// explicitly. Individual APIs that store traceable values behind [`Any`](std::any::Any), inside
-/// long-lived registries, or in staged artifacts that intentionally escape the current scope should
-/// add `'static` at those specific seams instead of imposing it on every traceable leaf globally.
+/// Concrete leaves that support exact algebraic identity detection should override [`Traceable::is_zero`] and
+/// [`Traceable::is_one`]. The default implementations return `false`, which keeps purely abstract or traced leaves
+/// valid while opting them out of constant-identity simplification.
 ///
 /// # Implementing [`Traceable`] for new leaf types
 ///

@@ -233,7 +233,6 @@ where
     V: Differentiable<ArrayType>,
     E::TracingOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>
-        + Operation<ArrayType>
         + LinearAddOperation<ArrayType, V>
         + LinearNegOperation<ArrayType, V>
         + LinearScaleOperation<ArrayType, V>,
@@ -291,7 +290,6 @@ where
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
     E::TracingOperation:
         InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
-    E::LinearOperation: Clone + Operation<ArrayType> + 'static,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearReplayOperation<Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
@@ -312,11 +310,7 @@ where
     where
         F: FnOnce(Self::FunctionInput<'call>) -> Self::FunctionOutput<'call>,
     {
-        jvp_traced::<_, _, _, V, E::TracingOperation, E::LinearOperation, E>(
-            |input| Ok(function(input)),
-            primals,
-            tangents,
-        )
+        jvp_traced::<_, _, _, V, E>(|input| Ok(function(input)), primals, tangents)
     }
 }
 

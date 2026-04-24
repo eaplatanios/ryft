@@ -97,9 +97,7 @@ impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
     E: Engine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType>,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, E::Value>
+    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
         + LinearScaleOperation<ArrayType, E::Value>,
     EngineTangent<E>: super::matrix::MatrixTangentSpace<E::Value>,

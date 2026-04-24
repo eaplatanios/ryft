@@ -91,9 +91,7 @@ impl<E> DifferentiableOperation<E> for NegOperation
 where
     E: Engine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Neg<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, E::Value>
+    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
         + LinearScaleOperation<ArrayType, E::Value>,
 {

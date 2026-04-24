@@ -85,9 +85,7 @@ impl<E> DifferentiableOperation<E> for SinOperation
 where
     E: Engine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Sin + Cos + Differentiable<ArrayType>,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, E::Value>
+    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
         + LinearScaleOperation<ArrayType, E::Value>,
 {
@@ -112,18 +110,12 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for
     }
 }
 
-impl<
-    'engine,
-    V: Traceable<ArrayType> + Sin,
-    O: SinTracingOperation<ArrayType, V>,
-    L: Clone,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Sin for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType> + Sin, E: Engine<Type = ArrayType, Value = V> + ?Sized> Sin for Tracer<'engine, E>
 where
-    O: Operation<ArrayType>,
+    E::TracingOperation: SinTracingOperation<ArrayType, V>,
 {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(O::sin_op())
+        self.unary(E::TracingOperation::sin_op())
     }
 }

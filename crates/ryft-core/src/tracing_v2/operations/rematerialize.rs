@@ -166,16 +166,15 @@ where
     }
 }
 
-impl<'engine, E, V: Value<ArrayType> + ZeroLike, O: Clone + 'static, L: Clone + Operation<ArrayType> + 'static>
+impl<'engine, E, V: Value<ArrayType> + ZeroLike>
     InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>
-    for RematerializeOperation<ArrayType, V, O, L>
+    for RematerializeOperation<ArrayType, V, E::TracingOperation, E::LinearOperation>
 where
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    O: Operation<ArrayType>,
-    O: InterpretableOperation<ArrayType, V>,
-    O: InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
-    O: RematerializeTracingOperation<ArrayType, V, L>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
+    E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
     fn interpret(
@@ -196,10 +195,10 @@ where
             exemplar_primal_input.engine,
             exemplar_primal_input.builder.clone(),
             primal_inputs.as_slice(),
-            O::rematerialize_op(self.clone()),
+            E::TracingOperation::rematerialize_op(self.clone()),
         )?;
         let body_program = self.body().program();
-        let tangent_outputs = replay_program_linearized_jit::<_, _, _, O, L, E>(
+        let tangent_outputs = replay_program_linearized_jit::<_, _, _, E>(
             exemplar_primal_input.engine,
             exemplar_primal_input.builder.clone(),
             linear_builder,
@@ -221,16 +220,14 @@ impl<
             ArrayType,
             Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
         > + 'static,
-    O: Clone + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearPrimitiveOperation<V>>
-        + ?Sized
-        + 'static,
-> DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O>
+    E: Engine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>> + ?Sized + 'static,
+> DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, E::TracingOperation>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    O: DifferentiableOperation<E>,
-    O: InterpretableOperation<ArrayType, V>,
-    O: for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
+    E::TracingOperation: DifferentiableOperation<E>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation:
+        for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
     LinearPrimitiveOperation<V>: CoreLinearProgramOperation<V>,
     for<'engine> LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
@@ -267,16 +264,13 @@ where
     }
 }
 
-impl<
-    'engine,
-    V: Value<ArrayType>,
-    O: Clone,
-    L: Clone,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> InterpretableOperation<ArrayType, Tracer<'engine, E>> for RematerializeOperation<ArrayType, V, O, L>
+impl<'engine, V: Value<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized>
+    InterpretableOperation<ArrayType, Tracer<'engine, E>>
+    for RematerializeOperation<ArrayType, V, E::TracingOperation, E::LinearOperation>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    O: Operation<ArrayType> + InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
+    E::TracingOperation:
+        InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
     fn interpret(&self, inputs: &[Tracer<'engine, E>]) -> Result<Vec<Tracer<'engine, E>>, TracingError> {
         if inputs.is_empty() {
@@ -291,7 +285,7 @@ where
             exemplar_input.engine,
             exemplar_input.builder.clone(),
             inputs,
-            O::rematerialize_op(self.clone()),
+            E::TracingOperation::rematerialize_op(self.clone()),
         )
     }
 }
@@ -408,9 +402,9 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerial
 /// Builds a linearized rematerialize op from its primal body by computing the pushforward and
 /// pullback programs at the provided primal inputs.
 #[allow(private_bounds)]
-pub(crate) fn make_linear_rematerialize<V, O, E>(
+pub(crate) fn make_linear_rematerialize<V, E>(
     engine: &E,
-    body: &FlatTracedRematerialize<ArrayType, V, O>,
+    body: &FlatTracedRematerialize<ArrayType, V, E::TracingOperation>,
     input_primals: Vec<V>,
 ) -> Result<LinearRematerializeOperation<ArrayType, V>, TracingError>
 where
@@ -421,14 +415,12 @@ where
             Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
         > + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    O: Clone + Operation<ArrayType> + 'static,
-    O: InterpretableOperation<ArrayType, V>,
-    O: DifferentiableOperation<E>,
-    O: for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<E>,
+    E::TracingOperation:
+        for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>,
     LinearPrimitiveOperation<V>: CoreLinearProgramOperation<V>,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = LinearPrimitiveOperation<V>>
-        + ?Sized
-        + 'static,
+    E: Engine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>> + ?Sized + 'static,
     for<'engine> LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
     let body_program = body.program();
@@ -483,16 +475,15 @@ impl<
     V: Traceable<ArrayType>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Input>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
-    O: Clone + Operation<ArrayType> + 'static,
-    L: Clone + Operation<ArrayType> + 'static,
 > RematerializeInvocationLeaf<Input, Output> for Tracer<'engine, E>
 where
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output, To<V> = Output::To<V>>,
-    O: InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, L>,
+    E::TracingOperation:
+        InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
     fn invoke<F>(function: F, input: Input) -> Result<Output, TracingError>
     where
@@ -509,7 +500,7 @@ where
             return Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into());
         };
         let (exemplar_output_types, body_program) =
-            trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, O, L, E, _>(
+            trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, E, _>(
                 exemplar_traced_input.engine,
                 |staged_input| Ok(function(staged_input)),
                 exemplar_input_types,
@@ -542,7 +533,7 @@ where
             exemplar_traced_input.engine,
             exemplar_traced_input.builder.clone(),
             traced_inputs.as_slice(),
-            O::rematerialize_op(RematerializeOperation::new(body)),
+            E::TracingOperation::rematerialize_op(RematerializeOperation::new(body)),
         )?;
         Output::from_parameters(output_structure, staged_outputs).map_err(TracingError::from)
     }

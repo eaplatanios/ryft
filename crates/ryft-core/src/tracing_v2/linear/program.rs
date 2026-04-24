@@ -39,22 +39,19 @@ where
 /// JVP immediately, it builds a staged [`Program`] over linear operations that can be replayed
 /// later on arbitrary tangent inputs at the same primal point.
 #[doc(hidden)]
-pub fn linearize_program<Input, Output, V, O, L, E>(
+pub fn linearize_program<Input, Output, V, E>(
     engine: &E,
-    program: &Program<ArrayType, V, O, Input, Output>,
+    program: &Program<ArrayType, V, E::TracingOperation, Input, Output>,
     input_primals: Vec<V>,
-) -> Result<Program<ArrayType, V, L, Input, Output>, TracingError>
+) -> Result<Program<ArrayType, V, E::LinearOperation, Input, Output>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    L: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
-    O: Clone + DifferentiableOperation<E>,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
+    E::LinearOperation:
+        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<E>,
 {
     fn tangent_for_atom<V, Input, Output, ProgramOperation, LinearOperation>(
         _program: &Program<ArrayType, V, ProgramOperation, Input, Output>,
@@ -84,9 +81,9 @@ where
     if input_primals.len() != program.input_ids.len() {
         return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_primals.len() });
     }
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, L>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::LinearOperation>::new()));
     let mut primals: Vec<Option<V>> = vec![None; program.atoms.len()];
-    let mut tangents: Vec<Option<LinearTerm<ArrayType, V, L>>> = vec![None; program.atoms.len()];
+    let mut tangents: Vec<Option<LinearTerm<ArrayType, V, E::LinearOperation>>> = vec![None; program.atoms.len()];
     for (input_atom, input_primal) in program.input_ids.iter().copied().zip(input_primals.into_iter()) {
         let tangent_atom = builder.borrow_mut().add_input(input_primal.r#type().into_owned());
         tangents[input_atom.index] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));

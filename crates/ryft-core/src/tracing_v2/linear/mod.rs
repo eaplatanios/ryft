@@ -89,25 +89,25 @@ fn ensure_single_scalar_gradient_output<V: Traceable<ArrayType>>(outputs: &[V]) 
 /// original function uses tuples, structs, or other parameterized shapes. This helper is the bridge
 /// between those worlds: it traces the structured function once, then retags the captured program
 /// so downstream reverse-mode code can operate on a canonical `Vec<V>` representation.
-pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, O, L, E, F>(
+pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, E, F>(
     engine: &'engine E,
     function: F,
     input_types: Input,
-) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TracingError>
+) -> Result<(Output, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>), TracingError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    O: Clone + Operation<ArrayType> + 'static,
-    L: Clone + Operation<ArrayType> + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     let input_leaf_count = input_types.parameter_structure().parameter_count();
-    let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
-        crate::tracing_v2::jit::trace(engine, function, input_types)?;
+    let (output_types, traced_program): (
+        Output,
+        Program<ArrayType, V, E::TracingOperation, Input::To<V>, Output::To<V>>,
+    ) = crate::tracing_v2::jit::trace(engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let Program { atoms, input_ids, output_ids, instructions, .. } = traced_program;
     let traced_program = Program {
@@ -129,22 +129,21 @@ where
 /// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
 /// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
 /// output and the traced gradient leaves.
-fn reverse_mode_scalar_traced_program<'engine, V, O, L, E>(
+fn reverse_mode_scalar_traced_program<'engine, V, E>(
     engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
-    traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::TracingOperation>>>,
+    traced_program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
     traced_primals: Vec<Tracer<'engine, E>>,
 ) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
-    O: Clone + Operation<ArrayType> + 'static,
-    L: Clone + Operation<ArrayType> + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E::TracingOperation:
+        InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
     let (outputs, pushforward) =
-        linearize_traced_program::<V, O, L, E>(engine, tracing_builder, traced_program, traced_primals)?;
+        linearize_traced_program::<V, E>(engine, tracing_builder, traced_program, traced_primals)?;
     ensure_single_scalar_gradient_output(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
     let pullback = transpose_traced_linear_program(engine, traced_output.builder.clone(), &pushforward)?;

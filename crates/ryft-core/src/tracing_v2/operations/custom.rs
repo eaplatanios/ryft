@@ -89,33 +89,25 @@ impl<T: Type, V: Traceable<T>> CustomPrimitiveExtensions<T, V> {
 /// This wrapper is `'static` so it can live inside the extension registry.
 struct LinearizedJitRule<
     V: Traceable<ArrayType> + ZeroLike,
-    O: Clone + Operation<ArrayType> + 'static,
-    OuterLinearOperation: Clone + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'static, E>>
         + LinearNegOperation<ArrayType, Tracer<'static, E>>
         + LinearScaleOperation<ArrayType, Tracer<'static, E>>
         + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-        + ?Sized
-        + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
 >(Arc<dyn InterpretableOperation<ArrayType, Linearized<Tracer<'static, E>, InnerLinearOperation>>>);
 
 impl<
     V: Traceable<ArrayType> + ZeroLike,
-    O: Clone + Operation<ArrayType> + 'static,
-    OuterLinearOperation: Clone + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'static, E>>
         + LinearNegOperation<ArrayType, Tracer<'static, E>>
         + LinearScaleOperation<ArrayType, Tracer<'static, E>>
         + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-        + ?Sized
-        + 'static,
-> LinearizedJitRule<V, O, OuterLinearOperation, InnerLinearOperation, E>
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
+> LinearizedJitRule<V, InnerLinearOperation, E>
 {
     fn interpret(
         &self,
@@ -165,9 +157,7 @@ struct JvpRule<E: Engine + 'static>(Arc<dyn DifferentiableOperation<E>>)
 where
     E::Type: Display,
     E::Value: Differentiable<E::Type>,
-    E::LinearOperation: Clone
-        + Operation<E::Type>
-        + LinearAddOperation<E::Type, E::Value>
+    E::LinearOperation: LinearAddOperation<E::Type, E::Value>
         + LinearNegOperation<E::Type, E::Value>
         + LinearScaleOperation<E::Type, E::Value>;
 
@@ -175,9 +165,7 @@ impl<E: Engine + 'static> JvpRule<E>
 where
     E::Type: Display,
     E::Value: Differentiable<E::Type>,
-    E::LinearOperation: Clone
-        + Operation<E::Type>
-        + LinearAddOperation<E::Type, E::Value>
+    E::LinearOperation: LinearAddOperation<E::Type, E::Value>
         + LinearNegOperation<E::Type, E::Value>
         + LinearScaleOperation<E::Type, E::Value>,
 {
@@ -238,8 +226,7 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Traceable<ArrayType> + Param
     where
         E: Engine<Type = T, Value = V> + 'static,
         V: Differentiable<T>,
-        E::LinearOperation:
-            Clone + Operation<T> + LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V>,
+        E::LinearOperation: LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V>,
         Rule: DifferentiableOperation<E> + 'static,
     {
         self.extensions.insert(JvpRule::<E>(Arc::new(rule)));
@@ -248,16 +235,9 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Traceable<ArrayType> + Param
 
     /// Registers one staged-carrier-specific linearized-JIT replay rule for nested custom primitives.
     #[doc(hidden)]
-    pub fn with_linearized_jit_rule_for<O, OuterLinearOperation, InnerLinearOperation, E, Rule>(
-        mut self,
-        rule: Rule,
-    ) -> Self
+    pub fn with_linearized_jit_rule_for<InnerLinearOperation, E, Rule>(mut self, rule: Rule) -> Self
     where
-        O: Clone + Operation<ArrayType> + 'static,
-        OuterLinearOperation: Clone + 'static,
-        E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-            + ?Sized
-            + 'static,
+        E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
         InnerLinearOperation: Clone
             + Operation<ArrayType>
             + LinearAddOperation<ArrayType, Tracer<'static, E>>
@@ -268,8 +248,7 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Traceable<ArrayType> + Param
         Linearized<Tracer<'static, E>, InnerLinearOperation>: Traceable<ArrayType>,
         V: Traceable<ArrayType> + ZeroLike,
     {
-        self.extensions
-            .insert(LinearizedJitRule::<V, O, OuterLinearOperation, InnerLinearOperation, E>(Arc::new(rule)));
+        self.extensions.insert(LinearizedJitRule::<V, InnerLinearOperation, E>(Arc::new(rule)));
         self
     }
 
@@ -303,8 +282,7 @@ impl<T: Type + Display + 'static, V: Traceable<T> + Traceable<ArrayType> + Param
     where
         E: Engine<Type = T, Value = V> + 'static,
         V: Differentiable<T>,
-        E::LinearOperation:
-            Clone + Operation<T> + LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V>,
+        E::LinearOperation: LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V>,
     {
         self.extensions
             .get::<JvpRule<E>>()
@@ -456,11 +434,8 @@ impl<V, E> DifferentiableOperation<E> for CustomPrimitive<ArrayType, V>
 where
     V: Traceable<ArrayType> + Parameter + Differentiable<ArrayType> + 'static,
     E: Engine<Type = ArrayType, Value = V> + 'static,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    E::LinearOperation:
+        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
 {
     fn jvp(
         &self,
@@ -473,11 +448,7 @@ where
 
 impl<
     V: Value<ArrayType> + ZeroLike + 'static,
-    O: Clone + Operation<ArrayType> + 'static,
-    OuterLinearOperation: Clone + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-        + ?Sized
-        + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'static, E>>
@@ -494,7 +465,7 @@ where
         inputs: &[Linearized<Tracer<'static, E>, InnerLinearOperation>],
     ) -> Result<Vec<Linearized<Tracer<'static, E>, InnerLinearOperation>>, TracingError> {
         self.extensions
-            .get::<LinearizedJitRule<V, O, OuterLinearOperation, InnerLinearOperation, E>>()
+            .get::<LinearizedJitRule<V, InnerLinearOperation, E>>()
             .ok_or_else(|| TracingError::from(self.missing_rule("linearized JIT replay")))?
             .interpret(inputs)
     }

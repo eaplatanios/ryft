@@ -87,9 +87,7 @@ impl<E> DifferentiableOperation<E> for CosOperation
 where
     E: Engine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Cos + Sin + Neg<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, E::Value>
+    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
         + LinearScaleOperation<ArrayType, E::Value>,
 {
@@ -117,18 +115,12 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
     }
 }
 
-impl<
-    'engine,
-    V: Traceable<ArrayType> + Cos,
-    O: CosTracingOperation<ArrayType, V>,
-    L: Clone,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> Cos for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType> + Cos, E: Engine<Type = ArrayType, Value = V> + ?Sized> Cos for Tracer<'engine, E>
 where
-    O: Operation<ArrayType>,
+    E::TracingOperation: CosTracingOperation<ArrayType, V>,
 {
     #[inline]
     fn cos(self) -> Self {
-        self.unary(O::cos_op())
+        self.unary(E::TracingOperation::cos_op())
     }
 }

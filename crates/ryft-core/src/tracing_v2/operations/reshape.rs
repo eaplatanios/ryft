@@ -264,15 +264,10 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<
-    'engine,
-    V: Traceable<ArrayType>,
-    O: ReshapeTracingOperation<ArrayType, V>,
-    L: Clone,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> ReshapeOps for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized> ReshapeOps
+    for Tracer<'engine, E>
 where
-    O: Operation<ArrayType>,
+    E::TracingOperation: ReshapeTracingOperation<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -284,7 +279,7 @@ where
             self.engine,
             self.builder.clone(),
             std::slice::from_ref(&self),
-            O::reshape_op(input_type, output_type),
+            E::TracingOperation::reshape_op(input_type, output_type),
         )?
         .into_iter()
         .next()
@@ -443,9 +438,7 @@ impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
     E: Engine<Type = ArrayType> + ?Sized,
     E::Value: ReshapeValue + ZeroLike + OneLike + MatrixOps + Differentiable<ArrayType>,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, E::Value>
+    E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
         + LinearScaleOperation<ArrayType, E::Value>,
     EngineTangent<E>: ReshapeTangentSpace<E::Value>,

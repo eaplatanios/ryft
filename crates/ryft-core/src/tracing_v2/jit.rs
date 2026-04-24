@@ -157,10 +157,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
         builder: Rc<RefCell<ProgramBuilder<E::Type, E::Value, E::TracingOperation>>>,
         inputs: &[Self],
         op: E::TracingOperation,
-    ) -> Result<Vec<Self>, TracingError>
-    where
-        E::TracingOperation: Operation<E::Type>,
-    {
+    ) -> Result<Vec<Self>, TracingError> {
         if inputs.iter().skip(1).any(|input| !Rc::ptr_eq(&builder, &input.builder)) {
             return Err(TracingError::MismatchedProgramBuilders);
         }
@@ -202,10 +199,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     }
 
     /// Stages a single-input primitive application and returns its unique output.
-    pub fn unary(self, op: E::TracingOperation) -> Self
-    where
-        E::TracingOperation: Operation<E::Type>,
-    {
+    pub fn unary(self, op: E::TracingOperation) -> Self {
         Self::apply_staged_op(self.engine, self.builder.clone(), std::slice::from_ref(&self), op)
             .expect("unary traced staging should preserve non-empty inputs")
             .into_iter()
@@ -214,10 +208,7 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     }
 
     /// Stages a two-input primitive application and returns its unique output.
-    pub fn binary(self, rhs: Self, op: E::TracingOperation) -> Self
-    where
-        E::TracingOperation: Operation<E::Type>,
-    {
+    pub fn binary(self, rhs: Self, op: E::TracingOperation) -> Self {
         debug_assert!(Rc::ptr_eq(&self.builder, &rhs.builder));
         Self::apply_staged_op(self.engine, self.builder.clone(), &[self, rhs], op)
             .expect("binary traced staging should preserve non-empty inputs")

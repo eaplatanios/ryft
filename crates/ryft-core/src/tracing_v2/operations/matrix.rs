@@ -212,19 +212,14 @@ impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
     }
 }
 
-impl<
-    'engine,
-    V: Traceable<ArrayType>,
-    O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
-    L: Clone,
-    E: crate::tracing_v2::Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized,
-> MatrixOps for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType>, E: crate::tracing_v2::Engine<Type = ArrayType, Value = V> + ?Sized> MatrixOps
+    for Tracer<'engine, E>
 where
-    O: Operation<ArrayType>,
+    E::TracingOperation: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, O::matmul_op())
+        self.binary(rhs, E::TracingOperation::matmul_op())
     }
 
     #[inline]
@@ -232,7 +227,7 @@ where
         if matrix_transpose_is_identity_type(&self.r#type()) {
             return self;
         }
-        self.unary(O::matrix_transpose_op())
+        self.unary(E::TracingOperation::matrix_transpose_op())
     }
 }
 

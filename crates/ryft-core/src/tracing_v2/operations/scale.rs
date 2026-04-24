@@ -126,11 +126,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
 impl<
     'engine,
     V: Value<ArrayType> + ZeroLike + Mul<Output = V>,
-    O: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V> + 'static,
-    OuterLinearOperation: Clone + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-        + ?Sized
-        + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'engine, E>>
@@ -139,7 +135,7 @@ impl<
 > InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
     for ScaleOperation<ArrayType, V>
 where
-    O: Operation<ArrayType>,
+    E::TracingOperation: MulTracingOperation<ArrayType, V> + ScaleTracingOperation<ArrayType, V> + 'static,
 {
     fn interpret(
         &self,
@@ -160,11 +156,8 @@ where
     V: Traceable<ArrayType> + Mul<Output = V>,
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
     V: Differentiable<ArrayType>,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    E::LinearOperation:
+        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
 {
     fn jvp(
         &self,

@@ -135,11 +135,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for RightMatMulOperation<V> {
 impl<
     'engine,
     V: Value<ArrayType> + MatrixOps + ZeroLike,
-    O: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V> + 'static,
-    OuterLinearOperation: Clone + 'static,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = OuterLinearOperation>
-        + ?Sized
-        + 'static,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     InnerLinearOperation: Clone
         + Operation<ArrayType>
         + LinearAddOperation<ArrayType, Tracer<'engine, E>>
@@ -151,7 +147,7 @@ impl<
 > InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
     for RightMatMulOperation<V>
 where
-    O: Operation<ArrayType>,
+    E::TracingOperation: MatMulTracingOperation<ArrayType, V> + MatrixTransposeTracingOperation<ArrayType, V> + 'static,
 {
     fn interpret(
         &self,
@@ -169,11 +165,8 @@ impl<V, E> DifferentiableOperation<E> for RightMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    E::LinearOperation: Clone
-        + Operation<ArrayType>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    E::LinearOperation:
+        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
     EngineTangent<E>: super::matrix::MatrixTangentSpace<V>,
 {
     fn jvp(

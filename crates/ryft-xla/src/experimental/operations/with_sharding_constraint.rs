@@ -57,8 +57,6 @@ impl WithShardingConstraintOperation {
         self.base_custom_primitive::<ShardMapTensor>()
             .with_jvp_rule_for::<crate::experimental::engine::XlaEngine<'static>, _>(self.clone())
             .with_linearized_jit_rule_for::<
-                XlaPrimitiveOperation,
-                LinearPrimitiveOperation<ShardMapTensor>,
                 LinearPrimitiveOperation<ShardMapTracer>,
                 crate::experimental::engine::XlaEngine<'static>,
                 _,
