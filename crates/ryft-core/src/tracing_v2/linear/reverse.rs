@@ -181,8 +181,9 @@ where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
 }
 
-/// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`] and
-/// pulls back a unit seed to obtain both the primal scalar output and its gradient.
+/// Concrete-value dispatch for [`value_and_grad`]: evaluates the user function via [`vjp`], checks
+/// that the output is a rank-0 scalar array, and pulls back a unit seed to obtain both the primal
+/// scalar output and its gradient.
 impl<
     E,
     V: Value<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
@@ -216,6 +217,7 @@ where
     {
         let (output, pullback): (V, Program<ArrayType, V, E::LinearOperation, V, Input>) =
             vjp(engine, |input| Ok(function(input)), primals)?;
+        ensure_scalar_gradient_output_type(output.r#type().as_ref())?;
         let gradient = pullback.interpret(output.one_like())?;
         Ok((output, gradient))
     }
@@ -291,7 +293,8 @@ where
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
 /// This is the most direct reverse-mode API when the caller needs both the function value and the
-/// gradient at the same primal point.
+/// gradient at the same primal point. The function must return exactly one rank-0 scalar array
+/// leaf. Use [`vjp`] directly for vector-valued functions that need an explicit output cotangent.
 #[allow(private_bounds, private_interfaces)]
 pub fn value_and_grad<'engine, E, F, Input, Leaf>(
     engine: &'engine E,
@@ -309,10 +312,54 @@ where
     Leaf::invoke(engine, function, primals)
 }
 
+/// Computes a scalar-output value, auxiliary outputs, and the reverse-mode gradient.
+///
+/// The differentiated value is the first element returned by `function`; it must be exactly one
+/// rank-0 scalar array leaf. Auxiliary leaves are returned to the caller but seeded with zero
+/// cotangents when the pullback is interpreted, so they do not contribute to the gradient.
+///
+/// This mirrors the semantics of a `has_aux` transform while keeping the Rust API explicit: the
+/// primal value and auxiliary data are returned as `((value, aux), gradient)`.
+#[allow(private_bounds)]
+pub fn value_and_grad_with_aux<'engine, E, F, Input, Aux, V>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<((V, Aux), Input), TracingError>
+where
+    E: Engine<Type = ArrayType, Value = V> + 'static,
+    V: Value<ArrayType>
+        + ZeroLike
+        + OneLike
+        + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    V: for<'call> Parameterized<V, To<Tracer<'call, E>> = Tracer<'call, E>>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Aux: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input::Family: for<'call> ParameterizedFamily<Tracer<'call, E>>,
+    Aux::Family: ParameterizedFamily<Tracer<'engine, E>, To = Aux::To<Tracer<'engine, E>>>,
+    V::Family: for<'call> ParameterizedFamily<Tracer<'call, E>, To = Tracer<'call, E>>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> (Tracer<'engine, E>, Aux::To<Tracer<'engine, E>>),
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<E>,
+    E::LinearOperation: CoreLinearProgramOperation<V>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
+{
+    let ((output, aux), pullback): ((V, Aux), Program<ArrayType, V, E::LinearOperation, (V, Aux), Input>) =
+        vjp(engine, |input| Ok(function(input)), primals)?;
+    ensure_scalar_gradient_output_type(output.r#type().as_ref())?;
+    let aux_zeros = Aux::from_parameters(aux.parameter_structure(), aux.parameters().map(ZeroLike::zero_like))?;
+    let gradient = pullback.interpret((output.one_like(), aux_zeros))?;
+    Ok(((output, aux), gradient))
+}
+
 /// Computes the reverse-mode gradient of a scalar-output function.
 ///
 /// [`grad`] is just [`value_and_grad`] with the primal result discarded, but it is the most common
-/// user-facing reverse-mode entry point and therefore gets its own dedicated wrapper.
+/// user-facing reverse-mode entry point and therefore gets its own dedicated wrapper. The function
+/// must return exactly one rank-0 scalar array leaf. Use [`vjp`] directly for vector-valued functions
+/// that need an explicit output cotangent.
 #[allow(private_bounds, private_interfaces)]
 pub fn grad<'engine, E, F, Input, Leaf>(engine: &'engine E, function: F, primals: Input) -> Result<Input, TracingError>
 where
@@ -326,9 +373,47 @@ where
     Leaf::invoke(engine, function, primals).map(|(_, gradient)| gradient)
 }
 
+/// Computes the reverse-mode gradient and auxiliary outputs of a scalar-output function.
+///
+/// This is [`value_and_grad_with_aux`] with the primal scalar value discarded. The return order is
+/// `(gradient, aux)`, matching the common use case where auxiliary outputs are diagnostics or
+/// cached intermediates and the gradient remains the primary result.
+#[allow(private_bounds)]
+pub fn grad_with_aux<'engine, E, F, Input, Aux, V>(
+    engine: &'engine E,
+    function: F,
+    primals: Input,
+) -> Result<(Input, Aux), TracingError>
+where
+    E: Engine<Type = ArrayType, Value = V> + 'static,
+    V: Value<ArrayType>
+        + ZeroLike
+        + OneLike
+        + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    V: for<'call> Parameterized<V, To<Tracer<'call, E>> = Tracer<'call, E>>,
+    Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Aux: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    Input::Family: for<'call> ParameterizedFamily<Tracer<'call, E>>,
+    Aux::Family: ParameterizedFamily<Tracer<'engine, E>, To = Aux::To<Tracer<'engine, E>>>,
+    V::Family: for<'call> ParameterizedFamily<Tracer<'call, E>, To = Tracer<'call, E>>,
+    F: FnOnce(Input::To<Tracer<'engine, E>>) -> (Tracer<'engine, E>, Aux::To<Tracer<'engine, E>>),
+    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E::TracingOperation: DifferentiableOperation<E>,
+    E::LinearOperation: CoreLinearProgramOperation<V>
+        + LinearAddOperation<ArrayType, V>
+        + LinearNegOperation<ArrayType, V>
+        + LinearScaleOperation<ArrayType, V>,
+{
+    value_and_grad_with_aux(engine, function, primals).map(|((_, aux), gradient)| (gradient, aux))
+}
+
 #[cfg(test)]
 mod tests {
+    use ndarray::arr2;
+
+    use crate::tracing::TracingError;
     use crate::tracing_v2::engine::ArrayScalarEngine;
+    use crate::tracing_v2::operations::matrix::ndarray_support::Array2Engine;
     use crate::tracing_v2::{DifferentiationError, Tracer};
 
     use super::*;
@@ -363,5 +448,49 @@ mod tests {
             result,
             Err(TracingError::Differentiation(DifferentiationError::MissingTracedReverseModeInputLeaves))
         ));
+    }
+
+    #[test]
+    fn test_grad_rejects_non_scalar_array_output() {
+        let engine = Array2Engine::<f64>::new();
+
+        let result = grad(&engine, |input| input, arr2(&[[1.0, 2.0], [3.0, 4.0]]));
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
+                if output_type.rank() == 2
+        ));
+    }
+
+    #[test]
+    fn test_value_and_grad_with_aux_ignores_aux_cotangents() {
+        let engine = ArrayScalarEngine::<f64>::new();
+
+        let ((value, aux), gradient): ((f64, (f64, f64)), (f64, f64)) = value_and_grad_with_aux(
+            &engine,
+            |(x, y)| {
+                let value = x.clone() * y.clone();
+                let aux = (x.clone() + y, x.clone() * x);
+                (value, aux)
+            },
+            (2.0f64, 3.0f64),
+        )
+        .unwrap();
+
+        assert_eq!(value, 6.0);
+        assert_eq!(aux, (5.0, 4.0));
+        assert_eq!(gradient, (3.0, 2.0));
+    }
+
+    #[test]
+    fn test_grad_with_aux_returns_gradient_and_aux() {
+        let engine = ArrayScalarEngine::<f64>::new();
+
+        let (gradient, aux): ((f64, f64), f64) =
+            grad_with_aux(&engine, |(x, y)| (x.clone() * y.clone(), x + y), (2.0f64, 3.0f64)).unwrap();
+
+        assert_eq!(gradient, (3.0, 2.0));
+        assert_eq!(aux, 5.0);
     }
 }

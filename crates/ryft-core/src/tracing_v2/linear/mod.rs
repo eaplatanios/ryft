@@ -13,7 +13,7 @@ use crate::{
         Value,
     },
     tracing_v2::{
-        LinearPrimitiveOperation,
+        DifferentiationError, LinearPrimitiveOperation,
         engine::Engine,
         forward::{JvpTracer, TangentSpace},
         jit::{Tracer, interpret_and_trace},
@@ -47,7 +47,7 @@ pub use program::transpose_linear_program;
 pub use program::transpose_linear_program_with_output_examples;
 pub use program::transpose_traced_linear_program;
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
-pub use reverse::{grad, jvp_program, value_and_grad, vjp};
+pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
 pub use term::{LinearTerm, Linearized};
 
 pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
@@ -67,6 +67,21 @@ type TracedLinearProgram<'engine, E> = Program<
 #[inline]
 fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
     vec![Placeholder; count]
+}
+
+#[inline]
+fn ensure_scalar_gradient_output_type(output_type: &ArrayType) -> Result<(), TracingError> {
+    if output_type.rank() != 0 {
+        return Err(DifferentiationError::NonScalarGradientOutput { output_type: output_type.clone() }.into());
+    }
+    Ok(())
+}
+
+fn ensure_single_scalar_gradient_output<V: Traceable<ArrayType>>(outputs: &[V]) -> Result<(), TracingError> {
+    if outputs.len() != 1 {
+        return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
+    }
+    ensure_scalar_gradient_output_type(outputs[0].r#type().as_ref())
 }
 
 /// Traces one type-directed body and normalizes the captured program to flat leaf vectors.
@@ -134,9 +149,7 @@ where
 {
     let (outputs, pushforward) =
         linearize_traced_program::<V, O, L, E>(engine, tracing_builder, traced_program, traced_primals)?;
-    if outputs.len() != 1 {
-        return Err(TracingError::InvalidOutputCount { expected: 1, got: outputs.len() });
-    }
+    ensure_single_scalar_gradient_output(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
     let pullback = transpose_traced_linear_program(engine, traced_output.builder.clone(), &pushforward)?;
     let traced_gradient = pullback.interpret(vec![traced_output.one_like()])?;
@@ -152,13 +165,15 @@ mod tests {
     };
 
     use indoc::indoc;
+    use ndarray::arr2;
 
     use crate::{
         parameters::Placeholder,
         tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError},
         tracing_v2::{
-            CustomPrimitive, DifferentiableOperation, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation,
-            Sin, engine::ArrayScalarEngine, test_support,
+            CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
+            PrimitiveOperation, Sin, engine::ArrayScalarEngine, operations::matrix::ndarray_support::Array2Engine,
+            test_support,
         },
         types::{ArrayType, DataType, TypeError},
     };
@@ -423,6 +438,32 @@ mod tests {
         let (grad_x2, grad_y2) = compiled.interpret((1.0f64, 5.0f64)).unwrap();
         approx_eq(grad_x2, 5.0 + 1.0f64.cos());
         approx_eq(grad_y2, 1.0);
+    }
+
+    #[test]
+    fn test_scalar_gradient_output_requires_single_leaf() {
+        let result = ensure_single_scalar_gradient_output(&[1.0f64, 2.0f64]);
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::InvalidGradientOutputLeafCount {
+                expected: 1,
+                got: 2
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_compile_grad_rejects_non_scalar_array_output() {
+        let engine = Array2Engine::<f64>::new();
+
+        let result = compile_grad(&engine, |input| input, arr2(&[[1.0, 2.0], [3.0, 4.0]]));
+
+        assert!(matches!(
+            result,
+            Err(TracingError::Differentiation(DifferentiationError::NonScalarGradientOutput { output_type }))
+                if output_type.rank() == 2
+        ));
     }
 
     // -----------------------------------------------------------------------

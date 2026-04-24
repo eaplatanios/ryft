@@ -330,6 +330,34 @@ impl<V: Traceable<ArrayType> + Parameter + ZeroLike + 'static> CustomPrimitive<A
         self.with_jvp_rule_for::<E, _>(rule)
     }
 
+    /// Registers one custom derivative rule for the canonical core staged carriers.
+    ///
+    /// This is a convenience wrapper for the common case where one rule type can provide both the
+    /// eager forward-mode [`DifferentiableOperation`] rule and the nested linearized-JIT replay rule.
+    /// It is equivalent to calling [`Self::with_jvp_rule`] followed by
+    /// [`Self::with_linearized_jit_rule`] with clones of the same rule.
+    ///
+    /// This does not register a transpose rule for treating the custom primitive itself as a linear
+    /// operation. Use [`Self::with_transpose_rule`] when a custom primitive must appear directly in a
+    /// transposed linear program.
+    pub fn with_derivative_rule<E, Rule>(self, rule: Rule) -> Self
+    where
+        V: Value<ArrayType> + Differentiable<ArrayType>,
+        E: Engine<
+                Type = ArrayType,
+                Value = V,
+                TracingOperation = PrimitiveOperation<ArrayType, V>,
+                LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
+            > + 'static,
+        Rule: Clone
+            + DifferentiableOperation<E>
+            + for<'engine> InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>>>
+            + 'static,
+        for<'engine> Linearized<Tracer<'engine, E>>: Traceable<ArrayType>,
+    {
+        self.with_jvp_rule::<E, _>(rule.clone()).with_linearized_jit_rule::<E, _>(rule)
+    }
+
     /// Registers one linearized-JIT replay rule for the canonical core staged carriers.
     #[doc(hidden)]
     pub fn with_linearized_jit_rule<E, Rule>(mut self, rule: Rule) -> Self
@@ -819,8 +847,7 @@ mod tests {
     fn test_custom_primitive_jvp_rule_participates_in_grad_and_linearized_jit_replay() {
         let engine = ArrayScalarEngine::<f64>::new();
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0))
-            .with_jvp_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0))
-            .with_linearized_jit_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0));
+            .with_derivative_rule::<ArrayScalarEngine<f64>, _>(ShiftOp::new(2.0));
 
         assert_eq!(
             grad(

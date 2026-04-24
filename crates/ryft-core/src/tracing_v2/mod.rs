@@ -31,8 +31,8 @@ pub use engine::Engine;
 pub use forward::{Differentiable, Dual, EngineTangent, JvpTracer, TangentSpace, jvp};
 pub use jit::{Tracer, TracerState, interpret_and_trace, trace};
 pub use linear::{
-    CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad, hessian,
-    jacfwd, jacrev, jvp_program, value_and_grad, vjp,
+    CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,
+    grad_with_aux, hessian, jacfwd, jacrev, jvp_program, value_and_grad, value_and_grad_with_aux, vjp,
 };
 pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
