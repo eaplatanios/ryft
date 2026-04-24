@@ -6,7 +6,10 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::{LinearPrimitiveOperation, engine::Engine};
+use ryft_core::tracing_v2::{
+    LinearPrimitiveOperation,
+    engines::{DifferentiableEngine, Engine},
+};
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};
@@ -125,7 +128,6 @@ impl<'c> Engine for XlaEngine<'c> {
     type Type = ArrayType;
     type Value = ShardMapTensor;
     type TracingOperation = XlaPrimitiveOperation;
-    type LinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
 
     fn zero(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
         validate_identity_synthesis("zero", array_type)?;
@@ -136,6 +138,11 @@ impl<'c> Engine for XlaEngine<'c> {
         validate_identity_synthesis("one", array_type)?;
         Ok(ShardMapTensor::one(array_type.clone()))
     }
+}
+
+impl<'c> DifferentiableEngine for XlaEngine<'c> {
+    type DifferentiableOperation = XlaPrimitiveOperation;
+    type LinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
 }
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {

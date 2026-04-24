@@ -8,7 +8,7 @@ use ryft_core::sharding::Sharding;
 use ryft_core::tracing::{InterpretableOperation, Operation, Traceable, TracingError};
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, Tracer,
-    engine::Engine,
+    engines::DifferentiableEngine,
     forward::{Differentiable, EngineTangent, JvpTracer},
     linear::{LinearTerm, Linearized},
     operations::unary_abstract,
@@ -55,10 +55,10 @@ impl WithShardingConstraintOperation {
     /// Returns the tensor-leaf custom primitive registration for this op.
     pub(crate) fn to_tensor_custom_primitive(&self) -> CustomPrimitive<ArrayType, ShardMapTensor> {
         self.base_custom_primitive::<ShardMapTensor>()
-            .with_jvp_rule_for::<crate::experimental::engine::XlaEngine<'static>, _>(self.clone())
+            .with_jvp_rule_for::<crate::experimental::engines::XlaEngine<'static>, _>(self.clone())
             .with_linearized_jit_rule_for::<
                 LinearPrimitiveOperation<ShardMapTracer>,
-                crate::experimental::engine::XlaEngine<'static>,
+                crate::experimental::engines::XlaEngine<'static>,
                 _,
             >(self.clone())
             .with_extension(self.clone())
@@ -141,7 +141,7 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperat
 
 trait WithShardingConstraintJvpValue<E>: Clone + Differentiable<ArrayType> + Traceable<ArrayType>
 where
-    E: Engine<Type = ArrayType, Value = Self, LinearOperation = LinearPrimitiveOperation<Self>> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType, Value = Self, LinearOperation = LinearPrimitiveOperation<Self>> + ?Sized,
     Self: Sized,
 {
     fn apply_constraint_tangent(
@@ -152,8 +152,11 @@ where
 
 impl<E> WithShardingConstraintJvpValue<E> for ShardMapTensor
 where
-    E: Engine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearPrimitiveOperation<ShardMapTensor>>
-        + ?Sized,
+    E: DifferentiableEngine<
+            Type = ArrayType,
+            Value = ShardMapTensor,
+            LinearOperation = LinearPrimitiveOperation<ShardMapTensor>,
+        > + ?Sized,
 {
     fn apply_constraint_tangent(
         op: &WithShardingConstraintOperation,
@@ -173,8 +176,11 @@ where
 
 impl<E> WithShardingConstraintJvpValue<E> for ShardMapTracer
 where
-    E: Engine<Type = ArrayType, Value = ShardMapTracer, LinearOperation = LinearPrimitiveOperation<ShardMapTracer>>
-        + ?Sized,
+    E: DifferentiableEngine<
+            Type = ArrayType,
+            Value = ShardMapTracer,
+            LinearOperation = LinearPrimitiveOperation<ShardMapTracer>,
+        > + ?Sized,
 {
     fn apply_constraint_tangent(
         op: &WithShardingConstraintOperation,
@@ -194,7 +200,7 @@ where
 
 impl<V, E> DifferentiableOperation<E> for WithShardingConstraintOperation
 where
-    E: Engine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>> + ?Sized,
     V: WithShardingConstraintJvpValue<E>,
     V: Differentiable<
             ArrayType,

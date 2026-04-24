@@ -30,7 +30,7 @@ use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
-use super::{engine::XlaEngine, lowering::LoweringError};
+use super::{engines::XlaEngine, lowering::LoweringError};
 
 /// Error type for internal shard-map metadata validation and Shardy rendering.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
@@ -436,7 +436,7 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging XLA programs directly from types.
-pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
+pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>, XlaPrimitiveOperation>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>;
@@ -3201,7 +3201,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     grad(
-                        crate::experimental::engine::XlaEngine::token(),
+                        crate::experimental::engines::XlaEngine::token(),
                         {
                             let mesh = mesh.clone();
                             let sharding = sharding.clone();

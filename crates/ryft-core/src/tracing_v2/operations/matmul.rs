@@ -6,7 +6,7 @@ use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     tracing::Traceable,
     tracing_v2::{
-        engine::Engine,
+        engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer},
     },
 };
@@ -66,7 +66,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
 
 impl<E> DifferentiableOperation<E> for MatMulOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>

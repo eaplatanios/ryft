@@ -4,7 +4,7 @@ use crate::{
     parameters::Parameterized,
     tracing::{InterpretableOperation, Operation, Traceable, TracingError},
     tracing_v2::{
-        engine::Engine,
+        engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, EngineTangent, JvpTracer},
         jit::Tracer,
         linear::LinearTerm,
@@ -202,13 +202,10 @@ pub trait LinearOperation<
 /// `E::Value` at `E::Type`, so the operation trait no longer needs separate `T`, `V`, `O`, `L`, or
 /// tangent parameters. Per-op capability requirements still live in the individual impl blocks
 /// through bounds on `E::Value` and [`EngineTangent<E>`].
-pub trait DifferentiableOperation<E: Engine + ?Sized>: Operation<E::Type>
+pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type>
 where
     E::Type: Display,
     E::Value: Differentiable<E::Type>,
-    E::LinearOperation: LinearAddOperation<E::Type, E::Value>
-        + LinearNegOperation<E::Type, E::Value>
-        + LinearScaleOperation<E::Type, E::Value>,
 {
     /// Applies the forward-mode JVP rule.
     ///
@@ -326,14 +323,11 @@ impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type + Display, V: Tra
     }
 }
 
-impl<InnerOperation: DifferentiableOperation<E> + ?Sized, E: Engine + ?Sized> DifferentiableOperation<E>
+impl<InnerOperation: DifferentiableOperation<E> + ?Sized, E: DifferentiableEngine + ?Sized> DifferentiableOperation<E>
     for Arc<InnerOperation>
 where
     E::Type: Display,
     E::Value: Differentiable<E::Type>,
-    E::LinearOperation: LinearAddOperation<E::Type, E::Value>
-        + LinearNegOperation<E::Type, E::Value>
-        + LinearScaleOperation<E::Type, E::Value>,
 {
     #[inline]
     fn jvp(

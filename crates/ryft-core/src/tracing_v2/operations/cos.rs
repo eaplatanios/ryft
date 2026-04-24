@@ -6,7 +6,7 @@ use std::{
 use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
-    engine::Engine,
+    engines::{DifferentiableEngine, Engine},
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
 };
@@ -85,7 +85,7 @@ impl<V: Traceable<ArrayType> + Cos> InterpretableOperation<ArrayType, V> for Cos
 
 impl<E> DifferentiableOperation<E> for CosOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Cos + Sin + Neg<Output = E::Value> + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
@@ -115,12 +115,13 @@ impl<V: Traceable<ArrayType> + Cos + Sin + Neg<Output = V>, T: TangentSpace<Arra
     }
 }
 
-impl<'engine, V: Traceable<ArrayType> + Cos, E: Engine<Type = ArrayType, Value = V> + ?Sized> Cos for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType> + Cos, E, O> Cos for Tracer<'engine, E, O>
 where
-    E::TracingOperation: CosTracingOperation<ArrayType, V>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
+    O: Clone + Operation<ArrayType> + CosTracingOperation<ArrayType, V>,
 {
     #[inline]
     fn cos(self) -> Self {
-        self.unary(E::TracingOperation::cos_op())
+        self.unary(O::cos_op())
     }
 }

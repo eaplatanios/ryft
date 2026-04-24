@@ -7,7 +7,7 @@ use ryft_core::{
     tracing::{InterpretableOperation, Operation, TracingError},
     tracing_v2::{
         CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearPrimitiveOperation, LinearTerm,
-        engine::Engine,
+        engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer},
         linear::{Linearized, linearize_program, transpose_linear_program_with_output_examples},
         operations::{
@@ -36,12 +36,7 @@ fn make_linear_xla_rematerialize<E>(
     input_primals: Vec<ShardMapTensor>,
 ) -> Result<LinearRematerializeOperation<ArrayType, ShardMapTensor>, TracingError>
 where
-    E: Engine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            TracingOperation = XlaPrimitiveOperation,
-            LinearOperation = XlaLinearOperation,
-        > + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
@@ -211,12 +206,7 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation
 
 impl<E> DifferentiableOperation<E> for XlaPrimitiveOperation
 where
-    E: Engine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            TracingOperation = XlaPrimitiveOperation,
-            LinearOperation = XlaLinearOperation,
-        > + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
     ShardMapTensor: Differentiable<
             ArrayType,
             Tangent<XlaLinearOperation> = LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>,
@@ -271,7 +261,9 @@ where
             Self::ShardMap(op) => op.jvp(engine, inputs),
             Self::LinearShardMap(op) => op.jvp(engine, inputs),
             Self::WithShardingConstraint(op) => op.jvp(engine, inputs),
-            Self::Custom(op) => op.jvp(engine, inputs),
+            Self::Custom(op) => {
+                Err(ryft_core::tracing_v2::CustomOperationError::MissingRule { op: op.name(), transform: "jvp" }.into())
+            }
         }
     }
 }
@@ -466,7 +458,7 @@ mod tests {
         let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
         let outputs = operation
             .jvp(
-                crate::experimental::engine::XlaEngine::token(),
+                crate::experimental::engines::XlaEngine::token(),
                 &[JvpTracer {
                     primal: ShardMapTensor::new(scalar_type()),
                     tangent: LinearTerm::from_staged_parts(tangent_atom, tangent_builder.clone()),

@@ -13,10 +13,10 @@ use crate::{
         Value,
     },
     tracing_v2::{
-        DifferentiationError, LinearPrimitiveOperation,
-        engine::Engine,
+        Differentiable, DifferentiationError, LinearPrimitiveOperation,
+        engines::{DifferentiableEngine, Engine},
         forward::{JvpTracer, TangentSpace},
-        jit::{Tracer, interpret_and_trace},
+        jit::{DifferentiableTracer, Tracer, interpret_and_trace_with_operation},
         operations::{
             CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, LinearAddOperation,
             LinearNegOperation, LinearScaleOperation, RematerializeTracingOperation,
@@ -53,14 +53,15 @@ pub use term::{LinearTerm, Linearized};
 pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
 pub(crate) use reverse::jvp_traced;
 
-type LinearizedTracedValue<'engine, E> = Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>;
+type LinearizedTracedValue<'engine, E, O = <E as Engine>::TracingOperation> =
+    Linearized<Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>;
 
-type TracedLinearProgram<'engine, E> = Program<
+type TracedLinearProgram<'engine, E, O = <E as Engine>::TracingOperation> = Program<
     ArrayType,
-    Tracer<'engine, E>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>,
-    Vec<Tracer<'engine, E>>,
-    Vec<Tracer<'engine, E>>,
+    Tracer<'engine, E, O>,
+    LinearPrimitiveOperation<Tracer<'engine, E, O>>,
+    Vec<Tracer<'engine, E, O>>,
+    Vec<Tracer<'engine, E, O>>,
 >;
 
 #[inline]
@@ -89,25 +90,24 @@ fn ensure_single_scalar_gradient_output<V: Traceable<ArrayType>>(outputs: &[V]) 
 /// original function uses tuples, structs, or other parameterized shapes. This helper is the bridge
 /// between those worlds: it traces the structured function once, then retags the captured program
 /// so downstream reverse-mode code can operate on a canonical `Vec<V>` representation.
-pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, E, F>(
+pub(crate) fn trace_flat_program_from_input_types<'engine, Input, Output, V, E, O, F>(
     engine: &'engine E,
     function: F,
     input_types: Input,
-) -> Result<(Output, Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>), TracingError>
+) -> Result<(Output, Program<ArrayType, V, O, Vec<V>, Vec<V>>), TracingError>
 where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<ArrayType, ParameterStructure: Clone>,
     Output: Parameterized<ArrayType, ParameterStructure: Clone>,
-    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E>>,
+    Input::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E, O>>,
+    Output::Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<'engine, E, O>>,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
+    O: Clone + Operation<ArrayType>,
+    F: FnOnce(Input::To<Tracer<'engine, E, O>>) -> Result<Output::To<Tracer<'engine, E, O>>, TracingError>,
 {
     let input_leaf_count = input_types.parameter_structure().parameter_count();
-    let (output_types, traced_program): (
-        Output,
-        Program<ArrayType, V, E::TracingOperation, Input::To<V>, Output::To<V>>,
-    ) = crate::tracing_v2::jit::trace(engine, function, input_types)?;
+    let (output_types, traced_program): (Output, Program<ArrayType, V, O, Input::To<V>, Output::To<V>>) =
+        crate::tracing_v2::jit::trace_with_operation::<E, O, _, _, _>(engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let Program { atoms, input_ids, output_ids, instructions, .. } = traced_program;
     let traced_program = Program {
@@ -129,21 +129,19 @@ where
 /// primal body and symbolic primals from an enclosing trace, it builds the pushforward, transposes
 /// it into a pullback, seeds that pullback with a symbolic one, and returns both the traced scalar
 /// output and the traced gradient leaves.
-fn reverse_mode_scalar_traced_program<'engine, V, E>(
+fn reverse_mode_scalar_traced_program<'engine, V, E, O>(
     engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::TracingOperation>>>,
-    traced_program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
-    traced_primals: Vec<Tracer<'engine, E>>,
-) -> Result<(Tracer<'engine, E>, Vec<Tracer<'engine, E>>), TracingError>
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
+    traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    traced_primals: Vec<Tracer<'engine, E, O>>,
+) -> Result<(Tracer<'engine, E, O>, Vec<Tracer<'engine, E, O>>), TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>> + 'static,
+    LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
 {
-    let (outputs, pushforward) =
-        linearize_traced_program::<V, E>(engine, tracing_builder, traced_program, traced_primals)?;
+    let (outputs, pushforward) = linearize_traced_program(engine, tracing_builder, traced_program, traced_primals)?;
     ensure_single_scalar_gradient_output(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
     let pullback = transpose_traced_linear_program(engine, traced_output.builder.clone(), &pushforward)?;
@@ -167,7 +165,7 @@ mod tests {
         tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError},
         tracing_v2::{
             CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
-            PrimitiveOperation, Sin, engine::ArrayScalarEngine, operations::matrix::ndarray_support::Array2Engine,
+            PrimitiveOperation, Sin, engines::ArrayScalarEngine, operations::matrix::ndarray_support::Array2Engine,
             test_support,
         },
         types::{ArrayType, DataType, TypeError},
@@ -253,6 +251,113 @@ mod tests {
             }
             Ok(vec![inputs[0].clone()])
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct OrdinaryAddOperation;
+
+    impl Display for OrdinaryAddOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("ordinary_add")
+        }
+    }
+
+    impl Operation<ArrayType> for OrdinaryAddOperation {
+        fn name(&self) -> &'static str {
+            "ordinary_add"
+        }
+
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            crate::tracing_v2::operations::AddOperation.infer_output_types(input_types)
+        }
+    }
+
+    impl InterpretableOperation<ArrayType, f64> for OrdinaryAddOperation {
+        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
+            crate::tracing_v2::operations::AddOperation.interpret(inputs)
+        }
+    }
+
+    impl crate::tracing_v2::operations::AddTracingOperation<ArrayType, f64> for OrdinaryAddOperation {
+        fn add_op() -> Self {
+            Self
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DifferentiableAddOperation;
+
+    impl Display for DifferentiableAddOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("differentiable_add")
+        }
+    }
+
+    impl Operation<ArrayType> for DifferentiableAddOperation {
+        fn name(&self) -> &'static str {
+            "differentiable_add"
+        }
+
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            crate::tracing_v2::operations::AddOperation.infer_output_types(input_types)
+        }
+    }
+
+    impl InterpretableOperation<ArrayType, f64> for DifferentiableAddOperation {
+        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, TracingError> {
+            crate::tracing_v2::operations::AddOperation.interpret(inputs)
+        }
+    }
+
+    impl crate::tracing_v2::operations::AddTracingOperation<ArrayType, f64> for DifferentiableAddOperation {
+        fn add_op() -> Self {
+            Self
+        }
+    }
+
+    struct SplitCarrierEngine;
+
+    impl Engine for SplitCarrierEngine {
+        type Type = ArrayType;
+        type Value = f64;
+        type TracingOperation = OrdinaryAddOperation;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(0.0)
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(1.0)
+        }
+    }
+
+    impl DifferentiableEngine for SplitCarrierEngine {
+        type DifferentiableOperation = DifferentiableAddOperation;
+        type LinearOperation = LinearPrimitiveOperation<f64>;
+    }
+
+    impl DifferentiableOperation<SplitCarrierEngine> for DifferentiableAddOperation {
+        fn jvp(
+            &self,
+            engine: &SplitCarrierEngine,
+            inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
+        ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
+            crate::tracing_v2::operations::AddOperation.jvp(engine, inputs)
+        }
+    }
+
+    #[test]
+    fn test_concrete_ad_uses_differentiable_carrier_instead_of_tracing_carrier() {
+        let engine = SplitCarrierEngine;
+        let (_, traced_program): (f64, Program<ArrayType, f64, OrdinaryAddOperation, f64, f64>) =
+            crate::tracing_v2::interpret_and_trace(&engine, |x: Tracer<SplitCarrierEngine>| Ok(x.clone() + x), 2.0f64)
+                .unwrap();
+        assert_eq!(traced_program.instructions[0].operation.name(), "ordinary_add");
+
+        let (primal, pushforward) = jvp_program(&engine, |x| Ok(x.clone() + x), 2.0f64).unwrap();
+
+        approx_eq(primal, 4.0);
+        approx_eq(pushforward.interpret(3.0f64).unwrap(), 6.0);
     }
 
     #[test]
@@ -350,7 +455,6 @@ mod tests {
         type Type = ArrayType;
         type Value = f64;
         type TracingOperation = PrimitiveOperation<f64>;
-        type LinearOperation = LinearPrimitiveOperation<f64>;
 
         fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
             Err(TypeError { message: "test engine cannot synthesize zero".to_string() }.into())
@@ -407,7 +511,7 @@ mod tests {
         let grad_at_2 = compiled.interpret(2.0f64).unwrap();
         approx_eq(grad_at_2, 2.0 * 2.0 + 2.0f64.cos());
 
-        // Verify at a DIFFERENT primal point Ã¢â‚¬â€ this is the key test.
+        // Verify at a different primal point.
         let grad_at_half = compiled.interpret(0.5f64).unwrap();
         approx_eq(grad_at_half, 2.0 * 0.5 + 0.5f64.cos());
 

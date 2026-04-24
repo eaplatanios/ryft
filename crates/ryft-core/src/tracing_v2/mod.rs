@@ -9,7 +9,7 @@ pub mod benchmarking;
 /// Errors raised while materializing dense Jacobian- and Hessian-style differentiation results.
 pub mod differentiation;
 /// Backend token interface for metadata-driven value synthesis and carrier selection.
-pub mod engine;
+pub mod engines;
 /// Forward-mode automatic differentiation over paired primal/tangent leaves.
 pub mod forward;
 /// Symbolic tracing entry points that capture staged programs from Rust closures.
@@ -27,7 +27,7 @@ pub(crate) mod test_support;
 
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::DifferentiationError;
-pub use engine::Engine;
+pub use engines::{DifferentiableEngine, Engine};
 pub use forward::{Differentiable, Dual, EngineTangent, JvpTracer, TangentSpace, jvp};
 pub use jit::{Tracer, TracerState, interpret_and_trace, trace};
 pub use linear::{

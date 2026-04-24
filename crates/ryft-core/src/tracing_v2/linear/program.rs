@@ -39,19 +39,17 @@ where
 /// JVP immediately, it builds a staged [`Program`] over linear operations that can be replayed
 /// later on arbitrary tangent inputs at the same primal point.
 #[doc(hidden)]
-pub fn linearize_program<Input, Output, V, E>(
+pub fn linearize_program<Input, Output, V, E, O>(
     engine: &E,
-    program: &Program<ArrayType, V, E::TracingOperation, Input, Output>,
+    program: &Program<ArrayType, V, O, Input, Output>,
     input_primals: Vec<V>,
 ) -> Result<Program<ArrayType, V, E::LinearOperation, Input, Output>, TracingError>
 where
     V: Traceable<ArrayType> + ZeroLike,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    E::LinearOperation:
-        LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<E>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    O: Clone + DifferentiableOperation<E>,
 {
     fn tangent_for_atom<V, Input, Output, ProgramOperation, LinearOperation>(
         _program: &Program<ArrayType, V, ProgramOperation, Input, Output>,
@@ -308,24 +306,27 @@ where
 /// cotangents represented as traced leaves in the enclosing outer trace. `tracing_builder` is that
 /// outer traced-program builder.
 #[allow(private_bounds)]
-pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E>(
+pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E, TracingOperation>(
     engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::TracingOperation>>>,
-    program: &Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
-) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Output, Input>, TracingError>
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, TracingOperation>>>,
+    program: &Program<ArrayType, Tracer<'engine, E, TracingOperation>, O, Input, Output>,
+) -> Result<Program<ArrayType, Tracer<'engine, E, TracingOperation>, O, Output, Input>, TracingError>
 where
     V: Traceable<ArrayType>,
-    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
-    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
-    O: CoreLinearProgramOperation<Tracer<'engine, E>> + LinearAddOperation<ArrayType, Tracer<'engine, E>> + Clone,
-    E: Engine<Type = ArrayType, Value = V, TracingOperation: Operation<ArrayType>> + ?Sized + 'static,
+    Input: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
+    Output: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
+    O: CoreLinearProgramOperation<Tracer<'engine, E, TracingOperation>>
+        + LinearAddOperation<ArrayType, Tracer<'engine, E, TracingOperation>>
+        + Clone,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    TracingOperation: Clone + Operation<ArrayType>,
 {
     transpose_linear_program_with_factories(
         program,
-        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, output_type, _| {
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E, TracingOperation>, O>>>, output_type, _| {
             Ok(builder.borrow_mut().add_input(output_type.clone()))
         },
-        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, input_type| {
+        |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E, TracingOperation>, O>>>, input_type| {
             let zero_type = input_type.clone();
             let zero_atom = tracing_builder.borrow_mut().add_constant(engine.zero(input_type)?);
             let zero_tracer = Tracer::from_staged_parts(zero_atom, zero_type, tracing_builder.clone(), engine);

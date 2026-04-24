@@ -10,7 +10,7 @@ use crate::{
     macros::check_input_count,
     tracing::{Traceable, TracingError},
     tracing_v2::{
-        engine::Engine,
+        engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
         linear::LinearTerm,
         operations::constants::ZeroLike,
@@ -123,7 +123,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
 
 impl<E> DifferentiableOperation<E> for AddOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Add<Output = E::Value> + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>

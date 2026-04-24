@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
-    engine::Engine,
+    engines::{DifferentiableEngine, Engine},
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
 };
@@ -83,7 +83,7 @@ impl<V: Traceable<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for Sin
 
 impl<E> DifferentiableOperation<E> for SinOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Sin + Cos + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
@@ -110,12 +110,13 @@ impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for
     }
 }
 
-impl<'engine, V: Traceable<ArrayType> + Sin, E: Engine<Type = ArrayType, Value = V> + ?Sized> Sin for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType> + Sin, E, O> Sin for Tracer<'engine, E, O>
 where
-    E::TracingOperation: SinTracingOperation<ArrayType, V>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
+    O: Clone + Operation<ArrayType> + SinTracingOperation<ArrayType, V>,
 {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(E::TracingOperation::sin_op())
+        self.unary(O::sin_op())
     }
 }

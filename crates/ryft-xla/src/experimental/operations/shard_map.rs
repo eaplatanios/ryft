@@ -15,8 +15,8 @@ use ryft_core::{
     },
     tracing_v2::{
         Cos, CustomOperationError, CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation,
-        LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, PrimitiveOperation, Sin, Tracer,
-        engine::Engine,
+        LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, Sin, Tracer,
+        engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer},
         operations::{
             constants::{OneLike, ZeroLike},
@@ -33,7 +33,7 @@ use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTensor, ShardMapTraceError, ShardMapTracer, TracedShardMap, fold_xla_program_constants,
 };
-use crate::experimental::{engine::XlaEngine, ops::XlaPrimitiveOperation};
+use crate::experimental::{engines::XlaEngine, ops::XlaPrimitiveOperation};
 
 /// Shared program type used by erased shard-map bodies.
 type FlatShardMapProgram =
@@ -676,10 +676,9 @@ impl LinearOperation<ArrayType, ShardMapTensor> for LinearShardMapOperation<Shar
 
 impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTensor>
 where
-    E: Engine<
+    E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            TracingOperation = XlaPrimitiveOperation,
             LinearOperation = LinearPrimitiveOperation<ShardMapTensor>,
         > + ?Sized,
     ShardMapTensor: Differentiable<
@@ -726,10 +725,9 @@ where
 
 impl<E> DifferentiableOperation<E> for LinearShardMapOperation<ShardMapTensor>
 where
-    E: Engine<
+    E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTensor,
-            TracingOperation = XlaPrimitiveOperation,
             LinearOperation = LinearPrimitiveOperation<ShardMapTensor>,
         > + ?Sized,
     ShardMapTensor: Differentiable<
@@ -848,10 +846,9 @@ impl LinearOperation<ArrayType, ShardMapTracer> for LinearShardMapOperation<Shar
 
 impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTracer>
 where
-    E: Engine<
+    E: DifferentiableEngine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            TracingOperation = PrimitiveOperation<ShardMapTracer>,
             LinearOperation = LinearPrimitiveOperation<ShardMapTracer>,
         > + ?Sized,
     ShardMapTracer: Differentiable<
@@ -2438,7 +2435,7 @@ mod tests {
 
         let outputs = operation
             .jvp(
-                crate::experimental::engine::XlaEngine::token(),
+                crate::experimental::engines::XlaEngine::token(),
                 &[JvpTracer { primal: ShardMapTensor::new(test_array_type()), tangent }],
             )
             .expect("linear tensor shard_map jvp should succeed");

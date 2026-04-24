@@ -1,5 +1,5 @@
 pub mod arrays;
-pub mod engine;
+pub mod engines;
 
 pub use arrays::{Array, ArrayError, NdArrayElement};
-pub use engine::NdArrayEngine;
+pub use engines::NdArrayEngine;

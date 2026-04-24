@@ -12,7 +12,7 @@ use crate::{
     tracing::{Traceable, TracingError},
     tracing_v2::{
         MatrixOps,
-        engine::Engine,
+        engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
         jit::Tracer,
         linear::LinearTerm,
@@ -264,10 +264,10 @@ impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> 
     }
 }
 
-impl<'engine, V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized> ReshapeOps
-    for Tracer<'engine, E>
+impl<'engine, V: Traceable<ArrayType>, E, O> ReshapeOps for Tracer<'engine, E, O>
 where
-    E::TracingOperation: ReshapeTracingOperation<ArrayType, V>,
+    E: Engine<Type = ArrayType, Value = V> + ?Sized,
+    O: Clone + Operation<ArrayType> + ReshapeTracingOperation<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -279,7 +279,7 @@ where
             self.engine,
             self.builder.clone(),
             std::slice::from_ref(&self),
-            E::TracingOperation::reshape_op(input_type, output_type),
+            O::reshape_op(input_type, output_type),
         )?
         .into_iter()
         .next()
@@ -436,7 +436,7 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType
 
 impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: ReshapeValue + ZeroLike + OneLike + MatrixOps + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>

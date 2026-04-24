@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::{
-    engine::Engine,
+    engines::{DifferentiableEngine, Engine},
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
     linear::LinearTerm,
@@ -155,7 +155,7 @@ where
 impl<V, E> DifferentiableOperation<E> for RightMatMulOperation<V>
 where
     V: MatrixValue + ZeroLike + Differentiable<ArrayType>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
     E::LinearOperation:
         LinearAddOperation<ArrayType, V> + LinearNegOperation<ArrayType, V> + LinearScaleOperation<ArrayType, V>,
     EngineTangent<E>: super::matrix::MatrixTangentSpace<V>,

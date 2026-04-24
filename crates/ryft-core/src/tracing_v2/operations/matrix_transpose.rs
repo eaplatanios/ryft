@@ -6,7 +6,7 @@ use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     tracing::Traceable,
     tracing_v2::{
-        engine::Engine,
+        engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer},
         linear::LinearTerm,
     },
@@ -95,7 +95,7 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOperation 
 
 impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: MatrixValue + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>

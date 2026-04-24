@@ -4,7 +4,7 @@ pub mod arrays;
 /// XLA-specific IR benchmark cases layered on top of `ryft_core::tracing_v2::benchmarking`.
 pub mod benchmark_support;
 /// Backend token used for traced XLA staging and PJRT-backed execution.
-pub mod engine;
+pub mod engines;
 /// StableHLO and Shardy lowering helpers for traced XLA programs.
 pub mod lowering;
 /// Experimental XLA-only higher-order primitives and staged operation helpers.
@@ -19,7 +19,7 @@ pub use arrays::{
     ExecuteArguments, device_put,
 };
 
-pub use engine::{XlaEngine, XlaEngineError};
+pub use engines::{XlaEngine, XlaEngineError};
 
 pub use shard_map::{
     ShardMapTraceError, TracedShardMap, TracedXlaProgram, shard_map, shard_map_with_options, trace,

@@ -12,7 +12,7 @@ use crate::tracing_v2::{
 use crate::tracing_v2::{
     Sin, Tracer,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
-    engine::ArrayScalarEngine,
+    engines::ArrayScalarEngine,
     grad, interpret_and_trace, jvp, jvp_program,
     operations::constants::OneLike,
     value_and_grad, vjp,

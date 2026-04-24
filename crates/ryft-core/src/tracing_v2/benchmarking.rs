@@ -305,7 +305,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing::Program;
-    use crate::tracing_v2::{Sin, engine::ArrayScalarEngine, interpret_and_trace, operations::constants::OneLike};
+    use crate::tracing_v2::{Sin, engines::ArrayScalarEngine, interpret_and_trace, operations::constants::OneLike};
 
     use super::*;
 

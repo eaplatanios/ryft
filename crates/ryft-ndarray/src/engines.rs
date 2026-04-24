@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use ryft_core::tracing::TracingError;
-use ryft_core::tracing_v2::{Engine, LinearPrimitiveOperation, PrimitiveOperation};
+use ryft_core::tracing_v2::{DifferentiableEngine, Engine, LinearPrimitiveOperation, PrimitiveOperation};
 use ryft_core::types::{ArrayType, TypeError};
 
 use crate::arrays::{Array, NdArrayElement};
@@ -29,7 +29,6 @@ impl<T: NdArrayElement> Engine for NdArrayEngine<T> {
     type Type = ArrayType;
     type Value = Array<T>;
     type TracingOperation = PrimitiveOperation<Array<T>>;
-    type LinearOperation = LinearPrimitiveOperation<Array<T>>;
 
     fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
         Array::zeros(array_type).map_err(array_error_to_tracing_error)
@@ -38,6 +37,11 @@ impl<T: NdArrayElement> Engine for NdArrayEngine<T> {
     fn one(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
         Array::ones(array_type).map_err(array_error_to_tracing_error)
     }
+}
+
+impl<T: NdArrayElement> DifferentiableEngine for NdArrayEngine<T> {
+    type DifferentiableOperation = PrimitiveOperation<Array<T>>;
+    type LinearOperation = LinearPrimitiveOperation<Array<T>>;
 }
 
 fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> TracingError {

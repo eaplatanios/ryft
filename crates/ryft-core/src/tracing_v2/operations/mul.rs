@@ -10,7 +10,7 @@ use crate::{
     macros::check_input_count,
     tracing::{Traceable, TracingError},
     tracing_v2::{
-        engine::Engine,
+        engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     },
 };
@@ -99,7 +99,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType
 
 impl<E> DifferentiableOperation<E> for MulOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Mul<Output = E::Value> + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>
@@ -130,7 +130,7 @@ mod tests {
     use crate::types::{DataType, Shape, Size};
     use crate::{
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension},
-        tracing_v2::{engine::ArrayScalarEngine, jvp, test_support},
+        tracing_v2::{engines::ArrayScalarEngine, jvp, test_support},
     };
 
     use super::*;

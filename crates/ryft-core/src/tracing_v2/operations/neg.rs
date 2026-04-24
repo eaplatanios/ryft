@@ -6,7 +6,7 @@ use std::{
 use crate::macros::check_input_count;
 use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
-    engine::Engine,
+    engines::DifferentiableEngine,
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     linear::LinearTerm,
     operations::constants::ZeroLike,
@@ -80,7 +80,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
 
 impl<E> DifferentiableOperation<E> for NegOperation
 where
-    E: Engine<Type = ArrayType> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
     E::Value: Traceable<ArrayType> + Neg<Output = E::Value> + Differentiable<ArrayType>,
     E::LinearOperation: LinearAddOperation<ArrayType, E::Value>
         + LinearNegOperation<ArrayType, E::Value>

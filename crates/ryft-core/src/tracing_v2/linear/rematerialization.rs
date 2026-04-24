@@ -1,19 +1,22 @@
 use super::*;
 
-fn build_traced_gradient_program<'engine, E, Input, V>(
+fn build_traced_gradient_program<'engine, E, Input, V, O>(
     engine: &'engine E,
     input_structure: Input::ParameterStructure,
-    traced_program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
+    traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+) -> Result<Program<ArrayType, V, O, Input, Input>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, V> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    O: Clone
+        + Operation<ArrayType>
+        + InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>>
+        + 'static,
+    LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
-    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::TracingOperation>::new()));
+    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new()));
     let traced_primals = traced_program
         .input_ids
         .iter()
@@ -23,7 +26,7 @@ where
             Tracer::from_staged_parts(atom, input_type, traced_primal_builder.clone(), engine)
         })
         .collect::<Vec<_>>();
-    let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E>(
+    let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E, O>(
         engine,
         traced_primal_builder.clone(),
         traced_program,
@@ -57,32 +60,37 @@ pub fn compile_grad<'engine, E, F, Input, V>(
     _engine: &'engine E,
     function: F,
     example_primals: Input,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, V> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>,
+    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
+        CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    Input::To<ArrayType>:
+        Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = Input::To<DifferentiableTracer<'engine, E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = DifferentiableTracer<'engine, E>>,
+    F: Fn(Input::To<DifferentiableTracer<'engine, E>>) -> DifferentiableTracer<'engine, E>,
 {
     let input_structure = example_primals.parameter_structure();
     let staged_input_types = Input::To::<ArrayType>::from_parameters(
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
-        _engine,
-        |staged_input| Ok(function(staged_input)),
-        staged_input_types,
-    )?;
+    let (_, traced_program) = trace_flat_program_from_input_types::<
+        Input::To<ArrayType>,
+        V::To<ArrayType>,
+        V,
+        E,
+        E::DifferentiableOperation,
+        _,
+    >(_engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
     build_traced_gradient_program(_engine, input_structure, &traced_program)
 }
 
@@ -117,7 +125,7 @@ pub enum RematerializationPolicy {
 /// This generalizes [`compile_grad`] by letting the caller control how forward-pass intermediates are handled
 /// during the backward pass:
 ///
-///   - [`RematerializationPolicy::SaveAll`]: identical to [`compile_grad`] Ã¢â‚¬â€ no rematerialization boundaries are
+///   - [`RematerializationPolicy::SaveAll`]: identical to [`compile_grad`] - no rematerialization boundaries are
 ///     inserted, so the XLA compiler decides which intermediates to save.
 ///   - [`RematerializationPolicy::RecomputeAll`]: the entire forward body is wrapped in a single
 ///     [`rematerialize`] boundary, forcing the backward pass to recompute all intermediates from inputs.
@@ -130,22 +138,24 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
     function: F,
     example_primals: Input,
     policy: RematerializationPolicy,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
+    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
+        CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    Input::To<ArrayType>:
+        Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = Input::To<DifferentiableTracer<'engine, E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = DifferentiableTracer<'engine, E>>,
+    F: Fn(Input::To<DifferentiableTracer<'engine, E>>) -> DifferentiableTracer<'engine, E>,
 {
     match policy {
         RematerializationPolicy::SaveAll => compile_grad(engine, &function, example_primals),
@@ -165,44 +175,49 @@ where
 /// (equivalent to [`RematerializationPolicy::RecomputeAll`]). When `Some(s)`, the program is
 /// partitioned into segments of at most `s` instructions, each wrapped in its own [`RematerializeOperation`].
 ///
-/// Internally, this replicates the flow of `grad` for [`Tracer`]-level inputs Ã¢â‚¬â€ trace, linearize,
-/// transpose, stage pullback Ã¢â‚¬â€ but inserts a segmentation step between tracing and linearization so
+/// Internally, this replicates the flow of `grad` for [`Tracer`]-level inputs - trace, linearize,
+/// transpose, stage pullback - but inserts a segmentation step between tracing and linearization so
 /// that the differentiation transform sees and respects the rematerialization boundaries.
 fn compile_grad_segmented<'engine, E, F, Input, V>(
     engine: &'engine E,
     function: &F,
     example_primals: Input,
     segment_size: Option<usize>,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + ZeroLike + OneLike,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
+    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
+        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
+        CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
-    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
-    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    Input::To<ArrayType>:
+        Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = Input::To<DifferentiableTracer<'engine, E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = DifferentiableTracer<'engine, E>>,
+    F: Fn(Input::To<DifferentiableTracer<'engine, E>>) -> DifferentiableTracer<'engine, E>,
 {
     let input_structure = example_primals.parameter_structure();
     let staged_input_types = Input::To::<ArrayType>::from_parameters(
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
-        engine,
-        |staged_input| Ok(function(staged_input)),
-        staged_input_types,
-    )?;
+    let (_, traced_program) = trace_flat_program_from_input_types::<
+        Input::To<ArrayType>,
+        V::To<ArrayType>,
+        V,
+        E,
+        E::DifferentiableOperation,
+        _,
+    >(engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
     let segmented_program = match segment_size {
-        None => wrap_program_in_rematerialize::<E, V>(&traced_program)?,
-        Some(size) => segment_program::<E, V>(&traced_program, size)?,
+        None => wrap_program_in_rematerialize::<E, V, E::DifferentiableOperation>(&traced_program)?,
+        Some(size) => segment_program::<E, V, E::DifferentiableOperation>(&traced_program, size)?,
     };
     build_traced_gradient_program(engine, input_structure, &segmented_program)
 }
@@ -220,27 +235,29 @@ where
 /// The segmented program is semantically equivalent to the original: calling it on the same inputs produces
 /// the same outputs. The difference is visible only during differentiation, where each [`RematerializeOperation`]
 /// boundary forces recomputation of within-segment intermediates rather than saving them.
-fn segment_program<E, V>(
-    program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
+fn segment_program<E, V, O>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     segment_size: usize,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TracingError>
+) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType>,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, V> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V>,
+    V: Traceable<ArrayType> + Differentiable<ArrayType>,
+    O: Clone
+        + Operation<ArrayType>
+        + InterpretableOperation<ArrayType, V>
+        + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
     let instructions = program.instructions.as_slice();
 
-    // If the program has fewer instructions than a single segment, no segmentation is needed Ã¢â‚¬â€ wrap the
+    // If the program has fewer instructions than a single segment, no segmentation is needed - wrap the
     // whole thing in a single RematerializeOperation.
     if instructions.len() <= segment_size {
-        return wrap_program_in_rematerialize::<E, V>(program);
+        return wrap_program_in_rematerialize::<E, V, O>(program);
     }
 
     // Divide instructions into segments.
-    let segments: Vec<&[Instruction<E::TracingOperation>]> = instructions.chunks(segment_size).collect();
+    let segments: Vec<&[Instruction<O>]> = instructions.chunks(segment_size).collect();
 
     // Build a mapping from atom ID to which instruction produces it (if any).
     let mut atom_producer: Vec<Option<usize>> = vec![None; program.atoms.len()];
@@ -266,7 +283,7 @@ where
 
     // Build the outer program.
     let input_atoms = program.input_ids.as_slice();
-    let mut outer_builder: ProgramBuilder<ArrayType, V, E::TracingOperation> = ProgramBuilder::new();
+    let mut outer_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new();
 
     // Map from original atom IDs to outer-program atom IDs.
     let mut atom_mapping: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
@@ -364,7 +381,7 @@ where
         let outer_outputs =
             output_types.into_iter().map(|r#type| outer_builder.add_variable(r#type)).collect::<Vec<_>>();
         outer_builder.instructions.push(Instruction {
-            operation: E::TracingOperation::rematerialize_op(remat_op),
+            operation: O::rematerialize_op(remat_op),
             inputs: outer_inputs,
             outputs: outer_outputs.clone(),
         });
@@ -393,13 +410,13 @@ where
 }
 
 /// Wraps an entire program in a single [`RematerializeOperation`] boundary.
-fn wrap_program_in_rematerialize<E, V>(
-    program: &Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>,
-) -> Result<Program<ArrayType, V, E::TracingOperation, Vec<V>, Vec<V>>, TracingError>
+fn wrap_program_in_rematerialize<E, V, O>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType>,
-    E::TracingOperation: RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V>,
+    V: Traceable<ArrayType> + Differentiable<ArrayType>,
+    O: Clone + Operation<ArrayType> + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>,
 {
     let program = program;
     let input_types: Vec<_> = program
@@ -428,13 +445,13 @@ where
     let body = FlatTracedRematerialize::from_parts(input_types.clone(), output_types.clone(), program.clone());
     let remat_op = RematerializeOperation::new(body);
 
-    let mut outer_builder: ProgramBuilder<ArrayType, V, E::TracingOperation> = ProgramBuilder::new();
+    let mut outer_builder: ProgramBuilder<ArrayType, V, O> = ProgramBuilder::new();
     let outer_inputs: Vec<AtomId> =
         input_types.iter().cloned().map(|input_type| outer_builder.add_input(input_type)).collect();
 
     let outer_outputs = output_types.into_iter().map(|r#type| outer_builder.add_variable(r#type)).collect::<Vec<_>>();
     outer_builder.instructions.push(Instruction {
-        operation: E::TracingOperation::rematerialize_op(remat_op),
+        operation: O::rematerialize_op(remat_op),
         inputs: outer_inputs.clone(),
         outputs: outer_outputs.clone(),
     });
@@ -543,7 +560,7 @@ fn build_segment_sub_program<V: Traceable<ArrayType>, O: Clone + Operation<Array
 mod tests {
     use crate::parameters::Placeholder;
     use crate::tracing::ProgramBuilder;
-    use crate::tracing_v2::{PrimitiveOperation, engine::ArrayScalarEngine};
+    use crate::tracing_v2::{PrimitiveOperation, engines::ArrayScalarEngine};
 
     use super::*;
 
@@ -555,7 +572,7 @@ mod tests {
         let traced_program =
             builder.build::<Vec<f64>, Vec<f64>>(vec![output_atom], Vec::<Placeholder>::new(), vec![Placeholder]);
 
-        let gradient_program = build_traced_gradient_program::<_, (), f64>(&engine, (), &traced_program).unwrap();
+        let gradient_program = build_traced_gradient_program(&engine, (), &traced_program).unwrap();
 
         assert_eq!(gradient_program.interpret(()).unwrap(), ());
     }

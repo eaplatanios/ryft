@@ -796,7 +796,7 @@ mod tests {
     use super::*;
     use crate::{
         broadcasting::Broadcastable,
-        tracing_v2::{Engine, operations::CustomPrimitive},
+        tracing_v2::{DifferentiableEngine, Engine, operations::CustomPrimitive},
         types::{DataType, Shape},
     };
 
@@ -944,7 +944,6 @@ mod tests {
         type Type = ArrayType;
         type Value = TestArray;
         type TracingOperation = PrimitiveOperation<TestArray>;
-        type LinearOperation = LinearPrimitiveOperation<TestArray>;
 
         fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
             Ok(TestArray { r#type: r#type.clone(), values: vec![0.0; TestArray::element_count(r#type)] })
@@ -953,6 +952,11 @@ mod tests {
         fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
             Ok(TestArray { r#type: r#type.clone(), values: vec![1.0; TestArray::element_count(r#type)] })
         }
+    }
+
+    impl DifferentiableEngine for TestArrayEngine {
+        type DifferentiableOperation = PrimitiveOperation<TestArray>;
+        type LinearOperation = LinearPrimitiveOperation<TestArray>;
     }
 
     #[derive(Clone, Debug)]

@@ -12,12 +12,11 @@ use crate::{
     tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value},
     tracing_v2::{
         LinearPrimitiveOperation,
-        engine::Engine,
-        jit::Tracer,
+        engines::{DifferentiableEngine, Engine},
+        jit::{DifferentiableTracer, Tracer},
         linear::{Linearized, jvp_program, jvp_traced},
         operations::{
-            CoreLinearReplayOperation, DifferentiableOperation, LinearAddOperation, LinearNegOperation,
-            LinearScaleOperation,
+            CoreLinearReplayOperation, LinearAddOperation, LinearNegOperation, LinearScaleOperation,
             constants::{OneLike, ZeroLike},
         },
     },
@@ -89,8 +88,9 @@ pub trait Differentiable<T: Type>: Traceable<T> {
 }
 
 /// Convenience alias for the primitive-level tangent representation associated with engine `E`.
-pub type EngineTangent<E> =
-    <<E as Engine>::Value as Differentiable<<E as Engine>::Type>>::Tangent<<E as Engine>::LinearOperation>;
+pub type EngineTangent<E> = <<E as Engine>::Value as Differentiable<<E as Engine>::Type>>::Tangent<
+    <E as DifferentiableEngine>::LinearOperation,
+>;
 
 impl<T, V> Differentiable<T> for V
 where
@@ -226,23 +226,22 @@ impl<
     Output: Parameterized<V, ParameterStructure: Clone>,
 > JvpInvocationLeaf<E, Input, Output> for V
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
-    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+    Input::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    Output::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
     V: Differentiable<ArrayType>,
-    E::TracingOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>
         + LinearAddOperation<ArrayType, V>
         + LinearNegOperation<ArrayType, V>
         + LinearScaleOperation<ArrayType, V>,
 {
     type FunctionInput<'engine>
-        = Input::To<Tracer<'engine, E>>
+        = Input::To<DifferentiableTracer<'engine, E>>
     where
         E: 'engine;
     type FunctionOutput<'engine>
-        = Output::To<Tracer<'engine, E>>
+        = Output::To<DifferentiableTracer<'engine, E>>
     where
         E: 'engine;
 
@@ -283,7 +282,7 @@ impl<
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
 > JvpInvocationLeaf<E, Input, Output> for Tracer<'engine, E>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
@@ -351,7 +350,7 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing_v2::{engine::ArrayScalarEngine, operations::constants::OneLike, test_support};
+    use crate::tracing_v2::{engines::ArrayScalarEngine, operations::constants::OneLike, test_support};
     use crate::types::{Type, Typed};
 
     use super::*;

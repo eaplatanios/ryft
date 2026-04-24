@@ -1,8 +1,12 @@
 use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
-    tracing::{Operation, TracingError},
-    tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation},
+    tracing::{Operation, Traceable, TracingError},
+    tracing_v2::{
+        Differentiable, DifferentiableOperation as DifferentiableOperationTrait,
+        LinearOperation as LinearOperationTrait, LinearPrimitiveOperation, PrimitiveOperation,
+        operations::{LinearAddOperation, LinearNegOperation, LinearScaleOperation},
+    },
     types::{ArrayType, Type},
 };
 
@@ -11,7 +15,7 @@ use crate::{
 /// [`Engine`] is the backend token threaded through the public `tracing_v2` transforms. It has
 /// two closely related jobs:
 ///
-/// 1. choose the closed operation carriers that ordinary and linear staged programs should store,
+/// 1. choose the closed operation carrier that ordinary staged programs should store,
 ///    and
 /// 2. synthesize representative zero and one values from abstract metadata when a transform needs
 ///    an exemplar but only knows a leaf's type.
@@ -41,19 +45,13 @@ pub trait Engine {
     /// The value is what program replay and eager transforms actually operate on. In other words,
     /// [`Engine::Type`] is the abstract description used while staging, while [`Engine::Value`] is
     /// the runtime leaf that inhabits traced programs once they are executed.
-    type Value;
+    type Value: Traceable<Self::Type>;
 
     /// Ordinary staged operation type selected by this engine for public tracing transforms.
     ///
     /// Programs produced by [`trace`](crate::tracing_v2::trace) and
     /// [`interpret_and_trace`](crate::tracing_v2::interpret_and_trace) store this carrier.
     type TracingOperation: Clone + Operation<Self::Type> + 'static;
-
-    /// Linear staged operation type selected by this engine for tangent and cotangent programs.
-    ///
-    /// Linear programs produced by [`jvp_program`](crate::tracing_v2::jvp_program),
-    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
-    type LinearOperation: Clone + Operation<Self::Type> + 'static;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
     ///
@@ -67,6 +65,36 @@ pub trait Engine {
     /// This is used less frequently than [`Engine::zero`] but plays the same architectural role:
     /// it lets traced code materialize identity seeds without depending on an existing exemplar.
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
+}
+
+/// Extension of [`Engine`] for backends that support automatic differentiation.
+///
+/// Engines that only need ordinary tracing implement [`Engine`] alone. AD transforms such as
+/// [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
+/// [`vjp`](crate::tracing_v2::vjp) require this extension trait so non-differentiable backends do
+/// not need to define fake tangent or differentiable-operation carriers.
+pub trait DifferentiableEngine: Engine
+where
+    Self::Value: Differentiable<Self::Type>,
+{
+    /// Differentiable staged operation type selected by this engine for AD transforms.
+    ///
+    /// Reverse- and forward-mode transforms trace user closures with this carrier instead of the
+    /// full ordinary tracing carrier. Backends can therefore expose non-differentiable operations
+    /// through [`Engine::TracingOperation`] without making those operations stageable inside
+    /// differentiated closures.
+    type DifferentiableOperation: Clone + DifferentiableOperationTrait<Self> + 'static;
+
+    /// Linear staged operation type selected by this engine for tangent and cotangent programs.
+    ///
+    /// Linear programs produced by [`jvp_program`](crate::tracing_v2::jvp_program),
+    /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
+    type LinearOperation: Clone
+        + LinearOperationTrait<Self::Type, Self::Value, Self::LinearOperation>
+        + LinearAddOperation<Self::Type, Self::Value>
+        + LinearNegOperation<Self::Type, Self::Value>
+        + LinearScaleOperation<Self::Type, Self::Value>
+        + 'static;
 }
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
@@ -103,7 +131,6 @@ macro_rules! impl_engine_for_array_scalar_engine {
             type Type = ArrayType;
             type Value = $ty;
             type TracingOperation = PrimitiveOperation<$ty>;
-            type LinearOperation = LinearPrimitiveOperation<$ty>;
 
             #[inline]
             fn zero(&self, _type: &ArrayType) -> Result<$ty, TracingError> {
@@ -114,6 +141,11 @@ macro_rules! impl_engine_for_array_scalar_engine {
             fn one(&self, _type: &ArrayType) -> Result<$ty, TracingError> {
                 Ok($one)
             }
+        }
+
+        impl DifferentiableEngine for ArrayScalarEngine<$ty> {
+            type DifferentiableOperation = PrimitiveOperation<$ty>;
+            type LinearOperation = LinearPrimitiveOperation<$ty>;
         }
     };
 }

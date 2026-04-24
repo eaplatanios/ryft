@@ -9,7 +9,7 @@ use crate::{
     tracing::{Traceable, TracingError, Value},
     tracing_v2::{
         Cos, MatrixOps, Sin,
-        engine::Engine,
+        engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer},
         jit::Tracer,
         linear::LinearTerm,
@@ -586,7 +586,7 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + Differentiable<ArrayType>
         + 'static,
-    E: Engine<
+    E: DifferentiableEngine<
             Type = ArrayType,
             Value = V,
             TracingOperation = PrimitiveOperation<V>,
@@ -636,7 +636,7 @@ impl<
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + Differentiable<ArrayType>
         + 'static,
-    E: Engine<
+    E: DifferentiableEngine<
             Type = ArrayType,
             Value = V,
             TracingOperation = PrimitiveOperation<V>,

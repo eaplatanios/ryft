@@ -281,19 +281,17 @@ pub fn jacfwd<'engine, E, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<E>,
-    E::LinearOperation: CoreLinearReplayOperation<V>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    F: FnOnce(
+        Input::To<DifferentiableTracer<'engine, E>>,
+    ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
+    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::LinearOperation: CoreLinearReplayOperation<V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -334,19 +332,17 @@ pub fn jacrev<'engine, E, F, Input, Output, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Output::ParameterStructure>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<E>,
-    E::LinearOperation: CoreLinearProgramOperation<V>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    F: FnOnce(
+        Input::To<DifferentiableTracer<'engine, E>>,
+    ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
+    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::LinearOperation: CoreLinearProgramOperation<V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -381,17 +377,15 @@ pub fn hessian<'engine, E, F, Input, V>(
     primals: Input,
 ) -> Result<DenseJacobian<V::Coordinate, Input::ParameterStructure, Input::ParameterStructure>, TracingError>
 where
-    E: Engine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TracingError>,
-    E::TracingOperation: InterpretableOperation<ArrayType, V>,
-    E::TracingOperation: DifferentiableOperation<E>,
-    E::LinearOperation: CoreLinearReplayOperation<V>
-        + LinearAddOperation<ArrayType, V>
-        + LinearNegOperation<ArrayType, V>
-        + LinearScaleOperation<ArrayType, V>,
+    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    F: FnOnce(
+        Input::To<DifferentiableTracer<'engine, E>>,
+    ) -> Result<Input::To<DifferentiableTracer<'engine, E>>, TracingError>,
+    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::LinearOperation: CoreLinearReplayOperation<V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)
 }
@@ -401,7 +395,7 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         tracing::TracingError,
-        tracing_v2::{DifferentiationError, Sin, engine::ArrayScalarEngine},
+        tracing_v2::{DifferentiationError, Sin, engines::ArrayScalarEngine},
     };
 
     use super::{DenseJacobian, jacfwd, jacrev};
