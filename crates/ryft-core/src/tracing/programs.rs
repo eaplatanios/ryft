@@ -28,47 +28,28 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// Concrete leaves that support exact algebraic identity detection should override [`Traceable::is_zero`] and
 /// [`Traceable::is_one`]. The default implementations return `false`, which keeps purely abstract or traced leaves
 /// valid while opting them out of constant-identity simplification.
-///
-/// # Implementing [`Traceable`] for new leaf types
-///
-/// Most concrete runtime values should still own their data:
-///
-/// - Small [`Copy`] scalars (`f32`, `i32`, `half::bf16`, ...) can implement [`Traceable`] directly,
-///   as the built-in scalar impls illustrate.
-/// - Heavier payloads (array buffers, tensors, device allocations) should typically wrap the
-///   underlying handle in [`Arc`](std::sync::Arc) (or [`Rc`](std::rc::Rc) for single-threaded
-///   cases) so the leaf stays cheaply cloneable.
-///
-/// Borrowing leaf types is still valid when the borrow is semantically tied to the surrounding
-/// tracing scope; they simply cannot be stored in APIs that later add a `'static` requirement.
-///
-/// See also [`Value`], the marker subtrait that distinguishes concrete leaves from tracing
-/// wrappers.
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
-    /// Returns `true` if every element of this value is exactly zero.
+    /// Returns `true` if this value is equivalent to an algebraic _zero_ value (i.e., additive identity).
+    /// [`ProgramBuilder`]s call this function on constant [`Atom`]s during [`Operation::try_simplify`] to detect and
+    /// eliminate algebraic identities at staging time (e.g., folding `x + 0` into `x` or `x * 0` into `0` without
+    /// emitting the operation into the staged program).
     ///
-    /// The program builder calls this on constant atoms during [`Operation::try_simplify`] to detect and
-    /// eliminate algebraic identities at staging time, for example folding `x + 0` into `x` or
-    /// `x * 0` into `0` without emitting the operation into the staged program.
-    ///
-    /// The default returns `false`, which is always safe: it simply opts the value out of
-    /// identity-based simplification. Concrete leaf types that can inspect their contents should
-    /// override this to return an accurate answer. Tracing wrappers like
-    /// [`Tracer`](crate::tracing_v2::Tracer) cannot meaningfully inspect their contents at staging
-    /// time and therefore keep the default.
+    /// The default implementation returns `false`, which is always safe as it simply opts the value out of
+    /// identity-based simplification. Concrete leaf types that can inspect their contents should override this
+    /// function to return a more accurate answer.
     #[inline]
     fn is_zero(&self) -> bool {
         false
     }
 
-    /// Returns `true` if every element of this value is exactly one.
+    /// Returns `true` if this value is equivalent to an algebraic _one_ value (i.e., multiplicative identity). This is
+    /// the multiplicative-identity counterpart of [`Self::is_zero`]. [`ProgramBuilder`]s call this function on constant
+    /// [`Atom`]s during [`Operation::try_simplify`] to detect and eliminate algebraic identities at staging time (e.g.,
+    /// folding `x * 1` into `x` without emitting the operation into the staged program).
     ///
-    /// This is the multiplicative-identity counterpart of [`Traceable::is_zero`]. The program
-    /// builder uses it during [`Operation::try_simplify`]
-    /// to fold operations like `x * 1` into `x` or `scale(x, 1)` into `x`.
-    ///
-    /// The same defaulting rationale applies: `false` is always safe, and only concrete leaf types
-    /// that can inspect their contents should override this.
+    /// The default implementation returns `false`, which is always safe as it simply opts the value out of
+    /// identity-based simplification. Concrete leaf types that can inspect their contents should override this
+    /// function to return a more accurate answer.
     #[inline]
     fn is_one(&self) -> bool {
         false
