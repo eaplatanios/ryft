@@ -26,17 +26,13 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// does not imply any other requirements for the underlying values.
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {}
 
-/// Staged atom carrying abstract metadata.
-///
-/// The variant encodes whether the atom is a retained literal constant or an ordinary program
-/// variable. Input-vs-derived provenance for variable atoms lives in the owning [`Program`]'s
-/// [`Program::input_ids`] list and instruction outputs rather than in the atom enum itself.
+/// [`Atom`]s form nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug)]
 pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant value that appears in a [`Program`].
     Constant(V),
 
-    /// Non-constant program variable carrying only its abstract type.
+    /// Non-constant variable of a specific [`Type`] that appears in a [`Program`].
     Variable(T),
 }
 
