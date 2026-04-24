@@ -87,7 +87,7 @@ impl<V: MatrixValue> Display for LeftMatMulOperation<V> {
     }
 }
 
-impl<V: MatrixValue> Operation for LeftMatMulOperation<V> {
+impl<V: MatrixValue> Operation<ArrayType> for LeftMatMulOperation<V> {
     fn name(&self) -> &'static str {
         "left_matmul"
     }

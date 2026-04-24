@@ -372,7 +372,7 @@ impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOperation<ArrayType, V>
 }
 
 /// [`Operation`] for [`PrimitiveOperation`] requires NO value-type bounds Ã¢â‚¬â€ shape validation works for any `V: Traceable<ArrayType>`.
-impl<V: Traceable<ArrayType>> Operation for PrimitiveOperation<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<ArrayType, V> {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -403,10 +403,12 @@ impl<V: Traceable<ArrayType>> Operation for PrimitiveOperation<ArrayType, V> {
             Self::Scale { .. } => ScaleOperation::<ArrayType, V>::abstract_eval_static(input_types),
             Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), input_types),
             Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), input_types),
-            Self::Reshape { input_type, output_type } => <ReshapeOperation as Operation>::infer_output_types(
-                &ReshapeOperation::new(input_type.clone(), output_type.clone()),
-                input_types,
-            ),
+            Self::Reshape { input_type, output_type } => {
+                <ReshapeOperation as Operation<ArrayType>>::infer_output_types(
+                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    input_types,
+                )
+            }
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
@@ -448,7 +450,7 @@ impl<V: Traceable<ArrayType>> Operation for PrimitiveOperation<ArrayType, V> {
 }
 
 /// [`Operation`] for [`LinearPrimitiveOperation`] requires NO value-type bounds Ã¢â‚¬â€ shape validation works for any `V: Traceable<ArrayType>`.
-impl<V: Traceable<ArrayType>> Operation for LinearPrimitiveOperation<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<ArrayType, V> {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -471,10 +473,12 @@ impl<V: Traceable<ArrayType>> Operation for LinearPrimitiveOperation<ArrayType, 
             Self::Scale { .. } => ScaleOperation::<ArrayType, V>::abstract_eval_static(input_types),
             Self::LeftMatMul { factor } => left_matmul_abstract_eval(&Typed::r#type(factor), input_types),
             Self::RightMatMul { factor } => right_matmul_abstract_eval(&Typed::r#type(factor), input_types),
-            Self::Reshape { input_type, output_type } => <ReshapeOperation as Operation>::infer_output_types(
-                &ReshapeOperation::new(input_type.clone(), output_type.clone()),
-                input_types,
-            ),
+            Self::Reshape { input_type, output_type } => {
+                <ReshapeOperation as Operation<ArrayType>>::infer_output_types(
+                    &ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                    input_types,
+                )
+            }
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }

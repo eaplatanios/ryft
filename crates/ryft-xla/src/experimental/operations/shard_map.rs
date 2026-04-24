@@ -570,7 +570,7 @@ fn infer_shard_map_output_types(
         .collect::<Vec<_>>())
 }
 
-impl Operation for ShardMapOperation<ShardMapTensor> {
+impl Operation<ArrayType> for ShardMapOperation<ShardMapTensor> {
     fn name(&self) -> &'static str {
         "shard_map"
     }
@@ -613,7 +613,7 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for ShardMapO
     }
 }
 
-impl Operation for LinearShardMapOperation<ShardMapTensor> {
+impl Operation<ArrayType> for LinearShardMapOperation<ShardMapTensor> {
     fn name(&self) -> &'static str {
         "linear_shard_map"
     }
@@ -776,7 +776,7 @@ where
     }
 }
 
-impl Operation for ShardMapOperation<ShardMapTracer> {
+impl Operation<ArrayType> for ShardMapOperation<ShardMapTracer> {
     fn name(&self) -> &'static str {
         "shard_map"
     }
@@ -802,7 +802,7 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<Sha
     }
 }
 
-impl Operation for LinearShardMapOperation<ShardMapTracer> {
+impl Operation<ArrayType> for LinearShardMapOperation<ShardMapTracer> {
     fn name(&self) -> &'static str {
         "linear_shard_map"
     }
@@ -2334,7 +2334,7 @@ mod tests {
         }
     }
 
-    impl Operation for TestCustomReplayOp {
+    impl Operation<ArrayType> for TestCustomReplayOp {
         fn name(&self) -> &'static str {
             "test_custom_replay"
         }

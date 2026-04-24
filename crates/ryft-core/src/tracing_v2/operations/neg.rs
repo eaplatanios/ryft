@@ -51,7 +51,7 @@ impl Display for NegOperation {
     }
 }
 
-impl Operation for NegOperation {
+impl Operation<ArrayType> for NegOperation {
     fn name(&self) -> &'static str {
         "neg"
     }

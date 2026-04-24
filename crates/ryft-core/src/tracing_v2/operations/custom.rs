@@ -412,7 +412,7 @@ impl<T: Type + Display, V: Traceable<T>> Display for CustomPrimitive<T, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Operation for CustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for CustomPrimitive<ArrayType, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.base.name()
@@ -540,7 +540,7 @@ impl<T: Type + Display, V: Traceable<T>> Display for LinearCustomPrimitive<T, V>
     }
 }
 
-impl<V: Traceable<ArrayType>> Operation for LinearCustomPrimitive<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearCustomPrimitive<ArrayType, V> {
     #[inline]
     fn name(&self) -> &'static str {
         self.primitive.name()
@@ -615,7 +615,7 @@ mod tests {
         }
     }
 
-    impl Operation for ShiftOp {
+    impl Operation<ArrayType> for ShiftOp {
         fn name(&self) -> &'static str {
             "test_shift"
         }

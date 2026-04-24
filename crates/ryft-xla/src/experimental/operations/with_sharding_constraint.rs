@@ -92,7 +92,7 @@ impl Display for WithShardingConstraintOperation {
     }
 }
 
-impl Operation for WithShardingConstraintOperation {
+impl Operation<ArrayType> for WithShardingConstraintOperation {
     fn name(&self) -> &'static str {
         "with_sharding_constraint"
     }
@@ -327,7 +327,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(sharding.clone());
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::infer_output_types(
+            <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap()],
             ),
@@ -350,7 +350,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::infer_output_types(
+            <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
                 &[
                     ArrayType::new(
@@ -398,7 +398,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(target_sharding);
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::infer_output_types(
+            <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, Some(input_sharding),)
                     .unwrap()],
@@ -430,7 +430,7 @@ mod tests {
         let op = WithShardingConstraintOperation::new(test_sharding(&mesh));
 
         assert_eq!(
-            <WithShardingConstraintOperation as Operation>::infer_output_types(
+            <WithShardingConstraintOperation as Operation<ArrayType>>::infer_output_types(
                 &op,
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8), Size::Static(4)]), None, None)
                     .unwrap()],

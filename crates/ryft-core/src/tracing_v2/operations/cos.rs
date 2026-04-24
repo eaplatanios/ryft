@@ -66,7 +66,7 @@ impl Display for CosOperation {
     }
 }
 
-impl Operation for CosOperation {
+impl Operation<ArrayType> for CosOperation {
     fn name(&self) -> &'static str {
         "cos"
     }

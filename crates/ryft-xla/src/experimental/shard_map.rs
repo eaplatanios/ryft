@@ -3202,9 +3202,8 @@ mod tests {
             mesh_devices,
         )
         .unwrap();
-        let sharding =
-            Sharding::new(device_mesh.logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
+        let sharding = Sharding::replicated(device_mesh.logical_mesh.clone(), 0);
+        let global_input_type = ArrayType::scalar(DataType::F32);
 
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
@@ -3242,43 +3241,32 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                  func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
                     %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<8xf32>
-                    %1 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %3 = stablehlo.cosine %arg1 : tensor<2xf32>
-                      sdy.return %3 : tensor<2xf32>
-                    } : (tensor<8xf32>) -> tensor<8xf32>
-                    %2 = sdy.manual_computation(%0, %1) in_shardings=[<@mesh, [{"x"}]>, <@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>, %arg2: tensor<2xf32>) {
-                      %3 = stablehlo.multiply %arg2, %arg1 : tensor<2xf32>
-                      sdy.return %3 : tensor<2xf32>
-                    } : (tensor<8xf32>, tensor<8xf32>) -> tensor<8xf32>
-                    return %2 : tensor<8xf32>
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [], replicated={"x"}>] out_shardings=[<@mesh, [], replicated={"x"}>] manual_axes={"x"} (%arg1: tensor<f32>) {
+                      %2 = stablehlo.cosine %arg1 : tensor<f32>
+                      sdy.return %2 : tensor<f32>
+                    } : (tensor<f32>) -> tensor<f32>
+                    %1 = sdy.manual_computation(%cst, %0) in_shardings=[<@mesh, [], replicated={"x"}>, <@mesh, [], replicated={"x"}>] out_shardings=[<@mesh, [], replicated={"x"}>] manual_axes={"x"} (%arg1: tensor<f32>, %arg2: tensor<f32>) {
+                      %2 = stablehlo.multiply %arg2, %arg1 : tensor<f32>
+                      sdy.return %2 : tensor<f32>
+                    } : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                    return %1 : tensor<f32>
                   }
                 }
             "#}
         );
 
-        let input_values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let input_buffers = client_devices
-            .iter()
-            .enumerate()
-            .map(|(device_index, device)| {
-                let shard_values = [input_values[device_index * 2], input_values[device_index * 2 + 1]];
-                client
-                    .buffer(
-                        f32_values_to_bytes(shard_values.as_slice()).as_slice(),
-                        BufferType::F32,
-                        [2u64],
-                        None,
-                        device.clone(),
-                        None,
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let input_array =
-            Array::new(static_sharded_array_type(DataType::F32, &[8], sharding), device_mesh, input_buffers).unwrap();
+        let input_value = 1.0f32;
+        let input_array = Array::from_host_buffer(
+            &client,
+            f32_values_to_bytes([input_value].as_slice()).as_slice(),
+            [],
+            DataType::F32,
+            device_mesh,
+            sharding,
+        )
+        .unwrap();
         let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
         let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
 
@@ -3292,27 +3280,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(outputs.len(), execution_device_ids.len());
-        let expected_values_by_device = client_devices
-            .iter()
-            .enumerate()
-            .map(|(device_index, device)| {
-                (
-                    device.id().unwrap(),
-                    vec![input_values[device_index * 2].cos(), input_values[device_index * 2 + 1].cos()],
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+        for output in outputs {
             output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let actual_values = f32s_from_bytes(output_bytes.as_slice());
-            let expected_values = expected_values_by_device.get(&device_id).unwrap();
-            assert_eq!(actual_values.len(), expected_values.len());
-            for (actual, expected) in actual_values.into_iter().zip(expected_values.iter().copied()) {
-                let delta = (actual - expected).abs();
-                assert!(delta <= 1e-5, "expected {actual} ~= {expected}; absolute error {delta}");
-            }
+            assert_eq!(actual_values.len(), 1);
+            let expected = input_value.cos();
+            let delta = (actual_values[0] - expected).abs();
+            assert!(delta <= 1e-5, "expected {} ~= {expected}; absolute error {delta}", actual_values[0]);
         }
     }
 

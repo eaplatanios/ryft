@@ -214,7 +214,7 @@ mod tests {
         }
     }
 
-    impl Operation for PanicReplayOp {
+    impl Operation<ArrayType> for PanicReplayOp {
         fn name(&self) -> &'static str {
             "panic_replay"
         }

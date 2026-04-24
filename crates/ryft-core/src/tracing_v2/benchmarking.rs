@@ -225,7 +225,7 @@ where
     V: Traceable<ArrayType>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    O: Clone + Display + Operation,
+    O: Clone + Display + Operation<ArrayType>,
     F: Fn(&O) -> Result<Vec<IrNestedRegionSummary>, BenchmarkError>,
 {
     let mut op_histogram = BTreeMap::new();

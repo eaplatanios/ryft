@@ -44,7 +44,7 @@ impl Display for MatMulOperation {
     }
 }
 
-impl Operation for MatMulOperation {
+impl Operation<ArrayType> for MatMulOperation {
     fn name(&self) -> &'static str {
         "matmul"
     }

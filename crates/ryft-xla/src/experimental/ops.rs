@@ -138,7 +138,7 @@ impl Display for XlaPrimitiveOperation {
     }
 }
 
-impl Operation for XlaPrimitiveOperation {
+impl Operation<ArrayType> for XlaPrimitiveOperation {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -426,7 +426,7 @@ mod tests {
         }
     }
 
-    impl Operation for TestCustomXlaOp {
+    impl Operation<ArrayType> for TestCustomXlaOp {
         fn name(&self) -> &'static str {
             "test_custom_xla"
         }

@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::parameters::{Parameter, ParameterError, Parameterized};
 use crate::tracing::TracingError;
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{Type, TypeError, Typed};
 
 /// Marker trait that identifies values in [`Program`]s. [`Value`] is a subtrait of [`Traceable`] implemented by types
 /// that carry real data, such as scalar and arrays. The sole purpose of this marker is to give Rust's coherence checker
@@ -161,10 +161,10 @@ impl Display for AtomId {
 /// [`crate::tracing_v2::DifferentiableOperation`] (forward-mode JVP).
 ///
 /// The type parameter `T` determines which abstract type descriptor is used for shape-level
-/// reasoning. The default is [`ArrayType`], which covers the entire core tracing infrastructure.
-/// Future instantiations with different type descriptors can reuse the same trait without
+/// reasoning. Core tracing code usually instantiates it with [`ArrayType`](crate::types::ArrayType),
+/// while future instantiations with different type descriptors can reuse the same trait without
 /// modifying existing implementations.
-pub trait Operation<T: Type = ArrayType>: Debug + Display {
+pub trait Operation<T: Type>: Debug + Display {
     /// Returns the stable primitive name used in diagnostics and pretty-printing.
     fn name(&self) -> &'static str;
 

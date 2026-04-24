@@ -86,7 +86,7 @@ impl<V: MatrixValue> Display for RightMatMulOperation<V> {
     }
 }
 
-impl<V: MatrixValue> Operation for RightMatMulOperation<V> {
+impl<V: MatrixValue> Operation<ArrayType> for RightMatMulOperation<V> {
     fn name(&self) -> &'static str {
         "right_matmul"
     }

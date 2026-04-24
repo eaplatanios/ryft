@@ -397,7 +397,7 @@ impl Display for ReshapeOperation {
     }
 }
 
-impl Operation for ReshapeOperation {
+impl Operation<ArrayType> for ReshapeOperation {
     fn name(&self) -> &'static str {
         "reshape"
     }

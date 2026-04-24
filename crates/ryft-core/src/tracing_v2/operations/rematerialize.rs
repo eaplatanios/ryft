@@ -123,7 +123,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone, L: Clone> Display for Remater
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operation
+impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operation<ArrayType>
     for RematerializeOperation<ArrayType, V, O, L>
 {
     fn name(&self) -> &'static str {
@@ -345,7 +345,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone> Display for LinearRemateriali
     }
 }
 
-impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation
+impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayType>
     for LinearRematerializeOperation<ArrayType, V, O>
 {
     fn name(&self) -> &'static str {

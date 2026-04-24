@@ -59,7 +59,7 @@ impl Display for AddOperation {
     }
 }
 
-impl Operation for AddOperation {
+impl Operation<ArrayType> for AddOperation {
     fn name(&self) -> &'static str {
         "add"
     }
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_broadcasts_and_promotes_inputs() {
-        let output = <AddOperation as Operation>::infer_output_types(
+        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(
             &AddOperation,
             &[
                 ArrayType::scalar(DataType::F32),
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_rejects_non_broadcastable_inputs() {
-        let error = <AddOperation as Operation>::infer_output_types(
+        let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
             &AddOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_add_abstract_eval_drops_layout_when_inputs_disagree() {
-        let output = <AddOperation as Operation>::infer_output_types(
+        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(
             &AddOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::scalar(), Some(Layout::Strided(StridedLayout::new(vec![]))), None)
@@ -264,7 +264,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = <AddOperation as Operation>::infer_output_types(&AddOperation, &[left, right]).unwrap();
+        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(&AddOperation, &[left, right]).unwrap();
 
         assert_eq!(
             output[0].sharding.as_ref().unwrap().varying_manual_axes,

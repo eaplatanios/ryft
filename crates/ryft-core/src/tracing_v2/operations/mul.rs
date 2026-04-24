@@ -46,7 +46,7 @@ impl Display for MulOperation {
     }
 }
 
-impl Operation for MulOperation {
+impl Operation<ArrayType> for MulOperation {
     fn name(&self) -> &'static str {
         "mul"
     }
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_mul_abstract_eval_broadcasts_and_promotes_inputs() {
-        let output = <MulOperation as Operation>::infer_output_types(
+        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
             &MulOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1), Size::Static(3)]), None, None).unwrap(),
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_mul_abstract_eval_rejects_non_broadcastable_inputs() {
-        let error = <MulOperation as Operation>::infer_output_types(
+        let error = <MulOperation as Operation<ArrayType>>::infer_output_types(
             &MulOperation,
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)]), None, None).unwrap(),
@@ -249,7 +249,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = <MulOperation as Operation>::infer_output_types(&MulOperation, &[left, right]).unwrap();
+        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[left, right]).unwrap();
 
         assert_eq!(
             output[0].sharding.as_ref().unwrap().varying_manual_axes,

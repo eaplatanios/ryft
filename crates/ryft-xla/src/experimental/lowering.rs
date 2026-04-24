@@ -180,7 +180,7 @@ impl<V: Traceable<ArrayType>> StableHloCustomLoweringExtension<V> {
 /// [`to_mlir_module_for_plain_program`] and related entry points. The core [`PrimitiveOperation`] and
 /// [`LinearPrimitiveOperation`] enums provide the default blanket implementations, and backends can add
 /// their own closed op carriers by implementing this trait for those enums.
-pub(crate) trait XlaOperation<V: MlirLowerableValue>: Operation {
+pub(crate) trait XlaOperation<V: MlirLowerableValue>: Operation<ArrayType> {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -2172,7 +2172,7 @@ mod tests {
         }
     }
 
-    impl Operation for TestCustomLoweredOp {
+    impl Operation<ArrayType> for TestCustomLoweredOp {
         fn name(&self) -> &'static str {
             "test_custom_lowered"
         }

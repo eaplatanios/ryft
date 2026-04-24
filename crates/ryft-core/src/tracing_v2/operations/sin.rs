@@ -64,7 +64,7 @@ impl Display for SinOperation {
     }
 }
 
-impl Operation for SinOperation {
+impl Operation<ArrayType> for SinOperation {
     fn name(&self) -> &'static str {
         "sin"
     }

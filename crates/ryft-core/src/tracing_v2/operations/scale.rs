@@ -85,7 +85,7 @@ impl<T: Type, V: Traceable<T>> Display for ScaleOperation<T, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Operation for ScaleOperation<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for ScaleOperation<ArrayType, V> {
     fn name(&self) -> &'static str {
         "scale"
     }

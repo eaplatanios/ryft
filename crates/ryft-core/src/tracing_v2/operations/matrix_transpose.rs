@@ -51,7 +51,7 @@ impl Display for MatrixTransposeOperation {
     }
 }
 
-impl Operation for MatrixTransposeOperation {
+impl Operation<ArrayType> for MatrixTransposeOperation {
     fn name(&self) -> &'static str {
         "matrix_transpose"
     }
