@@ -334,6 +334,36 @@ mod tests {
         approx_eq(pullback.interpret(4.0f64).unwrap(), 4.0);
     }
 
+    struct FailingZeroEngine;
+
+    impl Engine for FailingZeroEngine {
+        type Type = ArrayType;
+        type Value = f64;
+        type TracingOperation = PrimitiveOperation<ArrayType, f64>;
+        type LinearOperation = LinearPrimitiveOperation<ArrayType, f64>;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Err(TypeError { message: "test engine cannot synthesize zero".to_string() }.into())
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(1.0)
+        }
+    }
+
+    #[test]
+    fn transpose_linear_program_propagates_engine_zero_errors() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new();
+        builder.add_input(0.0f64.r#type().into_owned());
+        let output = builder.add_constant(1.0f64);
+        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder);
+
+        assert!(matches!(
+            super::program::transpose_linear_program(&FailingZeroEngine, &program),
+            Err(TracingError::Type(TypeError { message })) if message == "test engine cannot synthesize zero"
+        ));
+    }
+
     #[test]
     fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ArrayScalarEngine::<f64>::new();

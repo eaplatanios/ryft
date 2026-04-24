@@ -175,7 +175,7 @@ where
             Ok(builder.borrow_mut().add_input(output_type.clone()))
         },
         |builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, input_type| {
-            Ok(builder.borrow_mut().add_constant(engine.zero(input_type)))
+            Ok(builder.borrow_mut().add_constant(engine.zero(input_type)?))
         },
     )
 }
@@ -299,7 +299,7 @@ where
             Ok(builder.borrow_mut().add_input(output_examples[output_index].r#type().into_owned()))
         },
         |builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, input_type| {
-            Ok(builder.borrow_mut().add_constant(engine.zero(input_type)))
+            Ok(builder.borrow_mut().add_constant(engine.zero(input_type)?))
         },
     )
 }
@@ -330,7 +330,7 @@ where
         },
         |builder: &Rc<RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, O>>>, input_type| {
             let zero_type = input_type.clone();
-            let zero_atom = tracing_builder.borrow_mut().add_constant(engine.zero(input_type));
+            let zero_atom = tracing_builder.borrow_mut().add_constant(engine.zero(input_type)?);
             let zero_tracer = Tracer::from_staged_parts(zero_atom, zero_type, tracing_builder.clone(), engine);
             Ok(builder.borrow_mut().add_constant(zero_tracer))
         },

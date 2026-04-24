@@ -1,6 +1,7 @@
 use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
+    tracing::TracingError,
     tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation},
     types::{ArrayType, Type},
 };
@@ -59,13 +60,13 @@ pub trait Engine {
     /// Transforms use this when they need a representative value for a leaf without having a
     /// concrete witness available, for example when replaying a staged program from retained input
     /// types or constructing zero cotangents in a transposed linear program.
-    fn zero(&self, r#type: &Self::Type) -> Self::Value;
+    fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 
     /// Returns the multiplicative-identity value corresponding to the provided type metadata.
     ///
     /// This is used less frequently than [`Engine::zero`] but plays the same architectural role:
     /// it lets traced code materialize identity seeds without depending on an existing exemplar.
-    fn one(&self, r#type: &Self::Type) -> Self::Value;
+    fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
@@ -105,13 +106,13 @@ macro_rules! impl_engine_for_array_scalar_engine {
             type LinearOperation = LinearPrimitiveOperation<ArrayType, $ty>;
 
             #[inline]
-            fn zero(&self, _type: &ArrayType) -> $ty {
-                $zero
+            fn zero(&self, _type: &ArrayType) -> Result<$ty, TracingError> {
+                Ok($zero)
             }
 
             #[inline]
-            fn one(&self, _type: &ArrayType) -> $ty {
-                $one
+            fn one(&self, _type: &ArrayType) -> Result<$ty, TracingError> {
+                Ok($one)
             }
         }
     };
@@ -135,7 +136,7 @@ mod tests {
     fn test_array_scalar_engine_produces_canonical_zero_and_one() {
         let engine = ArrayScalarEngine::<f64>::new();
         let r#type = ArrayType::scalar(DataType::F64);
-        assert_eq!(Engine::zero(&engine, &r#type), 0.0);
-        assert_eq!(Engine::one(&engine, &r#type), 1.0);
+        assert_eq!(Engine::zero(&engine, &r#type), Ok(0.0));
+        assert_eq!(Engine::one(&engine, &r#type), Ok(1.0));
     }
 }

@@ -5,22 +5,20 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program};
 
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
+use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::{LinearPrimitiveOperation, engine::Engine};
-use ryft_core::types::ArrayType;
+use ryft_core::types::{ArrayType, DataType, TypeError};
 
 use super::arrays::{Array, ArrayError};
 use super::ops::XlaPrimitiveOperation;
 use super::shard_map::{ShardMapTensor, ShardMapTraceError, TracedXlaProgram};
 
 #[cfg(test)]
+use crate::pjrt::ToPjrt;
+#[cfg(test)]
 use ryft_core::sharding::MeshDeviceId;
 #[cfg(test)]
 use ryft_core::types::Size;
-#[cfg(test)]
-use ryft_core::types::data_types::DataType;
-
-#[cfg(test)]
-use crate::pjrt::ToPjrt;
 
 /// Error type returned by [`XlaEngine`] orchestration helpers.
 #[derive(Debug, thiserror::Error)]
@@ -129,12 +127,24 @@ impl<'c> Engine for XlaEngine<'c> {
     type TracingOperation = XlaPrimitiveOperation;
     type LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>;
 
-    fn zero(&self, array_type: &ArrayType) -> ShardMapTensor {
-        ShardMapTensor::zero(array_type.clone())
+    fn zero(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
+        validate_identity_synthesis("zero", array_type)?;
+        Ok(ShardMapTensor::zero(array_type.clone()))
     }
 
-    fn one(&self, array_type: &ArrayType) -> ShardMapTensor {
-        ShardMapTensor::one(array_type.clone())
+    fn one(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
+        validate_identity_synthesis("one", array_type)?;
+        Ok(ShardMapTensor::one(array_type.clone()))
+    }
+}
+
+fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {
+    match array_type.data_type {
+        DataType::Token | DataType::C64 | DataType::C128 => Err(TypeError {
+            message: format!("xla engine cannot synthesize {identity} value for element type {}", array_type.data_type),
+        }
+        .into()),
+        _ => Ok(()),
     }
 }
 
@@ -564,6 +574,17 @@ mod tests {
             let values = f32_values_from_bytes(host_bytes.as_slice());
             assert_eq!(values, vec![1.0, 1.0]);
         }
+    }
+
+    #[test]
+    fn test_engine_identity_synthesis_rejects_unsupported_constant_type() {
+        let array_type = ArrayType::scalar(DataType::C64);
+
+        assert!(matches!(
+            XlaEngine::token().one(&array_type),
+            Err(TracingError::Type(TypeError { message }))
+                if message == "xla engine cannot synthesize one value for element type c64"
+        ));
     }
 
     #[test]

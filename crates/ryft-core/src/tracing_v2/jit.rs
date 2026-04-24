@@ -247,7 +247,15 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     #[inline]
     fn zero_like(&self) -> Self {
         let r#type = self.r#type().into_owned();
-        let value = self.engine.zero(&r#type);
+        let value = match self.engine.zero(&r#type) {
+            Ok(value) => value,
+            Err(error) => {
+                if self.builder.borrow().error.is_none() {
+                    self.builder.borrow_mut().error = Some(error);
+                }
+                return Self::poison(r#type, self.builder.clone(), self.engine);
+            }
+        };
         let atom = self.builder.borrow_mut().add_constant(value);
         Self::from_staged_parts(atom, r#type, self.builder.clone(), self.engine)
     }
@@ -259,7 +267,15 @@ impl<'engine, E: Engine<Value: Traceable<E::Type>, TracingOperation: Operation<E
     #[inline]
     fn one_like(&self) -> Self {
         let r#type = self.r#type().into_owned();
-        let value = self.engine.one(&r#type);
+        let value = match self.engine.one(&r#type) {
+            Ok(value) => value,
+            Err(error) => {
+                if self.builder.borrow().error.is_none() {
+                    self.builder.borrow_mut().error = Some(error);
+                }
+                return Self::poison(r#type, self.builder.clone(), self.engine);
+            }
+        };
         let atom = self.builder.borrow_mut().add_constant(value);
         Self::from_staged_parts(atom, r#type, self.builder.clone(), self.engine)
     }
@@ -619,15 +635,46 @@ mod tests {
         type TracingOperation = PrimitiveOperation<ArrayType, f64>;
         type LinearOperation = LinearPrimitiveOperation<ArrayType, f64>;
 
-        fn zero(&self, _type: &ArrayType) -> f64 {
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
             let _ = self.id;
-            0.0
+            Ok(0.0)
         }
 
-        fn one(&self, _type: &ArrayType) -> f64 {
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
             let _ = self.id;
-            1.0
+            Ok(1.0)
         }
+    }
+
+    struct FailingOneEngine;
+
+    impl Engine for FailingOneEngine {
+        type Type = ArrayType;
+        type Value = f64;
+        type TracingOperation = PrimitiveOperation<ArrayType, f64>;
+        type LinearOperation = LinearPrimitiveOperation<ArrayType, f64>;
+
+        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Ok(0.0)
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
+            Err(TypeError { message: "test engine cannot synthesize one".to_string() }.into())
+        }
+    }
+
+    #[test]
+    fn tracer_one_like_records_engine_identity_error() {
+        let engine = FailingOneEngine;
+
+        assert!(matches!(
+            interpret_and_trace::<FailingOneEngine, _, f64, f64>(
+                &engine,
+                |x: Tracer<FailingOneEngine>| Ok(x.one_like()),
+                1.0f64,
+            ),
+            Err(TracingError::Type(TypeError { message })) if message == "test engine cannot synthesize one"
+        ));
     }
 
     #[test]
@@ -767,12 +814,12 @@ mod tests {
             type TracingOperation = TestAddOp;
             type LinearOperation = TestAddOp;
 
-            fn zero(&self, r#type: &TestType) -> TestValue {
-                TestValue::new(r#type.clone(), 0)
+            fn zero(&self, r#type: &TestType) -> Result<TestValue, TracingError> {
+                Ok(TestValue::new(r#type.clone(), 0))
             }
 
-            fn one(&self, r#type: &TestType) -> TestValue {
-                TestValue::new(r#type.clone(), 1)
+            fn one(&self, r#type: &TestType) -> Result<TestValue, TracingError> {
+                Ok(TestValue::new(r#type.clone(), 1))
             }
         }
 
@@ -909,12 +956,12 @@ mod tests {
             type TracingOperation = crate::tracing_v2::PrimitiveOperation<ArrayType, TestAbstractValue>;
             type LinearOperation = crate::tracing_v2::LinearPrimitiveOperation<ArrayType, TestAbstractValue>;
 
-            fn zero(&self, r#type: &ArrayType) -> TestAbstractValue {
-                TestAbstractValue { r#type: r#type.clone() }
+            fn zero(&self, r#type: &ArrayType) -> Result<TestAbstractValue, TracingError> {
+                Ok(TestAbstractValue { r#type: r#type.clone() })
             }
 
-            fn one(&self, r#type: &ArrayType) -> TestAbstractValue {
-                TestAbstractValue { r#type: r#type.clone() }
+            fn one(&self, r#type: &ArrayType) -> Result<TestAbstractValue, TracingError> {
+                Ok(TestAbstractValue { r#type: r#type.clone() })
             }
         }
 

@@ -273,13 +273,13 @@ pub mod ndarray_support {
     use super::{MatrixOps, matrix_array_type};
     use crate::{
         parameters::Parameter,
-        tracing::{Traceable, Value},
+        tracing::{Traceable, TracingError, Value},
         tracing_v2::{
             CoordinateValue, Cos, LinearPrimitiveOperation, PrimitiveOperation, Sin,
             engine::Engine,
             operations::constants::{OneLike, ZeroLike},
         },
-        types::{ArrayType, DataType, Typed},
+        types::{ArrayType, DataType, TypeError, Typed},
     };
 
     /// Stateless engine that synthesizes [`Array2`] values from [`ArrayType`] metadata.
@@ -303,10 +303,21 @@ pub mod ndarray_support {
         }
     }
 
-    fn matrix_extent(r#type: &ArrayType) -> (usize, usize) {
-        let rows = r#type.dimension(0).value().expect("Array2Engine requires a static row count");
-        let cols = r#type.dimension(1).value().expect("Array2Engine requires a static column count");
-        (rows, cols)
+    fn matrix_extent(r#type: &ArrayType) -> Result<(usize, usize), TracingError> {
+        if r#type.rank() != 2 {
+            return Err(
+                TypeError { message: format!("array2 engine requires rank-2 array type but got {}", r#type) }.into()
+            );
+        }
+        let row_size = r#type.dimension(0);
+        let col_size = r#type.dimension(1);
+        let rows = row_size.value().ok_or_else(|| TypeError {
+            message: format!("array2 engine requires a static row count but got {row_size}"),
+        })?;
+        let cols = col_size.value().ok_or_else(|| TypeError {
+            message: format!("array2 engine requires a static column count but got {col_size}"),
+        })?;
+        Ok((rows, cols))
     }
 
     impl Engine for Array2Engine<f32> {
@@ -316,13 +327,13 @@ pub mod ndarray_support {
         type LinearOperation = LinearPrimitiveOperation<ArrayType, Array2<f32>>;
 
         #[inline]
-        fn zero(&self, r#type: &ArrayType) -> Array2<f32> {
-            Array2::from_elem(matrix_extent(r#type), 0.0)
+        fn zero(&self, r#type: &ArrayType) -> Result<Array2<f32>, TracingError> {
+            Ok(Array2::from_elem(matrix_extent(r#type)?, 0.0))
         }
 
         #[inline]
-        fn one(&self, r#type: &ArrayType) -> Array2<f32> {
-            Array2::from_elem(matrix_extent(r#type), 1.0)
+        fn one(&self, r#type: &ArrayType) -> Result<Array2<f32>, TracingError> {
+            Ok(Array2::from_elem(matrix_extent(r#type)?, 1.0))
         }
     }
 
@@ -333,13 +344,13 @@ pub mod ndarray_support {
         type LinearOperation = LinearPrimitiveOperation<ArrayType, Array2<f64>>;
 
         #[inline]
-        fn zero(&self, r#type: &ArrayType) -> Array2<f64> {
-            Array2::from_elem(matrix_extent(r#type), 0.0)
+        fn zero(&self, r#type: &ArrayType) -> Result<Array2<f64>, TracingError> {
+            Ok(Array2::from_elem(matrix_extent(r#type)?, 0.0))
         }
 
         #[inline]
-        fn one(&self, r#type: &ArrayType) -> Array2<f64> {
-            Array2::from_elem(matrix_extent(r#type), 1.0)
+        fn one(&self, r#type: &ArrayType) -> Result<Array2<f64>, TracingError> {
+            Ok(Array2::from_elem(matrix_extent(r#type)?, 1.0))
         }
     }
 
