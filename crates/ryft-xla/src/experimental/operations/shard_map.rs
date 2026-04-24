@@ -47,8 +47,7 @@ pub(crate) struct ShardMapReplayContext {
 #[derive(Clone)]
 pub(crate) struct LinearizedShardMapReplayContext {
     tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaPrimitiveOperation>>>,
-    linear_builder:
-        Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>>>,
+    linear_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>>>,
 }
 
 #[derive(Clone)]
@@ -386,19 +385,14 @@ impl ShardMapOperation<ShardMapTracer> {
         &self,
         tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaPrimitiveOperation>>>,
         linear_builder: Rc<
-            RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>>,
+            RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>>,
         >,
         inputs: &[JvpTracer<
             ShardMapTracer,
-            LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
+            LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>,
         >],
     ) -> Result<
-        Vec<
-            JvpTracer<
-                ShardMapTracer,
-                LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
-            >,
-        >,
+        Vec<JvpTracer<ShardMapTracer, LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>>>,
         TracingError,
     > {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
@@ -686,14 +680,14 @@ where
             Type = ArrayType,
             Value = ShardMapTensor,
             TracingOperation = XlaPrimitiveOperation,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
+            LinearOperation = LinearPrimitiveOperation<ShardMapTensor>,
         > + ?Sized,
     ShardMapTensor: Differentiable<
             ArrayType,
-            Tangent<LinearPrimitiveOperation<ArrayType, ShardMapTensor>> = LinearTerm<
+            Tangent<LinearPrimitiveOperation<ShardMapTensor>> = LinearTerm<
                 ArrayType,
                 ShardMapTensor,
-                LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
+                LinearPrimitiveOperation<ShardMapTensor>,
             >,
         >,
 {
@@ -736,14 +730,14 @@ where
             Type = ArrayType,
             Value = ShardMapTensor,
             TracingOperation = XlaPrimitiveOperation,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
+            LinearOperation = LinearPrimitiveOperation<ShardMapTensor>,
         > + ?Sized,
     ShardMapTensor: Differentiable<
             ArrayType,
-            Tangent<LinearPrimitiveOperation<ArrayType, ShardMapTensor>> = LinearTerm<
+            Tangent<LinearPrimitiveOperation<ShardMapTensor>> = LinearTerm<
                 ArrayType,
                 ShardMapTensor,
-                LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
+                LinearPrimitiveOperation<ShardMapTensor>,
             >,
         >,
 {
@@ -857,15 +851,15 @@ where
     E: Engine<
             Type = ArrayType,
             Value = ShardMapTracer,
-            TracingOperation = PrimitiveOperation<ArrayType, ShardMapTracer>,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+            TracingOperation = PrimitiveOperation<ShardMapTracer>,
+            LinearOperation = LinearPrimitiveOperation<ShardMapTracer>,
         > + ?Sized,
     ShardMapTracer: Differentiable<
             ArrayType,
-            Tangent<LinearPrimitiveOperation<ArrayType, ShardMapTracer>> = LinearTerm<
+            Tangent<LinearPrimitiveOperation<ShardMapTracer>> = LinearTerm<
                 ArrayType,
                 ShardMapTracer,
-                LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOperation<ShardMapTracer>,
             >,
         >,
 {
@@ -1392,7 +1386,7 @@ fn make_linear_tensor_shard_map(
 
 fn try_linearize_traced_shard_map_body<
     F: FnOnce(
-        Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>>>,
+        Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>>>,
         Vec<Linearized<ShardMapTracer>>,
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError>,
 >(
@@ -1404,7 +1398,7 @@ fn try_linearize_traced_shard_map_body<
         Program<
             ArrayType,
             ShardMapTracer,
-            LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+            LinearPrimitiveOperation<ShardMapTracer>,
             Vec<ShardMapTracer>,
             Vec<ShardMapTracer>,
         >,
@@ -1415,7 +1409,7 @@ fn try_linearize_traced_shard_map_body<
     let builder = std::rc::Rc::new(std::cell::RefCell::new(ProgramBuilder::<
         ArrayType,
         ShardMapTracer,
-        LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+        LinearPrimitiveOperation<ShardMapTracer>,
     >::new()));
     let traced_input = primals
         .into_iter()
@@ -1443,7 +1437,7 @@ fn try_linearize_traced_shard_map_body<
 
 fn try_transpose_traced_shard_map_body<
     F: FnOnce(
-        Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>>>,
+        Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>>>,
         Vec<Linearized<ShardMapTracer>>,
     ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError>,
 >(
@@ -1456,7 +1450,7 @@ fn try_transpose_traced_shard_map_body<
         Program<
             ArrayType,
             ShardMapTracer,
-            LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+            LinearPrimitiveOperation<ShardMapTracer>,
             Vec<ShardMapTracer>,
             Vec<ShardMapTracer>,
         >,
@@ -1781,9 +1775,7 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 /// Applies one linearized shard-map body to already-traced values.
 pub(crate) fn apply_linearized_flat_shard_map(
     tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTensor, XlaPrimitiveOperation>>>,
-    linear_builder: Rc<
-        RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>>,
-    >,
+    linear_builder: Rc<RefCell<ProgramBuilder<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>>>,
     body: FlatTracedShardMap,
     traced_inputs: Vec<Linearized<ShardMapTracer>>,
 ) -> Result<Vec<Linearized<ShardMapTracer>>, ShardMapTraceError> {
@@ -2437,11 +2429,10 @@ mod tests {
     fn test_linear_tensor_shard_map_jvp_stages_linear_shard_map() {
         let body = simple_traced_shard_map_body();
         let operation = make_linear_tensor_shard_map(&body).expect("linear tensor shard_map should be buildable");
-        let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            ShardMapTensor,
-            LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-        >::new()));
+        let tangent_builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(),
+            ));
         let tangent_atom = tangent_builder.borrow_mut().add_input(test_array_type());
         let tangent = LinearTerm::from_staged_parts(tangent_atom, tangent_builder.clone());
 

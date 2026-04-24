@@ -470,8 +470,7 @@ mod tests {
 
     #[test]
     fn jit_tracer_zero_like_adds_constant_atoms() {
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(3.0f64.r#type().into_owned());
         let engine = ArrayScalarEngine::<f64>::new();
         let tracer: Tracer<ArrayScalarEngine<f64>> = Tracer::from_engine(atom, builder, &engine);
@@ -494,8 +493,7 @@ mod tests {
 
     #[test]
     fn traced_live_tracer_type_borrows_cached_type() {
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let input_type = ArrayType::scalar(crate::types::DataType::F64);
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = ArrayScalarEngine::<f64>::new();
@@ -508,10 +506,8 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_rejects_mismatched_program_builders() {
-        let builder_a =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
-        let builder_b =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let engine = TaggedEngine { id: 1 };
@@ -526,8 +522,7 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_rejects_mismatched_engines() {
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom_a = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let engine_a = TaggedEngine { id: 1 };
@@ -543,8 +538,7 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_returns_poisoned_tracers_after_builder_failure() {
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         builder.borrow_mut().error = Some(TracingError::InvalidInputCount { expected: 1, got: 0 });
         let engine = TaggedEngine { id: 1 };
@@ -562,8 +556,7 @@ mod tests {
 
     #[test]
     fn traced_apply_staged_op_caches_live_output_types() {
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let input_type = ArrayType::scalar(crate::types::DataType::F64);
         let atom = builder.borrow_mut().add_input(input_type.clone());
         let engine = TaggedEngine { id: 1 };
@@ -583,8 +576,7 @@ mod tests {
 
     #[test]
     fn poisoned_tracer_atom_id_returns_poisoned_tracer_error() {
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let engine = TaggedEngine { id: 1 };
         let tracer = Tracer {
             state: TracerState::Poison(ArrayType::scalar(crate::types::DataType::F64)),
@@ -598,16 +590,15 @@ mod tests {
     #[test]
     fn staged_program_replays_graphs() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
-            interpret_and_trace(
-                &engine,
-                |x: Tracer<ArrayScalarEngine<f64>>| {
-                    let squared = x.clone() * x.clone();
-                    Ok(squared + x.sin())
-                },
-                2.0f64,
-            )
-            .unwrap();
+        let (output, program): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
+            &engine,
+            |x: Tracer<ArrayScalarEngine<f64>>| {
+                let squared = x.clone() * x.clone();
+                Ok(squared + x.sin())
+            },
+            2.0f64,
+        )
+        .unwrap();
 
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.interpret(0.5f64).unwrap(), 0.5f64 * 0.5f64 + 0.5f64.sin());
@@ -632,8 +623,8 @@ mod tests {
     impl Engine for TaggedEngine {
         type Type = ArrayType;
         type Value = f64;
-        type TracingOperation = PrimitiveOperation<ArrayType, f64>;
-        type LinearOperation = LinearPrimitiveOperation<ArrayType, f64>;
+        type TracingOperation = PrimitiveOperation<f64>;
+        type LinearOperation = LinearPrimitiveOperation<f64>;
 
         fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
             let _ = self.id;
@@ -651,8 +642,8 @@ mod tests {
     impl Engine for FailingOneEngine {
         type Type = ArrayType;
         type Value = f64;
-        type TracingOperation = PrimitiveOperation<ArrayType, f64>;
-        type LinearOperation = LinearPrimitiveOperation<ArrayType, f64>;
+        type TracingOperation = PrimitiveOperation<f64>;
+        type LinearOperation = LinearPrimitiveOperation<f64>;
 
         fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
             Ok(0.0)
@@ -953,8 +944,8 @@ mod tests {
         impl crate::tracing_v2::engine::Engine for TestEngine {
             type Type = ArrayType;
             type Value = TestAbstractValue;
-            type TracingOperation = crate::tracing_v2::PrimitiveOperation<ArrayType, TestAbstractValue>;
-            type LinearOperation = crate::tracing_v2::LinearPrimitiveOperation<ArrayType, TestAbstractValue>;
+            type TracingOperation = crate::tracing_v2::PrimitiveOperation<TestAbstractValue>;
+            type LinearOperation = crate::tracing_v2::LinearPrimitiveOperation<TestAbstractValue>;
 
             fn zero(&self, r#type: &ArrayType) -> Result<TestAbstractValue, TracingError> {
                 Ok(TestAbstractValue { r#type: r#type.clone() })
@@ -971,7 +962,7 @@ mod tests {
                 Program<
                     ArrayType,
                     TestAbstractValue,
-                    crate::tracing_v2::PrimitiveOperation<ArrayType, TestAbstractValue>,
+                    crate::tracing_v2::PrimitiveOperation<TestAbstractValue>,
                     (TestAbstractValue, TestAbstractValue),
                     TestAbstractValue,
                 >,
@@ -1000,13 +991,12 @@ mod tests {
     #[test]
     fn staged_program_display_renders_the_staged_program() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<ArrayType, f64>, f64, f64>) =
-            interpret_and_trace(
-                &engine,
-                |x: Tracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
-                2.0f64,
-            )
-            .unwrap();
+        let (_, compiled): (f64, Program<ArrayType, f64, PrimitiveOperation<f64>, f64, f64>) = interpret_and_trace(
+            &engine,
+            |x: Tracer<ArrayScalarEngine<f64>>| Ok(x.clone() * x.clone() + x.sin()),
+            2.0f64,
+        )
+        .unwrap();
 
         assert_eq!(
             compiled.to_string(),

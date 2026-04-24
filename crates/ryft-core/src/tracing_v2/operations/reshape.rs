@@ -705,7 +705,7 @@ mod tests {
             Program<
                 ArrayType,
                 ndarray::Array2<f64>,
-                PrimitiveOperation<ArrayType, ndarray::Array2<f64>>,
+                PrimitiveOperation<ndarray::Array2<f64>>,
                 ndarray::Array2<f64>,
                 ndarray::Array2<f64>,
             >,
@@ -731,7 +731,7 @@ mod tests {
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             ndarray::Array2<f64>,
-            LinearPrimitiveOperation<ArrayType, ndarray::Array2<f64>>,
+            LinearPrimitiveOperation<ndarray::Array2<f64>>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());

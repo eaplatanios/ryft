@@ -304,7 +304,7 @@ impl<
         + OneLike
         + MatrixOps
         + ReshapeOps,
-> BatchableOperation<V> for PrimitiveOperation<ArrayType, V>
+> BatchableOperation<V> for PrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
 {
@@ -319,7 +319,7 @@ where
 }
 
 impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike + MatrixOps + ReshapeOps>
-    BatchableOperation<V> for LinearPrimitiveOperation<ArrayType, V>
+    BatchableOperation<V> for LinearPrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
 {
@@ -967,8 +967,8 @@ mod tests {
     impl Engine for TestArrayEngine {
         type Type = ArrayType;
         type Value = TestArray;
-        type TracingOperation = PrimitiveOperation<ArrayType, TestArray>;
-        type LinearOperation = LinearPrimitiveOperation<ArrayType, TestArray>;
+        type TracingOperation = PrimitiveOperation<TestArray>;
+        type LinearOperation = LinearPrimitiveOperation<TestArray>;
 
         fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
             Ok(TestArray { r#type: r#type.clone(), values: vec![0.0; TestArray::element_count(r#type)] })
@@ -1071,15 +1071,14 @@ mod tests {
         let right = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 1).unwrap();
 
         assert!(matches!(
-            PrimitiveOperation::<ArrayType, TestArray>::Add.batch(&[left, right]),
+            PrimitiveOperation::<TestArray>::Add.batch(&[left, right]),
             Err(TracingError::Batching(BatchingError::UnsupportedBatchAxisAlignment { .. }))
         ));
     }
 
     #[test]
     fn test_custom_primitive_requires_explicit_batching_rule() {
-        let operation =
-            PrimitiveOperation::<ArrayType, TestArray>::Custom(Arc::new(CustomPrimitive::new(TestCustomOp)));
+        let operation = PrimitiveOperation::<TestArray>::Custom(Arc::new(CustomPrimitive::new(TestCustomOp)));
         let input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0]), 0).unwrap();
 
         assert!(matches!(

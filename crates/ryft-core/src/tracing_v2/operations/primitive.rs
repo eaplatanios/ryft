@@ -21,7 +21,7 @@ use crate::{
             right_matmul::right_matmul_abstract_eval,
         },
     },
-    types::{ArrayType, Type, TypeError, Typed},
+    types::{ArrayType, TypeError, Typed},
 };
 
 use super::{
@@ -49,7 +49,7 @@ use super::{
 /// tracing entry points can store "one of the built-in operations" without resorting to trait
 /// objects for the common case.
 #[derive(Clone)]
-pub enum PrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
+pub enum PrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Elementwise addition.
     Add,
 
@@ -81,22 +81,22 @@ pub enum PrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
     RightMatMul { factor: V },
 
     /// Reshape between two statically known shapes.
-    Reshape { input_type: T, output_type: T },
+    Reshape { input_type: ArrayType, output_type: ArrayType },
 
     /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
     Rematerialize(
         Box<
             crate::tracing_v2::operations::RematerializeOperation<
-                T,
+                ArrayType,
                 V,
-                PrimitiveOperation<T, V>,
-                LinearPrimitiveOperation<T, V>,
+                PrimitiveOperation<V>,
+                LinearPrimitiveOperation<V>,
             >,
         >,
     ),
 
     /// Escape hatch for user- or crate-defined operations outside `ryft-core`.
-    Custom(Arc<CustomPrimitive<T, V>>),
+    Custom(Arc<CustomPrimitive<ArrayType, V>>),
 }
 
 /// Closed set of operations that may appear in staged linear programs.
@@ -105,7 +105,7 @@ pub enum PrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
 /// operations that make sense in tangent and cotangent programs plus the linearized higher-order
 /// ops needed by rematerialization.
 #[derive(Clone)]
-pub enum LinearPrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter> {
+pub enum LinearPrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Elementwise addition.
     Add,
 
@@ -125,18 +125,18 @@ pub enum LinearPrimitiveOperation<T: Type + Display, V: Traceable<T> + Parameter
     RightMatMul { factor: V },
 
     /// Reshape between two statically known shapes.
-    Reshape { input_type: T, output_type: T },
+    Reshape { input_type: ArrayType, output_type: ArrayType },
 
     /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
     Rematerialize(
-        Box<crate::tracing_v2::operations::LinearRematerializeOperation<T, V, LinearPrimitiveOperation<T, V>>>,
+        Box<crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, LinearPrimitiveOperation<V>>>,
     ),
 
     /// Escape hatch for user- or crate-defined linear custom operations.
-    Custom(Arc<LinearCustomPrimitive<T, V>>),
+    Custom(Arc<LinearCustomPrimitive<ArrayType, V>>),
 }
 
-impl<V: Traceable<ArrayType> + 'static> LinearPrimitiveOperation<ArrayType, V> {
+impl<V: Traceable<ArrayType> + 'static> LinearPrimitiveOperation<V> {
     /// Wraps one custom primitive in the linear-only operation universe after verifying transpose support.
     pub fn custom(primitive: CustomPrimitive<ArrayType, V>) -> Result<Self, TracingError> {
         Ok(Self::Custom(Arc::new(primitive.into_linear()?)))
@@ -148,172 +148,172 @@ impl<V: Traceable<ArrayType> + 'static> LinearPrimitiveOperation<ArrayType, V> {
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> AddTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> AddTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn add_op() -> Self {
         PrimitiveOperation::Add
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> MulTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> MulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn mul_op() -> Self {
         PrimitiveOperation::Mul
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> NegTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> NegTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn neg_op() -> Self {
         PrimitiveOperation::Neg
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> SinTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> SinTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn sin_op() -> Self {
         PrimitiveOperation::Sin
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> CosTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> CosTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn cos_op() -> Self {
         PrimitiveOperation::Cos
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> MatMulTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> MatMulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn matmul_op() -> Self {
         PrimitiveOperation::MatMul
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> MatrixTransposeTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> MatrixTransposeTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn matrix_transpose_op() -> Self {
         PrimitiveOperation::MatrixTranspose
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> ScaleTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> ScaleTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn scale_op(factor: V) -> Self {
         PrimitiveOperation::Scale { factor }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LeftMatMulTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LeftMatMulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn left_matmul_op(factor: V) -> Self {
         PrimitiveOperation::LeftMatMul { factor }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> RightMatMulTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> RightMatMulTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
     fn right_matmul_op(factor: V) -> Self {
         PrimitiveOperation::RightMatMul { factor }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> ReshapeTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> ReshapeTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn reshape_op(input_type: T, output_type: T) -> Self {
+    fn reshape_op(input_type: ArrayType, output_type: ArrayType) -> Self {
         PrimitiveOperation::Reshape { input_type, output_type }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> RematerializeTracingOperation<T, V, LinearPrimitiveOperation<T, V>>
-    for PrimitiveOperation<T, V>
+impl<V: Traceable<ArrayType>> RematerializeTracingOperation<ArrayType, V, LinearPrimitiveOperation<V>>
+    for PrimitiveOperation<V>
 {
     #[inline]
     fn rematerialize_op(
-        op: crate::tracing_v2::operations::RematerializeOperation<T, V, Self, LinearPrimitiveOperation<T, V>>,
+        op: crate::tracing_v2::operations::RematerializeOperation<ArrayType, V, Self, LinearPrimitiveOperation<V>>,
     ) -> Self {
         PrimitiveOperation::Rematerialize(Box::new(op))
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> CustomTracingOperation<T, V> for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> CustomTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
     #[inline]
-    fn custom_op(primitive: Arc<CustomPrimitive<T, V>>) -> Self {
+    fn custom_op(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Self {
         PrimitiveOperation::Custom(primitive)
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearAddOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearAddOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn linear_add_op() -> Self {
         LinearPrimitiveOperation::Add
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearNegOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearNegOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn linear_neg_op() -> Self {
         LinearPrimitiveOperation::Neg
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearMatrixTransposeOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearMatrixTransposeOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn linear_matrix_transpose_op() -> Self {
         LinearPrimitiveOperation::MatrixTranspose
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearScaleOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearScaleOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn linear_scale_op(factor: V) -> Self {
         LinearPrimitiveOperation::Scale { factor }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearLeftMatMulOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearLeftMatMulOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn linear_left_matmul_op(factor: V) -> Self {
         LinearPrimitiveOperation::LeftMatMul { factor }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearRightMatMulOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearRightMatMulOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn linear_right_matmul_op(factor: V) -> Self {
         LinearPrimitiveOperation::RightMatMul { factor }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearReshapeOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearReshapeOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_reshape_op(input_type: T, output_type: T) -> Self {
+    fn linear_reshape_op(input_type: ArrayType, output_type: ArrayType) -> Self {
         LinearPrimitiveOperation::Reshape { input_type, output_type }
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> LinearRematerializeCarrierOperation<T, V> for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> LinearRematerializeCarrierOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_rematerialize_op(op: crate::tracing_v2::operations::LinearRematerializeOperation<T, V, Self>) -> Self {
+    fn linear_rematerialize_op(
+        op: crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, Self>,
+    ) -> Self {
         LinearPrimitiveOperation::Rematerialize(Box::new(op))
     }
 }
 
-impl<T: Type + Display + 'static, V: Traceable<T> + 'static> LinearCustomOperation<T, V>
-    for LinearPrimitiveOperation<T, V>
-{
+impl<V: Traceable<ArrayType> + 'static> LinearCustomOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_custom_op(primitive: CustomPrimitive<T, V>) -> Result<Self, TracingError> {
+    fn linear_custom_op(primitive: CustomPrimitive<ArrayType, V>) -> Result<Self, TracingError> {
         Ok(LinearPrimitiveOperation::Custom(Arc::new(primitive.into_linear()?)))
     }
 
     #[inline]
-    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<T, V>>) -> Result<Self, TracingError> {
+    fn linear_custom_arc_op(primitive: Arc<CustomPrimitive<ArrayType, V>>) -> Result<Self, TracingError> {
         Ok(LinearPrimitiveOperation::Custom(Arc::new(LinearCustomPrimitive::from_custom_primitive(primitive)?)))
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> Debug for PrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> Debug for PrimitiveOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Add => write!(formatter, "Add"),
@@ -335,7 +335,7 @@ impl<T: Type + Display, V: Traceable<T>> Debug for PrimitiveOperation<T, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Display for PrimitiveOperation<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Display for PrimitiveOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
@@ -344,7 +344,7 @@ impl<V: Traceable<ArrayType>> Display for PrimitiveOperation<ArrayType, V> {
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>> Debug for LinearPrimitiveOperation<T, V> {
+impl<V: Traceable<ArrayType>> Debug for LinearPrimitiveOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Add => write!(formatter, "Add"),
@@ -362,7 +362,7 @@ impl<T: Type + Display, V: Traceable<T>> Debug for LinearPrimitiveOperation<T, V
     }
 }
 
-impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOperation<ArrayType, V> {
+impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reshape { output_type, .. } => write!(formatter, "reshape{}", output_type.shape),
@@ -371,8 +371,9 @@ impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOperation<ArrayType, V>
     }
 }
 
-/// [`Operation`] for [`PrimitiveOperation`] requires NO value-type bounds Ã¢â‚¬â€ shape validation works for any `V: Traceable<ArrayType>`.
-impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<ArrayType, V> {
+/// [`Operation`] for [`PrimitiveOperation`] requires no value-type bounds; shape validation works for
+/// any `V: Traceable<ArrayType>`.
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -449,8 +450,9 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<ArrayT
     }
 }
 
-/// [`Operation`] for [`LinearPrimitiveOperation`] requires NO value-type bounds Ã¢â‚¬â€ shape validation works for any `V: Traceable<ArrayType>`.
-impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<ArrayType, V> {
+/// [`Operation`] for [`LinearPrimitiveOperation`] requires no value-type bounds; shape validation
+/// works for any `V: Traceable<ArrayType>`.
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<V> {
     fn name(&self) -> &'static str {
         match self {
             Self::Add => "add",
@@ -536,7 +538,7 @@ impl<
         + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
-> InterpretableOperation<ArrayType, V> for PrimitiveOperation<ArrayType, V>
+> InterpretableOperation<ArrayType, V> for PrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
@@ -569,7 +571,7 @@ impl<
         + ZeroLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
-> InterpretableOperation<ArrayType, V> for LinearPrimitiveOperation<ArrayType, V>
+> InterpretableOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
@@ -599,7 +601,7 @@ impl<
         + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps,
-> LinearOperation<ArrayType, V> for LinearPrimitiveOperation<ArrayType, V>
+> LinearOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
@@ -654,12 +656,11 @@ impl<
     E: Engine<
             Type = ArrayType,
             Value = V,
-            TracingOperation = PrimitiveOperation<ArrayType, V>,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
+            TracingOperation = PrimitiveOperation<V>,
+            LinearOperation = LinearPrimitiveOperation<V>,
         > + ?Sized
         + 'static,
-> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>
-    for PrimitiveOperation<ArrayType, V>
+> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>> for PrimitiveOperation<V>
 where
     V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
@@ -705,18 +706,14 @@ impl<
     E: Engine<
             Type = ArrayType,
             Value = V,
-            TracingOperation = PrimitiveOperation<ArrayType, V>,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, V>,
+            TracingOperation = PrimitiveOperation<V>,
+            LinearOperation = LinearPrimitiveOperation<V>,
         > + 'static,
-> DifferentiableOperation<E> for PrimitiveOperation<ArrayType, V>
+> DifferentiableOperation<E> for PrimitiveOperation<V>
 where
     V: Differentiable<
             ArrayType,
-            Tangent<LinearPrimitiveOperation<ArrayType, V>> = LinearTerm<
-                ArrayType,
-                V,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >,
+            Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
         >,
     V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,

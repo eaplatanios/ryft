@@ -313,18 +313,16 @@ mod tests {
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, compiled): (
-            f64,
-            Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<ArrayType, f64>, f64, f64>,
-        ) = interpret_and_trace(
-            &engine,
-            |x| {
-                let with_constant = x.clone() + x.one_like();
-                Ok(with_constant.sin())
-            },
-            2.0f64,
-        )
-        .unwrap();
+        let (_, compiled): (f64, Program<ArrayType, f64, crate::tracing_v2::PrimitiveOperation<f64>, f64, f64>) =
+            interpret_and_trace(
+                &engine,
+                |x| {
+                    let with_constant = x.clone() + x.one_like();
+                    Ok(with_constant.sin())
+                },
+                2.0f64,
+            )
+            .unwrap();
 
         let summary = summarize_program(&compiled, |_| Ok(Vec::new())).unwrap();
         assert_eq!(

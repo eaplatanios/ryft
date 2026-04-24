@@ -28,7 +28,7 @@ use crate::experimental::{
     shard_map::{ShardMapTensor, ShardMapTracer},
 };
 
-type XlaLinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>;
+type XlaLinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
 
 fn make_linear_xla_rematerialize<E>(
     engine: &E,

@@ -76,7 +76,7 @@ pub(crate) fn replay_program_linearized_jit<'engine, ProgramInput, ProgramOutput
     engine: &'engine E,
     tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
     linear_builder: Rc<
-        RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>>,
+        RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
     >,
     program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
     inputs: Vec<LinearizedTracedValue<'engine, E>>,
@@ -127,7 +127,7 @@ where
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
         ArrayType,
         Tracer<'engine, E>,
-        LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>,
+        LinearPrimitiveOperation<Tracer<'engine, E>>,
     >::new()));
     let traced_input = primals
         .into_iter()

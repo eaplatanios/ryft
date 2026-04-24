@@ -561,7 +561,7 @@ impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V>
     }
 }
 
-impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<ArrayType, V> {
+impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -657,7 +657,7 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<A
     }
 }
 
-impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOperation<ArrayType, V> {
+impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -2357,7 +2357,7 @@ mod tests {
             ryft_core::tracing::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
+                ryft_core::tracing_v2::PrimitiveOperation<f64>,
                 (f64, f64),
                 f64,
             >,
@@ -2389,13 +2389,7 @@ mod tests {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             f64,
-            ryft_core::tracing::Program<
-                ArrayType,
-                f64,
-                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
-                f64,
-                f64,
-            >,
+            ryft_core::tracing::Program<ArrayType, f64, ryft_core::tracing_v2::PrimitiveOperation<f64>, f64, f64>,
         ) = ryft_core::tracing_v2::interpret_and_trace(
             &engine,
             |x| Ok(ryft_core::tracing_v2::rematerialize(|y| y.sin(), x).unwrap()),
@@ -2422,13 +2416,7 @@ mod tests {
         let engine = ryft_core::tracing_v2::engine::ArrayScalarEngine::<f64>::new();
         let (_, compiled): (
             f64,
-            ryft_core::tracing::Program<
-                ArrayType,
-                f64,
-                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
-                f64,
-                f64,
-            >,
+            ryft_core::tracing::Program<ArrayType, f64, ryft_core::tracing_v2::PrimitiveOperation<f64>, f64, f64>,
         ) = ryft_core::tracing_v2::interpret_and_trace(
             &engine,
             |x| {
@@ -2464,7 +2452,7 @@ mod tests {
             ryft_core::tracing::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>,
+                ryft_core::tracing_v2::LinearPrimitiveOperation<f64>,
                 f64,
                 (f64, f64),
             >,
@@ -2494,7 +2482,7 @@ mod tests {
             ryft_core::tracing::Program<
                 ArrayType,
                 f64,
-                ryft_core::tracing_v2::PrimitiveOperation<ArrayType, f64>,
+                ryft_core::tracing_v2::PrimitiveOperation<f64>,
                 (f64, f64),
                 (f64, f64),
             >,
@@ -2532,7 +2520,7 @@ mod tests {
             ryft_core::tracing::Program<
                 ArrayType,
                 Array2<f64>,
-                ryft_core::tracing_v2::LinearPrimitiveOperation<ArrayType, Array2<f64>>,
+                ryft_core::tracing_v2::LinearPrimitiveOperation<Array2<f64>>,
                 Array2<f64>,
                 (Array2<f64>, Array2<f64>),
             >,

@@ -53,13 +53,12 @@ pub use term::{LinearTerm, Linearized};
 pub(crate) use replay::{linearize_traced_program, replay_program_linearized_jit};
 pub(crate) use reverse::jvp_traced;
 
-type LinearizedTracedValue<'engine, E> =
-    Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>;
+type LinearizedTracedValue<'engine, E> = Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>;
 
 type TracedLinearProgram<'engine, E> = Program<
     ArrayType,
     Tracer<'engine, E>,
-    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>,
     Vec<Tracer<'engine, E>>,
     Vec<Tracer<'engine, E>>,
 >;
@@ -141,11 +140,8 @@ where
     O: Clone + Operation<ArrayType> + 'static,
     L: Clone + Operation<ArrayType> + 'static,
     E: Engine<Type = ArrayType, Value = V, TracingOperation = O, LinearOperation = L> + ?Sized + 'static,
-    O: InterpretableOperation<
-            ArrayType,
-            Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>>,
-        >,
-    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    O: InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
 {
     let (outputs, pushforward) =
         linearize_traced_program::<V, O, L, E>(engine, tracing_builder, traced_program, traced_primals)?;
@@ -310,7 +306,7 @@ mod tests {
     fn linearize_program_does_not_replay_the_forward_program_to_recover_representatives() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp)
             .with_jvp_rule::<ArrayScalarEngine<f64>, _>(PanicReplayOp);
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let input = builder.add_input(3.0f64.r#type().into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
@@ -332,7 +328,7 @@ mod tests {
             CustomPrimitive::<ArrayType, f64>::new(PanicReplayOp).with_transpose_rule(PanicReplayOp),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new();
         let input = builder.add_input(0.0f64.r#type().into_owned());
         let output_atom = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.instructions.push(Instruction {
@@ -354,8 +350,8 @@ mod tests {
     impl Engine for FailingZeroEngine {
         type Type = ArrayType;
         type Value = f64;
-        type TracingOperation = PrimitiveOperation<ArrayType, f64>;
-        type LinearOperation = LinearPrimitiveOperation<ArrayType, f64>;
+        type TracingOperation = PrimitiveOperation<f64>;
+        type LinearOperation = LinearPrimitiveOperation<f64>;
 
         fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
             Err(TypeError { message: "test engine cannot synthesize zero".to_string() }.into())
@@ -368,7 +364,7 @@ mod tests {
 
     #[test]
     fn transpose_linear_program_propagates_engine_zero_errors() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new();
         builder.add_input(0.0f64.r#type().into_owned());
         let output = builder.add_constant(1.0f64);
         let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder);
@@ -382,7 +378,7 @@ mod tests {
     #[test]
     fn linear_program_display_delegates_to_the_underlying_program() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>, f64, f64>) =
+        let (_, pushforward): (f64, Program<ArrayType, f64, LinearPrimitiveOperation<f64>, f64, f64>) =
             jvp_program(&engine, |x| Ok(quadratic_plus_sin(x)), 2.0f64).unwrap();
 
         assert_eq!(

@@ -11,7 +11,7 @@ use super::*;
 pub struct LinearTerm<
     T: Type + Display,
     V: Traceable<T> + Parameter,
-    O: Clone + Operation<T> = LinearPrimitiveOperation<ArrayType, V>,
+    O: Clone + Operation<T> = LinearPrimitiveOperation<V>,
 > {
     /// Atom id representing this symbolic tangent or cotangent inside the shared linear builder.
     pub atom: AtomId,
@@ -171,7 +171,7 @@ impl<
 /// This is the default tangent payload fed into primitive JVP rules during linearization: the
 /// primal component is an ordinary leaf `V`, while the tangent component is a symbolic
 /// [`LinearTerm`] staged into the linear builder.
-pub type Linearized<V, O = LinearPrimitiveOperation<ArrayType, V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;
+pub type Linearized<V, O = LinearPrimitiveOperation<V>> = JvpTracer<V, LinearTerm<ArrayType, V, O>>;
 
 #[cfg(test)]
 mod tests {
@@ -186,10 +186,8 @@ mod tests {
 
     #[test]
     fn linear_term_apply_staged_op_rejects_mismatched_program_builders() {
-        let builder_a =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
-        let builder_b =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<ArrayType, f64>>::new()));
+        let builder_a = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+        let builder_b = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
         let atom_a = builder_a.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let atom_b = builder_b.borrow_mut().add_input(2.0f64.r#type().into_owned());
         let term_a = LinearTerm::from_staged_parts(atom_a, builder_a.clone());

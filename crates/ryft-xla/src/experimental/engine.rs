@@ -125,7 +125,7 @@ impl<'c> Engine for XlaEngine<'c> {
     type Type = ArrayType;
     type Value = ShardMapTensor;
     type TracingOperation = XlaPrimitiveOperation;
-    type LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>;
+    type LinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
 
     fn zero(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
         validate_identity_synthesis("zero", array_type)?;

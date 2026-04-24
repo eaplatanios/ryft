@@ -28,8 +28,8 @@ impl<T> NdArrayEngine<T> {
 impl<T: NdArrayElement> Engine for NdArrayEngine<T> {
     type Type = ArrayType;
     type Value = Array<T>;
-    type TracingOperation = PrimitiveOperation<ArrayType, Array<T>>;
-    type LinearOperation = LinearPrimitiveOperation<ArrayType, Array<T>>;
+    type TracingOperation = PrimitiveOperation<Array<T>>;
+    type LinearOperation = LinearPrimitiveOperation<Array<T>>;
 
     fn zero(&self, array_type: &ArrayType) -> Result<Self::Value, TracingError> {
         Array::zeros(array_type).map_err(array_error_to_tracing_error)

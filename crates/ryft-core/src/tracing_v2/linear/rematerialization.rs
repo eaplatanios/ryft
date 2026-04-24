@@ -12,7 +12,7 @@ where
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
         + Operation<ArrayType>,
     E::LinearOperation: Operation<ArrayType>,
-    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::TracingOperation>::new()));
@@ -68,7 +68,7 @@ where
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E>>
         + Operation<ArrayType>,
     E::LinearOperation: Operation<ArrayType>,
-    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -148,7 +148,7 @@ where
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Operation<ArrayType>,
     E::LinearOperation: Operation<ArrayType>,
-    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -193,7 +193,7 @@ where
         + RematerializeTracingOperation<ArrayType, V, E::LinearOperation>
         + Operation<ArrayType>,
     E::LinearOperation: Operation<ArrayType>,
-    LinearPrimitiveOperation<ArrayType, Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn test_build_traced_gradient_program_handles_nullary_scalar_programs() {
         let engine = ArrayScalarEngine::<f64>::new();
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let output_atom = builder.add_constant(3.0f64);
         let traced_program =
             builder.build::<Vec<f64>, Vec<f64>>(vec![output_atom], Vec::<Placeholder>::new(), vec![Placeholder]);

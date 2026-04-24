@@ -58,8 +58,8 @@ impl WithShardingConstraintOperation {
             .with_jvp_rule_for::<crate::experimental::engine::XlaEngine<'static>, _>(self.clone())
             .with_linearized_jit_rule_for::<
                 XlaPrimitiveOperation,
-                LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-                LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
+                LinearPrimitiveOperation<ShardMapTensor>,
+                LinearPrimitiveOperation<ShardMapTracer>,
                 crate::experimental::engine::XlaEngine<'static>,
                 _,
             >(self.clone())
@@ -143,28 +143,24 @@ impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperat
 
 trait WithShardingConstraintJvpValue<E>: Clone + Differentiable<ArrayType> + Traceable<ArrayType>
 where
-    E: Engine<Type = ArrayType, Value = Self, LinearOperation = LinearPrimitiveOperation<ArrayType, Self>> + ?Sized,
+    E: Engine<Type = ArrayType, Value = Self, LinearOperation = LinearPrimitiveOperation<Self>> + ?Sized,
     Self: Sized,
 {
     fn apply_constraint_tangent(
         op: &WithShardingConstraintOperation,
-        tangent: &LinearTerm<ArrayType, Self, LinearPrimitiveOperation<ArrayType, Self>>,
-    ) -> Result<LinearTerm<ArrayType, Self, LinearPrimitiveOperation<ArrayType, Self>>, TracingError>;
+        tangent: &LinearTerm<ArrayType, Self, LinearPrimitiveOperation<Self>>,
+    ) -> Result<LinearTerm<ArrayType, Self, LinearPrimitiveOperation<Self>>, TracingError>;
 }
 
 impl<E> WithShardingConstraintJvpValue<E> for ShardMapTensor
 where
-    E: Engine<
-            Type = ArrayType,
-            Value = ShardMapTensor,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-        > + ?Sized,
+    E: Engine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = LinearPrimitiveOperation<ShardMapTensor>>
+        + ?Sized,
 {
     fn apply_constraint_tangent(
         op: &WithShardingConstraintOperation,
-        tangent: &LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>,
-    ) -> Result<LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ArrayType, ShardMapTensor>>, TracingError>
-    {
+        tangent: &LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>,
+    ) -> Result<LinearTerm<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>, TracingError> {
         LinearTerm::apply_staged_op(
             tangent.builder.clone(),
             std::slice::from_ref(tangent),
@@ -179,17 +175,13 @@ where
 
 impl<E> WithShardingConstraintJvpValue<E> for ShardMapTracer
 where
-    E: Engine<
-            Type = ArrayType,
-            Value = ShardMapTracer,
-            LinearOperation = LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
-        > + ?Sized,
+    E: Engine<Type = ArrayType, Value = ShardMapTracer, LinearOperation = LinearPrimitiveOperation<ShardMapTracer>>
+        + ?Sized,
 {
     fn apply_constraint_tangent(
         op: &WithShardingConstraintOperation,
-        tangent: &LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>,
-    ) -> Result<LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ArrayType, ShardMapTracer>>, TracingError>
-    {
+        tangent: &LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>,
+    ) -> Result<LinearTerm<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>, TracingError> {
         LinearTerm::apply_staged_op(
             tangent.builder.clone(),
             std::slice::from_ref(tangent),
@@ -204,15 +196,11 @@ where
 
 impl<V, E> DifferentiableOperation<E> for WithShardingConstraintOperation
 where
-    E: Engine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<ArrayType, V>> + ?Sized,
+    E: Engine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>> + ?Sized,
     V: WithShardingConstraintJvpValue<E>,
     V: Differentiable<
             ArrayType,
-            Tangent<LinearPrimitiveOperation<ArrayType, V>> = LinearTerm<
-                ArrayType,
-                V,
-                LinearPrimitiveOperation<ArrayType, V>,
-            >,
+            Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
         >,
 {
     fn jvp(
@@ -447,11 +435,10 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            ShardMapTensor,
-            LinearPrimitiveOperation<ArrayType, ShardMapTensor>,
-        >::new()));
+        let transpose_builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(),
+            ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution =
@@ -485,11 +472,10 @@ mod tests {
         let sharding = test_sharding(&mesh);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]), None, None).unwrap();
 
-        let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            ShardMapTracer,
-            LinearPrimitiveOperation<ArrayType, ShardMapTracer>,
-        >::new()));
+        let transpose_builder =
+            Rc::new(RefCell::new(
+                ProgramBuilder::<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>::new(),
+            ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution =

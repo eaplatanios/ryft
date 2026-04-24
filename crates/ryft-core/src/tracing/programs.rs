@@ -218,10 +218,17 @@ pub struct Instruction<O> {
 /// [`Program`] is the persistent artifact produced by tracing. It stores the finalized atom table,
 /// the ordered list of instructions, and the structured input/output metadata needed to turn flat leaf
 /// evaluation back into user-facing structured values. Both ordinary JIT traces and higher-order
-/// transforms exchange programs in this form. The generic parameters intentionally stay open so the
-/// same IR can represent ordinary programs plus tangent and cotangent programs over backend-specific
-/// operation carriers.
-pub struct Program<T: Type, V: Typed<T> + Parameter, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> {
+/// transforms exchange programs in this form. The operation carrier remains generic so the same IR
+/// can represent ordinary programs plus tangent and cotangent programs over backend-specific
+/// operation carriers, but every carrier must implement the shape-level [`Operation`] interface for
+/// the program's type domain.
+pub struct Program<
+    T: Type,
+    V: Typed<T> + Parameter,
+    O: Clone + Operation<T>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+> {
     /// Final atom table of the staged program.
     pub atoms: Vec<Atom<T, V>>,
 
@@ -245,7 +252,7 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O: Clone, Input: Parameteri
 }
 
 impl<
-    O: Clone,
+    O: Clone + Operation<T>,
     T: Type,
     V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
@@ -839,7 +846,7 @@ mod tests {
 
     #[test]
     fn program_builder_tracks_atom_kinds_and_executes() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(2.0f64.r#type().into_owned());
         let y = builder.add_input(3.0f64.r#type().into_owned());
         let two = builder.add_constant(2.0f64);
@@ -865,7 +872,7 @@ mod tests {
 
     #[test]
     fn program_interpret_preserves_duplicate_outputs() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
         let doubled = builder.add_instruction(PrimitiveOperation::Add, vec![x, x]).unwrap()[0];
         let program = builder.build::<f64, (f64, f64)>(vec![doubled, doubled], Placeholder, (Placeholder, Placeholder));
@@ -875,7 +882,7 @@ mod tests {
 
     #[test]
     fn program_interpret_rejects_mismatched_parameter_structures() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
         let program = builder.build::<Vec<f64>, f64>(vec![x], vec![Placeholder], Placeholder);
 
@@ -891,7 +898,7 @@ mod tests {
 
     #[test]
     fn program_display_uses_typed_jaxpr_like_rendering() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(1.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
@@ -911,7 +918,7 @@ mod tests {
 
     #[test]
     fn program_builder_rejects_unbound_inputs() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let result = builder.add_instruction(PrimitiveOperation::Add, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
         assert!(matches!(
             result,
@@ -922,7 +929,7 @@ mod tests {
 
     #[test]
     fn test_constant_folding_eliminates_instructions() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
 
@@ -960,7 +967,7 @@ mod tests {
 
     #[test]
     fn test_constant_folding_program_call_produces_correct_results() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let a = builder.add_constant(2.0f64);
         let b = builder.add_constant(3.0f64);
         let folded_sum = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap()[0];
@@ -978,7 +985,7 @@ mod tests {
 
     #[test]
     fn program_builder_tracks_only_types_for_variable_atoms() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(2.0f64.r#type().into_owned());
         let three = builder.add_constant(3.0f64);
         let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, three]).unwrap()[0];
@@ -1094,8 +1101,7 @@ mod tests {
             }
         }
 
-        let mut builder =
-            ProgramBuilder::<ArrayType, TestIdentityValue, PrimitiveOperation<ArrayType, TestIdentityValue>>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestIdentityValue, PrimitiveOperation<TestIdentityValue>>::new();
         let x = builder.add_input(TestIdentityValue::scalar(5.0).r#type().into_owned());
         let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
 

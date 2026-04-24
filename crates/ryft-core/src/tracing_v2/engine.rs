@@ -1,7 +1,7 @@
 use std::{fmt::Display, marker::PhantomData};
 
 use crate::{
-    tracing::TracingError,
+    tracing::{Operation, TracingError},
     tracing_v2::{LinearPrimitiveOperation, PrimitiveOperation},
     types::{ArrayType, Type},
 };
@@ -47,13 +47,13 @@ pub trait Engine {
     ///
     /// Programs produced by [`trace`](crate::tracing_v2::trace) and
     /// [`interpret_and_trace`](crate::tracing_v2::interpret_and_trace) store this carrier.
-    type TracingOperation: Clone + 'static;
+    type TracingOperation: Clone + Operation<Self::Type> + 'static;
 
     /// Linear staged operation type selected by this engine for tangent and cotangent programs.
     ///
     /// Linear programs produced by [`jvp_program`](crate::tracing_v2::jvp_program),
     /// [`vjp`](crate::tracing_v2::vjp), and related transforms store this carrier.
-    type LinearOperation: Clone + 'static;
+    type LinearOperation: Clone + Operation<Self::Type> + 'static;
 
     /// Returns the additive-identity value corresponding to the provided type metadata.
     ///
@@ -102,8 +102,8 @@ macro_rules! impl_engine_for_array_scalar_engine {
         impl Engine for ArrayScalarEngine<$ty> {
             type Type = ArrayType;
             type Value = $ty;
-            type TracingOperation = PrimitiveOperation<ArrayType, $ty>;
-            type LinearOperation = LinearPrimitiveOperation<ArrayType, $ty>;
+            type TracingOperation = PrimitiveOperation<$ty>;
+            type LinearOperation = LinearPrimitiveOperation<$ty>;
 
             #[inline]
             fn zero(&self, _type: &ArrayType) -> Result<$ty, TracingError> {

@@ -323,8 +323,8 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f32> {
         type Type = ArrayType;
         type Value = Array2<f32>;
-        type TracingOperation = PrimitiveOperation<ArrayType, Array2<f32>>;
-        type LinearOperation = LinearPrimitiveOperation<ArrayType, Array2<f32>>;
+        type TracingOperation = PrimitiveOperation<Array2<f32>>;
+        type LinearOperation = LinearPrimitiveOperation<Array2<f32>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Result<Array2<f32>, TracingError> {
@@ -340,8 +340,8 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f64> {
         type Type = ArrayType;
         type Value = Array2<f64>;
-        type TracingOperation = PrimitiveOperation<ArrayType, Array2<f64>>;
-        type LinearOperation = LinearPrimitiveOperation<ArrayType, Array2<f64>>;
+        type TracingOperation = PrimitiveOperation<Array2<f64>>;
+        type LinearOperation = LinearPrimitiveOperation<Array2<f64>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Result<Array2<f64>, TracingError> {
