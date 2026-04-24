@@ -42,7 +42,6 @@ where
     };
     traced_primal_builder
         .build::<Input, Input>(gradient_output_atoms, input_structure.clone(), input_structure)
-        .with_folded_constants()?
         .simplified()
 }
 

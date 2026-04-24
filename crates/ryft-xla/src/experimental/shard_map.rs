@@ -318,17 +318,7 @@ impl ryft_core::types::Typed<ArrayType> for ShardMapTensor {
     }
 }
 
-impl Traceable<ArrayType> for ShardMapTensor {
-    #[inline]
-    fn is_zero(&self) -> bool {
-        matches!(self.constant_kind, Some(ShardMapConstantKind::Zero))
-    }
-
-    #[inline]
-    fn is_one(&self) -> bool {
-        matches!(self.constant_kind, Some(ShardMapConstantKind::One))
-    }
-}
+impl Traceable<ArrayType> for ShardMapTensor {}
 
 impl Value<ArrayType> for ShardMapTensor {}
 

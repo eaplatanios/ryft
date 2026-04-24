@@ -1431,7 +1431,7 @@ fn try_linearize_traced_shard_map_body<
     };
     let program =
         builder.build::<Vec<ShardMapTracer>, Vec<ShardMapTracer>>(tangent_outputs, input_structure, output_structure);
-    let program = program.with_folded_constants()?.simplified()?;
+    let program = program.simplified()?;
     Ok((primal_outputs.clone(), program))
 }
 

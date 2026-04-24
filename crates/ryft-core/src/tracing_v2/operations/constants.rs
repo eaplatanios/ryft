@@ -34,17 +34,7 @@ macro_rules! impl_scalar_value_traits {
     ($ty:ty, $zero:expr, $one:expr) => {
         impl Value<ArrayType> for $ty {}
 
-        impl Traceable<ArrayType> for $ty {
-            #[inline]
-            fn is_zero(&self) -> bool {
-                *self == self.zero_like()
-            }
-
-            #[inline]
-            fn is_one(&self) -> bool {
-                *self == self.one_like()
-            }
-        }
+        impl Traceable<ArrayType> for $ty {}
 
         impl ZeroLike for $ty {
             #[inline]
@@ -81,7 +71,7 @@ mod tests {
     use half::{bf16, f16};
 
     use crate::{
-        tracing::{Traceable, Value},
+        tracing::Value,
         tracing_v2::{Cos, Sin, test_support},
         types::ArrayType,
         types::{DataType, Typed},
@@ -99,8 +89,6 @@ mod tests {
     {
         assert_eq!(value.zero_like(), zero);
         assert_eq!(value.one_like(), one);
-        assert!(Traceable::is_zero(&zero));
-        assert!(Traceable::is_one(&one));
     }
 
     #[test]

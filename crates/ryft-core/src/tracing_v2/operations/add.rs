@@ -8,7 +8,7 @@ use crate::broadcasting::Broadcastable;
 use crate::types::{ArrayType, Type, TypeError};
 use crate::{
     macros::check_input_count,
-    tracing::{AtomId, Traceable, TracingError},
+    tracing::{Traceable, TracingError},
     tracing_v2::{
         engine::Engine,
         forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
@@ -100,25 +100,6 @@ impl Operation<ArrayType> for AddOperation {
                 }
                 Ok(vec![output])
             }
-        }
-    }
-
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        _is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        if inputs.len() == 2 {
-            if is_zero_constant(inputs[0]) {
-                Some(vec![inputs[1]])
-            } else if is_zero_constant(inputs[1]) {
-                Some(vec![inputs[0]])
-            } else {
-                None
-            }
-        } else {
-            None
         }
     }
 }

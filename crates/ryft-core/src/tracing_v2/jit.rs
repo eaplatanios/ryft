@@ -322,8 +322,7 @@ impl<
 /// [`Program`].
 ///
 /// The returned pair contains both the structured output metadata inferred during tracing and the
-/// unsimplified staged program itself. Callers that want the canonical simplified form can invoke
-/// [`Program::with_folded_constants`](crate::tracing::Program::with_folded_constants) afterward.
+/// staged program itself.
 pub fn trace<'engine, E, F, Input, Output>(
     engine: &'engine E,
     function: F,
@@ -386,8 +385,8 @@ where
 ///
 /// This is the main "trace what I just ran" API used throughout tests and higher-order transforms.
 /// It first captures the symbolic program shape through [`trace`], then immediately re-tags that
-/// flat trace with the caller's original structures, simplifies it, and replays it on the supplied
-/// inputs. The result is a convenient pair:
+/// flat trace with the caller's original structures, applies structural dead-code cleanup, and
+/// replays it on the supplied inputs. The result is a convenient pair:
 ///
 /// - the concrete output that the caller would expect from eager execution, and
 /// - the staged [`Program`] representing the same computation for later reuse.
@@ -437,7 +436,7 @@ where
         output_structure,
         marker: std::marker::PhantomData,
     };
-    let program = program.with_folded_constants()?.simplified()?;
+    let program = program.simplified()?;
     let concrete_input = Input::from_parameters(program.input_structure.clone(), input_values)?;
     Ok((program.interpret(concrete_input)?, program))
 }
@@ -702,15 +701,7 @@ mod tests {
             }
         }
 
-        impl Traceable<TestType> for TestValue {
-            fn is_zero(&self) -> bool {
-                self.value == 0
-            }
-
-            fn is_one(&self) -> bool {
-                self.value == 1
-            }
-        }
+        impl Traceable<TestType> for TestValue {}
 
         impl crate::tracing::Value<TestType> for TestValue {}
 
@@ -753,24 +744,6 @@ mod tests {
                     return Err(TypeError { message: "test_add input types are incompatible".to_string() });
                 }
                 Ok(vec![input_types[0].clone()])
-            }
-
-            fn try_simplify(
-                &self,
-                inputs: &[AtomId],
-                is_zero_constant: &dyn Fn(AtomId) -> bool,
-                _is_one_constant: &dyn Fn(AtomId) -> bool,
-            ) -> Option<Vec<AtomId>> {
-                if inputs.len() != 2 {
-                    return None;
-                }
-                if is_zero_constant(inputs[0]) {
-                    Some(vec![inputs[1]])
-                } else if is_zero_constant(inputs[1]) {
-                    Some(vec![inputs[0]])
-                } else {
-                    None
-                }
             }
         }
 
@@ -854,15 +827,7 @@ mod tests {
             }
         }
 
-        impl Traceable<ArrayType> for TestAbstractValue {
-            fn is_zero(&self) -> bool {
-                false
-            }
-
-            fn is_one(&self) -> bool {
-                false
-            }
-        }
+        impl Traceable<ArrayType> for TestAbstractValue {}
 
         impl crate::tracing::Value<ArrayType> for TestAbstractValue {}
 

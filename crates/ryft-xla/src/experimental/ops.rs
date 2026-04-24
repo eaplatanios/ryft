@@ -4,7 +4,7 @@ use std::{
 };
 
 use ryft_core::{
-    tracing::{AtomId, InterpretableOperation, Operation, TracingError},
+    tracing::{InterpretableOperation, Operation, TracingError},
     tracing_v2::{
         CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearPrimitiveOperation, LinearTerm,
         engine::Engine,
@@ -180,26 +180,6 @@ impl Operation<ArrayType> for XlaPrimitiveOperation {
             Self::LinearShardMap(op) => op.infer_output_types(input_types),
             Self::WithShardingConstraint(op) => op.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
-        }
-    }
-
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        match self {
-            Self::Add => AddOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Mul => MulOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Neg => NegOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Scale { factor } => ScaleOperation::<ArrayType, ShardMapTensor>::new(factor.clone()).try_simplify(
-                inputs,
-                is_zero_constant,
-                is_one_constant,
-            ),
-            Self::Custom(op) => op.try_simplify(inputs, is_zero_constant, is_one_constant),
-            _ => None,
         }
     }
 }

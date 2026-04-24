@@ -24,37 +24,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
 /// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`], but
 /// does not imply any other requirements for the underlying values.
-///
-/// Concrete leaves that support exact algebraic identity detection should override [`Traceable::is_zero`] and
-/// [`Traceable::is_one`]. The default implementations return `false`, which keeps purely abstract or traced leaves
-/// valid while opting them out of constant-identity simplification.
-pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {
-    /// Returns `true` if this value is equivalent to an algebraic _zero_ value (i.e., additive identity).
-    /// [`ProgramBuilder`]s call this function on constant [`Atom`]s during [`Operation::try_simplify`] to detect and
-    /// eliminate algebraic identities at staging time (e.g., folding `x + 0` into `x` or `x * 0` into `0` without
-    /// emitting the operation into the staged program).
-    ///
-    /// The default implementation returns `false`, which is always safe as it simply opts the value out of
-    /// identity-based simplification. Concrete leaf types that can inspect their contents should override this
-    /// function to return a more accurate answer.
-    #[inline]
-    fn is_zero(&self) -> bool {
-        false
-    }
-
-    /// Returns `true` if this value is equivalent to an algebraic _one_ value (i.e., multiplicative identity). This is
-    /// the multiplicative-identity counterpart of [`Self::is_zero`]. [`ProgramBuilder`]s call this function on constant
-    /// [`Atom`]s during [`Operation::try_simplify`] to detect and eliminate algebraic identities at staging time (e.g.,
-    /// folding `x * 1` into `x` without emitting the operation into the staged program).
-    ///
-    /// The default implementation returns `false`, which is always safe as it simply opts the value out of
-    /// identity-based simplification. Concrete leaf types that can inspect their contents should override this
-    /// function to return a more accurate answer.
-    #[inline]
-    fn is_one(&self) -> bool {
-        false
-    }
-}
+pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {}
 
 /// Staged atom carrying abstract metadata.
 ///
@@ -120,8 +90,8 @@ impl Display for AtomId {
 
 /// Shape-level operation interface for staged programs.
 ///
-/// This trait covers the metadata surface needed for program construction, display, simplification,
-/// and backend lowering. Concrete execution is provided by the separate
+/// This trait covers the metadata surface needed for program construction, display, structural
+/// cleanup, and backend lowering. Concrete execution is provided by the separate
 /// [`InterpretableOperation`] trait. Staged-program differentiation rules are split between
 /// [`crate::tracing_v2::LinearOperation`] (transpose/replay) and
 /// [`crate::tracing_v2::DifferentiableOperation`] (forward-mode JVP).
@@ -136,25 +106,11 @@ pub trait Operation<T: Type>: Debug + Display {
 
     /// Computes output types from input types without executing the operation.
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>;
-
-    /// Returns simplified output atoms if this operation is a trivial algebraic identity.
-    ///
-    /// Called during program construction to eliminate no-op operations like `x + 0`, `x * 1`, or
-    /// `scale(x, 1)`. The callbacks check whether an input atom is a constant zero or one. Returns
-    /// [`None`] if no simplification applies.
-    fn try_simplify(
-        &self,
-        _inputs: &[AtomId],
-        _is_zero_constant: &dyn Fn(AtomId) -> bool,
-        _is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        None
-    }
 }
 
 /// Concrete execution capability for staged operations.
 ///
-/// Separated from [`Operation`] so that program construction, display, and simplification can work
+/// Separated from [`Operation`] so that program construction, display, and structural cleanup can work
 /// without value-type bounds. Only code paths that actually execute operations, such as program
 /// replay and JIT example propagation, require this trait.
 pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
@@ -314,7 +270,7 @@ impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>,
                         .ok_or(TracingError::MalformedProgram("variable atom had no owning instruction".to_string()))?;
                     assert!(
                         live_instructions[instruction_index],
-                        "attempted to remap a dead variable atom during program simplification"
+                        "attempted to remap a dead variable atom during structural program cleanup"
                     );
                     let instruction = &program.instructions[instruction_index];
                     let remapped_inputs = instruction
@@ -528,61 +484,6 @@ impl<
 
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
-
-    /// Folds any instruction whose inputs are all currently-known constants.
-    ///
-    /// This pass preserves the surrounding program structure. It removes the instructions that it
-    /// successfully folds and rewrites their output atoms to [`Atom::Constant`], but it does not
-    /// perform dead-code elimination or liveness-based cleanup afterward.
-    pub fn with_folded_constants(&self) -> Result<Self, TracingError>
-    where
-        Input::ParameterStructure: Clone,
-        Output::ParameterStructure: Clone,
-    {
-        let mut atoms = self.atoms.clone();
-        let mut instructions = Vec::with_capacity(self.instructions.len());
-
-        for instruction in self.instructions.iter() {
-            let mut input_constants = Vec::with_capacity(instruction.inputs.len());
-            let mut all_inputs_constant = true;
-            for input in instruction.inputs.iter().copied() {
-                let atom = atoms.get(input.index).ok_or(TracingError::UnboundAtomId { id: input })?;
-                let Some(value) = atom.as_constant() else {
-                    all_inputs_constant = false;
-                    break;
-                };
-                input_constants.push(value.clone());
-            }
-
-            if !all_inputs_constant {
-                instructions.push(instruction.clone());
-                continue;
-            }
-
-            let output_constants = instruction.operation.interpret(input_constants.as_slice())?;
-            if output_constants.len() != instruction.outputs.len() {
-                return Err(TracingError::InvalidOutputCount {
-                    expected: instruction.outputs.len(),
-                    got: output_constants.len(),
-                });
-            }
-
-            for (output_atom, output_value) in instruction.outputs.iter().copied().zip(output_constants.into_iter()) {
-                let atom = atoms.get_mut(output_atom.index).ok_or(TracingError::UnboundAtomId { id: output_atom })?;
-                *atom = Atom::Constant(output_value);
-            }
-        }
-
-        Ok(Self {
-            atoms,
-            input_ids: self.input_ids.clone(),
-            output_ids: self.output_ids.clone(),
-            instructions,
-            input_structure: self.input_structure.clone(),
-            output_structure: self.output_structure.clone(),
-            marker: PhantomData,
-        })
-    }
 }
 
 impl<
@@ -687,8 +588,8 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
     /// Adds a new input atom retaining only its abstract type.
     ///
     /// Intended for program transforms that rebuild structure without needing intermediate values
-    /// (for example [`Program::simplified`] or [`Program::with_folded_constants`]). Callers that later need a representative value for this
-    /// atom should synthesize it from the retained input type through an
+    /// (for example [`Program::simplified`]). Callers that later need a representative value for
+    /// this atom should synthesize it from the retained input type through an
     /// [`Engine`](crate::tracing_v2::Engine).
     #[inline]
     pub fn add_input(&mut self, r#type: T) -> AtomId {
@@ -699,8 +600,8 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
 
     /// Adds a constant atom to the program.
     ///
-    /// Constants are retained verbatim in the final [`Program`] so later replay, lowering, and
-    /// simplification passes can recover the literal value.
+    /// Constants are retained verbatim in the final [`Program`] so later replay and lowering can
+    /// recover the literal value.
     #[inline]
     pub fn add_constant(&mut self, value: V) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
@@ -719,11 +620,10 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
         id
     }
 
-    /// Adds a staged instruction using abstract evaluation and local algebraic simplification.
+    /// Adds a staged instruction using abstract evaluation.
     ///
-    /// This validates the input atoms through [`Operation::infer_output_types`], applies any local
-    /// `try_simplify` rewrite exposed by the operation, and otherwise stages one variable-output
-    /// instruction.
+    /// This validates the input atoms through [`Operation::infer_output_types`] and stages one
+    /// variable-output instruction.
     pub fn add_instruction(&mut self, operation: O, inputs: Vec<AtomId>) -> Result<Vec<AtomId>, TracingError> {
         let input_abstracts = inputs
             .iter()
@@ -735,12 +635,6 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_abstracts = operation.infer_output_types(input_abstracts.as_slice())?;
-
-        let is_zero = |id: AtomId| matches!(self.atoms.get(id.index), Some(Atom::Constant(value)) if value.is_zero());
-        let is_one = |id: AtomId| matches!(self.atoms.get(id.index), Some(Atom::Constant(value)) if value.is_one());
-        if let Some(simplified) = operation.try_simplify(&inputs, &is_zero, &is_one) {
-            return Ok(simplified);
-        }
 
         let outputs = output_abstracts.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
         self.instructions.push(Instruction { operation, inputs, outputs: outputs.clone() });
@@ -778,20 +672,13 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Default for ProgramBuild
 
 #[cfg(test)]
 mod tests {
-    use std::ops::{Add, Mul, Neg};
-
     use indoc::indoc;
-    use ryft_macros::Parameter;
 
     use crate::{
-        parameters::{Parameter, ParameterError, Parameterized, Placeholder},
-        tracing::{TracingError, Value},
-        tracing_v2::{
-            Cos, MatrixOps, PrimitiveOperation, Sin,
-            operations::constants::{OneLike, ZeroLike},
-            test_support,
-        },
-        types::{ArrayType, DataType, Shape, Typed},
+        parameters::{ParameterError, Parameterized, Placeholder},
+        tracing::TracingError,
+        tracing_v2::{PrimitiveOperation, test_support},
+        types::{ArrayType, DataType, Typed},
     };
 
     use super::*;
@@ -894,62 +781,6 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_folding_eliminates_instructions() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let a = builder.add_constant(2.0f64);
-        let b = builder.add_constant(3.0f64);
-
-        // Builder staging stays symbolic even for constant-only instructions.
-        let folded = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap();
-        assert_eq!(folded.len(), 1);
-        assert!(matches!(builder.atoms.get(folded[0].index), Some(Atom::Variable(_))));
-        assert_eq!(builder.instructions.len(), 1);
-
-        // Introduce a non-constant input and combine with the symbolic sum.
-        let x = builder.add_input(10.0f64.r#type().into_owned());
-        let result = builder.add_instruction(PrimitiveOperation::Mul, vec![folded[0], x]).unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(matches!(builder.atoms.get(result[0].index), Some(Atom::Variable(_))));
-        assert_eq!(builder.instructions.len(), 2);
-
-        // `with_folded_constants` folds the constant-only sum but leaves dead constants in place.
-        let program = builder.build::<f64, f64>(vec![result[0]], Placeholder, Placeholder);
-        assert_eq!(program.instructions.len(), 2);
-        let program = program.with_folded_constants().unwrap();
-        assert_eq!(program.instructions.len(), 1);
-        assert_eq!(program.atoms.len(), 5);
-        let program = program.simplified().unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = const
-                    %2:f64[] = mul %1 %0
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_constant_folding_program_call_produces_correct_results() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
-        let a = builder.add_constant(2.0f64);
-        let b = builder.add_constant(3.0f64);
-        let folded_sum = builder.add_instruction(PrimitiveOperation::Add, vec![a, b]).unwrap()[0];
-
-        let x = builder.add_input(10.0f64.r#type().into_owned());
-        let product = builder.add_instruction(PrimitiveOperation::Mul, vec![folded_sum, x]).unwrap()[0];
-        let program =
-            builder.build::<f64, f64>(vec![product], Placeholder, Placeholder).with_folded_constants().unwrap();
-
-        // folded_sum = 2.0 + 3.0 = 5.0, product = 5.0 * input
-        assert_eq!(program.interpret(10.0).unwrap(), 50.0);
-        assert_eq!(program.interpret(0.5).unwrap(), 2.5);
-        assert_eq!(program.interpret(0.0).unwrap(), 0.0);
-    }
-
-    #[test]
     fn program_builder_tracks_only_types_for_variable_atoms() {
         let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
         let x = builder.add_input(2.0f64.r#type().into_owned());
@@ -969,116 +800,5 @@ mod tests {
         assert!(matches!(program.atoms.get(three.index), Some(Atom::Constant(value)) if *value == 3.0));
         assert!(matches!(program.atoms.get(sum.index), Some(Atom::Variable(_))));
         assert_eq!(program.interpret(4.0).unwrap(), 7.0);
-    }
-
-    #[test]
-    fn custom_identity_values_participate_in_algebraic_simplification() {
-        #[derive(Clone, Debug, PartialEq, Parameter)]
-        struct TestIdentityValue {
-            r#type: ArrayType,
-            value: f64,
-        }
-
-        impl TestIdentityValue {
-            fn scalar(value: f64) -> Self {
-                Self { r#type: ArrayType::scalar(DataType::F64), value }
-            }
-        }
-
-        impl Typed<ArrayType> for TestIdentityValue {
-            fn r#type(&self) -> std::borrow::Cow<'_, ArrayType> {
-                std::borrow::Cow::Borrowed(&self.r#type)
-            }
-        }
-
-        impl Traceable<ArrayType> for TestIdentityValue {
-            fn is_zero(&self) -> bool {
-                self.value == 0.0
-            }
-
-            fn is_one(&self) -> bool {
-                self.value == 1.0
-            }
-        }
-
-        impl Value<ArrayType> for TestIdentityValue {}
-
-        impl Add for TestIdentityValue {
-            type Output = Self;
-
-            fn add(self, rhs: Self) -> Self::Output {
-                Self { r#type: self.r#type, value: self.value + rhs.value }
-            }
-        }
-
-        impl Mul for TestIdentityValue {
-            type Output = Self;
-
-            fn mul(self, rhs: Self) -> Self::Output {
-                Self { r#type: self.r#type, value: self.value * rhs.value }
-            }
-        }
-
-        impl Neg for TestIdentityValue {
-            type Output = Self;
-
-            fn neg(self) -> Self::Output {
-                Self { r#type: self.r#type, value: -self.value }
-            }
-        }
-
-        impl Sin for TestIdentityValue {
-            fn sin(self) -> Self {
-                self
-            }
-        }
-
-        impl Cos for TestIdentityValue {
-            fn cos(self) -> Self {
-                self
-            }
-        }
-
-        impl ZeroLike for TestIdentityValue {
-            fn zero_like(&self) -> Self {
-                Self::scalar(0.0)
-            }
-        }
-
-        impl OneLike for TestIdentityValue {
-            fn one_like(&self) -> Self {
-                Self::scalar(1.0)
-            }
-        }
-
-        impl MatrixOps for TestIdentityValue {
-            fn matmul(self, rhs: Self) -> Self {
-                Self { r#type: self.r#type, value: self.value * rhs.value }
-            }
-
-            fn transpose_matrix(self) -> Self {
-                self
-            }
-        }
-
-        impl crate::tracing_v2::operations::reshape::ReshapeOps for TestIdentityValue {
-            fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-                Ok(Self { r#type: ArrayType::new(DataType::F64, target_shape, None, None).unwrap(), value: self.value })
-            }
-        }
-
-        let mut builder = ProgramBuilder::<ArrayType, TestIdentityValue, PrimitiveOperation<TestIdentityValue>>::new();
-        let x = builder.add_input(TestIdentityValue::scalar(5.0).r#type().into_owned());
-        let zero = builder.add_constant(TestIdentityValue::scalar(0.0));
-
-        let simplified_add = builder.add_instruction(PrimitiveOperation::Add, vec![x, zero]).unwrap();
-        assert_eq!(simplified_add, vec![x]);
-        assert_eq!(builder.instructions.len(), 0);
-
-        let simplified_scale = builder
-            .add_instruction(PrimitiveOperation::Scale { factor: TestIdentityValue::scalar(1.0) }, vec![x])
-            .unwrap();
-        assert_eq!(simplified_scale, vec![x]);
-        assert_eq!(builder.instructions.len(), 0);
     }
 }

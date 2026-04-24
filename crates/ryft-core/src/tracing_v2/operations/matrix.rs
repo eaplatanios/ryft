@@ -169,7 +169,7 @@ fn matmul_array_sharding(lhs: &ArrayType, rhs: &ArrayType) -> Option<Sharding> {
 /// Computes the abstract output type of one matrix multiplication.
 ///
 /// This is the shared shape-and-sharding rule used by matrix multiplication across tracing,
-/// simplification, and backend wrappers.
+/// transposition, and backend wrappers.
 pub fn matmul_abstract(lhs: &ArrayType, rhs: &ArrayType, op: &'static str) -> Result<ArrayType, TypeError> {
     let (lhs_data_type, lhs_rows, lhs_cols) = matrix_parts(lhs, op)?;
     let (rhs_data_type, rhs_rows, rhs_cols) = matrix_parts(rhs, op)?;
@@ -387,15 +387,7 @@ pub mod ndarray_support {
         }
     }
 
-    impl Traceable<ArrayType> for Array2<f32> {
-        fn is_zero(&self) -> bool {
-            self.iter().all(|&x| x == 0.0)
-        }
-
-        fn is_one(&self) -> bool {
-            self.iter().all(|&x| x == 1.0)
-        }
-    }
+    impl Traceable<ArrayType> for Array2<f32> {}
 
     impl Value<ArrayType> for Array2<f32> {}
 
@@ -406,15 +398,7 @@ pub mod ndarray_support {
         }
     }
 
-    impl Traceable<ArrayType> for Array2<f64> {
-        fn is_zero(&self) -> bool {
-            self.iter().all(|&x| x == 0.0)
-        }
-
-        fn is_one(&self) -> bool {
-            self.iter().all(|&x| x == 1.0)
-        }
-    }
+    impl Traceable<ArrayType> for Array2<f64> {}
 
     impl Value<ArrayType> for Array2<f64> {}
 

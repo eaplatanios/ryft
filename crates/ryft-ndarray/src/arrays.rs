@@ -224,15 +224,7 @@ impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> Traceable<ArrayType> for Array<T> {
-    fn is_zero(&self) -> bool {
-        self.values.iter().all(|&value| value == T::zero())
-    }
-
-    fn is_one(&self) -> bool {
-        self.values.iter().all(|&value| value == T::one())
-    }
-}
+impl<T: NdArrayElement> Traceable<ArrayType> for Array<T> {}
 
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {}
 
@@ -442,7 +434,6 @@ fn array_error_to_tracing_error(error: ArrayError) -> TracingError {
 mod tests {
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
-    use ryft_core::tracing::Traceable;
     use ryft_core::tracing_v2::{MatrixOps, ReshapeOps};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -456,18 +447,6 @@ mod tests {
 
         assert_eq!(array.r#type().into_owned(), expected_type);
         assert_eq!(Array::scalar(2.0).as_ndarray(), &arr0(2.0).into_dyn());
-    }
-
-    #[test]
-    fn test_array_identity_detection() {
-        let zeros = Array::from_shape_vec([2], vec![0.0, 0.0]).unwrap();
-        let ones = Array::from_shape_vec([2], vec![1.0, 1.0]).unwrap();
-        let mixed = Array::from_shape_vec([2], vec![0.0, 1.0]).unwrap();
-
-        assert!(Traceable::is_zero(&zeros));
-        assert!(Traceable::is_one(&ones));
-        assert!(!Traceable::is_zero(&mixed));
-        assert!(!Traceable::is_one(&mixed));
     }
 
     #[test]

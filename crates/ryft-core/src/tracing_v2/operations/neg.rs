@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::macros::check_input_count;
-use crate::tracing::{AtomId, Traceable, TracingError};
+use crate::tracing::{Traceable, TracingError};
 use crate::tracing_v2::{
     engine::Engine,
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
@@ -58,15 +58,6 @@ impl Operation<ArrayType> for NegOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Ok(vec![unary_abstract(input_types)?])
-    }
-
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        _is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        if inputs.len() == 1 && is_zero_constant(inputs[0]) { Some(vec![inputs[0]]) } else { None }
     }
 }
 

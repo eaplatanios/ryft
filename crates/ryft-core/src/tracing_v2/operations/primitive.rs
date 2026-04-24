@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing::{AtomId, Traceable, TracingError, Value},
+    tracing::{Traceable, TracingError, Value},
     tracing_v2::{
         Cos, MatrixOps, Sin,
         engine::Engine,
@@ -414,40 +414,6 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
             Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
-
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        match self {
-            Self::Add => AddOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Mul => MulOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Neg => NegOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Scale { factor } => ScaleOperation::<ArrayType, V>::new(factor.clone()).try_simplify(
-                inputs,
-                is_zero_constant,
-                is_one_constant,
-            ),
-            Self::LeftMatMul { factor } => {
-                if factor.is_one() {
-                    Some(inputs.to_vec())
-                } else {
-                    None
-                }
-            }
-            Self::RightMatMul { factor } => {
-                if factor.is_one() {
-                    Some(inputs.to_vec())
-                } else {
-                    None
-                }
-            }
-            Self::Custom(op) => op.try_simplify(inputs, is_zero_constant, is_one_constant),
-            _ => None,
-        }
-    }
 }
 
 /// [`Operation`] for [`LinearPrimitiveOperation`] requires no value-type bounds; shape validation
@@ -483,39 +449,6 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
             }
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
-        }
-    }
-
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        match self {
-            Self::Add => AddOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Neg => NegOperation.try_simplify(inputs, is_zero_constant, is_one_constant),
-            Self::Scale { factor } => ScaleOperation::<ArrayType, V>::new(factor.clone()).try_simplify(
-                inputs,
-                is_zero_constant,
-                is_one_constant,
-            ),
-            Self::LeftMatMul { factor } => {
-                if factor.is_one() {
-                    Some(inputs.to_vec())
-                } else {
-                    None
-                }
-            }
-            Self::RightMatMul { factor } => {
-                if factor.is_one() {
-                    Some(inputs.to_vec())
-                } else {
-                    None
-                }
-            }
-            Self::Custom(op) => op.try_simplify(inputs, is_zero_constant, is_one_constant),
-            _ => None,
         }
     }
 }

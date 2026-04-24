@@ -187,15 +187,7 @@ impl<V: Parameter> Typed<ArrayType> for ArrayBatch<V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ArrayBatch<V> {
-    fn is_zero(&self) -> bool {
-        self.value.is_zero()
-    }
-
-    fn is_one(&self) -> bool {
-        self.value.is_one()
-    }
-}
+impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ArrayBatch<V> {}
 
 impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
 
@@ -583,15 +575,7 @@ impl<V: Parameter> Typed<ArrayType> for ReferenceBatch<V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ReferenceBatch<V> {
-    fn is_zero(&self) -> bool {
-        self.lanes.iter().all(Traceable::is_zero)
-    }
-
-    fn is_one(&self) -> bool {
-        self.lanes.iter().all(Traceable::is_one)
-    }
-}
+impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ReferenceBatch<V> {}
 
 impl<V: Value<ArrayType>> Value<ArrayType> for ReferenceBatch<V> {}
 
@@ -883,15 +867,7 @@ mod tests {
         }
     }
 
-    impl Traceable<ArrayType> for TestArray {
-        fn is_zero(&self) -> bool {
-            self.values.iter().all(|value| *value == 0.0)
-        }
-
-        fn is_one(&self) -> bool {
-            self.values.iter().all(|value| *value == 1.0)
-        }
-    }
+    impl Traceable<ArrayType> for TestArray {}
 
     impl Value<ArrayType> for TestArray {}
 

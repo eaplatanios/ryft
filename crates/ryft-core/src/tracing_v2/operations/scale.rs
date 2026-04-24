@@ -7,7 +7,7 @@ use std::{
 use indoc::indoc;
 
 use crate::macros::check_input_count;
-use crate::tracing::{AtomId, Traceable, TracingError, Value};
+use crate::tracing::{Traceable, TracingError, Value};
 use crate::tracing_v2::{
     engine::Engine,
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
@@ -92,15 +92,6 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for ScaleOperation<ArrayType,
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Self::abstract_eval_static(input_types)
-    }
-
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        _is_zero_constant: &dyn Fn(AtomId) -> bool,
-        _is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        if self.factor.is_one() { Some(inputs.to_vec()) } else { None }
     }
 }
 

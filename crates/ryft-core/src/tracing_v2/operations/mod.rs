@@ -2,7 +2,7 @@ use std::{fmt::Display, sync::Arc};
 
 use crate::{
     parameters::Parameterized,
-    tracing::{AtomId, InterpretableOperation, Operation, Traceable, TracingError},
+    tracing::{InterpretableOperation, Operation, Traceable, TracingError},
     tracing_v2::{
         engine::Engine,
         forward::{Differentiable, EngineTangent, JvpTracer},
@@ -301,16 +301,6 @@ impl<O: Operation<T> + ?Sized, T: Type> Operation<T> for Arc<O> {
     #[inline]
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         (**self).infer_output_types(input_types)
-    }
-
-    #[inline]
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        (**self).try_simplify(inputs, is_zero_constant, is_one_constant)
     }
 }
 

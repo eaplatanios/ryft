@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     parameters::Parameter,
-    tracing::{AtomId, Traceable, TracingError, Value},
+    tracing::{Traceable, TracingError, Value},
     tracing_v2::{
         engine::Engine,
         forward::{Differentiable, EngineTangent, JvpTracer},
@@ -399,16 +399,6 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for CustomPrimitive<ArrayType
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         self.base.infer_output_types(input_types)
     }
-
-    #[inline]
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        self.base.try_simplify(inputs, is_zero_constant, is_one_constant)
-    }
 }
 
 impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for CustomPrimitive<ArrayType, V> {
@@ -519,16 +509,6 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearCustomPrimitive<Arr
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         self.primitive.infer_output_types(input_types)
-    }
-
-    #[inline]
-    fn try_simplify(
-        &self,
-        inputs: &[AtomId],
-        is_zero_constant: &dyn Fn(AtomId) -> bool,
-        is_one_constant: &dyn Fn(AtomId) -> bool,
-    ) -> Option<Vec<AtomId>> {
-        self.primitive.try_simplify(inputs, is_zero_constant, is_one_constant)
     }
 }
 
