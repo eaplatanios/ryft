@@ -10,6 +10,7 @@ use crate::tracing_v2::{
     operations::{constants::ZeroLike, matrix::ndarray_support::Array2Engine},
 };
 use crate::tracing_v2::{
+    Sin, Tracer,
     benchmarking::{BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program},
     engine::ArrayScalarEngine,
     grad, interpret_and_trace, jvp, jvp_program,
@@ -161,7 +162,7 @@ fn emit_scalar_bilinear_sin_jvp() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
     let (_, pushforward): (
         f64,
         Program<ArrayType, f64, crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>, (f64, f64), f64>,
-    ) = jvp_program(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
+    ) = jvp_program(&ArrayScalarEngine::<f64>::new(), |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_jvp", "jvp_pushforward", &pushforward)?])
 }
 
@@ -170,7 +171,7 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Ben
     let (_, pullback): (
         f64,
         Program<ArrayType, f64, crate::tracing_v2::LinearPrimitiveOperation<ArrayType, f64>, f64, (f64, f64)>,
-    ) = vjp(&ArrayScalarEngine::<f64>::new(), bilinear_sin, (2.0f64, 3.0f64))?;
+    ) = vjp(&ArrayScalarEngine::<f64>::new(), |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
@@ -300,7 +301,7 @@ fn emit_matrix_matmul_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             (Array2<f64>, Array2<f64>),
             Array2<f64>,
         >,
-    ) = interpret_and_trace(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
+    ) = interpret_and_trace(&Array2Engine::<f64>::new(), |inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
     Ok(vec![tracing_record("matrix_matmul_jit", "jit", &compiled)?])
 }
 
@@ -316,7 +317,7 @@ fn emit_matrix_matmul_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Benchmark
             Array2<f64>,
             (Array2<f64>, Array2<f64>),
         >,
-    ) = vjp(&Array2Engine::<f64>::new(), bilinear_matmul, matrix_inputs())?;
+    ) = vjp(&Array2Engine::<f64>::new(), |inputs| Ok(bilinear_matmul(inputs)), matrix_inputs())?;
     Ok(vec![tracing_record("matrix_matmul_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 
@@ -334,7 +335,7 @@ fn emit_matrix_three_matmul_sine_hessian_style() -> Result<Vec<IrBenchmarkRecord
         >,
     ) = interpret_and_trace(
         &Array2Engine::<f64>::new(),
-        matrix_hessian_style_second_derivative,
+        |inputs| Ok(matrix_hessian_style_second_derivative(inputs)),
         hessian_style_matrix_inputs(),
     )?;
     Ok(vec![tracing_record("matrix_three_matmul_sine_hessian_style", "hessian_style", &compiled)?])

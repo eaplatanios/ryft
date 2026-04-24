@@ -5,7 +5,7 @@ use ryft_macros::Parameter;
 use crate::broadcasting::Broadcastable;
 use crate::parameters::Parameter;
 use crate::sharding::{Sharding, ShardingError};
-use crate::types::{DataType, Layout, Type};
+use crate::types::{DataType, Layout, Type, TypeError};
 
 /// Represents the size of an array dimension. Array dimensions can be either statically known at compilation time or
 /// dynamic, in which case their sizes will only be known at runtime. Dynamic dimensions may optionally have an upper
@@ -258,6 +258,55 @@ impl ArrayType {
     pub fn dimension(&self, index: i32) -> Size {
         self.shape.dimension(index)
     }
+
+    /// Returns a copy of this [`ArrayType`] with a dimension inserted at the provided index, with the provided size.
+    pub fn with_inserted_dimension(&self, index: usize, size: Size) -> Result<Self, TypeError> {
+        if index > self.rank() {
+            return Err(TypeError {
+                message: format!("cannot insert dimension at index {index} for rank-{} array type", self.rank()),
+            });
+        }
+        if self.layout.is_some() {
+            // TODO(eaplatanios): Why is this not supported? Why not support a reasonable default?
+            return Err(TypeError {
+                message: "cannot insert a dimension into an array type with a layout".to_string(),
+            });
+        }
+        if self.sharding.is_some() {
+            // TODO(eaplatanios): Why is this not supported? Why not support a reasonable default?
+            return Err(TypeError {
+                message: "cannot insert a dimension into an array type with sharding".to_string(),
+            });
+        }
+        let mut dimensions = self.shape.dimensions.clone();
+        dimensions.insert(index, size);
+        Ok(Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding: None })
+    }
+
+    /// Returns a copy of this [`ArrayType`] with its `index`-th dimension removed,
+    /// paired with the [`Size`] of the removed dimension.
+    pub fn without_dimension(&self, axis: usize) -> Result<(Self, Size), TypeError> {
+        if axis >= self.rank() {
+            return Err(TypeError {
+                message: format!("cannot remove dimension at index {axis} for rank-{} array type", self.rank()),
+            });
+        }
+        if self.layout.is_some() {
+            // TODO(eaplatanios): Why is this not supported? Why not support a reasonable default?
+            return Err(TypeError {
+                message: "cannot remove a dimension from an array type with a layout".to_string(),
+            });
+        }
+        if self.sharding.is_some() {
+            // TODO(eaplatanios): Why is this not supported? Why not support a reasonable default?
+            return Err(TypeError {
+                message: "cannot remove a dimension from an array type with sharding".to_string(),
+            });
+        }
+        let mut dimensions = self.shape.dimensions.clone();
+        let dimension = dimensions.remove(axis);
+        Ok((Self { data_type: self.data_type, shape: Shape::new(dimensions), layout: None, sharding: None }, dimension))
+    }
 }
 
 impl Display for ArrayType {
@@ -379,6 +428,15 @@ mod tests {
         assert_eq!(t1.dimension(0), Size::Static(42));
         assert_eq!(t1.dimension(1), Size::Dynamic(None));
         assert_eq!(t1.dimension(-1), Size::Dynamic(None));
+    }
+
+    #[test]
+    fn test_array_type_insert_and_remove_dimension() {
+        let t0 = ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()]), None, None).unwrap();
+        let t1 = t0.with_inserted_dimension(1, 5.into()).unwrap();
+        let t2 = ArrayType::new(F32, Shape::new(vec![2.into(), 5.into(), 3.into()]), None, None).unwrap();
+        assert_eq!(t1, t2);
+        assert_eq!(t1.without_dimension(1).unwrap(), (t0, Size::Static(5)));
     }
 
     #[test]

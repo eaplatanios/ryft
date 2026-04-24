@@ -1,6 +1,9 @@
 use super::*;
 
-use crate::tracing_v2::DifferentiationError;
+use crate::tracing_v2::{
+    BatchingError, DifferentiationError,
+    batching::{ReferenceBatch, interpret_reference_batched_program, reference_stack},
+};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
 ///
@@ -230,12 +233,24 @@ where
     parameters.iter().map(CoordinateValue::coordinate_count).collect::<Vec<_>>()
 }
 
-fn flatten_coordinates<Value, V>(value: Value) -> Vec<V::Coordinate>
+fn flatten_batched_coordinates<Value, V>(
+    value: Value::To<ReferenceBatch<V>>,
+    lane_count: usize,
+) -> Result<Vec<Vec<V::Coordinate>>, TracingError>
 where
-    Value: Parameterized<V>,
+    Value: Parameterized<V, Family: ParameterizedFamily<ReferenceBatch<V>>>,
     V: CoordinateValue,
 {
-    value.into_parameters().flat_map(|parameter| parameter.coordinates()).collect::<Vec<_>>()
+    let mut lane_coordinates = (0..lane_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for batch in value.into_parameters() {
+        if batch.len() != lane_count {
+            return Err(BatchingError::MismatchedBatchSize.into());
+        }
+        for (lane_index, parameter) in batch.into_lanes().into_iter().enumerate() {
+            lane_coordinates[lane_index].extend(parameter.coordinates());
+        }
+    }
+    Ok(lane_coordinates)
 }
 
 fn standard_basis<Value, V>(structure: &Value::ParameterStructure, parameters: &[V]) -> Result<Vec<Value>, TracingError>
@@ -257,8 +272,8 @@ where
 
 /// Materializes a dense Jacobian using forward-mode differentiation.
 ///
-/// [`jacfwd`] probes the pushforward with one basis tangent per input coordinate and collects the
-/// resulting output coordinates as matrix columns.
+/// [`jacfwd`] batches all input-coordinate basis tangents through one pushforward replay and collects
+/// the resulting output coordinates as matrix columns.
 #[allow(private_bounds)]
 pub fn jacfwd<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
@@ -270,8 +285,8 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
+    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
     E::TracingOperation: DifferentiableOperation<E>,
@@ -290,10 +305,14 @@ where
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
 
-    let mut columns = Vec::with_capacity(basis_inputs.len());
-    for tangent in basis_inputs {
-        columns.push(flatten_coordinates::<Output, V>(pushforward.interpret(tangent)?));
-    }
+    let columns = if basis_inputs.is_empty() {
+        Vec::new()
+    } else {
+        let lane_count = basis_inputs.len();
+        let batched_tangents = reference_stack::<V, Input>(basis_inputs)?;
+        let batched_outputs = interpret_reference_batched_program(&pushforward, batched_tangents)?;
+        flatten_batched_coordinates::<Output, V>(batched_outputs, lane_count)?
+    };
 
     DenseJacobian::from_columns(
         columns,
@@ -306,8 +325,8 @@ where
 
 /// Materializes a dense Jacobian using reverse-mode differentiation.
 ///
-/// [`jacrev`] probes the pullback with one basis cotangent per output coordinate and collects the
-/// resulting input coordinates as matrix rows.
+/// [`jacrev`] batches all output-coordinate basis cotangents through one pullback replay and collects
+/// the resulting input coordinates as matrix rows.
 #[allow(private_bounds)]
 pub fn jacrev<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
@@ -319,8 +338,8 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
+    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
     E::TracingOperation: DifferentiableOperation<E>,
@@ -339,10 +358,14 @@ where
     let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
     let basis_outputs = standard_basis::<Output, V>(&output_structure, output_parameters.as_slice())?;
 
-    let mut rows = Vec::with_capacity(basis_outputs.len());
-    for cotangent in basis_outputs {
-        rows.push(flatten_coordinates::<Input, V>(pullback.interpret(cotangent)?));
-    }
+    let rows = if basis_outputs.is_empty() {
+        Vec::new()
+    } else {
+        let lane_count = basis_outputs.len();
+        let batched_cotangents = reference_stack::<V, Output>(basis_outputs)?;
+        let batched_inputs = interpret_reference_batched_program(&pullback, batched_cotangents)?;
+        flatten_batched_coordinates::<Input, V>(batched_inputs, lane_count)?
+    };
 
     DenseJacobian::from_rows(rows, input_structure, output_structure, input_coordinate_counts, output_coordinate_counts)
 }
@@ -361,7 +384,7 @@ where
     E: Engine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<Tracer<'engine, E>>,
+    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TracingError>,
     E::TracingOperation: InterpretableOperation<ArrayType, V>,
     E::TracingOperation: DifferentiableOperation<E>,
@@ -375,9 +398,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{parameters::Placeholder, tracing::TracingError, tracing_v2::DifferentiationError};
+    use crate::{
+        parameters::Placeholder,
+        tracing::TracingError,
+        tracing_v2::{DifferentiationError, Sin, engine::ArrayScalarEngine},
+    };
 
-    use super::DenseJacobian;
+    use super::{DenseJacobian, jacfwd, jacrev};
+
+    fn assert_close(actual: f64, expected: f64) {
+        let delta = (actual - expected).abs();
+        assert!(delta <= 1e-12, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
+    }
 
     #[test]
     fn test_dense_jacobian_from_rows_rejects_invalid_row_count() {
@@ -423,5 +455,41 @@ mod tests {
                 got: 1,
             }))
         ));
+    }
+
+    #[test]
+    fn test_jacfwd_batches_basis_tangents() {
+        let engine = ArrayScalarEngine::<f64>::new();
+        let jacobian = jacfwd::<ArrayScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
+            &engine,
+            |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+            (2.0f64, 3.0f64),
+        )
+        .unwrap();
+
+        assert_eq!(jacobian.rows(), 2);
+        assert_eq!(jacobian.cols(), 2);
+        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
+        assert_close(jacobian.values()[1], 2.0);
+        assert_close(jacobian.values()[2], 1.0);
+        assert_close(jacobian.values()[3], 1.0);
+    }
+
+    #[test]
+    fn test_jacrev_batches_basis_cotangents() {
+        let engine = ArrayScalarEngine::<f64>::new();
+        let jacobian = jacrev::<ArrayScalarEngine<f64>, _, (f64, f64), (f64, f64), f64>(
+            &engine,
+            |(x, y)| Ok((x.clone() * y.clone() + x.clone().sin(), x + y)),
+            (2.0f64, 3.0f64),
+        )
+        .unwrap();
+
+        assert_eq!(jacobian.rows(), 2);
+        assert_eq!(jacobian.cols(), 2);
+        assert_close(jacobian.values()[0], 3.0 + 2.0f64.cos());
+        assert_close(jacobian.values()[1], 2.0);
+        assert_close(jacobian.values()[2], 1.0);
+        assert_close(jacobian.values()[3], 1.0);
     }
 }

@@ -1,3 +1,5 @@
+/// Explicit batching and `vmap` support for staged programs.
+pub mod batching;
 #[cfg(feature = "benchmarking")]
 /// Internal benchmark-case definitions that stay within the plain `tracing_v2` staged IR.
 pub(crate) mod benchmark_support;
@@ -23,6 +25,7 @@ pub mod operations;
 /// Test-only helpers shared by `tracing_v2` unit tests.
 pub(crate) mod test_support;
 
+pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::DifferentiationError;
 pub use engine::Engine;
 pub use forward::{Differentiable, Dual, EngineTangent, JvpTracer, TangentSpace, jvp};

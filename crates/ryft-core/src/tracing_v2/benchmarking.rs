@@ -4,10 +4,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::parameters::Parameterized;
-use crate::tracing::TracingError;
+use crate::tracing::{Atom, AtomId, Operation, Program, Traceable, TracingError};
 use crate::types::ArrayType;
-
-use super::{Atom, Operation, Program, Traceable};
 
 /// Error type returned by the IR benchmark tooling.
 #[derive(Debug, Error)]
@@ -250,9 +248,9 @@ where
         let normalized_name = normalize_op_name(instruction.operation.name());
         *op_histogram.entry(normalized_name).or_insert(0) += 1;
 
-        let input_depth = instruction.inputs.iter().map(|input| depth_by_atom[*input]).max().unwrap_or(0);
+        let input_depth = instruction.inputs.iter().map(|input| depth_by_atom[input.index]).max().unwrap_or(0);
         for output in instruction.outputs.iter().copied() {
-            depth_by_atom[output] = input_depth + 1;
+            depth_by_atom[output.index] = input_depth + 1;
         }
 
         nested_regions.extend(nested_regions_for_op(&instruction.operation)?);
@@ -307,9 +305,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::tracing::Program;
-    use crate::tracing_v2::{
-        Sin, Tracer, engine::ArrayScalarEngine, interpret_and_trace, operations::constants::OneLike,
-    };
+    use crate::tracing_v2::{Sin, engine::ArrayScalarEngine, interpret_and_trace, operations::constants::OneLike};
 
     use super::*;
 
@@ -324,7 +320,7 @@ mod tests {
             &engine,
             |x| {
                 let with_constant = x.clone() + x.one_like();
-                with_constant.sin()
+                Ok(with_constant.sin())
             },
             2.0f64,
         )
@@ -357,8 +353,6 @@ mod tests {
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_value_and_grad"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_linearize_pushforward"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_hessian_style"));
-        assert!(case_ids.contains(&"scalar_grad_of_vmap"));
-        assert!(case_ids.contains(&"scalar_vmap_of_grad"));
         #[cfg(feature = "ndarray")]
         assert!(case_ids.contains(&"matrix_matmul_jit"));
         #[cfg(feature = "ndarray")]
