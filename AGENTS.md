@@ -79,6 +79,8 @@ update this file so that they do not need to remind you again in the future.
   abstraction and keep one source of truth.
 - Prefer putting type bounds directly in the generic type declarations over using `where` bounds later on in the same
   signature.
+- When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
+  relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
 
 #### Formatting & Naming
 

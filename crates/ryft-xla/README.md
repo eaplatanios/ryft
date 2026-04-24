@@ -3,7 +3,7 @@
 > [!WARNING]
 > `ryft` is currently a work in progress and is evolving very actively. APIs and module or crate boundaries may change.
 
-This crate provides the XLA-specific backend functionality for Ryft. It builds on [`ryft-core`](../ryft-core) for core
+This crate provides an XLA backend functionality for Ryft. It builds on [`ryft-core`](../ryft-core) for core
 abstractions, [`ryft-mlir`](../ryft-mlir) for MLIR bindings, and [`ryft-pjrt`](../ryft-pjrt) for the PJRT runtime
 interface. `ryft-xla` is where traced Ryft programs are lowered to [StableHLO](https://openxla.org/stablehlo),
 partitioned via [Shardy](https://github.com/openxla/shardy), and executed through PJRT.

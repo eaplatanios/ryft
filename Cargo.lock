@@ -1765,6 +1765,7 @@ dependencies = [
  "ryft-core",
  "ryft-macros",
  "ryft-mlir",
+ "ryft-ndarray",
  "ryft-pjrt",
  "ryft-xla",
 ]
@@ -1816,6 +1817,16 @@ dependencies = [
  "pretty_assertions",
  "ryft-xla-sys",
  "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ryft-ndarray"
+version = "0.0.3"
+dependencies = [
+ "ndarray",
+ "pretty_assertions",
+ "ryft-core",
  "thiserror 2.0.18",
 ]
 
