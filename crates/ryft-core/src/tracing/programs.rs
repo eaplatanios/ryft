@@ -114,15 +114,10 @@ pub struct Instruction<O> {
     pub outputs: Vec<AtomId>,
 }
 
-/// Executable staged program over an open operation set.
-///
-/// [`Program`] is the persistent artifact produced by tracing. It stores the finalized atom table,
-/// the ordered list of instructions, and the structured input/output metadata needed to turn flat leaf
-/// evaluation back into user-facing structured values. Both ordinary JIT traces and higher-order
-/// transforms exchange programs in this form. The operation carrier remains generic so the same IR
-/// can represent ordinary programs plus tangent and cotangent programs over backend-specific
-/// operation carriers, but every carrier must implement the shape-level [`Operation`] interface for
-/// the program's type domain.
+/// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend. It
+/// consists of a sequence of [`Instruction`]s paired with [`Parameterized`] input and output types. This is the primary
+/// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things like
+/// automatic differentiation and just-in-time compilation).
 pub struct Program<
     T: Type,
     V: Typed<T> + Parameter,
@@ -130,25 +125,25 @@ pub struct Program<
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > {
-    /// Final atom table of the staged program.
+    /// [`Atom`]s contained in this [`Program`], in the order in which they will be computed/evaluated.
     pub atoms: Vec<Atom<T, V>>,
 
-    /// Input atom ids in the same order as the flattened input parameters.
+    /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
     pub input_ids: Vec<AtomId>,
 
-    /// Output atom ids in the same order as the flattened output parameters.
+    /// [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values) of this [`Program`].
     pub output_ids: Vec<AtomId>,
 
-    /// Ordered instructions that replay the staged computation.
+    /// Ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`].
     pub instructions: Vec<Instruction<O>>,
 
-    /// Structured input shape used to rebuild typed inputs from flat leaves.
+    /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
     pub input_structure: Input::ParameterStructure,
 
-    /// Structured output shape used to rebuild typed outputs from flat leaves.
+    /// [`Parameter`] structure that can be used to map flat lists of outputs to structured `Output` values.
     pub output_structure: Output::ParameterStructure,
 
-    /// Phantom marker that ties the program to its structured input and output [`Parameterized`] families.
+    /// [`PhantomData`] marker that ties this [`Program`] to its structured `Input` and `Output` types.
     pub marker: PhantomData<fn(Input) -> Output>,
 }
 
