@@ -460,9 +460,10 @@ impl<
         write!(formatter, "lambda ")?;
         self.input_ids.iter().enumerate().try_for_each(|(index, input_id)| {
             if index > 0 {
-                write!(formatter, ", ")?;
+                write!(formatter, ", {input_id}:{}", self.atoms[input_id.index].r#type())
+            } else {
+                write!(formatter, "{input_id}:{}", self.atoms[input_id.index].r#type())
             }
-            write!(formatter, "{input_id}:{}", self.atoms[input_id.index].r#type())
         })?;
         writeln!(formatter, " .")?;
         let mut instructions_by_first_output = vec![None; self.atoms.len()];
@@ -495,9 +496,10 @@ impl<
                         write!(formatter, "{} ", if binding_count == 0 { "let" } else { "   " })?;
                         instruction.outputs.iter().enumerate().try_for_each(|(index, output)| {
                             if index > 0 {
-                                write!(formatter, ", ")?;
+                                write!(formatter, ", {output}:{}", self.atoms[output.index].r#type())
+                            } else {
+                                write!(formatter, "{output}:{}", self.atoms[output.index].r#type())
                             }
-                            write!(formatter, "{output}:{}", self.atoms[output.index].r#type())
                         })?;
                         write!(formatter, " = {}", instruction.operation)?;
                         instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
@@ -509,10 +511,7 @@ impl<
         }
         write!(formatter, "in (")?;
         self.output_ids.iter().enumerate().try_for_each(|(index, output)| {
-            if index > 0 {
-                write!(formatter, ", ")?;
-            }
-            write!(formatter, "{output}")
+            if index > 0 { write!(formatter, ", {output}") } else { write!(formatter, "{output}") }
         })?;
         write!(formatter, ")")
     }
