@@ -1184,14 +1184,19 @@ impl FlatTracedShardMap {
         let input_count = traced.program.input_ids.len();
         let output_count = traced.program.output_ids.len();
         let Program { atoms, input_ids, output_ids, instructions, .. } = traced.program.clone();
-        let mut builder =
-            ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>>::new(
-                vec![Placeholder; input_count],
-            );
+        let mut builder = ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            XlaPrimitiveOperation,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
+        >::new(vec![Placeholder; input_count]);
         builder.atoms = atoms;
         builder.input_ids = input_ids;
         builder.instructions = instructions;
-        let program = builder.build(output_ids, vec![Placeholder; output_count]).unwrap();
+        let program = builder
+            .build(output_ids, vec![Placeholder; output_count])
+            .expect("retyping a traced shard_map program should preserve valid program metadata");
         Self::from_parts(
             traced.shard_map.clone(),
             traced.global_input_types.parameters().cloned().collect::<Vec<_>>(),

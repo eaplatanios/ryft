@@ -16,6 +16,7 @@ use crate::{
         operations::{
             constants::{OneLike, ZeroLike},
             reshape::ReshapeOps,
+            scan::{LinearizedScanJvpOperation, LinearizedScanTransposeOperation, ScanOperation, ScanValue},
         },
     },
     types::{ArrayType, Size, Type, Typed},
@@ -285,6 +286,371 @@ where
         .collect()
 }
 
+fn interpret_flat_batched_program<V, O>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    input_values: Vec<ArrayBatch<V>>,
+) -> Result<Vec<ArrayBatch<V>>, TracingError>
+where
+    V: Traceable<ArrayType>,
+    O: Clone + BatchableOperation<V>,
+{
+    if input_values.len() != program.input_ids.len() {
+        return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_values.len() });
+    }
+
+    let mut remaining_uses = vec![0usize; program.atoms.len()];
+    for instruction in program.instructions.iter() {
+        for input in instruction.inputs.iter().copied() {
+            let Some(use_count) = remaining_uses.get_mut(input.index) else {
+                return Err(TracingError::UnboundAtomId { id: input });
+            };
+            *use_count += 1;
+        }
+    }
+    for output in program.output_ids.iter().copied() {
+        let Some(use_count) = remaining_uses.get_mut(output.index) else {
+            return Err(TracingError::UnboundAtomId { id: output });
+        };
+        *use_count += 1;
+    }
+
+    let mut values = vec![None; program.atoms.len()];
+    for (atom, value) in program.input_ids.iter().copied().zip(input_values) {
+        let expected_type = program.atoms[atom.index].r#type().into_owned();
+        let got_type = value.logical_type()?;
+        ensure_compatible_array_type(&expected_type, &got_type)?;
+        values[atom.index] = Some(value);
+    }
+
+    for (atom_index, atom) in program.atoms.iter().enumerate() {
+        if remaining_uses[atom_index] == 0 {
+            continue;
+        }
+        if let Atom::Constant(value) = atom {
+            values[atom_index] = Some(ArrayBatch::unbatched(value.clone()));
+        }
+    }
+
+    let max_input_count = program.instructions.iter().map(|instruction| instruction.inputs.len()).max().unwrap_or(0);
+    let mut instruction_inputs = Vec::with_capacity(max_input_count);
+    for instruction in program.instructions.iter() {
+        instruction_inputs.clear();
+        for input in instruction.inputs.iter().copied() {
+            let Some(use_count) = remaining_uses.get_mut(input.index) else {
+                return Err(TracingError::UnboundAtomId { id: input });
+            };
+            if *use_count == 0 {
+                return Err(TracingError::MalformedProgram(
+                    "instruction consumed an already-exhausted atom".to_string(),
+                ));
+            }
+            *use_count -= 1;
+
+            let Some(slot) = values.get_mut(input.index) else {
+                return Err(TracingError::UnboundAtomId { id: input });
+            };
+            let value = if *use_count == 0 {
+                slot.take().ok_or(TracingError::UnboundAtomId { id: input })?
+            } else {
+                slot.as_ref().ok_or(TracingError::UnboundAtomId { id: input })?.clone()
+            };
+            instruction_inputs.push(value);
+        }
+
+        let outputs = instruction.operation.batch(instruction_inputs.as_slice())?;
+        if outputs.len() != instruction.outputs.len() {
+            return Err(TracingError::InvalidOutputCount { expected: instruction.outputs.len(), got: outputs.len() });
+        }
+        for (atom, value) in instruction.outputs.iter().copied().zip(outputs) {
+            let expected_type = program.atoms[atom.index].r#type().into_owned();
+            let got_type = value.logical_type()?;
+            ensure_compatible_array_type(&expected_type, &got_type)?;
+            if remaining_uses[atom.index] != 0 {
+                values[atom.index] = Some(value);
+            }
+        }
+    }
+
+    let mut outputs = Vec::with_capacity(program.output_ids.len());
+    for output in program.output_ids.iter().copied() {
+        let Some(use_count) = remaining_uses.get_mut(output.index) else {
+            return Err(TracingError::UnboundAtomId { id: output });
+        };
+        if *use_count == 0 {
+            return Err(TracingError::MalformedProgram(
+                "program output consumed an already-exhausted atom".to_string(),
+            ));
+        }
+        *use_count -= 1;
+
+        let Some(slot) = values.get_mut(output.index) else {
+            return Err(TracingError::UnboundAtomId { id: output });
+        };
+        let value = if *use_count == 0 {
+            slot.take().ok_or(TracingError::UnboundAtomId { id: output })?
+        } else {
+            slot.as_ref().ok_or(TracingError::UnboundAtomId { id: output })?.clone()
+        };
+        outputs.push(value);
+    }
+
+    Ok(outputs)
+}
+
+fn validate_logical_input_types<V: Traceable<ArrayType>>(
+    inputs: &[ArrayBatch<V>],
+    expected_input_types: &[ArrayType],
+) -> Result<(), TracingError> {
+    if inputs.len() != expected_input_types.len() {
+        return Err(TracingError::InvalidInputCount { expected: expected_input_types.len(), got: inputs.len() });
+    }
+    for (input, expected_type) in inputs.iter().zip(expected_input_types) {
+        ensure_compatible_array_type(expected_type, &input.logical_type()?)?;
+    }
+    Ok(())
+}
+
+fn target_batch_axis_and_size<V: Traceable<ArrayType>>(
+    inputs: &[ArrayBatch<V>],
+) -> Result<(Option<usize>, Option<usize>), TracingError> {
+    let target_batch_axis = inputs.iter().filter_map(ArrayBatch::batch_axis).min();
+    let mut target_batch_size = None;
+    if let Some(target_axis) = target_batch_axis {
+        for input in inputs {
+            if input.batch_axis() == Some(target_axis) {
+                target_batch_size = input.axis_size()?;
+                break;
+            }
+        }
+    }
+    Ok((target_batch_axis, target_batch_size))
+}
+
+fn slice_batched_scan_input<V: ScanValue>(x: &ArrayBatch<V>, scan_index: usize) -> Result<ArrayBatch<V>, TracingError> {
+    let scan_axis = if x.batch_axis() == Some(0) { 1 } else { 0 };
+    let value = x.value().scan_slice_axis(scan_axis, scan_index)?;
+    let batch_axis = x.batch_axis().map(|axis| if axis > scan_axis { axis - 1 } else { axis });
+    ArrayBatch::new(value.r#type().into_owned(), value, batch_axis)
+}
+
+fn stack_batched_scan_leaves<V: ScanValue>(
+    per_step_output_types: &[ArrayType],
+    stacked_output_types: &[ArrayType],
+    length: usize,
+    target_batch_axis: Option<usize>,
+    target_batch_size: Option<usize>,
+    stacked_leaves: Vec<Vec<Option<ArrayBatch<V>>>>,
+) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+    let mut outputs = Vec::with_capacity(stacked_leaves.len());
+    for (output_index, values) in stacked_leaves.into_iter().enumerate() {
+        let values = values.into_iter().collect::<Option<Vec<_>>>().ok_or(BatchingError::EmptyBatch)?;
+        let (stack_axis, output_type, output_batch_axis) = if let Some(first_value) = values.first() {
+            let stack_axis = match (target_batch_axis, first_value.batch_axis()) {
+                (Some(target_axis), Some(axis)) if target_axis == axis => axis + 1,
+                (Some(target_axis), Some(axis)) if target_axis == axis + 1 => 0,
+                _ => 0,
+            };
+            let output_type = first_value.r#type().with_inserted_dimension(stack_axis, Size::Static(length))?;
+            let output_batch_axis =
+                first_value.batch_axis().map(|axis| if stack_axis <= axis { axis + 1 } else { axis });
+            (stack_axis, output_type, output_batch_axis)
+        } else if let (Some(target_axis), Some(batch_size)) = (target_batch_axis, target_batch_size) {
+            let per_step_batch_axis = target_axis.saturating_sub(1);
+            let stack_axis = if target_axis == 0 { per_step_batch_axis + 1 } else { 0 };
+            let per_step_type = per_step_output_types[output_index]
+                .with_inserted_dimension(per_step_batch_axis, Size::Static(batch_size))?;
+            let output_type = per_step_type.with_inserted_dimension(stack_axis, Size::Static(length))?;
+            (stack_axis, output_type, Some(target_axis))
+        } else {
+            (0, stacked_output_types[output_index].clone(), None)
+        };
+        let output_value = V::scan_stack_axis(
+            stack_axis,
+            &output_type,
+            values.into_iter().map(ArrayBatch::into_value).collect::<Vec<_>>(),
+        )?;
+        outputs.push(ArrayBatch::new(output_type, output_value, output_batch_axis)?);
+    }
+    Ok(outputs)
+}
+
+impl<V: Value<ArrayType> + ScanValue, O: Clone + BatchableOperation<V>> BatchableOperation<V>
+    for ScanOperation<ArrayType, V, O>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        let carry_count = self.body().carry_types().len();
+        let xs_count = self.body().xs_types().len();
+        let y_count = self.body().y_types().len();
+        let expected_input_count = carry_count + xs_count;
+        if inputs.len() != expected_input_count {
+            return Err(TracingError::InvalidInputCount { expected: expected_input_count, got: inputs.len() });
+        }
+        let (target_batch_axis, target_batch_size) = target_batch_axis_and_size(inputs)?;
+
+        let mut carry = inputs[..carry_count].to_vec();
+        let xs = &inputs[carry_count..];
+        let mut stacked_y_leaves = vec![vec![None; self.body().length()]; y_count];
+
+        for step in 0..self.body().length() {
+            let scan_index = if self.reverse() { self.body().length() - 1 - step } else { step };
+            let x_slices = xs
+                .iter()
+                .map(|x| slice_batched_scan_input(x, scan_index))
+                .collect::<Result<Vec<_>, TracingError>>()?;
+            let mut body_inputs = Vec::with_capacity(carry_count + xs_count);
+            body_inputs.extend(carry);
+            body_inputs.extend(x_slices);
+            let body_outputs = interpret_flat_batched_program(self.body().program(), body_inputs)?;
+            if body_outputs.len() != carry_count + y_count {
+                return Err(TracingError::InvalidOutputCount {
+                    expected: carry_count + y_count,
+                    got: body_outputs.len(),
+                });
+            }
+            carry = body_outputs[..carry_count].to_vec();
+            for (output_index, value) in body_outputs[carry_count..].iter().cloned().enumerate() {
+                stacked_y_leaves[output_index][scan_index] = Some(value);
+            }
+        }
+
+        let mut outputs = carry;
+        outputs.extend(stack_batched_scan_leaves(
+            self.body().y_types(),
+            self.body().ys_types(),
+            self.body().length(),
+            target_batch_axis,
+            target_batch_size,
+            stacked_y_leaves,
+        )?);
+        Ok(outputs)
+    }
+}
+
+impl<
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + ZeroLike
+        + MatrixOps
+        + ReshapeOps
+        + ScanValue,
+> BatchableOperation<V> for LinearizedScanJvpOperation<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        let scan = self.scan();
+        let carry_count = scan.body().carry_types().len();
+        let xs_count = scan.body().xs_types().len();
+        validate_logical_input_types(
+            inputs,
+            &scan.body().carry_types().iter().chain(scan.body().xs_types()).cloned().collect::<Vec<_>>(),
+        )?;
+        let (target_batch_axis, target_batch_size) = target_batch_axis_and_size(inputs)?;
+        let mut carry = inputs[..carry_count].to_vec();
+        let xs = &inputs[carry_count..];
+        let mut stacked_y_leaves = vec![vec![None; scan.body().length()]; scan.body().y_types().len()];
+
+        for step in 0..scan.body().length() {
+            let scan_index = if scan.reverse() { scan.body().length() - 1 - step } else { step };
+            let x_slices = xs
+                .iter()
+                .map(|x| slice_batched_scan_input(x, scan_index))
+                .collect::<Result<Vec<_>, TracingError>>()?;
+            let mut body_inputs = Vec::with_capacity(carry_count + xs_count);
+            body_inputs.extend(carry);
+            body_inputs.extend(x_slices);
+            let body_outputs = interpret_flat_batched_program(&self.pushforwards()[step], body_inputs)?;
+            if body_outputs.len() != carry_count + scan.body().y_types().len() {
+                return Err(TracingError::InvalidOutputCount {
+                    expected: carry_count + scan.body().y_types().len(),
+                    got: body_outputs.len(),
+                });
+            }
+            carry = body_outputs[..carry_count].to_vec();
+            for (output_index, value) in body_outputs[carry_count..].iter().cloned().enumerate() {
+                stacked_y_leaves[output_index][scan_index] = Some(value);
+            }
+        }
+
+        let mut outputs = carry;
+        outputs.extend(stack_batched_scan_leaves(
+            scan.body().y_types(),
+            scan.body().ys_types(),
+            scan.body().length(),
+            target_batch_axis,
+            target_batch_size,
+            stacked_y_leaves,
+        )?);
+        Ok(outputs)
+    }
+}
+
+impl<
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + ZeroLike
+        + MatrixOps
+        + ReshapeOps
+        + ScanValue,
+> BatchableOperation<V> for LinearizedScanTransposeOperation<V>
+where
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+{
+    fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
+        let jvp = self.jvp();
+        let scan = jvp.scan();
+        let carry_count = scan.body().carry_types().len();
+        let y_count = scan.body().y_types().len();
+        validate_logical_input_types(
+            inputs,
+            &scan.body().carry_types().iter().chain(scan.body().ys_types()).cloned().collect::<Vec<_>>(),
+        )?;
+        let (target_batch_axis, target_batch_size) = target_batch_axis_and_size(inputs)?;
+        let mut carry_cotangents = inputs[..carry_count].to_vec();
+        let ys_cotangents = &inputs[carry_count..];
+        let mut stacked_x_cotangents = vec![vec![None; scan.body().length()]; scan.body().x_types().len()];
+
+        for step in (0..scan.body().length()).rev() {
+            let scan_index = if scan.reverse() { scan.body().length() - 1 - step } else { step };
+            let y_slices = ys_cotangents
+                .iter()
+                .map(|y| slice_batched_scan_input(y, scan_index))
+                .collect::<Result<Vec<_>, TracingError>>()?;
+            let mut body_output_cotangents = Vec::with_capacity(carry_count + y_count);
+            body_output_cotangents.extend(carry_cotangents);
+            body_output_cotangents.extend(y_slices);
+            let body_input_cotangents = interpret_flat_batched_program(&jvp.pullbacks()[step], body_output_cotangents)?;
+            if body_input_cotangents.len() != carry_count + scan.body().x_types().len() {
+                return Err(TracingError::InvalidOutputCount {
+                    expected: carry_count + scan.body().x_types().len(),
+                    got: body_input_cotangents.len(),
+                });
+            }
+            carry_cotangents = body_input_cotangents[..carry_count].to_vec();
+            for (input_index, cotangent) in body_input_cotangents[carry_count..].iter().cloned().enumerate() {
+                stacked_x_cotangents[input_index][scan_index] = Some(cotangent);
+            }
+        }
+
+        let mut outputs = carry_cotangents;
+        outputs.extend(stack_batched_scan_leaves(
+            scan.body().x_types(),
+            scan.body().xs_types(),
+            scan.body().length(),
+            target_batch_axis,
+            target_batch_size,
+            stacked_x_cotangents,
+        )?);
+        Ok(outputs)
+    }
+}
+
 impl<
     V: Value<ArrayType>
         + Add<Output = V>
@@ -295,23 +661,63 @@ impl<
         + ZeroLike
         + OneLike
         + MatrixOps
-        + ReshapeOps,
+        + ReshapeOps
+        + ScanValue,
 > BatchableOperation<V> for PrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
+            Self::Add => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::AddOperation, inputs),
+            Self::Mul => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MulOperation, inputs),
+            Self::Neg => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::NegOperation, inputs),
+            Self::Sin => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::SinOperation, inputs),
+            Self::Cos => batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::CosOperation, inputs),
+            Self::MatMul => {
+                batch_by_interpreting_physical_operation(&crate::tracing_v2::operations::MatMulOperation, inputs)
+            }
+            Self::MatrixTranspose => batch_by_interpreting_physical_operation(
+                &crate::tracing_v2::operations::MatrixTransposeOperation,
+                inputs,
+            ),
+            Self::Scale { factor } => batch_by_interpreting_physical_operation(
+                &crate::tracing_v2::operations::ScaleOperation::new(factor.clone()),
+                inputs,
+            ),
+            Self::LeftMatMul { factor } => batch_by_interpreting_physical_operation(
+                &crate::tracing_v2::operations::LeftMatMulOperation::new(factor.clone()),
+                inputs,
+            ),
+            Self::RightMatMul { factor } => batch_by_interpreting_physical_operation(
+                &crate::tracing_v2::operations::RightMatMulOperation::new(factor.clone()),
+                inputs,
+            ),
+            Self::Reshape { input_type, output_type } => batch_by_interpreting_physical_operation(
+                &crate::tracing_v2::operations::ReshapeOperation::new(input_type.clone(), output_type.clone()),
+                inputs,
+            ),
+            Self::SliceLeadingAxis(op) => batch_by_interpreting_physical_operation(op, inputs),
+            Self::ScatterLeadingAxisSlice(op) => batch_by_interpreting_physical_operation(op, inputs),
+            Self::StackLeadingAxis(op) => batch_by_interpreting_physical_operation(op, inputs),
+            Self::Scan(scan) => scan.batch(inputs),
             Self::Custom(_) | Self::Rematerialize(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
-            _ => batch_by_interpreting_physical_operation(self, inputs),
         }
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike + MatrixOps + ReshapeOps>
-    BatchableOperation<V> for LinearPrimitiveOperation<V>
+impl<
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + ZeroLike
+        + MatrixOps
+        + ReshapeOps
+        + ScanValue,
+> BatchableOperation<V> for LinearPrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
 {
@@ -320,6 +726,8 @@ where
             Self::Custom(_) | Self::Rematerialize(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
+            Self::LinearScanJvp(op) => op.batch(inputs),
+            Self::LinearScanTranspose(op) => op.batch(inputs),
             _ => batch_by_interpreting_physical_operation(self, inputs),
         }
     }
@@ -796,7 +1204,12 @@ mod tests {
     use super::*;
     use crate::{
         broadcasting::Broadcastable,
-        tracing_v2::{DifferentiableEngine, Engine, operations::CustomPrimitive},
+        tracing_v2::{
+            DifferentiableEngine, Engine,
+            linear::{jvp_program, transpose_linear_program},
+            operations::{CustomPrimitive, ScanError, ScanValue},
+            scan,
+        },
         types::{DataType, Shape},
     };
 
@@ -834,7 +1247,11 @@ mod tests {
         }
 
         fn element_count(r#type: &ArrayType) -> usize {
-            r#type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).product::<usize>().max(1)
+            if r#type.rank() == 0 {
+                1
+            } else {
+                r#type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).product()
+            }
         }
 
         fn broadcast_values(&self, output_len: usize) -> Vec<f64> {
@@ -870,6 +1287,105 @@ mod tests {
     impl Traceable<ArrayType> for TestArray {}
 
     impl Value<ArrayType> for TestArray {}
+
+    impl ScanValue for TestArray {
+        fn scan_slice_leading_axis(&self, index: usize) -> Result<Self, TracingError> {
+            self.scan_slice_axis(0, index)
+        }
+
+        fn scan_empty_slice_leading_axis(&self) -> Result<Self, TracingError> {
+            self.scan_empty_slice_axis(0)
+        }
+
+        fn scan_stack_leading_axis(output_type: &ArrayType, values: Vec<Self>) -> Result<Self, TracingError> {
+            Self::scan_stack_axis(0, output_type, values)
+        }
+
+        fn scan_slice_axis(&self, axis: usize, index: usize) -> Result<Self, TracingError> {
+            let (slice_type, length) = self.r#type.without_dimension(axis)?;
+            let Some(length) = length.value() else {
+                return Err(ScanError::DynamicLength { input_index: 0, size: length }.into());
+            };
+            assert!(index < length);
+            if axis == 0 {
+                let slice_element_count = Self::element_count(&slice_type);
+                let offset = index * slice_element_count;
+                return Ok(Self {
+                    r#type: slice_type,
+                    values: self.values[offset..offset + slice_element_count].to_vec(),
+                });
+            }
+            let dimensions =
+                self.r#type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).collect::<Vec<_>>();
+            let output_dimensions =
+                slice_type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).collect::<Vec<_>>();
+            let mut values = Vec::with_capacity(Self::element_count(&slice_type));
+            for output_offset in 0..Self::element_count(&slice_type) {
+                let mut remaining = output_offset;
+                let mut input_offset = 0;
+                for input_axis in 0..dimensions.len() {
+                    let coordinate = if input_axis == axis {
+                        index
+                    } else {
+                        let output_axis = if input_axis < axis { input_axis } else { input_axis - 1 };
+                        let stride = output_dimensions[output_axis + 1..].iter().product::<usize>().max(1);
+                        let coordinate = remaining / stride;
+                        remaining %= stride;
+                        coordinate
+                    };
+                    let input_stride = dimensions[input_axis + 1..].iter().product::<usize>().max(1);
+                    input_offset += coordinate * input_stride;
+                }
+                values.push(self.values[input_offset]);
+            }
+            Ok(Self { r#type: slice_type, values })
+        }
+
+        fn scan_empty_slice_axis(&self, axis: usize) -> Result<Self, TracingError> {
+            let (slice_type, _) = self.r#type.without_dimension(axis)?;
+            Ok(Self { r#type: slice_type.clone(), values: vec![0.0; Self::element_count(&slice_type)] })
+        }
+
+        fn scan_stack_axis(axis: usize, output_type: &ArrayType, values: Vec<Self>) -> Result<Self, TracingError> {
+            let (element_type, length) = output_type.without_dimension(axis)?;
+            assert_eq!(length.value(), Some(values.len()));
+            if axis == 0 {
+                let mut stacked_values = Vec::new();
+                for value in values {
+                    assert_eq!(value.r#type, element_type);
+                    stacked_values.extend(value.values);
+                }
+                return Ok(Self { r#type: output_type.clone(), values: stacked_values });
+            }
+            let output_dimensions =
+                output_type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).collect::<Vec<_>>();
+            let input_dimensions =
+                element_type.shape.dimensions.iter().map(|dimension| dimension.value().unwrap()).collect::<Vec<_>>();
+            let mut stacked_values = vec![0.0; Self::element_count(output_type)];
+            for (index, value) in values.into_iter().enumerate() {
+                assert_eq!(value.r#type, element_type);
+                for input_offset in 0..Self::element_count(&element_type) {
+                    let mut remaining = input_offset;
+                    let mut output_offset = 0;
+                    for output_axis in 0..output_dimensions.len() {
+                        let coordinate = if output_axis == axis {
+                            index
+                        } else {
+                            let input_axis = if output_axis < axis { output_axis } else { output_axis - 1 };
+                            let stride = input_dimensions[input_axis + 1..].iter().product::<usize>().max(1);
+                            let coordinate = remaining / stride;
+                            remaining %= stride;
+                            coordinate
+                        };
+                        let output_stride = output_dimensions[output_axis + 1..].iter().product::<usize>().max(1);
+                        output_offset += coordinate * output_stride;
+                    }
+                    stacked_values[output_offset] = value.values[input_offset];
+                }
+            }
+            Ok(Self { r#type: output_type.clone(), values: stacked_values })
+        }
+    }
 
     impl ZeroLike for TestArray {
         fn zero_like(&self) -> Self {
@@ -1065,6 +1581,143 @@ mod tests {
             operation.batch(&[input]),
             Err(TracingError::Batching(BatchingError::MissingBatchingRule { operation })) if operation == "custom_test"
         ));
+    }
+
+    #[test]
+    fn test_scan_batches_packed_carry_and_xs_for_default_vmap_axis() {
+        let engine = TestArrayEngine;
+
+        let output = vmap::<TestArrayEngine, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+            &engine,
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+            },
+            (TestArray::vector(vec![0.0, 10.0]), TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(output.0.values, vec![6.0, 25.0]);
+        assert_eq!(output.1.r#type, TestArray::matrix(2, 3, vec![0.0; 6]).r#type);
+        assert_eq!(output.1.values, vec![1.0, 3.0, 6.0, 14.0, 19.0, 25.0]);
+    }
+
+    #[test]
+    fn test_scan_batches_zero_length_packed_carry_and_xs_for_default_vmap_axis() {
+        let engine = TestArrayEngine;
+
+        let output = vmap::<TestArrayEngine, _, (TestArray, TestArray), (TestArray, TestArray), TestArray>(
+            &engine,
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+            },
+            (TestArray::vector(vec![0.0, 10.0]), TestArray::matrix(2, 0, vec![])),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(output.0.values, vec![0.0, 10.0]);
+        assert_eq!(output.1.r#type, TestArray::matrix(2, 0, vec![]).r#type);
+        assert_eq!(output.1.values, Vec::<f64>::new());
+    }
+
+    #[test]
+    fn test_linear_scan_jvp_batches_compact_scan_program() {
+        let engine = TestArrayEngine;
+        let (_, pushforward): (
+            (TestArray, TestArray),
+            Program<
+                ArrayType,
+                TestArray,
+                LinearPrimitiveOperation<TestArray>,
+                (TestArray, TestArray),
+                (TestArray, TestArray),
+            >,
+        ) = jvp_program(
+            &engine,
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+            },
+            (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 2.0, 3.0])),
+        )
+        .unwrap();
+
+        let output = interpret_batched_program(
+            &pushforward,
+            (
+                ArrayBatch::mapped(TestArray::vector(vec![10.0, 20.0]), 0).unwrap(),
+                ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]), 0).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(output.0.value().values, vec![13.0, 26.0]);
+        assert_eq!(output.1.r#type().into_owned(), TestArray::matrix(2, 3, vec![0.0; 6]).r#type);
+        assert_eq!(output.1.value().values, vec![11.0, 12.0, 13.0, 22.0, 24.0, 26.0]);
+    }
+
+    #[test]
+    fn test_linear_scan_transpose_batches_compact_scan_program() {
+        let engine = TestArrayEngine;
+        let (_, pushforward): (
+            (TestArray, TestArray),
+            Program<
+                ArrayType,
+                TestArray,
+                LinearPrimitiveOperation<TestArray>,
+                (TestArray, TestArray),
+                (TestArray, TestArray),
+            >,
+        ) = jvp_program(
+            &engine,
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+            },
+            (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 2.0, 3.0])),
+        )
+        .unwrap();
+        let pullback = transpose_linear_program(&engine, &pushforward).unwrap();
+
+        let output = interpret_batched_program(
+            &pullback,
+            (
+                ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0]), 0).unwrap(),
+                ArrayBatch::mapped(TestArray::matrix(2, 3, vec![0.0; 6]), 0).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(output.0.value().values, vec![1.0, 2.0]);
+        assert_eq!(output.1.r#type().into_owned(), TestArray::matrix(2, 3, vec![0.0; 6]).r#type);
+        assert_eq!(output.1.value().values, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
     }
 
     #[test]

@@ -12,8 +12,14 @@ use crate::{
         EngineTangent, JvpTracer, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Tracer,
         engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, TangentSpace},
-        linear::{Linearized, replay_program_linearized_jit, trace_flat_program_from_input_types},
-        operations::{DifferentiableOperation, LinearOperation, constants::ZeroLike},
+        linear::{
+            Linearized, linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
+            transpose_linear_program,
+        },
+        operations::{
+            CoreLinearProgramOperation, DifferentiableOperation, LinearAddOperation, LinearOperation,
+            constants::ZeroLike,
+        },
     },
     types::{ArrayType, Size, Type, TypeError, Typed},
 };
@@ -1070,6 +1076,314 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> Display for Sc
     }
 }
 
+type LinearScanBodyProgram<V> = Program<ArrayType, V, LinearPrimitiveOperation<V>, Vec<V>, Vec<V>>;
+
+/// Compact linear pushforward for one scan operation.
+#[derive(Clone)]
+pub struct LinearizedScanJvpOperation<V: Traceable<ArrayType> + Parameter> {
+    /// Captured scan metadata and body signature.
+    scan: ScanOperation<ArrayType, V, PrimitiveOperation<V>>,
+
+    /// Per-step linearized body pushforwards in forward scan execution order.
+    pushforwards: Vec<LinearScanBodyProgram<V>>,
+
+    /// Per-step body pullbacks matching [`LinearizedScanJvpOperation::pushforwards`].
+    pullbacks: Vec<LinearScanBodyProgram<V>>,
+}
+
+/// Compact linear transpose for one scan pushforward.
+#[derive(Clone)]
+pub struct LinearizedScanTransposeOperation<V: Traceable<ArrayType> + Parameter> {
+    /// Pushforward operation whose precomputed body pullbacks define this transpose.
+    jvp: LinearizedScanJvpOperation<V>,
+}
+
+impl<V: Traceable<ArrayType>> LinearizedScanJvpOperation<V> {
+    /// Builds one compact linearized scan operation by linearizing each body step once at the
+    /// concrete primal point.
+    pub(crate) fn from_scan<E>(
+        engine: &E,
+        scan: ScanOperation<ArrayType, V, PrimitiveOperation<V>>,
+        primal_inputs: Vec<V>,
+    ) -> Result<Self, TracingError>
+    where
+        V: ScanValue + ZeroLike,
+        PrimitiveOperation<V>: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+        LinearPrimitiveOperation<V>: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V>,
+        Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+        E: DifferentiableEngine<
+                Type = ArrayType,
+                Value = V,
+                DifferentiableOperation = PrimitiveOperation<V>,
+                LinearOperation = LinearPrimitiveOperation<V>,
+            > + ?Sized,
+    {
+        let abstract_inputs = primal_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let _ = scan.infer_output_types(abstract_inputs.as_slice())?;
+        let carry_count = scan.body.carry_types.len();
+        let x_count = scan.body.x_types.len();
+        let mut carry_primals = primal_inputs[..carry_count].to_vec();
+        let xs_primals = primal_inputs[carry_count..].to_vec();
+        let mut pushforwards = Vec::with_capacity(scan.body.length);
+        let mut pullbacks = Vec::with_capacity(scan.body.length);
+
+        for step in 0..scan.body.length {
+            let scan_index = if scan.reverse { scan.body.length - 1 - step } else { step };
+            let x_primals = xs_primals
+                .iter()
+                .map(|input| input.scan_slice_leading_axis(scan_index))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut body_primals = Vec::with_capacity(carry_count + x_count);
+            body_primals.extend(carry_primals);
+            body_primals.extend(x_primals);
+            let pushforward = linearize_program(engine, scan.body.program(), body_primals.clone())?;
+            let pullback = transpose_linear_program(engine, &pushforward)?;
+            let body_outputs = scan.body.program().interpret(body_primals)?;
+            carry_primals = body_outputs[..carry_count].to_vec();
+            pushforwards.push(pushforward);
+            pullbacks.push(pullback);
+        }
+
+        Ok(Self { scan, pushforwards, pullbacks })
+    }
+
+    fn input_types(&self) -> Vec<ArrayType> {
+        self.scan.body.carry_types.iter().chain(self.scan.body.xs_types.iter()).cloned().collect()
+    }
+
+    fn output_types(&self) -> Vec<ArrayType> {
+        self.scan.body.carry_types.iter().chain(self.scan.body.ys_types.iter()).cloned().collect()
+    }
+
+    /// Returns the captured primal scan metadata.
+    #[inline]
+    pub(crate) fn scan(&self) -> &ScanOperation<ArrayType, V, PrimitiveOperation<V>> {
+        &self.scan
+    }
+
+    /// Returns the per-step body pushforward programs in forward execution order.
+    #[inline]
+    pub(crate) fn pushforwards(&self) -> &[Program<ArrayType, V, LinearPrimitiveOperation<V>, Vec<V>, Vec<V>>] {
+        self.pushforwards.as_slice()
+    }
+
+    /// Returns the per-step body pullback programs in forward execution order.
+    #[inline]
+    pub(crate) fn pullbacks(&self) -> &[Program<ArrayType, V, LinearPrimitiveOperation<V>, Vec<V>, Vec<V>>] {
+        self.pullbacks.as_slice()
+    }
+}
+
+impl<V: Traceable<ArrayType>> LinearizedScanTransposeOperation<V> {
+    /// Builds the compact transpose of `jvp`.
+    #[inline]
+    pub fn new(jvp: LinearizedScanJvpOperation<V>) -> Self {
+        Self { jvp }
+    }
+
+    fn input_types(&self) -> Vec<ArrayType> {
+        self.jvp.output_types()
+    }
+
+    fn output_types(&self) -> Vec<ArrayType> {
+        self.jvp.input_types()
+    }
+
+    /// Returns the captured compact pushforward whose transpose this operation represents.
+    #[inline]
+    pub(crate) fn jvp(&self) -> &LinearizedScanJvpOperation<V> {
+        &self.jvp
+    }
+}
+
+impl<V: Traceable<ArrayType>> Debug for LinearizedScanJvpOperation<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LinearizedScanJvp")
+    }
+}
+
+impl<V: Traceable<ArrayType>> Debug for LinearizedScanTransposeOperation<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LinearizedScanTranspose")
+    }
+}
+
+impl<V: Traceable<ArrayType>> Display for LinearizedScanJvpOperation<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("linear_scan_jvp")
+    }
+}
+
+impl<V: Traceable<ArrayType>> Display for LinearizedScanTransposeOperation<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("linear_scan_transpose")
+    }
+}
+
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearizedScanJvpOperation<V> {
+    fn name(&self) -> &'static str {
+        "linear_scan_jvp"
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        let expected_input_types = self.input_types();
+        if input_types != expected_input_types.as_slice() {
+            return Err(TypeError {
+                message: "linear scan JVP input types do not match the captured scan signature".to_string(),
+            });
+        }
+        Ok(self.output_types())
+    }
+}
+
+impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearizedScanTransposeOperation<V> {
+    fn name(&self) -> &'static str {
+        "linear_scan_transpose"
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        let expected_input_types = self.input_types();
+        if input_types != expected_input_types.as_slice() {
+            return Err(TypeError {
+                message: "linear scan transpose input types do not match the captured scan signature".to_string(),
+            });
+        }
+        Ok(self.output_types())
+    }
+}
+
+impl<V: Traceable<ArrayType> + ScanValue> InterpretableOperation<ArrayType, V> for LinearizedScanJvpOperation<V>
+where
+    LinearPrimitiveOperation<V>: InterpretableOperation<ArrayType, V>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        let _ = self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
+        let carry_count = self.scan.body.carry_types.len();
+        let x_count = self.scan.body.x_types.len();
+        let y_count = self.scan.body.y_types.len();
+        let mut carry_tangents = inputs[..carry_count].to_vec();
+        let xs_tangents = inputs[carry_count..].to_vec();
+        let mut stacked_y_tangents = vec![vec![None; self.scan.body.length]; y_count];
+
+        for step in 0..self.scan.body.length {
+            let scan_index = if self.scan.reverse { self.scan.body.length - 1 - step } else { step };
+            let x_tangents = xs_tangents
+                .iter()
+                .map(|input| input.scan_slice_leading_axis(scan_index))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut body_tangents = Vec::with_capacity(carry_count + x_count);
+            body_tangents.extend(carry_tangents);
+            body_tangents.extend(x_tangents);
+            let body_outputs = self.pushforwards[step].interpret(body_tangents)?;
+            carry_tangents = body_outputs[..carry_count].to_vec();
+            for (output_index, output) in body_outputs[carry_count..].iter().cloned().enumerate() {
+                stacked_y_tangents[output_index][scan_index] = Some(output);
+            }
+        }
+
+        let mut outputs = carry_tangents;
+        for (output_type, values) in self.scan.body.ys_types.iter().zip(stacked_y_tangents) {
+            let values = values.into_iter().collect::<Option<Vec<_>>>().ok_or(ScanError::MissingEagerOutputMetadata)?;
+            outputs.push(V::scan_stack_leading_axis_with_exemplar(output_type, values, inputs.first())?);
+        }
+        Ok(outputs)
+    }
+}
+
+impl<V: Traceable<ArrayType> + ScanValue> InterpretableOperation<ArrayType, V> for LinearizedScanTransposeOperation<V>
+where
+    LinearPrimitiveOperation<V>: InterpretableOperation<ArrayType, V>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+{
+    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
+        let _ = self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
+        let carry_count = self.jvp.scan.body.carry_types.len();
+        let x_count = self.jvp.scan.body.x_types.len();
+        let y_count = self.jvp.scan.body.y_types.len();
+        let mut carry_cotangents = inputs[..carry_count].to_vec();
+        let ys_cotangents = inputs[carry_count..].to_vec();
+        let mut stacked_x_cotangents = vec![vec![None; self.jvp.scan.body.length]; x_count];
+
+        for step in (0..self.jvp.scan.body.length).rev() {
+            let scan_index = if self.jvp.scan.reverse { self.jvp.scan.body.length - 1 - step } else { step };
+            let y_cotangents = ys_cotangents
+                .iter()
+                .map(|input| input.scan_slice_leading_axis(scan_index))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut body_output_cotangents = Vec::with_capacity(carry_count + y_count);
+            body_output_cotangents.extend(carry_cotangents);
+            body_output_cotangents.extend(y_cotangents);
+            let body_input_cotangents = self.jvp.pullbacks[step].interpret(body_output_cotangents)?;
+            carry_cotangents = body_input_cotangents[..carry_count].to_vec();
+            for (input_index, cotangent) in body_input_cotangents[carry_count..].iter().cloned().enumerate() {
+                stacked_x_cotangents[input_index][scan_index] = Some(cotangent);
+            }
+        }
+
+        let mut outputs = carry_cotangents;
+        for (output_type, values) in self.jvp.scan.body.xs_types.iter().zip(stacked_x_cotangents) {
+            let values = values.into_iter().collect::<Option<Vec<_>>>().ok_or(ScanError::MissingEagerOutputMetadata)?;
+            outputs.push(V::scan_stack_leading_axis_with_exemplar(output_type, values, inputs.first())?);
+        }
+        Ok(outputs)
+    }
+}
+
+impl<V: Traceable<ArrayType> + ScanValue> LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>
+    for LinearizedScanJvpOperation<V>
+{
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>>>, TracingError> {
+        let Some(first_cotangent) = output_cotangents.first() else {
+            return if self.input_types().is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(ScanError::MissingTracedInvocationContext.into())
+            };
+        };
+        Ok(LinearTerm::apply_staged_op(
+            first_cotangent.builder.clone(),
+            output_cotangents,
+            LinearPrimitiveOperation::LinearScanTranspose(Box::new(LinearizedScanTransposeOperation::new(
+                self.clone(),
+            ))),
+            self.input_types().len(),
+        )?
+        .into_iter()
+        .map(Some)
+        .collect())
+    }
+}
+
+impl<V: Traceable<ArrayType> + ScanValue> LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>
+    for LinearizedScanTransposeOperation<V>
+{
+    fn transpose(
+        &self,
+        output_cotangents: &[LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>>>, TracingError> {
+        let Some(first_cotangent) = output_cotangents.first() else {
+            return if self.output_types().is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(ScanError::MissingTracedInvocationContext.into())
+            };
+        };
+        Ok(LinearTerm::apply_staged_op(
+            first_cotangent.builder.clone(),
+            output_cotangents,
+            LinearPrimitiveOperation::LinearScanJvp(Box::new(self.jvp.clone())),
+            self.output_types().len(),
+        )?
+        .into_iter()
+        .map(Some)
+        .collect())
+    }
+}
+
 impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayType> for ScanOperation<ArrayType, V, O> {
     fn name(&self) -> &'static str {
         "scan"
@@ -1137,67 +1451,22 @@ where
     }
 }
 
-fn replay_scan_body_jvp<V, O, E>(
-    engine: &E,
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    primals: Vec<V>,
-    tangents: Vec<EngineTangent<E>>,
-) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError>
+impl<V, E> DifferentiableOperation<E> for ScanOperation<ArrayType, V, PrimitiveOperation<V>>
 where
-    V: Traceable<ArrayType> + ZeroLike + Differentiable<ArrayType>,
-    EngineTangent<E>: TangentSpace<ArrayType, V>,
-    O: Clone + Operation<ArrayType> + DifferentiableOperation<E>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
-{
-    if primals.len() != program.input_ids.len() {
-        return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: primals.len() });
-    }
-    if tangents.len() != program.input_ids.len() {
-        return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: tangents.len() });
-    }
-    let tangent_exemplar = tangents.first().cloned();
-    let mut values = vec![None; program.atoms.len()];
-    for (atom_id, (primal, tangent)) in program.input_ids.iter().copied().zip(primals.into_iter().zip(tangents)) {
-        values[atom_id.index] = Some(JvpTracer { primal, tangent });
-    }
-    for (atom_index, atom) in program.atoms.iter().enumerate() {
-        if let crate::tracing::Atom::Constant(value) = atom {
-            let Some(tangent_exemplar) = tangent_exemplar.as_ref() else {
-                return Err(ScanError::MissingTransformRule { transform: "jvp for nullary scan body constants" }.into());
-            };
-            values[atom_index] = Some(JvpTracer {
-                primal: value.clone(),
-                tangent: EngineTangent::<E>::zero_like(value, tangent_exemplar),
-            });
-        }
-    }
-    for instruction in program.instructions.iter() {
-        let inputs = instruction
-            .inputs
-            .iter()
-            .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
-            .collect::<Result<Vec<_>, _>>()?;
-        let outputs = instruction.operation.jvp(engine, inputs.as_slice())?;
-        if outputs.len() != instruction.outputs.len() {
-            return Err(TracingError::InvalidOutputCount { expected: instruction.outputs.len(), got: outputs.len() });
-        }
-        for (atom_id, output) in instruction.outputs.iter().copied().zip(outputs) {
-            values[atom_id.index] = Some(output);
-        }
-    }
-    program
-        .output_ids
-        .iter()
-        .map(|output| values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
-        .collect()
-}
-
-impl<V, O, E> DifferentiableOperation<E> for ScanOperation<ArrayType, V, O>
-where
-    V: ScanValue + ZeroLike + Differentiable<ArrayType>,
-    EngineTangent<E>: ScanValue + TangentSpace<ArrayType, V>,
-    O: Clone + Operation<ArrayType> + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    V: ScanValue
+        + ZeroLike
+        + Differentiable<
+            ArrayType,
+            Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
+        >,
+    PrimitiveOperation<V>: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+    LinearPrimitiveOperation<V>: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V>,
+    E: DifferentiableEngine<
+            Type = ArrayType,
+            Value = V,
+            DifferentiableOperation = PrimitiveOperation<V>,
+            LinearOperation = LinearPrimitiveOperation<V>,
+        > + ?Sized,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     fn jvp(
@@ -1207,48 +1476,22 @@ where
     ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
-        let carry_count = self.body.carry_types.len();
-        let x_count = self.body.x_types.len();
-        let y_count = self.body.y_types.len();
-        let mut carry_primals = primal_inputs[..carry_count].to_vec();
-        let xs_primals = &primal_inputs[carry_count..];
-        let mut carry_tangents = inputs[..carry_count].iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let xs_tangents = inputs[carry_count..].iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-        let mut stacked_y_tangents = vec![vec![None; self.body.length]; y_count];
-
-        for step in 0..self.body.length {
-            let scan_index = if self.reverse { self.body.length - 1 - step } else { step };
-            let x_primals = xs_primals
-                .iter()
-                .map(|input| input.scan_slice_leading_axis(scan_index))
-                .collect::<Result<Vec<_>, _>>()?;
-            let x_tangents = xs_tangents
-                .iter()
-                .map(|input| input.scan_slice_leading_axis(scan_index))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut body_primals = Vec::with_capacity(carry_count + x_count);
-            body_primals.extend(carry_primals);
-            body_primals.extend(x_primals);
-            let mut body_tangents = Vec::with_capacity(carry_count + x_count);
-            body_tangents.extend(carry_tangents);
-            body_tangents.extend(x_tangents);
-            let body_outputs = replay_scan_body_jvp(engine, self.body.program(), body_primals, body_tangents)?;
-            carry_primals = body_outputs[..carry_count].iter().map(|output| output.primal.clone()).collect();
-            carry_tangents = body_outputs[..carry_count].iter().map(|output| output.tangent.clone()).collect();
-            for (output_index, output) in body_outputs[carry_count..].iter().enumerate() {
-                stacked_y_tangents[output_index][scan_index] = Some(output.tangent.clone());
-            }
-        }
-
-        let mut tangent_outputs = carry_tangents;
-        for (output_type, values) in self.body.ys_types.iter().zip(stacked_y_tangents) {
-            let values = values.into_iter().collect::<Option<Vec<_>>>().ok_or(ScanError::MissingEagerOutputMetadata)?;
-            tangent_outputs.push(EngineTangent::<E>::scan_stack_leading_axis_with_exemplar(
-                output_type,
-                values,
-                inputs.first().map(|input| &input.tangent),
-            )?);
-        }
+        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let output_count = self.body.carry_types.len() + self.body.ys_types.len();
+        let tangent_outputs = if output_count == 0 {
+            Vec::new()
+        } else {
+            let Some(first_tangent) = tangent_inputs.first() else {
+                return Err(ScanError::MissingTracedInvocationContext.into());
+            };
+            let linear_scan = LinearizedScanJvpOperation::from_scan(engine, self.clone(), primal_inputs)?;
+            LinearTerm::apply_staged_op(
+                first_tangent.builder.clone(),
+                tangent_inputs.as_slice(),
+                LinearPrimitiveOperation::LinearScanJvp(Box::new(linear_scan)),
+                output_count,
+            )?
+        };
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
@@ -1672,7 +1915,7 @@ mod tests {
         tracing::{Program, Traceable, Value},
         tracing_v2::{
             Cos, DifferentiableEngine, Engine, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, jvp,
-            linear::vjp,
+            linear::{jvp_program, transpose_linear_program, vjp},
             operations::{
                 constants::{OneLike, ZeroLike},
                 reshape::ReshapeOps,
@@ -2016,6 +2259,82 @@ mod tests {
 
         assert_eq!(primal, (TestArray::scalar(6.0), TestArray::vector(vec![1.0, 3.0, 6.0])));
         assert_eq!(tangent, (TestArray::scalar(13.0), TestArray::vector(vec![11.0, 12.0, 13.0])));
+    }
+
+    #[test]
+    fn test_scan_jvp_program_preserves_compact_linear_scan() {
+        let engine = TestArrayEngine;
+        let (primal, pushforward): (
+            (TestArray, TestArray),
+            Program<
+                ArrayType,
+                TestArray,
+                LinearPrimitiveOperation<TestArray>,
+                (TestArray, TestArray),
+                (TestArray, TestArray),
+            >,
+        ) = jvp_program(
+            &engine,
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+            },
+            (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 2.0, 3.0])),
+        )
+        .unwrap();
+
+        assert_eq!(primal, (TestArray::scalar(6.0), TestArray::vector(vec![1.0, 3.0, 6.0])));
+        assert_eq!(pushforward.instructions.len(), 1);
+        assert_eq!(pushforward.instructions[0].operation.name(), "linear_scan_jvp");
+        assert!(!pushforward.to_string().contains("slice_leading_axis"));
+        assert!(!pushforward.to_string().contains("stack_leading_axis"));
+
+        let tangent = pushforward.interpret((TestArray::scalar(10.0), TestArray::vector(vec![1.0, 1.0, 1.0]))).unwrap();
+        assert_eq!(tangent, (TestArray::scalar(13.0), TestArray::vector(vec![11.0, 12.0, 13.0])));
+    }
+
+    #[test]
+    fn test_scan_transpose_program_preserves_compact_linear_scan() {
+        let engine = TestArrayEngine;
+        let (_, pushforward): (
+            (TestArray, TestArray),
+            Program<
+                ArrayType,
+                TestArray,
+                LinearPrimitiveOperation<TestArray>,
+                (TestArray, TestArray),
+                (TestArray, TestArray),
+            >,
+        ) = jvp_program(
+            &engine,
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+            },
+            (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 2.0, 3.0])),
+        )
+        .unwrap();
+        let pullback = transpose_linear_program(&engine, &pushforward).unwrap();
+
+        assert_eq!(pullback.instructions.len(), 1);
+        assert_eq!(pullback.instructions[0].operation.name(), "linear_scan_transpose");
+        assert!(!pullback.to_string().contains("slice_leading_axis"));
+        assert!(!pullback.to_string().contains("stack_leading_axis"));
+
+        let cotangents = pullback.interpret((TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0]))).unwrap();
+        assert_eq!(cotangents, (TestArray::scalar(1.0), TestArray::vector(vec![1.0, 1.0, 1.0])));
     }
 
     #[test]

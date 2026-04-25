@@ -113,9 +113,8 @@ where
         crate::tracing_v2::jit::trace_with_operation::<E, O, _, _, _>(engine, function, input_types)?;
     let output_leaf_count = output_types.parameter_structure().parameter_count();
     let Program { atoms, input_ids, output_ids, instructions, .. } = traced_program;
-    let mut builder = ProgramBuilder::<ArrayType, V, O, Vec<V>, Vec<V>>::new(flat_leaf_parameter_structure(
-        input_leaf_count,
-    ));
+    let mut builder =
+        ProgramBuilder::<ArrayType, V, O, Vec<V>, Vec<V>>::new(flat_leaf_parameter_structure(input_leaf_count));
     builder.atoms = atoms;
     builder.input_ids = input_ids;
     builder.instructions = instructions;

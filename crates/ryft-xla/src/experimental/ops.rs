@@ -883,11 +883,9 @@ fn finish_traced_xla_program(
         Ok(builder) => builder.into_inner(),
         Err(_) => return Err(TracingError::EscapedProgramBuilder),
     };
-    Ok(builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-        output_atoms,
-        vec![Placeholder; input_count],
-        vec![Placeholder; output_count],
-    ))
+    builder
+        .into_typed::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![Placeholder; input_count])
+        .build(output_atoms, vec![Placeholder; output_count])
 }
 
 fn trace_linearized_scan_jvp_body(
@@ -910,7 +908,7 @@ fn trace_linearized_scan_jvp_body(
         .collect::<Vec<_>>();
     let builder =
         std::rc::Rc::new(std::cell::RefCell::new(
-            ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(),
+            ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(Vec::new()),
         ));
     let inputs = input_types
         .iter()
@@ -1514,7 +1512,13 @@ mod tests {
     > {
         let scalar_type = scalar_type();
         let xs_type = vector_type(3);
-        let mut body_builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+        let mut body_builder = ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            XlaPrimitiveOperation,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
+        >::new(vec![Placeholder, Placeholder]);
         let carry = body_builder.add_input(scalar_type.clone());
         let x = body_builder.add_input(scalar_type.clone());
         let next_carry = body_builder
@@ -1523,11 +1527,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("add should produce one output");
-        let body_program = body_builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            vec![next_carry, next_carry],
-            vec![Placeholder, Placeholder],
-            vec![Placeholder, Placeholder],
-        );
+        let body_program = body_builder.build(vec![next_carry, next_carry], vec![Placeholder, Placeholder]).unwrap();
         let body = ryft_core::tracing_v2::operations::FlatTracedScan::from_parts(
             vec![scalar_type.clone()],
             vec![scalar_type.clone()],
@@ -1538,19 +1538,27 @@ mod tests {
             body_program,
         );
         let scan = ScanOperation::new(body, ScanOptions::default());
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+        let mut builder = ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            XlaPrimitiveOperation,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
+        >::new(vec![Placeholder, Placeholder]);
         let carry = builder.add_input(scalar_type);
         let xs = builder.add_input(vector_type(3));
         let outputs = builder.add_instruction(XlaPrimitiveOperation::Scan(Box::new(scan)), vec![carry, xs]).unwrap();
-        builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            outputs,
-            vec![Placeholder, Placeholder],
-            vec![Placeholder, Placeholder],
-        )
+        builder.build(outputs, vec![Placeholder, Placeholder]).unwrap()
     }
 
     fn unary_rematerialize_body() -> FlatTracedRematerialize<ArrayType, ShardMapTensor, XlaPrimitiveOperation> {
-        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+        let mut builder = ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            XlaPrimitiveOperation,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
+        >::new(vec![Placeholder]);
         let input = builder.add_input(scalar_type());
         let output = builder
             .add_instruction(XlaPrimitiveOperation::Sin, vec![input])
@@ -1558,11 +1566,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("sine should produce one output");
-        let program = builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            vec![output],
-            vec![Placeholder],
-            vec![Placeholder],
-        );
+        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
         FlatTracedRematerialize::from_parts(vec![scalar_type()], vec![scalar_type()], program)
     }
 
@@ -1585,7 +1589,7 @@ mod tests {
         let operation =
             XlaPrimitiveOperation::Rematerialize(Box::new(RematerializeOperation::new(unary_rematerialize_body())));
         let tangent_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaLinearOperation>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaLinearOperation>::new(Vec::new())));
         let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
         let outputs = operation
             .jvp(
@@ -1603,11 +1607,10 @@ mod tests {
         let tangent_builder = Rc::try_unwrap(tangent_builder)
             .expect("rematerialize jvp builder should not have outstanding linear terms")
             .into_inner();
-        let tangent_program = tangent_builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            output_atoms,
-            vec![Placeholder],
-            vec![Placeholder],
-        );
+        let tangent_program = tangent_builder
+            .into_typed::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(vec![Placeholder])
+            .build(output_atoms, vec![Placeholder])
+            .unwrap();
         assert!(
             tangent_program.to_string().contains("rematerialize"),
             "expected linearized xla rematerialize jvp to stage a linear rematerialize op: {}",
@@ -1651,7 +1654,13 @@ mod tests {
     fn test_replay_xla_program_with_tracers_uses_custom_replay_extension() {
         let sharding = Sharding::replicated(test_mesh(), 0);
         let custom = WithShardingConstraintOperation::new(sharding).to_tensor_custom_primitive();
-        let mut program_builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new();
+        let mut program_builder = ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            XlaPrimitiveOperation,
+            Vec<ShardMapTensor>,
+            Vec<ShardMapTensor>,
+        >::new(vec![Placeholder]);
         let input = program_builder.add_input(scalar_type());
         let output = program_builder
             .add_instruction(XlaPrimitiveOperation::Custom(Arc::new(custom)), vec![input])
@@ -1659,13 +1668,9 @@ mod tests {
             .into_iter()
             .next()
             .expect("custom op should produce one output");
-        let program = program_builder.build::<Vec<ShardMapTensor>, Vec<ShardMapTensor>>(
-            vec![output],
-            vec![Placeholder],
-            vec![Placeholder],
-        );
+        let program = program_builder.build(vec![output], vec![Placeholder]).unwrap();
         let tracing_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(Vec::new())));
         let traced_input_atom = tracing_builder.borrow_mut().add_input(scalar_type());
         let traced_input =
             Tracer::from_staged_parts(traced_input_atom, scalar_type(), tracing_builder, XlaEngine::token());
