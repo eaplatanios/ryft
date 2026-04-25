@@ -542,17 +542,14 @@ pub struct ProgramBuilder<
     /// Optional [`TracingError`] encountered during program construction that will be propagated via [`Self::build`].
     pub error: Option<TracingError>,
 
-    /// Marker tying this builder to the output structure it will eventually produce.
-    marker: PhantomData<Output>,
+    /// [`PhantomData`] marker that ties this [`ProgramBuilder`] to its structured `Input` and `Output` types.
+    marker: PhantomData<fn(Input) -> Output>,
 }
 
 impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     ProgramBuilder<T, V, O, Input, Output>
 {
-    /// Creates an empty builder.
-    ///
-    /// Fresh builders contain no atoms or instructions and are typically owned by one tracing
-    /// scope. The input structure is recorded up front because it is fixed before tracing starts.
+    /// Creates a new [`ProgramBuilder`] with the provided input type and structure.
     #[inline]
     pub fn new(input_structure: Input::ParameterStructure) -> Self {
         Self {
