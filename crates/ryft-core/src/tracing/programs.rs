@@ -457,15 +457,14 @@ impl<
 > Display for Program<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            formatter,
-            "lambda {} .",
-            self.input_ids
-                .iter()
-                .map(|input| format!("{input}:{}", self.atoms[input.index].r#type()))
-                .collect::<Vec<_>>()
-                .join(", "),
-        )?;
+        write!(formatter, "lambda ")?;
+        self.input_ids.iter().enumerate().try_for_each(|(index, input_id)| {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+            write!(formatter, "{input_id}:{}", self.atoms[input_id.index].r#type())
+        })?;
+        writeln!(formatter, " .")?;
         let mut instructions_by_first_output = vec![None; self.atoms.len()];
         for (index, instruction) in self.instructions.iter().enumerate() {
             if let Some(output_id) = instruction.outputs.first() {
@@ -493,29 +492,29 @@ impl<
                 Atom::Variable(_) => {
                     if let Some(instruction_index) = instructions_by_first_output[atom_id] {
                         let instruction = &self.instructions[instruction_index];
-                        writeln!(
-                            formatter,
-                            "{} {} = {}{}",
-                            if binding_count == 0 { "let" } else { "   " },
-                            instruction
-                                .outputs
-                                .iter()
-                                .map(|output| format!("{output}:{}", self.atoms[output.index].r#type()))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            instruction.operation,
-                            instruction.inputs.iter().map(|input| format!(" {input}")).collect::<Vec<_>>().join(""),
-                        )?;
+                        write!(formatter, "{} ", if binding_count == 0 { "let" } else { "   " })?;
+                        instruction.outputs.iter().enumerate().try_for_each(|(index, output)| {
+                            if index > 0 {
+                                write!(formatter, ", ")?;
+                            }
+                            write!(formatter, "{output}:{}", self.atoms[output.index].r#type())
+                        })?;
+                        write!(formatter, " = {}", instruction.operation)?;
+                        instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
+                        writeln!(formatter)?;
                         binding_count += 1;
                     };
                 }
             }
         }
-        write!(
-            formatter,
-            "in ({})",
-            self.output_ids.iter().map(|output| output.to_string()).collect::<Vec<_>>().join(", "),
-        )
+        write!(formatter, "in (")?;
+        self.output_ids.iter().enumerate().try_for_each(|(index, output)| {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+            write!(formatter, "{output}")
+        })?;
+        write!(formatter, ")")
     }
 }
 
