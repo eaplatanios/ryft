@@ -211,7 +211,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         Output::ParameterStructure: Clone,
     {
         /// Marks the [`Atom`] that corresponds to the provided `atom_id`, its producing [`Instruction`], and all
-        /// transitive input [`Atom`]s as _live_ in the provided `atom_is_live` and `instruction_is_live` arrays.
+        /// transitive input [`Atom`]s as _live_ in the provided `atom_is_live` array.
         fn mark_atom_as_live<
             T: Type,
             V: Traceable<T>,
@@ -222,17 +222,13 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             program: &Program<T, V, O, Input, Output>,
             atom_id: AtomId,
             atom_is_live: &mut [bool],
-            instruction_is_live: &mut [bool],
             parent_instructions: &[Option<usize>],
         ) {
             if !atom_is_live[atom_id.index] {
                 atom_is_live[atom_id.index] = true;
                 if let Some(instruction_index) = parent_instructions[atom_id.index] {
-                    if !instruction_is_live[instruction_index] {
-                        instruction_is_live[instruction_index] = true;
-                        for input in program.instructions[instruction_index].inputs.iter().copied() {
-                            mark_atom_as_live(program, input, atom_is_live, instruction_is_live, parent_instructions);
-                        }
+                    for input in program.instructions[instruction_index].inputs.iter().copied() {
+                        mark_atom_as_live(program, input, atom_is_live, parent_instructions);
                     }
                 }
             }
@@ -240,7 +236,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
 
         /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the provided `builder`, along with its
         /// transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
-        fn remap_atom<
+        fn add_atom_to_program_builder<
             T: Type,
             V: Traceable<T>,
             O: Clone + Operation<T>,
@@ -269,7 +265,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                         .iter()
                         .copied()
                         .map(|input| {
-                            remap_atom(
+                            add_atom_to_program_builder(
                                 program_builder,
                                 atom_id_mapping,
                                 input,
@@ -308,15 +304,8 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         }
 
         let mut live_atoms = vec![false; self.atoms.len()];
-        let mut live_instructions = vec![false; self.instructions.len()];
         for output in self.output_ids.iter().copied() {
-            mark_atom_as_live(
-                self,
-                output,
-                live_atoms.as_mut_slice(),
-                live_instructions.as_mut_slice(),
-                instruction_by_output.as_slice(),
-            );
+            mark_atom_as_live(self, output, live_atoms.as_mut_slice(), instruction_by_output.as_slice());
         }
 
         let mut program_builder = ProgramBuilder::<T, V, O>::new();
@@ -335,7 +324,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             .iter()
             .copied()
             .map(|output| {
-                remap_atom(
+                add_atom_to_program_builder(
                     &mut program_builder,
                     &mut atom_id_mapping,
                     output,
