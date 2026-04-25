@@ -457,64 +457,65 @@ impl<
 > Display for Program<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inputs = self
-            .input_ids
-            .iter()
-            .map(|input| format!("{input}:{}", self.atoms[input.index].r#type()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(formatter, "lambda {inputs} .")?;
-
-        let mut instruction_by_first_output = vec![None; self.atoms.len()];
+        writeln!(
+            formatter,
+            "lambda {} .",
+            self.input_ids
+                .iter()
+                .map(|input| format!("{input}:{}", self.atoms[input.index].r#type()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )?;
+        let mut instructions_by_first_output = vec![None; self.atoms.len()];
         for (index, instruction) in self.instructions.iter().enumerate() {
-            if let Some(first_output) = instruction.outputs.first() {
-                instruction_by_first_output[first_output.index] = Some(index);
+            if let Some(output_id) = instruction.outputs.first() {
+                instructions_by_first_output[output_id.index] = Some(index);
             }
         }
-
         let mut binding_count = 0usize;
-        let mut input_atom_flags = vec![false; self.atoms.len()];
-        for input_atom in self.input_ids.iter().copied() {
-            input_atom_flags[input_atom.index] = true;
+        let mut is_input = vec![false; self.atoms.len()];
+        for input_id in self.input_ids.iter().copied() {
+            is_input[input_id.index] = true;
         }
         for (atom_id, atom) in self.atoms.iter().enumerate() {
             match atom {
                 Atom::Constant(_) => {
-                    let prefix = if binding_count == 0 { "let" } else { "   " };
                     writeln!(
                         formatter,
-                        "{prefix} {}:{} = const",
+                        "{} {}:{} = const",
+                        if binding_count == 0 { "let" } else { "   " },
                         AtomId { index: atom_id },
                         self.atoms[atom_id].r#type()
                     )?;
                     binding_count += 1;
                 }
-                Atom::Variable(_) if input_atom_flags[atom_id] => {}
+                Atom::Variable(_) if is_input[atom_id] => {}
                 Atom::Variable(_) => {
-                    let Some(instruction_index) = instruction_by_first_output[atom_id] else {
-                        continue;
+                    if let Some(instruction_index) = instructions_by_first_output[atom_id] {
+                        let instruction = &self.instructions[instruction_index];
+                        writeln!(
+                            formatter,
+                            "{} {} = {}{}",
+                            if binding_count == 0 { "let" } else { "   " },
+                            instruction
+                                .outputs
+                                .iter()
+                                .map(|output| format!("{output}:{}", self.atoms[output.index].r#type()))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            instruction.operation,
+                            instruction.inputs.iter().map(|input| format!(" {input}")).collect::<Vec<_>>().join(""),
+                        )?;
+                        binding_count += 1;
                     };
-                    let instruction = &self.instructions[instruction_index];
-                    let outputs = instruction
-                        .outputs
-                        .iter()
-                        .map(|output| format!("{output}:{}", self.atoms[output.index].r#type()))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let inputs = instruction.inputs.iter().map(|input| input.to_string()).collect::<Vec<_>>().join(" ");
-                    let prefix = if binding_count == 0 { "let" } else { "   " };
-                    if inputs.is_empty() {
-                        writeln!(formatter, "{prefix} {outputs} = {}", instruction.operation)?;
-                    } else {
-                        writeln!(formatter, "{prefix} {outputs} = {} {inputs}", instruction.operation)?;
-                    }
-                    binding_count += 1;
                 }
             }
         }
-
-        let outputs = self.output_ids.iter().map(|output| output.to_string()).collect::<Vec<_>>().join(", ");
-        write!(formatter, "in ({outputs})")
+        write!(
+            formatter,
+            "in ({})",
+            self.output_ids.iter().map(|output| output.to_string()).collect::<Vec<_>>().join(", "),
+        )
     }
 }
 
