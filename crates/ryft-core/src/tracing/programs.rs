@@ -100,20 +100,17 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 
-/// Single instruction in a staged program.
-///
-/// An [`Instruction`] is the IR-level record of one primitive application. It names the operation
-/// object to apply, the input atoms it consumes, and the output atoms it defines. Programs are
-/// purely dataflow-based, so instructions execute in list order with no control-flow nodes.
+/// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`]s. [`Program`]s are
+/// purely dataflow-based, and so [`Instruction`]s execute in sequential order with no control-flow nodes.
 #[derive(Clone, Debug)]
 pub struct Instruction<O> {
-    /// Operation applied by this instruction.
+    /// [`Operation`] applied by this [`Instruction`].
     pub operation: O,
 
-    /// Input atoms consumed by the instruction.
+    /// [`AtomId`]s of the input [`Atom`]s consumed by this [`Instruction`].
     pub inputs: Vec<AtomId>,
 
-    /// Output atoms produced by the instruction.
+    /// [`AtomId`]s of the output [`Atom`]s produced by this [`Instruction`].
     pub outputs: Vec<AtomId>,
 }
 
