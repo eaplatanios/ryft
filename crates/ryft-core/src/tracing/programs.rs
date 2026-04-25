@@ -125,7 +125,7 @@ pub struct Program<
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > {
-    /// [`Atom`]s contained in this [`Program`], in the order in which they will be computed/evaluated.
+    /// [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
     pub atoms: Vec<Atom<T, V>>,
 
     /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
@@ -517,28 +517,20 @@ impl<
     }
 }
 
-/// Builder for staged programs.
-///
-/// [`ProgramBuilder`] is the mutable workhorse used by the tracing entry points and by the
-/// linearization helpers. It mirrors the final [`Program`] IR closely: variable atoms retain only
-/// their abstract types, while concrete values are kept only for literal constants.
-///
-/// During traced execution the builder also carries the first staging failure encountered in that
-/// tracing scope. This lets infallible operator syntax like `x + y` poison the shared trace and
-/// stop recording new instructions even though the surrounding closure cannot immediately return
-/// `Result`.
+/// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
+/// but also carries an optional [`TracingError`] that can be used to signal a failure during program construction.
 #[derive(Clone, Debug)]
 pub struct ProgramBuilder<T: Type, V: Typed<T>, O: Clone + Operation<T>> {
-    /// Atom table accumulated so far, including inputs, constants, and derived outputs.
+    /// [`Atom`]s contained in the [`Program`] that is being built, in the order in which they will be evaluated.
     pub atoms: Vec<Atom<T, V>>,
 
-    /// Input atom ids in parameter order.
+    /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of the [`Program`] being built.
     pub input_ids: Vec<AtomId>,
 
-    /// Instructions recorded so far in execution order.
+    /// Ordered sequence of [`Instruction`]s that make up the computational graph of the [`Program`] being built.
     pub instructions: Vec<Instruction<O>>,
 
-    /// First staging failure recorded while this builder was used for traced execution.
+    /// Optional [`TracingError`] encountered during program construction that will be propagated via [`Self::build`].
     pub error: Option<TracingError>,
 }
 
