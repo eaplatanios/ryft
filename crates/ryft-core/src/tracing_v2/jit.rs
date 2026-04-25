@@ -830,7 +830,6 @@ mod tests {
                     ControlFlowError, ControlFlowValue,
                     constants::{OneLike, ZeroLike},
                     reshape::ReshapeOps,
-                    scan::{ScanError, ScanValue},
                 },
             },
             types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
@@ -854,22 +853,6 @@ mod tests {
         impl ControlFlowValue for TestAbstractValue {
             fn control_flow_predicate(&self) -> Result<bool, TracingError> {
                 Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
-            }
-        }
-
-        impl ScanValue for TestAbstractValue {
-            fn scan_slice_leading_axis(&self, _index: usize) -> Result<Self, TracingError> {
-                Err(ScanError::UnsupportedValueCapability {
-                    capability: "leading-axis slicing for abstract test values",
-                }
-                .into())
-            }
-
-            fn scan_stack_leading_axis(_output_type: &ArrayType, _values: Vec<Self>) -> Result<Self, TracingError> {
-                Err(ScanError::UnsupportedValueCapability {
-                    capability: "leading-axis stacking for abstract test values",
-                }
-                .into())
             }
         }
 

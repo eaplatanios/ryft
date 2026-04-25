@@ -60,9 +60,6 @@ pub mod right_matmul;
 /// Scalar and tensor scaling.
 pub mod scale;
 
-/// Traced static scan loop.
-pub mod scan;
-
 /// Elementwise sine.
 pub mod sin;
 
@@ -89,12 +86,6 @@ pub use rematerialize::{
 pub use reshape::{LinearReshapeOperation, ReshapeOperation, ReshapeTracingOperation};
 pub use right_matmul::{LinearRightMatMulOperation, RightMatMulOperation, RightMatMulTracingOperation};
 pub use scale::{LinearScaleOperation, ScaleOperation, ScaleTracingOperation};
-pub use scan::{
-    FlatTracedScan, LeadingAxisTracingOperation, LinearizedScanJvpOperation, LinearizedScanTransposeOperation,
-    ScanError, ScanOperation, ScanOptions, ScanTracingOperation, ScanUnroll, ScanValue,
-    ScatterLeadingAxisSliceOperation, SliceLeadingAxisOperation, StackLeadingAxisOperation, scan, scan_with_options,
-    scan_without_xs, scan_without_xs_with_options,
-};
 pub use sin::{Sin, SinOperation, SinTracingOperation};
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.

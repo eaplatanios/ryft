@@ -275,10 +275,7 @@ pub mod ndarray_support {
         tracing_v2::{
             CoordinateValue, Cos, LinearPrimitiveOperation, PrimitiveOperation, Sin,
             engines::{DifferentiableEngine, Engine},
-            operations::{
-                constants::{OneLike, ZeroLike},
-                scan::{ScanError, ScanValue},
-            },
+            operations::constants::{OneLike, ZeroLike},
         },
         types::{ArrayType, DataType, TypeError, Typed},
     };
@@ -415,38 +412,6 @@ pub mod ndarray_support {
     impl Traceable<ArrayType> for Array2<f64> {}
 
     impl Value<ArrayType> for Array2<f64> {}
-
-    impl ScanValue for Array2<f32> {
-        fn scan_slice_leading_axis(&self, _index: usize) -> Result<Self, TracingError> {
-            Err(ScanError::UnsupportedValueCapability {
-                capability: "leading-axis slicing for rank-changing ndarray Array2 leaves",
-            }
-            .into())
-        }
-
-        fn scan_stack_leading_axis(_output_type: &ArrayType, _values: Vec<Self>) -> Result<Self, TracingError> {
-            Err(ScanError::UnsupportedValueCapability {
-                capability: "leading-axis stacking for rank-changing ndarray Array2 leaves",
-            }
-            .into())
-        }
-    }
-
-    impl ScanValue for Array2<f64> {
-        fn scan_slice_leading_axis(&self, _index: usize) -> Result<Self, TracingError> {
-            Err(ScanError::UnsupportedValueCapability {
-                capability: "leading-axis slicing for rank-changing ndarray Array2 leaves",
-            }
-            .into())
-        }
-
-        fn scan_stack_leading_axis(_output_type: &ArrayType, _values: Vec<Self>) -> Result<Self, TracingError> {
-            Err(ScanError::UnsupportedValueCapability {
-                capability: "leading-axis stacking for rank-changing ndarray Array2 leaves",
-            }
-            .into())
-        }
-    }
 
     impl ZeroLike for Array2<f32> {
         #[inline]

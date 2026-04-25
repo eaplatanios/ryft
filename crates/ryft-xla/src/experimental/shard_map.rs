@@ -23,7 +23,6 @@ use ryft_core::tracing::{
 use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
     constants::{OneLike, ZeroLike},
-    scan::ScanValue,
 };
 use ryft_core::tracing_v2::{Cos, Linearized, MatrixOps, Sin, Tracer, trace as trace_types};
 
@@ -328,37 +327,6 @@ impl Value<ArrayType> for ShardMapTensor {}
 impl ControlFlowValue for ShardMapTensor {
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
-    }
-}
-
-impl ScanValue for ShardMapTensor {
-    fn scan_slice_leading_axis(&self, _index: usize) -> Result<Self, TracingError> {
-        self.scan_slice_axis(0, _index)
-    }
-
-    fn scan_empty_slice_leading_axis(&self) -> Result<Self, TracingError> {
-        self.scan_empty_slice_axis(0)
-    }
-
-    fn scan_stack_leading_axis(output_type: &ArrayType, values: Vec<Self>) -> Result<Self, TracingError> {
-        Self::scan_stack_axis(0, output_type, values)
-    }
-
-    fn scan_slice_axis(&self, axis: usize, _index: usize) -> Result<Self, TracingError> {
-        Ok(Self { array_type: self.array_type.without_dimension(axis)?.0, constant_kind: self.constant_kind })
-    }
-
-    fn scan_empty_slice_axis(&self, axis: usize) -> Result<Self, TracingError> {
-        Ok(Self { array_type: self.array_type.without_dimension(axis)?.0, constant_kind: self.constant_kind })
-    }
-
-    fn scan_stack_axis(_axis: usize, output_type: &ArrayType, values: Vec<Self>) -> Result<Self, TracingError> {
-        let constant_kind = values
-            .iter()
-            .map(|value| value.constant_kind)
-            .reduce(|left, right| if left == right { left } else { None })
-            .flatten();
-        Ok(Self { array_type: output_type.clone(), constant_kind })
     }
 }
 

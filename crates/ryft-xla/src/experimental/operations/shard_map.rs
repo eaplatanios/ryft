@@ -15,11 +15,11 @@ use ryft_core::{
     },
     tracing_v2::{
         Cos, CustomOperationError, CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation,
-        LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, ScanValue, Sin, Tracer,
+        LinearPrimitiveOperation, LinearTerm, Linearized, MatrixOps, Sin, Tracer,
         engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer},
         operations::{
-            ConditionOperation, ControlFlowError, ScanOperation, WhileOperation,
+            ConditionOperation, ControlFlowError, WhileOperation,
             constants::{OneLike, ZeroLike},
             reshape::ReshapeOps,
         },
@@ -933,7 +933,6 @@ pub(crate) trait ReplayShardMapValue:
     + ReshapeOps
     + ZeroLike
     + OneLike
-    + ScanValue
 {
     type ReplayContext;
 
@@ -948,12 +947,6 @@ pub(crate) trait ReplayShardMapValue:
     fn apply_linear_shard_map_operation(
         replay_context: &Self::ReplayContext,
         shard_map_op: &LinearShardMapOperation<ShardMapTensor>,
-        inputs: Vec<Self>,
-    ) -> Result<Vec<Self>, ShardMapTraceError>;
-
-    fn apply_scan_operation(
-        replay_context: &Self::ReplayContext,
-        scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
         inputs: Vec<Self>,
     ) -> Result<Vec<Self>, ShardMapTraceError>;
 
@@ -1610,14 +1603,8 @@ fn replay_traced_xla_program<
                     XlaPrimitiveOperation::Reshape { output_type, .. } => {
                         vec![input_values[0].clone().reshape(output_type.shape.clone())?]
                     }
-                    XlaPrimitiveOperation::SliceLeadingAxis(op) => op.interpret(input_values.as_slice())?,
-                    XlaPrimitiveOperation::ScatterLeadingAxisSlice(op) => op.interpret(input_values.as_slice())?,
-                    XlaPrimitiveOperation::StackLeadingAxis(op) => op.interpret(input_values.as_slice())?,
                     XlaPrimitiveOperation::Rematerialize(remat) => {
                         replay_traced_xla_program(replay_context, remat.body().program(), input_values)?
-                    }
-                    XlaPrimitiveOperation::Scan(scan) => {
-                        V::apply_scan_operation(replay_context, scan.as_ref(), input_values)?
                     }
                     XlaPrimitiveOperation::Condition(condition) => {
                         V::apply_condition_operation(replay_context, condition.as_ref(), input_values)?
@@ -1893,20 +1880,6 @@ impl ReplayShardMapValue for ShardMapTracer {
             .map_err(ShardMapTraceError::TracingError)
     }
 
-    fn apply_scan_operation(
-        replay_context: &Self::ReplayContext,
-        scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
-        inputs: Vec<Self>,
-    ) -> Result<Vec<Self>, ShardMapTraceError> {
-        Tracer::apply_staged_op(
-            XlaEngine::token(),
-            replay_context.tracing_builder.clone(),
-            inputs.as_slice(),
-            XlaPrimitiveOperation::Scan(Box::new(scan_op.clone())),
-        )
-        .map_err(ShardMapTraceError::TracingError)
-    }
-
     fn apply_condition_operation(
         replay_context: &Self::ReplayContext,
         condition_op: &ConditionOperation<ShardMapTensor, XlaPrimitiveOperation>,
@@ -2001,14 +1974,6 @@ impl ReplayShardMapValue for Linearized<ShardMapTracer> {
             .zip(tangent_outputs)
             .map(|(primal, tangent)| Linearized { primal, tangent })
             .collect::<Vec<_>>())
-    }
-
-    fn apply_scan_operation(
-        _replay_context: &Self::ReplayContext,
-        scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
-        inputs: Vec<Self>,
-    ) -> Result<Vec<Self>, ShardMapTraceError> {
-        scan_op.interpret_linearized_jit(inputs.as_slice()).map_err(ShardMapTraceError::TracingError)
     }
 
     fn apply_condition_operation(

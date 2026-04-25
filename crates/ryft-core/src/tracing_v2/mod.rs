@@ -38,10 +38,6 @@ pub use linear::{LinearTerm, Linearized};
 pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
 pub use operations::rematerialize::rematerialize;
 pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
-pub use operations::scan::{
-    ScanError, ScanOptions, ScanUnroll, ScanValue, scan, scan_with_options, scan_without_xs,
-    scan_without_xs_with_options,
-};
 pub use operations::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos, CustomOperationError,
     CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, FlatProgram, LinearCustomPrimitive,

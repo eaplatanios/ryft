@@ -20,11 +20,6 @@ use crate::{
             control_flow::{ConditionOperation, ControlFlowValue, WhileOperation},
             left_matmul::left_matmul_abstract_eval,
             right_matmul::right_matmul_abstract_eval,
-            scan::{
-                LeadingAxisTracingOperation, LinearizedScanJvpOperation, LinearizedScanTransposeOperation, ScanError,
-                ScanOperation, ScanTracingOperation, ScanValue, ScatterLeadingAxisSliceOperation,
-                SliceLeadingAxisOperation, StackLeadingAxisOperation,
-            },
         },
     },
     types::{ArrayType, TypeError, Typed},
@@ -89,15 +84,6 @@ pub enum PrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Reshape between two statically known shapes.
     Reshape { input_type: ArrayType, output_type: ArrayType },
 
-    /// Slice one statically indexed leading-axis element.
-    SliceLeadingAxis(SliceLeadingAxisOperation),
-
-    /// Scatter one leading-axis slice into an otherwise-zero stacked value.
-    ScatterLeadingAxisSlice(ScatterLeadingAxisSliceOperation),
-
-    /// Stack same-typed leaves along a new leading axis.
-    StackLeadingAxis(StackLeadingAxisOperation),
-
     /// Higher-order rematerialization boundary carrying a compiled body and optional transpose body.
     Rematerialize(
         Box<
@@ -109,9 +95,6 @@ pub enum PrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
             >,
         >,
     ),
-
-    /// Higher-order static scan loop carrying a compiled body.
-    Scan(Box<ScanOperation<ArrayType, V, PrimitiveOperation<V>>>),
 
     /// Higher-order conditional carrying true and false branch programs.
     Condition(Box<ConditionOperation<V, PrimitiveOperation<V>>>),
@@ -151,25 +134,10 @@ pub enum LinearPrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Reshape between two statically known shapes.
     Reshape { input_type: ArrayType, output_type: ArrayType },
 
-    /// Slice one statically indexed leading-axis element.
-    SliceLeadingAxis(SliceLeadingAxisOperation),
-
-    /// Scatter one leading-axis slice into an otherwise-zero stacked value.
-    ScatterLeadingAxisSlice(ScatterLeadingAxisSliceOperation),
-
-    /// Stack same-typed leaves along a new leading axis.
-    StackLeadingAxis(StackLeadingAxisOperation),
-
     /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
     Rematerialize(
         Box<crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, LinearPrimitiveOperation<V>>>,
     ),
-
-    /// Compact linearized scan pushforward.
-    LinearScanJvp(Box<LinearizedScanJvpOperation<V>>),
-
-    /// Compact transpose of a linearized scan pushforward.
-    LinearScanTranspose(Box<LinearizedScanTransposeOperation<V>>),
 
     /// Higher-order conditional restricted to linear branch programs.
     Condition(Box<ConditionOperation<V, LinearPrimitiveOperation<V>>>),
@@ -270,23 +238,6 @@ impl<V: Traceable<ArrayType>> ReshapeTracingOperation<ArrayType, V> for Primitiv
     }
 }
 
-impl<V: Traceable<ArrayType>> LeadingAxisTracingOperation<V> for PrimitiveOperation<V> {
-    #[inline]
-    fn slice_leading_axis_op(op: SliceLeadingAxisOperation) -> Self {
-        PrimitiveOperation::SliceLeadingAxis(op)
-    }
-
-    #[inline]
-    fn scatter_leading_axis_slice_op(op: ScatterLeadingAxisSliceOperation) -> Self {
-        PrimitiveOperation::ScatterLeadingAxisSlice(op)
-    }
-
-    #[inline]
-    fn stack_leading_axis_op(op: StackLeadingAxisOperation) -> Self {
-        PrimitiveOperation::StackLeadingAxis(op)
-    }
-}
-
 impl<V: Traceable<ArrayType>> RematerializeTracingOperation<ArrayType, V, LinearPrimitiveOperation<V>>
     for PrimitiveOperation<V>
 {
@@ -295,13 +246,6 @@ impl<V: Traceable<ArrayType>> RematerializeTracingOperation<ArrayType, V, Linear
         op: crate::tracing_v2::operations::RematerializeOperation<ArrayType, V, Self, LinearPrimitiveOperation<V>>,
     ) -> Self {
         PrimitiveOperation::Rematerialize(Box::new(op))
-    }
-}
-
-impl<V: Traceable<ArrayType>> ScanTracingOperation<ArrayType, V> for PrimitiveOperation<V> {
-    #[inline]
-    fn scan_op(op: ScanOperation<ArrayType, V, Self>) -> Self {
-        PrimitiveOperation::Scan(Box::new(op))
     }
 }
 
@@ -361,23 +305,6 @@ impl<V: Traceable<ArrayType>> LinearReshapeOperation<ArrayType, V> for LinearPri
     }
 }
 
-impl<V: Traceable<ArrayType>> LeadingAxisTracingOperation<V> for LinearPrimitiveOperation<V> {
-    #[inline]
-    fn slice_leading_axis_op(op: SliceLeadingAxisOperation) -> Self {
-        LinearPrimitiveOperation::SliceLeadingAxis(op)
-    }
-
-    #[inline]
-    fn scatter_leading_axis_slice_op(op: ScatterLeadingAxisSliceOperation) -> Self {
-        LinearPrimitiveOperation::ScatterLeadingAxisSlice(op)
-    }
-
-    #[inline]
-    fn stack_leading_axis_op(op: StackLeadingAxisOperation) -> Self {
-        LinearPrimitiveOperation::StackLeadingAxis(op)
-    }
-}
-
 impl<V: Traceable<ArrayType>> LinearRematerializeCarrierOperation<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn linear_rematerialize_op(
@@ -415,11 +342,7 @@ impl<V: Traceable<ArrayType>> Debug for PrimitiveOperation<V> {
             Self::Reshape { input_type, output_type } => {
                 write!(formatter, "Reshape({input_type} -> {output_type})")
             }
-            Self::SliceLeadingAxis(op) => Debug::fmt(op, formatter),
-            Self::ScatterLeadingAxisSlice(op) => Debug::fmt(op, formatter),
-            Self::StackLeadingAxis(op) => Debug::fmt(op, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
-            Self::Scan(scan) => Debug::fmt(scan, formatter),
             Self::Condition(condition) => Debug::fmt(condition, formatter),
             Self::While(while_operation) => Debug::fmt(while_operation, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
@@ -448,12 +371,7 @@ impl<V: Traceable<ArrayType>> Debug for LinearPrimitiveOperation<V> {
             Self::Reshape { input_type, output_type } => {
                 write!(formatter, "Reshape({input_type} -> {output_type})")
             }
-            Self::SliceLeadingAxis(op) => Debug::fmt(op, formatter),
-            Self::ScatterLeadingAxisSlice(op) => Debug::fmt(op, formatter),
-            Self::StackLeadingAxis(op) => Debug::fmt(op, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
-            Self::LinearScanJvp(op) => Debug::fmt(op, formatter),
-            Self::LinearScanTranspose(op) => Debug::fmt(op, formatter),
             Self::Condition(condition) => Debug::fmt(condition, formatter),
             Self::While(while_operation) => Debug::fmt(while_operation, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
@@ -486,11 +404,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
-            Self::SliceLeadingAxis(op) => op.name(),
-            Self::ScatterLeadingAxisSlice(op) => op.name(),
-            Self::StackLeadingAxis(op) => op.name(),
             Self::Rematerialize(remat) => remat.name(),
-            Self::Scan(scan) => scan.name(),
             Self::Condition(condition) => condition.name(),
             Self::While(while_operation) => while_operation.name(),
             Self::Custom(op) => op.name(),
@@ -515,11 +429,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
                     input_types,
                 )
             }
-            Self::SliceLeadingAxis(op) => op.infer_output_types(input_types),
-            Self::ScatterLeadingAxisSlice(op) => op.infer_output_types(input_types),
-            Self::StackLeadingAxis(op) => op.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
-            Self::Scan(scan) => scan.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
@@ -539,12 +449,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
-            Self::SliceLeadingAxis(op) => op.name(),
-            Self::ScatterLeadingAxisSlice(op) => op.name(),
-            Self::StackLeadingAxis(op) => op.name(),
             Self::Rematerialize(remat) => remat.name(),
-            Self::LinearScanJvp(op) => op.name(),
-            Self::LinearScanTranspose(op) => op.name(),
             Self::Condition(condition) => condition.name(),
             Self::While(while_operation) => while_operation.name(),
             Self::Custom(op) => op.name(),
@@ -565,12 +470,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
                     input_types,
                 )
             }
-            Self::SliceLeadingAxis(op) => op.infer_output_types(input_types),
-            Self::ScatterLeadingAxisSlice(op) => op.infer_output_types(input_types),
-            Self::StackLeadingAxis(op) => op.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
-            Self::LinearScanJvp(op) => op.infer_output_types(input_types),
-            Self::LinearScanTranspose(op) => op.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
@@ -595,7 +495,6 @@ impl<
         + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue
         + ControlFlowValue,
 > InterpretableOperation<ArrayType, V> for PrimitiveOperation<V>
 where
@@ -616,11 +515,7 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::SliceLeadingAxis(op) => op.interpret(inputs),
-            Self::ScatterLeadingAxisSlice(op) => op.interpret(inputs),
-            Self::StackLeadingAxis(op) => op.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Scan(scan) => scan.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
@@ -636,7 +531,6 @@ impl<
         + ZeroLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue
         + ControlFlowValue,
 > InterpretableOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
@@ -653,12 +547,7 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::SliceLeadingAxis(op) => op.interpret(inputs),
-            Self::ScatterLeadingAxisSlice(op) => op.interpret(inputs),
-            Self::StackLeadingAxis(op) => op.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::LinearScanJvp(op) => op.interpret(inputs),
-            Self::LinearScanTranspose(op) => op.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
@@ -675,7 +564,6 @@ impl<
         + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue
         + ControlFlowValue,
 > LinearOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
@@ -695,12 +583,7 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).transpose(output_cotangents)
             }
-            Self::SliceLeadingAxis(op) => op.transpose(output_cotangents),
-            Self::ScatterLeadingAxisSlice(op) => op.transpose(output_cotangents),
-            Self::StackLeadingAxis(op) => op.transpose(output_cotangents),
             Self::Rematerialize(remat) => remat.transpose(output_cotangents),
-            Self::LinearScanJvp(op) => op.transpose(output_cotangents),
-            Self::LinearScanTranspose(op) => op.transpose(output_cotangents),
             Self::Condition(condition) => condition.transpose(output_cotangents),
             Self::While(while_operation) => while_operation.transpose(output_cotangents),
             Self::Custom(op) => op.transpose(output_cotangents),
@@ -734,7 +617,6 @@ impl<
         + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue
         + ControlFlowValue
         + Differentiable<ArrayType>
         + 'static,
@@ -768,11 +650,7 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
-            Self::SliceLeadingAxis(op) => op.interpret(inputs),
-            Self::ScatterLeadingAxisSlice(op) => op.interpret(inputs),
-            Self::StackLeadingAxis(op) => op.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Scan(scan) => scan.interpret_linearized_jit(inputs),
             Self::Condition(_) | Self::While(_) => {
                 Err(crate::tracing_v2::operations::ControlFlowError::MissingTransformRule {
                     transform: "linearized JIT replay",
@@ -796,7 +674,6 @@ impl<
         + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue
         + ControlFlowValue
         + Differentiable<ArrayType>
         + 'static,
@@ -815,7 +692,7 @@ where
         >,
     V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    EngineTangent<E>: MatrixTangentSpace<V> + ReshapeTangentSpace<V> + ScanValue,
+    EngineTangent<E>: MatrixTangentSpace<V> + ReshapeTangentSpace<V>,
 {
     fn jvp(
         &self,
@@ -836,13 +713,7 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, inputs)
             }
-            Self::SliceLeadingAxis(op) => op.jvp(engine, inputs),
-            Self::ScatterLeadingAxisSlice(_) => {
-                Err(ScanError::MissingTransformRule { transform: "scatter jvp" }.into())
-            }
-            Self::StackLeadingAxis(op) => op.jvp(engine, inputs),
             Self::Rematerialize(remat) => remat.as_ref().jvp(engine, inputs),
-            Self::Scan(scan) => scan.as_ref().jvp(engine, inputs),
             Self::Condition(condition) => condition.as_ref().jvp(engine, inputs),
             Self::While(while_operation) => while_operation.as_ref().jvp(engine, inputs),
             Self::Custom(op) => op.jvp(engine, inputs),
