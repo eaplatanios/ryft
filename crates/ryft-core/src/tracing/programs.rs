@@ -210,10 +210,12 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
+        /// Marks the [`Atom`] that corresponds to the provided `atom_id`, its producing [`Instruction`], and all
+        /// transitive input [`Atom`]s as _live_ in the provided `atom_is_live` and `instruction_is_live` arrays.
         fn mark_atom_as_live<
-            O: Clone + Operation<T>,
             T: Type,
             V: Traceable<T>,
+            O: Clone + Operation<T>,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
         >(
@@ -236,44 +238,48 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             }
         }
 
+        /// Adds the [`Atom`] that corresponds to the provided `atom_id` to the provided `builder`, along with its
+        /// transitive producers, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`.
         fn remap_atom<
-            O: Clone + Operation<T>,
             T: Type,
             V: Traceable<T>,
+            O: Clone + Operation<T>,
             Input: Parameterized<V>,
             Output: Parameterized<V>,
         >(
+            program_builder: &mut ProgramBuilder<T, V, O>,
+            atom_id_mapping: &mut HashMap<AtomId, AtomId>,
             atom_id: AtomId,
             program: &Program<T, V, O, Input, Output>,
-            builder: &mut ProgramBuilder<T, V, O>,
-            atom_mapping: &mut HashMap<AtomId, AtomId>,
-            instruction_is_live: &[bool],
             parent_instructions: &[Option<usize>],
         ) -> Result<AtomId, TracingError> {
-            if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
+            if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
                 return Ok(*mapped_atom);
             }
 
             let atom = program.atoms.get(atom_id.index).ok_or(TracingError::UnboundAtomId { id: atom_id })?;
             let mapped_atom = match atom {
-                Atom::Constant(value) => builder.add_constant(value.clone()),
+                Atom::Constant(value) => program_builder.add_constant(value.clone()),
                 Atom::Variable(_) => {
                     let instruction_index = parent_instructions[atom_id.index]
-                        .ok_or(TracingError::MalformedProgram("variable atom had no owning instruction".to_string()))?;
-                    assert!(
-                        instruction_is_live[instruction_index],
-                        "attempted to remap a dead variable atom during structural program cleanup"
-                    );
+                        .ok_or(TracingError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
                     let instruction = &program.instructions[instruction_index];
                     let remapped_inputs = instruction
                         .inputs
                         .iter()
                         .copied()
                         .map(|input| {
-                            remap_atom(input, program, builder, atom_mapping, instruction_is_live, parent_instructions)
+                            remap_atom(
+                                program_builder,
+                                atom_id_mapping,
+                                input,
+                                program,
+                                parent_instructions,
+                            )
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let remapped_outputs = builder.add_instruction(instruction.operation.clone(), remapped_inputs)?;
+                    let remapped_outputs =
+                        program_builder.add_instruction(instruction.operation.clone(), remapped_inputs)?;
                     if remapped_outputs.len() != instruction.outputs.len() {
                         return Err(TracingError::InvalidOutputCount {
                             expected: instruction.outputs.len(),
@@ -283,12 +289,14 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                     for (old_output, new_output) in
                         instruction.outputs.iter().copied().zip(remapped_outputs.iter().copied())
                     {
-                        atom_mapping.insert(old_output, new_output);
+                        atom_id_mapping.insert(old_output, new_output);
                     }
-                    *atom_mapping.get(&atom_id).expect("remapped instruction outputs should populate the atom mapping")
+                    *atom_id_mapping
+                        .get(&atom_id)
+                        .expect("remapped instruction outputs should populate the atom mapping")
                 }
             };
-            atom_mapping.entry(atom_id).or_insert(mapped_atom);
+            atom_id_mapping.entry(atom_id).or_insert(mapped_atom);
             Ok(mapped_atom)
         }
 
@@ -311,15 +319,15 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             );
         }
 
-        let mut builder = ProgramBuilder::<T, V, O>::new();
-        let mut atom_mapping = HashMap::new();
+        let mut program_builder = ProgramBuilder::<T, V, O>::new();
+        let mut atom_id_mapping = HashMap::new();
         for input_atom in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_atom.index).ok_or(TracingError::UnboundAtomId { id: input_atom })?;
             let Atom::Variable(r#type) = input else {
                 return Err(TracingError::MalformedProgram("program input atom was not a variable".to_string()));
             };
-            let mapped = builder.add_input(r#type.clone());
-            atom_mapping.insert(input_atom, mapped);
+            let mapped = program_builder.add_input(r#type.clone());
+            atom_id_mapping.insert(input_atom, mapped);
         }
 
         let outputs = self
@@ -328,17 +336,16 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             .copied()
             .map(|output| {
                 remap_atom(
+                    &mut program_builder,
+                    &mut atom_id_mapping,
                     output,
                     self,
-                    &mut builder,
-                    &mut atom_mapping,
-                    live_instructions.as_slice(),
                     instruction_by_output.as_slice(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(builder.build::<Input, Output>(outputs, self.input_structure.clone(), self.output_structure.clone()))
+        Ok(program_builder.build::<Input, Output>(outputs, self.input_structure.clone(), self.output_structure.clone()))
     }
 }
 
