@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
-use crate::parameters::{Parameter, ParameterError, Parameterized};
+use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::tracing::TracingError;
 use crate::types::{Type, TypeError, Typed};
 
@@ -27,7 +27,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Parameter)]
 pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant value that appears in a [`Program`].
     Constant(V),
@@ -177,19 +177,40 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         self.input_ids.iter().map(|input_id| &self.atoms[input_id.index])
     }
 
+    /// Returns the structured `Input` of this [`Program`] parameterized by the corresponding [`Atom`]s.
+    #[inline]
+    pub fn input(&self) -> Result<Input::To<Atom<T, V>>, ParameterError>
+    where
+        Input::ParameterStructure: Clone,
+        Input::Family: ParameterizedFamily<Atom<T, V>>,
+    {
+        Input::To::<Atom<T, V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
+    }
+
     /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
     #[inline]
     pub fn outputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
         self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
     }
 
-    /// Eliminates dead constants and instructions that do not contribute to the program outputs.
+    /// Returns the structured `Output` of this [`Program`] parameterized by the corresponding [`Atom`]s.
+    #[inline]
+    pub fn output(&self) -> Result<Output::To<Atom<T, V>>, ParameterError>
+    where
+        Output::ParameterStructure: Clone,
+        Output::Family: ParameterizedFamily<Atom<T, V>>,
+    {
+        Output::To::<Atom<T, V>>::from_parameters(self.output_structure.clone(), self.outputs().cloned())
+    }
+
+    /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
+    /// to the [`Program`]'s output removed.
     pub fn simplified(&self) -> Result<Self, TracingError>
     where
         Input::ParameterStructure: Clone,
         Output::ParameterStructure: Clone,
     {
-        fn mark_live<
+        fn mark_atom_as_live<
             O: Clone + Operation<T>,
             T: Type,
             V: Traceable<T>,
@@ -198,22 +219,19 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         >(
             program: &Program<T, V, O, Input, Output>,
             atom_id: AtomId,
-            live_atoms: &mut [bool],
-            live_instructions: &mut [bool],
-            instruction_by_output: &[Option<usize>],
+            atom_is_live: &mut [bool],
+            instruction_is_live: &mut [bool],
+            parent_instructions: &[Option<usize>],
         ) {
-            if live_atoms[atom_id.index] {
-                return;
-            }
-            live_atoms[atom_id.index] = true;
-            if let Some(instruction_index) = instruction_by_output[atom_id.index] {
-                if live_instructions[instruction_index] {
-                    return;
-                }
-                live_instructions[instruction_index] = true;
-                let instruction = &program.instructions[instruction_index];
-                for input in instruction.inputs.iter().copied() {
-                    mark_live(program, input, live_atoms, live_instructions, instruction_by_output);
+            if !atom_is_live[atom_id.index] {
+                atom_is_live[atom_id.index] = true;
+                if let Some(instruction_index) = parent_instructions[atom_id.index] {
+                    if !instruction_is_live[instruction_index] {
+                        instruction_is_live[instruction_index] = true;
+                        for input in program.instructions[instruction_index].inputs.iter().copied() {
+                            mark_atom_as_live(program, input, atom_is_live, instruction_is_live, parent_instructions);
+                        }
+                    }
                 }
             }
         }
@@ -229,8 +247,8 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             program: &Program<T, V, O, Input, Output>,
             builder: &mut ProgramBuilder<T, V, O>,
             atom_mapping: &mut HashMap<AtomId, AtomId>,
-            live_instructions: &[bool],
-            instruction_by_output: &[Option<usize>],
+            instruction_is_live: &[bool],
+            parent_instructions: &[Option<usize>],
         ) -> Result<AtomId, TracingError> {
             if let Some(mapped_atom) = atom_mapping.get(&atom_id) {
                 return Ok(*mapped_atom);
@@ -240,10 +258,10 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
             let mapped_atom = match atom {
                 Atom::Constant(value) => builder.add_constant(value.clone()),
                 Atom::Variable(_) => {
-                    let instruction_index = instruction_by_output[atom_id.index]
+                    let instruction_index = parent_instructions[atom_id.index]
                         .ok_or(TracingError::MalformedProgram("variable atom had no owning instruction".to_string()))?;
                     assert!(
-                        live_instructions[instruction_index],
+                        instruction_is_live[instruction_index],
                         "attempted to remap a dead variable atom during structural program cleanup"
                     );
                     let instruction = &program.instructions[instruction_index];
@@ -252,7 +270,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
                         .iter()
                         .copied()
                         .map(|input| {
-                            remap_atom(input, program, builder, atom_mapping, live_instructions, instruction_by_output)
+                            remap_atom(input, program, builder, atom_mapping, instruction_is_live, parent_instructions)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let remapped_outputs = builder.add_instruction(instruction.operation.clone(), remapped_inputs)?;
@@ -284,7 +302,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
         let mut live_atoms = vec![false; self.atoms.len()];
         let mut live_instructions = vec![false; self.instructions.len()];
         for output in self.output_ids.iter().copied() {
-            mark_live(
+            mark_atom_as_live(
                 self,
                 output,
                 live_atoms.as_mut_slice(),
@@ -705,6 +723,27 @@ mod tests {
         let program = builder.build::<f64, (f64, f64)>(vec![doubled, doubled], Placeholder, (Placeholder, Placeholder));
 
         assert_eq!(program.interpret(2.0f64).unwrap(), (4.0f64, 4.0f64));
+    }
+
+    #[test]
+    fn program_reconstructs_structured_input_and_output_atoms() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        let x = builder.add_input(1.0f64.r#type().into_owned());
+        let y = builder.add_input(2.0f64.r#type().into_owned());
+        let sum = builder.add_instruction(PrimitiveOperation::Add, vec![x, y]).unwrap()[0];
+        let program = builder.build::<(f64, f64), (f64, f64)>(
+            vec![x, sum],
+            (Placeholder, Placeholder),
+            (Placeholder, Placeholder),
+        );
+
+        let input = program.input().unwrap();
+        assert!(matches!(input.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(input.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+
+        let output = program.output().unwrap();
+        assert!(matches!(output.0, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
+        assert!(matches!(output.1, Atom::Variable(r#type) if r#type == ArrayType::scalar(DataType::F64)));
     }
 
     #[test]
