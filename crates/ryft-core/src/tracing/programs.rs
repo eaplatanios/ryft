@@ -26,7 +26,7 @@ pub trait Value<T: Type>: Traceable<T> {}
 /// does not imply any other requirements for the underlying values.
 pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {}
 
-/// [`Atom`]s form nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
+/// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug)]
 pub enum Atom<T: Type, V: Typed<T>> {
     /// Literal constant value that appears in a [`Program`].
@@ -37,19 +37,19 @@ pub enum Atom<T: Type, V: Typed<T>> {
 }
 
 impl<T: Type, V: Typed<T>> Atom<T, V> {
-    /// Returns `true` if this [`Atom`] is a [`Atom::Constant`].
+    /// Returns `true` if this [`Atom`] is an [`Atom::Constant`].
     #[inline]
     pub fn is_constant(&self) -> bool {
         matches!(self, Self::Constant(_))
     }
 
-    /// Returns `true` if this [`Atom`] is a [`Atom::Variable`].
+    /// Returns `true` if this [`Atom`] is an [`Atom::Variable`].
     #[inline]
     pub fn is_variable(&self) -> bool {
         matches!(self, Self::Variable(_))
     }
 
-    /// Returns the underlying constant value if this atom is a [`Atom::Constant`] and [`None`] otherwise.
+    /// Returns the underlying constant value if this atom is an [`Atom::Constant`] and [`None`] otherwise.
     #[inline]
     pub fn as_constant(&self) -> Option<&V> {
         match self {
@@ -68,13 +68,12 @@ impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
     }
 }
 
-/// Identifier for an atom within a staged program.
-///
-/// Atom identifiers are stable indexes into a program's atom table. Instructions refer to their
-/// inputs and outputs by these ids, which keeps the staged IR compact and easy to clone.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Parameter)]
+/// Unique identifier for an [`Atom`] within a [`Program`]. [`AtomId`]s are stable indexes into a [`Program`]'s atom
+/// table. [`Instruction`]s refer to their inputs and outputs by these IDs, which keeps the intermediate representation
+/// compact and easy to clone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
 pub struct AtomId {
-    /// Zero-based index of this atom inside the owning [`Program`]'s atom table.
+    /// Zero-based index of the corresponding [`Atom`] inside the owning [`Program`]'s atom table.
     pub index: usize,
 }
 
@@ -84,33 +83,20 @@ impl Display for AtomId {
     }
 }
 
-/// Shape-level operation interface for staged programs.
-///
-/// This trait covers the metadata surface needed for program construction, display, structural
-/// cleanup, and backend lowering. Concrete execution is provided by the separate
-/// [`InterpretableOperation`] trait. Staged-program differentiation rules are split between
-/// [`crate::tracing_v2::LinearOperation`] (transpose/replay) and
-/// [`crate::tracing_v2::DifferentiableOperation`] (forward-mode JVP).
-///
-/// The type parameter `T` determines which abstract type descriptor is used for shape-level
-/// reasoning. Core tracing code usually instantiates it with [`ArrayType`](crate::types::ArrayType),
-/// while future instantiations with different type descriptors can reuse the same trait without
-/// modifying existing implementations.
+/// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as [`Instruction`]s in
+/// [`Program`]s. This trait represents the high-level operation interface that only requires operations to be able to
+/// provide their name and to infer their output [`Type`]s given their input [`Type`]s.
 pub trait Operation<T: Type>: Debug + Display {
-    /// Returns the stable primitive name used in diagnostics and pretty-printing.
+    /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
-    /// Computes output types from input types without executing the operation.
+    /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s without executing it.
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>;
 }
 
-/// Concrete execution capability for staged operations.
-///
-/// Separated from [`Operation`] so that program construction, display, and structural cleanup can work
-/// without value-type bounds. Only code paths that actually execute operations, such as program
-/// replay and JIT example propagation, require this trait.
+/// [`InterpretableOperation`]s are [`Operation`]s that can be interpreted (i.e., executed) given concrete input values.
 pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
-    /// Executes the operation on concrete values.
+    /// Interprets this [`Operation`] given the provided input values and returns the resulting output values.
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 

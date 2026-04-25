@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn jvp_tracer_exposes_generic_type_metadata_for_non_array_types() {
-        #[derive(Clone, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug, PartialEq, Eq)]
         struct TestType(&'static str);
 
         impl Type for TestType {
@@ -401,7 +401,7 @@ mod tests {
             }
         }
 
-        #[derive(Clone, Debug, Eq, Parameter, PartialEq)]
+        #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
         struct TestValue {
             r#type: TestType,
             value: i32,

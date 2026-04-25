@@ -27,7 +27,7 @@ use crate::{
 /// arise only after the tracing scope has already recorded an error and can no longer stage new
 /// instructions safely. They still retain the inferred abstract output type so later type queries
 /// and best-effort short-circuiting can continue without manufacturing a dummy atom.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TracerState<T: Type> {
     /// Normal traced leaf backed by a concrete atom in the staged program.
     Live(AtomId, T),
@@ -680,7 +680,7 @@ mod tests {
 
         use Type;
 
-        #[derive(Clone, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug, PartialEq, Eq)]
         struct TestType(&'static str);
 
         impl Type for TestType {
@@ -697,7 +697,7 @@ mod tests {
             }
         }
 
-        #[derive(Clone, Debug, Eq, Parameter, PartialEq)]
+        #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
         struct TestValue {
             r#type: TestType,
             value: i32,

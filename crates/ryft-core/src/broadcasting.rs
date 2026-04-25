@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Represents broadcasting-related errors.
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BroadcastingError {
     #[error("cannot broadcast an empty collection of types")]
     EmptyBroadcastingInput,
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_parameterized_array_type_broadcastable() {
-        #[derive(Parameterized, Clone, Debug, Eq, PartialEq)]
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
         #[ryft(crate = "crate::parameters")]
         enum TestEnum<P: Parameter> {
             Wrapped { inner: P },

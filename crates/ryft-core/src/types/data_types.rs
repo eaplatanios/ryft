@@ -8,7 +8,7 @@ use crate::parameters::Parameter;
 use crate::types::Type;
 
 /// Represents [`DataType`]-related errors.
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DataTypeError {
     #[error("{message}")]
     InvalidDataType { message: String, backtrace: String },
@@ -1054,7 +1054,7 @@ impl DataType {
 
 /// Node in the [`DataType`] promotion lattice. Refer to the documentation of [`DataType`] for more information
 /// on `ryft`'s type promotion semantics.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum DataTypePromotionNode {
     /// Represents a concrete [`DataType`] node in the promotion lattice.
     DataType(DataType),

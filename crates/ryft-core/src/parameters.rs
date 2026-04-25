@@ -9,7 +9,7 @@ use paste::paste;
 use thiserror::Error;
 
 /// Represents [`Parameter`]-related errors.
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ParameterError {
     #[error(
         "{}",

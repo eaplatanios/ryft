@@ -340,7 +340,7 @@ impl<'c> XlaEngine<'c> {
 // ---------------------------------------------------------------------------
 
 /// Kind of constant value materialized by [`XlaEngine::constant`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(test)]
 enum ConstantKind {
     /// Additive identity.

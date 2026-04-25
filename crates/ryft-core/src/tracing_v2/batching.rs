@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Errors emitted by explicit batching and `vmap` helpers.
-#[derive(Clone, Debug, Error, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum BatchingError {
     /// No mapped array leaves were provided and no explicit axis size is available.
     #[error("encountered an empty batch")]

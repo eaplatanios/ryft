@@ -15,7 +15,7 @@ use crate::types::{DataType, Layout, Type, TypeError};
 ///
 /// Note that the [`Display`] implementation of [`Size`] renders static sizes as just a number, dynamic sizes
 /// with an upper bound as `<` followed by the upper bound, and dynamic sizes with no upper bound as `*`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Parameter)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum Size {
     /// Static size that is known at compilation time.
     Static(usize),
@@ -69,7 +69,7 @@ impl From<usize> for Size {
 ///
 /// Note that the [`Display`] implementation of [`Shape`] renders shapes as the rendered dimension sizes
 /// in a comma-separated list surrounded by square brackets.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Parameter)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Shape {
     /// [`Size`]s of the array dimensions ordered from outermost to innermost.
     pub dimensions: Vec<Size>,
@@ -174,7 +174,7 @@ impl Display for Shape {
 ///   "c64[*, 42]",
 /// );
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Parameter)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ArrayType {
     /// [`DataType`] of the elements stored in the array.
     pub data_type: DataType,

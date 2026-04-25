@@ -3,14 +3,14 @@ use std::fmt::Display;
 use thiserror::Error;
 
 /// Represents [`Layout`]-related errors.
-#[derive(Error, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LayoutError {
     #[error("invalid layout: {message}")]
     InvalidLayout { message: String },
 }
 
 /// Describes one dimension of a [`Tile`].
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TileDimension {
     /// Tile dimension with a fixed size (i.e., number of elements).
     Sized(usize),
@@ -55,7 +55,7 @@ impl Display for TileDimension {
 
 /// Tile used in a [`TiledLayout`]. Ryft tiled layouts match XLA tiled layouts. Refer to the
 /// [official XLA documentation](https://openxla.org/xla/tiled_layout) for more information.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tile {
     /// Dimensions of this [`ryft_pjrt::Tile`], ordered from the most major dimension to the most minor dimension.
     /// The dimensions of a tile correspond to a suffix of the dimensions of the tiled array.
@@ -91,7 +91,7 @@ impl From<Vec<TileDimension>> for Tile {
 
 /// Tiling-based [`Layout`]. Ryft tiled layouts match XLA tiled layouts. Refer to the
 /// [official XLA documentation](https://openxla.org/xla/tiled_layout) for more information.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TiledLayout {
     /// Sequence of logical dimension indices ordered from the most minor physical dimension (i.e., the one with the
     /// fastest varying index) to the most major physical dimension (i.e., the one with the slowest varying index).
@@ -143,7 +143,7 @@ impl Display for TiledLayout {
 /// Strided [`Layout`]. The storage offset of the element at logical index `(i, j, k)` in a 3-dimensional array,
 /// for example, is computed as follows when using this layout: `i * strides[0] + j * strides[1] + k * strides[2]`.
 /// This offset is relative to the storage location pointed to by the underlying array data.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StridedLayout {
     /// Sequence of dimension strides (i.e., number of bytes to traverse per dimension). This sequence must have the
     /// same length as the rank of the corresponding array value. Strides are allowed to be negative, in which case the
@@ -179,7 +179,7 @@ impl Display for StridedLayout {
 
 /// Memory/storage layout of a (potentially) multi-dimensional array that determines the mapping from logical indices
 /// to physical offsets in the underlying memory/storage.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layout {
     /// Tiling-based [`Layout`]. Refer to [`TiledLayout`] for more information.
     Tiled(TiledLayout),
