@@ -148,9 +148,9 @@ pub struct Program<
 }
 
 impl<
-    O: Clone + Operation<T>,
     T: Type,
     V: Traceable<T>,
+    O: Clone + Operation<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > Clone for Program<T, V, O, Input, Output>
@@ -168,16 +168,16 @@ impl<
     }
 }
 
-impl<O: Clone + Operation<T>, T: Type, V: Traceable<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<T, V, O, Input, Output>
 {
-    /// Returns the program input atoms in parameter order.
+    /// Returns the [`Atom`]s that correspond to the inputs of this [`Program`].
     #[inline]
     pub fn inputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
         self.input_ids.iter().map(|input_id| &self.atoms[input_id.index])
     }
 
-    /// Returns the program output atoms in parameter order.
+    /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
     #[inline]
     pub fn outputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
         self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
