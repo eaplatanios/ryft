@@ -17,7 +17,7 @@ use crate::{
             AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
             NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
             constants::{OneLike, ZeroLike},
-            control_flow::{ConditionOperation, ControlFlowValue, WhileOperation},
+            control_flow::{ConditionOperation, ControlFlowValue, LinearConditionOperation, WhileOperation},
             left_matmul::left_matmul_abstract_eval,
             right_matmul::right_matmul_abstract_eval,
         },
@@ -311,6 +311,13 @@ impl<V: Traceable<ArrayType>> LinearRematerializeCarrierOperation<ArrayType, V> 
         op: crate::tracing_v2::operations::LinearRematerializeOperation<ArrayType, V, Self>,
     ) -> Self {
         LinearPrimitiveOperation::Rematerialize(Box::new(op))
+    }
+}
+
+impl<V: Traceable<ArrayType>> LinearConditionOperation<V> for LinearPrimitiveOperation<V> {
+    #[inline]
+    fn linear_condition_op(op: ConditionOperation<V, Self>) -> Self {
+        LinearPrimitiveOperation::Condition(Box::new(op))
     }
 }
 

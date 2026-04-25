@@ -65,8 +65,8 @@ pub mod sin;
 
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
 pub use control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
-    flat_program_input_types, flat_program_output_types,
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, LinearConditionOperation,
+    WhileOperation, flat_program_input_types, flat_program_output_types,
 };
 pub use cos::{Cos, CosOperation, CosTracingOperation};
 pub use custom::{

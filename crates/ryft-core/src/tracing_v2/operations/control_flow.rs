@@ -17,6 +17,17 @@ use crate::{
 
 use super::{DifferentiableOperation, LinearOperation};
 
+/// Hidden staging trait for the `condition` higher-order primitive in linear programs.
+///
+/// Linear transpose rules sometimes need to rebuild a nested condition after swapping each branch
+/// for its transpose branch. Backend-owned linear carriers implement this trait so the rule can
+/// stage that rebuilt condition without depending on [`LinearPrimitiveOperation`].
+#[doc(hidden)]
+pub trait LinearConditionOperation<V: Traceable<ArrayType>>: Clone + Operation<ArrayType> {
+    /// Constructs the carrier-specific representation of a linear `condition` primitive.
+    fn linear_condition_op(op: ConditionOperation<V, Self>) -> Self;
+}
+
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O> = Program<ArrayType, V, O, Vec<V>, Vec<V>>;
 
@@ -445,14 +456,15 @@ where
     }
 }
 
-impl<V> LinearOperation<ArrayType, V> for ConditionOperation<V, LinearPrimitiveOperation<V>>
+impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O>
 where
     V: Traceable<ArrayType>,
+    O: LinearConditionOperation<V>,
 {
     fn transpose(
         &self,
-        output_cotangents: &[LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>>>, TracingError> {
+        output_cotangents: &[LinearTerm<ArrayType, V, O>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, O>>>, TracingError> {
         if matches!(self.predicate, ConditionPredicate::RuntimeInput(_)) {
             return Err(
                 ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }.into()
@@ -484,14 +496,14 @@ where
         let cotangents = LinearTerm::apply_staged_op(
             first_cotangent.builder.clone(),
             output_cotangents,
-            LinearPrimitiveOperation::Condition(Box::new(transposed_condition)),
+            O::linear_condition_op(transposed_condition),
             input_count,
         )?;
         Ok(cotangents.into_iter().map(Some).collect())
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for ConditionOperation<V, PrimitiveOperation<V>>
+impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O>
 where
     V: ControlFlowValue
         + ZeroLike
@@ -503,8 +515,8 @@ where
                 <E as DifferentiableEngine>::LinearOperation,
             >,
         >,
-    E: DifferentiableEngine<Type = ArrayType, Value = V, DifferentiableOperation = PrimitiveOperation<V>> + ?Sized,
-    PrimitiveOperation<V>: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as DifferentiableEngine>::LinearOperation: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
 {
@@ -632,19 +644,20 @@ where
     }
 }
 
-impl<V> LinearOperation<ArrayType, V> for WhileOperation<V, LinearPrimitiveOperation<V>>
+impl<V, O> LinearOperation<ArrayType, V, O> for WhileOperation<V, O>
 where
     V: Traceable<ArrayType>,
+    O: Clone + Operation<ArrayType>,
 {
     fn transpose(
         &self,
-        _output_cotangents: &[LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>>>, TracingError> {
+        _output_cotangents: &[LinearTerm<ArrayType, V, O>],
+    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, O>>>, TracingError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
     }
 }
 
-impl<V, E> DifferentiableOperation<E> for WhileOperation<V, PrimitiveOperation<V>>
+impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O>
 where
     V: ControlFlowValue
         + ZeroLike
@@ -656,8 +669,8 @@ where
                 <E as DifferentiableEngine>::LinearOperation,
             >,
         >,
-    E: DifferentiableEngine<Type = ArrayType, Value = V, DifferentiableOperation = PrimitiveOperation<V>> + ?Sized,
-    PrimitiveOperation<V>: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as DifferentiableEngine>::LinearOperation: Operation<ArrayType>,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
 {
@@ -711,8 +724,11 @@ mod tests {
 
     use crate::{
         parameters::{Parameter, Placeholder},
-        tracing::{ProgramBuilder, Traceable},
-        tracing_v2::engines::ArrayScalarEngine,
+        tracing::{ProgramBuilder, Traceable, Value},
+        tracing_v2::{
+            engines::{ArrayScalarEngine, Engine},
+            operations::{LinearAddOperation, LinearNegOperation, LinearScaleOperation},
+        },
         types::DataType,
     };
 
@@ -743,6 +759,17 @@ mod tests {
     }
 
     impl Traceable<ArrayType> for TestValue {}
+
+    impl Value<ArrayType> for TestValue {}
+
+    impl ZeroLike for TestValue {
+        fn zero_like(&self) -> Self {
+            match self {
+                Self::Bool(_) => Self::Bool(false),
+                Self::Number(_) => Self::Number(0.0),
+            }
+        }
+    }
 
     impl ControlFlowValue for TestValue {
         fn control_flow_predicate(&self) -> Result<bool, TracingError> {
@@ -825,6 +852,246 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    enum TestLinearOperation {
+        Add,
+        Neg,
+        Scale { factor: TestValue },
+        Condition(Box<ConditionOperation<TestValue, TestLinearOperation>>),
+    }
+
+    impl Display for TestLinearOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.name())
+        }
+    }
+
+    impl Operation<ArrayType> for TestLinearOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Add => "linear_add",
+                Self::Neg => "linear_neg",
+                Self::Scale { .. } => "linear_scale",
+                Self::Condition(condition) => condition.name(),
+            }
+        }
+
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            match self {
+                Self::Add => {
+                    ensure_input_count(2, input_types.len(), self.name())?;
+                    ensure_types_match(self.name(), &input_types[..1], &input_types[1..])?;
+                    Ok(vec![input_types[0].clone()])
+                }
+                Self::Neg | Self::Scale { .. } => {
+                    ensure_input_count(1, input_types.len(), self.name())?;
+                    Ok(vec![input_types[0].clone()])
+                }
+                Self::Condition(condition) => condition.infer_output_types(input_types),
+            }
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            match self {
+                Self::Condition(condition) => condition.render(formatter, indentation),
+                _ => Display::fmt(self, formatter),
+            }
+        }
+    }
+
+    impl InterpretableOperation<ArrayType, TestValue> for TestLinearOperation {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+            match self {
+                Self::Add => match (&inputs[0], &inputs[1]) {
+                    (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
+                    _ => Err(TypeError { message: "linear add expected numeric inputs".to_string() }.into()),
+                },
+                Self::Neg => match &inputs[0] {
+                    TestValue::Number(value) => Ok(vec![TestValue::Number(-value)]),
+                    _ => Err(TypeError { message: "linear neg expected a numeric input".to_string() }.into()),
+                },
+                Self::Scale { factor } => match (factor, &inputs[0]) {
+                    (TestValue::Number(factor), TestValue::Number(value)) => {
+                        Ok(vec![TestValue::Number(factor * value)])
+                    }
+                    _ => Err(TypeError { message: "linear scale expected numeric inputs".to_string() }.into()),
+                },
+                Self::Condition(condition) => condition.interpret(inputs),
+            }
+        }
+    }
+
+    impl LinearOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
+        fn transpose(
+            &self,
+            output_cotangents: &[LinearTerm<ArrayType, TestValue, TestLinearOperation>],
+        ) -> Result<Vec<Option<LinearTerm<ArrayType, TestValue, TestLinearOperation>>>, TracingError> {
+            match self {
+                Self::Add => {
+                    ensure_input_count(1, output_cotangents.len(), self.name())?;
+                    Ok(vec![Some(output_cotangents[0].clone()), Some(output_cotangents[0].clone())])
+                }
+                Self::Neg => {
+                    ensure_input_count(1, output_cotangents.len(), self.name())?;
+                    let outputs = LinearTerm::apply_staged_op(
+                        output_cotangents[0].builder.clone(),
+                        output_cotangents,
+                        Self::Neg,
+                        1,
+                    )?;
+                    Ok(vec![Some(outputs[0].clone())])
+                }
+                Self::Scale { factor } => {
+                    ensure_input_count(1, output_cotangents.len(), self.name())?;
+                    let outputs = LinearTerm::apply_staged_op(
+                        output_cotangents[0].builder.clone(),
+                        output_cotangents,
+                        Self::Scale { factor: factor.clone() },
+                        1,
+                    )?;
+                    Ok(vec![Some(outputs[0].clone())])
+                }
+                Self::Condition(condition) => condition.transpose(output_cotangents),
+            }
+        }
+    }
+
+    impl LinearAddOperation<ArrayType, TestValue> for TestLinearOperation {
+        fn linear_add_op() -> Self {
+            Self::Add
+        }
+    }
+
+    impl LinearNegOperation<ArrayType, TestValue> for TestLinearOperation {
+        fn linear_neg_op() -> Self {
+            Self::Neg
+        }
+    }
+
+    impl LinearScaleOperation<ArrayType, TestValue> for TestLinearOperation {
+        fn linear_scale_op(factor: TestValue) -> Self {
+            Self::Scale { factor }
+        }
+    }
+
+    impl LinearConditionOperation<TestValue> for TestLinearOperation {
+        fn linear_condition_op(op: ConditionOperation<TestValue, Self>) -> Self {
+            Self::Condition(Box::new(op))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum TestDifferentiableOperation {
+        IsPositive,
+        SubtractOne,
+        Scale { factor: TestValue },
+    }
+
+    impl Display for TestDifferentiableOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.name())
+        }
+    }
+
+    impl Operation<ArrayType> for TestDifferentiableOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::IsPositive => "is_positive",
+                Self::SubtractOne => "subtract_one",
+                Self::Scale { .. } => "scale",
+            }
+        }
+
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            match self {
+                Self::IsPositive => {
+                    ensure_input_count(1, input_types.len(), self.name())?;
+                    Ok(vec![ArrayType::scalar(DataType::Boolean)])
+                }
+                Self::SubtractOne | Self::Scale { .. } => {
+                    ensure_input_count(1, input_types.len(), self.name())?;
+                    Ok(vec![input_types[0].clone()])
+                }
+            }
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            let _ = indentation;
+            Display::fmt(self, formatter)
+        }
+    }
+
+    impl InterpretableOperation<ArrayType, TestValue> for TestDifferentiableOperation {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+            match self {
+                Self::IsPositive => match &inputs[0] {
+                    TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
+                    _ => Err(TypeError { message: "is_positive expected a numeric input".to_string() }.into()),
+                },
+                Self::SubtractOne => match &inputs[0] {
+                    TestValue::Number(value) => Ok(vec![TestValue::Number(value - 1.0)]),
+                    _ => Err(TypeError { message: "subtract_one expected a numeric input".to_string() }.into()),
+                },
+                Self::Scale { factor } => match (factor, &inputs[0]) {
+                    (TestValue::Number(factor), TestValue::Number(value)) => {
+                        Ok(vec![TestValue::Number(factor * value)])
+                    }
+                    _ => Err(TypeError { message: "scale expected numeric inputs".to_string() }.into()),
+                },
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestEngine;
+
+    impl Engine for TestEngine {
+        type Type = ArrayType;
+        type Value = TestValue;
+        type TracingOperation = TestDifferentiableOperation;
+
+        fn zero(&self, r#type: &ArrayType) -> Result<TestValue, TracingError> {
+            if r#type.data_type == DataType::Boolean { Ok(TestValue::Bool(false)) } else { Ok(TestValue::Number(0.0)) }
+        }
+
+        fn one(&self, _type: &ArrayType) -> Result<TestValue, TracingError> {
+            Ok(TestValue::Number(1.0))
+        }
+    }
+
+    impl DifferentiableEngine for TestEngine {
+        type DifferentiableOperation = TestDifferentiableOperation;
+        type LinearOperation = TestLinearOperation;
+    }
+
+    impl DifferentiableOperation<TestEngine> for TestDifferentiableOperation {
+        fn jvp(
+            &self,
+            _engine: &TestEngine,
+            inputs: &[JvpTracer<TestValue, EngineTangent<TestEngine>>],
+        ) -> Result<Vec<JvpTracer<TestValue, EngineTangent<TestEngine>>>, TracingError> {
+            match self {
+                Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
+                Self::SubtractOne => {
+                    ensure_input_count(1, inputs.len(), self.name())?;
+                    let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
+                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: inputs[0].tangent.clone() }])
+                }
+                Self::Scale { factor } => {
+                    ensure_input_count(1, inputs.len(), self.name())?;
+                    let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
+                    let tangent_outputs = LinearTerm::apply_staged_op(
+                        inputs[0].tangent.builder.clone(),
+                        std::slice::from_ref(&inputs[0].tangent),
+                        TestLinearOperation::Scale { factor: factor.clone() },
+                        1,
+                    )?;
+                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0].clone() }])
+                }
+            }
+        }
+    }
+
     fn add_one_branch() -> FlatProgram<TestValue, TestOperation> {
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new(vec![Placeholder]);
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -859,6 +1126,42 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(PrimitiveOperation::Scale { factor }, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder]).unwrap()
+    }
+
+    fn custom_linear_identity_branch() -> FlatProgram<TestValue, TestLinearOperation> {
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder]);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.build(vec![input], vec![Placeholder]).unwrap()
+    }
+
+    fn custom_scale_branch(factor: f64) -> FlatProgram<TestValue, TestDifferentiableOperation> {
+        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new(vec![Placeholder]);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(TestDifferentiableOperation::Scale { factor: TestValue::Number(factor) }, vec![input])
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder]).unwrap()
+    }
+
+    fn custom_while_condition_branch() -> FlatProgram<TestValue, TestDifferentiableOperation> {
+        let mut builder =
+            ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new(vec![Placeholder, Placeholder]);
+        let counter = builder.add_input(ArrayType::scalar(DataType::F64));
+        let _value = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TestDifferentiableOperation::IsPositive, vec![counter]).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder]).unwrap()
+    }
+
+    fn custom_while_body_branch() -> FlatProgram<TestValue, TestDifferentiableOperation> {
+        let mut builder =
+            ProgramBuilder::<ArrayType, TestValue, TestDifferentiableOperation>::new(vec![Placeholder, Placeholder]);
+        let counter = builder.add_input(ArrayType::scalar(DataType::F64));
+        let value = builder.add_input(ArrayType::scalar(DataType::F64));
+        let next_counter = builder.add_instruction(TestDifferentiableOperation::SubtractOne, vec![counter]).unwrap()[0];
+        let next_value = builder
+            .add_instruction(TestDifferentiableOperation::Scale { factor: TestValue::Number(2.0) }, vec![value])
+            .unwrap()[0];
+        builder.build(vec![next_counter, next_value], vec![Placeholder, Placeholder]).unwrap()
     }
 
     #[test]
@@ -1030,6 +1333,60 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_condition_jvp_uses_custom_carriers() {
+        let condition =
+            ConditionOperation::with_captured_predicate(true, custom_scale_branch(2.0), custom_scale_branch(3.0))
+                .unwrap();
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder])));
+        let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let tangent = LinearTerm::from_staged_parts(tangent_input, builder.clone());
+        let outputs = condition.jvp(&TestEngine, &[JvpTracer { primal: TestValue::Number(4.0), tangent }]).unwrap();
+
+        assert_eq!(outputs[0].primal, TestValue::Number(8.0));
+        let tangent_output = outputs[0].tangent.atom;
+        drop(outputs);
+        let builder = Rc::try_unwrap(builder).unwrap().into_inner();
+        let tangent_program = builder.build(vec![tangent_output], vec![Placeholder]).unwrap();
+        assert_eq!(tangent_program.interpret(vec![TestValue::Number(10.0)]), Ok(vec![TestValue::Number(20.0)]));
+    }
+
+    #[test]
+    fn test_generic_while_jvp_propagates_tangents_through_iterations() {
+        let while_operation = WhileOperation::new(custom_while_condition_branch(), custom_while_body_branch()).unwrap();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![
+            Placeholder,
+            Placeholder,
+        ])));
+        let counter_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let value_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let counter_tangent = LinearTerm::from_staged_parts(counter_tangent_input, builder.clone());
+        let value_tangent = LinearTerm::from_staged_parts(value_tangent_input, builder.clone());
+        let outputs = while_operation
+            .jvp(
+                &TestEngine,
+                &[
+                    JvpTracer { primal: TestValue::Number(3.0), tangent: counter_tangent },
+                    JvpTracer { primal: TestValue::Number(5.0), tangent: value_tangent },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            outputs.iter().map(|output| output.primal.clone()).collect::<Vec<_>>(),
+            vec![TestValue::Number(0.0), TestValue::Number(40.0)],
+        );
+        let tangent_outputs = outputs.iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
+        drop(outputs);
+        let builder = Rc::try_unwrap(builder).unwrap().into_inner();
+        let tangent_program = builder.build(tangent_outputs, vec![Placeholder, Placeholder]).unwrap();
+        assert_eq!(
+            tangent_program.interpret(vec![TestValue::Number(0.0), TestValue::Number(1.0)]),
+            Ok(vec![TestValue::Number(0.0), TestValue::Number(8.0)]),
+        );
+    }
+
+    #[test]
     fn test_linear_condition_transpose_requires_explicit_transpose_branches() {
         let condition =
             ConditionOperation::with_captured_predicate(true, identity_linear_branch(), identity_linear_branch())
@@ -1039,5 +1396,27 @@ mod tests {
             condition.transpose(&[]),
             Err(TracingError::ControlFlow(ControlFlowError::MissingBranchTranspose { branch: "true" })),
         ));
+    }
+
+    #[test]
+    fn test_generic_linear_condition_transpose_uses_custom_carrier() {
+        let condition = ConditionOperation::with_transpose_branches(
+            ConditionPredicate::Captured(true),
+            custom_linear_identity_branch(),
+            custom_linear_identity_branch(),
+            custom_linear_identity_branch(),
+            custom_linear_identity_branch(),
+        )
+        .unwrap();
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder])));
+        let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let cotangent = LinearTerm::from_staged_parts(cotangent_input, builder.clone());
+        let outputs = condition.transpose(&[cotangent]).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_some());
+        let builder = builder.borrow();
+        assert!(matches!(builder.instructions[0].operation, TestLinearOperation::Condition(_)));
     }
 }
