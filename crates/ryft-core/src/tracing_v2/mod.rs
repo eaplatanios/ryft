@@ -43,6 +43,7 @@ pub use operations::scan::{
     scan_without_xs_with_options,
 };
 pub use operations::{
-    Cos, CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation,
-    LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin,
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos, CustomOperationError,
+    CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, FlatProgram, LinearCustomPrimitive,
+    LinearOperation, LinearPrimitiveOperation, PrimitiveOperation, Sin, WhileOperation,
 };

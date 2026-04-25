@@ -1917,6 +1917,7 @@ mod tests {
             Cos, DifferentiableEngine, Engine, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, jvp,
             linear::{jvp_program, transpose_linear_program, vjp},
             operations::{
+                ControlFlowError, ControlFlowValue,
                 constants::{OneLike, ZeroLike},
                 reshape::ReshapeOps,
             },
@@ -1967,6 +1968,12 @@ mod tests {
     impl Traceable<ArrayType> for TestArray {}
 
     impl Value<ArrayType> for TestArray {}
+
+    impl ControlFlowValue for TestArray {
+        fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+            Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
+        }
+    }
 
     impl Add for TestArray {
         type Output = Self;

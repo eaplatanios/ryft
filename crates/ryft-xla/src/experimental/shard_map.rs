@@ -21,7 +21,7 @@ use ryft_core::tracing::{
     Atom, AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
 };
 use ryft_core::tracing_v2::operations::{
-    AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
+    AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
     constants::{OneLike, ZeroLike},
     scan::ScanValue,
 };
@@ -324,6 +324,12 @@ impl ryft_core::types::Typed<ArrayType> for ShardMapTensor {
 impl Traceable<ArrayType> for ShardMapTensor {}
 
 impl Value<ArrayType> for ShardMapTensor {}
+
+impl ControlFlowValue for ShardMapTensor {
+    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
+    }
+}
 
 impl ScanValue for ShardMapTensor {
     fn scan_slice_leading_axis(&self, _index: usize) -> Result<Self, TracingError> {

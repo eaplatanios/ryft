@@ -17,6 +17,7 @@ use crate::{
             AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
             NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
             constants::{OneLike, ZeroLike},
+            control_flow::{ConditionOperation, ControlFlowValue, WhileOperation},
             left_matmul::left_matmul_abstract_eval,
             right_matmul::right_matmul_abstract_eval,
             scan::{
@@ -112,6 +113,12 @@ pub enum PrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
     /// Higher-order static scan loop carrying a compiled body.
     Scan(Box<ScanOperation<ArrayType, V, PrimitiveOperation<V>>>),
 
+    /// Higher-order conditional carrying true and false branch programs.
+    Condition(Box<ConditionOperation<V, PrimitiveOperation<V>>>),
+
+    /// Higher-order while loop carrying condition and body programs.
+    While(Box<WhileOperation<V, PrimitiveOperation<V>>>),
+
     /// Escape hatch for user- or crate-defined operations outside `ryft-core`.
     Custom(Arc<CustomPrimitive<ArrayType, V>>),
 }
@@ -163,6 +170,12 @@ pub enum LinearPrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
 
     /// Compact transpose of a linearized scan pushforward.
     LinearScanTranspose(Box<LinearizedScanTransposeOperation<V>>),
+
+    /// Higher-order conditional restricted to linear branch programs.
+    Condition(Box<ConditionOperation<V, LinearPrimitiveOperation<V>>>),
+
+    /// Higher-order while loop restricted to linear condition and body programs.
+    While(Box<WhileOperation<V, LinearPrimitiveOperation<V>>>),
 
     /// Escape hatch for user- or crate-defined linear custom operations.
     Custom(Arc<LinearCustomPrimitive<ArrayType, V>>),
@@ -407,6 +420,8 @@ impl<V: Traceable<ArrayType>> Debug for PrimitiveOperation<V> {
             Self::StackLeadingAxis(op) => Debug::fmt(op, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Scan(scan) => Debug::fmt(scan, formatter),
+            Self::Condition(condition) => Debug::fmt(condition, formatter),
+            Self::While(while_operation) => Debug::fmt(while_operation, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
         }
     }
@@ -439,6 +454,8 @@ impl<V: Traceable<ArrayType>> Debug for LinearPrimitiveOperation<V> {
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::LinearScanJvp(op) => Debug::fmt(op, formatter),
             Self::LinearScanTranspose(op) => Debug::fmt(op, formatter),
+            Self::Condition(condition) => Debug::fmt(condition, formatter),
+            Self::While(while_operation) => Debug::fmt(while_operation, formatter),
             Self::Custom(op) => Debug::fmt(op.as_ref(), formatter),
         }
     }
@@ -474,6 +491,8 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
             Self::StackLeadingAxis(op) => op.name(),
             Self::Rematerialize(remat) => remat.name(),
             Self::Scan(scan) => scan.name(),
+            Self::Condition(condition) => condition.name(),
+            Self::While(while_operation) => while_operation.name(),
             Self::Custom(op) => op.name(),
         }
     }
@@ -501,6 +520,8 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
             Self::StackLeadingAxis(op) => op.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Scan(scan) => scan.infer_output_types(input_types),
+            Self::Condition(condition) => condition.infer_output_types(input_types),
+            Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
@@ -524,6 +545,8 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
             Self::Rematerialize(remat) => remat.name(),
             Self::LinearScanJvp(op) => op.name(),
             Self::LinearScanTranspose(op) => op.name(),
+            Self::Condition(condition) => condition.name(),
+            Self::While(while_operation) => while_operation.name(),
             Self::Custom(op) => op.name(),
         }
     }
@@ -548,6 +571,8 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::LinearScanJvp(op) => op.infer_output_types(input_types),
             Self::LinearScanTranspose(op) => op.infer_output_types(input_types),
+            Self::Condition(condition) => condition.infer_output_types(input_types),
+            Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
@@ -570,7 +595,8 @@ impl<
         + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue,
+        + ScanValue
+        + ControlFlowValue,
 > InterpretableOperation<ArrayType, V> for PrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
@@ -595,6 +621,8 @@ where
             Self::StackLeadingAxis(op) => op.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Scan(scan) => scan.interpret(inputs),
+            Self::Condition(condition) => condition.interpret(inputs),
+            Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
         }
     }
@@ -608,7 +636,8 @@ impl<
         + ZeroLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue,
+        + ScanValue
+        + ControlFlowValue,
 > InterpretableOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
@@ -630,6 +659,8 @@ where
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::LinearScanJvp(op) => op.interpret(inputs),
             Self::LinearScanTranspose(op) => op.interpret(inputs),
+            Self::Condition(condition) => condition.interpret(inputs),
+            Self::While(while_operation) => while_operation.interpret(inputs),
             Self::Custom(op) => op.interpret(inputs),
         }
     }
@@ -644,7 +675,8 @@ impl<
         + OneLike
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ScanValue,
+        + ScanValue
+        + ControlFlowValue,
 > LinearOperation<ArrayType, V> for LinearPrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
@@ -669,6 +701,8 @@ where
             Self::Rematerialize(remat) => remat.transpose(output_cotangents),
             Self::LinearScanJvp(op) => op.transpose(output_cotangents),
             Self::LinearScanTranspose(op) => op.transpose(output_cotangents),
+            Self::Condition(condition) => condition.transpose(output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(output_cotangents),
             Self::Custom(op) => op.transpose(output_cotangents),
         }
     }
@@ -701,6 +735,7 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ScanValue
+        + ControlFlowValue
         + Differentiable<ArrayType>
         + 'static,
     E: DifferentiableEngine<
@@ -738,6 +773,12 @@ where
             Self::StackLeadingAxis(op) => op.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Scan(scan) => scan.interpret_linearized_jit(inputs),
+            Self::Condition(_) | Self::While(_) => {
+                Err(crate::tracing_v2::operations::ControlFlowError::MissingTransformRule {
+                    transform: "linearized JIT replay",
+                }
+                .into())
+            }
             Self::Custom(op) => op.interpret_linearized_jit(inputs),
         }
     }
@@ -756,6 +797,7 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ScanValue
+        + ControlFlowValue
         + Differentiable<ArrayType>
         + 'static,
     E: DifferentiableEngine<
@@ -801,6 +843,8 @@ where
             Self::StackLeadingAxis(op) => op.jvp(engine, inputs),
             Self::Rematerialize(remat) => remat.as_ref().jvp(engine, inputs),
             Self::Scan(scan) => scan.as_ref().jvp(engine, inputs),
+            Self::Condition(condition) => condition.as_ref().jvp(engine, inputs),
+            Self::While(while_operation) => while_operation.as_ref().jvp(engine, inputs),
             Self::Custom(op) => op.jvp(engine, inputs),
         }
     }

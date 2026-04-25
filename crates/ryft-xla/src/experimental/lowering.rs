@@ -18,6 +18,7 @@ use ryft_core::tracing_v2::{
         MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
         RightMatMulOperation, ScaleOperation, ScanOperation, ScatterLeadingAxisSliceOperation, SinOperation,
         SliceLeadingAxisOperation, StackLeadingAxisOperation,
+        control_flow::{ConditionOperation, ConditionPredicate, WhileOperation},
     },
 };
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
@@ -136,6 +137,24 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
         )
+    }
+
+    /// Lowers one nested condition operation inside this lowering context.
+    pub(crate) fn lower_condition<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
+        &mut self,
+        condition_op: &ConditionOperation<V, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
+    }
+
+    /// Lowers one nested while operation inside this lowering context.
+    pub(crate) fn lower_while<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
+        &mut self,
+        while_op: &WhileOperation<V, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested scan operation to a StableHLO while loop.
@@ -650,6 +669,8 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
             ),
             Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
             Self::Scan(scan) => lowerer.lower_scan(scan.as_ref(), input_values),
+            Self::Condition(condition) => lowerer.lower_condition(condition.as_ref(), input_values),
+            Self::While(while_operation) => lowerer.lower_while(while_operation.as_ref(), input_values),
             Self::ShardMap(shard_map_op) => {
                 let simplified_body = shard_map_op
                     .body()
@@ -712,6 +733,30 @@ impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V>
             lowerer.context,
             lowerer.location,
         )
+    }
+}
+
+impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V> for ConditionOperation<V, O> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lowerer.lower_condition(self, input_values)
+    }
+}
+
+impl<V: MlirLowerableValue, O: Clone + XlaOperation<V>> XlaOperation<V> for WhileOperation<V, O> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lowerer.lower_while(self, input_values)
     }
 }
 
@@ -828,6 +873,12 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<V
             ),
             PrimitiveOperation::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
             PrimitiveOperation::Scan(_) => Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() }),
+            PrimitiveOperation::Condition(condition) => {
+                condition.lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            PrimitiveOperation::While(while_operation) => {
+                while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
             PrimitiveOperation::Custom(_) => {
                 Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() })
             }
@@ -940,6 +991,12 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
             LinearPrimitiveOperation::LinearScanJvp(_) | LinearPrimitiveOperation::LinearScanTranspose(_) => {
                 Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() })
             }
+            LinearPrimitiveOperation::Condition(condition) => {
+                condition.lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            LinearPrimitiveOperation::While(while_operation) => {
+                while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
             LinearPrimitiveOperation::Custom(custom_op) => {
                 let mut shard_map_lowerer =
                     ShardMapMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
@@ -999,6 +1056,24 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
         )
+    }
+
+    /// Lowers one nested condition operation inside this lowering context.
+    pub(crate) fn lower_condition<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
+        &mut self,
+        condition_op: &ConditionOperation<V, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_condition_to_if(condition_op, input_values, &mut self.block, self.context, self.location)
+    }
+
+    /// Lowers one nested while operation inside this lowering context.
+    pub(crate) fn lower_while<V: MlirLowerableValue, O: Clone + XlaOperation<V>>(
+        &mut self,
+        while_op: &WhileOperation<V, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_while_to_while(while_op, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested scan operation inside this lowering context.
@@ -1409,6 +1484,14 @@ where
             XlaPrimitiveOperation::Scan(scan_op) => {
                 mesh = collect_nested_sharding_mesh(scan_op.body().program(), mesh)?;
             }
+            XlaPrimitiveOperation::Condition(condition_op) => {
+                mesh = collect_nested_sharding_mesh(condition_op.true_branch(), mesh)?;
+                mesh = collect_nested_sharding_mesh(condition_op.false_branch(), mesh)?;
+            }
+            XlaPrimitiveOperation::While(while_op) => {
+                mesh = collect_nested_sharding_mesh(while_op.condition(), mesh)?;
+                mesh = collect_nested_sharding_mesh(while_op.body(), mesh)?;
+            }
             XlaPrimitiveOperation::WithShardingConstraint(sharding_constraint_op) => {
                 mesh = Some(match mesh.take() {
                     Some(existing_mesh) => {
@@ -1696,6 +1779,163 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
     Ok((new_carry, updated_ys))
 }
 
+fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError>
+where
+    V: MlirLowerableValue,
+    O: Clone + XlaOperation<V>,
+{
+    let mut region = context.region();
+    let block = context.block_with_no_arguments();
+    {
+        let mut block_ref = block.as_ref();
+        let outputs = lower_nested_program_inline(program, input_values, &mut block_ref, context, location, false)?;
+        block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location));
+    }
+    region.append_block(block);
+    Ok(region)
+}
+
+fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V, O>(
+    condition_op: &ConditionOperation<V, O>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    V: MlirLowerableValue,
+    O: Clone + XlaOperation<V>,
+{
+    let operand_count = condition_op.input_types().len();
+    match condition_op.predicate() {
+        ConditionPredicate::Captured(predicate) => {
+            if input_values.len() != operand_count {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!("condition expected {operand_count} lowered inputs but got {}", input_values.len()),
+                });
+            }
+            let branch = if *predicate { condition_op.true_branch() } else { condition_op.false_branch() };
+            lower_nested_program_inline(branch, input_values, block, context, location, false)
+        }
+        ConditionPredicate::RuntimeInput(_) => {
+            let expected_input_count = operand_count + 1;
+            if input_values.len() != expected_input_count {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "condition expected {expected_input_count} lowered inputs but got {}",
+                        input_values.len(),
+                    ),
+                });
+            }
+            let branch_inputs = &input_values[1..];
+            let true_branch_region =
+                lower_control_flow_region(condition_op.true_branch(), branch_inputs, context, location)?;
+            let false_branch_region =
+                lower_control_flow_region(condition_op.false_branch(), branch_inputs, context, location)?;
+            let operation = block.append_operation(stable_hlo::r#if(
+                input_values[0],
+                true_branch_region.into(),
+                false_branch_region.into(),
+                location,
+            ));
+            Ok((0..condition_op.output_types().len())
+                .map(|index| {
+                    operation.result(index).expect("stablehlo.if should return one result per output").as_ref()
+                })
+                .collect())
+        }
+    }
+}
+
+fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O>(
+    while_op: &WhileOperation<V, O>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    V: MlirLowerableValue,
+    O: Clone + XlaOperation<V>,
+{
+    let state_types = while_op.state_types();
+    if input_values.len() != state_types.len() {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("while expected {} lowered inputs but got {}", state_types.len(), input_values.len()),
+        });
+    }
+    let lowered_state_types = state_types
+        .iter()
+        .map(|array_type| lower_tensor_type(array_type, context, location).map(|tensor_type| tensor_type.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let block_arguments = lowered_state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
+
+    let mut condition_region = context.region();
+    let condition_block = context.block(block_arguments.as_slice());
+    {
+        let mut condition_block_ref = condition_block.as_ref();
+        let condition_inputs = (0..state_types.len())
+            .map(|index| {
+                condition_block_ref.argument(index).expect("while condition should have state arguments").as_ref()
+            })
+            .collect::<Vec<_>>();
+        let condition_outputs = lower_nested_program_inline(
+            while_op.condition(),
+            condition_inputs.as_slice(),
+            &mut condition_block_ref,
+            context,
+            location,
+            false,
+        )?;
+        if condition_outputs.len() != 1 {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!("while condition lowered to {} outputs", condition_outputs.len()),
+            });
+        }
+        condition_block_ref.append_operation(stable_hlo::r#return(condition_outputs.as_slice(), location));
+    }
+    condition_region.append_block(condition_block);
+
+    let mut body_region = context.region();
+    let body_block = context.block(block_arguments.as_slice());
+    {
+        let mut body_block_ref = body_block.as_ref();
+        let body_inputs = (0..state_types.len())
+            .map(|index| body_block_ref.argument(index).expect("while body should have state arguments").as_ref())
+            .collect::<Vec<_>>();
+        let body_outputs = lower_nested_program_inline(
+            while_op.body(),
+            body_inputs.as_slice(),
+            &mut body_block_ref,
+            context,
+            location,
+            false,
+        )?;
+        if body_outputs.len() != state_types.len() {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!("while body lowered to {} outputs", body_outputs.len()),
+            });
+        }
+        body_block_ref.append_operation(stable_hlo::r#return(body_outputs.as_slice(), location));
+    }
+    body_region.append_block(body_block);
+
+    let operation = block.append_operation(stable_hlo::r#while(
+        input_values,
+        condition_region.into(),
+        body_region.into(),
+        location,
+    ));
+    Ok((0..state_types.len())
+        .map(|index| operation.result(index).expect("stablehlo.while should return one result per state leaf").as_ref())
+        .collect())
+}
+
 pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -1881,20 +2121,30 @@ pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     Ok(outputs)
 }
 
-/// Inlines a rematerialize body's sub-program into the given block by mapping the provided input
+/// Inlines a nested sub-program into the given block by mapping the provided input
 /// MLIR values to the body's input atoms, lowering constants and instructions in topological
-/// order, and returning optimization-barrier outputs corresponding to the body's output atoms.
-fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
+/// order, and returning lowered values corresponding to the program's output atoms.
+fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    add_optimization_barrier: bool,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
     O: Clone + XlaOperation<V>,
 {
+    if input_values.len() != program.input_ids.len() {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!(
+                "nested program expected {} lowered inputs but got {}",
+                program.input_ids.len(),
+                input_values.len()
+            ),
+        });
+    }
     let mut atom_values = vec![None; program.atoms.len()];
     for (atom_id, mlir_value) in program.input_ids.iter().copied().zip(input_values.iter().copied()) {
         atom_values[atom_id.index] = Some(mlir_value);
@@ -1954,7 +2204,7 @@ where
         .iter()
         .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
         .collect::<Result<Vec<_>, _>>()?;
-    if outputs.is_empty() {
+    if outputs.is_empty() || !add_optimization_barrier {
         return Ok(outputs);
     }
     let barrier = block.append_operation(stable_hlo::optimization_barrier(outputs.as_slice(), location));
@@ -1966,6 +2216,21 @@ where
                 .as_ref()
         })
         .collect::<Vec<_>>())
+}
+
+/// Inlines a rematerialize body's sub-program and places an optimization barrier on its boundary outputs.
+fn lower_rematerialize_inline<'b, 'c: 'b, 't: 'c, O, V>(
+    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
+where
+    V: MlirLowerableValue,
+    O: Clone + XlaOperation<V>,
+{
+    lower_nested_program_inline(program, input_values, block, context, location, true)
 }
 
 /// Lowers one plain traced program to values inside a block.
@@ -2453,6 +2718,8 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaPrimitiveOperation::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
         XlaPrimitiveOperation::Scan(scan_op) => lowerer.lower_scan(scan_op.as_ref(), input_values),
+        XlaPrimitiveOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
+        XlaPrimitiveOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
         XlaPrimitiveOperation::ShardMap(shard_map_op) => {
             let simplified_body = shard_map_op
                 .body()
@@ -2833,6 +3100,23 @@ mod tests {
         ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]), None, None).unwrap()
     }
 
+    fn xla_identity_branch(
+        input_type: ArrayType,
+    ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder]);
+        let input = builder.add_input(input_type);
+        builder.build(vec![input], vec![Placeholder]).unwrap()
+    }
+
+    fn xla_neg_branch(
+        input_type: ArrayType,
+    ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>> {
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder]);
+        let input = builder.add_input(input_type);
+        let output = builder.add_instruction(XlaPrimitiveOperation::Neg, vec![input]).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder]).unwrap()
+    }
+
     fn lower_traced_module(
         traced: &TracedShardMap<ArrayType, ArrayType>,
         function_name: &str,
@@ -3034,6 +3318,49 @@ mod tests {
         assert!(!stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
         assert!(!stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
         assert!(stablehlo.contains("tensor<0xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_condition_to_stablehlo_if() {
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let input_type = ArrayType::scalar(DataType::F32);
+        let condition = ConditionOperation::new(
+            predicate_type.clone(),
+            xla_neg_branch(input_type.clone()),
+            xla_identity_branch(input_type.clone()),
+        )
+        .unwrap();
+        let mut builder =
+            ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder, Placeholder]);
+        let predicate = builder.add_input(predicate_type);
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(XlaPrimitiveOperation::Condition(Box::new(condition)), vec![predicate, input])
+            .unwrap()[0];
+        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("\"stablehlo.if\""), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.negate"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_while_to_stablehlo_while() {
+        let state_type = ArrayType::scalar(DataType::Boolean);
+        let while_operation =
+            WhileOperation::new(xla_identity_branch(state_type.clone()), xla_identity_branch(state_type.clone()))
+                .unwrap();
+        let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new(vec![Placeholder]);
+        let state = builder.add_input(state_type);
+        let output = builder
+            .add_instruction(XlaPrimitiveOperation::While(Box::new(while_operation)), vec![state])
+            .unwrap()[0];
+        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
     }
 
     #[test]

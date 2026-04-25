@@ -827,6 +827,7 @@ mod tests {
             tracing_v2::{
                 Cos, MatrixOps, Sin,
                 operations::{
+                    ControlFlowError, ControlFlowValue,
                     constants::{OneLike, ZeroLike},
                     reshape::ReshapeOps,
                     scan::{ScanError, ScanValue},
@@ -849,6 +850,12 @@ mod tests {
         impl Traceable<ArrayType> for TestAbstractValue {}
 
         impl crate::tracing::Value<ArrayType> for TestAbstractValue {}
+
+        impl ControlFlowValue for TestAbstractValue {
+            fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+                Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
+            }
+        }
 
         impl ScanValue for TestAbstractValue {
             fn scan_slice_leading_axis(&self, _index: usize) -> Result<Self, TracingError> {

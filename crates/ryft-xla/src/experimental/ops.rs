@@ -16,14 +16,15 @@ use ryft_core::{
             transpose_linear_program_with_output_examples, transpose_traced_linear_program,
         },
         operations::{
-            AddOperation, AddTracingOperation, CosOperation, CosTracingOperation, CustomTracingOperation,
-            FlatTracedRematerialize, LeadingAxisTracingOperation, LeftMatMulOperation, LeftMatMulTracingOperation,
-            LinearRematerializeOperation, MatMulOperation, MatMulTracingOperation, MatrixTransposeOperation,
-            MatrixTransposeTracingOperation, MulOperation, MulTracingOperation, NegOperation, NegTracingOperation,
-            RematerializeOperation, RematerializeTracingOperation, ReshapeOperation, ReshapeTracingOperation,
-            RightMatMulOperation, RightMatMulTracingOperation, ScaleOperation, ScaleTracingOperation, ScanError,
-            ScanOperation, ScanOptions, ScanTracingOperation, ScatterLeadingAxisSliceOperation, SinOperation,
-            SinTracingOperation, SliceLeadingAxisOperation, StackLeadingAxisOperation,
+            AddOperation, AddTracingOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation,
+            CosTracingOperation, CustomTracingOperation, FlatTracedRematerialize, LeadingAxisTracingOperation,
+            LeftMatMulOperation, LeftMatMulTracingOperation, LinearRematerializeOperation, MatMulOperation,
+            MatMulTracingOperation, MatrixTransposeOperation, MatrixTransposeTracingOperation, MulOperation,
+            MulTracingOperation, NegOperation, NegTracingOperation, RematerializeOperation,
+            RematerializeTracingOperation, ReshapeOperation, ReshapeTracingOperation, RightMatMulOperation,
+            RightMatMulTracingOperation, ScaleOperation, ScaleTracingOperation, ScanError, ScanOperation, ScanOptions,
+            ScanTracingOperation, ScatterLeadingAxisSliceOperation, SinOperation, SinTracingOperation,
+            SliceLeadingAxisOperation, StackLeadingAxisOperation, WhileOperation,
             left_matmul::left_matmul_abstract_eval, lift_jit_constant, right_matmul::right_matmul_abstract_eval,
             scan_with_options, scan_without_xs_with_options,
         },
@@ -837,7 +838,7 @@ fn interpret_xla_scan_jvp<E>(
     inputs: &[JvpTracer<ShardMapTensor, EngineTangent<E>>],
 ) -> Result<Vec<JvpTracer<ShardMapTensor, EngineTangent<E>>>, TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
 {
     let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
     let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
@@ -855,6 +856,46 @@ where
         tangent_inputs.as_slice(),
         LinearPrimitiveOperation::Custom(Arc::new(linear_scan.to_linear_custom_primitive())),
         scan.body().carry_types().len() + scan.body().ys_types().len(),
+    )?;
+    Ok(primal_outputs
+        .into_iter()
+        .zip(tangent_outputs)
+        .map(|(primal, tangent)| JvpTracer { primal, tangent })
+        .collect())
+}
+
+fn interpret_xla_condition_jvp<E>(
+    condition: &ConditionOperation<ShardMapTensor, XlaPrimitiveOperation>,
+    inputs: &[JvpTracer<ShardMapTensor, EngineTangent<E>>],
+    engine: &E,
+) -> Result<Vec<JvpTracer<ShardMapTensor, EngineTangent<E>>>, TracingError>
+where
+    E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
+{
+    let ConditionPredicate::Captured(predicate) = condition.predicate() else {
+        return Err(ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition jvp" }.into());
+    };
+    let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
+    let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+    let Some(tangent_builder) = tangent_inputs.first().map(|input| input.builder.clone()) else {
+        return if condition.output_types().is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(ScanError::MissingTracedInvocationContext.into())
+        };
+    };
+
+    let selected_branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
+    let primal_outputs = selected_branch.interpret(primal_inputs.clone())?;
+    let true_pushforward = linearize_program(engine, condition.true_branch(), primal_inputs.clone())?;
+    let false_pushforward = linearize_program(engine, condition.false_branch(), primal_inputs)?;
+    let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
+        .map_err(TracingError::from)?;
+    let tangent_outputs = LinearTerm::apply_staged_op(
+        tangent_builder,
+        tangent_inputs.as_slice(),
+        LinearPrimitiveOperation::Condition(Box::new(linear_condition)),
+        condition.output_types().len(),
     )?;
     Ok(primal_outputs
         .into_iter()
@@ -1053,6 +1094,12 @@ pub enum XlaPrimitiveOperation {
     /// Higher-order static scan loop.
     Scan(Box<ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>>),
 
+    /// Higher-order conditional.
+    Condition(Box<ConditionOperation<ShardMapTensor, XlaPrimitiveOperation>>),
+
+    /// Higher-order while loop.
+    While(Box<WhileOperation<ShardMapTensor, XlaPrimitiveOperation>>),
+
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<ShardMapTensor>>),
 
@@ -1085,6 +1132,8 @@ impl Debug for XlaPrimitiveOperation {
             Self::StackLeadingAxis(op) => Debug::fmt(op, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Scan(scan) => Debug::fmt(scan, formatter),
+            Self::Condition(condition) => Debug::fmt(condition, formatter),
+            Self::While(while_operation) => Debug::fmt(while_operation, formatter),
             Self::ShardMap(op) => Debug::fmt(op, formatter),
             Self::LinearShardMap(op) => Debug::fmt(op, formatter),
             Self::WithShardingConstraint(op) => Debug::fmt(op, formatter),
@@ -1121,6 +1170,8 @@ impl Operation<ArrayType> for XlaPrimitiveOperation {
             Self::StackLeadingAxis(op) => op.name(),
             Self::Rematerialize(remat) => remat.name(),
             Self::Scan(scan) => scan.name(),
+            Self::Condition(condition) => condition.name(),
+            Self::While(while_operation) => while_operation.name(),
             Self::ShardMap(op) => op.name(),
             Self::LinearShardMap(op) => op.name(),
             Self::WithShardingConstraint(op) => op.name(),
@@ -1148,6 +1199,8 @@ impl Operation<ArrayType> for XlaPrimitiveOperation {
             Self::StackLeadingAxis(op) => op.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Scan(scan) => scan.infer_output_types(input_types),
+            Self::Condition(condition) => condition.infer_output_types(input_types),
+            Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::ShardMap(op) => op.infer_output_types(input_types),
             Self::LinearShardMap(op) => op.infer_output_types(input_types),
             Self::WithShardingConstraint(op) => op.infer_output_types(input_types),
@@ -1177,6 +1230,8 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for XlaPrimitiveOperation
             Self::StackLeadingAxis(op) => op.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Scan(scan) => scan.interpret(inputs),
+            Self::Condition(condition) => condition.interpret(inputs),
+            Self::While(while_operation) => while_operation.interpret(inputs),
             Self::ShardMap(op) => op.interpret(inputs),
             Self::LinearShardMap(op) => op.interpret(inputs),
             Self::WithShardingConstraint(op) => op.interpret(inputs),
@@ -1221,6 +1276,24 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
                     exemplar.builder.clone(),
                     inputs,
                     XlaPrimitiveOperation::Scan(scan.clone()),
+                )
+            }
+            Self::Condition(condition) => {
+                let exemplar = inputs.first().ok_or(ScanError::MissingTracedInvocationContext)?;
+                ryft_core::tracing_v2::Tracer::apply_staged_op(
+                    exemplar.engine,
+                    exemplar.builder.clone(),
+                    inputs,
+                    XlaPrimitiveOperation::Condition(condition.clone()),
+                )
+            }
+            Self::While(while_operation) => {
+                let exemplar = inputs.first().ok_or(ScanError::MissingTracedInvocationContext)?;
+                ryft_core::tracing_v2::Tracer::apply_staged_op(
+                    exemplar.engine,
+                    exemplar.builder.clone(),
+                    inputs,
+                    XlaPrimitiveOperation::While(while_operation.clone()),
                 )
             }
             Self::ShardMap(op) => {
@@ -1310,6 +1383,8 @@ where
                     .collect::<Vec<_>>())
             }
             Self::Scan(scan) => interpret_xla_scan_jvp::<E>(scan, inputs),
+            Self::Condition(condition) => interpret_xla_condition_jvp::<E>(condition, inputs, engine),
+            Self::While(_) => Err(ControlFlowError::MissingTransformRule { transform: "while jvp" }.into()),
             Self::ShardMap(op) => op.jvp(engine, inputs),
             Self::LinearShardMap(op) => op.jvp(engine, inputs),
             Self::WithShardingConstraint(op) => op.jvp(engine, inputs),
@@ -1344,6 +1419,9 @@ impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for XlaPrimit
             Self::StackLeadingAxis(op) => op.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Scan(scan) => interpret_xla_scan_linearized_jit(scan, inputs),
+            Self::Condition(_) | Self::While(_) => {
+                Err(ControlFlowError::MissingTransformRule { transform: "linearized JIT replay" }.into())
+            }
             Self::ShardMap(op) => op.interpret(inputs),
             Self::LinearShardMap(op) => op.interpret(inputs),
             Self::WithShardingConstraint(op) => op.interpret(inputs),

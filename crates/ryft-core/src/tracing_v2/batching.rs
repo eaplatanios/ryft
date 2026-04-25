@@ -11,7 +11,7 @@ use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily},
     tracing::{Atom, InterpretableOperation, Operation, Program, Traceable, TracingError, Value},
     tracing_v2::{
-        Cos, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, Tracer,
+        ControlFlowError, ControlFlowValue, Cos, LinearPrimitiveOperation, MatrixOps, PrimitiveOperation, Sin, Tracer,
         jit::trace,
         operations::{
             constants::{OneLike, ZeroLike},
@@ -191,6 +191,15 @@ impl<V: Parameter> Typed<ArrayType> for ArrayBatch<V> {
 impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ArrayBatch<V> {}
 
 impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
+
+impl<V: Traceable<ArrayType> + ControlFlowValue> ControlFlowValue for ArrayBatch<V> {
+    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        if self.batch_axis.is_some() {
+            return Err(ControlFlowError::MissingTransformRule { transform: "batched predicate control flow" }.into());
+        }
+        self.value.control_flow_predicate()
+    }
+}
 
 /// Packed-array batching rule for one staged operation.
 ///
@@ -536,7 +545,8 @@ impl<
         + ZeroLike
         + MatrixOps
         + ReshapeOps
-        + ScanValue,
+        + ScanValue
+        + ControlFlowValue,
 > BatchableOperation<V> for LinearizedScanJvpOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
@@ -597,7 +607,8 @@ impl<
         + ZeroLike
         + MatrixOps
         + ReshapeOps
-        + ScanValue,
+        + ScanValue
+        + ControlFlowValue,
 > BatchableOperation<V> for LinearizedScanTransposeOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
@@ -662,7 +673,8 @@ impl<
         + OneLike
         + MatrixOps
         + ReshapeOps
-        + ScanValue,
+        + ScanValue
+        + ControlFlowValue,
 > BatchableOperation<V> for PrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
@@ -701,7 +713,7 @@ where
             Self::ScatterLeadingAxisSlice(op) => batch_by_interpreting_physical_operation(op, inputs),
             Self::StackLeadingAxis(op) => batch_by_interpreting_physical_operation(op, inputs),
             Self::Scan(scan) => scan.batch(inputs),
-            Self::Custom(_) | Self::Rematerialize(_) => {
+            Self::Custom(_) | Self::Rematerialize(_) | Self::Condition(_) | Self::While(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
         }
@@ -716,14 +728,15 @@ impl<
         + ZeroLike
         + MatrixOps
         + ReshapeOps
-        + ScanValue,
+        + ScanValue
+        + ControlFlowValue,
 > BatchableOperation<V> for LinearPrimitiveOperation<V>
 where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
 {
     fn batch(&self, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, TracingError> {
         match self {
-            Self::Custom(_) | Self::Rematerialize(_) => {
+            Self::Custom(_) | Self::Rematerialize(_) | Self::Condition(_) | Self::While(_) => {
                 Err(BatchingError::MissingBatchingRule { operation: self.name().to_string() }.into())
             }
             Self::LinearScanJvp(op) => op.batch(inputs),
@@ -987,6 +1000,12 @@ impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ReferenceBatch<V> {}
 
 impl<V: Value<ArrayType>> Value<ArrayType> for ReferenceBatch<V> {}
 
+impl<V: Traceable<ArrayType> + ControlFlowValue> ControlFlowValue for ReferenceBatch<V> {
+    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        Err(ControlFlowError::MissingTransformRule { transform: "reference-batched predicate control flow" }.into())
+    }
+}
+
 fn validate_reference_lane_count<V: Parameter>(batches: &[ReferenceBatch<V>]) -> Result<usize, BatchingError> {
     let Some(first_batch) = batches.first() else {
         return Err(BatchingError::EmptyBatch);
@@ -1207,7 +1226,7 @@ mod tests {
         tracing_v2::{
             DifferentiableEngine, Engine,
             linear::{jvp_program, transpose_linear_program},
-            operations::{CustomPrimitive, ScanError, ScanValue},
+            operations::{ControlFlowError, ControlFlowValue, CustomPrimitive, ScanError, ScanValue},
             scan,
         },
         types::{DataType, Shape},
@@ -1287,6 +1306,12 @@ mod tests {
     impl Traceable<ArrayType> for TestArray {}
 
     impl Value<ArrayType> for TestArray {}
+
+    impl ControlFlowValue for TestArray {
+        fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+            Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
+        }
+    }
 
     impl ScanValue for TestArray {
         fn scan_slice_leading_axis(&self, index: usize) -> Result<Self, TracingError> {

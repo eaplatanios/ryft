@@ -21,6 +21,9 @@ pub mod cos;
 /// Value-level identity helpers and built-in scalar constant traits.
 pub mod constants;
 
+/// Higher-order condition and while-loop operations.
+pub mod control_flow;
+
 /// Custom-primitive escape hatch.
 pub mod custom;
 
@@ -64,6 +67,10 @@ pub mod scan;
 pub mod sin;
 
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
+pub use control_flow::{
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
+    flat_program_input_types, flat_program_output_types,
+};
 pub use cos::{Cos, CosOperation, CosTracingOperation};
 pub use custom::{
     CustomOperationError, CustomPrimitive, CustomPrimitiveExtensions, CustomTracingOperation, LinearCustomOperation,

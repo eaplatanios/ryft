@@ -3,7 +3,7 @@ use thiserror::Error;
 use super::programs::AtomId;
 
 use crate::parameters::ParameterError;
-use crate::tracing_v2::{BatchingError, CustomOperationError, DifferentiationError, ScanError};
+use crate::tracing_v2::{BatchingError, ControlFlowError, CustomOperationError, DifferentiationError, ScanError};
 use crate::types::TypeError;
 
 /// Represents errors related to tracing in `ryft-core`.
@@ -44,6 +44,9 @@ pub enum TracingError {
 
     #[error(transparent)]
     Batching(#[from] BatchingError),
+
+    #[error(transparent)]
+    ControlFlow(#[from] ControlFlowError),
 
     #[error(transparent)]
     CustomOperation(#[from] CustomOperationError),
