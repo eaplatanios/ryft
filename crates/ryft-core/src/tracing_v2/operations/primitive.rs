@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing::{Traceable, TracingError, Value},
+    tracing::{OperationFormatter, Traceable, TracingError, Value},
     tracing_v2::{
         Cos, MatrixOps, Sin,
         engines::DifferentiableEngine,
@@ -388,7 +388,7 @@ impl<V: Traceable<ArrayType>> Display for LinearPrimitiveOperation<V> {
     }
 }
 
-/// [`Operation`] for [`PrimitiveOperation`] requires no value-type bounds; shape validation works for
+/// [`Operation`] for [`PrimitiveOperation`] relies only on the [`Traceable`] value contract; shape validation works for
 /// any `V: Traceable<ArrayType>`.
 impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
     fn name(&self) -> &'static str {
@@ -435,9 +435,28 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for PrimitiveOperation<V> {
             Self::Custom(op) => op.infer_output_types(input_types),
         }
     }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).render(formatter, indentation)
+            }
+            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.name())?
+                .bracketed(|operation| operation.field("factor", factor)),
+            Self::LeftMatMul { factor } | Self::RightMatMul { factor } => {
+                OperationFormatter::new(formatter, indentation, self.name())?
+                    .bracketed(|operation| operation.field("factor", factor))
+            }
+            Self::Rematerialize(remat) => remat.render(formatter, indentation),
+            Self::Condition(condition) => condition.render(formatter, indentation),
+            Self::While(while_operation) => while_operation.render(formatter, indentation),
+            Self::Custom(op) => op.render(formatter, indentation),
+            _ => Display::fmt(self, formatter),
+        }
+    }
 }
 
-/// [`Operation`] for [`LinearPrimitiveOperation`] requires no value-type bounds; shape validation
+/// [`Operation`] for [`LinearPrimitiveOperation`] relies only on the [`Traceable`] value contract; shape validation
 /// works for any `V: Traceable<ArrayType>`.
 impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<V> {
     fn name(&self) -> &'static str {
@@ -474,6 +493,25 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
             Self::Custom(op) => op.infer_output_types(input_types),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).render(formatter, indentation)
+            }
+            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.name())?
+                .bracketed(|operation| operation.field("factor", factor)),
+            Self::LeftMatMul { factor } | Self::RightMatMul { factor } => {
+                OperationFormatter::new(formatter, indentation, self.name())?
+                    .bracketed(|operation| operation.field("factor", factor))
+            }
+            Self::Rematerialize(remat) => remat.render(formatter, indentation),
+            Self::Condition(condition) => condition.render(formatter, indentation),
+            Self::While(while_operation) => while_operation.render(formatter, indentation),
+            Self::Custom(op) => op.render(formatter, indentation),
+            _ => Display::fmt(self, formatter),
         }
     }
 }

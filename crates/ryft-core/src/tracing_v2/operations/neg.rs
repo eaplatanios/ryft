@@ -20,14 +20,14 @@ use super::{
 
 /// Hidden staging trait for the negation primitive.
 #[doc(hidden)]
-pub trait NegTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait NegTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the negation primitive.
     fn neg_op() -> Self;
 }
 
 /// Hidden staging trait for the negation primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearNegOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait LinearNegOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the linear negation primitive.
     fn linear_neg_op() -> Self;
 }

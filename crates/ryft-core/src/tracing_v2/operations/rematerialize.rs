@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{Program, ProgramBuilder, Traceable, TracingError, Value},
+    tracing::{OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value},
     tracing_v2::{
         Differentiable, DifferentiationError, EngineTangent, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation,
         Tracer,
@@ -21,7 +21,7 @@ use super::{CoreLinearProgramOperation, DifferentiableOperation, InterpretableOp
 
 /// Hidden staging trait for the `rematerialize` higher-order primitive.
 #[doc(hidden)]
-pub trait RematerializeTracingOperation<T: Type + Display, V: Traceable<T>, L: Clone>: Clone + Operation<T> {
+pub trait RematerializeTracingOperation<T: Type, V: Traceable<T>, L: Clone>: Clone + Operation<T> {
     /// Constructs the carrier-specific representation of the `rematerialize` higher-order primitive
     /// with a captured traced body.
     fn rematerialize_op(op: RematerializeOperation<T, V, Self, L>) -> Self;
@@ -29,7 +29,7 @@ pub trait RematerializeTracingOperation<T: Type + Display, V: Traceable<T>, L: C
 
 /// Hidden staging trait for the `rematerialize` higher-order primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearRematerializeCarrierOperation<T: Type + Display, V: Traceable<T>>: Clone + Operation<T> {
+pub trait LinearRematerializeCarrierOperation<T: Type, V: Traceable<T>>: Clone + Operation<T> {
     /// Constructs the carrier-specific representation of the linear `rematerialize` higher-order
     /// primitive with a captured linear traced body.
     fn linear_rematerialize_op(op: LinearRematerializeOperation<T, V, Self>) -> Self;
@@ -85,7 +85,7 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> FlatTracedRematerialize<
 /// that powers the user-facing rematerialization policies in [`crate::tracing_v2::linear`].
 #[derive(Clone)]
 pub struct RematerializeOperation<
-    T: Type + Display,
+    T: Type,
     V: Traceable<T> + Parameter,
     O: Clone + Operation<T> = PrimitiveOperation<V>,
     L: Clone = LinearPrimitiveOperation<V>,
@@ -97,7 +97,7 @@ pub struct RematerializeOperation<
     marker: PhantomData<fn() -> L>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> RematerializeOperation<T, V, O, L> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> RematerializeOperation<T, V, O, L> {
     /// Builds one ordinary (non-linear) rematerialize op wrapping the given body.
     #[inline]
     pub fn new(body: FlatTracedRematerialize<T, V, O>) -> Self {
@@ -111,17 +111,13 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Rema
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Debug
-    for RematerializeOperation<T, V, O, L>
-{
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Debug for RematerializeOperation<T, V, O, L> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Rematerialize")
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Display
-    for RematerializeOperation<T, V, O, L>
-{
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, L: Clone> Display for RematerializeOperation<T, V, O, L> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
@@ -150,6 +146,11 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>, L: Clone> Operati
             });
         }
         Ok(self.body.output_types.clone())
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.program("body", self.body().program()))
     }
 }
 
@@ -298,7 +299,7 @@ where
 /// Linear-only rematerialization boundary that always carries both the linear body and its transpose body.
 #[derive(Clone)]
 pub struct LinearRematerializeOperation<
-    T: Type + Display,
+    T: Type,
     V: Traceable<T> + Parameter,
     O: Clone + Operation<T> = LinearPrimitiveOperation<V>,
 > {
@@ -309,7 +310,7 @@ pub struct LinearRematerializeOperation<
     transpose_body: FlatTracedRematerialize<T, V, O>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearRematerializeOperation<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> LinearRematerializeOperation<T, V, O> {
     /// Builds one linear rematerialize op with an explicit transpose body.
     #[inline]
     pub fn new(body: FlatTracedRematerialize<T, V, O>, transpose_body: FlatTracedRematerialize<T, V, O>) -> Self {
@@ -327,13 +328,13 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearRemateri
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> Debug for LinearRematerializeOperation<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Debug for LinearRematerializeOperation<T, V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "LinearRematerialize")
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> Display for LinearRematerializeOperation<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> Display for LinearRematerializeOperation<T, V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "rematerialize")
     }
@@ -362,6 +363,13 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayTy
             });
         }
         Ok(self.body.output_types.clone())
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.program("body", self.body().program())?;
+            operation.program("transpose_body", self.transpose_body.program())
+        })
     }
 }
 
@@ -710,7 +718,13 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = rematerialize %0
+                let %1:f64[] = rematerialize [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                ] %0
                 in (%1)
             "}
             .trim_end(),

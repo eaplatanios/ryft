@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::ops::{Add, Mul, Neg};
 
 use ndarray::{Array2, ArrayD, Ix2, IxDyn, Zip};
@@ -8,12 +8,15 @@ use thiserror::Error;
 use ryft_core::parameters::Parameter;
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing::{Traceable, Value};
-use ryft_core::tracing_v2::operations::constants::{OneLike, ZeroLike};
+use ryft_core::tracing_v2::operations::{
+    ControlFlowError, ControlFlowValue,
+    constants::{OneLike, ZeroLike},
+};
 use ryft_core::tracing_v2::{CoordinateValue, Cos, MatrixOps, ReshapeOps, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
-pub trait NdArrayElement: Copy + Clone + Debug + PartialEq + 'static {
+pub trait NdArrayElement: Copy + Clone + Debug + Display + PartialEq + 'static {
     /// `ryft-core` data type corresponding to this element.
     const DATA_TYPE: DataType;
 
@@ -214,6 +217,12 @@ impl<T: NdArrayElement> Array<T> {
 
 impl<T: NdArrayElement> Parameter for Array<T> {}
 
+impl<T: NdArrayElement> Display for Array<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.values, formatter)
+    }
+}
+
 impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
     fn r#type(&self) -> Cow<'_, ArrayType> {
         let shape = Shape::new(self.values.shape().iter().copied().map(Size::Static).collect::<Vec<_>>());
@@ -227,6 +236,13 @@ impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
 impl<T: NdArrayElement> Traceable<ArrayType> for Array<T> {}
 
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {}
+
+impl<T: NdArrayElement> ControlFlowValue for Array<T> {
+    #[inline]
+    fn control_flow_predicate(&self) -> Result<bool, TracingError> {
+        Err(ControlFlowError::InvalidPredicateValue { type_: self.r#type().into_owned() }.into())
+    }
+}
 
 impl<T: NdArrayElement> ZeroLike for Array<T> {
     #[inline]
@@ -434,6 +450,7 @@ fn array_error_to_tracing_error(error: ArrayError) -> TracingError {
 mod tests {
     use ndarray::{arr0, arr1, arr2};
     use pretty_assertions::assert_eq;
+    use ryft_core::tracing_v2::operations::ControlFlowValue;
     use ryft_core::tracing_v2::{MatrixOps, ReshapeOps};
     use ryft_core::types::{ArrayType, DataType, Shape, Size, Typed};
 
@@ -447,6 +464,22 @@ mod tests {
 
         assert_eq!(array.r#type().into_owned(), expected_type);
         assert_eq!(Array::scalar(2.0).as_ndarray(), &arr0(2.0).into_dyn());
+    }
+
+    #[test]
+    fn test_array_display_delegates_to_ndarray_values() {
+        assert_eq!(Array::scalar(2.0).to_string(), "2");
+        assert_eq!(Array::from_shape_vec([2], vec![1.0, 2.0]).unwrap().to_string(), "[1, 2]");
+    }
+
+    #[test]
+    fn test_array_control_flow_predicate_reports_invalid_type() {
+        let array = Array::from_shape_vec([2], vec![1.0, 2.0]).unwrap();
+
+        assert_eq!(
+            array.control_flow_predicate().unwrap_err().to_string(),
+            "control-flow predicate value has type f64[2], but expected bool[]"
+        );
     }
 
     #[test]

@@ -28,14 +28,14 @@ use super::{
 /// `XlaPrimitiveOperation`) implement this trait so that generic transform code can stage `AddOperation` without
 /// knowing which carrier is in use.
 #[doc(hidden)]
-pub trait AddTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait AddTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the addition primitive.
     fn add_op() -> Self;
 }
 
 /// Hidden staging trait for the addition primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearAddOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait LinearAddOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the linear addition primitive.
     fn linear_add_op() -> Self;
 }

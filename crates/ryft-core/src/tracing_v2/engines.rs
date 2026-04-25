@@ -1,4 +1,4 @@
-use std::{fmt::Display, marker::PhantomData};
+use std::marker::PhantomData;
 
 use crate::{
     tracing::{Operation, Traceable, TracingError},
@@ -38,7 +38,7 @@ pub trait Engine {
     /// This is the descriptor carried by staged atoms and used during abstract evaluation. For the
     /// default core pipeline it is usually [`ArrayType`](crate::types::ArrayType), but the trait is
     /// generic so backends can substitute a richer metadata type if needed.
-    type Type: Type + Display;
+    type Type: Type;
 
     /// Concrete leaf value produced by this engine.
     ///

@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
+    fmt::Display,
     ops::{Add, Mul, Neg},
     rc::Rc,
 };
@@ -97,6 +98,19 @@ impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Clone for Trace
 impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> std::fmt::Debug for Tracer<'engine, E, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Tracer").field("state", &self.state).finish_non_exhaustive()
+    }
+}
+
+impl<'engine, E, O> Display for Tracer<'engine, E, O>
+where
+    E: Engine + ?Sized,
+    O: Clone + Operation<E::Type>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.state {
+            TracerState::Live(atom, _) => Display::fmt(atom, formatter),
+            TracerState::Poison(r#type) => write!(formatter, "<poison:{type}>"),
+        }
     }
 }
 
@@ -220,7 +234,12 @@ impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Typed<E::Type> 
     }
 }
 
-impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Traceable<E::Type> for Tracer<'engine, E, O> {}
+impl<'engine, E, O> Traceable<E::Type> for Tracer<'engine, E, O>
+where
+    E: Engine + ?Sized,
+    O: Clone + Operation<E::Type>,
+{
+}
 
 impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> ZeroLike for Tracer<'engine, E, O> {
     #[inline]
@@ -720,6 +739,12 @@ mod tests {
             }
         }
 
+        impl fmt::Display for TestValue {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "{}", self.value)
+            }
+        }
+
         impl Traceable<TestType> for TestValue {}
 
         impl crate::tracing::Value<TestType> for TestValue {}
@@ -843,6 +868,12 @@ mod tests {
         impl Typed<ArrayType> for TestAbstractValue {
             fn r#type(&self) -> Cow<'_, ArrayType> {
                 Cow::Borrowed(&self.r#type)
+            }
+        }
+
+        impl std::fmt::Display for TestAbstractValue {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(&self.r#type, formatter)
             }
         }
 

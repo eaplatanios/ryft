@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    fmt::{Debug, Display},
-    rc::Rc,
-};
+use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ryft_macros::Parameter;
 
@@ -369,13 +365,13 @@ mod tests {
         assert_eq!(
             pushforward.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = scale %0
-                    %2:f64[] = scale %0
-                    %3:f64[] = add %1 %2
-                    %4:f64[] = scale %0
-                    %5:f64[] = add %3 %4
-                in (%5)
+            lambda %0:f64[] .
+            let %1:f64[] = scale [factor=2] %0
+                %2:f64[] = scale [factor=2] %0
+                %3:f64[] = add %1 %2
+                %4:f64[] = scale [factor=-0.4161468365471424] %0
+                %5:f64[] = add %3 %4
+            in (%5)
             "}
             .trim_end(),
         );
@@ -394,12 +390,12 @@ mod tests {
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = scale %0
-                    %2:f64[] = scale %0
-                    %3:f64[] = add %1 %2
-                    %4:f64[] = scale %0
-                in (%3, %4)
+            lambda %0:f64[] .
+            let %1:f64[] = scale [factor=-0.4161468365471424] %0
+                %2:f64[] = scale [factor=3] %0
+                %3:f64[] = add %1 %2
+                %4:f64[] = scale [factor=2] %0
+            in (%3, %4)
             "}
             .trim_end(),
         );
@@ -486,13 +482,13 @@ mod tests {
         assert_eq!(
             pushforward.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = scale %0
-                    %2:f64[] = scale %0
-                    %3:f64[] = add %1 %2
-                    %4:f64[] = scale %0
-                    %5:f64[] = add %3 %4
-                in (%5)
+            lambda %0:f64[] .
+            let %1:f64[] = scale [factor=2] %0
+                %2:f64[] = scale [factor=2] %0
+                %3:f64[] = add %1 %2
+                %4:f64[] = scale [factor=-0.4161468365471424] %0
+                %5:f64[] = add %3 %4
+            in (%5)
             "}
             .trim_end(),
         );

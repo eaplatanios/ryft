@@ -22,9 +22,9 @@ pub trait Value<T: Type>: Traceable<T> {}
 
 /// Represents leaf values that can participate in traced [`Program`]s. [`Traceable`] is implemented by every type that
 /// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
-/// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`], but
-/// does not imply any other requirements for the underlying values.
-pub trait Traceable<T: Type>: Clone + Parameter + Typed<T> {}
+/// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
+/// requires [`Display`] so that constants and [`Operation`] metadata can render their carried values directly.
+pub trait Traceable<T: Type>: Clone + Display + Parameter + Typed<T> {}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]
@@ -83,15 +83,127 @@ impl Display for AtomId {
     }
 }
 
+/// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
+/// If the length exceeds this value, then the section contents will be rendered over multiple lines.
+const MAX_INLINE_OPERATION_SECTION_CONTENTS_LENGTH: usize = 80;
+
+/// Helper for rendering [`Operation`]s that supports proper bracketing and indentation for operation metadata.
+/// [`OperationFormatter`] centralizes the indentation and bracket layout used by higher-order or metadata-carrying
+/// operations. The operation name is written immediately by [`OperationFormatter::new`], while
+/// [`OperationFormatter::bracketed`] owns the bracketed metadata delimiters. Scalar fields are buffered so that short
+/// metadata can render inline when no nested program fields are present, while nested program fields force multiline
+/// rendering.
+pub struct OperationFormatter<'f, 'a> {
+    /// [`Formatter`](std::fmt::Formatter) receiving the rendered text.
+    formatter: &'f mut std::fmt::Formatter<'a>,
+
+    /// Indentation of the rendered [`Instruction`] line that owns the [`Operation`] that is being rendered.
+    indentation: usize,
+
+    /// Buffered scalar field name-value pairs that may be rendered inline if no nested [`Program`] fields are present.
+    fields: Vec<(String, String)>,
+
+    /// Boolean indicating whether this [`Operation`] being rendered has been forced to use multiple lines.
+    is_multiline: bool,
+}
+
+impl<'f, 'a> OperationFormatter<'f, 'a> {
+    /// Creates a new [`OperationFormatter`] and writes the provided [`Operation`] name.
+    #[inline]
+    pub fn new(
+        formatter: &'f mut std::fmt::Formatter<'a>,
+        indentation: usize,
+        name: &'static str,
+    ) -> Result<Self, std::fmt::Error> {
+        write!(formatter, "{name}")?;
+        Ok(Self { formatter, indentation, fields: Vec::new(), is_multiline: false })
+    }
+
+    /// Renders the provided field name-value pair.
+    #[inline]
+    pub fn field(&mut self, name: &str, value: impl Display) -> std::fmt::Result {
+        if self.is_multiline {
+            write!(self.formatter, "\n{:indentation$}{name}={value},", "", indentation = self.indentation + 4)
+        } else {
+            self.fields.push((name.to_string(), value.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued fields.
+    #[inline]
+    pub fn program<
+        T: Type,
+        V: Traceable<T>,
+        O: Clone + Operation<T>,
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+    >(
+        &mut self,
+        name: &str,
+        program: &Program<T, V, O, Input, Output>,
+    ) -> std::fmt::Result {
+        self.is_multiline = true;
+        for (name, value) in std::mem::take(&mut self.fields) {
+            write!(self.formatter, "\n{:indentation$}{name}={value},", "", indentation = self.indentation + 4)?;
+        }
+        writeln!(self.formatter)?;
+        write!(self.formatter, "{:indentation$}", "", indentation = self.indentation + 4)?;
+        writeln!(self.formatter, "{name}={{")?;
+        program.render(self.formatter, self.indentation + 8)?;
+        writeln!(self.formatter)?;
+        write!(self.formatter, "{:indentation$}", "", indentation = self.indentation + 4)?;
+        write!(self.formatter, "}},")
+    }
+
+    /// Renders a bracketed section (using square brackets) using the provided closure for rendering its contents.
+    #[inline]
+    pub fn bracketed(mut self, render_contents: impl FnOnce(&mut Self) -> std::fmt::Result) -> std::fmt::Result {
+        write!(self.formatter, " [")?;
+        render_contents(&mut self)?;
+        let inline_contents_length = self
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, (name, value))| name.len() + 1 + value.len() + if index == 0 { 0 } else { 2 })
+            .sum::<usize>();
+        if self.is_multiline || inline_contents_length > MAX_INLINE_OPERATION_SECTION_CONTENTS_LENGTH {
+            self.is_multiline = true;
+            for (name, value) in std::mem::take(&mut self.fields) {
+                write!(self.formatter, "\n{:indentation$}{name}={value},", "", indentation = self.indentation + 4)?;
+            }
+            writeln!(self.formatter)?;
+            write!(self.formatter, "{:indentation$}", "", indentation = self.indentation)?;
+        } else {
+            for (index, (name, value)) in self.fields.iter().enumerate() {
+                if index > 0 {
+                    write!(self.formatter, ", {name}={value}")?;
+                } else {
+                    write!(self.formatter, "{name}={value}")?;
+                }
+            }
+        }
+        write!(self.formatter, "]")
+    }
+}
+
 /// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as [`Instruction`]s in
 /// [`Program`]s. This trait represents the high-level operation interface that only requires operations to be able to
 /// provide their name and to infer their output [`Type`]s given their input [`Type`]s.
-pub trait Operation<T: Type>: Debug + Display {
+pub trait Operation<T: Type>: Debug {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
 
     /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s without executing it.
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>;
+
+    /// Renders this [`Operation`] as part of an [`Instruction`]. The default implementation simply renders
+    /// [`Operation::name`]. Operations carrying semantic metadata or nested [`Program`]s should override this
+    /// function and use [`OperationFormatter`] for consistent bracketed and indented formatting.
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let _ = indentation;
+        formatter.write_str(self.name())
+    }
 }
 
 /// [`InterpretableOperation`]s are [`Operation`]s that can be interpreted (i.e., executed) given concrete input values.
@@ -100,8 +212,9 @@ pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError>;
 }
 
-/// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`]s. [`Program`]s are
-/// purely dataflow-based, and so [`Instruction`]s execute in sequential order with no control-flow nodes.
+/// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`]s. [`Program`]s execute
+/// [`Instruction`]s in sequential order, and higher-order [`Operation`]s can carry nested programs for control flow
+/// or other structured evaluation boundaries.
 #[derive(Clone, Debug)]
 pub struct Instruction<O> {
     /// [`Operation`] applied by this [`Instruction`].
@@ -448,15 +561,13 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
     }
 }
 
-impl<
-    T: Type + Display,
-    V: Traceable<T>,
-    O: Clone + Display + Operation<T>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> Display for Program<T, V, O, Input, Output>
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<T, V, O, Input, Output>
 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
+    /// are nested within other programs like with control flow [`Operation`]s.
+    pub fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        write!(formatter, "{:indentation$}", "")?;
         write!(formatter, "lambda ")?;
         self.input_ids.iter().enumerate().try_for_each(|(index, input_id)| {
             if index > 0 {
@@ -480,6 +591,7 @@ impl<
         for (atom_id, atom) in self.atoms.iter().enumerate() {
             match atom {
                 Atom::Constant(_) => {
+                    write!(formatter, "{:indentation$}", "")?;
                     writeln!(
                         formatter,
                         "{} {}:{} = const",
@@ -493,6 +605,7 @@ impl<
                 Atom::Variable(_) => {
                     if let Some(instruction_index) = instructions_by_first_output[atom_id] {
                         let instruction = &self.instructions[instruction_index];
+                        write!(formatter, "{:indentation$}", "")?;
                         write!(formatter, "{} ", if binding_count == 0 { "let" } else { "   " })?;
                         instruction.outputs.iter().enumerate().try_for_each(|(index, output)| {
                             if index > 0 {
@@ -501,7 +614,10 @@ impl<
                                 write!(formatter, "{output}:{}", self.atoms[output.index].r#type())
                             }
                         })?;
-                        write!(formatter, " = {}", instruction.operation)?;
+                        write!(formatter, " = ")?;
+                        instruction
+                            .operation
+                            .render(formatter, if binding_count == 0 { indentation } else { indentation + 4 })?;
                         instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
                         writeln!(formatter)?;
                         binding_count += 1;
@@ -509,11 +625,20 @@ impl<
                 }
             }
         }
+        write!(formatter, "{:indentation$}", "")?;
         write!(formatter, "in (")?;
         self.output_ids.iter().enumerate().try_for_each(|(index, output)| {
             if index > 0 { write!(formatter, ", {output}") } else { write!(formatter, "{output}") }
         })?;
         write!(formatter, ")")
+    }
+}
+
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
+    for Program<T, V, O, Input, Output>
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
     }
 }
 
@@ -681,6 +806,33 @@ mod tests {
 
     use super::*;
 
+    const LONG_METADATA_VALUE: &str = concat!(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaa",
+    );
+
+    #[derive(Clone, Debug)]
+    struct LongMetadataOperation;
+
+    impl Operation<ArrayType> for LongMetadataOperation {
+        fn name(&self) -> &'static str {
+            "long_metadata"
+        }
+
+        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+            if input_types.len() != 1 {
+                return Err(TypeError { message: format!("expected 1 input type but got {}", input_types.len()) });
+            }
+            Ok(vec![input_types[0].clone()])
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            OperationFormatter::new(formatter, indentation, self.name())?
+                .bracketed(|operation| operation.field("value", LONG_METADATA_VALUE))
+        }
+    }
+
     #[test]
     fn atom_id_display_uses_percent_prefix() {
         assert_eq!(AtomId { index: 42 }.to_string(), "%42");
@@ -719,12 +871,32 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = const
-                    %3:f64[] = scale %0
+                    %3:f64[] = scale [factor=2] %0
                     %4:f64[] = add %3 %1
                 in (%4)
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn program_display_keeps_long_metadata_multiline() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, LongMetadataOperation, f64, f64>::new(Placeholder);
+        let input = builder.add_input(2.0f64.r#type().into_owned());
+        let output = builder.add_instruction(LongMetadataOperation, vec![input]).unwrap()[0];
+        let program = builder.build(vec![output], Placeholder).unwrap();
+        let expected = format!(
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = long_metadata [
+                    value={LONG_METADATA_VALUE},
+                ] %0
+                in (%1)
+            "},
+            LONG_METADATA_VALUE = LONG_METADATA_VALUE,
+        );
+
+        assert_eq!(program.to_string(), expected.trim_end());
     }
 
     #[test]

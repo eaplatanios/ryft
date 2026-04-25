@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     parameters::Parameterized,
-    tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError},
+    tracing::{InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError},
     tracing_v2::{
         EngineTangent, JvpTracer, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Tracer,
         engines::{DifferentiableEngine, Engine},
@@ -411,6 +411,21 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayTy
         ensure_types_match("condition operand", &operand_input_types, &input_types[operand_start..])?;
         Ok(self.output_types())
     }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            match &self.predicate {
+                ConditionPredicate::RuntimeInput(predicate_type) => {
+                    operation.field("predicate", format_args!("runtime_input(type={predicate_type})"))?;
+                }
+                ConditionPredicate::Captured(predicate) => {
+                    operation.field("predicate", format_args!("captured({predicate})"))?;
+                }
+            }
+            operation.program("true_branch", self.true_branch())?;
+            operation.program("false_branch", self.false_branch())
+        })
+    }
 }
 
 impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<V, O>
@@ -582,6 +597,13 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> Operation<ArrayTy
         ensure_types_match("while input", &state_types, input_types)?;
         Ok(state_types)
     }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.program("condition", self.condition())?;
+            operation.program("body", self.body())
+        })
+    }
 }
 
 impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<V, O>
@@ -683,6 +705,7 @@ where
 mod tests {
     use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
@@ -699,6 +722,15 @@ mod tests {
     enum TestValue {
         Bool(bool),
         Number(f64),
+    }
+
+    impl Display for TestValue {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Bool(value) => Display::fmt(value, formatter),
+                Self::Number(value) => Display::fmt(value, formatter),
+            }
+        }
     }
 
     impl Typed<ArrayType> for TestValue {
@@ -726,6 +758,8 @@ mod tests {
         Add,
         Sub,
         IsPositive,
+        Condition(Box<ConditionOperation<TestValue, TestOperation>>),
+        While(Box<WhileOperation<TestValue, TestOperation>>),
     }
 
     impl Display for TestOperation {
@@ -740,6 +774,8 @@ mod tests {
                 Self::Add => "add",
                 Self::Sub => "sub",
                 Self::IsPositive => "is_positive",
+                Self::Condition(condition) => condition.name(),
+                Self::While(while_operation) => while_operation.name(),
             }
         }
 
@@ -754,6 +790,16 @@ mod tests {
                     ensure_input_count(1, input_types.len(), self.name())?;
                     Ok(vec![ArrayType::scalar(DataType::Boolean)])
                 }
+                Self::Condition(condition) => condition.infer_output_types(input_types),
+                Self::While(while_operation) => while_operation.infer_output_types(input_types),
+            }
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            match self {
+                Self::Condition(condition) => condition.render(formatter, indentation),
+                Self::While(while_operation) => while_operation.render(formatter, indentation),
+                _ => Display::fmt(self, formatter),
             }
         }
     }
@@ -773,6 +819,8 @@ mod tests {
                     TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
                     _ => Err(TypeError { message: "is_positive expected a numeric input".to_string() }.into()),
                 },
+                Self::Condition(condition) => condition.interpret(inputs),
+                Self::While(while_operation) => while_operation.interpret(inputs),
             }
         }
     }
@@ -830,6 +878,48 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_program_rendering_includes_nested_branches() {
+        let condition =
+            ConditionOperation::new(ArrayType::scalar(DataType::Boolean), add_one_branch(), subtract_one_branch())
+                .unwrap();
+        let mut builder =
+            ProgramBuilder::<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>::new(vec![
+                Placeholder,
+                Placeholder,
+            ]);
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(TestOperation::Condition(Box::new(condition)), vec![predicate, input])
+            .unwrap()[0];
+        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[] = condition [
+                    predicate=runtime_input(type=bool[]),
+                    true_branch={
+                        lambda %0:f64[] .
+                        let %1:f64[] = const
+                            %2:f64[] = add %0 %1
+                        in (%2)
+                    },
+                    false_branch={
+                        lambda %0:f64[] .
+                        let %1:f64[] = const
+                            %2:f64[] = sub %0 %1
+                        in (%2)
+                    },
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_primitive_carrier_condition_interprets_captured_predicate() {
         let condition =
             ConditionOperation::with_captured_predicate(false, scalar_scale_branch(2.0), scalar_scale_branch(3.0))
@@ -859,6 +949,45 @@ mod tests {
         let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
 
         assert_eq!(while_operation.interpret(&[TestValue::Number(3.0)]), Ok(vec![TestValue::Number(0.0)]),);
+    }
+
+    #[test]
+    fn test_while_program_rendering_includes_condition_and_body() {
+        let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new(vec![Placeholder]);
+        let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
+        let condition_output =
+            condition_builder.add_instruction(TestOperation::IsPositive, vec![condition_input]).unwrap()[0];
+        let condition = condition_builder.build(vec![condition_output], vec![Placeholder]).unwrap();
+        let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
+        let mut builder =
+            ProgramBuilder::<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>::new(vec![
+                Placeholder,
+            ]);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TestOperation::While(Box::new(while_operation)), vec![input]).unwrap()[0];
+        let program = builder.build(vec![output], vec![Placeholder]).unwrap();
+
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = while [
+                    condition={
+                        lambda %0:f64[] .
+                        let %1:bool[] = is_positive %0
+                        in (%1)
+                    },
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = const
+                            %2:f64[] = sub %0 %1
+                        in (%2)
+                    },
+                ] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

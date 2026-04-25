@@ -22,7 +22,7 @@ use super::{
 
 /// Hidden staging trait for the multiplication primitive.
 #[doc(hidden)]
-pub trait MulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait MulTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the multiplication primitive.
     fn mul_op() -> Self;
 }

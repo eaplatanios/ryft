@@ -19,7 +19,7 @@ use super::{
 
 /// Hidden staging trait for the cosine primitive.
 #[doc(hidden)]
-pub trait CosTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait CosTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the cosine primitive.
     fn cos_op() -> Self;
 }

@@ -10,18 +10,12 @@ pub use ryft_pjrt as pjrt;
 #[cfg(feature = "xla")]
 pub use ryft_xla as xla;
 
-pub use ryft_core::broadcasting::{Broadcastable, BroadcastingError};
-pub use ryft_core::errors::Error;
-pub use ryft_core::parameters::{
-    Parameter, ParameterError, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
-    PathPrefixedParameterIterator, Placeholder,
+pub use ryft_core::{
+    ArrayType, Atom, AtomId, Broadcastable, BroadcastingError, DataType, DataTypeError, DeviceMesh, Error, Instruction,
+    InterpretableOperation, Layout, LayoutError, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId,
+    MeshProcessIndex, Operation, OperationFormatter, Parameter, ParameterError, ParameterPath, ParameterPathSegment,
+    Parameterized, ParameterizedFamily, PathPrefixedParameterIterator, Placeholder, Program, ProgramBuilder, Shape,
+    Sharding, ShardingDimension, ShardingError, ShardingVisualization, Size, StridedLayout, Tile, TileDimension,
+    TiledLayout, Traceable, TracingError, Type, Value,
 };
-pub use ryft_core::sharding::{
-    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, MeshDevice, MeshDeviceId, MeshProcessIndex, Sharding,
-    ShardingDimension, ShardingError, ShardingVisualization,
-};
-pub use ryft_core::types::Type;
-pub use ryft_core::types::array_types::{ArrayType, Shape, Size};
-pub use ryft_core::types::data_types::{DataType, DataTypeError};
-pub use ryft_core::types::layouts::{Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 pub use ryft_macros::{Parameter, Parameterized};

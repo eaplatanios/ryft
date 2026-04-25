@@ -94,7 +94,7 @@ pub type EngineTangent<E> = <<E as Engine>::Value as Differentiable<<E as Engine
 
 impl<T, V> Differentiable<T> for V
 where
-    T: Type + Display,
+    T: Type,
     V: Traceable<T> + ZeroLike,
 {
     type Tangent<LinearOperation>
@@ -130,6 +130,12 @@ impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V>> Typed<Ty> for JvpTracer
     #[inline]
     fn r#type(&self) -> Cow<'_, Ty> {
         <V as Typed<Ty>>::r#type(&self.primal)
+    }
+}
+
+impl<V: Display, T> Display for JvpTracer<V, T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.primal, formatter)
     }
 }
 
@@ -416,6 +422,12 @@ mod tests {
         impl Typed<TestType> for TestValue {
             fn r#type(&self) -> Cow<'_, TestType> {
                 Cow::Borrowed(&self.r#type)
+            }
+        }
+
+        impl fmt::Display for TestValue {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "{}", self.value)
             }
         }
 

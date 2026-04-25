@@ -67,10 +67,10 @@ pub(crate) fn assert_bilinear_pushforward_rendering() {
         pushforward.to_string(),
         indoc! {"
             lambda %0:f64[], %1:f64[] .
-            let %2:f64[] = scale %0
-                %3:f64[] = scale %1
+            let %2:f64[] = scale [factor=3] %0
+                %3:f64[] = scale [factor=2] %1
                 %4:f64[] = add %2 %3
-                %5:f64[] = scale %0
+                %5:f64[] = scale [factor=-0.4161468365471424] %0
                 %6:f64[] = add %4 %5
             in (%6)
         "}
@@ -105,10 +105,10 @@ pub(crate) fn assert_quadratic_pushforward_rendering() {
         pushforward.to_string(),
         indoc! {"
             lambda %0:f64[] .
-            let %1:f64[] = scale %0
-                %2:f64[] = scale %0
+            let %1:f64[] = scale [factor=2] %0
+                %2:f64[] = scale [factor=2] %0
                 %3:f64[] = add %1 %2
-                %4:f64[] = scale %0
+                %4:f64[] = scale [factor=-0.4161468365471424] %0
                 %5:f64[] = add %3 %4
             in (%5)
         "}

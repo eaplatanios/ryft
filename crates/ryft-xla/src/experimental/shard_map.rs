@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
-    fmt::Debug,
+    fmt::{Debug, Display},
     ops::{Add, Mul, Neg},
 };
 
@@ -257,6 +257,15 @@ pub enum ShardMapConstantKind {
     One,
 }
 
+impl Display for ShardMapConstantKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => formatter.write_str("zero"),
+            Self::One => formatter.write_str("one"),
+        }
+    }
+}
+
 /// Abstract tensor leaf used while tracing XLA programs directly from [`ArrayType`] metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub struct ShardMapTensor {
@@ -311,6 +320,17 @@ impl ShardMapTensor {
     pub fn with_type(mut self, array_type: ArrayType) -> Self {
         self.array_type = array_type;
         self
+    }
+}
+
+impl Display for ShardMapTensor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.constant_kind {
+            Some(constant_kind) => {
+                write!(formatter, "shard_map_tensor(type={}, constant={constant_kind})", self.array_type)
+            }
+            None => write!(formatter, "shard_map_tensor(type={})", self.array_type),
+        }
     }
 }
 
@@ -2711,6 +2731,15 @@ mod tests {
                 .varying_manual_axes,
             BTreeSet::<String>::new()
         );
+    }
+
+    #[test]
+    fn test_shard_map_tensor_display_renders_type_and_constant_kind() {
+        let array_type = ArrayType::scalar(DataType::F32);
+
+        assert_eq!(ShardMapTensor::new(array_type.clone()).to_string(), "shard_map_tensor(type=f32[])");
+        assert_eq!(ShardMapTensor::zero(array_type.clone()).to_string(), "shard_map_tensor(type=f32[], constant=zero)",);
+        assert_eq!(ShardMapTensor::one(array_type).to_string(), "shard_map_tensor(type=f32[], constant=one)");
     }
 
     #[test]

@@ -20,14 +20,14 @@ use super::{
 
 /// Hidden staging trait for the matrix transposition primitive.
 #[doc(hidden)]
-pub trait MatrixTransposeTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait MatrixTransposeTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the matrix transposition primitive.
     fn matrix_transpose_op() -> Self;
 }
 
 /// Hidden staging trait for the matrix transposition primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearMatrixTransposeOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait LinearMatrixTransposeOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the linear matrix transposition primitive.
     fn linear_matrix_transpose_op() -> Self;
 }

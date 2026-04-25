@@ -19,7 +19,7 @@ use super::{
 
 /// Hidden staging trait for the matrix multiplication primitive.
 #[doc(hidden)]
-pub trait MatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait MatMulTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the matrix multiplication primitive.
     fn matmul_op() -> Self;
 }

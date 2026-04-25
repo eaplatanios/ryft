@@ -7,7 +7,7 @@ use std::{
 use indoc::indoc;
 
 use crate::macros::check_input_count;
-use crate::tracing::{Traceable, TracingError, Value};
+use crate::tracing::{OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
     engines::{DifferentiableEngine, Engine},
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
@@ -24,14 +24,14 @@ use super::{
 
 /// Hidden staging trait for the scaling primitive.
 #[doc(hidden)]
-pub trait ScaleTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait ScaleTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the scaling primitive with a captured factor.
     fn scale_op(factor: V) -> Self;
 }
 
 /// Hidden staging trait for the scaling primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearScaleOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait LinearScaleOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the linear scaling primitive with a captured factor.
     fn linear_scale_op(factor: V) -> Self;
 }
@@ -92,6 +92,11 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for ScaleOperation<ArrayType,
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Self::abstract_eval_static(input_types)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("factor", self.factor()))
     }
 }
 
@@ -207,7 +212,7 @@ mod tests {
             transpose_program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = scale %0
+                let %1:f64[] = scale [factor=3] %0
                 in (%1)
             "}
             .trim_end(),

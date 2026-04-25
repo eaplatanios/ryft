@@ -1,4 +1,4 @@
-use std::{fmt::Display, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
     parameters::Parameterized,
@@ -183,11 +183,8 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///
 /// Structural validation happens when the forward linear program is built and when any staged ops
 /// emitted by the rule are added to the transpose program.
-pub trait LinearOperation<
-    T: Type + Display,
-    V: Traceable<T>,
-    LinearCarrier: Clone = primitive::LinearPrimitiveOperation<V>,
->: Operation<T>
+pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearPrimitiveOperation<V>>:
+    Operation<T>
 {
     /// Applies the transpose rule for reverse-mode differentiation.
     ///
@@ -213,7 +210,6 @@ pub trait LinearOperation<
 /// through bounds on `E::Value` and [`EngineTangent<E>`].
 pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type>
 where
-    E::Type: Display,
     E::Value: Differentiable<E::Type>,
 {
     /// Applies the forward-mode JVP rule.
@@ -308,6 +304,11 @@ impl<O: Operation<T> + ?Sized, T: Type> Operation<T> for Arc<O> {
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         (**self).infer_output_types(input_types)
     }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        (**self).render(formatter, indentation)
+    }
 }
 
 impl<O: InterpretableOperation<T, V> + ?Sized, T: Type, V: Traceable<T>> InterpretableOperation<T, V> for Arc<O> {
@@ -317,7 +318,7 @@ impl<O: InterpretableOperation<T, V> + ?Sized, T: Type, V: Traceable<T>> Interpr
     }
 }
 
-impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type + Display, V: Traceable<T>, LinearCarrier: Clone>
+impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type, V: Traceable<T>, LinearCarrier: Clone>
     LinearOperation<T, V, LinearCarrier> for Arc<O>
 {
     #[inline]
@@ -335,7 +336,6 @@ impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type + Display, V: Tra
 impl<InnerOperation: DifferentiableOperation<E> + ?Sized, E: DifferentiableEngine + ?Sized> DifferentiableOperation<E>
     for Arc<InnerOperation>
 where
-    E::Type: Display,
     E::Value: Differentiable<E::Type>,
 {
     #[inline]

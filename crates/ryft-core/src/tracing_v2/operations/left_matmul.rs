@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
-use crate::tracing::{Traceable, TracingError, Value};
+use crate::tracing::{OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
     engines::{DifferentiableEngine, Engine},
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
@@ -26,7 +26,7 @@ use super::{
 
 /// Hidden staging trait for the left matrix-multiplication primitive.
 #[doc(hidden)]
-pub trait LeftMatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait LeftMatMulTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the left matrix-multiplication primitive
     /// with a captured factor.
     fn left_matmul_op(factor: V) -> Self;
@@ -34,7 +34,7 @@ pub trait LeftMatMulTracingOperation<T: Type + Display, V: Traceable<T>>: Clone 
 
 /// Hidden staging trait for the left matrix-multiplication primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearLeftMatMulOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait LinearLeftMatMulOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the linear left matrix-multiplication
     /// primitive with a captured factor.
     fn linear_left_matmul_op(factor: V) -> Self;
@@ -94,6 +94,11 @@ impl<V: MatrixValue> Operation<ArrayType> for LeftMatMulOperation<V> {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         left_matmul_abstract_eval(&<V as Typed<ArrayType>>::r#type(&self.factor), input_types)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("factor", self.factor()))
     }
 }
 

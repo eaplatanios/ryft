@@ -81,6 +81,9 @@ update this file so that they do not need to remind you again in the future.
   signature.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
   relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
+- When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
+  reparameterized form (e.g., `Input::To<T>`) instead of introducing a separate generic metadata type that is
+  only coupled by matching `ParameterStructure`s.
 
 #### Formatting & Naming
 
@@ -94,6 +97,8 @@ update this file so that they do not need to remind you again in the future.
   `Result<_, Error>`; reserve `try_from_*` for trait-based conversions or when an infallible `from_*` already exists.
 - Always name the formatter argument `formatter` in `Display` and `Debug` implementations; do not use `f` or any other
   shorthand.
+- When writing indentation into `std::fmt::Formatter`, prefer inline width-based formatting like
+  `write!(formatter, "{:indentation$}", "")` over per-space loops or one-off helper functions.
 - For user-requested renames or removals, always run a targeted search afterward to verify that no old identifier
   references remain in the `ryft` codebase.
 - Use `r#type`, `r#await`, etc. when a reserved Rust keyword must be used as an identifier.

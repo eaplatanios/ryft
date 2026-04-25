@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    fmt::Debug,
+    fmt::{Debug, Display},
     ops::{Add, Mul, Neg},
 };
 
@@ -184,6 +184,12 @@ impl<V: Parameter> Typed<ArrayType> for ArrayBatch<V> {
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
+    }
+}
+
+impl<V: Display + Parameter> Display for ArrayBatch<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "batch(value={}, axis={:?})", self.value, self.batch_axis)
     }
 }
 
@@ -620,6 +626,19 @@ impl<V: Parameter> Typed<ArrayType> for ReferenceBatch<V> {
     }
 }
 
+impl<V: Display + Parameter> Display for ReferenceBatch<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "reference_batch(")?;
+        for (index, lane) in self.lanes.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+            Display::fmt(lane, formatter)?;
+        }
+        write!(formatter, ")")
+    }
+}
+
 impl<V: Traceable<ArrayType>> Traceable<ArrayType> for ReferenceBatch<V> {}
 
 impl<V: Value<ArrayType>> Value<ArrayType> for ReferenceBatch<V> {}
@@ -918,6 +937,12 @@ mod tests {
     }
 
     impl Parameter for TestArray {}
+
+    impl Display for TestArray {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{:?}", self.values)
+        }
+    }
 
     impl Typed<ArrayType> for TestArray {
         fn r#type(&self) -> Cow<'_, ArrayType> {

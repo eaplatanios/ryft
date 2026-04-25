@@ -9,7 +9,7 @@ use indoc::indoc;
 use crate::{
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
-    tracing::{Traceable, TracingError},
+    tracing::{OperationFormatter, Traceable, TracingError},
     tracing_v2::{
         MatrixOps,
         engines::{DifferentiableEngine, Engine},
@@ -28,7 +28,7 @@ use super::{
 
 /// Hidden staging trait for the reshape primitive.
 #[doc(hidden)]
-pub trait ReshapeTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait ReshapeTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the reshape primitive with explicit input
     /// and output abstract types.
     fn reshape_op(input_type: T, output_type: T) -> Self;
@@ -36,7 +36,7 @@ pub trait ReshapeTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
 
 /// Hidden staging trait for the reshape primitive in linear programs.
 #[doc(hidden)]
-pub trait LinearReshapeOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait LinearReshapeOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the linear reshape primitive with explicit
     /// input and output abstract types.
     fn linear_reshape_op(input_type: T, output_type: T) -> Self;
@@ -408,6 +408,13 @@ impl Operation<ArrayType> for ReshapeOperation {
         }
         Ok(vec![self.output_type().clone()])
     }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("input_type", self.input_type())?;
+            operation.field("output_type", self.output_type())
+        })
+    }
 }
 
 impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation {
@@ -709,7 +716,7 @@ mod tests {
             compiled.to_string(),
             indoc! {"
                 lambda %0:f64[2, 2] .
-                let %1:f64[1, 4] = reshape[1, 4] %0
+                let %1:f64[1, 4] = reshape [input_type=f64[2, 2], output_type=f64[1, 4]] %0
                 in (%1)
             "}
             .trim_end(),

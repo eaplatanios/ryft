@@ -16,7 +16,7 @@ use super::{
 
 /// Hidden staging trait for the sine primitive.
 #[doc(hidden)]
-pub trait SinTracingOperation<T: Type + Display, V: Traceable<T>>: Clone {
+pub trait SinTracingOperation<T: Type, V: Traceable<T>>: Clone {
     /// Constructs the carrier-specific representation of the sine primitive.
     fn sin_op() -> Self;
 }

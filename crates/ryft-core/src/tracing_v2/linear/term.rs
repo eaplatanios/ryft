@@ -8,11 +8,7 @@ use super::*;
 /// in a shared linear-program builder and stages new linear instructions as it is combined with other
 /// terms.
 #[derive(Clone, Parameter)]
-pub struct LinearTerm<
-    T: Type + Display,
-    V: Traceable<T> + Parameter,
-    O: Clone + Operation<T> = LinearPrimitiveOperation<V>,
-> {
+pub struct LinearTerm<T: Type, V: Traceable<T> + Parameter, O: Clone + Operation<T> = LinearPrimitiveOperation<V>> {
     /// Atom id representing this symbolic tangent or cotangent inside the shared linear builder.
     pub atom: AtomId,
 
@@ -20,13 +16,13 @@ pub struct LinearTerm<
     pub builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> std::fmt::Debug for LinearTerm<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> std::fmt::Debug for LinearTerm<T, V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("LinearTerm").field("atom", &self.atom).finish()
     }
 }
 
-impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, V, O> {
+impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, V, O> {
     /// Reconstructs a linear term from already-staged parts.
     ///
     /// This is mainly used by the linearization and transpose helpers when they need to hand
@@ -127,7 +123,7 @@ impl<T: Type + Display, V: Traceable<T>, O: Clone + Operation<T>> LinearTerm<T, 
 }
 
 impl<
-    T: Type + Display,
+    T: Type,
     V: Traceable<T> + ZeroLike,
     O: LinearAddOperation<T, V> + LinearNegOperation<T, V> + LinearScaleOperation<T, V> + Operation<T>,
 > TangentSpace<T, V> for LinearTerm<T, V, O>
