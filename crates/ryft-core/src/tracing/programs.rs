@@ -79,7 +79,7 @@ pub struct AtomId {
 
 impl Display for AtomId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.index)
+        write!(formatter, "%{}", self.index)
     }
 }
 
@@ -457,10 +457,12 @@ impl<
 > Display for Program<T, V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let format_atom = |id: AtomId| format!("%{id}");
-        let format_typed_atom = |id: AtomId| format!("%{id}:{}", self.atoms[id.index].r#type());
-
-        let inputs = self.input_ids.iter().map(|input| format_typed_atom(*input)).collect::<Vec<_>>().join(", ");
+        let inputs = self
+            .input_ids
+            .iter()
+            .map(|input| format!("{input}:{}", self.atoms[input.index].r#type()))
+            .collect::<Vec<_>>()
+            .join(", ");
         writeln!(formatter, "lambda {inputs} .")?;
 
         let mut instruction_by_first_output = vec![None; self.atoms.len()];
@@ -479,7 +481,12 @@ impl<
             match atom {
                 Atom::Constant(_) => {
                     let prefix = if binding_count == 0 { "let" } else { "   " };
-                    writeln!(formatter, "{prefix} {} = const", format_typed_atom(AtomId { index: atom_id }))?;
+                    writeln!(
+                        formatter,
+                        "{prefix} {}:{} = const",
+                        AtomId { index: atom_id },
+                        self.atoms[atom_id].r#type()
+                    )?;
                     binding_count += 1;
                 }
                 Atom::Variable(_) if input_atom_flags[atom_id] => {}
@@ -491,11 +498,10 @@ impl<
                     let outputs = instruction
                         .outputs
                         .iter()
-                        .map(|output| format_typed_atom(*output))
+                        .map(|output| format!("{output}:{}", self.atoms[output.index].r#type()))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let inputs =
-                        instruction.inputs.iter().map(|input| format_atom(*input)).collect::<Vec<_>>().join(" ");
+                    let inputs = instruction.inputs.iter().map(|input| input.to_string()).collect::<Vec<_>>().join(" ");
                     let prefix = if binding_count == 0 { "let" } else { "   " };
                     if inputs.is_empty() {
                         writeln!(formatter, "{prefix} {outputs} = {}", instruction.operation)?;
@@ -507,7 +513,7 @@ impl<
             }
         }
 
-        let outputs = self.output_ids.iter().map(|output| format_atom(*output)).collect::<Vec<_>>().join(", ");
+        let outputs = self.output_ids.iter().map(|output| output.to_string()).collect::<Vec<_>>().join(", ");
         write!(formatter, "in ({outputs})")
     }
 }
@@ -644,6 +650,11 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn atom_id_display_uses_percent_prefix() {
+        assert_eq!(AtomId { index: 42 }.to_string(), "%42");
+    }
 
     #[test]
     fn atom_as_constant_returns_only_literal_values() {
