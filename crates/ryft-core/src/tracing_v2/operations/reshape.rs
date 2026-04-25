@@ -725,7 +725,7 @@ mod tests {
             ArrayType,
             ndarray::Array2<f64>,
             LinearPrimitiveOperation<ndarray::Array2<f64>>,
-        >::new()));
+        >::new(Vec::new())));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ReshapeOperation::new(
@@ -744,11 +744,10 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_program = transpose_builder.build::<ndarray::Array2<f64>, ndarray::Array2<f64>>(
-            vec![contribution_atom],
-            Placeholder,
-            Placeholder,
-        );
+        let transpose_program = transpose_builder
+            .into_typed::<ndarray::Array2<f64>, ndarray::Array2<f64>>(Placeholder)
+            .build(vec![contribution_atom], Placeholder)
+            .unwrap();
         assert_eq!(
             transpose_program.interpret(arr2(&[[1.0f64, 2.0, 3.0, 4.0]])).unwrap(),
             arr2(&[[1.0f64, 2.0], [3.0, 4.0]])

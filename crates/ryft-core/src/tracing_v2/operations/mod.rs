@@ -57,6 +57,9 @@ pub mod right_matmul;
 /// Scalar and tensor scaling.
 pub mod scale;
 
+/// Traced static scan loop.
+pub mod scan;
+
 /// Elementwise sine.
 pub mod sin;
 
@@ -79,6 +82,12 @@ pub use rematerialize::{
 pub use reshape::{LinearReshapeOperation, ReshapeOperation, ReshapeTracingOperation};
 pub use right_matmul::{LinearRightMatMulOperation, RightMatMulOperation, RightMatMulTracingOperation};
 pub use scale::{LinearScaleOperation, ScaleOperation, ScaleTracingOperation};
+pub use scan::{
+    FlatTracedScan, LeadingAxisTracingOperation, LinearizedScanJvpOperation, LinearizedScanTransposeOperation,
+    ScanError, ScanOperation, ScanOptions, ScanTracingOperation, ScanUnroll, ScanValue,
+    ScatterLeadingAxisSliceOperation, SliceLeadingAxisOperation, StackLeadingAxisOperation, scan, scan_with_options,
+    scan_without_xs, scan_without_xs_with_options,
+};
 pub use sin::{Sin, SinOperation, SinTracingOperation};
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
@@ -124,7 +133,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder, ScaleOperation};
 ///
 ///   let builder =
-///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
 ///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
@@ -140,7 +149,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   use ryft_core::tracing_v2::{AddOperation, LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder};
 ///
 ///   let builder =
-///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
 ///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
@@ -160,7 +169,9 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   };
 ///
 ///   let builder = Rc::new(RefCell::new(
-///       ProgramBuilder::<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>::new(),
+///       ProgramBuilder::<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>::new(
+///           Vec::new(),
+///       ),
 ///   ));
 ///   let cotangent_atom = builder.borrow_mut().add_input(arr2(&[[1.0, 2.0], [3.0, 4.0]]).r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());

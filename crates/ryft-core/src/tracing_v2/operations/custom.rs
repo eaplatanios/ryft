@@ -669,7 +669,8 @@ mod tests {
     #[test]
     fn test_custom_primitive_missing_transpose_rule_reports_targeted_error() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
         let cotangent_atom = builder.borrow_mut().add_input(0.0f64.r#type().into_owned());
         let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder);
 

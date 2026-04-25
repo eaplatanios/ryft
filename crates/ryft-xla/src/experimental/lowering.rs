@@ -16,7 +16,8 @@ use ryft_core::tracing_v2::{
     operations::{
         AddOperation, CosOperation, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
         MatrixTransposeOperation, MulOperation, NegOperation, RematerializeOperation, ReshapeOperation,
-        RightMatMulOperation, ScaleOperation, SinOperation,
+        RightMatMulOperation, ScaleOperation, ScanOperation, ScatterLeadingAxisSliceOperation, SinOperation,
+        SliceLeadingAxisOperation, StackLeadingAxisOperation,
     },
 };
 use ryft_core::types::{ArrayType, DataType, Size, Typed};
@@ -135,6 +136,15 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
         )
+    }
+
+    /// Lowers one nested scan operation to a StableHLO while loop.
+    pub(crate) fn lower_scan(
+        &mut self,
+        scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_scan_to_while(scan_op, input_values, &mut self.block, self.context, self.location)
     }
 }
 
@@ -401,6 +411,126 @@ impl<V: MlirLowerableValue> XlaOperation<V> for ReshapeOperation {
     }
 }
 
+impl<V: MlirLowerableValue> XlaOperation<V> for SliceLeadingAxisOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if input_values.len() != 1 {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!("slice expected 1 lowered input but got {}", input_values.len()),
+            });
+        }
+        let mut start_indices = vec![0; self.input_type().rank()];
+        start_indices[self.axis()] = self.index();
+        let mut limit_indices = static_dimensions(self.input_type())?;
+        limit_indices[self.axis()] = self.index() + 1;
+        let strides = vec![1; self.input_type().rank()];
+        let slice = lowerer.block.append_operation(stable_hlo::slice(
+            input_values[0],
+            start_indices.as_slice(),
+            limit_indices.as_slice(),
+            strides.as_slice(),
+            lowerer.location,
+        ));
+        let output_shape = static_dimensions(self.output_type())?;
+        let result = lowerer.block.append_operation(stable_hlo::reshape(
+            slice.result(0).expect("stablehlo.slice should return one result"),
+            output_shape.as_slice(),
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue> XlaOperation<V> for ScatterLeadingAxisSliceOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if input_values.len() != 1 {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!("scatter expected 1 lowered input but got {}", input_values.len()),
+            });
+        }
+        let zero =
+            lower_zero_tensor_constant(&mut lowerer.block, lowerer.context, lowerer.location, self.output_type())?;
+        let mut update_shape = static_dimensions(self.output_type())?;
+        update_shape[self.axis()] = 1;
+        let update = lowerer.block.append_operation(stable_hlo::reshape(
+            input_values[0],
+            update_shape.as_slice(),
+            lowerer.location,
+        ));
+        let mut start_indices = Vec::with_capacity(self.output_type().rank());
+        for axis in 0..self.output_type().rank() {
+            let index = if axis == self.axis() { self.index() as i64 } else { 0 };
+            start_indices.push(lower_i64_scalar_constant(
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                index,
+            )?);
+        }
+        let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+            zero,
+            update.result(0).expect("stablehlo.reshape should return one result").as_ref(),
+            start_indices.as_slice(),
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue> XlaOperation<V> for StackLeadingAxisOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if input_values.len() != self.length() {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!("stack expected {} lowered input(s) but got {}", self.length(), input_values.len()),
+            });
+        }
+        if input_values.is_empty() {
+            return Ok(vec![lower_zero_tensor_constant(
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                self.output_type(),
+            )?]);
+        }
+        let mut slice_shape = static_dimensions(self.output_type())?;
+        slice_shape[self.axis()] = 1;
+        let reshaped_inputs = input_values
+            .iter()
+            .map(|input| {
+                let reshape = lowerer.block.append_operation(stable_hlo::reshape(
+                    *input,
+                    slice_shape.as_slice(),
+                    lowerer.location,
+                ));
+                reshape.result(0).expect("stablehlo.reshape should return one result").as_ref()
+            })
+            .collect::<Vec<_>>();
+        let result = lowerer.block.append_operation(stable_hlo::concatenate(
+            reshaped_inputs.as_slice(),
+            self.axis(),
+            lowerer.location,
+        ));
+        Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
+    }
+}
+
 impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -495,7 +625,31 @@ impl XlaOperation<ShardMapTensor> for XlaPrimitiveOperation {
                     lowerer,
                 )
             }
+            Self::SliceLeadingAxis(op) => <SliceLeadingAxisOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                op,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::ScatterLeadingAxisSlice(op) => {
+                <ScatterLeadingAxisSliceOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                    op,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            Self::StackLeadingAxis(op) => <StackLeadingAxisOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                op,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             Self::Rematerialize(remat) => lowerer.lower_rematerialize(remat.as_ref(), input_values),
+            Self::Scan(scan) => lowerer.lower_scan(scan.as_ref(), input_values),
             Self::ShardMap(shard_map_op) => {
                 let simplified_body = shard_map_op
                     .body()
@@ -649,7 +803,31 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for PrimitiveOperation<V
                     lowerer,
                 )
             }
+            PrimitiveOperation::SliceLeadingAxis(op) => <SliceLeadingAxisOperation as XlaOperation<V>>::lower_to_mlir(
+                op,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            PrimitiveOperation::ScatterLeadingAxisSlice(op) => {
+                <ScatterLeadingAxisSliceOperation as XlaOperation<V>>::lower_to_mlir(
+                    op,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            PrimitiveOperation::StackLeadingAxis(op) => <StackLeadingAxisOperation as XlaOperation<V>>::lower_to_mlir(
+                op,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             PrimitiveOperation::Rematerialize(remat) => lowerer.lower_rematerialize(remat, input_values),
+            PrimitiveOperation::Scan(_) => Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() }),
             PrimitiveOperation::Custom(_) => {
                 Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() })
             }
@@ -723,6 +901,33 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
                     lowerer,
                 )
             }
+            LinearPrimitiveOperation::SliceLeadingAxis(op) => {
+                <SliceLeadingAxisOperation as XlaOperation<V>>::lower_to_mlir(
+                    op,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            LinearPrimitiveOperation::ScatterLeadingAxisSlice(op) => {
+                <ScatterLeadingAxisSliceOperation as XlaOperation<V>>::lower_to_mlir(
+                    op,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            LinearPrimitiveOperation::StackLeadingAxis(op) => {
+                <StackLeadingAxisOperation as XlaOperation<V>>::lower_to_mlir(
+                    op,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             LinearPrimitiveOperation::Rematerialize(remat) => {
                 <LinearRematerializeOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
                     remat,
@@ -732,8 +937,20 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
                     lowerer,
                 )
             }
-            LinearPrimitiveOperation::Custom(_) => {
+            LinearPrimitiveOperation::LinearScanJvp(_) | LinearPrimitiveOperation::LinearScanTranspose(_) => {
                 Err(LoweringError::UnsupportedOp { op: Operation::name(self).to_string() })
+            }
+            LinearPrimitiveOperation::Custom(custom_op) => {
+                let mut shard_map_lowerer =
+                    ShardMapMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+                custom_op
+                    .primitive()
+                    .extensions()
+                    .get::<StableHloCustomLoweringExtension<V>>()
+                    .ok_or_else(|| LoweringError::MissingCustomLowering {
+                        op: custom_op.primitive().name().to_string(),
+                    })?
+                    .lower_to_mlir(custom_op.primitive().as_ref(), input_values, output_types, &mut shard_map_lowerer)
             }
         }
     }
@@ -760,6 +977,14 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         lower_tensor_type(array_type, self.context, self.location)
     }
 
+    /// Lowers one literal value inside this lowering context.
+    pub(crate) fn lower_literal_value<V: MlirLowerableValue>(
+        &mut self,
+        value: &V,
+    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        lower_literal_value(value, &mut self.block, self.context, self.location)
+    }
+
     /// Lowers one nested `rematerialize` op by inlining the body sub-program into the current block
     /// and placing an optimization barrier on the boundary outputs.
     pub(crate) fn lower_rematerialize<V: MlirLowerableValue, O: Clone + XlaOperation<V>, L: Clone>(
@@ -774,6 +999,15 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
         )
+    }
+
+    /// Lowers one nested scan operation inside this lowering context.
+    pub(crate) fn lower_scan(
+        &mut self,
+        scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        lower_scan_to_while(scan_op, input_values, &mut self.block, self.context, self.location)
     }
 
     /// Lowers one nested Shardy manual computation operation inside this lowering context.
@@ -1172,6 +1406,9 @@ where
             XlaPrimitiveOperation::LinearShardMap(shard_map_op) => {
                 mesh = collect_nested_linear_shard_map_mesh(shard_map_op.eval_mode(), mesh)?;
             }
+            XlaPrimitiveOperation::Scan(scan_op) => {
+                mesh = collect_nested_sharding_mesh(scan_op.body().program(), mesh)?;
+            }
             XlaPrimitiveOperation::WithShardingConstraint(sharding_constraint_op) => {
                 mesh = Some(match mesh.take() {
                     Some(existing_mesh) => {
@@ -1261,6 +1498,387 @@ fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError
             Size::Dynamic(_) => Err(LoweringError::InvalidTensorType { array_type: array_type.clone() }),
         })
         .collect()
+}
+
+fn lower_i64_scalar_constant<'b, 'c: 'b, 't: 'c>(
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    value: i64,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let tensor_type = context
+        .tensor_type(context.signless_integer_type(64), &[], None, location)
+        .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I64) })?;
+    let elements = context
+        .dense_i64_elements_attribute(tensor_type, &[value])
+        .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+    let constant = block.append_operation(stable_hlo::constant(elements, location));
+    Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+}
+
+fn lower_zero_tensor_constant<'b, 'c: 'b, 't: 'c>(
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    array_type: &ArrayType,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let tensor_type = lower_tensor_type(array_type, context, location)?;
+    let elements =
+        lower_constant_elements_attribute(array_type.data_type, tensor_type, ShardMapConstantKind::Zero, context)?;
+    let constant = block.append_operation(stable_hlo::constant(elements, location));
+    Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+}
+
+fn lower_xla_program_inline<'b, 'c: 'b, 't: 'c>(
+    program: &Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let mut atom_values = vec![None; program.atoms.len()];
+    for (atom_id, mlir_value) in program.input_ids.iter().copied().zip(input_values.iter().copied()) {
+        atom_values[atom_id.index] = Some(mlir_value);
+    }
+
+    let mut instruction_by_first_output = vec![None; program.atoms.len()];
+    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
+        if let Some(first_output) = instruction.outputs.first() {
+            instruction_by_first_output[first_output.index] = Some(instruction_index);
+        }
+    }
+    let mut input_atom_flags = vec![false; program.atoms.len()];
+    for input_atom in program.input_ids.iter().copied() {
+        input_atom_flags[input_atom.index] = true;
+    }
+
+    for atom_index in 0..program.atoms.len() {
+        let atom_id = AtomId { index: atom_index };
+        let atom = &program.atoms[atom_index];
+        match atom {
+            Atom::Constant(value) => {
+                atom_values[atom_index] = Some(lower_constant(atom_id, value, block, context, location)?);
+            }
+            Atom::Variable(_) if input_atom_flags[atom_index] => {}
+            Atom::Variable(_) => {
+                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
+                    continue;
+                };
+                let instruction = &program.instructions[instruction_index];
+                let inputs = instruction
+                    .inputs
+                    .iter()
+                    .map(|input| atom_values[input.index].ok_or(LoweringError::MissingAtomValue { atom_id: *input }))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let lowered_outputs = lower_instruction(
+                    program,
+                    instruction_index,
+                    atom_values.as_slice(),
+                    inputs.as_slice(),
+                    block,
+                    context,
+                    location,
+                )?;
+                for (output_atom, lowered_output) in
+                    instruction.outputs.iter().copied().zip(lowered_outputs.into_iter())
+                {
+                    atom_values[output_atom.index] = Some(lowered_output);
+                }
+            }
+        }
+    }
+
+    let outputs = program
+        .output_ids
+        .iter()
+        .map(|output| atom_values[output.index].ok_or(LoweringError::MissingAtomValue { atom_id: *output }))
+        .collect::<Result<Vec<_>, _>>()?;
+    if outputs.is_empty() {
+        return Ok(outputs);
+    }
+    let barrier = block.append_operation(stable_hlo::optimization_barrier(outputs.as_slice(), location));
+    Ok((0..outputs.len())
+        .map(|index| {
+            barrier
+                .result(index)
+                .expect("stablehlo.optimization_barrier should return one result per operand")
+                .as_ref()
+        })
+        .collect::<Vec<_>>())
+}
+
+fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
+    scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
+    carry_values: &[ValueRef<'b, 'c, 't>],
+    xs_values: &[ValueRef<'b, 'c, 't>],
+    ys_values: &[ValueRef<'b, 'c, 't>],
+    counter: ValueRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError> {
+    let length = scan_op.body().length();
+    let carry_count = scan_op.body().carry_types().len();
+    let xs_count = scan_op.body().xs_types().len();
+    let y_count = scan_op.body().y_types().len();
+    if carry_values.len() != carry_count || xs_values.len() != xs_count || ys_values.len() != y_count {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!(
+                "scan iteration expected ({carry_count}, {xs_count}, {y_count}) carry/xs/ys values but got ({}, {}, {})",
+                carry_values.len(),
+                xs_values.len(),
+                ys_values.len(),
+            ),
+        });
+    }
+
+    let zero = lower_i64_scalar_constant(block, context, location, 0)?;
+    let scan_index = if scan_op.reverse() {
+        let last_index = lower_i64_scalar_constant(block, context, location, length as i64 - 1)?;
+        let subtract = block.append_operation(stable_hlo::subtract(last_index, counter, location));
+        subtract.result(0).expect("stablehlo.subtract should return one result").as_ref()
+    } else {
+        counter
+    };
+
+    let mut x_slices = Vec::with_capacity(xs_count);
+    for (xs_value, (xs_type, x_type)) in
+        xs_values.iter().zip(scan_op.body().xs_types().iter().zip(scan_op.body().x_types()))
+    {
+        let mut start_indices = Vec::with_capacity(xs_type.rank());
+        start_indices.push(scan_index);
+        start_indices.extend((1..xs_type.rank()).map(|_| zero));
+        let mut slice_sizes = static_dimensions(xs_type)?;
+        slice_sizes[0] = 1;
+        let slice = block.append_operation(stable_hlo::dynamic_slice(
+            *xs_value,
+            start_indices.as_slice(),
+            slice_sizes.as_slice(),
+            location,
+        ));
+        let x_shape = static_dimensions(x_type)?;
+        let x_slice = block.append_operation(stable_hlo::reshape(
+            slice.result(0).expect("stablehlo.dynamic_slice should return one result"),
+            x_shape.as_slice(),
+            location,
+        ));
+        x_slices.push(x_slice.result(0).expect("stablehlo.reshape should return one result").as_ref());
+    }
+
+    let mut body_inputs = Vec::with_capacity(carry_count + xs_count);
+    body_inputs.extend(carry_values.iter().copied());
+    body_inputs.extend(x_slices);
+    let body_outputs =
+        lower_xla_program_inline(scan_op.body().program(), body_inputs.as_slice(), block, context, location)?;
+    let new_carry = body_outputs[..carry_count].to_vec();
+    let y_outputs = &body_outputs[carry_count..];
+
+    let mut updated_ys = Vec::with_capacity(y_count);
+    for (ys_value, (ys_type, y_value)) in ys_values.iter().zip(scan_op.body().ys_types().iter().zip(y_outputs)) {
+        let update_shape = static_dimensions(ys_type)?
+            .into_iter()
+            .enumerate()
+            .map(|(dimension, size)| if dimension == 0 { 1 } else { size })
+            .collect::<Vec<_>>();
+        let update = block.append_operation(stable_hlo::reshape(*y_value, update_shape.as_slice(), location));
+        let mut start_indices = Vec::with_capacity(ys_type.rank());
+        start_indices.push(scan_index);
+        start_indices.extend((1..ys_type.rank()).map(|_| zero));
+        let updated = block.append_operation(stable_hlo::dynamic_update_slice(
+            *ys_value,
+            update.result(0).expect("stablehlo.reshape should return one result").as_ref(),
+            start_indices.as_slice(),
+            location,
+        ));
+        updated_ys.push(updated.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref());
+    }
+
+    Ok((new_carry, updated_ys))
+}
+
+pub(crate) fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
+    scan_op: &ScanOperation<ArrayType, ShardMapTensor, XlaPrimitiveOperation>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    let length = scan_op.body().length();
+
+    let carry_count = scan_op.body().carry_types().len();
+    let xs_count = scan_op.body().xs_types().len();
+    let y_count = scan_op.body().y_types().len();
+    let expected_input_count = carry_count + xs_count;
+    if input_values.len() != expected_input_count {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("scan expected {expected_input_count} lowered inputs but got {}", input_values.len()),
+        });
+    }
+
+    let mut carry_values = input_values[..carry_count].to_vec();
+    let xs_values = input_values[carry_count..].to_vec();
+    let mut ys_values = scan_op
+        .body()
+        .ys_types()
+        .iter()
+        .map(|ys_type| lower_zero_tensor_constant(block, context, location, ys_type))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unroll_factor = scan_op.unroll().factor(length).max(1);
+
+    if unroll_factor < length {
+        let rolled_length = length / unroll_factor * unroll_factor;
+        let counter_type = context
+            .tensor_type(context.signless_integer_type(64), &[], None, location)
+            .ok_or_else(|| LoweringError::InvalidTensorType { array_type: ArrayType::scalar(DataType::I64) })?;
+        let mut state_types = Vec::<TypeRef<'c, 't>>::with_capacity(1 + carry_count + xs_count + y_count);
+        state_types.push(counter_type.as_ref());
+        for array_type in scan_op
+            .body()
+            .carry_types()
+            .iter()
+            .chain(scan_op.body().xs_types().iter())
+            .chain(scan_op.body().ys_types().iter())
+        {
+            state_types.push(lower_tensor_type(array_type, context, location)?.as_ref());
+        }
+        let state_block_arguments = state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
+
+        let initial_counter = lower_i64_scalar_constant(block, context, location, 0)?;
+        let mut initial_state = Vec::with_capacity(state_types.len());
+        initial_state.push(initial_counter);
+        initial_state.extend(carry_values.iter().copied());
+        initial_state.extend(xs_values.iter().copied());
+        initial_state.extend(ys_values.iter().copied());
+
+        let mut condition_region = context.region();
+        let condition_block = context.block(state_block_arguments.as_slice());
+        {
+            let mut condition_block_ref = condition_block.as_ref();
+            let limit = lower_i64_scalar_constant(&mut condition_block_ref, context, location, rolled_length as i64)?;
+            let compare = condition_block_ref.append_operation(stable_hlo::compare(
+                condition_block_ref.argument(0).expect("scan condition should have counter argument"),
+                limit,
+                stable_hlo::ComparisonDirection::LessThan,
+                stable_hlo::ComparisonType::Signed,
+                location,
+            ));
+            let predicate = compare.result(0).expect("stablehlo.compare should return one result").as_ref();
+            condition_block_ref.append_operation(stable_hlo::r#return(&[predicate], location));
+        }
+        condition_region.append_block(condition_block);
+
+        let mut body_region = context.region();
+        let body_block = context.block(state_block_arguments.as_slice());
+        {
+            let mut body_block_ref = body_block.as_ref();
+            let mut counter = body_block_ref.argument(0).expect("scan body should have counter argument").as_ref();
+            let one = lower_i64_scalar_constant(&mut body_block_ref, context, location, 1)?;
+            let mut body_carry_values = (0..carry_count)
+                .map(|index| {
+                    body_block_ref.argument(1 + index).expect("scan body should have carry arguments").as_ref()
+                })
+                .collect::<Vec<_>>();
+            let xs_arguments_offset = 1 + carry_count;
+            let ys_arguments_offset = xs_arguments_offset + xs_count;
+            let body_xs_values = (0..xs_count)
+                .map(|index| {
+                    body_block_ref
+                        .argument(xs_arguments_offset + index)
+                        .expect("scan body should have xs arguments")
+                        .as_ref()
+                })
+                .collect::<Vec<_>>();
+            let mut body_ys_values = (0..y_count)
+                .map(|index| {
+                    body_block_ref
+                        .argument(ys_arguments_offset + index)
+                        .expect("scan body should have ys accumulator arguments")
+                        .as_ref()
+                })
+                .collect::<Vec<_>>();
+
+            for _ in 0..unroll_factor {
+                let (next_carry, next_ys) = lower_scan_iteration(
+                    scan_op,
+                    body_carry_values.as_slice(),
+                    body_xs_values.as_slice(),
+                    body_ys_values.as_slice(),
+                    counter,
+                    &mut body_block_ref,
+                    context,
+                    location,
+                )?;
+                body_carry_values = next_carry;
+                body_ys_values = next_ys;
+                let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, one, location));
+                counter = next_counter.result(0).expect("stablehlo.add should return one result").as_ref();
+            }
+
+            let mut returned_state = Vec::with_capacity(state_types.len());
+            returned_state.push(counter);
+            returned_state.extend(body_carry_values);
+            returned_state.extend(body_xs_values);
+            returned_state.extend(body_ys_values);
+            body_block_ref.append_operation(stable_hlo::r#return(returned_state.as_slice(), location));
+        }
+        body_region.append_block(body_block);
+
+        let while_operation = block.append_operation(stable_hlo::r#while(
+            initial_state.as_slice(),
+            condition_region.into(),
+            body_region.into(),
+            location,
+        ));
+        carry_values = (0..carry_count)
+            .map(|index| while_operation.result(1 + index).expect("scan while should return carry results").as_ref())
+            .collect();
+        let ys_results_offset = 1 + carry_count + xs_count;
+        ys_values = (0..y_count)
+            .map(|index| {
+                while_operation
+                    .result(ys_results_offset + index)
+                    .expect("scan while should return ys accumulator results")
+                    .as_ref()
+            })
+            .collect();
+
+        for counter in rolled_length..length {
+            let counter = lower_i64_scalar_constant(block, context, location, counter as i64)?;
+            let (next_carry, next_ys) = lower_scan_iteration(
+                scan_op,
+                carry_values.as_slice(),
+                xs_values.as_slice(),
+                ys_values.as_slice(),
+                counter,
+                block,
+                context,
+                location,
+            )?;
+            carry_values = next_carry;
+            ys_values = next_ys;
+        }
+    } else {
+        for counter in 0..length {
+            let counter = lower_i64_scalar_constant(block, context, location, counter as i64)?;
+            let (next_carry, next_ys) = lower_scan_iteration(
+                scan_op,
+                carry_values.as_slice(),
+                xs_values.as_slice(),
+                ys_values.as_slice(),
+                counter,
+                block,
+                context,
+                location,
+            )?;
+            carry_values = next_carry;
+            ys_values = next_ys;
+        }
+    }
+
+    let mut outputs = Vec::with_capacity(carry_count + y_count);
+    outputs.extend(carry_values);
+    outputs.extend(ys_values);
+    Ok(outputs)
 }
 
 /// Inlines a rematerialize body's sub-program into the given block by mapping the provided input
@@ -1800,7 +2418,41 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             ));
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
+        XlaPrimitiveOperation::SliceLeadingAxis(op) => {
+            let mut plain_lowerer =
+                PlainMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+            <SliceLeadingAxisOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                op,
+                input_values,
+                output_types,
+                PlainMlirLoweringMode::Unpacked,
+                &mut plain_lowerer,
+            )
+        }
+        XlaPrimitiveOperation::ScatterLeadingAxisSlice(op) => {
+            let mut plain_lowerer =
+                PlainMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+            <ScatterLeadingAxisSliceOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                op,
+                input_values,
+                output_types,
+                PlainMlirLoweringMode::Unpacked,
+                &mut plain_lowerer,
+            )
+        }
+        XlaPrimitiveOperation::StackLeadingAxis(op) => {
+            let mut plain_lowerer =
+                PlainMlirLowerer { block: lowerer.block, context: lowerer.context, location: lowerer.location };
+            <StackLeadingAxisOperation as XlaOperation<ShardMapTensor>>::lower_to_mlir(
+                op,
+                input_values,
+                output_types,
+                PlainMlirLoweringMode::Unpacked,
+                &mut plain_lowerer,
+            )
+        }
         XlaPrimitiveOperation::Rematerialize(remat_op) => lowerer.lower_rematerialize(remat_op.as_ref(), input_values),
+        XlaPrimitiveOperation::Scan(scan_op) => lowerer.lower_scan(scan_op.as_ref(), input_values),
         XlaPrimitiveOperation::ShardMap(shard_map_op) => {
             let simplified_body = shard_map_op
                 .body()
@@ -1827,9 +2479,17 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         XlaPrimitiveOperation::Custom(custom_op) => custom_op
             .extensions()
-            .get::<StableHloCustomLoweringExtension<ShardMapTensor>>()
-            .ok_or_else(|| LoweringError::MissingCustomLowering { op: op.name().to_string() })?
-            .lower_to_mlir(custom_op.as_ref(), input_values, output_types, lowerer),
+            .get::<LinearShardMapOperation<ShardMapTensor>>()
+            .map(|shard_map_op| {
+                lowerer.lower_linear_shard_map_eval_mode(shard_map_op.eval_mode(), captured_values, input_values)
+            })
+            .unwrap_or_else(|| {
+                custom_op
+                    .extensions()
+                    .get::<StableHloCustomLoweringExtension<ShardMapTensor>>()
+                    .ok_or_else(|| LoweringError::MissingCustomLowering { op: op.name().to_string() })?
+                    .lower_to_mlir(custom_op.as_ref(), input_values, output_types, lowerer)
+            }),
     }
 }
 
@@ -1891,6 +2551,20 @@ where
             .iter()
             .map(|atom_id| atom_values[atom_id.index].ok_or(LoweringError::MissingAtomValue { atom_id: *atom_id }))
             .collect::<Result<Vec<_>, _>>()?,
+        XlaPrimitiveOperation::Custom(custom_op) => custom_op
+            .extensions()
+            .get::<LinearShardMapOperation<ShardMapTensor>>()
+            .map(|shard_map_op| {
+                shard_map_op
+                    .captured_global_primals()
+                    .iter()
+                    .map(|atom_id| {
+                        atom_values[atom_id.index].ok_or(LoweringError::MissingAtomValue { atom_id: *atom_id })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         _ => Vec::new(),
     };
     let mut lowerer = ShardMapMlirLowerer { block: *block, context, location };
@@ -2136,12 +2810,15 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError};
     use ryft_core::tracing_v2::{
-        Cos, CustomPrimitive, MatrixOps, Sin,
+        Cos, CustomPrimitive, MatrixOps, ScanOptions, ScanUnroll, Sin,
         operations::constants::{OneLike, ZeroLike},
+        scan, scan_with_options,
     };
     use ryft_core::types::{Shape, TypeError};
 
-    use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
+    use super::super::shard_map::{
+        ShardMapTracer, TracedShardMap, TracedXlaProgram, shard_map as traced_shard_map, trace as trace_xla_function,
+    };
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -2215,11 +2892,16 @@ mod tests {
         op: XlaPrimitiveOperation,
     ) -> Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, ShardMapTensor, ShardMapTensor> {
         let input_type = test_vector_type(4);
-        let mut builder =
-            ProgramBuilder::<ArrayType, ShardMapTensor, crate::experimental::ops::XlaPrimitiveOperation>::new();
+        let mut builder = ProgramBuilder::<
+            ArrayType,
+            ShardMapTensor,
+            crate::experimental::ops::XlaPrimitiveOperation,
+            ShardMapTensor,
+            ShardMapTensor,
+        >::new(Placeholder);
         let input = builder.add_input(input_type.clone());
         let output = builder.add_instruction(op, vec![input]).unwrap()[0];
-        builder.build::<ShardMapTensor, ShardMapTensor>(vec![output], Placeholder, Placeholder)
+        builder.build(vec![output], Placeholder).unwrap()
     }
 
     #[cfg(feature = "ndarray")]
@@ -2303,6 +2985,340 @@ mod tests {
                 }
             "#}
         );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_scan_to_while() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+                .unwrap()
+            },
+            (ArrayType::scalar(DataType::F32), test_vector_type(3)),
+        )
+        .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_zero_length_scan_without_loop_body() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+            |(carry, xs)| {
+                scan(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                )
+                .unwrap()
+            },
+            (ArrayType::scalar(DataType::F32), test_vector_type(0)),
+        )
+        .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("tensor<0xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_reverse_scan_indexing() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+            |(carry, xs)| {
+                scan_with_options(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                    ScanOptions::default().with_reverse(true),
+                )
+                .unwrap()
+            },
+            (ArrayType::scalar(DataType::F32), test_vector_type(3)),
+        )
+        .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.subtract"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_fully_unrolls_scan() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+            |(carry, xs)| {
+                scan_with_options(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                    ScanOptions::default().with_unroll(ScanUnroll::Full),
+                )
+                .unwrap()
+            },
+            (ArrayType::scalar(DataType::F32), test_vector_type(3)),
+        )
+        .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 3, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 3, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_partially_unrolls_scan_body_and_remainder() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+            |(carry, xs)| {
+                scan_with_options(
+                    |(carry, x)| {
+                        let next_carry = carry + x;
+                        (next_carry.clone(), next_carry)
+                    },
+                    carry,
+                    xs,
+                    ScanOptions::default().with_unroll(ScanUnroll::Count(2)),
+                )
+                .unwrap()
+            },
+            (ArrayType::scalar(DataType::F32), test_vector_type(5)),
+        )
+        .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 3, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 3, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_scan_jvp() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            trace_xla_function(
+                |(carry, xs, carry_tangent, xs_tangent)| {
+                    let (_, tangent) = ryft_core::tracing_v2::jvp(
+                        crate::experimental::engines::XlaEngine::token(),
+                        |(carry, xs)| {
+                            scan(
+                                |(carry, x)| {
+                                    let next_carry = carry + x;
+                                    (next_carry.clone(), next_carry)
+                                },
+                                carry,
+                                xs,
+                            )
+                            .unwrap()
+                        },
+                        (carry, xs),
+                        (carry_tangent, xs_tangent),
+                    )
+                    .unwrap();
+                    tangent
+                },
+                (
+                    ArrayType::scalar(DataType::F32),
+                    test_vector_type(3),
+                    ArrayType::scalar(DataType::F32),
+                    test_vector_type(3),
+                ),
+            )
+            .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert_eq!(stablehlo.matches("stablehlo.while").count(), 1, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_slice").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 1, "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.concatenate"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_zero_length_scan_jvp_without_loop_body() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            trace_xla_function(
+                |(carry, xs, carry_tangent, xs_tangent)| {
+                    let (_, tangent) = ryft_core::tracing_v2::jvp(
+                        crate::experimental::engines::XlaEngine::token(),
+                        |(carry, xs)| {
+                            scan(
+                                |(carry, x)| {
+                                    let next_carry = carry + x;
+                                    (next_carry.clone(), next_carry)
+                                },
+                                carry,
+                                xs,
+                            )
+                            .unwrap()
+                        },
+                        (carry, xs),
+                        (carry_tangent, xs_tangent),
+                    )
+                    .unwrap();
+                    tangent
+                },
+                (
+                    ArrayType::scalar(DataType::F32),
+                    test_vector_type(0),
+                    ArrayType::scalar(DataType::F32),
+                    test_vector_type(0),
+                ),
+            )
+            .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("tensor<0xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_scan_grad_with_compact_reverse_scans() {
+        fn trace_scan_grad(split_transpose: bool) -> String {
+            let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+                move |(carry, xs)| {
+                    ryft_core::tracing_v2::grad(
+                        crate::experimental::engines::XlaEngine::token(),
+                        |(carry, xs)| {
+                            let (final_carry, _) = scan_with_options(
+                                |(carry, x)| {
+                                    let next_carry = carry + x;
+                                    (next_carry.clone(), next_carry)
+                                },
+                                carry,
+                                xs,
+                                ScanOptions::default().with_split_transpose(split_transpose),
+                            )
+                            .unwrap();
+                            final_carry
+                        },
+                        (carry, xs),
+                    )
+                    .unwrap()
+                },
+                (ArrayType::scalar(DataType::F32), test_vector_type(3)),
+            )
+            .unwrap();
+            traced.to_mlir_module("main").unwrap()
+        }
+
+        let stablehlo = trace_scan_grad(false);
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.matches("stablehlo.while").count() <= 3, "{stablehlo}");
+        assert!(stablehlo.matches("stablehlo.dynamic_slice").count() < 6, "{stablehlo}");
+
+        let split_stablehlo = trace_scan_grad(true);
+        assert!(
+            split_stablehlo.matches("stablehlo.while").count() > stablehlo.matches("stablehlo.while").count(),
+            "{split_stablehlo}"
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_zero_length_scan_grad_without_loop_body() {
+        let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+            |(carry, xs)| {
+                ryft_core::tracing_v2::grad(
+                    crate::experimental::engines::XlaEngine::token(),
+                    |(carry, xs)| {
+                        let (final_carry, _) = scan(
+                            |(carry, x)| {
+                                let next_carry = carry + x;
+                                (next_carry.clone(), next_carry)
+                            },
+                            carry,
+                            xs,
+                        )
+                        .unwrap();
+                        final_carry
+                    },
+                    (carry, xs),
+                )
+                .unwrap()
+            },
+            (ArrayType::scalar(DataType::F32), test_vector_type(0)),
+        )
+        .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(!stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
+        assert!(!stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
+        assert!(stablehlo.contains("tensor<0xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_scan_grad_with_nested_shard_map_body() {
+        let mesh = test_manual_mesh("x", 4);
+        let sharding = Sharding::replicated(mesh.clone(), 0);
+        let traced: TracedXlaProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace_xla_function(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |(carry, xs)| {
+                    ryft_core::tracing_v2::grad(
+                        crate::experimental::engines::XlaEngine::token(),
+                        {
+                            let mesh = mesh.clone();
+                            let sharding = sharding.clone();
+                            move |(carry, xs)| {
+                                let (final_carry, _) = scan(
+                                    {
+                                        let mesh = mesh.clone();
+                                        let sharding = sharding.clone();
+                                        move |(carry, x)| {
+                                            let mapped =
+                                                traced_shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                                                    |local_x| local_x.clone() + local_x,
+                                                    x,
+                                                    mesh.clone(),
+                                                    sharding.clone(),
+                                                    sharding.clone(),
+                                                )
+                                                .expect("shard_map in scan body should trace");
+                                            let next_carry: ShardMapTracer = carry + mapped;
+                                            (next_carry.clone(), next_carry)
+                                        }
+                                    },
+                                    carry,
+                                    xs,
+                                )
+                                .unwrap();
+                                final_carry
+                            }
+                        },
+                        (carry, xs),
+                    )
+                    .unwrap()
+                }
+            },
+            (ArrayType::scalar(DataType::F32), test_vector_type(3)),
+        )
+        .unwrap();
+        let stablehlo = traced.to_mlir_module("main").unwrap();
+
+        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
+        assert!(stablehlo.contains("sdy.manual_computation"), "{stablehlo}");
     }
 
     #[test]

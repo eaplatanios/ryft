@@ -109,7 +109,8 @@ where
 /// [`super::program::linearize_program`]: instead of consuming concrete primals and producing a
 /// linear program immediately, it works inside an outer JIT trace and stages the resulting
 /// pushforward symbolically.
-pub(crate) fn linearize_traced_program<'engine, V, E, O>(
+#[doc(hidden)]
+pub fn linearize_traced_program<'engine, V, E, O>(
     engine: &'engine E,
     tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
@@ -125,7 +126,7 @@ where
         ArrayType,
         Tracer<'engine, E, O>,
         LinearPrimitiveOperation<Tracer<'engine, E, O>>,
-    >::new()));
+    >::new(Vec::new())));
     let traced_input = primals
         .into_iter()
         .map(|primal| {
@@ -144,11 +145,8 @@ where
         }
     };
     let program = builder
-        .build::<Vec<Tracer<'engine, E, O>>, Vec<Tracer<'engine, E, O>>>(
-            tangent_outputs,
-            vec![Placeholder; input_count],
-            vec![Placeholder; primal_outputs.len()],
-        )
+        .into_typed::<Vec<Tracer<'engine, E, O>>, Vec<Tracer<'engine, E, O>>>(vec![Placeholder; input_count])
+        .build(tangent_outputs, vec![Placeholder; primal_outputs.len()])?
         .simplified()?;
     Ok((primal_outputs.clone(), program))
 }

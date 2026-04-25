@@ -17,10 +17,13 @@ use thiserror::Error;
 
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::{Atom, AtomId, InterpretableOperation, Operation, Program, Traceable, TracingError, Value};
+use ryft_core::tracing::{
+    Atom, AtomId, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
+};
 use ryft_core::tracing_v2::operations::{
     AddOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
     constants::{OneLike, ZeroLike},
+    scan::ScanValue,
 };
 use ryft_core::tracing_v2::{Cos, Linearized, MatrixOps, Sin, Tracer, trace as trace_types};
 
@@ -322,6 +325,37 @@ impl Traceable<ArrayType> for ShardMapTensor {}
 
 impl Value<ArrayType> for ShardMapTensor {}
 
+impl ScanValue for ShardMapTensor {
+    fn scan_slice_leading_axis(&self, _index: usize) -> Result<Self, TracingError> {
+        self.scan_slice_axis(0, _index)
+    }
+
+    fn scan_empty_slice_leading_axis(&self) -> Result<Self, TracingError> {
+        self.scan_empty_slice_axis(0)
+    }
+
+    fn scan_stack_leading_axis(output_type: &ArrayType, values: Vec<Self>) -> Result<Self, TracingError> {
+        Self::scan_stack_axis(0, output_type, values)
+    }
+
+    fn scan_slice_axis(&self, axis: usize, _index: usize) -> Result<Self, TracingError> {
+        Ok(Self { array_type: self.array_type.without_dimension(axis)?.0, constant_kind: self.constant_kind })
+    }
+
+    fn scan_empty_slice_axis(&self, axis: usize) -> Result<Self, TracingError> {
+        Ok(Self { array_type: self.array_type.without_dimension(axis)?.0, constant_kind: self.constant_kind })
+    }
+
+    fn scan_stack_axis(_axis: usize, output_type: &ArrayType, values: Vec<Self>) -> Result<Self, TracingError> {
+        let constant_kind = values
+            .iter()
+            .map(|value| value.constant_kind)
+            .reduce(|left, right| if left == right { left } else { None })
+            .flatten();
+        Ok(Self { array_type: output_type.clone(), constant_kind })
+    }
+}
+
 impl ZeroLike for ShardMapTensor {
     #[inline]
     fn zero_like(&self) -> Self {
@@ -505,15 +539,13 @@ where
         }
     }
 
-    Ok(Program {
-        atoms,
-        input_ids: program.input_ids.clone(),
-        output_ids: program.output_ids.clone(),
-        instructions,
-        input_structure: program.input_structure.clone(),
-        output_structure: program.output_structure.clone(),
-        marker: std::marker::PhantomData,
-    })
+    let mut builder = ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>::new(
+        program.input_structure.clone(),
+    );
+    builder.atoms = atoms;
+    builder.input_ids = program.input_ids.clone();
+    builder.instructions = instructions;
+    builder.build(program.output_ids.clone(), program.output_structure.clone())
 }
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
@@ -1152,15 +1184,14 @@ impl FlatTracedShardMap {
         let input_count = traced.program.input_ids.len();
         let output_count = traced.program.output_ids.len();
         let Program { atoms, input_ids, output_ids, instructions, .. } = traced.program.clone();
-        let program = Program {
-            atoms,
-            input_ids,
-            output_ids,
-            instructions,
-            input_structure: vec![Placeholder; input_count],
-            output_structure: vec![Placeholder; output_count],
-            marker: std::marker::PhantomData,
-        };
+        let mut builder =
+            ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Vec<ShardMapTensor>, Vec<ShardMapTensor>>::new(
+                vec![Placeholder; input_count],
+            );
+        builder.atoms = atoms;
+        builder.input_ids = input_ids;
+        builder.instructions = instructions;
+        let program = builder.build(output_ids, vec![Placeholder; output_count]).unwrap();
         Self::from_parts(
             traced.shard_map.clone(),
             traced.global_input_types.parameters().cloned().collect::<Vec<_>>(),

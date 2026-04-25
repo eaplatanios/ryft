@@ -441,7 +441,7 @@ mod tests {
 
         let transpose_builder =
             Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(),
+                ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(Vec::new()),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
@@ -458,11 +458,10 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_program = transpose_builder.build::<ShardMapTensor, ShardMapTensor>(
-            vec![contribution_atom],
-            Placeholder,
-            Placeholder,
-        );
+        let transpose_program = transpose_builder
+            .into_typed::<ShardMapTensor, ShardMapTensor>(Placeholder)
+            .build(vec![contribution_atom], Placeholder)
+            .unwrap();
         assert_eq!(
             transpose_program.to_string(),
             format!("lambda %0:f32[8] .\nlet %1:f32[8][sharding={sharding}] = with_sharding_constraint %0\nin (%1)")
@@ -478,7 +477,7 @@ mod tests {
 
         let transpose_builder =
             Rc::new(RefCell::new(
-                ProgramBuilder::<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>::new(),
+                ProgramBuilder::<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>::new(Vec::new()),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
@@ -495,11 +494,10 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_program = transpose_builder.build::<ShardMapTracer, ShardMapTracer>(
-            vec![contribution_atom],
-            Placeholder,
-            Placeholder,
-        );
+        let transpose_program = transpose_builder
+            .into_typed::<ShardMapTracer, ShardMapTracer>(Placeholder)
+            .build(vec![contribution_atom], Placeholder)
+            .unwrap();
         assert_eq!(
             transpose_program.to_string(),
             format!("lambda %0:f32[8] .\nlet %1:f32[8][sharding={sharding}] = with_sharding_constraint %0\nin (%1)")

@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn test_scale_transpose_scales_output_cotangents() {
         let transpose_builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
         let contribution = ScaleOperation::new(3.0f64)
@@ -198,7 +198,10 @@ mod tests {
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
             .into_inner();
-        let transpose_program = transpose_builder.build::<f64, f64>(vec![contribution_atom], Placeholder, Placeholder);
+        let transpose_program = transpose_builder
+            .into_typed::<f64, f64>(Placeholder)
+            .build(vec![contribution_atom], Placeholder)
+            .unwrap();
         approx_eq(transpose_program.interpret(2.0f64).unwrap(), 6.0);
         assert_eq!(
             transpose_program.to_string(),
