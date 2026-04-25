@@ -331,26 +331,17 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>, Input: Parameterized<V>,
 
         Ok(program_builder.build(output_ids, self.input_structure.clone(), self.output_structure.clone()))
     }
-}
 
-impl<
-    T: Type,
-    V: Traceable<T>,
-    O: Clone + InterpretableOperation<T, V>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-> Program<T, V, O, Input, Output>
-{
-    /// Interprets the staged program on concrete input values.
-    ///
-    /// This is the user-facing replay entry point for staged programs. It checks that the incoming
-    /// structured value matches the program's expected parameter structure, evaluates the flat IR,
-    /// and then rebuilds the structured output.
+    /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
+    /// [`Program`]s. It checks that the provided input value matches the program's expected input structure, evaluates
+    /// the [`Instruction`]s in order, and finally builds a structured output value from the computed output values.
     pub fn interpret(&self, input: Input) -> Result<Output, TracingError>
     where
+        O: InterpretableOperation<T, V>,
         Input::ParameterStructure: Debug + PartialEq,
         Output::ParameterStructure: Clone,
     {
+        // Validate that the caller supplied an input with the expected parameter structure.
         let input_structure = input.parameter_structure();
         if input_structure != self.input_structure {
             return Err(ParameterError::MismatchedParameterStructures {
@@ -360,35 +351,41 @@ impl<
             .into());
         }
 
-        let input_values = input.into_parameters().collect::<Vec<_>>();
-        if input_values.len() != self.input_ids.len() {
-            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: input_values.len() });
+        // Flatten the structured input so that we can get the input values aligned to the input atoms of the program.
+        let inputs = input.into_parameters().collect::<Vec<_>>();
+        if inputs.len() != self.input_ids.len() {
+            return Err(TracingError::InvalidInputCount { expected: self.input_ids.len(), got: inputs.len() });
         }
 
+        // Count every future consumer of each atom, including final program outputs. These counts let us move each
+        // value out on its last use and clone it only when a later consumer still needs it.
         let mut remaining_uses = vec![0usize; self.atoms.len()];
         for instruction in self.instructions.iter() {
-            for input in instruction.inputs.iter().copied() {
-                let Some(use_count) = remaining_uses.get_mut(input.index) else {
-                    return Err(TracingError::UnboundAtomId { id: input });
+            for input_id in instruction.inputs.iter().copied() {
+                let Some(remaining_uses) = remaining_uses.get_mut(input_id.index) else {
+                    return Err(TracingError::UnboundAtomId { id: input_id });
                 };
-                *use_count += 1;
+                *remaining_uses += 1;
             }
         }
-        for output in self.output_ids.iter().copied() {
-            let Some(use_count) = remaining_uses.get_mut(output.index) else {
-                return Err(TracingError::UnboundAtomId { id: output });
+        for output_id in self.output_ids.iter().copied() {
+            let Some(remaining_uses) = remaining_uses.get_mut(output_id.index) else {
+                return Err(TracingError::UnboundAtomId { id: output_id });
             };
-            *use_count += 1;
+            *remaining_uses += 1;
         }
 
+        // Store concrete input values in a sparse value table indexed by [`AtomId`].
         let mut values = vec![None; self.atoms.len()];
-        for (atom, value) in self.input_ids.iter().copied().zip(input_values) {
-            let Some(slot) = values.get_mut(atom.index) else {
-                return Err(TracingError::UnboundAtomId { id: atom });
+        for (input_id, input) in self.input_ids.iter().copied().zip(inputs) {
+            let Some(slot) = values.get_mut(input_id.index) else {
+                return Err(TracingError::UnboundAtomId { id: input_id });
             };
-            *slot = Some(value);
+            *slot = Some(input);
         }
 
+        // Materialize literal constants that are live. Dead constants can remain unset because no instruction or
+        // program output will read them.
         for (atom_index, atom) in self.atoms.iter().enumerate() {
             if remaining_uses[atom_index] == 0 {
                 continue;
@@ -398,32 +395,23 @@ impl<
             }
         }
 
+        // Replay instructions in program order, reusing one scratch input buffer to avoid per-instruction allocation.
         let max_input_count = self.instructions.iter().map(|instruction| instruction.inputs.len()).max().unwrap_or(0);
         let mut instruction_inputs = Vec::with_capacity(max_input_count);
         for instruction in self.instructions.iter() {
             instruction_inputs.clear();
-            for input in instruction.inputs.iter().copied() {
-                let Some(use_count) = remaining_uses.get_mut(input.index) else {
-                    return Err(TracingError::UnboundAtomId { id: input });
-                };
-                if *use_count == 0 {
-                    return Err(TracingError::MalformedProgram(
-                        "instruction consumed an already-exhausted atom".to_string(),
-                    ));
-                }
-                *use_count -= 1;
-
-                let Some(slot) = values.get_mut(input.index) else {
-                    return Err(TracingError::UnboundAtomId { id: input });
-                };
-                let value = if *use_count == 0 {
-                    slot.take().ok_or(TracingError::UnboundAtomId { id: input })?
-                } else {
-                    slot.as_ref().ok_or(TracingError::UnboundAtomId { id: input })?.clone()
-                };
+            for input_id in instruction.inputs.iter().copied() {
+                // Consume the appropriate input value for the current instruction. If this is the last consumer,
+                // move the value out of the table. Otherwise, clone it so later consumers can still read it.
+                let remaining_uses = remaining_uses.get_mut(input_id.index).unwrap();
+                debug_assert!(*remaining_uses > 0);
+                *remaining_uses -= 1;
+                let value = values.get_mut(input_id.index).unwrap();
+                let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
                 instruction_inputs.push(value);
             }
 
+            // Interpret the operation using concrete values and ensure it produces the expected number of outputs.
             let outputs = instruction.operation.interpret(instruction_inputs.as_slice())?;
             if outputs.len() != instruction.outputs.len() {
                 return Err(TracingError::InvalidOutputCount {
@@ -432,39 +420,30 @@ impl<
                 });
             }
 
-            for (atom, value) in instruction.outputs.iter().copied().zip(outputs) {
-                let Some(slot) = values.get_mut(atom.index) else {
-                    return Err(TracingError::UnboundAtomId { id: atom });
+            for (output_id, output) in instruction.outputs.iter().copied().zip(outputs) {
+                let Some(value) = values.get_mut(output_id.index) else {
+                    return Err(TracingError::UnboundAtomId { id: output_id });
                 };
-                if remaining_uses[atom.index] != 0 {
-                    *slot = Some(value);
+
+                // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
+                if remaining_uses[output_id.index] != 0 {
+                    *value = Some(output);
                 }
             }
         }
 
+        // Gather the program outputs using the same last-use transfer logic that we used for the instruction inputs.
         let mut outputs = Vec::with_capacity(self.output_ids.len());
-        for output in self.output_ids.iter().copied() {
-            let Some(use_count) = remaining_uses.get_mut(output.index) else {
-                return Err(TracingError::UnboundAtomId { id: output });
-            };
-            if *use_count == 0 {
-                return Err(TracingError::MalformedProgram(
-                    "program output consumed an already-exhausted atom".to_string(),
-                ));
-            }
-            *use_count -= 1;
-
-            let Some(slot) = values.get_mut(output.index) else {
-                return Err(TracingError::UnboundAtomId { id: output });
-            };
-            let value = if *use_count == 0 {
-                slot.take().ok_or(TracingError::UnboundAtomId { id: output })?
-            } else {
-                slot.as_ref().ok_or(TracingError::UnboundAtomId { id: output })?.clone()
-            };
+        for output_id in self.output_ids.iter().copied() {
+            let remaining_uses = remaining_uses.get_mut(output_id.index).unwrap();
+            debug_assert!(*remaining_uses > 0);
+            *remaining_uses -= 1;
+            let value = values.get_mut(output_id.index).unwrap();
+            let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
             outputs.push(value);
         }
 
+        // Reshape the flat output values into the structured output type that this program is expected to produce.
         Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
     }
 }
