@@ -720,6 +720,17 @@ impl<T: Type, V: Traceable<T>, O: Clone + Operation<T>> ProgramBuilder<T, V, O> 
         if let Some(error) = self.error {
             return Err(error);
         }
+
+        let expected_input_count = input_structure.parameter_count();
+        if self.input_ids.len() != expected_input_count {
+            return Err(TracingError::InvalidInputCount { expected: expected_input_count, got: self.input_ids.len() });
+        }
+
+        let expected_output_count = output_structure.parameter_count();
+        if output_ids.len() != expected_output_count {
+            return Err(TracingError::InvalidOutputCount { expected: expected_output_count, got: output_ids.len() });
+        }
+
         Ok(Program {
             atoms: self.atoms,
             input_ids: self.input_ids,
@@ -929,6 +940,27 @@ mod tests {
         assert!(matches!(
             builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
             Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        ));
+    }
+
+    #[test]
+    fn program_builder_build_rejects_input_structure_count_mismatch() {
+        let builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+
+        assert!(matches!(
+            builder.build::<f64, ()>(Vec::new(), Placeholder, ()),
+            Err(TracingError::InvalidInputCount { expected: 1, got: 0 }),
+        ));
+    }
+
+    #[test]
+    fn program_builder_build_rejects_output_structure_count_mismatch() {
+        let mut builder = ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new();
+        builder.add_input(1.0f64.r#type().into_owned());
+
+        assert!(matches!(
+            builder.build::<f64, f64>(Vec::new(), Placeholder, Placeholder),
+            Err(TracingError::InvalidOutputCount { expected: 1, got: 0 }),
         ));
     }
 
