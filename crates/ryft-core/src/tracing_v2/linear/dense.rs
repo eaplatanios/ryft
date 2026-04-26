@@ -291,7 +291,7 @@ where
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation: CoreLinearReplayOperation<V>,
+    E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -342,7 +342,8 @@ where
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation: CoreLinearProgramOperation<V>,
+    E::LinearOperation:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, E::LinearOperation>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -385,7 +386,7 @@ where
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Input::To<DifferentiableTracer<'engine, E>>, TracingError>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation: CoreLinearReplayOperation<V>,
+    E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)
 }

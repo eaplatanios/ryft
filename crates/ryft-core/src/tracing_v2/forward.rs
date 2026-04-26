@@ -16,7 +16,7 @@ use crate::{
         jit::{DifferentiableTracer, Tracer},
         linear::{Linearized, jvp_program, jvp_traced},
         operations::{
-            CoreLinearReplayOperation, SupportsAdd, SupportsNeg, SupportsScale,
+            SupportsAdd, SupportsNeg, SupportsScale,
             constants::{OneLike, ZeroLike},
         },
     },
@@ -287,7 +287,7 @@ where
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
     E::TracingOperation:
         InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearReplayOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input

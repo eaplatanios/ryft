@@ -17,7 +17,7 @@ use crate::{
     types::{ArrayType, Type, TypeError, Typed},
 };
 
-use super::{CoreLinearProgramOperation, DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the `rematerialize` higher-order primitive.
 #[doc(hidden)]
@@ -176,7 +176,9 @@ where
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + 'static,
     O: InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>,
     O: SupportsRematerialize<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
+    LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
+        + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
 {
     fn interpret(
         &self,
@@ -231,8 +233,11 @@ where
     O: for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>
         + 'static,
-    LinearPrimitiveOperation<V>: CoreLinearProgramOperation<V>,
-    for<'engine> LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
+    LinearPrimitiveOperation<V>:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
+    for<'engine> LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
+        + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
 {
     fn jvp(
         &self,
@@ -434,11 +439,14 @@ where
         + DifferentiableOperation<E>
         + for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>
         + 'static,
-    LinearPrimitiveOperation<V>: CoreLinearProgramOperation<V>,
+    LinearPrimitiveOperation<V>:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
     E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>>
         + ?Sized
         + 'static,
-    for<'engine> LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
+    for<'engine> LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
+        + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
 {
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;

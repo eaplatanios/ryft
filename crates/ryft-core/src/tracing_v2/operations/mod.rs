@@ -1,7 +1,6 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use crate::{
-    parameters::Parameterized,
     tracing::{AtomId, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
         engines::{DifferentiableEngine, Engine},
@@ -240,72 +239,6 @@ where
         engine: &E,
         inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
     ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError>;
-}
-
-/// Default linear-op carrier capability: eager replay on concrete values.
-///
-/// This captures the minimum replay surface a stored linear carrier needs: shape metadata through
-/// [`Operation`] and concrete evaluation through [`InterpretableOperation`].
-///
-/// It is intentionally narrower than the ordinary staged carrier used during tracing: linear
-/// programs only need metadata reasoning plus concrete replay, not forward-mode differentiation.
-///
-/// The linear-program surface consists of shape metadata through [`Operation`], concrete replay
-/// through [`InterpretableOperation`], and a separate transpose rule through [`LinearOperation`].
-pub(crate) trait CoreLinearReplayOperation<V: Traceable<ArrayType>>:
-    Operation<ArrayType> + InterpretableOperation<ArrayType, V>
-where
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-{
-}
-
-impl<V: Traceable<ArrayType>, O> CoreLinearReplayOperation<V> for O
-where
-    O: Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-{
-}
-
-/// Default linear-op carrier capability: eager replay plus transpose support.
-pub(crate) trait CoreLinearProgramOperation<V: Traceable<ArrayType>>:
-    Clone + CoreLinearReplayOperation<V> + LinearOperation<ArrayType, V, Self>
-{
-}
-
-impl<V: Traceable<ArrayType>, O: Clone + CoreLinearReplayOperation<V> + LinearOperation<ArrayType, V, O>>
-    CoreLinearProgramOperation<V> for O
-{
-}
-
-/// Capability bundle gathering the linear staging traits needed to drive `Tracer` replay.
-///
-/// This bundle is `'static` because it must satisfy the `'static` requirements imposed by the JIT
-/// tracer's storage of staged instructions and is bounded over the [`Tracer`] flavor that backs
-/// linearized JIT replay rules. Any inner linear operation type that implements
-/// [`SupportsAdd`](add::SupportsAdd),
-/// [`SupportsNeg`](neg::SupportsNeg), and
-/// [`SupportsScale`](scale::SupportsScale) for the appropriate Tracer leaf
-/// automatically satisfies it.
-#[doc(hidden)]
-pub trait TracerLinearOperation<V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static>:
-    Clone + Operation<ArrayType> + 'static
-where
-    for<'engine> Self: add::SupportsAdd<ArrayType, Tracer<'engine, E>>
-        + neg::SupportsNeg<ArrayType, Tracer<'engine, E>>
-        + scale::SupportsScale<ArrayType, Tracer<'engine, E>>,
-{
-}
-
-impl<
-    V: Traceable<ArrayType>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    InnerLinearOperation: Clone + Operation<ArrayType> + 'static,
-> TracerLinearOperation<V, E> for InnerLinearOperation
-where
-    for<'engine> InnerLinearOperation: add::SupportsAdd<ArrayType, Tracer<'engine, E>>
-        + neg::SupportsNeg<ArrayType, Tracer<'engine, E>>
-        + scale::SupportsScale<ArrayType, Tracer<'engine, E>>,
-{
 }
 
 // ---------------------------------------------------------------------------

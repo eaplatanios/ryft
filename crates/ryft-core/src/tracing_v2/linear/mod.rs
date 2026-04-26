@@ -9,13 +9,13 @@ use crate::{
         Value,
     },
     tracing_v2::{
-        Differentiable, DifferentiationError, LinearPrimitiveOperation,
+        Differentiable, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
         engines::{DifferentiableEngine, Engine},
         forward::{JvpTracer, TangentSpace},
         jit::{DifferentiableTracer, Tracer, interpret_and_trace_with_operation},
         operations::{
-            CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, LinearTransposeContext,
-            SupportsAdd, SupportsNeg, SupportsRematerialize, SupportsScale,
+            DifferentiableOperation, LinearTransposeContext, SupportsAdd, SupportsNeg, SupportsRematerialize,
+            SupportsScale,
             constants::{OneLike, ZeroLike},
             rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
@@ -140,7 +140,9 @@ where
     V: Traceable<ArrayType> + ZeroLike + OneLike,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
     O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>> + 'static,
-    LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
+    LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
+        + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
 {
     let (outputs, pushforward) = linearize_traced_program(engine, tracing_builder, traced_program, traced_primals)?;
     ensure_single_scalar_gradient_output(outputs.as_slice())?;

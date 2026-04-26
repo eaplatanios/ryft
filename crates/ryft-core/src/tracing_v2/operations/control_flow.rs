@@ -15,9 +15,7 @@ use crate::{
     types::{ArrayType, DataType, TypeError, Typed},
 };
 
-use super::{
-    CoreLinearProgramOperation, DifferentiableOperation, LinearOperation, LinearTransposeContext, SupportsAdd,
-};
+use super::{DifferentiableOperation, LinearOperation, LinearTransposeContext, SupportsAdd};
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O> = Program<ArrayType, V, O, Vec<V>, Vec<V>>;
@@ -394,7 +392,11 @@ where
 impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O>
 where
     V: Traceable<ArrayType>,
-    O: CoreLinearProgramOperation<V> + SupportsAdd<ArrayType, V> + From<ConditionOperation<V, O>>,
+    O: Clone
+        + InterpretableOperation<ArrayType, V>
+        + LinearOperation<ArrayType, V, O>
+        + SupportsAdd<ArrayType, V>
+        + From<ConditionOperation<V, O>>,
 {
     fn transpose(
         &self,

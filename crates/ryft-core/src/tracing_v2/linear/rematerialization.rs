@@ -13,7 +13,9 @@ where
         + InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>>
         + 'static,
-    LinearPrimitiveOperation<Tracer<'engine, E, O>>: CoreLinearProgramOperation<Tracer<'engine, E, O>>,
+    LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
+        + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
     let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new()));
@@ -66,8 +68,13 @@ where
     V: Value<ArrayType> + ZeroLike + OneLike,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>,
-    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
-        CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
+    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
+        + LinearOperation<
+            ArrayType,
+            DifferentiableTracer<'engine, E>,
+            LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>,
+        >,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -145,8 +152,13 @@ where
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
-        CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
+    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
+        + LinearOperation<
+            ArrayType,
+            DifferentiableTracer<'engine, E>,
+            LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>,
+        >,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
@@ -190,8 +202,13 @@ where
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
         + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>:
-        CoreLinearProgramOperation<DifferentiableTracer<'engine, E>>,
+    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
+        + LinearOperation<
+            ArrayType,
+            DifferentiableTracer<'engine, E>,
+            LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>,
+        >,
     V: Parameterized<V, ParameterStructure = Placeholder>,
     V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,

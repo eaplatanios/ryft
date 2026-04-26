@@ -57,7 +57,7 @@ where
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
     E::TracingOperation:
         InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearReplayOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
     let primal_structure = primals.parameter_structure();
@@ -125,7 +125,8 @@ where
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation: CoreLinearProgramOperation<V>,
+    E::LinearOperation:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, E::LinearOperation>,
 {
     let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
@@ -183,7 +184,8 @@ where
     Input::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     V::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation: CoreLinearProgramOperation<V>,
+    E::LinearOperation:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, E::LinearOperation>,
 {
     type Value = V;
     type FunctionInput<'engine>
@@ -225,7 +227,9 @@ where
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
     E::TracingOperation:
         InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: CoreLinearProgramOperation<Tracer<'engine, E>>,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
+        + LinearOperation<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
 {
     type Value = Tracer<'engine, E>;
     type FunctionInput<'call>
@@ -324,7 +328,8 @@ where
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> (DifferentiableTracer<'engine, E>, Aux::To<DifferentiableTracer<'engine, E>>),
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation: CoreLinearProgramOperation<V>,
+    E::LinearOperation:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, E::LinearOperation>,
 {
     let ((output, aux), pullback): ((V, Aux), Program<ArrayType, V, E::LinearOperation, (V, Aux), Input>) =
         vjp(engine, |input| Ok(function(input)), primals)?;
@@ -380,7 +385,8 @@ where
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> (DifferentiableTracer<'engine, E>, Aux::To<DifferentiableTracer<'engine, E>>),
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation: CoreLinearProgramOperation<V>,
+    E::LinearOperation:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, E::LinearOperation>,
 {
     value_and_grad_with_aux(engine, function, primals).map(|((_, aux), gradient)| (gradient, aux))
 }
