@@ -1,14 +1,13 @@
 use std::{cell::RefCell, rc::Rc};
 
 use crate::{
-    tracing::{AtomId, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
+    tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
         engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, EngineTangent, JvpTracer},
         jit::Tracer,
-        linear::LinearTerm,
     },
-    types::{ArrayType, Type, TypeError},
+    types::{ArrayType, Type, TypeError, Typed},
 };
 
 /// Elementwise addition.
@@ -63,6 +62,7 @@ pub mod scale;
 pub mod sin;
 
 pub use add::{AddOperation, SupportsAdd};
+pub use constants::{SupportsZero, ZeroOperation};
 pub use control_flow::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
     flat_program_input_types, flat_program_output_types,
@@ -181,22 +181,78 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///
 /// Structural validation happens when the forward linear program is built and when any staged ops
 /// emitted by the rule are added to the transpose program.
+///
+/// Concrete state threaded through linear transposition rules.
+///
+/// [`TranspositionContext`] owns the currently active transpose-program builder. Primitive rules
+/// stage new linear instructions through it, and higher-order rules use it to recursively transpose
+/// nested linear programs into the same builder. The pass propagates structural zeros via
+/// `Option<LinearTerm>`, so no cotangent-synthesis policy lives on the context anymore.
 #[doc(hidden)]
-pub trait LinearTransposeContext<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> {
-    /// Creates one pullback-program input for an output cotangent.
-    fn make_output_cotangent_input(
-        &mut self,
-        builder: &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
-        output_type: &T,
-        output_index: usize,
-    ) -> Result<AtomId, TracingError>;
+pub struct TranspositionContext<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> {
+    /// Builder for the currently active transpose program.
+    builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
 
-    /// Creates a structurally zero cotangent for a disconnected input.
-    fn make_missing_input_cotangent(
+    /// Phantom marker reserving a context lifetime for future per-pass borrows without forcing an
+    /// API change when one is added.
+    marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> TranspositionContext<'a, T, V, LinearCarrier> {
+    /// Creates a transposition context that stages into `builder`.
+    #[doc(hidden)]
+    pub fn new(builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>) -> Self {
+        Self { builder, marker: std::marker::PhantomData }
+    }
+
+    /// Returns the builder for the currently active transpose program.
+    #[inline]
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>> {
+        &self.builder
+    }
+
+    /// Stages one operation in the currently active transpose program.
+    ///
+    /// `inputs` are atom ids that already live in the transpose builder. Output types are inferred
+    /// via [`Operation::infer_output_types`] and the resulting variable atoms are returned in
+    /// forward order.
+    pub fn apply_operation(
+        &self,
+        inputs: &[AtomId],
+        operation: LinearCarrier,
+        output_count: usize,
+    ) -> Result<Vec<AtomId>, TracingError> {
+        let mut builder_borrow = self.builder.borrow_mut();
+        let input_types =
+            inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = operation.infer_output_types(&input_types)?;
+        if output_types.len() != output_count {
+            return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_types.len() });
+        }
+        let outputs = output_types.into_iter().map(|r#type| builder_borrow.add_variable(r#type)).collect::<Vec<_>>();
+        builder_borrow
+            .instructions
+            .push(Instruction { operation, inputs: inputs.to_vec(), outputs: outputs.clone() });
+        Ok(outputs)
+    }
+
+    /// Replaces the active transpose-program builder and returns the previous one.
+    #[inline]
+    pub(crate) fn replace_builder(
         &mut self,
-        builder: &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
-        input_type: &T,
-    ) -> Result<AtomId, TracingError>;
+        builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
+    ) -> Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>> {
+        std::mem::replace(&mut self.builder, builder)
+    }
+
+    /// Takes ownership of the active builder, leaving an empty builder behind.
+    pub(crate) fn take_builder(&mut self) -> Result<ProgramBuilder<T, V, LinearCarrier>, TracingError> {
+        let builder = self.replace_builder(Rc::new(RefCell::new(ProgramBuilder::new())));
+        match Rc::try_unwrap(builder) {
+            Ok(builder) => Ok(builder.into_inner()),
+            Err(_) => Err(TracingError::EscapedProgramBuilder),
+        }
+    }
 }
 
 pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearPrimitiveOperation<V>>:
@@ -204,17 +260,20 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primi
 {
     /// Applies the transpose rule for reverse-mode differentiation.
     ///
-    /// `output_cotangents` is aligned with the op outputs in forward order. The returned vector
-    /// must be aligned with the op inputs in forward order.
+    /// `output_cotangents` is aligned with the op outputs in forward order. Each entry is
+    /// `Some(atom)` when the corresponding output has an accumulated symbolic cotangent atom in
+    /// the active transpose builder and `None` when its cotangent is structurally zero. The
+    /// returned vector must be aligned with the op inputs in forward order.
     ///
-    /// Returning `Some(term)` means that input receives the staged cotangent contribution `term`.
-    /// Returning `None` means the contribution is structurally zero and the transpose pass does not
-    /// need to materialize an explicit zero term for that input.
+    /// Returning `Some(atom)` means that input receives the staged cotangent contribution `atom`.
+    /// Returning `None` means the contribution is structurally zero and the transpose pass does
+    /// not need to materialize an explicit zero atom for that input. Rules stage new linear ops in
+    /// the transpose builder via [`TranspositionContext::apply_operation`].
     fn transpose(
         &self,
-        context: &mut dyn LinearTransposeContext<T, V, LinearCarrier>,
-        output_cotangents: &[LinearTerm<T, V, LinearCarrier>],
-    ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TracingError>
+        context: &mut TranspositionContext<'_, T, V, LinearCarrier>,
+        output_cotangents: &[Option<AtomId>],
+    ) -> Result<Vec<Option<AtomId>>, TracingError>
     where
         LinearCarrier: Operation<T>;
 }

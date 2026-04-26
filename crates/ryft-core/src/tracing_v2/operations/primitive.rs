@@ -16,7 +16,7 @@ use crate::{
         operations::{
             AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
             NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
-            constants::{OneLike, ZeroLike},
+            constants::{OneLike, ZeroLike, ZeroOperation},
             control_flow::{ConditionOperation, ControlFlowValue, WhileOperation},
             left_matmul::left_matmul_abstract_eval,
             right_matmul::right_matmul_abstract_eval,
@@ -28,6 +28,7 @@ use crate::{
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation,
     add::SupportsAdd,
+    constants::SupportsZero,
     cos::SupportsCos,
     custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom},
     left_matmul::SupportsLeftMatMul,
@@ -133,6 +134,15 @@ pub enum LinearPrimitiveOperation<V: Traceable<ArrayType> + Parameter> {
 
     /// Reshape between two statically known shapes.
     Reshape { input_type: ArrayType, output_type: ArrayType },
+
+    /// Typed zero with no inputs and one output, carrying a [`ZeroOperation`].
+    ///
+    /// Emitted by the transpose pass at the boundary of pullbacks for primal inputs that
+    /// receive no cotangent contribution from any output. Interpreting it requires
+    /// [`Zero<ArrayType>`](crate::tracing_v2::operations::constants::Zero) on the value type;
+    /// staged tracer programs must materialize these ops away (via the outer-trace builder)
+    /// before being interpreted.
+    Zero(ZeroOperation),
 
     /// Higher-order rematerialization boundary restricted to linear bodies and transpose bodies.
     Rematerialize(
@@ -263,6 +273,21 @@ impl<V: Traceable<ArrayType>> SupportsAdd<ArrayType, V> for LinearPrimitiveOpera
     }
 }
 
+impl<V: Traceable<ArrayType>> SupportsZero<ArrayType, V> for LinearPrimitiveOperation<V> {
+    #[inline]
+    fn zero_operation(r#type: ArrayType) -> Self {
+        LinearPrimitiveOperation::Zero(ZeroOperation::new(r#type))
+    }
+
+    #[inline]
+    fn as_zero(&self) -> Option<&ArrayType> {
+        match self {
+            Self::Zero(zero) => Some(zero.output_type()),
+            _ => None,
+        }
+    }
+}
+
 impl<V: Traceable<ArrayType>> SupportsNeg<ArrayType, V> for LinearPrimitiveOperation<V> {
     #[inline]
     fn neg_operation() -> Self {
@@ -378,6 +403,7 @@ impl<V: Traceable<ArrayType>> Debug for LinearPrimitiveOperation<V> {
             Self::Reshape { input_type, output_type } => {
                 write!(formatter, "Reshape({input_type} -> {output_type})")
             }
+            Self::Zero(zero) => Debug::fmt(zero, formatter),
             Self::Rematerialize(remat) => Debug::fmt(remat, formatter),
             Self::Condition(condition) => Debug::fmt(condition, formatter),
             Self::While(while_operation) => Debug::fmt(while_operation, formatter),
@@ -475,6 +501,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
             Self::LeftMatMul { .. } => "left_matmul",
             Self::RightMatMul { .. } => "right_matmul",
             Self::Reshape { .. } => "reshape",
+            Self::Zero(zero) => zero.name(),
             Self::Rematerialize(remat) => remat.name(),
             Self::Condition(condition) => condition.name(),
             Self::While(while_operation) => while_operation.name(),
@@ -496,6 +523,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
                     input_types,
                 )
             }
+            Self::Zero(zero) => zero.infer_output_types(input_types),
             Self::Rematerialize(remat) => remat.infer_output_types(input_types),
             Self::Condition(condition) => condition.infer_output_types(input_types),
             Self::While(while_operation) => while_operation.infer_output_types(input_types),
@@ -514,6 +542,7 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for LinearPrimitiveOperation<
                 OperationFormatter::new(formatter, indentation, self.name())?
                     .bracketed(|operation| operation.field("factor", factor))
             }
+            Self::Zero(zero) => zero.render(formatter, indentation),
             Self::Rematerialize(remat) => remat.render(formatter, indentation),
             Self::Condition(condition) => condition.render(formatter, indentation),
             Self::While(while_operation) => while_operation.render(formatter, indentation),
@@ -574,6 +603,7 @@ impl<
         + Neg<Output = V>
         + Mul<Output = V>
         + ZeroLike
+        + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
@@ -592,6 +622,7 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
             }
+            Self::Zero(zero) => zero.interpret(inputs),
             Self::Rematerialize(remat) => remat.interpret(inputs),
             Self::Condition(condition) => condition.interpret(inputs),
             Self::While(while_operation) => while_operation.interpret(inputs),
@@ -607,6 +638,7 @@ impl<
         + Mul<Output = V>
         + ZeroLike
         + OneLike
+        + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue,
@@ -616,9 +648,14 @@ where
 {
     fn transpose(
         &self,
-        context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
-        output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
+        context: &mut crate::tracing_v2::operations::TranspositionContext<
+            '_,
+            ArrayType,
+            V,
+            LinearPrimitiveOperation<V>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         match self {
             Self::Add => AddOperation.transpose(context, output_cotangents),
             Self::Neg => NegOperation.transpose(context, output_cotangents),
@@ -633,6 +670,7 @@ where
             Self::Reshape { input_type, output_type } => {
                 ReshapeOperation::new(input_type.clone(), output_type.clone()).transpose(context, output_cotangents)
             }
+            Self::Zero(zero) => zero.transpose(context, output_cotangents),
             Self::Rematerialize(remat) => remat.transpose(context, output_cotangents),
             Self::Condition(condition) => condition.transpose(context, output_cotangents),
             Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
@@ -721,6 +759,7 @@ impl<
         + Cos
         + ZeroLike
         + OneLike
+        + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + Parameterized<V>
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps

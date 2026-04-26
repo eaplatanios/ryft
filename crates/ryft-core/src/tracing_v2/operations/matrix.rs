@@ -271,7 +271,7 @@ pub mod ndarray_support {
         tracing_v2::{
             CoordinateValue, Cos, LinearPrimitiveOperation, PrimitiveOperation, Sin,
             engines::{DifferentiableEngine, Engine},
-            operations::constants::{OneLike, ZeroLike},
+            operations::constants::{OneLike, Zero, ZeroLike},
         },
         types::{ArrayType, DataType, TypeError, Typed},
     };
@@ -434,6 +434,20 @@ pub mod ndarray_support {
         #[inline]
         fn one_like(&self) -> Self {
             Array2::from_elem(self.raw_dim(), 1.0)
+        }
+    }
+
+    impl Zero<ArrayType> for Array2<f32> {
+        #[inline]
+        fn zero(r#type: &ArrayType) -> Result<Self, TracingError> {
+            Ok(Array2::from_elem(matrix_extent(r#type)?, 0.0))
+        }
+    }
+
+    impl Zero<ArrayType> for Array2<f64> {
+        #[inline]
+        fn zero(r#type: &ArrayType) -> Result<Self, TracingError> {
+            Ok(Array2::from_elem(matrix_extent(r#type)?, 0.0))
         }
     }
 

@@ -5,7 +5,7 @@ use std::{
 
 use ryft_core::macros::check_input_count;
 use ryft_core::sharding::Sharding;
-use ryft_core::tracing::{InterpretableOperation, Operation, Traceable, TracingError};
+use ryft_core::tracing::{AtomId, InterpretableOperation, Operation, Traceable, TracingError};
 use ryft_core::tracing_v2::{
     CustomPrimitive, DifferentiableOperation, LinearCustomPrimitive, LinearOperation, LinearPrimitiveOperation, Tracer,
     engines::DifferentiableEngine,
@@ -123,24 +123,26 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstrain
 impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
     fn transpose(
         &self,
-        _context: &mut dyn ryft_core::tracing_v2::operations::LinearTransposeContext<
+        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+            '_,
             ArrayType,
             ShardMapTensor,
             LinearPrimitiveOperation<ShardMapTensor>,
         >,
-        output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TracingError> {
+        output_cotangents: &[Option<AtomId>],
+    ) -> Result<Vec<Option<AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
-        let contribution = LinearTerm::apply_staged_op(
-            output_cotangents[0].builder.clone(),
-            std::slice::from_ref(&output_cotangents[0]),
-            LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?,
-            1,
-        )?
-        .into_iter()
-        .next()
-        .expect("sharding constraint should produce one cotangent contribution");
-        Ok(vec![Some(contribution)])
+        match output_cotangents[0] {
+            Some(atom) => {
+                let contribution = context
+                    .apply_operation(&[atom], LinearPrimitiveOperation::custom(self.to_tensor_custom_primitive())?, 1)?
+                    .into_iter()
+                    .next()
+                    .expect("sharding constraint should produce one cotangent contribution");
+                Ok(vec![Some(contribution)])
+            }
+            None => Ok(vec![None]),
+        }
     }
 }
 
@@ -262,24 +264,30 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstrain
 impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
     fn transpose(
         &self,
-        _context: &mut dyn ryft_core::tracing_v2::operations::LinearTransposeContext<
+        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+            '_,
             ArrayType,
             ShardMapTracer,
             LinearPrimitiveOperation<ShardMapTracer>,
         >,
-        output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TracingError> {
+        output_cotangents: &[Option<AtomId>],
+    ) -> Result<Vec<Option<AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
-        let contribution = LinearTerm::apply_staged_op(
-            output_cotangents[0].builder.clone(),
-            std::slice::from_ref(&output_cotangents[0]),
-            LinearPrimitiveOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
-            1,
-        )?
-        .into_iter()
-        .next()
-        .expect("sharding constraint should produce one cotangent contribution");
-        Ok(vec![Some(contribution)])
+        match output_cotangents[0] {
+            Some(atom) => {
+                let contribution = context
+                    .apply_operation(
+                        &[atom],
+                        LinearPrimitiveOperation::Custom(Arc::new(self.to_tracer_linear_custom_primitive())),
+                        1,
+                    )?
+                    .into_iter()
+                    .next()
+                    .expect("sharding constraint should produce one cotangent contribution");
+                Ok(vec![Some(contribution)])
+            }
+            None => Ok(vec![None]),
+        }
     }
 }
 
@@ -308,10 +316,8 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::{AtomId, Operation, ProgramBuilder, Traceable};
-    use ryft_core::tracing_v2::{
-        LinearOperation, LinearPrimitiveOperation, LinearTerm, operations::LinearTransposeContext,
-    };
+    use ryft_core::tracing::{Operation, ProgramBuilder, Traceable};
+    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, operations::TranspositionContext};
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -324,27 +330,10 @@ mod tests {
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
     }
 
-    struct TestLinearTransposeContext;
-
-    impl<V: Traceable<ArrayType>> LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>
-        for TestLinearTransposeContext
-    {
-        fn make_output_cotangent_input(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
-            output_type: &ArrayType,
-            _output_index: usize,
-        ) -> Result<AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_input(output_type.clone()))
-        }
-
-        fn make_missing_input_cotangent(
-            &mut self,
-            _builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
-            _input_type: &ArrayType,
-        ) -> Result<AtomId, TracingError> {
-            panic!("with_sharding_constraint transpose tests should not synthesize missing cotangents");
-        }
+    fn test_transposition_context<V: Traceable<ArrayType>>(
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
+    ) -> TranspositionContext<'static, ArrayType, V, LinearPrimitiveOperation<V>> {
+        TranspositionContext::new(builder)
     }
 
     #[test]
@@ -479,20 +468,18 @@ mod tests {
                 ProgramBuilder::<ArrayType, ShardMapTensor, LinearPrimitiveOperation<ShardMapTensor>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
-        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let mut context = TestLinearTransposeContext;
-        let contribution = LinearOperation::transpose(
+        let mut context = test_transposition_context(transpose_builder.clone());
+        let contribution_atom = LinearOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
-            &[output_cotangent],
+            &[Some(output_cotangent_atom)],
         )
         .unwrap()
         .into_iter()
         .next()
         .expect("transpose should return one contribution")
         .expect("transpose should produce one cotangent contribution");
-        let contribution_atom = contribution.atom;
-        drop(contribution);
+        drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")
@@ -518,20 +505,18 @@ mod tests {
                 ProgramBuilder::<ArrayType, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>::new(),
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
-        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let mut context = TestLinearTransposeContext;
-        let contribution = LinearOperation::transpose(
+        let mut context = test_transposition_context(transpose_builder.clone());
+        let contribution_atom = LinearOperation::transpose(
             &WithShardingConstraintOperation::new(sharding.clone()),
             &mut context,
-            &[output_cotangent],
+            &[Some(output_cotangent_atom)],
         )
         .unwrap()
         .into_iter()
         .next()
         .expect("transpose should return one contribution")
         .expect("transpose should produce one cotangent contribution");
-        let contribution_atom = contribution.atom;
-        drop(contribution);
+        drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")

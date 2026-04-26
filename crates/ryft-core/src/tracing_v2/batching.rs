@@ -359,6 +359,7 @@ impl<
         + Mul<Output = V>
         + Neg<Output = V>
         + ZeroLike
+        + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + MatrixOps
         + ReshapeOps
         + ControlFlowValue,
@@ -776,6 +777,18 @@ mod tests {
     impl ZeroLike for TestArray {
         fn zero_like(&self) -> Self {
             Self { r#type: self.r#type.clone(), values: vec![0.0; self.values.len()] }
+        }
+    }
+
+    impl crate::tracing_v2::operations::constants::Zero<ArrayType> for TestArray {
+        fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
+            let mut element_count = 1usize;
+            for dim in &value_type.shape.dimensions {
+                element_count *= dim.value().ok_or_else(|| crate::types::TypeError {
+                    message: format!("test array zero requires static shape but got {value_type}"),
+                })?;
+            }
+            Ok(Self { r#type: value_type.clone(), values: vec![0.0; element_count] })
         }
     }
 

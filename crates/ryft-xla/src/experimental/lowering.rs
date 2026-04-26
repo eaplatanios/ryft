@@ -779,6 +779,27 @@ impl<V: MlirLowerableValue + MatrixOps> XlaOperation<V> for LinearPrimitiveOpera
                     lowerer,
                 )
             }
+            LinearPrimitiveOperation::Zero(zero) => {
+                if !input_values.is_empty() {
+                    return Err(TracingError::InvalidInputCount { expected: 0, got: input_values.len() }.into());
+                }
+                if output_types.len() != 1 {
+                    return Err(TracingError::InvalidOutputCount { expected: 1, got: output_types.len() }.into());
+                }
+                let zero_type = zero.output_type();
+                let block = &mut lowerer.block;
+                let context = lowerer.context;
+                let location = lowerer.location;
+                let tensor_type = lower_tensor_type(zero_type, context, location)?;
+                let elements = lower_constant_elements_attribute(
+                    zero_type.data_type,
+                    tensor_type,
+                    ShardMapConstantKind::Zero,
+                    context,
+                )?;
+                let constant = block.append_operation(stable_hlo::constant(elements, location));
+                Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
+            }
             LinearPrimitiveOperation::Rematerialize(remat) => {
                 <LinearRematerializeOperation<ArrayType, V> as XlaOperation<V>>::lower_to_mlir(
                     remat,

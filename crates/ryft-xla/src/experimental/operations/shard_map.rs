@@ -686,13 +686,14 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for LinearShardMapOperati
 impl LinearOperation<ArrayType, ShardMapTensor> for LinearShardMapOperation<ShardMapTensor> {
     fn transpose(
         &self,
-        _context: &mut dyn ryft_core::tracing_v2::operations::LinearTransposeContext<
+        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+            '_,
             ArrayType,
             ShardMapTensor,
             LinearPrimitiveOperation<ShardMapTensor>,
         >,
-        output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TracingError> {
+        output_cotangents: &[Option<AtomId>],
+    ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != self.output_types.len() {
             return Err(TracingError::InvalidInputCount {
                 expected: self.output_types.len(),
@@ -702,14 +703,48 @@ impl LinearOperation<ArrayType, ShardMapTensor> for LinearShardMapOperation<Shar
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
         }
-        let contributions = LinearTerm::apply_staged_op(
-            output_cotangents[0].builder.clone(),
-            output_cotangents,
+        if output_cotangents.iter().all(Option::is_none) {
+            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
+        }
+        let materialized = output_cotangents
+            .iter()
+            .zip(self.output_types.iter())
+            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent, output_type))
+            .collect::<Vec<_>>();
+        let contributions = context.apply_operation(
+            materialized.as_slice(),
             LinearPrimitiveOperation::Custom(Arc::new(self.transpose_op().to_tensor_linear_custom_primitive())),
             self.input_types.len(),
         )?;
         Ok(contributions.into_iter().map(Some).collect::<Vec<_>>())
     }
+}
+
+/// Returns a concrete atom for `cotangent`, staging a typed `Zero` op when the cotangent is
+/// structurally zero. Higher-order linear rules use this when they must consume all output
+/// cotangents jointly.
+fn materialize_optional_cotangent<V>(
+    context: &ryft_core::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearPrimitiveOperation<V>>,
+    cotangent: &Option<AtomId>,
+    output_type: &ArrayType,
+) -> AtomId
+where
+    V: ryft_core::tracing::Traceable<ArrayType>,
+{
+    if let Some(atom) = cotangent {
+        return *atom;
+    }
+    let builder = context.builder();
+    let mut builder_borrow = builder.borrow_mut();
+    let output = builder_borrow.add_variable(output_type.clone());
+    builder_borrow.instructions.push(ryft_core::tracing::Instruction {
+        operation: LinearPrimitiveOperation::Zero(ryft_core::tracing_v2::operations::constants::ZeroOperation::new(
+            output_type.clone(),
+        )),
+        inputs: vec![],
+        outputs: vec![output],
+    });
+    output
 }
 
 impl<E> DifferentiableOperation<E> for ShardMapOperation<ShardMapTensor>
@@ -861,13 +896,14 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for LinearShardMapOperati
 impl LinearOperation<ArrayType, ShardMapTracer> for LinearShardMapOperation<ShardMapTracer> {
     fn transpose(
         &self,
-        _context: &mut dyn ryft_core::tracing_v2::operations::LinearTransposeContext<
+        context: &mut ryft_core::tracing_v2::operations::TranspositionContext<
+            '_,
             ArrayType,
             ShardMapTracer,
             LinearPrimitiveOperation<ShardMapTracer>,
         >,
-        output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TracingError> {
+        output_cotangents: &[Option<AtomId>],
+    ) -> Result<Vec<Option<AtomId>>, TracingError> {
         if output_cotangents.len() != self.output_types.len() {
             return Err(TracingError::InvalidInputCount {
                 expected: self.output_types.len(),
@@ -877,9 +913,16 @@ impl LinearOperation<ArrayType, ShardMapTracer> for LinearShardMapOperation<Shar
         if output_cotangents.is_empty() {
             return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
         }
-        let contributions = LinearTerm::apply_staged_op(
-            output_cotangents[0].builder.clone(),
-            output_cotangents,
+        if output_cotangents.iter().all(Option::is_none) {
+            return Ok((0..self.input_types.len()).map(|_| None).collect::<Vec<_>>());
+        }
+        let materialized = output_cotangents
+            .iter()
+            .zip(self.output_types.iter())
+            .map(|(cotangent, output_type)| materialize_optional_cotangent(context, cotangent, output_type))
+            .collect::<Vec<_>>();
+        let contributions = context.apply_operation(
+            materialized.as_slice(),
             LinearPrimitiveOperation::Custom(Arc::new(self.transpose_op().to_tracer_linear_custom_primitive())),
             self.input_types.len(),
         )?;
@@ -2299,7 +2342,7 @@ mod tests {
         tracing::{Atom, AtomId, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
         tracing_v2::{
             CustomOperationError, CustomPrimitive, DifferentiableOperation, LinearPrimitiveOperation, LinearTerm,
-            Tracer, forward::JvpTracer, operations::LinearTransposeContext,
+            Tracer, forward::JvpTracer, operations::TranspositionContext,
         },
         types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
     };
@@ -2320,27 +2363,10 @@ mod tests {
         ArrayType::scalar(DataType::F32)
     }
 
-    struct TestLinearTransposeContext;
-
-    impl<V: Traceable<ArrayType>> LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>
-        for TestLinearTransposeContext
-    {
-        fn make_output_cotangent_input(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
-            output_type: &ArrayType,
-            _output_index: usize,
-        ) -> Result<AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_input(output_type.clone()))
-        }
-
-        fn make_missing_input_cotangent(
-            &mut self,
-            _builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
-            _input_type: &ArrayType,
-        ) -> Result<AtomId, TracingError> {
-            panic!("shard_map transpose tests should not synthesize missing cotangents");
-        }
+    fn test_transposition_context<V: Traceable<ArrayType>>(
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
+    ) -> TranspositionContext<'static, ArrayType, V, LinearPrimitiveOperation<V>> {
+        TranspositionContext::new(builder)
     }
 
     fn test_shard_map() -> ShardMap {
@@ -2601,7 +2627,8 @@ mod tests {
     #[test]
     fn test_linear_tensor_shard_map_transpose_supports_zero_outputs() {
         let operation = zero_output_linear_shard_map_operation::<ShardMapTensor>();
-        let mut context = TestLinearTransposeContext;
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let mut context = test_transposition_context(builder);
 
         let contributions = ryft_core::tracing_v2::LinearOperation::transpose(&operation, &mut context, &[])
             .expect("zero-output linear shard_map transpose should succeed");
@@ -2613,7 +2640,8 @@ mod tests {
     #[test]
     fn test_linear_traced_shard_map_transpose_supports_zero_outputs() {
         let operation = zero_output_linear_shard_map_operation::<ShardMapTracer>();
-        let mut context = TestLinearTransposeContext;
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let mut context = test_transposition_context(builder);
 
         let contributions = ryft_core::tracing_v2::LinearOperation::transpose(&operation, &mut context, &[])
             .expect("zero-output traced linear shard_map transpose should succeed");

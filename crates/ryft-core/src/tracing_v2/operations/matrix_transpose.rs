@@ -8,7 +8,6 @@ use crate::{
     tracing_v2::{
         engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer},
-        linear::LinearTerm,
     },
 };
 
@@ -69,21 +68,25 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
 impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOperation {
     fn transpose(
         &self,
-        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
-        output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
+        context: &mut crate::tracing_v2::operations::TranspositionContext<
+            '_,
+            ArrayType,
+            V,
+            LinearPrimitiveOperation<V>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
-        Ok(vec![Some(
-            LinearTerm::apply_staged_op(
-                output_cotangents[0].builder.clone(),
-                std::slice::from_ref(&output_cotangents[0]),
-                LinearPrimitiveOperation::MatrixTranspose,
-                1,
-            )?
-            .into_iter()
-            .next()
-            .expect("matrix transpose should produce one cotangent contribution"),
-        )])
+        match output_cotangents[0] {
+            Some(atom) => Ok(vec![Some(
+                context
+                    .apply_operation(&[atom], LinearPrimitiveOperation::MatrixTranspose, 1)?
+                    .into_iter()
+                    .next()
+                    .expect("matrix transpose should produce one cotangent contribution"),
+            )]),
+            None => Ok(vec![None]),
+        }
     }
 }
 

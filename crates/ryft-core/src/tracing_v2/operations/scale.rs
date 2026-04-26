@@ -13,7 +13,6 @@ use crate::tracing_v2::{
     engines::{DifferentiableEngine, Engine},
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
-    linear::LinearTerm,
     operations::constants::ZeroLike,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
@@ -111,11 +110,25 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
 {
     fn transpose(
         &self,
-        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
-        output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
+        context: &mut crate::tracing_v2::operations::TranspositionContext<
+            '_,
+            ArrayType,
+            V,
+            LinearPrimitiveOperation<V>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
-        Ok(vec![Some(output_cotangents[0].clone().scale(self.factor().clone()))])
+        match output_cotangents[0] {
+            Some(atom) => Ok(vec![Some(
+                context
+                    .apply_operation(&[atom], LinearPrimitiveOperation::Scale { factor: self.factor().clone() }, 1)?
+                    .into_iter()
+                    .next()
+                    .expect("scale transpose should produce one cotangent contribution"),
+            )]),
+            None => Ok(vec![None]),
+        }
     }
 }
 
@@ -175,31 +188,16 @@ mod tests {
 
     use crate::{
         parameters::Placeholder,
-        tracing::{AtomId, ProgramBuilder},
-        tracing_v2::{LinearPrimitiveOperation, operations::LinearTransposeContext},
+        tracing::ProgramBuilder,
+        tracing_v2::{LinearPrimitiveOperation, operations::TranspositionContext},
     };
 
     use super::*;
 
-    struct TestLinearTransposeContext;
-
-    impl LinearTransposeContext<ArrayType, f64, LinearPrimitiveOperation<f64>> for TestLinearTransposeContext {
-        fn make_output_cotangent_input(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
-            output_type: &ArrayType,
-            _output_index: usize,
-        ) -> Result<AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_input(output_type.clone()))
-        }
-
-        fn make_missing_input_cotangent(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
-            _input_type: &ArrayType,
-        ) -> Result<AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_constant(0.0))
-        }
+    fn test_transposition_context(
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
+    ) -> TranspositionContext<'static, ArrayType, f64, LinearPrimitiveOperation<f64>> {
+        TranspositionContext::new(builder)
     }
 
     fn approx_eq(left: f64, right: f64) {
@@ -212,17 +210,15 @@ mod tests {
         let transpose_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
-        let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let mut context = TestLinearTransposeContext;
-        let contribution = ScaleOperation::new(3.0f64)
-            .transpose(&mut context, &[output_cotangent])
+        let mut context = test_transposition_context(transpose_builder.clone());
+        let contribution_atom = ScaleOperation::new(3.0f64)
+            .transpose(&mut context, &[Some(output_cotangent_atom)])
             .unwrap()
             .into_iter()
             .next()
             .expect("transpose should return one contribution")
             .expect("transpose should produce one cotangent contribution");
-        let contribution_atom = contribution.atom;
-        drop(contribution);
+        drop(context);
 
         let transpose_builder = Rc::try_unwrap(transpose_builder)
             .expect("transpose builder should not have outstanding linear terms")

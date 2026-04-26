@@ -260,6 +260,22 @@ impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> ZeroLike for Tr
     }
 }
 
+impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> crate::tracing_v2::operations::constants::Zero<E::Type>
+    for Tracer<'engine, E, O>
+{
+    /// Tracer cannot synthesize a zero from an [`E::Type`] alone because constructing a tracer
+    /// requires both an engine reference and a builder, neither of which is in scope here.
+    /// Programs that contain `Zero` ops over tracer values must materialize them away (via the
+    /// outer-trace builder) before being interpreted.
+    #[inline]
+    fn zero(_type: &E::Type) -> Result<Self, TracingError> {
+        Err(crate::types::TypeError {
+            message: "tracer values cannot synthesize zero from type metadata; materialize zero ops first".to_string(),
+        }
+        .into())
+    }
+}
+
 impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> OneLike for Tracer<'engine, E, O> {
     #[inline]
     fn one_like(&self) -> Self {

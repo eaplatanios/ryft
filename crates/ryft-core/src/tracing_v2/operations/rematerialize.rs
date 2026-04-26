@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value},
+    tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value},
     tracing_v2::{
         Differentiable, DifferentiationError, EngineTangent, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation,
         Tracer,
@@ -219,6 +219,7 @@ where
 impl<
     V: Value<ArrayType>
         + ZeroLike
+        + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + Differentiable<
             ArrayType,
             Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
@@ -393,9 +394,14 @@ where
 impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerializeOperation<ArrayType, V> {
     fn transpose(
         &self,
-        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
-        output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
+        context: &mut crate::tracing_v2::operations::TranspositionContext<
+            '_,
+            ArrayType,
+            V,
+            LinearPrimitiveOperation<V>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         let transpose = self.transpose_op();
         if output_cotangents.is_empty() {
             return if self.body.input_types().is_empty() {
@@ -404,17 +410,50 @@ impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerial
                 Err(DifferentiationError::MissingLinearRematerializeTransposeCotangentLeaves.into())
             };
         }
-        let exemplar_output_cotangent = output_cotangents[0].clone();
-        Ok(LinearTerm::apply_staged_op(
-            exemplar_output_cotangent.builder.clone(),
-            output_cotangents,
-            LinearPrimitiveOperation::Rematerialize(Box::new(transpose)),
-            self.body.input_types().len(),
-        )?
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>())
+        if output_cotangents.iter().all(Option::is_none) {
+            return Ok(vec![None; self.body.input_types().len()]);
+        }
+        let materialized = output_cotangents
+            .iter()
+            .zip(transpose.body.input_types().iter())
+            .map(|(cotangent, input_type)| materialize_optional_cotangent(context, *cotangent, input_type))
+            .collect::<Vec<_>>();
+        Ok(context
+            .apply_operation(
+                materialized.as_slice(),
+                LinearPrimitiveOperation::Rematerialize(Box::new(transpose)),
+                self.body.input_types().len(),
+            )?
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>())
     }
+}
+
+/// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
+/// is structurally zero. Linear higher-order rules use this when they must consume all output
+/// cotangents jointly (e.g. a nested transpose program that has a fixed input arity).
+fn materialize_optional_cotangent<V>(
+    context: &crate::tracing_v2::operations::TranspositionContext<'_, ArrayType, V, LinearPrimitiveOperation<V>>,
+    cotangent: Option<crate::tracing::AtomId>,
+    input_type: &ArrayType,
+) -> crate::tracing::AtomId
+where
+    V: Traceable<ArrayType>,
+{
+    if let Some(atom) = cotangent {
+        return atom;
+    }
+    use crate::tracing_v2::operations::SupportsZero;
+    let builder = context.builder();
+    let mut builder_borrow = builder.borrow_mut();
+    let output = builder_borrow.add_variable(input_type.clone());
+    builder_borrow.instructions.push(Instruction {
+        operation: <LinearPrimitiveOperation<V> as SupportsZero<ArrayType, V>>::zero_operation(input_type.clone()),
+        inputs: vec![],
+        outputs: vec![output],
+    });
+    output
 }
 
 /// Builds a linearized rematerialize op from its primal body by computing the pushforward and
@@ -451,7 +490,7 @@ where
     let body_program = body.program();
     let output_primals = body_program.interpret(input_primals.clone())?;
     let pushforward = linearize_program(engine, body_program, input_primals)?;
-    let pullback = transpose_linear_program_with_output_examples(engine, &pushforward, output_primals.as_slice())?;
+    let pullback = transpose_linear_program_with_output_examples(&pushforward, output_primals.as_slice())?;
     Ok(LinearRematerializeOperation::new(
         FlatTracedRematerialize::from_parts(body.input_types.clone(), body.output_types.clone(), pushforward),
         FlatTracedRematerialize::from_parts(body.output_types.clone(), body.input_types.clone(), pullback),
@@ -599,13 +638,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::tracing::{AtomId, Program, ProgramBuilder};
+    use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
         DifferentiationError, JvpTracer, LinearPrimitiveOperation, Linearized, Sin, Tracer,
         engines::ArrayScalarEngine,
         interpret_and_trace,
         linear::{compile_grad, grad, value_and_grad},
-        operations::LinearTransposeContext,
+        operations::TranspositionContext,
     };
 
     use super::*;
@@ -619,25 +658,8 @@ mod tests {
         ArrayType::scalar(crate::types::DataType::F64)
     }
 
-    struct TestLinearTransposeContext;
-
-    impl LinearTransposeContext<ArrayType, f64, LinearPrimitiveOperation<f64>> for TestLinearTransposeContext {
-        fn make_output_cotangent_input(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
-            output_type: &ArrayType,
-            _output_index: usize,
-        ) -> Result<AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_input(output_type.clone()))
-        }
-
-        fn make_missing_input_cotangent(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
-            _input_type: &ArrayType,
-        ) -> Result<AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_constant(0.0))
-        }
+    fn test_transposition_context() -> TranspositionContext<'static, ArrayType, f64, LinearPrimitiveOperation<f64>> {
+        TranspositionContext::new(Rc::new(RefCell::new(ProgramBuilder::new())))
     }
 
     fn empty_traced_body() -> FlatTracedRematerialize<ArrayType, f64> {
@@ -698,8 +720,8 @@ mod tests {
     #[test]
     fn test_linear_rematerialize_transpose_requires_output_cotangent_leaves() {
         let operation = LinearRematerializeOperation::<ArrayType, f64>::new(empty_linear_body(), empty_linear_body());
-        let output_cotangents: Vec<LinearTerm<ArrayType, f64>> = Vec::new();
-        let mut context = TestLinearTransposeContext;
+        let output_cotangents: Vec<Option<crate::tracing::AtomId>> = Vec::new();
+        let mut context = test_transposition_context();
 
         assert!(matches!(
             operation.transpose(&mut context, output_cotangents.as_slice()),

@@ -342,8 +342,10 @@ where
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    E::LinearOperation:
-        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, E::LinearOperation>,
+    E::LinearOperation: Clone
+        + InterpretableOperation<ArrayType, V>
+        + LinearOperation<ArrayType, V, E::LinearOperation>
+        + crate::tracing_v2::operations::SupportsZero<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();

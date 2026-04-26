@@ -357,6 +357,13 @@ impl ZeroLike for ShardMapTensor {
     }
 }
 
+impl ryft_core::tracing_v2::operations::constants::Zero<ArrayType> for ShardMapTensor {
+    #[inline]
+    fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
+        Ok(Self::zero(value_type.clone()))
+    }
+}
+
 impl OneLike for ShardMapTensor {
     #[inline]
     fn one_like(&self) -> Self {

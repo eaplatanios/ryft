@@ -13,7 +13,6 @@ use crate::{
         LinearPrimitiveOperation,
         engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
-        linear::LinearTerm,
         operations::constants::ZeroLike,
     },
 };
@@ -105,11 +104,16 @@ impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<Array
 impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for AddOperation {
     fn transpose(
         &self,
-        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
-        output_cotangents: &[LinearTerm<ArrayType, V>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
+        _context: &mut crate::tracing_v2::operations::TranspositionContext<
+            '_,
+            ArrayType,
+            V,
+            LinearPrimitiveOperation<V>,
+        >,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         check_input_count!(output_cotangents, 1);
-        Ok(vec![Some(output_cotangents[0].clone()), Some(output_cotangents[0].clone())])
+        Ok(vec![output_cotangents[0], output_cotangents[0]])
     }
 }
 

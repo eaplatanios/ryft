@@ -14,8 +14,7 @@ use crate::{
         forward::{JvpTracer, TangentSpace},
         jit::{DifferentiableTracer, Tracer, interpret_and_trace_with_operation},
         operations::{
-            DifferentiableOperation, LinearTransposeContext, SupportsAdd, SupportsNeg, SupportsRematerialize,
-            SupportsScale,
+            DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsRematerialize, SupportsScale,
             constants::{OneLike, ZeroLike},
             rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
@@ -39,8 +38,6 @@ mod term;
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 #[doc(hidden)]
 pub use program::linearize_program;
-pub use program::transpose_linear_program;
-pub(crate) use program::transpose_linear_program_with_context;
 pub use program::transpose_linear_program_with_output_examples;
 pub use program::transpose_traced_linear_program;
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
@@ -168,7 +165,9 @@ mod tests {
         tracing::{InterpretableOperation, Operation, ProgramBuilder, TracingError},
         tracing_v2::{
             CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
-            PrimitiveOperation, Sin, engines::ArrayScalarEngine, operations::matrix::ndarray_support::Array2Engine,
+            PrimitiveOperation, Sin,
+            engines::ArrayScalarEngine,
+            operations::{TranspositionContext, matrix::ndarray_support::Array2Engine},
             test_support,
         },
         types::{ArrayType, DataType, TypeError},
@@ -234,13 +233,13 @@ mod tests {
     impl LinearOperation<ArrayType, f64> for PanicReplayOp {
         fn transpose(
             &self,
-            _context: &mut dyn LinearTransposeContext<ArrayType, f64, LinearPrimitiveOperation<f64>>,
-            output_cotangents: &[LinearTerm<ArrayType, f64>],
-        ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TracingError> {
+            _context: &mut TranspositionContext<'_, ArrayType, f64, LinearPrimitiveOperation<f64>>,
+            output_cotangents: &[Option<crate::tracing::AtomId>],
+        ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             if output_cotangents.len() != 1 {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
             }
-            Ok(vec![Some(output_cotangents[0].clone())])
+            Ok(vec![output_cotangents[0]])
         }
     }
 
@@ -390,7 +389,7 @@ mod tests {
     fn test_transposed_linear_program_matches_the_reverse_mode_pullback() {
         let engine = ArrayScalarEngine::<f64>::new();
         let (primal, pushforward) = jvp_program(&engine, |inputs| Ok(bilinear_sin(inputs)), (2.0f64, 3.0f64)).unwrap();
-        let pullback = transpose_linear_program(&engine, &pushforward).unwrap();
+        let pullback = transpose_linear_program_with_output_examples(&pushforward, &[primal]).unwrap();
         let cotangent = pullback.interpret(1.0f64).unwrap();
 
         approx_eq(primal, 2.0 * 3.0 + 2.0f64.sin());
@@ -448,38 +447,8 @@ mod tests {
         let program = builder.build::<f64, f64>(output, Placeholder, Placeholder).unwrap();
         let pushforward = program;
 
-        let pullback =
-            super::program::transpose_linear_program(&ArrayScalarEngine::<f64>::new(), &pushforward).unwrap();
+        let pullback = super::program::transpose_linear_program_with_output_examples(&pushforward, &[0.0f64]).unwrap();
         approx_eq(pullback.interpret(4.0f64).unwrap(), 4.0);
-    }
-
-    struct FailingZeroEngine;
-
-    impl Engine for FailingZeroEngine {
-        type Type = ArrayType;
-        type Value = f64;
-        type TracingOperation = PrimitiveOperation<f64>;
-
-        fn zero(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Err(TypeError { message: "test engine cannot synthesize zero".to_string() }.into())
-        }
-
-        fn one(&self, _type: &ArrayType) -> Result<f64, TracingError> {
-            Ok(1.0)
-        }
-    }
-
-    #[test]
-    fn transpose_linear_program_propagates_engine_zero_errors() {
-        let mut builder = ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new();
-        builder.add_input(0.0f64.r#type().into_owned());
-        let output = builder.add_constant(1.0f64);
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
-
-        assert!(matches!(
-            super::program::transpose_linear_program(&FailingZeroEngine, &program),
-            Err(TracingError::Type(TypeError { message })) if message == "test engine cannot synthesize zero"
-        ));
     }
 
     #[test]

@@ -4,18 +4,18 @@ use thiserror::Error;
 
 use crate::{
     parameters::Parameterized,
-    tracing::{InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError},
+    tracing::{Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError},
     tracing_v2::{
         EngineTangent, JvpTracer, LinearTerm, PrimitiveOperation, Tracer,
         engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, TangentSpace},
-        linear::{linearize_program, transpose_linear_program_with_context},
+        linear::linearize_program,
         operations::constants::ZeroLike,
     },
     types::{ArrayType, DataType, TypeError, Typed},
 };
 
-use super::{DifferentiableOperation, LinearOperation, LinearTransposeContext, SupportsAdd};
+use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TranspositionContext};
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O> = Program<ArrayType, V, O, Vec<V>, Vec<V>>;
@@ -396,40 +396,72 @@ where
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, O>
         + SupportsAdd<ArrayType, V>
+        + crate::tracing_v2::operations::SupportsZero<ArrayType, V>
         + From<ConditionOperation<V, O>>,
 {
     fn transpose(
         &self,
-        context: &mut dyn LinearTransposeContext<ArrayType, V, O>,
-        output_cotangents: &[LinearTerm<ArrayType, V, O>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, O>>>, TracingError> {
+        context: &mut TranspositionContext<'_, ArrayType, V, O>,
+        output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         let ConditionPredicate::Captured(predicate) = self.predicate else {
             return Err(
                 ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }.into()
             );
         };
-        let Some(first_cotangent) = output_cotangents.first() else {
+        if output_cotangents.is_empty() {
             return if self.input_types().is_empty() {
                 Ok(Vec::new())
             } else {
                 Err(ControlFlowError::MissingLinearInvocationContext.into())
             };
-        };
-        let mut transpose_branch = |branch: &FlatProgram<V, O>| transpose_linear_program_with_context(context, branch);
+        }
+        if output_cotangents.iter().all(Option::is_none) {
+            return Ok(vec![None; self.input_types().len()]);
+        }
         let transposed_condition = ConditionOperation::with_captured_predicate(
             predicate,
-            transpose_branch(&self.true_branch)?,
-            transpose_branch(&self.false_branch)?,
+            context.transpose_nested_program(&self.true_branch)?,
+            context.transpose_nested_program(&self.false_branch)?,
         )?;
+        let materialized = output_cotangents
+            .iter()
+            .zip(self.output_types().iter())
+            .map(|(cotangent, output_type)| stage_optional_cotangent(context, *cotangent, output_type))
+            .collect::<Vec<_>>();
         let input_count = self.input_types().len();
-        let cotangents = LinearTerm::apply_staged_op(
-            first_cotangent.builder.clone(),
-            output_cotangents,
-            O::from(transposed_condition),
-            input_count,
-        )?;
+        let cotangents =
+            context.apply_operation(materialized.as_slice(), O::from(transposed_condition), input_count)?;
         Ok(cotangents.into_iter().map(Some).collect())
     }
+}
+
+/// Returns a concrete cotangent atom for `cotangent`, staging a typed `Zero` op when the cotangent
+/// is structurally zero. Higher-order linear rules use this when they must consume all output
+/// cotangents jointly.
+fn stage_optional_cotangent<V, O>(
+    context: &TranspositionContext<'_, ArrayType, V, O>,
+    cotangent: Option<crate::tracing::AtomId>,
+    output_type: &ArrayType,
+) -> crate::tracing::AtomId
+where
+    V: Traceable<ArrayType>,
+    O: Clone + Operation<ArrayType> + crate::tracing_v2::operations::SupportsZero<ArrayType, V>,
+{
+    if let Some(atom) = cotangent {
+        return atom;
+    }
+    let builder = context.builder();
+    let mut builder_borrow = builder.borrow_mut();
+    let output = builder_borrow.add_variable(output_type.clone());
+    builder_borrow.instructions.push(Instruction {
+        operation: <O as crate::tracing_v2::operations::SupportsZero<ArrayType, V>>::zero_operation(
+            output_type.clone(),
+        ),
+        inputs: vec![],
+        outputs: vec![output],
+    });
+    output
 }
 
 impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O>
@@ -580,9 +612,9 @@ where
 {
     fn transpose(
         &self,
-        _context: &mut dyn LinearTransposeContext<ArrayType, V, O>,
-        _output_cotangents: &[LinearTerm<ArrayType, V, O>],
-    ) -> Result<Vec<Option<LinearTerm<ArrayType, V, O>>>, TracingError> {
+        _context: &mut TranspositionContext<'_, ArrayType, V, O>,
+        _output_cotangents: &[Option<crate::tracing::AtomId>],
+    ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
     }
 }
@@ -658,7 +690,7 @@ mod tests {
         tracing_v2::{
             LinearPrimitiveOperation,
             engines::{ArrayScalarEngine, Engine},
-            operations::{SupportsAdd, SupportsNeg, SupportsScale},
+            operations::{SupportsAdd, SupportsNeg, SupportsScale, constants::Zero},
         },
         types::DataType,
     };
@@ -698,6 +730,19 @@ mod tests {
             match self {
                 Self::Bool(_) => Self::Bool(false),
                 Self::Number(_) => Self::Number(0.0),
+            }
+        }
+    }
+
+    impl Zero<ArrayType> for TestValue {
+        fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
+            match value_type.data_type {
+                DataType::Boolean => Ok(Self::Bool(false)),
+                DataType::F64 => Ok(Self::Number(0.0)),
+                _ => Err(crate::types::TypeError {
+                    message: format!("test value cannot synthesize zero for {value_type}"),
+                }
+                .into()),
             }
         }
     }
@@ -855,33 +900,39 @@ mod tests {
     impl LinearOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose(
             &self,
-            context: &mut dyn LinearTransposeContext<ArrayType, TestValue, TestLinearOperation>,
-            output_cotangents: &[LinearTerm<ArrayType, TestValue, TestLinearOperation>],
-        ) -> Result<Vec<Option<LinearTerm<ArrayType, TestValue, TestLinearOperation>>>, TracingError> {
+            context: &mut TranspositionContext<'_, ArrayType, TestValue, TestLinearOperation>,
+            output_cotangents: &[Option<crate::tracing::AtomId>],
+        ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
             match self {
                 Self::Add => {
                     ensure_input_count(1, output_cotangents.len(), self.name())?;
-                    Ok(vec![Some(output_cotangents[0].clone()), Some(output_cotangents[0].clone())])
+                    Ok(vec![output_cotangents[0], output_cotangents[0]])
                 }
                 Self::Neg => {
                     ensure_input_count(1, output_cotangents.len(), self.name())?;
-                    let outputs = LinearTerm::apply_staged_op(
-                        output_cotangents[0].builder.clone(),
-                        output_cotangents,
-                        Self::Neg,
-                        1,
-                    )?;
-                    Ok(vec![Some(outputs[0].clone())])
+                    match output_cotangents[0] {
+                        Some(atom) => Ok(vec![Some(
+                            context
+                                .apply_operation(&[atom], Self::Neg, 1)?
+                                .into_iter()
+                                .next()
+                                .expect("neg transpose should produce one cotangent contribution"),
+                        )]),
+                        None => Ok(vec![None]),
+                    }
                 }
                 Self::Scale { factor } => {
                     ensure_input_count(1, output_cotangents.len(), self.name())?;
-                    let outputs = LinearTerm::apply_staged_op(
-                        output_cotangents[0].builder.clone(),
-                        output_cotangents,
-                        Self::Scale { factor: factor.clone() },
-                        1,
-                    )?;
-                    Ok(vec![Some(outputs[0].clone())])
+                    match output_cotangents[0] {
+                        Some(atom) => Ok(vec![Some(
+                            context
+                                .apply_operation(&[atom], Self::Scale { factor: factor.clone() }, 1)?
+                                .into_iter()
+                                .next()
+                                .expect("scale transpose should produce one cotangent contribution"),
+                        )]),
+                        None => Ok(vec![None]),
+                    }
                 }
                 Self::Condition(condition) => condition.transpose(context, output_cotangents),
             }
@@ -891,6 +942,14 @@ mod tests {
     impl SupportsAdd<ArrayType, TestValue> for TestLinearOperation {
         fn add_operation() -> Self {
             Self::Add
+        }
+    }
+
+    impl crate::tracing_v2::operations::SupportsZero<ArrayType, TestValue> for TestLinearOperation {
+        fn zero_operation(_type: ArrayType) -> Self {
+            // Test linear carrier doesn't include a Zero variant; the tests below never disconnect
+            // primal inputs, so this constructor is unreachable in practice.
+            Self::Scale { factor: TestValue::Number(0.0) }
         }
     }
 
@@ -996,25 +1055,10 @@ mod tests {
         type LinearOperation = TestLinearOperation;
     }
 
-    struct TestLinearTransposeContext;
-
-    impl LinearTransposeContext<ArrayType, TestValue, TestLinearOperation> for TestLinearTransposeContext {
-        fn make_output_cotangent_input(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
-            output_type: &ArrayType,
-            _output_index: usize,
-        ) -> Result<crate::tracing::AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_input(output_type.clone()))
-        }
-
-        fn make_missing_input_cotangent(
-            &mut self,
-            builder: &Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
-            input_type: &ArrayType,
-        ) -> Result<crate::tracing::AtomId, TracingError> {
-            Ok(builder.borrow_mut().add_constant(TestEngine.zero(input_type)?))
-        }
+    fn test_transposition_context(
+        builder: Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
+    ) -> TranspositionContext<'static, ArrayType, TestValue, TestLinearOperation> {
+        TranspositionContext::new(builder)
     }
 
     impl DifferentiableOperation<TestEngine> for TestDifferentiableOperation {
@@ -1345,11 +1389,10 @@ mod tests {
         .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let cotangent = LinearTerm::from_staged_parts(cotangent_input, builder);
-        let mut context = TestLinearTransposeContext;
+        let mut context = test_transposition_context(builder);
 
         assert!(matches!(
-            condition.transpose(&mut context, &[cotangent]),
+            condition.transpose(&mut context, &[Some(cotangent_input)]),
             Err(TracingError::ControlFlow(ControlFlowError::MissingTransformRule {
                 transform: "runtime-predicate condition transpose",
             })),
@@ -1366,9 +1409,8 @@ mod tests {
         .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let cotangent = LinearTerm::from_staged_parts(cotangent_input, builder.clone());
-        let mut context = TestLinearTransposeContext;
-        let outputs = condition.transpose(&mut context, &[cotangent]).unwrap();
+        let mut context = test_transposition_context(builder.clone());
+        let outputs = condition.transpose(&mut context, &[Some(cotangent_input)]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_some());
