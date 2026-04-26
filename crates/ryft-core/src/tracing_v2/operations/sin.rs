@@ -7,7 +7,7 @@ use crate::tracing_v2::{
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
 };
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale, cos::Cos,
@@ -74,7 +74,7 @@ impl Operation<ArrayType> for SinOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for SinOperation {
+impl<V: Typed<ArrayType> + Clone + Sin> InterpretableOperation<ArrayType, V> for SinOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![inputs[0].clone().sin()])
@@ -84,7 +84,7 @@ impl<V: Traceable<ArrayType> + Sin> InterpretableOperation<ArrayType, V> for Sin
 impl<E> DifferentiableOperation<E> for SinOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: Traceable<ArrayType> + Sin + Cos + Differentiable<ArrayType>,
+    E::Value: Sin + Cos + Differentiable<ArrayType>,
     E::LinearOperation:
         SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {
@@ -102,7 +102,7 @@ where
     }
 }
 
-impl<V: Traceable<ArrayType> + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for JvpTracer<V, T> {
+impl<V: Typed<ArrayType> + Clone + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for JvpTracer<V, T> {
     #[inline]
     fn sin(self) -> Self {
         Self { primal: self.primal.clone().sin(), tangent: T::scale(self.primal.cos(), self.tangent) }

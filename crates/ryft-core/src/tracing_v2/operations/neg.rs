@@ -12,7 +12,7 @@ use crate::tracing_v2::{
     linear::LinearTerm,
     operations::constants::ZeroLike,
 };
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
     DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, SupportsScale,
@@ -55,7 +55,7 @@ impl Operation<ArrayType> for NegOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
+impl<V: Typed<ArrayType> + Clone + Neg<Output = V>> InterpretableOperation<ArrayType, V> for NegOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![-inputs[0].clone()])
@@ -76,7 +76,7 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
 impl<E> DifferentiableOperation<E> for NegOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: Traceable<ArrayType> + Neg<Output = E::Value> + Differentiable<ArrayType>,
+    E::Value: Neg<Output = E::Value> + Differentiable<ArrayType>,
     E::LinearOperation:
         SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {

@@ -394,7 +394,7 @@ impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for Custom
 
 impl<V, E> DifferentiableOperation<E> for CustomPrimitive<ArrayType, V>
 where
-    V: Traceable<ArrayType> + Parameter + Differentiable<ArrayType> + 'static,
+    V: Differentiable<ArrayType> + 'static,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
 {
     fn jvp(

@@ -46,7 +46,7 @@ pub struct ScaleOperation<T: Type, V: Typed<T>> {
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: Type, V: Traceable<T>> ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T>> ScaleOperation<T, V> {
     /// Creates a new scale operation capturing the provided factor.
     #[inline]
     pub fn new(factor: V) -> Self {
@@ -60,7 +60,7 @@ impl<T: Type, V: Traceable<T>> ScaleOperation<T, V> {
     }
 }
 
-impl<V: Traceable<ArrayType>> ScaleOperation<ArrayType, V> {
+impl<V: Typed<ArrayType>> ScaleOperation<ArrayType, V> {
     /// Validates abstract inputs without needing a concrete instance.
     ///
     /// This is mainly used by carrier-level wrappers that want to construct or validate a scale op
@@ -70,19 +70,19 @@ impl<V: Traceable<ArrayType>> ScaleOperation<ArrayType, V> {
     }
 }
 
-impl<T: Type, V: Traceable<T>> Debug for ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T>> Debug for ScaleOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Scale")
     }
 }
 
-impl<T: Type, V: Traceable<T>> Display for ScaleOperation<T, V> {
+impl<T: Type, V: Typed<T>> Display for ScaleOperation<T, V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "scale")
     }
 }
 
-impl<V: Traceable<ArrayType>> Operation<ArrayType> for ScaleOperation<ArrayType, V> {
+impl<V: Typed<ArrayType> + Display> Operation<ArrayType> for ScaleOperation<ArrayType, V> {
     fn name(&self) -> &'static str {
         "scale"
     }
@@ -97,7 +97,9 @@ impl<V: Traceable<ArrayType>> Operation<ArrayType> for ScaleOperation<ArrayType,
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V>> InterpretableOperation<ArrayType, V> for ScaleOperation<ArrayType, V> {
+impl<V: Typed<ArrayType> + Display + Clone + Mul<Output = V>> InterpretableOperation<ArrayType, V>
+    for ScaleOperation<ArrayType, V>
+{
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 1);
         Ok(vec![self.factor().clone() * inputs[0].clone()])
@@ -147,9 +149,8 @@ where
 
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
 where
-    V: Traceable<ArrayType> + Mul<Output = V>,
+    V: Differentiable<ArrayType> + Mul<Output = V>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
-    V: Differentiable<ArrayType>,
     E::LinearOperation: SupportsAdd<ArrayType, V> + SupportsNeg<ArrayType, V> + SupportsScale<ArrayType, V>,
 {
     fn jvp(

@@ -185,7 +185,7 @@ where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Add for JvpTracer<V, T> {
+impl<V: Typed<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>> Add for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -194,7 +194,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike, T: TangentSpace<Array
     }
 }
 
-impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Mul for JvpTracer<V, T> {
+impl<V: Typed<ArrayType> + Clone + Mul<Output = V>, T: TangentSpace<ArrayType, V>> Mul for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]
@@ -206,7 +206,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike, T: TangentSpace<Array
     }
 }
 
-impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike, T: TangentSpace<ArrayType, V>> Neg for JvpTracer<V, T> {
+impl<V: Typed<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>> Neg for JvpTracer<V, T> {
     type Output = Self;
 
     #[inline]

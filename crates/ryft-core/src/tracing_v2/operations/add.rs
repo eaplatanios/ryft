@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::broadcasting::Broadcastable;
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 use crate::{
     macros::check_input_count,
     tracing::{Traceable, TracingError},
@@ -95,7 +95,7 @@ impl Operation<ArrayType> for AddOperation {
     }
 }
 
-impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
+impl<V: Typed<ArrayType> + Clone + Add<Output = V>> InterpretableOperation<ArrayType, V> for AddOperation {
     fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
         check_input_count!(inputs, 2);
         Ok(vec![inputs[0].clone() + inputs[1].clone()])
@@ -116,7 +116,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<Array
 impl<E> DifferentiableOperation<E> for AddOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: Traceable<ArrayType> + Add<Output = E::Value> + Differentiable<ArrayType>,
+    E::Value: Add<Output = E::Value> + Differentiable<ArrayType>,
     E::LinearOperation:
         SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
 {
