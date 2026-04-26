@@ -63,22 +63,17 @@ where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::Operation: InterpretableOperation<ArrayType, V> + TracedLinearizableOperation<'engine, E>,
-    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
-        + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
-        + LinearOperation<
-            ArrayType,
-            DifferentiableTracer<'engine, E>,
-            LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>,
-        >,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
+        + LinearOperation<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
-    Input::To<ArrayType>:
-        Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = Input::To<DifferentiableTracer<'engine, E>>>,
-    V::To<ArrayType>: Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = DifferentiableTracer<'engine, E>>,
-    F: Fn(Input::To<DifferentiableTracer<'engine, E>>) -> DifferentiableTracer<'engine, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
+    F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
 {
     let input_structure = example_primals.parameter_structure();
     let staged_input_types = Input::To::<ArrayType>::from_parameters(
@@ -144,22 +139,17 @@ where
     E::Operation: InterpretableOperation<ArrayType, V>
         + TracedLinearizableOperation<'engine, E>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
-        + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
-        + LinearOperation<
-            ArrayType,
-            DifferentiableTracer<'engine, E>,
-            LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>,
-        >,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
+        + LinearOperation<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
-    Input::To<ArrayType>:
-        Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = Input::To<DifferentiableTracer<'engine, E>>>,
-    V::To<ArrayType>: Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = DifferentiableTracer<'engine, E>>,
-    F: Fn(Input::To<DifferentiableTracer<'engine, E>>) -> DifferentiableTracer<'engine, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
+    F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
 {
     match policy {
         RematerializationPolicy::SaveAll => compile_grad(engine, &function, example_primals),
@@ -194,22 +184,17 @@ where
     E::Operation: InterpretableOperation<ArrayType, V>
         + TracedLinearizableOperation<'engine, E>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
-        + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
-        + LinearOperation<
-            ArrayType,
-            DifferentiableTracer<'engine, E>,
-            LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>,
-        >,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
+        + LinearOperation<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
     V: Parameterized<V, ParameterStructure = Placeholder>,
-    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    V::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
     Vec<V>: Parameterized<V, ParameterStructure = Vec<Placeholder>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<DifferentiableTracer<'engine, E>>,
-    Input::To<ArrayType>:
-        Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = Input::To<DifferentiableTracer<'engine, E>>>,
-    V::To<ArrayType>: Parameterized<ArrayType, To<DifferentiableTracer<'engine, E>> = DifferentiableTracer<'engine, E>>,
-    F: Fn(Input::To<DifferentiableTracer<'engine, E>>) -> DifferentiableTracer<'engine, E>,
+    Input::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<'engine, E>>,
+    Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input::To<Tracer<'engine, E>>>,
+    V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
+    F: Fn(Input::To<Tracer<'engine, E>>) -> Tracer<'engine, E>,
 {
     let input_structure = example_primals.parameter_structure();
     let staged_input_types = Input::To::<ArrayType>::from_parameters(

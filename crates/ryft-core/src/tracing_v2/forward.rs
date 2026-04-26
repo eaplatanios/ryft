@@ -10,7 +10,7 @@ use crate::{
     tracing_v2::{
         LinearPrimitiveOperation,
         engines::{DifferentiableEngine, Engine, TracingEngine},
-        jit::{DifferentiableTracer, Tracer},
+        jit::Tracer,
         linear::{jvp_program, jvp_traced},
         operations::{
             DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale, TracedLinearizationCarrier,
@@ -288,8 +288,8 @@ impl<
 > JvpInvocationLeaf<E, Input, Output> for V
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    Input::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
-    Output::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
+    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
+    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
     E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
@@ -297,11 +297,11 @@ where
         + SupportsScale<ArrayType, V>,
 {
     type FunctionInput<'engine>
-        = Input::To<DifferentiableTracer<'engine, E>>
+        = Input::To<Tracer<'engine, E>>
     where
         E: 'engine;
     type FunctionOutput<'engine>
-        = Output::To<DifferentiableTracer<'engine, E>>
+        = Output::To<Tracer<'engine, E>>
     where
         E: 'engine;
 
@@ -405,6 +405,7 @@ mod tests {
     use crate::tracing_v2::{
         PrimitiveOperation,
         engines::ArrayScalarEngine,
+        jit::TracingScope,
         operations::{AddOperation, DifferentiableOperation},
         test_support,
     };
@@ -421,8 +422,9 @@ mod tests {
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let outer_input_a = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
         let outer_input_b = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
-        let primal_a = Tracer::from_engine(outer_input_a, outer_builder.clone(), &engine);
-        let primal_b = Tracer::from_engine(outer_input_b, outer_builder.clone(), &engine);
+        let outer_scope = TracingScope::new(&engine, outer_builder.clone());
+        let primal_a = outer_scope.tracer_from_atom(outer_input_a);
+        let primal_b = outer_scope.tracer_from_atom(outer_input_b);
 
         let linearization_engine = LinearizationEngine::<ArrayScalarEngine<f64>>::new(&engine, outer_builder.clone());
 

@@ -1,7 +1,7 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use crate::{
-    parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
+    parameters::{Parameterized, ParameterizedFamily, Placeholder},
     tracing::{
         Atom, AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError,
         Value,
@@ -10,7 +10,7 @@ use crate::{
         Differentiable, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
         engines::{DifferentiableEngine, Engine, TracingEngine},
         forward::JvpTracer,
-        jit::{DifferentiableTracer, Tracer, interpret_and_trace},
+        jit::{Tracer, interpret_and_trace},
         operations::{
             DifferentiableOperation, SupportsAdd, SupportsRematerialize,
             constants::{One, OneLike, Zero, ZeroLike},

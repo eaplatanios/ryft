@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::{
+    parameters::Parameter,
     tracing::{Operation, Traceable, TracingError},
     tracing_v2::{
         Differentiable, LinearOperation as LinearOperationTrait, LinearPrimitiveOperation, PrimitiveOperation,
@@ -32,7 +33,7 @@ pub trait Engine {
     /// This is the descriptor carried by staged atoms and used during abstract evaluation. For the
     /// default core pipeline it is usually [`ArrayType`](crate::types::ArrayType), but the trait is
     /// generic so backends can substitute a richer metadata type if needed.
-    type Type: Type;
+    type Type: Type + Parameter;
 
     /// Concrete leaf value produced by this engine.
     ///
