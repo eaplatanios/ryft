@@ -493,29 +493,6 @@ where
     Ok((output_types, program))
 }
 
-/// Stages `function` directly from type metadata using the active engine's operation carrier.
-pub fn trace_with_operation<'engine, E, F, Input, Output>(
-    engine: &'engine E,
-    function: F,
-    input_types: Input,
-) -> Result<(Output, Program<E::Type, E::Value, E::Operation, Input::To<E::Value>, Output::To<E::Value>>), TracingError>
-where
-    E: TracingEngine<Type: Parameter> + ?Sized,
-    Input: Parameterized<
-            E::Type,
-            ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    Output: Parameterized<
-            E::Type,
-            ParameterStructure: Clone,
-            Family: ParameterizedFamily<E::Value> + ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-{
-    trace_active(engine, function, input_types)
-}
-
 /// Stages `function` directly from type metadata using the ordinary staged op set selected by `engine`.
 pub fn trace<'engine, E, F, Input, Output>(
     engine: &'engine E,
@@ -537,34 +514,6 @@ where
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
 {
     trace_active(engine, function, input_types)
-}
-
-/// Stages `function`, interprets the resulting program on the supplied concrete inputs, and returns
-/// both the interpreted output and the staged program.
-///
-/// This is the main "trace what I just ran" API used throughout tests and higher-order transforms.
-/// It first captures the symbolic program shape through [`trace`], then immediately re-tags that
-/// flat trace with the caller's original structures, applies structural dead-code cleanup, and
-/// replays it on the supplied inputs. The result is a convenient pair:
-///
-/// - the concrete output that the caller would expect from eager execution, and
-/// - the staged [`Program`] representing the same computation for later reuse.
-pub fn interpret_and_trace_with_operation<'engine, E, F, Input, Output>(
-    engine: &'engine E,
-    function: F,
-    input: Input,
-) -> Result<(Output, Program<E::Type, E::Value, E::Operation, Input, Output>), TracingError>
-where
-    E: TracingEngine<Type: Parameter, Operation: InterpretableOperation<E::Type, E::Value>> + ?Sized,
-    Input: Parameterized<
-            E::Value,
-            ParameterStructure: Clone + std::fmt::Debug + PartialEq,
-            Family: ParameterizedFamily<Tracer<'engine, E>>,
-        >,
-    Output: Parameterized<E::Value, ParameterStructure: Clone, Family: ParameterizedFamily<Tracer<'engine, E>>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-{
-    interpret_and_trace(engine, function, input)
 }
 
 /// Stages `function` with the ordinary op carrier, interprets it, and returns both results.

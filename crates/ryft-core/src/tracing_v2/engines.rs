@@ -66,63 +66,6 @@ pub trait TracingEngine: Engine {
     type Operation: Clone + Operation<Self::Type>;
 }
 
-/// Active tracing engine that pairs an arbitrary operation carrier with a runtime [`Engine`].
-///
-/// Most backends implement [`TracingEngine`] directly. This wrapper is for transforms that need to
-/// replay or construct a program with an operation carrier chosen by the caller rather than by the
-/// backend's ordinary tracing surface.
-#[derive(Debug)]
-pub struct OperationTracingEngine<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> {
-    /// Runtime engine used for metadata-driven value synthesis.
-    engine: &'engine E,
-
-    /// Operation carrier selected for the active trace.
-    marker: PhantomData<fn() -> O>,
-}
-
-impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> OperationTracingEngine<'engine, E, O> {
-    /// Creates a tracing engine that pairs `engine` with operation carrier `O`.
-    #[inline]
-    pub const fn new(engine: &'engine E) -> Self {
-        Self { engine, marker: PhantomData }
-    }
-
-    /// Returns the wrapped runtime engine.
-    #[inline]
-    pub const fn inner(&self) -> &'engine E {
-        self.engine
-    }
-}
-
-impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Clone for OperationTracingEngine<'engine, E, O> {
-    fn clone(&self) -> Self {
-        Self { engine: self.engine, marker: PhantomData }
-    }
-}
-
-impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Copy for OperationTracingEngine<'engine, E, O> {}
-
-impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Engine for OperationTracingEngine<'engine, E, O> {
-    type Type = E::Type;
-    type Value = E::Value;
-
-    #[inline]
-    fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        self.engine.zero(r#type)
-    }
-
-    #[inline]
-    fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
-        self.engine.one(r#type)
-    }
-}
-
-impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> TracingEngine
-    for OperationTracingEngine<'engine, E, O>
-{
-    type Operation = O;
-}
-
 /// Extension of [`Engine`] for backends that support automatic differentiation.
 ///
 /// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
