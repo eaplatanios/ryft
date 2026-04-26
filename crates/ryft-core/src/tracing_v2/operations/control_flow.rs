@@ -4,18 +4,20 @@ use thiserror::Error;
 
 use crate::{
     parameters::Parameterized,
-    tracing::{Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError},
+    tracing::{
+        Instruction, InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError, Value,
+    },
     tracing_v2::{
-        EngineTangent, JvpTracer, LinearTerm, PrimitiveOperation, Tracer,
+        JvpContext, JvpTracer, PrimitiveOperation, Tracer,
         engines::{DifferentiableEngine, Engine},
-        forward::{Differentiable, TangentSpace},
+        forward::Differentiable,
         linear::linearize_program,
-        operations::constants::ZeroLike,
+        operations::constants::{Zero, ZeroLike},
     },
     types::{ArrayType, DataType, TypeError, Typed},
 };
 
-use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TranspositionContext};
+use super::{DifferentiableOperation, LinearOperation, SupportsAdd, TracedLinearizationCarrier, TranspositionContext};
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O> = Program<ArrayType, V, O, Vec<V>, Vec<V>>;
@@ -86,7 +88,7 @@ impl ControlFlowValue for ndarray::Array2<f64> {
     }
 }
 
-impl<V: ControlFlowValue, T: TangentSpace<ArrayType, V>> ControlFlowValue for JvpTracer<V, T> {
+impl<V: ControlFlowValue, T: Clone + crate::parameters::Parameter> ControlFlowValue for JvpTracer<V, T> {
     #[inline]
     fn control_flow_predicate(&self) -> Result<bool, TracingError> {
         self.primal.control_flow_predicate()
@@ -191,30 +193,29 @@ fn ensure_input_count(expected: usize, got: usize, operation: &'static str) -> R
     Ok(())
 }
 
-/// Replays one staged linear program by inlining its instructions into an existing linear builder.
-fn replay_linear_program_on_terms<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>>(
+/// Replays one staged linear program by inlining its instructions into an existing linear builder
+/// owned by a [`JvpContext`].
+fn replay_linear_program_on_atoms<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>>(
+    context: &JvpContext<'_, V, O>,
     program: &FlatProgram<V, O>,
-    inputs: &[LinearTerm<ArrayType, V, O>],
-) -> Result<Vec<LinearTerm<ArrayType, V, O>>, TracingError> {
+    inputs: &[crate::tracing::AtomId],
+) -> Result<Vec<crate::tracing::AtomId>, TracingError> {
     if inputs.len() != program.input_ids.len() {
         return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: inputs.len() });
     }
-    if inputs.is_empty() {
-        if program.output_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        return Err(ControlFlowError::MissingLinearInvocationContext.into());
+    if inputs.is_empty() && program.output_ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let builder = inputs[0].builder.clone();
-    let mut values = vec![None; program.atoms.len()];
-    for (input_id, input) in program.input_ids.iter().copied().zip(inputs.iter().cloned()) {
+    let builder = context.builder().clone();
+    let mut values: Vec<Option<crate::tracing::AtomId>> = vec![None; program.atoms.len()];
+    for (input_id, input) in program.input_ids.iter().copied().zip(inputs.iter().copied()) {
         values[input_id.index] = Some(input);
     }
     for (atom_index, atom) in program.atoms.iter().enumerate() {
         if let crate::tracing::Atom::Constant(value) = atom {
             let atom = builder.borrow_mut().add_constant(value.clone());
-            values[atom_index] = Some(LinearTerm::from_staged_parts(atom, builder.clone()));
+            values[atom_index] = Some(atom);
         }
     }
 
@@ -222,10 +223,9 @@ fn replay_linear_program_on_terms<V: Traceable<ArrayType>, O: Clone + Operation<
         let instruction_inputs = instruction
             .inputs
             .iter()
-            .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
+            .map(|input| values[input.index].ok_or(TracingError::UnboundAtomId { id: *input }))
             .collect::<Result<Vec<_>, _>>()?;
-        let outputs = LinearTerm::apply_staged_op(
-            builder.clone(),
+        let outputs = context.apply_operation(
             instruction_inputs.as_slice(),
             instruction.operation.clone(),
             instruction.outputs.len(),
@@ -238,7 +238,7 @@ fn replay_linear_program_on_terms<V: Traceable<ArrayType>, O: Clone + Operation<
     program
         .output_ids
         .iter()
-        .map(|output| values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
+        .map(|output| values[output.index].ok_or(TracingError::UnboundAtomId { id: *output }))
         .collect()
 }
 
@@ -466,16 +466,7 @@ where
 
 impl<V, E, O> DifferentiableOperation<E> for ConditionOperation<V, O>
 where
-    V: ControlFlowValue
-        + ZeroLike
-        + Differentiable<
-            ArrayType,
-            Tangent<<E as DifferentiableEngine>::LinearOperation> = LinearTerm<
-                ArrayType,
-                V,
-                <E as DifferentiableEngine>::LinearOperation,
-            >,
-        >,
+    V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as DifferentiableEngine>::LinearOperation: Operation<ArrayType>,
@@ -484,8 +475,9 @@ where
     fn jvp(
         &self,
         engine: &E,
-        inputs: &[JvpTracer<V, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
+        context: &mut crate::tracing_v2::JvpContext<'_, V, E::LinearOperation>,
+        inputs: &[JvpTracer<V, crate::tracing::AtomId>],
+    ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let operand_count = self.input_types().len();
         let expected_count = operand_count + usize::from(matches!(self.predicate, ConditionPredicate::RuntimeInput(_)));
         if inputs.len() != expected_count {
@@ -496,16 +488,46 @@ where
             ConditionPredicate::Captured(predicate) => (predicate, inputs),
         };
         let primal_operands = operands.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let tangent_operands = operands.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_operands = operands.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let branch = self.selected_branch(predicate);
         let primal_outputs = branch.interpret(primal_operands.clone())?;
         let pushforward = linearize_program(engine, branch, primal_operands)?;
-        let tangent_outputs = replay_linear_program_on_terms(&pushforward, tangent_operands.as_slice())?;
+        let tangent_outputs = replay_linear_program_on_atoms(context, &pushforward, tangent_operands.as_slice())?;
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
             .map(|(primal, tangent)| JvpTracer { primal, tangent })
             .collect())
+    }
+}
+
+/// JVP rule for `ConditionOperation` under
+/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
+///
+/// Predicate extraction does not work at trace time (the wrapper engine's `Value` is `Tracer`,
+/// whose `control_flow_predicate` always errors), so this impl reports
+/// [`ControlFlowError::MissingTransformRule`] for any traced JVP attempt.
+impl<'engine, V, EInner, OInner>
+    DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>>
+    for ConditionOperation<V, OInner>
+where
+    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    EInner: crate::tracing_v2::engines::Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    OInner: TracedLinearizationCarrier<V>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+{
+    fn jvp(
+        &self,
+        _engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>,
+        _context: &mut crate::tracing_v2::JvpContext<
+            '_,
+            crate::tracing_v2::Tracer<'engine, EInner, OInner>,
+            crate::tracing_v2::LinearPrimitiveOperation<crate::tracing_v2::Tracer<'engine, EInner, OInner>>,
+        >,
+        _inputs: &[JvpTracer<crate::tracing_v2::Tracer<'engine, EInner, OInner>, crate::tracing::AtomId>],
+    ) -> Result<Vec<JvpTracer<crate::tracing_v2::Tracer<'engine, EInner, OInner>, crate::tracing::AtomId>>, TracingError>
+    {
+        Err(ControlFlowError::MissingTransformRule { transform: "linearization engine traced JVP" }.into())
     }
 }
 
@@ -619,18 +641,36 @@ where
     }
 }
 
+/// JVP rule for `WhileOperation` under
+/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine). See the matching
+/// [`ConditionOperation`] impl for rationale; predicate extraction does not work at trace time.
+impl<'engine, V, EInner, OInner>
+    DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>>
+    for WhileOperation<V, OInner>
+where
+    V: ControlFlowValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    EInner: crate::tracing_v2::engines::Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    OInner: TracedLinearizationCarrier<V>,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
+{
+    fn jvp(
+        &self,
+        _engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>,
+        _context: &mut crate::tracing_v2::JvpContext<
+            '_,
+            crate::tracing_v2::Tracer<'engine, EInner, OInner>,
+            crate::tracing_v2::LinearPrimitiveOperation<crate::tracing_v2::Tracer<'engine, EInner, OInner>>,
+        >,
+        _inputs: &[JvpTracer<crate::tracing_v2::Tracer<'engine, EInner, OInner>, crate::tracing::AtomId>],
+    ) -> Result<Vec<JvpTracer<crate::tracing_v2::Tracer<'engine, EInner, OInner>, crate::tracing::AtomId>>, TracingError>
+    {
+        Err(ControlFlowError::MissingTransformRule { transform: "linearization engine traced JVP" }.into())
+    }
+}
+
 impl<V, E, O> DifferentiableOperation<E> for WhileOperation<V, O>
 where
-    V: ControlFlowValue
-        + ZeroLike
-        + Differentiable<
-            ArrayType,
-            Tangent<<E as DifferentiableEngine>::LinearOperation> = LinearTerm<
-                ArrayType,
-                V,
-                <E as DifferentiableEngine>::LinearOperation,
-            >,
-        >,
+    V: ControlFlowValue + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E> + InterpretableOperation<ArrayType, V> + Operation<ArrayType>,
     <E as DifferentiableEngine>::LinearOperation: Operation<ArrayType>,
@@ -639,14 +679,15 @@ where
     fn jvp(
         &self,
         engine: &E,
-        inputs: &[JvpTracer<V, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
+        context: &mut crate::tracing_v2::JvpContext<'_, V, E::LinearOperation>,
+        inputs: &[JvpTracer<V, crate::tracing::AtomId>],
+    ) -> Result<Vec<JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let state_count = self.state_types().len();
         if inputs.len() != state_count {
             return Err(TracingError::InvalidInputCount { expected: state_count, got: inputs.len() });
         }
         let mut state_primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let mut state_tangents = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let mut state_tangents = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
 
         loop {
             let condition_outputs = self.condition.interpret(state_primals.clone())?;
@@ -663,7 +704,7 @@ where
 
             let pushforward = linearize_program(engine, self.body(), state_primals.clone())?;
             let next_primals = self.body.interpret(state_primals)?;
-            let next_tangents = replay_linear_program_on_terms(&pushforward, state_tangents.as_slice())?;
+            let next_tangents = replay_linear_program_on_atoms(context, &pushforward, state_tangents.as_slice())?;
             if next_primals.len() != state_count {
                 return Err(TracingError::InvalidOutputCount { expected: state_count, got: next_primals.len() });
             }
@@ -688,9 +729,12 @@ mod tests {
         parameters::{Parameter, Placeholder},
         tracing::{ProgramBuilder, Traceable, Value},
         tracing_v2::{
-            LinearPrimitiveOperation,
+            Differentiable, LinearPrimitiveOperation,
             engines::{ArrayScalarEngine, Engine},
-            operations::{SupportsAdd, SupportsNeg, SupportsScale, constants::Zero},
+            operations::{
+                SupportsAdd, SupportsNeg, SupportsScale,
+                constants::{One, OneLike, Zero},
+            },
         },
         types::DataType,
     };
@@ -734,6 +778,15 @@ mod tests {
         }
     }
 
+    impl OneLike for TestValue {
+        fn one_like(&self) -> Self {
+            match self {
+                Self::Bool(_) => Self::Bool(true),
+                Self::Number(_) => Self::Number(1.0),
+            }
+        }
+    }
+
     impl Zero<ArrayType> for TestValue {
         fn zero(value_type: &ArrayType) -> Result<Self, TracingError> {
             match value_type.data_type {
@@ -745,6 +798,29 @@ mod tests {
                 .into()),
             }
         }
+    }
+
+    impl One<ArrayType> for TestValue {
+        fn one(value_type: &ArrayType) -> Result<Self, TracingError> {
+            if value_type.rank() != 0 {
+                return Err(crate::tracing_v2::DifferentiationError::NonScalarGradientOutput {
+                    output_type: value_type.clone(),
+                }
+                .into());
+            }
+            match value_type.data_type {
+                DataType::Boolean => Ok(Self::Bool(true)),
+                DataType::F64 => Ok(Self::Number(1.0)),
+                _ => Err(crate::types::TypeError {
+                    message: format!("test value cannot synthesize one for {value_type}"),
+                }
+                .into()),
+            }
+        }
+    }
+
+    impl Differentiable<ArrayType> for TestValue {
+        type Tangent = Self;
     }
 
     impl ControlFlowValue for TestValue {
@@ -1065,25 +1141,29 @@ mod tests {
         fn jvp(
             &self,
             _engine: &TestEngine,
-            inputs: &[JvpTracer<TestValue, EngineTangent<TestEngine>>],
-        ) -> Result<Vec<JvpTracer<TestValue, EngineTangent<TestEngine>>>, TracingError> {
+            context: &mut JvpContext<'_, TestValue, TestLinearOperation>,
+            inputs: &[JvpTracer<TestValue, crate::tracing::AtomId>],
+        ) -> Result<Vec<JvpTracer<TestValue, crate::tracing::AtomId>>, TracingError> {
             match self {
                 Self::IsPositive => Err(ControlFlowError::MissingTransformRule { transform: "is_positive jvp" }.into()),
                 Self::SubtractOne => {
                     ensure_input_count(1, inputs.len(), self.name())?;
                     let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
-                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: inputs[0].tangent.clone() }])
+                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: inputs[0].tangent }])
                 }
                 Self::Scale { factor } => {
                     ensure_input_count(1, inputs.len(), self.name())?;
                     let primal_outputs = self.interpret(std::slice::from_ref(&inputs[0].primal))?;
-                    let tangent_outputs = LinearTerm::apply_staged_op(
-                        inputs[0].tangent.builder.clone(),
-                        std::slice::from_ref(&inputs[0].tangent),
-                        TestLinearOperation::Scale { factor: factor.clone() },
-                        1,
-                    )?;
-                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent: tangent_outputs[0].clone() }])
+                    let tangent = context
+                        .apply_operation(
+                            &[inputs[0].tangent],
+                            TestLinearOperation::Scale { factor: factor.clone() },
+                            1,
+                        )?
+                        .into_iter()
+                        .next()
+                        .expect("test scale jvp should produce one tangent");
+                    Ok(vec![JvpTracer { primal: primal_outputs[0].clone(), tangent }])
                 }
             }
         }
@@ -1310,12 +1390,14 @@ mod tests {
         let engine = ArrayScalarEngine::<f64>::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let tangent = LinearTerm::from_staged_parts(tangent_input, builder.clone());
-        let outputs = condition.jvp(&engine, &[JvpTracer { primal: 4.0, tangent }]).unwrap();
+        let mut context = JvpContext::new(builder.clone());
+        let outputs =
+            condition.jvp(&engine, &mut context, &[JvpTracer { primal: 4.0, tangent: tangent_input }]).unwrap();
 
         assert_eq!(outputs[0].primal, 8.0);
-        let tangent_output = outputs[0].tangent.atom;
+        let tangent_output = outputs[0].tangent;
         drop(outputs);
+        drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
         let tangent_program = builder.build::<f64, f64>(vec![tangent_output], Placeholder, Placeholder).unwrap();
         assert_eq!(tangent_program.interpret(10.0), Ok(20.0));
@@ -1328,12 +1410,15 @@ mod tests {
                 .unwrap();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let tangent = LinearTerm::from_staged_parts(tangent_input, builder.clone());
-        let outputs = condition.jvp(&TestEngine, &[JvpTracer { primal: TestValue::Number(4.0), tangent }]).unwrap();
+        let mut context = JvpContext::new(builder.clone());
+        let outputs = condition
+            .jvp(&TestEngine, &mut context, &[JvpTracer { primal: TestValue::Number(4.0), tangent: tangent_input }])
+            .unwrap();
 
         assert_eq!(outputs[0].primal, TestValue::Number(8.0));
-        let tangent_output = outputs[0].tangent.atom;
+        let tangent_output = outputs[0].tangent;
         drop(outputs);
+        drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
         let tangent_program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![tangent_output], vec![Placeholder], vec![Placeholder])
@@ -1347,14 +1432,14 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let counter_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let value_tangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        let counter_tangent = LinearTerm::from_staged_parts(counter_tangent_input, builder.clone());
-        let value_tangent = LinearTerm::from_staged_parts(value_tangent_input, builder.clone());
+        let mut context = JvpContext::new(builder.clone());
         let outputs = while_operation
             .jvp(
                 &TestEngine,
+                &mut context,
                 &[
-                    JvpTracer { primal: TestValue::Number(3.0), tangent: counter_tangent },
-                    JvpTracer { primal: TestValue::Number(5.0), tangent: value_tangent },
+                    JvpTracer { primal: TestValue::Number(3.0), tangent: counter_tangent_input },
+                    JvpTracer { primal: TestValue::Number(5.0), tangent: value_tangent_input },
                 ],
             )
             .unwrap();
@@ -1363,8 +1448,9 @@ mod tests {
             outputs.iter().map(|output| output.primal.clone()).collect::<Vec<_>>(),
             vec![TestValue::Number(0.0), TestValue::Number(40.0)],
         );
-        let tangent_outputs = outputs.iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
+        let tangent_outputs = outputs.iter().map(|output| output.tangent).collect::<Vec<_>>();
         drop(outputs);
+        drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
         let tangent_program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(

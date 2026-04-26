@@ -11,7 +11,9 @@ use crate::tracing_v2::{
 /// explicit basis. [`CoordinateValue`] is the bridge from the generic tracing world into that
 /// coordinate-based view: it teaches the dense helpers how many coordinates a leaf contributes,
 /// what basis vectors to probe with, and how to flatten outputs back into numeric entries.
-pub trait CoordinateValue: Traceable<ArrayType> + ZeroLike + OneLike {
+pub trait CoordinateValue:
+    Traceable<ArrayType> + ZeroLike + OneLike + Zero<ArrayType> + One<ArrayType> + Differentiable<ArrayType, Tangent = Self>
+{
     /// Scalar-like coordinate type used by dense Jacobians and Hessians.
     type Coordinate: Clone + Debug + PartialEq + 'static;
 

@@ -38,7 +38,6 @@ error[E0283]: type annotations needed
              DevicePutPlacement
              DevicePutSharding
              JvpTracer<V, T>
-             LinearTerm<T, V, O>
              Option<P>
            and $N others
 note: required by a bound in `StructWithUnusedParameterType`

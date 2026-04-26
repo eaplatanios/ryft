@@ -1,18 +1,15 @@
 use std::fmt::{Debug, Display};
 
 use crate::macros::check_input_count;
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
     engines::{DifferentiableEngine, Engine},
-    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
+    forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale, cos::Cos,
-    unary_abstract,
-};
+use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsScale, cos::Cos, unary_abstract};
 
 /// Hidden carrier capability for staging the sine primitive.
 #[doc(hidden)]
@@ -83,29 +80,29 @@ impl<V: Typed<ArrayType> + Clone + Sin> InterpretableOperation<ArrayType, V> for
 
 impl<E> DifferentiableOperation<E> for SinOperation
 where
-    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: Sin + Cos + Differentiable<ArrayType>,
-    E::LinearOperation:
-        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
+    E: DifferentiableEngine + ?Sized,
+    SinOperation: Operation<E::Type>,
+    E::Value: Sin + Cos + Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperation: SupportsScale<E::Type, E::Value>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
-        Ok(vec![JvpTracer {
-            primal: input.primal.clone().sin(),
-            tangent: EngineTangent::<E>::scale(input.primal.clone().cos(), input.tangent.clone()),
-        }])
-    }
-}
-
-impl<V: Typed<ArrayType> + Clone + Sin + Cos, T: TangentSpace<ArrayType, V>> Sin for JvpTracer<V, T> {
-    #[inline]
-    fn sin(self) -> Self {
-        Self { primal: self.primal.clone().sin(), tangent: T::scale(self.primal.cos(), self.tangent) }
+        let tangent = context
+            .apply_operation(
+                &[input.tangent],
+                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(input.primal.clone().cos()),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("sin jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal: input.primal.clone().sin(), tangent }])
     }
 }
 

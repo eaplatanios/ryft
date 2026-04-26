@@ -7,19 +7,19 @@ use std::{
 use indoc::indoc;
 
 use crate::macros::check_input_count;
-use crate::tracing::{OperationFormatter, Traceable, TracingError, Value};
+use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
     LinearPrimitiveOperation,
     engines::{DifferentiableEngine, Engine},
-    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
+    forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
     operations::constants::ZeroLike,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, SupportsNeg,
-    lift_jit_constant, mul::SupportsMul, unary_abstract,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier,
+    unary_abstract,
 };
 
 /// Hidden carrier capability for staging the scaling primitive.
@@ -132,51 +132,69 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
     }
 }
 
-impl<
-    'engine,
-    V: Value<ArrayType> + ZeroLike + Mul<Output = V>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    InnerLinearOperation: Clone
-        + Operation<ArrayType>
-        + SupportsAdd<ArrayType, Tracer<'engine, E>>
-        + SupportsNeg<ArrayType, Tracer<'engine, E>>
-        + SupportsScale<ArrayType, Tracer<'engine, E>>,
-> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>
-    for ScaleOperation<ArrayType, V>
-where
-    E::TracingOperation: SupportsMul<ArrayType, V> + SupportsScale<ArrayType, V> + 'static,
-{
-    fn interpret(
-        &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>, InnerLinearOperation>>, TracingError>
-    {
-        check_input_count!(inputs, 1);
-        let factor = lift_jit_constant(self.factor(), &inputs[0].primal);
-        Ok(vec![JvpTracer {
-            primal: factor.clone() * inputs[0].primal.clone(),
-            tangent: inputs[0].tangent.clone().scale(factor),
-        }])
-    }
-}
-
 impl<V, E> DifferentiableOperation<E> for ScaleOperation<ArrayType, V>
 where
-    V: Differentiable<ArrayType> + Mul<Output = V>,
+    V: Differentiable<ArrayType, Tangent = V> + Mul<Output = V>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
-    E::LinearOperation: SupportsAdd<ArrayType, V> + SupportsNeg<ArrayType, V> + SupportsScale<ArrayType, V>,
+    E::LinearOperation: SupportsScale<ArrayType, V>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<V, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, V, E::LinearOperation>,
+        inputs: &[JvpTracer<V, AtomId>],
+    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
-        Ok(vec![JvpTracer {
-            primal: self.factor().clone() * input.primal.clone(),
-            tangent: EngineTangent::<E>::scale(self.factor().clone(), input.tangent.clone()),
-        }])
+        let tangent = context
+            .apply_operation(
+                &[input.tangent],
+                <E::LinearOperation as SupportsScale<ArrayType, V>>::scale_operation(self.factor().clone()),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("scale jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal: self.factor().clone() * input.primal.clone(), tangent }])
+    }
+}
+
+/// JVP rule for `ScaleOperation` under the
+/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine) wrapper.
+///
+/// The operation's captured factor is `V_inner` (the underlying engine's value type), but the
+/// wrapper engine's [`Value`](crate::tracing_v2::engines::Engine::Value) is
+/// [`Tracer<'engine, EInner, OInner>`](crate::tracing_v2::Tracer). The rule lifts the captured
+/// factor into a `Tracer` constant in the outer trace and then stages both the primal product
+/// and the tangent scale on traced primals.
+impl<'engine, V, EInner, OInner>
+    DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>>
+    for ScaleOperation<ArrayType, V>
+where
+    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
+    EInner: Engine<Type = ArrayType, Value = V> + ?Sized,
+    OInner: TracedLinearizationCarrier<V>,
+    Tracer<'engine, EInner, OInner>: Mul<Output = Tracer<'engine, EInner, OInner>>,
+{
+    fn jvp(
+        &self,
+        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner, OInner>,
+            LinearPrimitiveOperation<Tracer<'engine, EInner, OInner>>,
+        >,
+        inputs: &[JvpTracer<Tracer<'engine, EInner, OInner>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner, OInner>, AtomId>>, TracingError> {
+        check_input_count!(inputs, 1);
+        let input = &inputs[0];
+        let factor_tracer = engine.lift_constant(self.factor().clone());
+        let tangent = context
+            .apply_operation(&[input.tangent], LinearPrimitiveOperation::Scale { factor: factor_tracer.clone() }, 1)?
+            .into_iter()
+            .next()
+            .expect("scale jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal: factor_tracer * input.primal.clone(), tangent }])
     }
 }
 

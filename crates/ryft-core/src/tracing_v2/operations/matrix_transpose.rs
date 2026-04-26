@@ -4,16 +4,15 @@ use crate::macros::check_input_count;
 use crate::tracing::TracingError;
 use crate::types::{ArrayType, Type, TypeError};
 use crate::{
-    tracing::Traceable,
+    tracing::{AtomId, Traceable},
     tracing_v2::{
         engines::DifferentiableEngine,
-        forward::{Differentiable, EngineTangent, JvpTracer},
+        forward::{Differentiable, JvpContext, JvpTracer},
     },
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation, SupportsAdd,
-    SupportsNeg, SupportsScale,
+    DifferentiableOperation, InterpretableOperation, LinearOperation, LinearPrimitiveOperation, Operation,
     matrix::{MatrixOps, MatrixValue, transpose_abstract},
 };
 
@@ -93,17 +92,26 @@ impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOperation 
 impl<E> DifferentiableOperation<E> for MatrixTransposeOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: MatrixValue + Differentiable<ArrayType>,
-    E::LinearOperation:
-        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
-    EngineTangent<E>: super::matrix::MatrixTangentSpace<E::Value>,
+    E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
+    E::LinearOperation: SupportsMatrixTranspose<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
-        Ok(vec![inputs[0].clone().transpose_matrix()])
+        let primal = inputs[0].primal.clone().transpose_matrix();
+        let tangent = context
+            .apply_operation(
+                &[inputs[0].tangent],
+                <E::LinearOperation as SupportsMatrixTranspose<ArrayType, E::Value>>::matrix_transpose_operation(),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("matrix transpose jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }

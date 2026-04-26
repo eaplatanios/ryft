@@ -1,24 +1,13 @@
-use std::{
-    collections::BTreeSet,
-    ops::{Add, Mul, Neg},
-};
+use std::collections::BTreeSet;
 
 use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing::Traceable,
-    tracing_v2::{
-        forward::{JvpTracer, TangentSpace},
-        jit::Tracer,
-        linear::LinearTerm,
-        operations::constants::ZeroLike,
-    },
+    tracing_v2::jit::Tracer,
     types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
 };
 
-use super::{
-    Operation, SupportsAdd, SupportsLeftMatMul, SupportsMatMul, SupportsMatrixTranspose, SupportsNeg,
-    SupportsRightMatMul, SupportsScale,
-};
+use super::{Operation, SupportsMatMul, SupportsMatrixTranspose};
 
 /// Matrix operations required by the tracing prototype.
 ///
@@ -62,38 +51,6 @@ impl MatrixOps for f64 {
     #[inline]
     fn transpose_matrix(self) -> Self {
         self
-    }
-}
-
-/// Tangent representation for matrix-valued primals.
-///
-/// This extends [`TangentSpace`](crate::tracing_v2::TangentSpace) with the additional linear
-/// actions needed by matrix-valued JVP and transpose rules.
-pub trait MatrixTangentSpace<V: MatrixValue>: TangentSpace<ArrayType, V> {
-    /// Applies the linear map `tangent -> factor @ tangent`.
-    fn matmul_left(factor: V, tangent: Self) -> Self;
-
-    /// Applies the linear map `tangent -> tangent @ factor`.
-    fn matmul_right(tangent: Self, factor: V) -> Self;
-
-    /// Transposes a tangent value.
-    fn transpose_matrix(value: Self) -> Self;
-}
-
-impl<V: MatrixValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike> MatrixTangentSpace<V> for V {
-    #[inline]
-    fn matmul_left(factor: V, tangent: Self) -> Self {
-        factor.matmul(tangent)
-    }
-
-    #[inline]
-    fn matmul_right(tangent: Self, factor: V) -> Self {
-        tangent.matmul(factor)
-    }
-
-    #[inline]
-    fn transpose_matrix(value: Self) -> Self {
-        value.transpose_matrix()
     }
 }
 
@@ -193,24 +150,6 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
     matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
 }
 
-impl<V: MatrixValue, T: MatrixTangentSpace<V>> MatrixOps for JvpTracer<V, T> {
-    #[inline]
-    fn matmul(self, rhs: Self) -> Self {
-        JvpTracer {
-            primal: self.primal.clone().matmul(rhs.primal.clone()),
-            tangent: T::add(T::matmul_right(self.tangent, rhs.primal), T::matmul_left(self.primal, rhs.tangent)),
-        }
-    }
-
-    #[inline]
-    fn transpose_matrix(self) -> Self {
-        if matrix_transpose_is_identity_type(&self.primal.r#type()) {
-            return self;
-        }
-        JvpTracer { primal: self.primal.transpose_matrix(), tangent: T::transpose_matrix(self.tangent) }
-    }
-}
-
 impl<'engine, V: Traceable<ArrayType>, E, O> MatrixOps for Tracer<'engine, E, O>
 where
     E: crate::tracing_v2::Engine<Type = ArrayType, Value = V> + ?Sized,
@@ -230,33 +169,6 @@ where
     }
 }
 
-impl<
-    V: MatrixValue + ZeroLike,
-    O: SupportsLeftMatMul<ArrayType, V>
-        + SupportsAdd<ArrayType, V>
-        + SupportsNeg<ArrayType, V>
-        + Operation<ArrayType>
-        + SupportsRightMatMul<ArrayType, V>
-        + SupportsScale<ArrayType, V>
-        + SupportsMatrixTranspose<ArrayType, V>,
-> MatrixTangentSpace<V> for LinearTerm<ArrayType, V, O>
-{
-    #[inline]
-    fn matmul_left(factor: V, tangent: Self) -> Self {
-        tangent.apply_linear_op(O::left_matmul_operation(factor))
-    }
-
-    #[inline]
-    fn matmul_right(tangent: Self, factor: V) -> Self {
-        tangent.apply_linear_op(O::right_matmul_operation(factor))
-    }
-
-    #[inline]
-    fn transpose_matrix(value: Self) -> Self {
-        value.apply_linear_op(O::matrix_transpose_operation())
-    }
-}
-
 #[cfg(any(feature = "ndarray", test))]
 pub mod ndarray_support {
     use std::borrow::Cow;
@@ -269,9 +181,9 @@ pub mod ndarray_support {
         parameters::Parameter,
         tracing::{Traceable, TracingError, Value},
         tracing_v2::{
-            CoordinateValue, Cos, LinearPrimitiveOperation, PrimitiveOperation, Sin,
+            CoordinateValue, Cos, Differentiable, LinearPrimitiveOperation, PrimitiveOperation, Sin,
             engines::{DifferentiableEngine, Engine},
-            operations::constants::{OneLike, Zero, ZeroLike},
+            operations::constants::{One, OneLike, Zero, ZeroLike},
         },
         types::{ArrayType, DataType, TypeError, Typed},
     };
@@ -449,6 +361,28 @@ pub mod ndarray_support {
         fn zero(r#type: &ArrayType) -> Result<Self, TracingError> {
             Ok(Array2::from_elem(matrix_extent(r#type)?, 0.0))
         }
+    }
+
+    impl One<ArrayType> for Array2<f32> {
+        #[inline]
+        fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
+            Err(crate::tracing_v2::DifferentiationError::NonScalarGradientOutput { output_type: r#type.clone() }.into())
+        }
+    }
+
+    impl One<ArrayType> for Array2<f64> {
+        #[inline]
+        fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
+            Err(crate::tracing_v2::DifferentiationError::NonScalarGradientOutput { output_type: r#type.clone() }.into())
+        }
+    }
+
+    impl Differentiable<ArrayType> for Array2<f32> {
+        type Tangent = Self;
+    }
+
+    impl Differentiable<ArrayType> for Array2<f64> {
+        type Tangent = Self;
     }
 
     impl CoordinateValue for Array2<f32> {

@@ -1,7 +1,5 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
-use ryft_macros::Parameter;
-
 use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing::{
@@ -11,11 +9,11 @@ use crate::{
     tracing_v2::{
         Differentiable, DifferentiationError, LinearOperation, LinearPrimitiveOperation,
         engines::{DifferentiableEngine, Engine},
-        forward::{JvpTracer, TangentSpace},
+        forward::JvpTracer,
         jit::{DifferentiableTracer, Tracer, interpret_and_trace_with_operation},
         operations::{
-            DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsRematerialize, SupportsScale,
-            constants::{OneLike, ZeroLike},
+            DifferentiableOperation, SupportsAdd, SupportsRematerialize,
+            constants::{One, OneLike, Zero, ZeroLike},
             rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
     },
@@ -28,12 +26,10 @@ mod dense;
 mod program;
 /// Rematerialization-aware compiled-gradient helpers.
 mod rematerialization;
-/// Replay helpers that reinterpret traced programs under linearized leaf semantics.
+/// Traced-program linearization helpers.
 mod replay;
 /// Public reverse-mode APIs built from traced programs and staged pullbacks.
 mod reverse;
-/// Linear leaf wrappers and the staged linearized-value carrier.
-mod term;
 
 pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 #[doc(hidden)]
@@ -41,16 +37,12 @@ pub use program::linearize_program;
 pub use program::transpose_linear_program_with_output_examples;
 pub use program::transpose_traced_linear_program;
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
-pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
-pub use term::{LinearTerm, Linearized};
-
+#[doc(hidden)]
+pub use replay::TracedLinearizableOperation;
 #[doc(hidden)]
 pub use replay::linearize_traced_program;
-pub(crate) use replay::replay_program_linearized_jit;
 pub(crate) use reverse::jvp_traced;
-
-type LinearizedTracedValue<'engine, E, O = <E as Engine>::TracingOperation> =
-    Linearized<Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>;
+pub use reverse::{grad, grad_with_aux, jvp_program, value_and_grad, value_and_grad_with_aux, vjp};
 
 #[doc(hidden)]
 pub type TracedLinearProgram<'engine, E, O = <E as Engine>::TracingOperation> = Program<
@@ -66,19 +58,15 @@ fn flat_leaf_parameter_structure(count: usize) -> Vec<Placeholder> {
     vec![Placeholder; count]
 }
 
-#[inline]
-fn ensure_scalar_gradient_output_type(output_type: &ArrayType) -> Result<(), TracingError> {
-    if output_type.rank() != 0 {
-        return Err(DifferentiationError::NonScalarGradientOutput { output_type: output_type.clone() }.into());
-    }
-    Ok(())
-}
-
-fn ensure_single_scalar_gradient_output<V: Traceable<ArrayType>>(outputs: &[V]) -> Result<(), TracingError> {
+fn ensure_single_gradient_output<T, V>(outputs: &[V]) -> Result<(), TracingError>
+where
+    T: Type,
+    V: Differentiable<T>,
+{
     if outputs.len() != 1 {
         return Err(DifferentiationError::InvalidGradientOutputLeafCount { expected: 1, got: outputs.len() }.into());
     }
-    ensure_scalar_gradient_output_type(outputs[0].r#type().as_ref())
+    Ok(())
 }
 
 /// Traces one type-directed body and normalizes the captured program to flat leaf vectors.
@@ -134,18 +122,23 @@ fn reverse_mode_scalar_traced_program<'engine, V, E, O>(
     traced_primals: Vec<Tracer<'engine, E, O>>,
 ) -> Result<(Tracer<'engine, E, O>, Vec<Tracer<'engine, E, O>>), TracingError>
 where
-    V: Traceable<ArrayType> + ZeroLike + OneLike,
+    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>> + 'static,
+    O: Clone + Operation<ArrayType> + TracedLinearizableOperation<'engine, E, O> + 'static,
     LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
         + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
 {
     let (outputs, pushforward) = linearize_traced_program(engine, tracing_builder, traced_program, traced_primals)?;
-    ensure_single_scalar_gradient_output(outputs.as_slice())?;
+    ensure_single_gradient_output::<ArrayType, _>(outputs.as_slice())?;
     let traced_output = outputs[0].clone();
     let pullback = transpose_traced_linear_program(engine, traced_output.builder.clone(), &pushforward)?;
-    let traced_gradient = pullback.interpret(vec![traced_output.one_like()])?;
+    let seed_type = traced_output.r#type().into_owned();
+    let _ = <V as One<ArrayType>>::one(&seed_type)?;
+    let seed_value = engine.one(&seed_type)?;
+    let seed_atom = traced_output.builder.borrow_mut().add_constant(seed_value);
+    let seed = Tracer::from_staged_parts(seed_atom, seed_type, traced_output.builder.clone(), engine);
+    let traced_gradient = pullback.interpret(vec![seed])?;
     Ok((traced_output, traced_gradient))
 }
 
@@ -247,8 +240,9 @@ mod tests {
         fn jvp(
             &self,
             _engine: &ArrayScalarEngine<f64>,
-            inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
-        ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
+            _context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearPrimitiveOperation<f64>>,
+            inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
+        ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
             if inputs.len() != 1 {
                 return Err(TracingError::InvalidInputCount { expected: 1, got: inputs.len() });
             }
@@ -343,9 +337,10 @@ mod tests {
         fn jvp(
             &self,
             engine: &SplitCarrierEngine,
-            inputs: &[JvpTracer<f64, LinearTerm<ArrayType, f64>>],
-        ) -> Result<Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>>, TracingError> {
-            crate::tracing_v2::operations::AddOperation.jvp(engine, inputs)
+            context: &mut crate::tracing_v2::JvpContext<'_, f64, LinearPrimitiveOperation<f64>>,
+            inputs: &[JvpTracer<f64, crate::tracing::AtomId>],
+        ) -> Result<Vec<JvpTracer<f64, crate::tracing::AtomId>>, TracingError> {
+            crate::tracing_v2::operations::AddOperation.jvp(engine, context, inputs)
         }
     }
 
@@ -514,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_scalar_gradient_output_requires_single_leaf() {
-        let result = ensure_single_scalar_gradient_output(&[1.0f64, 2.0f64]);
+        let result = ensure_single_gradient_output::<ArrayType, _>(&[1.0f64, 2.0f64]);
 
         assert!(matches!(
             result,

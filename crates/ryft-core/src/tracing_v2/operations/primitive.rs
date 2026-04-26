@@ -6,13 +6,12 @@ use std::{
 
 use crate::{
     parameters::{Parameter, Parameterized},
-    tracing::{OperationFormatter, Traceable, TracingError, Value},
+    tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value},
     tracing_v2::{
         Cos, MatrixOps, Sin,
         engines::DifferentiableEngine,
-        forward::{Differentiable, EngineTangent, JvpTracer},
+        forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
-        linear::LinearTerm,
         operations::{
             AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
             NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
@@ -33,12 +32,11 @@ use super::{
     custom::{CustomPrimitive, LinearCustomPrimitive, SupportsCustom, SupportsLinearCustom},
     left_matmul::SupportsLeftMatMul,
     matmul::SupportsMatMul,
-    matrix::MatrixTangentSpace,
     matrix_transpose::SupportsMatrixTranspose,
     mul::SupportsMul,
     neg::SupportsNeg,
     rematerialize::{SupportsLinearRematerialize, SupportsRematerialize},
-    reshape::{ReshapeTangentSpace, SupportsReshape},
+    reshape::SupportsReshape,
     right_matmul::SupportsRightMatMul,
     scale::SupportsScale,
     sin::SupportsSin,
@@ -679,77 +677,6 @@ where
     }
 }
 
-/// Linearized JIT replay: evaluates staged operations on [`Linearized<Tracer<V>>`] values.
-///
-/// For pure (non-capturing) ops, this is covered by their generic [`InterpretableOperation<V>`] implementations
-/// because [`JvpTracer`] already implements all necessary arithmetic, matrix, and reshape traits.
-/// Capturing ops ([`ScaleOperation`], [`LeftMatMulOperation`], [`RightMatMulOperation`]) and
-/// [`RematerializeOperation`](crate::tracing_v2::operations::RematerializeOperation) provide
-/// dedicated [`InterpretableOperation`] implementations that lift captured constants into the JIT
-/// trace.
-///
-/// [`Linearized<Tracer<V>>`]: crate::tracing_v2::linear::Linearized
-/// [`ScaleOperation`]: crate::tracing_v2::operations::ScaleOperation
-/// [`LeftMatMulOperation`]: crate::tracing_v2::operations::LeftMatMulOperation
-/// [`RightMatMulOperation`]: crate::tracing_v2::operations::RightMatMulOperation
-impl<
-    'engine,
-    V: Value<ArrayType>
-        + Add<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Parameterized<V>
-        + MatrixOps
-        + crate::tracing_v2::operations::reshape::ReshapeOps
-        + ControlFlowValue
-        + Differentiable<ArrayType>
-        + 'static,
-    E: DifferentiableEngine<
-            Type = ArrayType,
-            Value = V,
-            TracingOperation = PrimitiveOperation<V>,
-            LinearOperation = LinearPrimitiveOperation<V>,
-        > + ?Sized
-        + 'static,
-> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>> for PrimitiveOperation<V>
-where
-    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-{
-    fn interpret(
-        &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E>>>, TracingError> {
-        match self {
-            Self::Add => AddOperation.interpret(inputs),
-            Self::Mul => MulOperation.interpret(inputs),
-            Self::Neg => NegOperation.interpret(inputs),
-            Self::Sin => SinOperation.interpret(inputs),
-            Self::Cos => CosOperation.interpret(inputs),
-            Self::MatMul => MatMulOperation.interpret(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.interpret(inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
-            }
-            Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Condition(_) | Self::While(_) => {
-                Err(crate::tracing_v2::operations::ControlFlowError::MissingTransformRule {
-                    transform: "linearized JIT replay",
-                }
-                .into())
-            }
-            Self::Custom(op) => op.interpret_linearized_jit(inputs),
-        }
-    }
-}
-
 impl<
     V: Value<ArrayType>
         + Add<Output = V>
@@ -764,7 +691,7 @@ impl<
         + MatrixOps
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + ControlFlowValue
-        + Differentiable<ArrayType>
+        + Differentiable<ArrayType, Tangent = V>
         + 'static,
     E: DifferentiableEngine<
             Type = ArrayType,
@@ -775,38 +702,156 @@ impl<
         > + 'static,
 > DifferentiableOperation<E> for PrimitiveOperation<V>
 where
-    V: Differentiable<
-            ArrayType,
-            Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
-        >,
+    V: Differentiable<ArrayType, Tangent = V>,
     V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    EngineTangent<E>: MatrixTangentSpace<V> + ReshapeTangentSpace<V>,
+    LinearPrimitiveOperation<V>: super::SupportsAdd<ArrayType, V>
+        + super::SupportsNeg<ArrayType, V>
+        + super::SupportsScale<ArrayType, V>
+        + super::SupportsLeftMatMul<ArrayType, V>
+        + super::SupportsRightMatMul<ArrayType, V>
+        + super::SupportsMatrixTranspose<ArrayType, V>
+        + super::SupportsReshape<ArrayType, V>,
 {
     fn jvp(
         &self,
         engine: &E,
-        inputs: &[JvpTracer<V, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<V, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, V, E::LinearOperation>,
+        inputs: &[JvpTracer<V, AtomId>],
+    ) -> Result<Vec<JvpTracer<V, AtomId>>, TracingError> {
         match self {
-            Self::Add => AddOperation.jvp(engine, inputs),
-            Self::Mul => MulOperation.jvp(engine, inputs),
-            Self::Neg => NegOperation.jvp(engine, inputs),
-            Self::Sin => SinOperation.jvp(engine, inputs),
-            Self::Cos => CosOperation.jvp(engine, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, inputs),
-            Self::MatMul => MatMulOperation.jvp(engine, inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, inputs),
+            Self::Add => AddOperation.jvp(engine, context, inputs),
+            Self::Mul => MulOperation.jvp(engine, context, inputs),
+            Self::Neg => NegOperation.jvp(engine, context, inputs),
+            Self::Sin => SinOperation.jvp(engine, context, inputs),
+            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
+            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, inputs)
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
             }
-            Self::Rematerialize(remat) => remat.as_ref().jvp(engine, inputs),
-            Self::Condition(condition) => condition.as_ref().jvp(engine, inputs),
-            Self::While(while_operation) => while_operation.as_ref().jvp(engine, inputs),
-            Self::Custom(op) => op.jvp(engine, inputs),
+            Self::Rematerialize(remat) => remat.as_ref().jvp(engine, context, inputs),
+            Self::Condition(condition) => condition.as_ref().jvp(engine, context, inputs),
+            Self::While(while_operation) => while_operation.as_ref().jvp(engine, context, inputs),
+            Self::Custom(op) => op.jvp(engine, context, inputs),
         }
+    }
+}
+
+/// Linearization-engine dispatcher for [`PrimitiveOperation`] under the traced-linearization path.
+///
+/// Forwards each variant to the per-op JVP rule, picking up the
+/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine)-keyed impls for V-capturing
+/// variants ([`Scale`](Self::Scale), [`LeftMatMul`](Self::LeftMatMul),
+/// [`RightMatMul`](Self::RightMatMul)), the [`Rematerialize`](Self::Rematerialize) impl that
+/// recurses via [`linearize_traced_program`](crate::tracing_v2::linear::linearize_traced_program),
+/// the [`Condition`](Self::Condition) / [`While`](Self::While) stub impls (predicate extraction
+/// does not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
+/// linearization rule.
+impl<'engine, V, EInner>
+    DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, PrimitiveOperation<V>>>
+    for PrimitiveOperation<V>
+where
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Sin
+        + Cos
+        + ZeroLike
+        + OneLike
+        + crate::tracing_v2::operations::constants::Zero<ArrayType>
+        + Parameterized<V>
+        + MatrixOps
+        + crate::tracing_v2::operations::reshape::ReshapeOps
+        + ControlFlowValue
+        + Differentiable<ArrayType, Tangent = V>
+        + 'static,
+    EInner: crate::tracing_v2::engines::Engine<Type = ArrayType, Value = V, TracingOperation = PrimitiveOperation<V>>
+        + ?Sized
+        + 'static,
+    V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
+    Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    LinearPrimitiveOperation<V>: super::SupportsAdd<ArrayType, V>
+        + super::SupportsNeg<ArrayType, V>
+        + super::SupportsScale<ArrayType, V>
+        + super::SupportsLeftMatMul<ArrayType, V>
+        + super::SupportsRightMatMul<ArrayType, V>
+        + super::SupportsMatrixTranspose<ArrayType, V>
+        + super::SupportsReshape<ArrayType, V>
+        + Clone
+        + InterpretableOperation<ArrayType, V>
+        + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
+    Tracer<'engine, EInner, PrimitiveOperation<V>>: Add<Output = Tracer<'engine, EInner, PrimitiveOperation<V>>>
+        + Mul<Output = Tracer<'engine, EInner, PrimitiveOperation<V>>>
+        + Neg<Output = Tracer<'engine, EInner, PrimitiveOperation<V>>>
+        + Sin
+        + Cos
+        + MatrixOps,
+    for<'a> LinearPrimitiveOperation<Tracer<'a, EInner, PrimitiveOperation<V>>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'a, EInner, PrimitiveOperation<V>>>
+        + LinearOperation<
+            ArrayType,
+            Tracer<'a, EInner, PrimitiveOperation<V>>,
+            LinearPrimitiveOperation<Tracer<'a, EInner, PrimitiveOperation<V>>>,
+        >,
+{
+    fn jvp(
+        &self,
+        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, PrimitiveOperation<V>>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner, PrimitiveOperation<V>>,
+            LinearPrimitiveOperation<Tracer<'engine, EInner, PrimitiveOperation<V>>>,
+        >,
+        inputs: &[JvpTracer<Tracer<'engine, EInner, PrimitiveOperation<V>>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner, PrimitiveOperation<V>>, AtomId>>, TracingError> {
+        match self {
+            Self::Add => AddOperation.jvp(engine, context, inputs),
+            Self::Mul => MulOperation.jvp(engine, context, inputs),
+            Self::Neg => NegOperation.jvp(engine, context, inputs),
+            Self::Sin => SinOperation.jvp(engine, context, inputs),
+            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
+            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
+            }
+            Self::Rematerialize(remat) => remat.as_ref().jvp(engine, context, inputs),
+            Self::Condition(condition) => condition.as_ref().jvp(engine, context, inputs),
+            Self::While(while_operation) => while_operation.as_ref().jvp(engine, context, inputs),
+            Self::Custom(op) => op.jvp(engine, context, inputs),
+        }
+    }
+}
+
+impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner, PrimitiveOperation<V>>
+    for PrimitiveOperation<V>
+where
+    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + Parameter + 'static,
+    EInner: crate::tracing_v2::engines::Engine<Type = ArrayType, Value = V> + ?Sized + 'engine,
+    PrimitiveOperation<V>:
+        DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, PrimitiveOperation<V>>>,
+{
+    fn jvp_traced_linearization(
+        &self,
+        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, PrimitiveOperation<V>>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner, PrimitiveOperation<V>>,
+            LinearPrimitiveOperation<Tracer<'engine, EInner, PrimitiveOperation<V>>>,
+        >,
+        inputs: &[JvpTracer<Tracer<'engine, EInner, PrimitiveOperation<V>>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner, PrimitiveOperation<V>>, AtomId>>, TracingError> {
+        <Self as DifferentiableOperation<
+            crate::tracing_v2::LinearizationEngine<'engine, EInner, PrimitiveOperation<V>>,
+        >>::jvp(self, engine, context, inputs)
     }
 }
 

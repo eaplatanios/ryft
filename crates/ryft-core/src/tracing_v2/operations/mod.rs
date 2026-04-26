@@ -4,7 +4,7 @@ use crate::{
     tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
         engines::{DifferentiableEngine, Engine},
-        forward::{Differentiable, EngineTangent, JvpTracer},
+        forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
     },
     types::{ArrayType, Type, TypeError, Typed},
@@ -87,6 +87,44 @@ pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};
 
+/// Carrier capability required by [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
+///
+/// Traced linearization runs ordinary JVP rules with [`Tracer`] primals. Those rules may stage the
+/// primal side of built-in arithmetic through the outer operation carrier, so the carrier must know
+/// how to represent the primitive operations that can appear while evaluating those traced primals.
+/// Keeping that requirement as one semantic bound prevents every traced-linearization impl from
+/// repeating the individual primitive support traits.
+#[doc(hidden)]
+pub trait TracedLinearizationCarrier<V: Traceable<ArrayType>>:
+    Clone
+    + Operation<ArrayType>
+    + SupportsAdd<ArrayType, V>
+    + SupportsMul<ArrayType, V>
+    + SupportsNeg<ArrayType, V>
+    + SupportsScale<ArrayType, V>
+    + SupportsMatMul<ArrayType, V>
+    + SupportsMatrixTranspose<ArrayType, V>
+    + SupportsReshape<ArrayType, V>
+    + 'static
+{
+}
+
+impl<V, O> TracedLinearizationCarrier<V> for O
+where
+    V: Traceable<ArrayType>,
+    O: Clone
+        + Operation<ArrayType>
+        + SupportsAdd<ArrayType, V>
+        + SupportsMul<ArrayType, V>
+        + SupportsNeg<ArrayType, V>
+        + SupportsScale<ArrayType, V>
+        + SupportsMatMul<ArrayType, V>
+        + SupportsMatrixTranspose<ArrayType, V>
+        + SupportsReshape<ArrayType, V>
+        + 'static,
+{
+}
+
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
 pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized>(
     constant: &V,
@@ -123,59 +161,12 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///
 /// A few concrete examples:
 ///
-/// - For [`ScaleOperation`], `y = a * x`, the transpose stages one new [`LinearTerm`] representing
-///   `a * c`, where `c` is the output cotangent:
-///   ```rust,ignore
-///   use std::{cell::RefCell, rc::Rc};
-///
-///   use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder, ScaleOperation};
-///
-///   let builder =
-///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
-///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
-///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
-///
-///   let contributions = ScaleOperation::new(3.0f64).transpose(context, &[cotangent]).unwrap();
-///   let dx = contributions[0].clone().expect("scale contributes one cotangent");
-///   // `dx` is a staged `LinearTerm` representing `3.0 * cotangent`.
-///   ```
-/// - For [`AddOperation`], `y = x0 + x1`, the transpose duplicates the same staged cotangent for both
-///   inputs:
-///   ```rust,ignore
-///   use std::{cell::RefCell, rc::Rc};
-///
-///   use ryft_core::tracing_v2::{AddOperation, LinearOperation, LinearPrimitiveOperation, LinearTerm, ProgramBuilder};
-///
-///   let builder =
-///       Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
-///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
-///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
-///
-///   let contributions = AddOperation.transpose(context, &[cotangent]).unwrap();
-///   let dx0 = contributions[0].clone().expect("add contributes to lhs");
-///   let dx1 = contributions[1].clone().expect("add contributes to rhs");
-///   // `dx0` and `dx1` are staged `LinearTerm`s representing the same cotangent.
-///   ```
-/// - For [`MatrixTransposeOperation`], `Y = X^T`, the transpose stages another transpose on the output
-///   cotangent:
-///   ```rust,ignore
-///   use std::{cell::RefCell, rc::Rc};
-///
-///   use ndarray::arr2;
-///   use ryft_core::tracing_v2::{
-///       LinearOperation, LinearPrimitiveOperation, LinearTerm, MatrixTransposeOperation, ProgramBuilder,
-///   };
-///
-///   let builder = Rc::new(RefCell::new(
-///       ProgramBuilder::<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>::new(),
-///   ));
-///   let cotangent_atom = builder.borrow_mut().add_input(arr2(&[[1.0, 2.0], [3.0, 4.0]]).r#type().into_owned());
-///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
-///
-///   let contributions = MatrixTransposeOperation.transpose(context, &[cotangent]).unwrap();
-///   let dx = contributions[0].clone().expect("transpose contributes one cotangent");
-///   // `dx` is a staged `LinearTerm` representing `cotangent.transpose()`.
-///   ```
+/// - For [`ScaleOperation`], `y = a * x`, the transpose stages one new scale instruction that
+///   computes `a * c`, where `c` is the output cotangent atom.
+/// - For [`AddOperation`], `y = x0 + x1`, the transpose returns the same cotangent atom for both
+///   inputs.
+/// - For [`MatrixTransposeOperation`], `Y = X^T`, the transpose stages another transpose on the
+///   output cotangent atom.
 /// - For [`ReshapeOperation`], the transpose reshapes the output cotangent back to the input shape because
 ///   reshape only changes layout metadata.
 ///
@@ -187,7 +178,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 /// [`TranspositionContext`] owns the currently active transpose-program builder. Primitive rules
 /// stage new linear instructions through it, and higher-order rules use it to recursively transpose
 /// nested linear programs into the same builder. The pass propagates structural zeros via
-/// `Option<LinearTerm>`, so no cotangent-synthesis policy lives on the context anymore.
+/// `Option<AtomId>`, so no cotangent-synthesis policy lives on the context anymore.
 #[doc(hidden)]
 pub struct TranspositionContext<'a, T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> {
     /// Builder for the currently active transpose program.
@@ -280,22 +271,20 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primi
 
 /// Forward-mode differentiation rule keyed only by the engine that owns the staged carriers.
 ///
-/// Primitive JVP rules recover their tangent representation from [`Differentiable`] on
-/// `E::Value` at `E::Type`, so the operation trait no longer needs separate `T`, `V`, `O`, `L`, or
-/// tangent parameters. Per-op capability requirements still live in the individual impl blocks
-/// through bounds on `E::Value` and [`EngineTangent<E>`].
+/// Primitive JVP rules consume `JvpTracer<E::Value, AtomId>` inputs — primal value plus tangent
+/// atom id in the active linear-program builder — and stage tangent ops via
+/// [`JvpContext::apply_operation`]. Higher-order rules (e.g., the rematerialization and
+/// control-flow ops) use `engine` to recurse into nested sub-programs.
 pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type>
 where
-    E::Value: Differentiable<E::Type>,
+    E::Value: Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperation: Operation<E::Type>,
 {
     /// Applies the forward-mode JVP rule.
-    ///
-    /// The `engine` argument carries the context needed to synthesize zero values for higher-order
-    /// ops that replay staged sub-programs such as [`RematerializeOperation`]. Pure arithmetic ops
-    /// ignore it.
     fn jvp(
         &self,
         engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError>;
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError>;
 }

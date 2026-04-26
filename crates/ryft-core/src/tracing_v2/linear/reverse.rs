@@ -11,10 +11,10 @@ pub fn jvp_program<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, Program<ArrayType, V, E::LinearOperation, Input, Output>), TracingError>
+) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Input, Output>), TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: Traceable<ArrayType> + ZeroLike,
+    E: DifferentiableEngine<Value = V> + 'static,
+    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<DifferentiableTracer<'engine, E>>,
@@ -22,7 +22,8 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::DifferentiableOperation: InterpretableOperation<E::Type, V>,
+    E::Type: Parameter,
 {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
@@ -47,7 +48,7 @@ pub(crate) fn jvp_traced<'engine, F, Input, Output, V, E>(
     tangents: Input,
 ) -> Result<(Output, Output), TracingError>
 where
-    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
+    V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
@@ -55,8 +56,7 @@ where
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
+    E::TracingOperation: TracedLinearizableOperation<'engine, E, E::TracingOperation>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
@@ -113,10 +113,10 @@ pub fn vjp<'engine, E, F, Input, Output, V>(
     engine: &'engine E,
     function: F,
     primals: Input,
-) -> Result<(Output, Program<ArrayType, V, E::LinearOperation, Output, Input>), TracingError>
+) -> Result<(Output, Program<E::Type, V, E::LinearOperation, Output, Input>), TracingError>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: Traceable<ArrayType> + ZeroLike + OneLike,
+    E: DifferentiableEngine<Value = V> + 'static,
+    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
     Input::Family: ParameterizedFamily<DifferentiableTracer<'engine, E>>,
@@ -124,11 +124,12 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::DifferentiableOperation: InterpretableOperation<E::Type, V>,
     E::LinearOperation: Clone
-        + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, E::LinearOperation>
-        + crate::tracing_v2::operations::SupportsZero<ArrayType, V>,
+        + InterpretableOperation<E::Type, V>
+        + LinearOperation<E::Type, V, E::LinearOperation>
+        + crate::tracing_v2::operations::SupportsZero<E::Type, V>,
+    E::Type: Parameter,
 {
     let (output, pushforward) = jvp_program::<E, F, Input, Output, V>(engine, function, primals)?;
     let output_examples = output.parameters().cloned().collect::<Vec<_>>();
@@ -177,7 +178,11 @@ where
 /// scalar output and its gradient.
 impl<
     E,
-    V: Value<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
+    V: Value<ArrayType>
+        + Differentiable<ArrayType, Tangent = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
+        + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input> for V
 where
@@ -207,8 +212,7 @@ where
     {
         let (output, pullback): (V, Program<ArrayType, V, E::LinearOperation, V, Input>) =
             vjp(engine, |input| Ok(function(input)), primals)?;
-        ensure_scalar_gradient_output_type(output.r#type().as_ref())?;
-        let gradient = pullback.interpret(output.one_like())?;
+        let gradient = pullback.interpret(<V as One<ArrayType>>::one(output.r#type().as_ref())?)?;
         Ok((output, gradient))
     }
 }
@@ -219,7 +223,10 @@ where
 impl<
     'engine,
     E,
-    V: Traceable<ArrayType> + ZeroLike + OneLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    V: Traceable<ArrayType>
+        + Differentiable<ArrayType, Tangent = V>
+        + One<ArrayType>
+        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 > ValueAndGradInvocationLeaf<E, Input> for Tracer<'engine, E>
 where
@@ -229,8 +236,7 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
+    E::TracingOperation: TracedLinearizableOperation<'engine, E, E::TracingOperation>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
         + LinearOperation<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
@@ -319,8 +325,9 @@ pub fn value_and_grad_with_aux<'engine, E, F, Input, Aux, V>(
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType>
-        + ZeroLike
-        + OneLike
+        + Differentiable<ArrayType, Tangent = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
         + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     V: for<'call> Parameterized<V, To<DifferentiableTracer<'call, E>> = DifferentiableTracer<'call, E>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
@@ -339,9 +346,13 @@ where
 {
     let ((output, aux), pullback): ((V, Aux), Program<ArrayType, V, E::LinearOperation, (V, Aux), Input>) =
         vjp(engine, |input| Ok(function(input)), primals)?;
-    ensure_scalar_gradient_output_type(output.r#type().as_ref())?;
-    let aux_zeros = Aux::from_parameters(aux.parameter_structure(), aux.parameters().map(ZeroLike::zero_like))?;
-    let gradient = pullback.interpret((output.one_like(), aux_zeros))?;
+    let aux_zeros = Aux::from_parameters(
+        aux.parameter_structure(),
+        aux.parameters()
+            .map(|value| <V as Zero<ArrayType>>::zero(value.r#type().as_ref()))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let gradient = pullback.interpret((<V as One<ArrayType>>::one(output.r#type().as_ref())?, aux_zeros))?;
     Ok(((output, aux), gradient))
 }
 
@@ -378,8 +389,9 @@ pub fn grad_with_aux<'engine, E, F, Input, Aux, V>(
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType>
-        + ZeroLike
-        + OneLike
+        + Differentiable<ArrayType, Tangent = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
         + Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     V: for<'call> Parameterized<V, To<DifferentiableTracer<'call, E>> = DifferentiableTracer<'call, E>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
@@ -401,14 +413,265 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ndarray::arr2;
+    use std::borrow::Cow;
+    use std::fmt::{self, Display};
+    use std::ops::{Add, Neg};
 
-    use crate::tracing::TracingError;
+    use ndarray::arr2;
+    use ryft_macros::Parameter;
+
+    use crate::tracing::{InterpretableOperation, Operation, Traceable, TracingError, Value};
     use crate::tracing_v2::engines::ArrayScalarEngine;
+    use crate::tracing_v2::operations::add::{AddOperation, SupportsAdd};
+    use crate::tracing_v2::operations::constants::{One, OneLike, Zero, ZeroLike};
     use crate::tracing_v2::operations::matrix::ndarray_support::Array2Engine;
-    use crate::tracing_v2::{DifferentiationError, Tracer};
+    use crate::tracing_v2::operations::neg::SupportsNeg;
+    use crate::tracing_v2::operations::scale::SupportsScale;
+    use crate::tracing_v2::{Differentiable, DifferentiationError, Tracer};
+    use crate::types::{Type, TypeError, Typed};
 
     use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
+    struct TestType;
+
+    impl Display for TestType {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("test")
+        }
+    }
+
+    impl Type for TestType {
+        fn is_compatible_with(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Parameter)]
+    struct TestValue(f64);
+
+    impl Display for TestValue {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            Display::fmt(&self.0, formatter)
+        }
+    }
+
+    impl Add for TestValue {
+        type Output = Self;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            Self(self.0 + rhs.0)
+        }
+    }
+
+    impl Neg for TestValue {
+        type Output = Self;
+
+        fn neg(self) -> Self::Output {
+            Self(-self.0)
+        }
+    }
+
+    impl Typed<TestType> for TestValue {
+        fn r#type(&self) -> Cow<'_, TestType> {
+            Cow::Owned(TestType)
+        }
+    }
+
+    impl Traceable<TestType> for TestValue {}
+
+    impl Value<TestType> for TestValue {}
+
+    impl ZeroLike for TestValue {
+        fn zero_like(&self) -> Self {
+            Self(0.0)
+        }
+    }
+
+    impl OneLike for TestValue {
+        fn one_like(&self) -> Self {
+            Self(1.0)
+        }
+    }
+
+    impl Zero<TestType> for TestValue {
+        fn zero(_type: &TestType) -> Result<Self, TracingError> {
+            Ok(Self(0.0))
+        }
+    }
+
+    impl One<TestType> for TestValue {
+        fn one(_type: &TestType) -> Result<Self, TracingError> {
+            Ok(Self(1.0))
+        }
+    }
+
+    impl Differentiable<TestType> for TestValue {
+        type Tangent = Self;
+    }
+
+    #[derive(Clone, Debug)]
+    enum TestLinearOperation {
+        Add,
+        Neg,
+        Scale { factor: TestValue },
+    }
+
+    impl Display for TestLinearOperation {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.name())
+        }
+    }
+
+    impl Operation<TestType> for AddOperation {
+        fn name(&self) -> &'static str {
+            "add"
+        }
+
+        fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
+            if input_types.len() != 2 {
+                return Err(TypeError { message: format!("add expected 2 input types but got {}", input_types.len()) });
+            }
+            Ok(vec![TestType])
+        }
+    }
+
+    impl InterpretableOperation<TestType, TestValue> for AddOperation {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+            if inputs.len() != 2 {
+                return Err(TracingError::InvalidInputCount { expected: 2, got: inputs.len() });
+            }
+            Ok(vec![inputs[0].clone() + inputs[1].clone()])
+        }
+    }
+
+    impl SupportsAdd<TestType, TestValue> for AddOperation {
+        fn add_operation() -> Self {
+            AddOperation
+        }
+    }
+
+    impl Operation<TestType> for TestLinearOperation {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Add => "add",
+                Self::Neg => "neg",
+                Self::Scale { .. } => "scale",
+            }
+        }
+
+        fn infer_output_types(&self, input_types: &[TestType]) -> Result<Vec<TestType>, TypeError> {
+            let expected = match self {
+                Self::Add => 2,
+                Self::Neg | Self::Scale { .. } => 1,
+            };
+            if input_types.len() != expected {
+                return Err(TypeError {
+                    message: format!("{} expected {expected} input types but got {}", self.name(), input_types.len()),
+                });
+            }
+            Ok(vec![TestType])
+        }
+    }
+
+    impl InterpretableOperation<TestType, TestValue> for TestLinearOperation {
+        fn interpret(&self, inputs: &[TestValue]) -> Result<Vec<TestValue>, TracingError> {
+            let expected = match self {
+                Self::Add => 2,
+                Self::Neg | Self::Scale { .. } => 1,
+            };
+            if inputs.len() != expected {
+                return Err(TracingError::InvalidInputCount { expected, got: inputs.len() });
+            }
+            Ok(vec![match self {
+                Self::Add => inputs[0].clone() + inputs[1].clone(),
+                Self::Neg => -inputs[0].clone(),
+                Self::Scale { factor } => TestValue(factor.0 * inputs[0].0),
+            }])
+        }
+    }
+
+    impl SupportsAdd<TestType, TestValue> for TestLinearOperation {
+        fn add_operation() -> Self {
+            Self::Add
+        }
+    }
+
+    impl SupportsNeg<TestType, TestValue> for TestLinearOperation {
+        fn neg_operation() -> Self {
+            Self::Neg
+        }
+    }
+
+    impl SupportsScale<TestType, TestValue> for TestLinearOperation {
+        fn scale_operation(factor: TestValue) -> Self {
+            Self::Scale { factor }
+        }
+    }
+
+    impl LinearOperation<TestType, TestValue, TestLinearOperation> for TestLinearOperation {
+        fn transpose(
+            &self,
+            context: &mut crate::tracing_v2::operations::TranspositionContext<
+                '_,
+                TestType,
+                TestValue,
+                TestLinearOperation,
+            >,
+            output_cotangents: &[Option<crate::tracing::AtomId>],
+        ) -> Result<Vec<Option<crate::tracing::AtomId>>, TracingError> {
+            if output_cotangents.len() != 1 {
+                return Err(TracingError::InvalidInputCount { expected: 1, got: output_cotangents.len() });
+            }
+            Ok(match self {
+                Self::Add => vec![output_cotangents[0], output_cotangents[0]],
+                Self::Neg => match output_cotangents[0] {
+                    Some(cotangent) => {
+                        vec![Some(context.apply_operation(&[cotangent], Self::Neg, 1)?[0])]
+                    }
+                    None => vec![None],
+                },
+                Self::Scale { factor } => match output_cotangents[0] {
+                    Some(cotangent) => {
+                        vec![Some(context.apply_operation(&[cotangent], Self::Scale { factor: factor.clone() }, 1)?[0])]
+                    }
+                    None => vec![None],
+                },
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestEngine;
+
+    impl Engine for TestEngine {
+        type Type = TestType;
+        type Value = TestValue;
+        type TracingOperation = AddOperation;
+
+        fn zero(&self, _type: &TestType) -> Result<TestValue, TracingError> {
+            Ok(TestValue(0.0))
+        }
+
+        fn one(&self, _type: &TestType) -> Result<TestValue, TracingError> {
+            Ok(TestValue(1.0))
+        }
+    }
+
+    impl DifferentiableEngine for TestEngine {
+        type DifferentiableOperation = AddOperation;
+        type LinearOperation = TestLinearOperation;
+    }
+
+    #[test]
+    fn test_jvp_program_supports_non_array_type_metadata() {
+        let engine = TestEngine;
+        let (output, pushforward) =
+            jvp_program(&engine, |x: Tracer<'_, TestEngine, AddOperation>| Ok(x.clone() + x), TestValue(3.0)).unwrap();
+
+        assert_eq!(output, TestValue(6.0));
+        assert_eq!(pushforward.interpret(TestValue(5.0)), Ok(TestValue(10.0)));
+    }
 
     #[test]
     fn test_jvp_traced_requires_input_leaves() {

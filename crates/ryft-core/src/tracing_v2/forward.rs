@@ -1,102 +1,209 @@
-use std::{
-    borrow::Cow,
-    fmt::Debug,
-    fmt::Display,
-    ops::{Add, Mul, Neg},
-};
+use std::{borrow::Cow, cell::RefCell, fmt::Debug, fmt::Display, rc::Rc};
 
 use ryft_macros::Parameter;
 
 use crate::{
     parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder},
-    tracing::{InterpretableOperation, Operation, Program, Traceable, TracingError, Value},
+    tracing::{
+        AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
+    },
     tracing_v2::{
         LinearPrimitiveOperation,
         engines::{DifferentiableEngine, Engine},
         jit::{DifferentiableTracer, Tracer},
-        linear::{Linearized, jvp_program, jvp_traced},
+        linear::{jvp_program, jvp_traced},
         operations::{
-            SupportsAdd, SupportsNeg, SupportsScale,
-            constants::{OneLike, ZeroLike},
+            SupportsAdd, SupportsNeg, SupportsScale, TracedLinearizationCarrier,
+            constants::{One, Zero},
         },
     },
     types::{ArrayType, Type, Typed},
 };
 
-/// Tangent representation for a traced primal value.
+/// Concrete state threaded through forward-mode JVP rules.
 ///
-/// [`TangentSpace`] tells the forward-mode machinery what kind of object should travel alongside a
-/// given primal leaf while computing a Jacobian-vector product. The simplest case uses the primal
-/// type itself, but staged linearization replaces tangents with symbolic values such as
-/// [`crate::tracing_v2::LinearTerm`] so that the same primitive JVP rules can build reusable linear
-/// programs instead of concrete numbers.
-///
-/// [`jvp_program`]: crate::tracing_v2::jvp_program
-pub trait TangentSpace<T: Type, V: Typed<T>>: Clone + Parameter {
-    /// Adds two tangent values.
-    fn add(lhs: Self, rhs: Self) -> Self;
-
-    /// Negates a tangent value.
-    fn neg(value: Self) -> Self;
-
-    /// Scales a tangent by a primal value.
-    fn scale(factor: V, tangent: Self) -> Self;
-
-    /// Produces a zero tangent matching the primal shape.
-    fn zero_like(primal: &V, tangent: &Self) -> Self;
-}
-
-impl<T: Type, V: Traceable<T> + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike> TangentSpace<T, V>
-    for V
-{
-    #[inline]
-    fn add(lhs: Self, rhs: Self) -> Self {
-        lhs + rhs
-    }
-
-    #[inline]
-    fn neg(value: Self) -> Self {
-        -value
-    }
-
-    #[inline]
-    fn scale(factor: V, tangent: Self) -> Self {
-        factor * tangent
-    }
-
-    #[inline]
-    fn zero_like(primal: &V, _tangent: &Self) -> Self {
-        primal.zero_like()
-    }
-}
-
-/// Value-level differentiation metadata for one abstract type family.
-///
-/// This trait chooses how a leaf value participates in forward-mode differentiation for abstract
-/// descriptor `T`. The staged linear carrier stays a generic associated type parameter so engine
-/// choices remain in the tracing layer instead of becoming part of the value trait itself.
-pub trait Differentiable<T: Type>: Traceable<T> {
-    /// Tangent payload carried alongside `Self` during primitive-level JVP staging.
-    type Tangent<LinearOperation>: TangentSpace<T, Self>
-    where
-        T: Display,
-        LinearOperation: Clone + Operation<T> + SupportsAdd<T, Self> + SupportsNeg<T, Self> + SupportsScale<T, Self>;
-}
-
-/// Convenience alias for the primitive-level tangent representation associated with engine `E`.
-pub type EngineTangent<E> = <<E as Engine>::Value as Differentiable<<E as Engine>::Type>>::Tangent<
-    <E as DifferentiableEngine>::LinearOperation,
->;
-
-impl<T, V> Differentiable<T> for V
+/// [`JvpContext`] owns the active linear-program builder where tangent ops are staged. It is the
+/// forward-mode counterpart of
+/// [`TranspositionContext`](crate::tracing_v2::operations::TranspositionContext): JVP rules call
+/// [`apply_operation`](Self::apply_operation) to stage tangent ops on the active builder.
+#[doc(hidden)]
+pub struct JvpContext<'a, V, LinearCarrier, T = ArrayType>
 where
     T: Type,
-    V: Traceable<T> + ZeroLike,
+    V: Traceable<T>,
+    LinearCarrier: Clone + Operation<T>,
 {
-    type Tangent<LinearOperation>
-        = crate::tracing_v2::LinearTerm<T, V, LinearOperation>
-    where
-        LinearOperation: Clone + Operation<T> + SupportsAdd<T, Self> + SupportsNeg<T, Self> + SupportsScale<T, Self>;
+    /// Builder for the currently active linear program.
+    builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
+
+    /// Phantom marker reserving a context lifetime for future per-pass borrows without forcing an
+    /// API change when one is added.
+    marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, T, V, LinearCarrier> JvpContext<'a, V, LinearCarrier, T>
+where
+    T: Type,
+    V: Traceable<T>,
+    LinearCarrier: Clone + Operation<T>,
+{
+    /// Creates a JVP context that stages into `builder`.
+    #[doc(hidden)]
+    pub fn new(builder: Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>) -> Self {
+        Self { builder, marker: std::marker::PhantomData }
+    }
+
+    /// Returns the builder for the currently active linear program.
+    #[inline]
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>> {
+        &self.builder
+    }
+
+    /// Stages one operation in the currently active linear program.
+    pub fn apply_operation(
+        &self,
+        inputs: &[AtomId],
+        operation: LinearCarrier,
+        output_count: usize,
+    ) -> Result<Vec<AtomId>, TracingError> {
+        let mut builder_borrow = self.builder.borrow_mut();
+        let input_types =
+            inputs.iter().map(|atom| builder_borrow.atoms[atom.index].r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = operation.infer_output_types(&input_types)?;
+        if output_types.len() != output_count {
+            return Err(TracingError::InvalidOutputCount { expected: output_count, got: output_types.len() });
+        }
+        let outputs = output_types.into_iter().map(|r#type| builder_borrow.add_variable(r#type)).collect::<Vec<_>>();
+        builder_borrow
+            .instructions
+            .push(Instruction { operation, inputs: inputs.to_vec(), outputs: outputs.clone() });
+        Ok(outputs)
+    }
+
+    /// Stages a constant tangent on the active linear builder.
+    pub fn add_constant(&self, value: V) -> AtomId {
+        self.builder.borrow_mut().add_constant(value)
+    }
+}
+
+/// Value-level contract for leaves that participate in automatic differentiation over `T`.
+///
+/// The associated [`Tangent`](Self::Tangent) type makes the tangent representation explicit even
+/// though today's staged linear-program IR still requires `Tangent = Self` at the transform
+/// boundary. The default methods synthesize zero tangents and unit gradient seeds from the
+/// value's abstract type metadata through [`Zero`] and [`One`].
+pub trait Differentiable<T: Type>: Traceable<T> {
+    /// Tangent and cotangent leaf type associated with this primal leaf.
+    type Tangent: Traceable<T> + Zero<T> + One<T>;
+}
+
+/// Linearization-side wrapper over an outer engine for traced forward-mode AD.
+///
+/// [`LinearizationEngine`] adapts a concrete underlying engine `E` so that JVP rules can run with
+/// [`Tracer<'engine, E, O>`](crate::tracing_v2::Tracer) primals instead of bare `E::Value` leaves.
+/// It is used by the traced linearization pipeline to drive
+/// [`linearize_program`](crate::tracing_v2::linear::linearize_program) inside an outer JIT scope:
+/// the wrapper exposes [`Engine::Value`] = `Tracer<'engine, E, O>` so each per-op JVP rule sees
+/// traced primals and stages tangent ops into a separate linear-program builder over the same
+/// traced primal type.
+///
+/// Architecturally, this wrapper lets traced linearization go through the same per-op
+/// [`DifferentiableOperation`](crate::tracing_v2::operations::DifferentiableOperation) rules that
+/// power concrete forward-mode AD, just specialized to a wrapper engine whose `Value` is itself a
+/// staged tracer from an outer scope.
+pub struct LinearizationEngine<'engine, E, O>
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    O: Clone + Operation<ArrayType>,
+{
+    /// Underlying engine that owns the outer tracing scope.
+    inner: &'engine E,
+
+    /// Outer tracing builder used to lift constants and stage primal effects of higher-order ops.
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, O>>>,
+}
+
+impl<'engine, E, O> LinearizationEngine<'engine, E, O>
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    O: Clone + Operation<ArrayType>,
+{
+    /// Wraps `inner` and the outer-trace builder so JVP rules can operate on traced primals.
+    #[inline]
+    pub fn new(inner: &'engine E, tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, O>>>) -> Self {
+        Self { inner, tracing_builder }
+    }
+
+    /// Returns the underlying engine.
+    #[inline]
+    pub fn inner(&self) -> &'engine E {
+        self.inner
+    }
+
+    /// Returns the shared outer-trace program builder.
+    #[inline]
+    pub fn tracing_builder(&self) -> &Rc<RefCell<ProgramBuilder<ArrayType, E::Value, O>>> {
+        &self.tracing_builder
+    }
+
+    /// Lifts a concrete `E::Value` into a [`Tracer`] constant in the outer trace.
+    ///
+    /// JVP rules for V-capturing ops (`ScaleOperation`, `LeftMatMulOperation`,
+    /// `RightMatMulOperation`) need to convert their captured factor — which is `E::Value` (i.e.
+    /// the underlying engine's value type) — into a [`Tracer`] before staging the primal effect
+    /// or constructing a new linear op. This helper centralizes that lift.
+    pub fn lift_constant(&self, value: E::Value) -> Tracer<'engine, E, O> {
+        let r#type = <E::Value as Typed<ArrayType>>::r#type(&value).into_owned();
+        let atom = self.tracing_builder.borrow_mut().add_constant(value);
+        Tracer::from_staged_parts(atom, r#type, self.tracing_builder.clone(), self.inner)
+    }
+}
+
+impl<'engine, E, O> Engine for LinearizationEngine<'engine, E, O>
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    O: Clone + Operation<ArrayType> + 'static,
+{
+    type Type = ArrayType;
+    type Value = Tracer<'engine, E, O>;
+    type TracingOperation = O;
+
+    #[inline]
+    fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+        let value = self.inner.zero(r#type)?;
+        let atom = self.tracing_builder.borrow_mut().add_constant(value);
+        Ok(Tracer::from_staged_parts(atom, r#type.clone(), self.tracing_builder.clone(), self.inner))
+    }
+
+    #[inline]
+    fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
+        let value = self.inner.one(r#type)?;
+        let atom = self.tracing_builder.borrow_mut().add_constant(value);
+        Ok(Tracer::from_staged_parts(atom, r#type.clone(), self.tracing_builder.clone(), self.inner))
+    }
+}
+
+impl<'engine, E, O> DifferentiableEngine for LinearizationEngine<'engine, E, O>
+where
+    E: Engine<Type = ArrayType> + ?Sized,
+    E::Value: Differentiable<ArrayType, Tangent = E::Value>,
+    O: TracedLinearizationCarrier<E::Value>,
+{
+    /// Pinned to a concrete [`AddOperation`](crate::tracing_v2::operations::AddOperation) carrier
+    /// to keep trait resolution finite. The associated type is unused by traced linearization in
+    /// practice — it satisfies the trait's bound but the wrapper engine does not expose itself
+    /// via [`trace`](crate::tracing_v2::trace), so closures never see this carrier directly.
+    type DifferentiableOperation = crate::tracing_v2::operations::AddOperation;
+    type LinearOperation = LinearPrimitiveOperation<Tracer<'engine, E, O>>;
+}
+
+impl<'engine, E, O> Differentiable<E::Type> for Tracer<'engine, E, O>
+where
+    E: Engine + ?Sized,
+    E::Value: Differentiable<E::Type>,
+    O: Clone + Operation<E::Type>,
+{
+    type Tangent = Self;
 }
 
 /// Forward-mode tracer carrying both a primal and a tangent.
@@ -107,8 +214,9 @@ where
 /// carries the directional derivative information flowing alongside it.
 ///
 /// The type parameters have no bounds on the struct itself so that `JvpTracer` can appear in
-/// signatures without eagerly propagating all tangent-space requirements. The required
-/// relationship is enforced only on the impl blocks that actually manipulate the values.
+/// signatures without eagerly propagating all tangent requirements. `tracing_v2` uses `T = AtomId`
+/// for the rule-based JVP path threaded through [`JvpContext`], where rules manipulate symbolic
+/// tangent atoms directly.
 #[derive(Clone, Debug, Parameter)]
 pub struct JvpTracer<V, T> {
     /// The primal value.
@@ -118,7 +226,7 @@ pub struct JvpTracer<V, T> {
     pub tangent: T,
 }
 
-impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V>> Typed<Ty> for JvpTracer<V, T> {
+impl<Ty: Type, V: Typed<Ty>, T> Typed<Ty> for JvpTracer<V, T> {
     #[inline]
     fn r#type(&self) -> Cow<'_, Ty> {
         <V as Typed<Ty>>::r#type(&self.primal)
@@ -131,27 +239,7 @@ impl<V: Display, T> Display for JvpTracer<V, T> {
     }
 }
 
-impl<Ty: Type, V: Traceable<Ty>, T: TangentSpace<Ty, V>> Traceable<Ty> for JvpTracer<V, T> {}
-
-impl<V: Traceable<ArrayType> + ZeroLike, T: TangentSpace<ArrayType, V>> ZeroLike for JvpTracer<V, T> {
-    #[inline]
-    fn zero_like(&self) -> Self {
-        Self { primal: self.primal.zero_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
-    }
-}
-
-impl<V: Traceable<ArrayType> + OneLike, T: TangentSpace<ArrayType, V>> OneLike for JvpTracer<V, T> {
-    #[inline]
-    fn one_like(&self) -> Self {
-        Self { primal: self.primal.one_like(), tangent: T::zero_like(&self.primal, &self.tangent) }
-    }
-}
-
-/// Standard dual number representation used for first-order forward-mode evaluation.
-///
-/// [`Dual`] is the common case where primal and tangent live in the same space, which is exactly
-/// the setup used by ordinary first-order JVPs over concrete leaves.
-pub type Dual<V> = JvpTracer<V, V>;
+impl<Ty: Type, V: Traceable<Ty>, T: Clone + Parameter> Traceable<Ty> for JvpTracer<V, T> {}
 
 /// Dispatch trait used by [`jvp`] so it can operate both on concrete values and on already traced values.
 ///
@@ -185,41 +273,14 @@ where
         F: FnOnce(Self::FunctionInput<'engine>) -> Self::FunctionOutput<'engine>;
 }
 
-impl<V: Typed<ArrayType> + Add<Output = V>, T: TangentSpace<ArrayType, V>> Add for JvpTracer<V, T> {
-    type Output = Self;
-
-    #[inline]
-    fn add(self, rhs: Self) -> Self::Output {
-        Self { primal: self.primal + rhs.primal, tangent: T::add(self.tangent, rhs.tangent) }
-    }
-}
-
-impl<V: Typed<ArrayType> + Clone + Mul<Output = V>, T: TangentSpace<ArrayType, V>> Mul for JvpTracer<V, T> {
-    type Output = Self;
-
-    #[inline]
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self {
-            primal: self.primal.clone() * rhs.primal.clone(),
-            tangent: T::add(T::scale(rhs.primal, self.tangent), T::scale(self.primal, rhs.tangent)),
-        }
-    }
-}
-
-impl<V: Typed<ArrayType> + Neg<Output = V>, T: TangentSpace<ArrayType, V>> Neg for JvpTracer<V, T> {
-    type Output = Self;
-
-    #[inline]
-    fn neg(self) -> Self::Output {
-        Self { primal: -self.primal, tangent: T::neg(self.tangent) }
-    }
-}
-
 /// Concrete-value dispatch for [`jvp`]: traces the user function with [`Tracer`] to build a staged
 /// pushforward via [`jvp_program`] and evaluates it at the supplied tangents.
 impl<
     E,
-    V: Value<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure: Clone + PartialEq>,
+    V: Value<ArrayType>
+        + Differentiable<ArrayType, Tangent = V>
+        + Zero<ArrayType>
+        + Parameterized<V, ParameterStructure: Clone + PartialEq>,
     Input: Parameterized<V, ParameterStructure: Clone + Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone>,
 > JvpInvocationLeaf<E, Input, Output> for V
@@ -228,7 +289,6 @@ where
     Input::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     Output::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
-    V: Differentiable<ArrayType>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsNeg<ArrayType, V>
@@ -275,7 +335,7 @@ where
 impl<
     'engine,
     E,
-    V: Traceable<ArrayType> + ZeroLike + Parameterized<V, ParameterStructure = Placeholder>,
+    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + Debug + PartialEq, To<Tracer<'engine, E>> = Input>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
 > JvpInvocationLeaf<E, Input, Output> for Tracer<'engine, E>
@@ -285,8 +345,7 @@ where
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
-    E::TracingOperation:
-        InterpretableOperation<ArrayType, Linearized<Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
+    E::TracingOperation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E, E::TracingOperation>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
@@ -339,31 +398,56 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        borrow::Cow,
-        fmt,
-        ops::{Add, Mul, Neg},
-    };
-
-    use ryft_macros::Parameter;
-
     use crate::parameters::{ParameterError, Parameterized};
-    use crate::tracing_v2::{engines::ArrayScalarEngine, operations::constants::OneLike, test_support};
-    use crate::types::{Type, Typed};
+    use crate::tracing::ProgramBuilder;
+    use crate::tracing_v2::{
+        PrimitiveOperation,
+        engines::ArrayScalarEngine,
+        operations::{AddOperation, DifferentiableOperation},
+        test_support,
+    };
 
     use super::*;
 
+    /// Validates that [`LinearizationEngine`] can host a JVP rule like [`AddOperation`] when its
+    /// `Value` is `Tracer<E, O>`: the rule stages its primal effect through the underlying engine
+    /// and its tangent effect through the wrapper's `LinearOperation` carrier without any
+    /// `'static` constraints on the wrapper itself.
     #[test]
-    fn dual_zero_like_zeros_the_tangent_component() {
-        let dual = JvpTracer { primal: 3.0f64, tangent: 4.0f64 };
-        let zero = dual.zero_like();
-        assert_eq!(zero.primal, 0.0);
-        assert_eq!(zero.tangent, 0.0);
+    fn linearization_engine_dispatches_add_jvp_with_traced_primals() {
+        let engine = ArrayScalarEngine::<f64>::new();
+        let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
+        let outer_input_a = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
+        let outer_input_b = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
+        let primal_a = Tracer::from_engine(outer_input_a, outer_builder.clone(), &engine);
+        let primal_b = Tracer::from_engine(outer_input_b, outer_builder.clone(), &engine);
 
-        let ones = dual.one_like();
-        assert_eq!(ones.primal, 1.0);
-        assert_eq!(ones.tangent, 0.0);
-        test_support::assert_quadratic_pushforward_rendering();
+        let linearization_engine =
+            LinearizationEngine::<ArrayScalarEngine<f64>, PrimitiveOperation<f64>>::new(&engine, outer_builder.clone());
+
+        let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
+            ArrayType,
+            Tracer<'_, ArrayScalarEngine<f64>, PrimitiveOperation<f64>>,
+            LinearPrimitiveOperation<Tracer<'_, ArrayScalarEngine<f64>, PrimitiveOperation<f64>>>,
+        >::new()));
+        let tangent_a = linear_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
+        let tangent_b = linear_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
+        let mut context = JvpContext::new(linear_builder.clone());
+
+        let outputs = AddOperation
+            .jvp(
+                &linearization_engine,
+                &mut context,
+                &[
+                    JvpTracer { primal: primal_a, tangent: tangent_a },
+                    JvpTracer { primal: primal_b, tangent: tangent_b },
+                ],
+            )
+            .expect("AddOperation::jvp should run on a LinearizationEngine wrapper");
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(linear_builder.borrow().instructions.len(), 1);
+        assert_eq!(outer_builder.borrow().instructions.len(), 1);
     }
 
     #[test]
@@ -380,115 +464,5 @@ mod tests {
                 && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
         ));
         test_support::assert_quadratic_pushforward_rendering();
-    }
-
-    #[test]
-    fn jvp_tracer_exposes_generic_type_metadata_for_non_array_types() {
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        struct TestType(&'static str);
-
-        impl Type for TestType {
-            fn is_compatible_with(&self, other: &Self) -> bool {
-                self == other
-            }
-        }
-
-        impl fmt::Display for TestType {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(self.0)
-            }
-        }
-
-        #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
-        struct TestValue {
-            r#type: TestType,
-            value: i32,
-        }
-
-        impl TestValue {
-            fn new(r#type: TestType, value: i32) -> Self {
-                Self { r#type, value }
-            }
-        }
-
-        impl Typed<TestType> for TestValue {
-            fn r#type(&self) -> Cow<'_, TestType> {
-                Cow::Borrowed(&self.r#type)
-            }
-        }
-
-        impl fmt::Display for TestValue {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "{}", self.value)
-            }
-        }
-
-        impl Traceable<TestType> for TestValue {}
-
-        impl ZeroLike for TestValue {
-            fn zero_like(&self) -> Self {
-                Self::new(self.r#type.clone(), 0)
-            }
-        }
-
-        impl Add for TestValue {
-            type Output = Self;
-
-            fn add(self, rhs: Self) -> Self::Output {
-                assert_eq!(self.r#type, rhs.r#type);
-                Self::new(self.r#type, self.value + rhs.value)
-            }
-        }
-
-        impl Mul for TestValue {
-            type Output = Self;
-
-            fn mul(self, rhs: Self) -> Self::Output {
-                assert_eq!(self.r#type, rhs.r#type);
-                Self::new(self.r#type, self.value * rhs.value)
-            }
-        }
-
-        impl Neg for TestValue {
-            type Output = Self;
-
-            fn neg(self) -> Self::Output {
-                Self::new(self.r#type, -self.value)
-            }
-        }
-
-        let scalar_type = TestType("test_scalar");
-        let left = JvpTracer {
-            primal: TestValue::new(scalar_type.clone(), 3),
-            tangent: TestValue::new(scalar_type.clone(), 4),
-        };
-        assert_eq!(left.r#type().into_owned(), scalar_type.clone());
-
-        fn assert_traceable<T: Type, V: Traceable<T>>(_value: &V) {}
-
-        assert_traceable::<TestType, _>(&left);
-
-        assert_eq!(
-            <TestValue as TangentSpace<TestType, TestValue>>::zero_like(&left.primal, &left.tangent),
-            TestValue::new(scalar_type.clone(), 0),
-        );
-        assert_eq!(
-            <TestValue as TangentSpace<TestType, TestValue>>::add(
-                TestValue::new(scalar_type.clone(), 4),
-                TestValue::new(scalar_type.clone(), 5),
-            ),
-            TestValue::new(scalar_type.clone(), 9),
-        );
-        assert_eq!(
-            <TestValue as TangentSpace<TestType, TestValue>>::scale(
-                TestValue::new(scalar_type.clone(), 3),
-                TestValue::new(scalar_type.clone(), 5),
-            ),
-            TestValue::new(scalar_type.clone(), 15),
-        );
-        assert_eq!(
-            <TestValue as TangentSpace<TestType, TestValue>>::neg(TestValue::new(scalar_type.clone(), 4)),
-            TestValue::new(scalar_type, -4),
-        );
     }
 }

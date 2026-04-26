@@ -73,9 +73,17 @@ pub trait Engine {
 /// [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
 /// [`vjp`](crate::tracing_v2::vjp) require this extension trait so non-differentiable backends do
 /// not need to define fake tangent or differentiable-operation carriers.
+///
+/// The associated `DifferentiableOperation` and `LinearOperation` carriers are not bounded by
+/// `'static`. That allows wrapper engines such as
+/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine), used by
+/// [`linearize_traced_program`](crate::tracing_v2::linear::linearize_traced_program) to drive
+/// `linearize_program` on traced primals, to satisfy `DifferentiableEngine` even though their
+/// carriers reference the borrow lifetime of the inner engine. Call sites that genuinely need a
+/// `'static` engine restate the bound at the use site.
 pub trait DifferentiableEngine: Engine
 where
-    Self::Value: Differentiable<Self::Type>,
+    Self::Value: Differentiable<Self::Type, Tangent = Self::Value>,
 {
     /// Differentiable staged operation type selected by this engine for AD transforms.
     ///
@@ -83,7 +91,7 @@ where
     /// full ordinary tracing carrier. Backends can therefore expose non-differentiable operations
     /// through [`Engine::TracingOperation`] without making those operations stageable inside
     /// differentiated closures.
-    type DifferentiableOperation: Clone + DifferentiableOperationTrait<Self> + 'static;
+    type DifferentiableOperation: Clone + DifferentiableOperationTrait<Self>;
 
     /// Linear staged operation type selected by this engine for tangent and cotangent programs.
     ///
@@ -93,8 +101,7 @@ where
         + LinearOperationTrait<Self::Type, Self::Value, Self::LinearOperation>
         + SupportsAdd<Self::Type, Self::Value>
         + SupportsNeg<Self::Type, Self::Value>
-        + SupportsScale<Self::Type, Self::Value>
-        + 'static;
+        + SupportsScale<Self::Type, Self::Value>;
 }
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.

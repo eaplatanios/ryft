@@ -1,106 +1,25 @@
 use super::*;
+use crate::tracing_v2::{JvpContext, LinearizationEngine};
 
-/// Replays one staged program under caller-supplied leaf semantics.
+/// Operation-level capability required by traced program linearization.
 ///
-/// This is the generic engine behind several internal replay modes: ordinary interpretation,
-/// linearized JIT replay, and symbolic linearization all use the same atom-walking logic while
-/// customizing how constants are lifted and how primitive instructions are applied.
-fn replay_program_with<ProgramInput, ProgramOutput, V, O, R, LiftConstant, ApplyOp>(
-    program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
-    inputs: Vec<R>,
-    lift_constant: LiftConstant,
-    apply_op: ApplyOp,
-) -> Result<Vec<R>, TracingError>
+/// [`linearize_traced_program`] runs while an outer trace is already active. Its primal values are
+/// therefore [`Tracer`] leaves, while tangent values are atom ids in a fresh linear builder. This
+/// trait is the exact semantic contract needed for one staged operation carrier to participate in
+/// that pass.
+#[doc(hidden)]
+pub trait TracedLinearizableOperation<'engine, E, O>: Clone + Operation<ArrayType>
 where
-    ProgramInput: Parameterized<V>,
-    ProgramOutput: Parameterized<V>,
-    V: Traceable<ArrayType>,
+    E: Engine<Type = ArrayType> + ?Sized,
     O: Clone + Operation<ArrayType>,
-    R: Clone,
-    LiftConstant: Fn(&V) -> Result<R, TracingError>,
-    ApplyOp: Fn(&O, Vec<R>) -> Result<Vec<R>, TracingError>,
 {
-    let mut values = vec![None; program.atoms.len()];
-    for (atom_id, value) in program.input_ids.iter().copied().zip(inputs.iter().cloned()) {
-        values[atom_id.index] = Some(value);
-    }
-
-    let mut instruction_by_first_output = vec![None; program.atoms.len()];
-    for (instruction_index, instruction) in program.instructions.iter().enumerate() {
-        if let Some(first_output) = instruction.outputs.first() {
-            instruction_by_first_output[first_output.index] = Some(instruction_index);
-        }
-    }
-    let mut input_atom_flags = vec![false; program.atoms.len()];
-    for input_atom in program.input_ids.iter().copied() {
-        input_atom_flags[input_atom.index] = true;
-    }
-
-    for atom_index in 0..program.atoms.len() {
-        let atom = &program.atoms[atom_index];
-        match atom {
-            Atom::Constant(value) => {
-                values[atom_index] = Some(lift_constant(value)?);
-            }
-            Atom::Variable(_) if input_atom_flags[atom_index] => {}
-            Atom::Variable(_) => {
-                let Some(instruction_index) = instruction_by_first_output[atom_index] else {
-                    continue;
-                };
-                let instruction = &program.instructions[instruction_index];
-                let input_values = instruction
-                    .inputs
-                    .iter()
-                    .map(|input| values[input.index].clone().ok_or(TracingError::UnboundAtomId { id: *input }))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let outputs = apply_op(&instruction.operation, input_values)?;
-                for (output_atom, output_value) in instruction.outputs.iter().copied().zip(outputs) {
-                    values[output_atom.index] = Some(output_value);
-                }
-            }
-        }
-    }
-
-    program
-        .output_ids
-        .iter()
-        .map(|output| values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: *output }))
-        .collect()
-}
-
-/// Replays a staged program on traced dual leaves inside an outer JIT scope.
-///
-/// This is the key helper that lets higher-order transforms symbolically replay an already-traced
-/// body while preserving both its primal outputs and its staged tangent propagation.
-pub(crate) fn replay_program_linearized_jit<'engine, ProgramInput, ProgramOutput, V, E, O>(
-    engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
-    linear_builder: Rc<
-        RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>>,
-    >,
-    program: &Program<ArrayType, V, O, ProgramInput, ProgramOutput>,
-    inputs: Vec<LinearizedTracedValue<'engine, E, O>>,
-) -> Result<Vec<LinearizedTracedValue<'engine, E, O>>, TracingError>
-where
-    ProgramInput: Parameterized<V>,
-    ProgramOutput: Parameterized<V>,
-    V: Traceable<ArrayType> + ZeroLike,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>> + 'static,
-{
-    replay_program_with(
-        program,
-        inputs,
-        |constant| {
-            let primal_type = constant.r#type().into_owned();
-            let primal_atom = tracing_builder.borrow_mut().add_constant(constant.clone());
-            let primal = Tracer::from_staged_parts(primal_atom, primal_type, tracing_builder.clone(), engine);
-            let tangent_atom = linear_builder.borrow_mut().add_constant(primal.zero_like());
-            let tangent = LinearTerm::from_staged_parts(tangent_atom, linear_builder.clone());
-            Ok(Linearized { primal, tangent })
-        },
-        |op, values| InterpretableOperation::<ArrayType, LinearizedTracedValue<'engine, E, O>>::interpret(op, &values),
-    )
+    /// Applies this operation's JVP rule to traced primals inside the active linearization pass.
+    fn jvp_traced_linearization(
+        &self,
+        engine: &LinearizationEngine<'engine, E, O>,
+        context: &mut JvpContext<'_, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
+        inputs: &[JvpTracer<Tracer<'engine, E, O>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, E, O>, AtomId>>, TracingError>;
 }
 
 /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
@@ -117,27 +36,107 @@ pub fn linearize_traced_program<'engine, V, E, O>(
     primals: Vec<Tracer<'engine, E, O>>,
 ) -> Result<(Vec<Tracer<'engine, E, O>>, TracedLinearProgram<'engine, E, O>), TracingError>
 where
-    V: Traceable<ArrayType> + ZeroLike,
+    V: Traceable<ArrayType>,
     E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>> + 'static,
+    O: Clone + Operation<ArrayType> + TracedLinearizableOperation<'engine, E, O> + 'static,
 {
+    fn tangent_for_atom<'engine, V, E, O>(
+        primal_values: &[Option<Tracer<'engine, E, O>>],
+        builder: &Rc<
+            RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>>,
+        >,
+        tangents: &mut [Option<AtomId>],
+        atom_id: AtomId,
+    ) -> Result<AtomId, TracingError>
+    where
+        V: Traceable<ArrayType>,
+        E: Engine<Type = ArrayType, Value = V> + ?Sized,
+        O: Clone + Operation<ArrayType>,
+    {
+        if let Some(atom) = tangents[atom_id.index] {
+            return Ok(atom);
+        }
+        let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
+        let atom = builder.borrow_mut().add_constant(primal.zero_like());
+        tangents[atom_id.index] = Some(atom);
+        Ok(atom)
+    }
+
     let input_count = primals.len();
+    if input_count != program.input_ids.len() {
+        return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_count });
+    }
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
         ArrayType,
         Tracer<'engine, E, O>,
         LinearPrimitiveOperation<Tracer<'engine, E, O>>,
     >::new()));
-    let traced_input = primals
-        .into_iter()
-        .map(|primal| {
-            let atom = builder.borrow_mut().add_input(primal.r#type().into_owned());
-            Linearized { primal, tangent: LinearTerm::from_staged_parts(atom, builder.clone()) }
-        })
-        .collect::<Vec<_>>();
-    let traced_output = replay_program_linearized_jit(engine, tracing_builder, builder.clone(), program, traced_input)?;
-    let primal_outputs = traced_output.iter().map(|output| output.primal.clone()).collect::<Vec<_>>();
-    let tangent_outputs = traced_output.iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
-    drop(traced_output);
+    let linearization_engine = LinearizationEngine::new(engine, tracing_builder);
+    let mut primal_values: Vec<Option<Tracer<'engine, E, O>>> = vec![None; program.atoms.len()];
+    let mut tangents: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
+
+    for (input_atom, primal) in program.input_ids.iter().copied().zip(primals.into_iter()) {
+        let tangent = builder.borrow_mut().add_input(primal.r#type().into_owned());
+        primal_values[input_atom.index] = Some(primal);
+        tangents[input_atom.index] = Some(tangent);
+    }
+    for (atom_index, atom) in program.atoms.iter().enumerate() {
+        if let Atom::Constant(value) = atom {
+            primal_values[atom_index] = Some(linearization_engine.lift_constant(value.clone()));
+        }
+    }
+
+    let mut context = JvpContext::new(builder.clone());
+    for instruction in &program.instructions {
+        let input_duals = instruction
+            .inputs
+            .iter()
+            .copied()
+            .map(|input_atom| {
+                Ok(JvpTracer {
+                    primal: primal_values[input_atom.index]
+                        .clone()
+                        .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
+                    tangent: tangent_for_atom::<V, E, O>(
+                        primal_values.as_slice(),
+                        &builder,
+                        tangents.as_mut_slice(),
+                        input_atom,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, TracingError>>()?;
+        let output_duals = instruction.operation.jvp_traced_linearization(
+            &linearization_engine,
+            &mut context,
+            input_duals.as_slice(),
+        )?;
+        if output_duals.len() != instruction.outputs.len() {
+            return Err(TracingError::InvalidOutputCount {
+                expected: instruction.outputs.len(),
+                got: output_duals.len(),
+            });
+        }
+        for (output_atom, output_dual) in instruction.outputs.iter().copied().zip(output_duals.into_iter()) {
+            primal_values[output_atom.index] = Some(output_dual.primal);
+            tangents[output_atom.index] = Some(output_dual.tangent);
+        }
+    }
+
+    let primal_outputs = program
+        .output_ids
+        .iter()
+        .copied()
+        .map(|output| primal_values[output.index].clone().ok_or(TracingError::UnboundAtomId { id: output }))
+        .collect::<Result<Vec<_>, _>>()?;
+    let tangent_outputs = program
+        .output_ids
+        .iter()
+        .copied()
+        .map(|output| tangent_for_atom::<V, E, O>(primal_values.as_slice(), &builder, tangents.as_mut_slice(), output))
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(context);
+    drop(tangents);
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
         Err(_) => {

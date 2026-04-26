@@ -16,7 +16,7 @@ use crate::{
         engines::{DifferentiableEngine, Engine},
         operations::{
             SupportsAdd, SupportsMul, SupportsNeg,
-            constants::{OneLike, ZeroLike},
+            constants::{One, OneLike, ZeroLike},
         },
     },
     types::Typed,
@@ -271,6 +271,19 @@ impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> crate::tracing_
     fn zero(_type: &E::Type) -> Result<Self, TracingError> {
         Err(crate::types::TypeError {
             message: "tracer values cannot synthesize zero from type metadata; materialize zero ops first".to_string(),
+        }
+        .into())
+    }
+}
+
+impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> One<E::Type> for Tracer<'engine, E, O> {
+    /// Tracer cannot synthesize a one from an [`E::Type`] alone because constructing a tracer
+    /// requires both an engine reference and a builder, neither of which is in scope here.
+    /// Differentiable tracer seeds must be derived from an existing tracer exemplar instead.
+    #[inline]
+    fn one(_type: &E::Type) -> Result<Self, TracingError> {
+        Err(crate::types::TypeError {
+            message: "tracer values cannot synthesize one from type metadata; use an exemplar-backed seed".to_string(),
         }
         .into())
     }

@@ -49,6 +49,26 @@ pub trait Zero<T: Type>: Sized {
     fn zero(r#type: &T) -> Result<Self, TracingError>;
 }
 
+/// Synthesizes a typed unit cotangent seed without an exemplar.
+///
+/// [`One`] is the seed counterpart to [`Zero`]. It is intentionally fallible because not every
+/// abstract descriptor admits the unit seed required by scalar-output reverse-mode transforms. For
+/// example, the built-in [`ArrayType`] implementations reject non-rank-0 descriptors so `grad`
+/// keeps its scalar-output semantics even though the check depends on runtime metadata.
+pub trait One<T: Type>: Sized {
+    /// Returns the unit cotangent seed described by `r#type`.
+    fn one(r#type: &T) -> Result<Self, TracingError>;
+}
+
+fn ensure_scalar_array_seed_type(r#type: &ArrayType) -> Result<(), TracingError> {
+    if r#type.rank() != 0 {
+        return Err(
+            crate::tracing_v2::DifferentiationError::NonScalarGradientOutput { output_type: r#type.clone() }.into()
+        );
+    }
+    Ok(())
+}
+
 /// Hidden carrier capability for staging the zero primitive.
 ///
 /// `SupportsZero` lets generic transform code stage the typed-zero primitive on linear-program
@@ -173,6 +193,18 @@ macro_rules! impl_scalar_value_traits {
             fn zero(_type: &ArrayType) -> Result<Self, TracingError> {
                 Ok($zero)
             }
+        }
+
+        impl One<ArrayType> for $ty {
+            #[inline]
+            fn one(r#type: &ArrayType) -> Result<Self, TracingError> {
+                ensure_scalar_array_seed_type(r#type)?;
+                Ok($one)
+            }
+        }
+
+        impl crate::tracing_v2::forward::Differentiable<ArrayType> for $ty {
+            type Tangent = Self;
         }
     };
 }

@@ -7,11 +7,11 @@ fn build_traced_gradient_program<'engine, E, Input, V, O>(
 ) -> Result<Program<ArrayType, V, O, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: Value<ArrayType> + ZeroLike + OneLike,
+    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     O: Clone
         + Operation<ArrayType>
         + InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, O>>
+        + TracedLinearizableOperation<'engine, E, O>
         + 'static,
     LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
@@ -65,9 +65,9 @@ pub fn compile_grad<'engine, E, F, Input, V>(
 ) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: Value<ArrayType> + ZeroLike + OneLike,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>,
+    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
+    E::DifferentiableOperation:
+        InterpretableOperation<ArrayType, V> + TracedLinearizableOperation<'engine, E, E::DifferentiableOperation>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
         + LinearOperation<
@@ -148,9 +148,9 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
 ) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: Value<ArrayType> + ZeroLike + OneLike,
+    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
+        + TracedLinearizableOperation<'engine, E, E::DifferentiableOperation>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
@@ -198,9 +198,9 @@ fn compile_grad_segmented<'engine, E, F, Input, V>(
 ) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    V: Value<ArrayType> + ZeroLike + OneLike,
+    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
     E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
-        + InterpretableOperation<ArrayType, LinearizedTracedValue<'engine, E, E::DifferentiableOperation>>
+        + TracedLinearizableOperation<'engine, E, E::DifferentiableOperation>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
@@ -258,7 +258,7 @@ fn segment_program<E, V, O>(
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType> + Differentiable<ArrayType>,
+    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     O: Clone
         + Operation<ArrayType>
         + InterpretableOperation<ArrayType, V>
@@ -432,7 +432,7 @@ fn wrap_program_in_rematerialize<E, V, O>(
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V>,
-    V: Traceable<ArrayType> + Differentiable<ArrayType>,
+    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     O: Clone + Operation<ArrayType> + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
 {
     let program = program;

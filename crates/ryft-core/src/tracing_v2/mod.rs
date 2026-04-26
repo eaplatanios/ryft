@@ -28,16 +28,15 @@ pub(crate) mod test_support;
 pub use batching::{ArrayBatch, BatchableOperation, BatchingError, interpret_batched_program, vmap};
 pub use differentiation::DifferentiationError;
 pub use engines::{DifferentiableEngine, Engine};
-pub use forward::{Differentiable, Dual, EngineTangent, JvpTracer, TangentSpace, jvp};
+pub use forward::{Differentiable, JvpContext, JvpTracer, LinearizationEngine, jvp};
 pub use jit::{Tracer, TracerState, interpret_and_trace, trace};
 pub use linear::{
     CoordinateValue, DenseJacobian, RematerializationPolicy, compile_grad, compile_grad_with_policy, grad,
     grad_with_aux, hessian, jacfwd, jacrev, jvp_program, value_and_grad, value_and_grad_with_aux, vjp,
 };
-pub use linear::{LinearTerm, Linearized};
-pub use operations::matrix::{MatrixOps, MatrixTangentSpace, MatrixValue};
+pub use operations::matrix::{MatrixOps, MatrixValue};
 pub use operations::rematerialize::rematerialize;
-pub use operations::reshape::{ReshapeOps, ReshapeTangentSpace, ReshapeValue};
+pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::{
     ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, Cos, CustomOperationError,
     CustomPrimitive, CustomPrimitiveExtensions, DifferentiableOperation, FlatProgram, LinearCustomPrimitive,

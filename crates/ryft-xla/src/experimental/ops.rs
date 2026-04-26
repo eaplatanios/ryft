@@ -4,12 +4,14 @@ use std::{
 };
 
 use ryft_core::{
+    tracing::AtomId,
     tracing::{InterpretableOperation, Operation, TracingError},
     tracing_v2::{
-        CustomPrimitive, DifferentiableOperation, DifferentiationError, LinearPrimitiveOperation, LinearTerm,
+        CustomOperationError, CustomPrimitive, DifferentiableOperation, DifferentiationError, JvpContext,
+        LinearPrimitiveOperation, LinearizationEngine,
         engines::DifferentiableEngine,
-        forward::{Differentiable, EngineTangent, JvpTracer},
-        linear::{Linearized, linearize_program, transpose_linear_program_with_output_examples},
+        forward::{Differentiable, JvpTracer},
+        linear::{TracedLinearizableOperation, linearize_program, transpose_linear_program_with_output_examples},
         operations::{
             AddOperation, ConditionOperation, ConditionPredicate, ControlFlowError, CosOperation,
             FlatTracedRematerialize, LeftMatMulOperation, LinearRematerializeOperation, MatMulOperation,
@@ -24,6 +26,7 @@ use ryft_core::{
 };
 
 use crate::experimental::{
+    engines::XlaEngine,
     operations::{
         LinearShardMapOperation, ShardMapCustomReplayExtension, ShardMapOperation, ShardMapReplayContext,
         WithShardingConstraintOperation,
@@ -98,9 +101,10 @@ fn replay_xla_program_with_tracers(
 
 fn interpret_xla_condition_jvp<E>(
     condition: &ConditionOperation<ShardMapTensor, XlaPrimitiveOperation>,
-    inputs: &[JvpTracer<ShardMapTensor, EngineTangent<E>>],
+    context: &mut JvpContext<'_, ShardMapTensor, XlaLinearOperation>,
+    inputs: &[JvpTracer<ShardMapTensor, AtomId>],
     engine: &E,
-) -> Result<Vec<JvpTracer<ShardMapTensor, EngineTangent<E>>>, TracingError>
+) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
 {
@@ -108,14 +112,10 @@ where
         return Err(ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition jvp" }.into());
     };
     let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-    let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-    let Some(tangent_builder) = tangent_inputs.first().map(|input| input.builder.clone()) else {
-        return if condition.output_types().is_empty() {
-            Ok(Vec::new())
-        } else {
-            Err(TracingError::InvalidInputCount { expected: 1, got: 0 })
-        };
-    };
+    let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
+    if tangent_inputs.is_empty() && !condition.output_types().is_empty() {
+        return Err(TracingError::InvalidInputCount { expected: 1, got: 0 });
+    }
 
     let selected_branch = if *predicate { condition.true_branch() } else { condition.false_branch() };
     let primal_outputs = selected_branch.interpret(primal_inputs.clone())?;
@@ -123,8 +123,7 @@ where
     let false_pushforward = linearize_program(engine, condition.false_branch(), primal_inputs)?;
     let linear_condition = ConditionOperation::with_captured_predicate(*predicate, true_pushforward, false_pushforward)
         .map_err(TracingError::from)?;
-    let tangent_outputs = LinearTerm::apply_staged_op(
-        tangent_builder,
+    let tangent_outputs = context.apply_operation(
         tangent_inputs.as_slice(),
         LinearPrimitiveOperation::Condition(Box::new(linear_condition)),
         condition.output_types().len(),
@@ -363,7 +362,7 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
                 let exemplar = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let replay_context = ShardMapReplayContext::new(exemplar.builder.clone());
                 op.extensions()
-                    .get::<ShardMapCustomReplayExtension<ShardMapTracer>>()
+                    .get::<ShardMapCustomReplayExtension>()
                     .ok_or_else(|| {
                         TracingError::CustomOperation(ryft_core::tracing_v2::CustomOperationError::MissingRule {
                             op: op.name(),
@@ -380,43 +379,36 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for XlaPrimitiveOperation
 impl<E> DifferentiableOperation<E> for XlaPrimitiveOperation
 where
     E: DifferentiableEngine<Type = ArrayType, Value = ShardMapTensor, LinearOperation = XlaLinearOperation>,
-    ShardMapTensor: Differentiable<
-            ArrayType,
-            Tangent<XlaLinearOperation> = LinearTerm<ArrayType, ShardMapTensor, XlaLinearOperation>,
-        >,
+    ShardMapTensor: Differentiable<ArrayType, Tangent = ShardMapTensor>,
 {
     fn jvp(
         &self,
         engine: &E,
-        inputs: &[JvpTracer<ShardMapTensor, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<ShardMapTensor, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, ShardMapTensor, XlaLinearOperation>,
+        inputs: &[JvpTracer<ShardMapTensor, AtomId>],
+    ) -> Result<Vec<JvpTracer<ShardMapTensor, AtomId>>, TracingError> {
         match self {
-            Self::Add => AddOperation.jvp(engine, inputs),
-            Self::Mul => MulOperation.jvp(engine, inputs),
-            Self::Neg => NegOperation.jvp(engine, inputs),
-            Self::Sin => SinOperation.jvp(engine, inputs),
-            Self::Cos => CosOperation.jvp(engine, inputs),
-            Self::MatMul => MatMulOperation.jvp(engine, inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, inputs),
+            Self::Add => AddOperation.jvp(engine, context, inputs),
+            Self::Mul => MulOperation.jvp(engine, context, inputs),
+            Self::Neg => NegOperation.jvp(engine, context, inputs),
+            Self::Sin => SinOperation.jvp(engine, context, inputs),
+            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
+            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, inputs)
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
             }
             Self::Rematerialize(remat) => {
                 let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-                let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+                let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
                 let primal_outputs = remat.interpret(primal_inputs.as_slice())?;
-                let tangent_builder = if let Some(first_tangent) = tangent_inputs.first() {
-                    first_tangent.builder.clone()
-                } else if remat.body().output_types().is_empty() {
-                    return Ok(Vec::new());
-                } else {
+                if tangent_inputs.is_empty() && !remat.body().output_types().is_empty() {
                     return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
-                };
-                let tangent_outputs = LinearTerm::apply_staged_op(
-                    tangent_builder,
+                }
+                let tangent_outputs = context.apply_operation(
                     tangent_inputs.as_slice(),
                     LinearPrimitiveOperation::Rematerialize(Box::new(make_linear_xla_rematerialize(
                         engine,
@@ -431,11 +423,11 @@ where
                     .map(|(primal, tangent)| JvpTracer { primal, tangent })
                     .collect::<Vec<_>>())
             }
-            Self::Condition(condition) => interpret_xla_condition_jvp::<E>(condition, inputs, engine),
+            Self::Condition(condition) => interpret_xla_condition_jvp::<E>(condition, context, inputs, engine),
             Self::While(_) => Err(ControlFlowError::MissingTransformRule { transform: "while jvp" }.into()),
-            Self::ShardMap(op) => op.jvp(engine, inputs),
-            Self::LinearShardMap(op) => op.jvp(engine, inputs),
-            Self::WithShardingConstraint(op) => op.jvp(engine, inputs),
+            Self::ShardMap(op) => op.jvp(engine, context, inputs),
+            Self::LinearShardMap(op) => op.jvp(engine, context, inputs),
+            Self::WithShardingConstraint(op) => op.jvp(engine, context, inputs),
             Self::Custom(op) => {
                 Err(ryft_core::tracing_v2::CustomOperationError::MissingRule { op: op.name(), transform: "jvp" }.into())
             }
@@ -443,33 +435,60 @@ where
     }
 }
 
-impl InterpretableOperation<ArrayType, Linearized<ShardMapTracer>> for XlaPrimitiveOperation {
-    fn interpret(
+impl TracedLinearizableOperation<'static, XlaEngine<'static>, XlaPrimitiveOperation> for XlaPrimitiveOperation {
+    fn jvp_traced_linearization(
         &self,
-        inputs: &[Linearized<ShardMapTracer>],
-    ) -> Result<Vec<Linearized<ShardMapTracer>>, TracingError> {
+        engine: &LinearizationEngine<'static, XlaEngine<'static>, XlaPrimitiveOperation>,
+        context: &mut JvpContext<'_, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>,
+        inputs: &[JvpTracer<ShardMapTracer, AtomId>],
+    ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         match self {
-            Self::Add => AddOperation.interpret(inputs),
-            Self::Mul => MulOperation.interpret(inputs),
-            Self::Neg => NegOperation.interpret(inputs),
-            Self::Sin => SinOperation.interpret(inputs),
-            Self::Cos => CosOperation.interpret(inputs),
-            Self::MatMul => MatMulOperation.interpret(inputs),
-            Self::MatrixTranspose => MatrixTransposeOperation.interpret(inputs),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).interpret(inputs),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).interpret(inputs),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).interpret(inputs),
+            Self::Add => AddOperation.jvp(engine, context, inputs),
+            Self::Mul => MulOperation.jvp(engine, context, inputs),
+            Self::Neg => NegOperation.jvp(engine, context, inputs),
+            Self::Sin => SinOperation.jvp(engine, context, inputs),
+            Self::Cos => CosOperation.jvp(engine, context, inputs),
+            Self::MatMul => MatMulOperation.jvp(engine, context, inputs),
+            Self::MatrixTranspose => MatrixTransposeOperation.jvp(engine, context, inputs),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
+            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).jvp(engine, context, inputs),
             Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).interpret(inputs)
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).jvp(engine, context, inputs)
             }
-            Self::Rematerialize(remat) => remat.interpret(inputs),
-            Self::Condition(_) | Self::While(_) => {
-                Err(ControlFlowError::MissingTransformRule { transform: "linearized JIT replay" }.into())
+            Self::Rematerialize(remat) => remat.jvp(engine, context, inputs),
+            Self::Condition(condition) => condition.jvp(engine, context, inputs),
+            Self::While(while_operation) => while_operation.jvp(engine, context, inputs),
+            Self::ShardMap(op) => {
+                let traced_op = ShardMapOperation::<ShardMapTracer>::new(op.body().clone());
+                traced_op.jvp_with_builders(engine.tracing_builder().clone(), context, inputs)
             }
-            Self::ShardMap(op) => op.interpret(inputs),
-            Self::LinearShardMap(op) => op.interpret(inputs),
-            Self::WithShardingConstraint(op) => op.interpret(inputs),
-            Self::Custom(op) => op.interpret(inputs),
+            Self::LinearShardMap(op) => op.jvp_traced_with_builders(engine.tracing_builder().clone(), context, inputs),
+            Self::WithShardingConstraint(op) => {
+                let input = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
+                let primal = ryft_core::tracing_v2::Tracer::apply_staged_op(
+                    XlaEngine::token(),
+                    engine.tracing_builder().clone(),
+                    std::slice::from_ref(&input.primal),
+                    XlaPrimitiveOperation::WithShardingConstraint(op.clone()),
+                )?
+                .into_iter()
+                .next()
+                .expect("with_sharding_constraint should produce one primal output");
+                let tangent = context
+                    .apply_operation(
+                        &[input.tangent],
+                        LinearPrimitiveOperation::Custom(Arc::new(op.to_tracer_linear_custom_primitive())),
+                        1,
+                    )?
+                    .into_iter()
+                    .next()
+                    .expect("with_sharding_constraint should produce one tangent output");
+                Ok(vec![JvpTracer { primal, tangent }])
+            }
+            Self::Custom(op) => {
+                Err(CustomOperationError::MissingRule { op: op.name(), transform: "traced linearization" }.into())
+            }
         }
     }
 }
@@ -556,7 +575,7 @@ impl SupportsReshape<ArrayType, ShardMapTensor> for XlaPrimitiveOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, fmt::Display, rc::Rc, sync::Arc};
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
 
     use pretty_assertions::assert_eq;
 
@@ -564,37 +583,11 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::ProgramBuilder;
     use ryft_core::tracing_v2::Tracer;
-    use ryft_core::tracing_v2::operations::CustomOperationError;
     use ryft_core::types::{DataType, Typed};
 
     use crate::experimental::engines::XlaEngine;
 
     use super::*;
-
-    #[derive(Clone, Debug)]
-    struct TestCustomXlaOp;
-
-    impl Display for TestCustomXlaOp {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "test_custom_xla")
-        }
-    }
-
-    impl Operation<ArrayType> for TestCustomXlaOp {
-        fn name(&self) -> &'static str {
-            "test_custom_xla"
-        }
-
-        fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-            Ok(input_types.to_vec())
-        }
-    }
-
-    impl InterpretableOperation<ArrayType, ShardMapTensor> for TestCustomXlaOp {
-        fn interpret(&self, inputs: &[ShardMapTensor]) -> Result<Vec<ShardMapTensor>, TracingError> {
-            Ok(inputs.to_vec())
-        }
-    }
 
     fn scalar_type() -> ArrayType {
         ArrayType::scalar(DataType::F32)
@@ -621,39 +614,25 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_xla_op_missing_linearized_jit_rule_reports_missing_rule() {
-        let operation = XlaPrimitiveOperation::Custom(Arc::new(CustomPrimitive::new(TestCustomXlaOp)));
-        let inputs: Vec<Linearized<ShardMapTracer>> = vec![];
-
-        assert!(matches!(
-            operation.interpret(&inputs),
-            Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
-                op: "test_custom_xla",
-                transform: "linearized JIT replay",
-            }))
-        ));
-    }
-
-    #[test]
     fn test_xla_rematerialize_jvp_stages_a_linear_rematerialize() {
         let operation =
             XlaPrimitiveOperation::Rematerialize(Box::new(RematerializeOperation::new(unary_rematerialize_body())));
         let tangent_builder =
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaLinearOperation>::new()));
         let tangent_atom = tangent_builder.borrow_mut().add_input(scalar_type());
+        let mut context = JvpContext::new(tangent_builder.clone());
         let outputs = operation
             .jvp(
                 crate::experimental::engines::XlaEngine::token(),
-                &[JvpTracer {
-                    primal: ShardMapTensor::new(scalar_type()),
-                    tangent: LinearTerm::from_staged_parts(tangent_atom, tangent_builder.clone()),
-                }],
+                &mut context,
+                &[JvpTracer { primal: ShardMapTensor::new(scalar_type()), tangent: tangent_atom }],
             )
             .expect("xla rematerialize jvp should succeed");
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal.r#type().into_owned(), scalar_type());
 
-        let output_atoms = outputs.into_iter().map(|output| output.tangent.atom).collect::<Vec<_>>();
+        let output_atoms = outputs.into_iter().map(|output| output.tangent).collect::<Vec<_>>();
+        drop(context);
         let tangent_builder = Rc::try_unwrap(tangent_builder)
             .expect("rematerialize jvp builder should not have outstanding linear terms")
             .into_inner();
@@ -662,7 +641,7 @@ mod tests {
             .unwrap();
         assert!(
             tangent_program.to_string().contains("rematerialize"),
-            "expected linearized xla rematerialize jvp to stage a linear rematerialize op: {}",
+            "expected xla rematerialize jvp to stage a linear rematerialize op: {}",
             tangent_program
         );
     }

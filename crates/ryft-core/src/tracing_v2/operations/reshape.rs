@@ -1,7 +1,4 @@
-use std::{
-    fmt::{Debug, Display},
-    ops::{Add, Mul, Neg},
-};
+use std::fmt::{Debug, Display};
 
 #[cfg(test)]
 use indoc::indoc;
@@ -9,22 +6,17 @@ use indoc::indoc;
 use crate::{
     macros::check_input_count,
     sharding::{Sharding, ShardingDimension},
-    tracing::{OperationFormatter, Traceable, TracingError},
+    tracing::{AtomId, OperationFormatter, Traceable, TracingError},
     tracing_v2::{
-        LinearPrimitiveOperation, MatrixOps,
+        LinearPrimitiveOperation,
         engines::{DifferentiableEngine, Engine},
-        forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
+        forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
-        linear::LinearTerm,
-        operations::constants::{OneLike, ZeroLike},
     },
     types::{ArrayType, Shape, Size, Type, TypeError, Typed},
 };
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, add::SupportsAdd, neg::SupportsNeg,
-    scale::SupportsScale,
-};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
 
 /// Hidden carrier capability for staging the reshape primitive.
 #[doc(hidden)]
@@ -203,56 +195,6 @@ pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
 
 impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
-/// Tangent-space reshape capability used by [`JvpTracer`].
-///
-/// Forward-mode AD uses this to propagate tangents through reshape without forcing all tangent
-/// representations to be identical to the primal representation.
-pub trait ReshapeTangentSpace<V: ReshapeValue>: TangentSpace<ArrayType, V> {
-    /// Reshapes one tangent value from `input_type` to `output_type`.
-    fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TracingError>;
-}
-
-impl<V: ReshapeValue + Add<Output = V> + Mul<Output = V> + Neg<Output = V> + ZeroLike> ReshapeTangentSpace<V> for V {
-    fn reshape(_input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TracingError> {
-        tangent.reshape(output_type.shape.clone())
-    }
-}
-
-impl<
-    V: ReshapeValue + ZeroLike + OneLike + MatrixOps,
-    O: SupportsAdd<ArrayType, V> + SupportsNeg<ArrayType, V> + SupportsReshape<ArrayType, V> + SupportsScale<ArrayType, V>,
-> ReshapeTangentSpace<V> for LinearTerm<ArrayType, V, O>
-where
-    O: Operation<ArrayType>,
-{
-    fn reshape(input_type: &ArrayType, output_type: &ArrayType, tangent: Self) -> Result<Self, TracingError> {
-        if input_type == output_type {
-            return Ok(tangent);
-        }
-        Ok(LinearTerm::apply_staged_op(
-            tangent.builder.clone(),
-            std::slice::from_ref(&tangent),
-            O::reshape_operation(input_type.clone(), output_type.clone()),
-            1,
-        )?
-        .into_iter()
-        .next()
-        .expect("reshape should produce one tangent output"))
-    }
-}
-
-impl<V: ReshapeValue, T: ReshapeTangentSpace<V>> ReshapeOps for JvpTracer<V, T> {
-    fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
-        let input_type = self.primal.r#type().into_owned();
-        let output_type = reshape_abstract(&input_type, &target_shape, "reshape")?;
-        if input_type == output_type {
-            return Ok(self);
-        }
-        let tangent = T::reshape(&input_type, &output_type, self.tangent)?;
-        Ok(Self { primal: self.primal.reshape(target_shape)?, tangent })
-    }
-}
-
 impl<'engine, V: Traceable<ArrayType>, E, O> ReshapeOps for Tracer<'engine, E, O>
 where
     E: Engine<Type = ArrayType, Value = V> + ?Sized,
@@ -413,7 +355,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
     }
 }
 
-impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType, V> for ReshapeOperation {
+impl<V: ReshapeValue> LinearOperation<ArrayType, V> for ReshapeOperation {
     fn transpose(
         &self,
         context: &mut crate::tracing_v2::operations::TranspositionContext<
@@ -451,18 +393,30 @@ impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType
 impl<E> DifferentiableOperation<E> for ReshapeOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: ReshapeValue + ZeroLike + OneLike + MatrixOps + Differentiable<ArrayType>,
-    E::LinearOperation:
-        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
-    EngineTangent<E>: ReshapeTangentSpace<E::Value>,
+    E::Value: ReshapeValue + Differentiable<ArrayType, Tangent = E::Value>,
+    E::LinearOperation: SupportsReshape<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
-        Ok(vec![inputs[0].clone().reshape(self.output_type().shape.clone())?])
+        let primal = inputs[0].primal.clone().reshape(self.output_type().shape.clone())?;
+        let tangent = context
+            .apply_operation(
+                &[inputs[0].tangent],
+                <E::LinearOperation as SupportsReshape<ArrayType, E::Value>>::reshape_operation(
+                    self.input_type().clone(),
+                    self.output_type().clone(),
+                ),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("reshape jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }
 

@@ -792,10 +792,26 @@ mod tests {
         }
     }
 
+    impl crate::tracing_v2::operations::constants::One<ArrayType> for TestArray {
+        fn one(value_type: &ArrayType) -> Result<Self, TracingError> {
+            if value_type.rank() != 0 {
+                return Err(crate::tracing_v2::DifferentiationError::NonScalarGradientOutput {
+                    output_type: value_type.clone(),
+                }
+                .into());
+            }
+            Ok(Self { r#type: value_type.clone(), values: vec![1.0] })
+        }
+    }
+
     impl OneLike for TestArray {
         fn one_like(&self) -> Self {
             Self { r#type: self.r#type.clone(), values: vec![1.0; self.values.len()] }
         }
+    }
+
+    impl crate::tracing_v2::Differentiable<ArrayType> for TestArray {
+        type Tangent = Self;
     }
 
     impl Add for TestArray {

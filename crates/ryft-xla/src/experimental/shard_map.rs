@@ -22,9 +22,9 @@ use ryft_core::tracing::{
 };
 use ryft_core::tracing_v2::operations::{
     AddOperation, ControlFlowError, ControlFlowValue, MatMulOperation, MatrixTransposeOperation, MulOperation,
-    constants::{OneLike, ZeroLike},
+    constants::{One, OneLike, ZeroLike},
 };
-use ryft_core::tracing_v2::{Cos, Linearized, MatrixOps, Sin, Tracer, trace as trace_types};
+use ryft_core::tracing_v2::{Cos, Differentiable, MatrixOps, Sin, Tracer, trace as trace_types};
 
 use crate::experimental::operations::WithShardingConstraintOperation;
 use crate::experimental::ops::XlaPrimitiveOperation;
@@ -135,11 +135,6 @@ pub enum ShardMapTraceError {
     /// leaf is available to supply the outer tracing context.
     #[error("traced shard_map with non-empty outputs requires at least one traced input leaf")]
     MissingTracedInvocationContext,
-
-    /// Error returned when linearized `shard_map` staging has non-empty outputs but no traced
-    /// primal/tangent leaf is available to supply the outer replay context.
-    #[error("linearized shard_map with non-empty outputs requires at least one traced input leaf")]
-    MissingLinearizedInvocationContext,
 
     /// Error returned while building StableHLO/Shardy MLIR for a traced shard-map body.
     #[error("{message}")]
@@ -364,11 +359,28 @@ impl ryft_core::tracing_v2::operations::constants::Zero<ArrayType> for ShardMapT
     }
 }
 
+impl One<ArrayType> for ShardMapTensor {
+    #[inline]
+    fn one(value_type: &ArrayType) -> Result<Self, TracingError> {
+        if value_type.rank() != 0 {
+            return Err(ryft_core::tracing_v2::DifferentiationError::NonScalarGradientOutput {
+                output_type: value_type.clone(),
+            }
+            .into());
+        }
+        Ok(Self::one(value_type.clone()))
+    }
+}
+
 impl OneLike for ShardMapTensor {
     #[inline]
     fn one_like(&self) -> Self {
         Self::one(self.array_type.clone())
     }
+}
+
+impl Differentiable<ArrayType> for ShardMapTensor {
+    type Tangent = Self;
 }
 
 impl Add for ShardMapTensor {
@@ -568,10 +580,8 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
-        Output::Family: ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
-            + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<Linearized<ShardMapTracer>>;
+        Output::Family:
+            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>;
 
     /// Invokes [`shard_map`] for one specific tracing regime.
     fn invoke<
@@ -592,10 +602,8 @@ pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
             + ParameterizedFamily<Sharding>
             + ParameterizedFamily<ShardMapTensor>
             + ParameterizedFamily<ShardMapTracer>,
-        Output::Family: ParameterizedFamily<Sharding>
-            + ParameterizedFamily<ShardMapTensor>
-            + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<Linearized<ShardMapTracer>>;
+        Output::Family:
+            ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>;
 }
 
 /// Stages an arbitrary traced XLA function over global tensor types.
@@ -710,10 +718,8 @@ where
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<ShardMapTensor>
         + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<Sharding>
-        + ParameterizedFamily<ShardMapTensor>
-        + ParameterizedFamily<ShardMapTracer>
-        + ParameterizedFamily<Linearized<ShardMapTracer>>,
+    Output::Family:
+        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
 {
     shard_map_with_options(function, inputs, mesh, in_specs, out_specs, vec![], true)
 }
@@ -755,10 +761,8 @@ where
         + ParameterizedFamily<Sharding>
         + ParameterizedFamily<ShardMapTensor>
         + ParameterizedFamily<ShardMapTracer>,
-    Output::Family: ParameterizedFamily<Sharding>
-        + ParameterizedFamily<ShardMapTensor>
-        + ParameterizedFamily<ShardMapTracer>
-        + ParameterizedFamily<Linearized<ShardMapTracer>>,
+    Output::Family:
+        ParameterizedFamily<Sharding> + ParameterizedFamily<ShardMapTensor> + ParameterizedFamily<ShardMapTracer>,
 {
     Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes, check_vma)
 }
@@ -2076,23 +2080,6 @@ mod tests {
             );
 
         assert!(matches!(result, Err(ShardMapTraceError::MissingTracedInvocationContext)));
-    }
-
-    #[test]
-    fn test_shard_map_rejects_zero_input_linearized_invocation_without_context() {
-        let mesh = test_logical_mesh_2x2();
-        let result: Result<Vec<Linearized<ShardMapTracer>>, ShardMapTraceError> =
-            shard_map::<_, Vec<Linearized<ShardMapTracer>>, Vec<ArrayType>, Linearized<ShardMapTracer>>(
-                |_: Vec<ShardMapTracer>| -> Vec<ShardMapTracer> {
-                    unreachable!("zero-input linearized invocation should fail early")
-                },
-                Vec::<Linearized<ShardMapTracer>>::new(),
-                mesh.clone(),
-                Vec::<Sharding>::new(),
-                vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
-            );
-
-        assert!(matches!(result, Err(ShardMapTraceError::MissingLinearizedInvocationContext)));
     }
 
     #[test]

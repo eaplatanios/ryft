@@ -4,16 +4,18 @@ use crate::macros::check_input_count;
 use crate::tracing::TracingError;
 use crate::types::{ArrayType, Type, TypeError};
 use crate::{
-    tracing::Traceable,
+    tracing::{AtomId, Traceable},
     tracing_v2::{
         engines::DifferentiableEngine,
-        forward::{Differentiable, EngineTangent, JvpTracer},
+        forward::{Differentiable, JvpContext, JvpTracer},
     },
 };
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale,
+    DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd,
+    left_matmul::SupportsLeftMatMul,
     matrix::{MatrixOps, MatrixValue, matmul_abstract},
+    right_matmul::SupportsRightMatMul,
 };
 
 /// Hidden carrier capability for staging the matrix multiplication primitive.
@@ -66,17 +68,52 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatMulOperation {
 impl<E> DifferentiableOperation<E> for MatMulOperation
 where
     E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: MatrixValue + Differentiable<ArrayType>,
-    E::LinearOperation:
-        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
-    EngineTangent<E>: super::matrix::MatrixTangentSpace<E::Value>,
+    E::Value: MatrixValue + Differentiable<ArrayType, Tangent = E::Value>,
+    E::LinearOperation: SupportsAdd<ArrayType, E::Value>
+        + SupportsLeftMatMul<ArrayType, E::Value>
+        + SupportsRightMatMul<ArrayType, E::Value>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 2);
-        Ok(vec![inputs[0].clone().matmul(inputs[1].clone())])
+        let left = &inputs[0];
+        let right = &inputs[1];
+        let primal = left.primal.clone().matmul(right.primal.clone());
+        let left_term = context
+            .apply_operation(
+                &[left.tangent],
+                <E::LinearOperation as SupportsRightMatMul<ArrayType, E::Value>>::right_matmul_operation(
+                    right.primal.clone(),
+                ),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("matmul jvp right matmul should produce one tangent");
+        let right_term = context
+            .apply_operation(
+                &[right.tangent],
+                <E::LinearOperation as SupportsLeftMatMul<ArrayType, E::Value>>::left_matmul_operation(
+                    left.primal.clone(),
+                ),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("matmul jvp left matmul should produce one tangent");
+        let tangent = context
+            .apply_operation(
+                &[left_term, right_term],
+                <E::LinearOperation as SupportsAdd<ArrayType, E::Value>>::add_operation(),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("matmul jvp add should produce one tangent");
+        Ok(vec![JvpTracer { primal, tangent }])
     }
 }

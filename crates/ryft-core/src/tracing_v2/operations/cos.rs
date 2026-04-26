@@ -4,17 +4,16 @@ use std::{
 };
 
 use crate::macros::check_input_count;
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
     engines::{DifferentiableEngine, Engine},
-    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
+    forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::{
-    DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale, sin::Sin,
-    unary_abstract,
+    DifferentiableOperation, InterpretableOperation, Operation, SupportsNeg, SupportsScale, sin::Sin, unary_abstract,
 };
 
 /// Hidden carrier capability for staging the cosine primitive.
@@ -85,32 +84,34 @@ impl<V: Typed<ArrayType> + Clone + Cos> InterpretableOperation<ArrayType, V> for
 
 impl<E> DifferentiableOperation<E> for CosOperation
 where
-    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: Cos + Sin + Neg<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation:
-        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
+    E: DifferentiableEngine + ?Sized,
+    CosOperation: Operation<E::Type>,
+    E::Value: Cos + Sin + Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperation: SupportsNeg<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
-        Ok(vec![JvpTracer {
-            primal: input.primal.clone().cos(),
-            tangent: EngineTangent::<E>::neg(EngineTangent::<E>::scale(
-                input.primal.clone().sin(),
-                input.tangent.clone(),
-            )),
-        }])
-    }
-}
-
-impl<V: Typed<ArrayType> + Clone + Cos + Sin + Neg<Output = V>, T: TangentSpace<ArrayType, V>> Cos for JvpTracer<V, T> {
-    #[inline]
-    fn cos(self) -> Self {
-        Self { primal: self.primal.clone().cos(), tangent: T::neg(T::scale(self.primal.sin(), self.tangent)) }
+        let scaled = context
+            .apply_operation(
+                &[input.tangent],
+                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(input.primal.clone().sin()),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("cos jvp scale should produce one tangent");
+        let tangent = context
+            .apply_operation(&[scaled], <E::LinearOperation as SupportsNeg<E::Type, E::Value>>::neg_operation(), 1)?
+            .into_iter()
+            .next()
+            .expect("cos jvp neg should produce one tangent");
+        Ok(vec![JvpTracer { primal: input.primal.clone().cos(), tangent }])
     }
 }
 

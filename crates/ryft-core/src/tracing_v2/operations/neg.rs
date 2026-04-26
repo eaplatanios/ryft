@@ -4,19 +4,16 @@ use std::{
 };
 
 use crate::macros::check_input_count;
-use crate::tracing::{Traceable, TracingError};
+use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
     LinearPrimitiveOperation,
     engines::DifferentiableEngine,
-    forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
+    forward::{Differentiable, JvpContext, JvpTracer},
     operations::constants::ZeroLike,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
-use super::{
-    DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, SupportsAdd, SupportsScale,
-    unary_abstract,
-};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, unary_abstract};
 
 /// Hidden carrier capability for staging the negation primitive.
 #[doc(hidden)]
@@ -88,20 +85,27 @@ impl<V: Traceable<ArrayType> + Neg<Output = V> + ZeroLike> LinearOperation<Array
 
 impl<E> DifferentiableOperation<E> for NegOperation
 where
-    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: Neg<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation:
-        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
+    E: DifferentiableEngine + ?Sized,
+    NegOperation: Operation<E::Type>,
+    E::Value: Neg<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperation: SupportsNeg<E::Type, E::Value>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
-        Ok(vec![JvpTracer {
-            primal: -inputs[0].primal.clone(),
-            tangent: EngineTangent::<E>::neg(inputs[0].tangent.clone()),
-        }])
+        let tangent = context
+            .apply_operation(
+                &[inputs[0].tangent],
+                <E::LinearOperation as SupportsNeg<E::Type, E::Value>>::neg_operation(),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("neg jvp should produce one tangent");
+        Ok(vec![JvpTracer { primal: -inputs[0].primal.clone(), tangent }])
     }
 }

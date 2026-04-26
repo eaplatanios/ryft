@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::tracing_v2::JvpContext;
 use crate::tracing_v2::operations::{SupportsZero, TranspositionContext};
 
 /// Converts a staged primal program into a staged pushforward linear map.
@@ -10,50 +11,46 @@ use crate::tracing_v2::operations::{SupportsZero, TranspositionContext};
 #[doc(hidden)]
 pub fn linearize_program<Input, Output, V, E, O>(
     engine: &E,
-    program: &Program<ArrayType, V, O, Input, Output>,
+    program: &Program<E::Type, V, O, Input, Output>,
     input_primals: Vec<V>,
-) -> Result<Program<ArrayType, V, E::LinearOperation, Input, Output>, TracingError>
+) -> Result<Program<E::Type, V, E::LinearOperation, Input, Output>, TracingError>
 where
-    V: Traceable<ArrayType> + ZeroLike,
+    V: Differentiable<E::Type, Tangent = V> + Zero<E::Type>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: DifferentiableEngine<Value = V> + ?Sized,
     O: Clone + DifferentiableOperation<E>,
 {
-    fn tangent_for_atom<V, Input, Output, ProgramOperation, LinearOperation>(
-        _program: &Program<ArrayType, V, ProgramOperation, Input, Output>,
+    fn tangent_for_atom<T, V, LinearOperation>(
         primal_values: &[Option<V>],
-        builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, LinearOperation>>>,
-        tangents: &mut [Option<LinearTerm<ArrayType, V, LinearOperation>>],
+        builder: &Rc<RefCell<ProgramBuilder<T, V, LinearOperation>>>,
+        tangents: &mut [Option<AtomId>],
         atom_id: AtomId,
-    ) -> Result<LinearTerm<ArrayType, V, LinearOperation>, TracingError>
+    ) -> Result<AtomId, TracingError>
     where
-        V: Traceable<ArrayType> + ZeroLike,
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-        ProgramOperation: Clone + Operation<ArrayType>,
-        LinearOperation: Clone + Operation<ArrayType>,
+        T: Type,
+        V: Differentiable<T, Tangent = V> + Zero<T>,
+        LinearOperation: Clone + Operation<T>,
     {
-        if let Some(term) = tangents[atom_id.index].clone() {
-            return Ok(term);
+        if let Some(atom) = tangents[atom_id.index] {
+            return Ok(atom);
         }
         let primal = primal_values[atom_id.index].as_ref().ok_or(TracingError::UnboundAtomId { id: atom_id })?;
-        let tangent_atom = builder.borrow_mut().add_constant(primal.zero_like());
-        let tangent = LinearTerm::from_staged_parts(tangent_atom, builder.clone());
-        tangents[atom_id.index] = Some(tangent.clone());
-        Ok(tangent)
+        let atom = builder.borrow_mut().add_constant(<V as Zero<T>>::zero(primal.r#type().as_ref())?);
+        tangents[atom_id.index] = Some(atom);
+        Ok(atom)
     }
 
     let program = program;
     if input_primals.len() != program.input_ids.len() {
         return Err(TracingError::InvalidInputCount { expected: program.input_ids.len(), got: input_primals.len() });
     }
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::LinearOperation>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<E::Type, V, E::LinearOperation>::new()));
     let mut primals: Vec<Option<V>> = vec![None; program.atoms.len()];
-    let mut tangents: Vec<Option<LinearTerm<ArrayType, V, E::LinearOperation>>> = vec![None; program.atoms.len()];
+    let mut tangents: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
     for (input_atom, input_primal) in program.input_ids.iter().copied().zip(input_primals.into_iter()) {
         let tangent_atom = builder.borrow_mut().add_input(input_primal.r#type().into_owned());
-        tangents[input_atom.index] = Some(LinearTerm::from_staged_parts(tangent_atom, builder.clone()));
+        tangents[input_atom.index] = Some(tangent_atom);
         primals[input_atom.index] = Some(input_primal);
     }
     for (atom_index, atom) in program.atoms.iter().enumerate() {
@@ -63,6 +60,7 @@ where
         }
     }
 
+    let mut context = JvpContext::<'_, V, E::LinearOperation, E::Type>::new(builder.clone());
     for instruction in &program.instructions {
         let input_duals = instruction
             .inputs
@@ -71,8 +69,7 @@ where
             .map(|input_atom| {
                 Ok(JvpTracer {
                     primal: primals[input_atom.index].clone().ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                    tangent: tangent_for_atom(
-                        program,
+                    tangent: tangent_for_atom::<E::Type, V, E::LinearOperation>(
                         primals.as_slice(),
                         &builder,
                         tangents.as_mut_slice(),
@@ -81,7 +78,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
-        let output_duals = instruction.operation.jvp(engine, input_duals.as_slice())?;
+        let output_duals = instruction.operation.jvp(engine, &mut context, input_duals.as_slice())?;
         if output_duals.len() != instruction.outputs.len() {
             return Err(TracingError::InvalidOutputCount {
                 expected: instruction.outputs.len(),
@@ -99,10 +96,15 @@ where
         .iter()
         .copied()
         .map(|output_atom| {
-            tangent_for_atom(program, primals.as_slice(), &builder, tangents.as_mut_slice(), output_atom)
-                .map(|term| term.atom)
+            tangent_for_atom::<E::Type, V, E::LinearOperation>(
+                primals.as_slice(),
+                &builder,
+                tangents.as_mut_slice(),
+                output_atom,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    drop(context);
     drop(tangents);
     let builder = match Rc::try_unwrap(builder) {
         Ok(builder) => builder.into_inner(),
@@ -115,29 +117,27 @@ where
         .simplified()
 }
 
-fn transpose_linear_program_with_context<V, Input, Output, O>(
-    context: &mut TranspositionContext<'_, ArrayType, V, O>,
-    program: &Program<ArrayType, V, O, Input, Output>,
-) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
+fn transpose_linear_program_with_context<T, V, Input, Output, O>(
+    context: &mut TranspositionContext<'_, T, V, O>,
+    program: &Program<T, V, O, Input, Output>,
+) -> Result<Program<T, V, O, Output, Input>, TracingError>
 where
-    V: Traceable<ArrayType>,
+    T: Type,
+    V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    O: Clone
-        + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, O>
-        + SupportsAdd<ArrayType, V>
-        + SupportsZero<ArrayType, V>,
+    O: Clone + InterpretableOperation<T, V> + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
-    fn accumulate<V, O>(
-        builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
+    fn accumulate<T, V, O>(
+        builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
         adjoints: &mut [Option<AtomId>],
         atom: AtomId,
         contribution: AtomId,
     ) -> Result<(), TracingError>
     where
-        V: Traceable<ArrayType>,
-        O: SupportsAdd<ArrayType, V> + Operation<ArrayType> + Clone,
+        T: Type,
+        V: Traceable<T>,
+        O: SupportsAdd<T, V> + Operation<T> + Clone,
     {
         adjoints[atom.index] = Some(match adjoints[atom.index] {
             Some(existing) => {
@@ -156,15 +156,16 @@ where
         Ok(())
     }
 
-    fn stage_zero<V, O>(builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, r#type: ArrayType) -> AtomId
+    fn stage_zero<T, V, O>(builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>, r#type: T) -> AtomId
     where
-        V: Traceable<ArrayType>,
-        O: SupportsZero<ArrayType, V> + Operation<ArrayType> + Clone,
+        T: Type,
+        V: Traceable<T>,
+        O: SupportsZero<T, V> + Operation<T> + Clone,
     {
         let mut builder_borrow = builder.borrow_mut();
         let output = builder_borrow.add_variable(r#type.clone());
         builder_borrow.instructions.push(Instruction {
-            operation: <O as SupportsZero<ArrayType, V>>::zero_operation(r#type),
+            operation: <O as SupportsZero<T, V>>::zero_operation(r#type),
             inputs: vec![],
             outputs: vec![output],
         });
@@ -181,7 +182,7 @@ where
 
     let mut adjoints = vec![None; program.atoms.len()];
     for (cotangent, output) in output_cotangent_inputs.into_iter().zip(program.output_ids.iter().copied()) {
-        accumulate(&builder, adjoints.as_mut_slice(), output, cotangent)?;
+        accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), output, cotangent)?;
     }
 
     for instruction in program.instructions.iter().rev() {
@@ -193,7 +194,7 @@ where
         let input_cotangents = instruction.operation.transpose(context, instruction_output_cotangents.as_slice())?;
         for (input, contribution) in instruction.inputs.iter().copied().zip(input_cotangents) {
             if let Some(contribution) = contribution {
-                accumulate(&builder, adjoints.as_mut_slice(), input, contribution)?;
+                accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), input, contribution)?;
             }
         }
     }
@@ -204,7 +205,7 @@ where
         .copied()
         .map(|input| match adjoints[input.index] {
             Some(adjoint) => adjoint,
-            None => stage_zero::<V, O>(&builder, program.atoms[input.index].r#type().into_owned()),
+            None => stage_zero::<T, V, O>(&builder, program.atoms[input.index].r#type().into_owned()),
         })
         .collect::<Vec<_>>();
     drop(builder);
@@ -214,20 +215,17 @@ where
         .simplified()
 }
 
-impl<V, O> TranspositionContext<'_, ArrayType, V, O>
+impl<T, V, O> TranspositionContext<'_, T, V, O>
 where
-    V: Traceable<ArrayType>,
-    O: Clone
-        + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, O>
-        + SupportsAdd<ArrayType, V>
-        + SupportsZero<ArrayType, V>,
+    T: Type,
+    V: Traceable<T>,
+    O: Clone + InterpretableOperation<T, V> + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
     /// Transposes one nested linear program into a fresh sibling builder.
     pub(crate) fn transpose_nested_program<Input, Output>(
         &mut self,
-        program: &Program<ArrayType, V, O, Input, Output>,
-    ) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
+        program: &Program<T, V, O, Input, Output>,
+    ) -> Result<Program<T, V, O, Output, Input>, TracingError>
     where
         Input: Parameterized<V, ParameterStructure: Clone>,
         Output: Parameterized<V, ParameterStructure: Clone>,
@@ -249,25 +247,22 @@ where
 /// [`LinearPrimitiveOperation::Zero`](crate::tracing_v2::LinearPrimitiveOperation::Zero) ops, which
 /// the value type's [`Zero<ArrayType>`](crate::tracing_v2::operations::constants::Zero)
 /// implementation evaluates at interpretation time.
-pub fn transpose_linear_program_with_output_examples<V, Input, Output, O>(
-    program: &Program<ArrayType, V, O, Input, Output>,
+pub fn transpose_linear_program_with_output_examples<T, V, Input, Output, O>(
+    program: &Program<T, V, O, Input, Output>,
     output_examples: &[V],
-) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
+) -> Result<Program<T, V, O, Output, Input>, TracingError>
 where
-    V: Traceable<ArrayType>,
+    T: Type,
+    V: Traceable<T>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    O: Clone
-        + InterpretableOperation<ArrayType, V>
-        + LinearOperation<ArrayType, V, O>
-        + SupportsAdd<ArrayType, V>
-        + SupportsZero<ArrayType, V>,
+    O: Clone + InterpretableOperation<T, V> + LinearOperation<T, V, O> + SupportsAdd<T, V> + SupportsZero<T, V>,
 {
     let expected_output_count = program.output_ids.len();
     if output_examples.len() != expected_output_count {
         return Err(TracingError::InvalidInputCount { expected: expected_output_count, got: output_examples.len() });
     }
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new()));
     let mut context = TranspositionContext::new(builder);
     transpose_linear_program_with_context(&mut context, program)
 }

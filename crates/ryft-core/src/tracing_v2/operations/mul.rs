@@ -8,14 +8,14 @@ use crate::broadcasting::Broadcastable;
 use crate::types::{ArrayType, Type, TypeError, Typed};
 use crate::{
     macros::check_input_count,
-    tracing::{Traceable, TracingError},
+    tracing::{AtomId, Traceable, TracingError},
     tracing_v2::{
         engines::DifferentiableEngine,
-        forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
+        forward::{Differentiable, JvpContext, JvpTracer},
     },
 };
 
-use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsNeg, SupportsScale};
+use super::{DifferentiableOperation, InterpretableOperation, Operation, SupportsAdd, SupportsScale};
 
 /// Hidden carrier capability for staging the multiplication primitive.
 #[doc(hidden)]
@@ -96,26 +96,48 @@ impl<V: Typed<ArrayType> + Clone + Mul<Output = V>> InterpretableOperation<Array
 
 impl<E> DifferentiableOperation<E> for MulOperation
 where
-    E: DifferentiableEngine<Type = ArrayType> + ?Sized,
-    E::Value: Mul<Output = E::Value> + Differentiable<ArrayType>,
-    E::LinearOperation:
-        SupportsAdd<ArrayType, E::Value> + SupportsNeg<ArrayType, E::Value> + SupportsScale<ArrayType, E::Value>,
+    E: DifferentiableEngine + ?Sized,
+    MulOperation: Operation<E::Type>,
+    E::Value: Mul<Output = E::Value> + Differentiable<E::Type, Tangent = E::Value>,
+    E::LinearOperation: SupportsAdd<E::Type, E::Value> + SupportsScale<E::Type, E::Value>,
 {
     fn jvp(
         &self,
         _engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
+        context: &mut JvpContext<'_, E::Value, E::LinearOperation, E::Type>,
+        inputs: &[JvpTracer<E::Value, AtomId>],
+    ) -> Result<Vec<JvpTracer<E::Value, AtomId>>, TracingError> {
         check_input_count!(inputs, 2);
         let left = &inputs[0];
         let right = &inputs[1];
-        Ok(vec![JvpTracer {
-            primal: left.primal.clone() * right.primal.clone(),
-            tangent: EngineTangent::<E>::add(
-                EngineTangent::<E>::scale(right.primal.clone(), left.tangent.clone()),
-                EngineTangent::<E>::scale(left.primal.clone(), right.tangent.clone()),
-            ),
-        }])
+        let left_term = context
+            .apply_operation(
+                &[left.tangent],
+                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(right.primal.clone()),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("mul jvp scale should produce one tangent");
+        let right_term = context
+            .apply_operation(
+                &[right.tangent],
+                <E::LinearOperation as SupportsScale<E::Type, E::Value>>::scale_operation(left.primal.clone()),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("mul jvp scale should produce one tangent");
+        let tangent = context
+            .apply_operation(
+                &[left_term, right_term],
+                <E::LinearOperation as SupportsAdd<E::Type, E::Value>>::add_operation(),
+                1,
+            )?
+            .into_iter()
+            .next()
+            .expect("mul jvp add should produce one tangent");
+        Ok(vec![JvpTracer { primal: left.primal.clone() * right.primal.clone(), tangent }])
     }
 }
 

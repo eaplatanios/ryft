@@ -5,19 +5,17 @@ use crate::{
     parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder},
     tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value},
     tracing_v2::{
-        Differentiable, DifferentiationError, EngineTangent, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation,
-        Tracer,
+        Differentiable, DifferentiationError, LinearPrimitiveOperation, PrimitiveOperation, Tracer,
         engines::DifferentiableEngine,
         linear::{
-            linearize_program, replay_program_linearized_jit, trace_flat_program_from_input_types,
-            transpose_linear_program_with_output_examples,
+            linearize_program, trace_flat_program_from_input_types, transpose_linear_program_with_output_examples,
         },
-        operations::constants::ZeroLike,
+        operations::constants::{Zero, ZeroLike},
     },
     types::{ArrayType, Type, TypeError, Typed},
 };
 
-use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation};
+use super::{DifferentiableOperation, InterpretableOperation, LinearOperation, Operation, TracedLinearizationCarrier};
 
 /// Hidden carrier capability for staging the `rematerialize` higher-order primitive.
 #[doc(hidden)]
@@ -167,50 +165,109 @@ where
     }
 }
 
-impl<'engine, E, O, V: Value<ArrayType> + ZeroLike + Differentiable<ArrayType>>
-    InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>
-    for RematerializeOperation<ArrayType, V, O, E::LinearOperation>
+/// JVP rule for `RematerializeOperation` under
+/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
+///
+/// Stages the primal effect by applying the rematerialize op in the outer trace via
+/// [`Tracer::apply_staged_op`], then recursively linearizes the body through
+/// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
+/// that pushforward (paired with its transpose) in a
+/// [`LinearPrimitiveOperation::Rematerialize`] variant that the active linear builder can stage
+/// directly.
+impl<'engine, V, EInner, OInner>
+    DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>>
+    for RematerializeOperation<ArrayType, V, OInner, LinearPrimitiveOperation<V>>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    V: Value<ArrayType>
+        + ZeroLike
+        + crate::tracing_v2::operations::constants::Zero<ArrayType>
+        + Differentiable<ArrayType, Tangent = V>
+        + 'static,
+    EInner: crate::tracing_v2::engines::Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    OInner: TracedLinearizationCarrier<V>
+        + InterpretableOperation<ArrayType, V>
+        + SupportsRematerialize<ArrayType, V, LinearPrimitiveOperation<V>>,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + 'static,
-    O: InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>,
-    O: SupportsRematerialize<ArrayType, V, E::LinearOperation>,
-    LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
-        + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
+    LinearPrimitiveOperation<V>:
+        Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
+    OInner: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner, OInner>,
+    for<'a> LinearPrimitiveOperation<Tracer<'a, EInner, OInner>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'a, EInner, OInner>>
+        + LinearOperation<ArrayType, Tracer<'a, EInner, OInner>, LinearPrimitiveOperation<Tracer<'a, EInner, OInner>>>,
 {
-    fn interpret(
+    fn jvp(
         &self,
-        inputs: &[crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>],
-    ) -> Result<Vec<crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>, TracingError> {
-        if inputs.is_empty() {
-            return if self.body.output_types().is_empty() {
-                Ok(Vec::new())
-            } else {
-                Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into())
-            };
-        }
+        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>,
+        context: &mut crate::tracing_v2::JvpContext<
+            '_,
+            Tracer<'engine, EInner, OInner>,
+            LinearPrimitiveOperation<Tracer<'engine, EInner, OInner>>,
+        >,
+        inputs: &[crate::tracing_v2::JvpTracer<Tracer<'engine, EInner, OInner>, crate::tracing::AtomId>],
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<Tracer<'engine, EInner, OInner>, crate::tracing::AtomId>>, TracingError>
+    {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let exemplar_primal_input = primal_inputs[0].clone();
-        let linear_builder = inputs[0].tangent.builder.clone();
-        let primal_outputs = Tracer::apply_staged_op(
-            exemplar_primal_input.engine,
-            exemplar_primal_input.builder.clone(),
-            primal_inputs.as_slice(),
-            O::rematerialize_operation(self.clone()),
+        let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
+
+        let primal_outputs = if primal_inputs.is_empty() {
+            if !self.body().output_types().is_empty() {
+                return Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into());
+            }
+            Vec::new()
+        } else {
+            let exemplar = primal_inputs[0].clone();
+            Tracer::apply_staged_op(
+                exemplar.engine,
+                exemplar.builder.clone(),
+                primal_inputs.as_slice(),
+                OInner::rematerialize_operation(self.clone()),
+            )?
+        };
+
+        if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
+            return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
+        }
+
+        let (_, pushforward) = crate::tracing_v2::linear::linearize_traced_program(
+            engine.inner(),
+            engine.tracing_builder().clone(),
+            self.body().program(),
+            primal_inputs,
         )?;
-        let body_program = self.body().program();
-        let tangent_outputs = replay_program_linearized_jit(
-            exemplar_primal_input.engine,
-            exemplar_primal_input.builder.clone(),
-            linear_builder,
-            body_program,
-            inputs.to_vec(),
+        let pullback = crate::tracing_v2::linear::transpose_traced_linear_program(
+            engine.inner(),
+            engine.tracing_builder().clone(),
+            &pushforward,
         )?;
+
+        let body_input_types = self.body().input_types().to_vec();
+        let body_output_types = self.body().output_types().to_vec();
+        let linear_remat = LinearRematerializeOperation::<
+            ArrayType,
+            Tracer<'engine, EInner, OInner>,
+            LinearPrimitiveOperation<Tracer<'engine, EInner, OInner>>,
+        >::new(
+            FlatTracedRematerialize::<
+                ArrayType,
+                Tracer<'engine, EInner, OInner>,
+                LinearPrimitiveOperation<Tracer<'engine, EInner, OInner>>,
+            >::from_parts(body_input_types.clone(), body_output_types.clone(), pushforward),
+            FlatTracedRematerialize::<
+                ArrayType,
+                Tracer<'engine, EInner, OInner>,
+                LinearPrimitiveOperation<Tracer<'engine, EInner, OInner>>,
+            >::from_parts(body_output_types, body_input_types, pullback),
+        );
+
+        let tangent_outputs = context.apply_operation(
+            tangent_inputs.as_slice(),
+            LinearPrimitiveOperation::Rematerialize(Box::new(linear_remat)),
+            self.body().output_types().len(),
+        )?;
+
         Ok(primal_outputs
             .into_iter()
-            .zip(tangent_outputs.into_iter().map(|output| output.tangent))
+            .zip(tangent_outputs)
             .map(|(primal, tangent)| crate::tracing_v2::JvpTracer { primal, tangent })
             .collect::<Vec<_>>())
     }
@@ -220,10 +277,8 @@ impl<
     V: Value<ArrayType>
         + ZeroLike
         + crate::tracing_v2::operations::constants::Zero<ArrayType>
-        + Differentiable<
-            ArrayType,
-            Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
-        > + 'static,
+        + Differentiable<ArrayType, Tangent = V>
+        + 'static,
     E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>> + ?Sized + 'static,
     O: Clone + Operation<ArrayType>,
 > DifferentiableOperation<E> for RematerializeOperation<ArrayType, V, O, E::LinearOperation>
@@ -231,9 +286,7 @@ where
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     O: DifferentiableOperation<E>,
     O: InterpretableOperation<ArrayType, V>,
-    O: for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>
-        + SupportsRematerialize<ArrayType, V, E::LinearOperation>
-        + 'static,
+    O: SupportsRematerialize<ArrayType, V, E::LinearOperation> + 'static,
     LinearPrimitiveOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
     for<'engine> LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
@@ -243,20 +296,16 @@ where
     fn jvp(
         &self,
         engine: &E,
-        inputs: &[crate::tracing_v2::JvpTracer<V, EngineTangent<E>>],
-    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, EngineTangent<E>>>, TracingError> {
+        context: &mut crate::tracing_v2::JvpContext<'_, V, E::LinearOperation>,
+        inputs: &[crate::tracing_v2::JvpTracer<V, crate::tracing::AtomId>],
+    ) -> Result<Vec<crate::tracing_v2::JvpTracer<V, crate::tracing::AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let tangent_inputs = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
+        let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
         let primal_outputs = <Self as InterpretableOperation<ArrayType, V>>::interpret(self, primal_inputs.as_slice())?;
-        let tangent_builder = if let Some(first_tangent) = tangent_inputs.first() {
-            first_tangent.builder.clone()
-        } else if self.body.output_types.is_empty() {
-            return Ok(Vec::new());
-        } else {
+        if tangent_inputs.is_empty() && !self.body.output_types.is_empty() {
             return Err(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves.into());
-        };
-        let tangent_outputs = LinearTerm::apply_staged_op(
-            tangent_builder,
+        }
+        let tangent_outputs = context.apply_operation(
             tangent_inputs.as_slice(),
             LinearPrimitiveOperation::Rematerialize(Box::new(make_linear_rematerialize(
                 engine,
@@ -275,7 +324,7 @@ where
 
 impl<
     'engine,
-    V: Value<ArrayType> + Differentiable<ArrayType>,
+    V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
 > InterpretableOperation<ArrayType, Tracer<'engine, E>>
     for RematerializeOperation<ArrayType, V, E::TracingOperation, E::LinearOperation>
@@ -465,19 +514,9 @@ pub(crate) fn make_linear_rematerialize<V, E, O>(
     input_primals: Vec<V>,
 ) -> Result<LinearRematerializeOperation<ArrayType, V>, TracingError>
 where
-    V: Traceable<ArrayType>
-        + ZeroLike
-        + Differentiable<
-            ArrayType,
-            Tangent<LinearPrimitiveOperation<V>> = LinearTerm<ArrayType, V, LinearPrimitiveOperation<V>>,
-        > + 'static,
+    V: Traceable<ArrayType> + ZeroLike + Differentiable<ArrayType, Tangent = V> + Zero<ArrayType> + 'static,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    O: Clone
-        + Operation<ArrayType>
-        + InterpretableOperation<ArrayType, V>
-        + DifferentiableOperation<E>
-        + for<'engine> InterpretableOperation<ArrayType, crate::tracing_v2::linear::Linearized<Tracer<'engine, E, O>>>
-        + 'static,
+    O: Clone + Operation<ArrayType> + InterpretableOperation<ArrayType, V> + DifferentiableOperation<E> + 'static,
     LinearPrimitiveOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
     E: DifferentiableEngine<Type = ArrayType, Value = V, LinearOperation = LinearPrimitiveOperation<V>>
@@ -536,7 +575,7 @@ impl<
 impl<
     'engine,
     E,
-    V: Traceable<ArrayType> + Differentiable<ArrayType>,
+    V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Input>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
 > RematerializeInvocationLeaf<Input, Output> for Tracer<'engine, E>
@@ -640,7 +679,7 @@ mod tests {
 
     use crate::tracing::{Program, ProgramBuilder};
     use crate::tracing_v2::{
-        DifferentiationError, JvpTracer, LinearPrimitiveOperation, Linearized, Sin, Tracer,
+        DifferentiationError, JvpTracer, LinearPrimitiveOperation, Sin, Tracer,
         engines::ArrayScalarEngine,
         interpret_and_trace,
         linear::{compile_grad, grad, value_and_grad},
@@ -684,24 +723,15 @@ mod tests {
     }
 
     #[test]
-    fn test_linearized_traced_rematerialize_requires_input_leaves() {
-        let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
-        let inputs: Vec<Linearized<Tracer<'_, ArrayScalarEngine<f64>>>> = Vec::new();
-
-        assert!(matches!(
-            operation.interpret(inputs.as_slice()),
-            Err(TracingError::Differentiation(DifferentiationError::MissingTracedRematerializeInputLeaves))
-        ));
-    }
-
-    #[test]
     fn test_linear_rematerialize_jvp_requires_tangent_leaves() {
         let engine = ArrayScalarEngine::<f64>::new();
         let operation = RematerializeOperation::<ArrayType, f64>::new(empty_traced_body());
-        let inputs: Vec<JvpTracer<f64, LinearTerm<ArrayType, f64>>> = Vec::new();
+        let inputs: Vec<JvpTracer<f64, crate::tracing::AtomId>> = Vec::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new()));
+        let mut context = crate::tracing_v2::JvpContext::new(builder);
 
         assert!(matches!(
-            operation.jvp(&engine, inputs.as_slice()),
+            operation.jvp(&engine, &mut context, inputs.as_slice()),
             Err(TracingError::Differentiation(DifferentiationError::MissingLinearRematerializeReplayTangentLeaves))
         ));
     }
