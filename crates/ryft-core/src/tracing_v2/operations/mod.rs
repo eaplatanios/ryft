@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, rc::Rc};
 
 use crate::{
     tracing::{AtomId, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
@@ -239,63 +239,4 @@ where
         engine: &E,
         inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
     ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError>;
-}
-
-// ---------------------------------------------------------------------------
-// Arc forwarding impls
-// ---------------------------------------------------------------------------
-
-impl<O: Operation<T> + ?Sized, T: Type> Operation<T> for Arc<O> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        (**self).name()
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        (**self).infer_output_types(input_types)
-    }
-
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        (**self).render(formatter, indentation)
-    }
-}
-
-impl<O: InterpretableOperation<T, V> + ?Sized, T: Type, V: Traceable<T>> InterpretableOperation<T, V> for Arc<O> {
-    #[inline]
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, TracingError> {
-        (**self).interpret(inputs)
-    }
-}
-
-impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type, V: Traceable<T>, LinearCarrier: Clone>
-    LinearOperation<T, V, LinearCarrier> for Arc<O>
-{
-    #[inline]
-    fn transpose(
-        &self,
-        context: &mut dyn LinearTransposeContext<T, V, LinearCarrier>,
-        output_cotangents: &[LinearTerm<T, V, LinearCarrier>],
-    ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TracingError>
-    where
-        LinearCarrier: Operation<T>,
-    {
-        (**self).transpose(context, output_cotangents)
-    }
-}
-
-impl<InnerOperation: DifferentiableOperation<E> + ?Sized, E: DifferentiableEngine + ?Sized> DifferentiableOperation<E>
-    for Arc<InnerOperation>
-where
-    E::Value: Differentiable<E::Type>,
-{
-    #[inline]
-    fn jvp(
-        &self,
-        engine: &E,
-        inputs: &[JvpTracer<E::Value, EngineTangent<E>>],
-    ) -> Result<Vec<JvpTracer<E::Value, EngineTangent<E>>>, TracingError> {
-        (**self).jvp(engine, inputs)
-    }
 }
