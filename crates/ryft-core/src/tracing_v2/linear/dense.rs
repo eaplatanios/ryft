@@ -292,7 +292,7 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
@@ -343,7 +343,7 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
     E::LinearOperation: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, E::LinearOperation>
@@ -389,7 +389,7 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Input::To<DifferentiableTracer<'engine, E>>, TracingError>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)

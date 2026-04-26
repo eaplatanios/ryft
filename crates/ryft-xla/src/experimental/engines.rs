@@ -8,7 +8,7 @@ use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::{
     LinearPrimitiveOperation,
-    engines::{DifferentiableEngine, Engine},
+    engines::{DifferentiableEngine, Engine, TracingEngine},
 };
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
@@ -127,7 +127,6 @@ impl<'c> XlaEngine<'c> {
 impl<'c> Engine for XlaEngine<'c> {
     type Type = ArrayType;
     type Value = ShardMapTensor;
-    type TracingOperation = XlaPrimitiveOperation;
 
     fn zero(&self, array_type: &ArrayType) -> Result<ShardMapTensor, TracingError> {
         validate_identity_synthesis("zero", array_type)?;
@@ -140,8 +139,11 @@ impl<'c> Engine for XlaEngine<'c> {
     }
 }
 
+impl<'c> TracingEngine for XlaEngine<'c> {
+    type Operation = XlaPrimitiveOperation;
+}
+
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
-    type DifferentiableOperation = XlaPrimitiveOperation;
     type LinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
 }
 

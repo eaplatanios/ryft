@@ -9,7 +9,7 @@ use crate::{
     tracing::{AtomId, OperationFormatter, Traceable, TracingError},
     tracing_v2::{
         LinearPrimitiveOperation,
-        engines::{DifferentiableEngine, Engine},
+        engines::{DifferentiableEngine, TracingEngine},
         forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
     },
@@ -195,10 +195,10 @@ pub trait ReshapeValue: Traceable<ArrayType> + ReshapeOps {}
 
 impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
-impl<'engine, V: Traceable<ArrayType>, E, O> ReshapeOps for Tracer<'engine, E, O>
+impl<'engine, V: Traceable<ArrayType>, E> ReshapeOps for Tracer<'engine, E>
 where
-    E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone + Operation<ArrayType> + SupportsReshape<ArrayType, V>,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E::Operation: SupportsReshape<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
         let input_type = self.r#type().into_owned();
@@ -208,7 +208,7 @@ where
         }
         let engine = self.engine.clone();
         Ok(engine
-            .apply_staged_op(std::slice::from_ref(&self), O::reshape_operation(input_type, output_type))?
+            .apply_staged_op(std::slice::from_ref(&self), E::Operation::reshape_operation(input_type, output_type))?
             .into_iter()
             .next()
             .expect("reshape should produce one traced output"))

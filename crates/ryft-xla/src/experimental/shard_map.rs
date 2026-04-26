@@ -483,7 +483,7 @@ impl MatrixOps for ShardMapTensor {
 }
 
 /// Tracer alias used while staging XLA programs directly from types.
-pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>, XlaPrimitiveOperation>;
+pub(crate) type ShardMapTracer = Tracer<'static, XlaEngine<'static>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub(crate) type XlaProgram<Input, Output> = Program<ArrayType, ShardMapTensor, XlaPrimitiveOperation, Input, Output>;

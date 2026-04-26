@@ -1,24 +1,20 @@
 use super::*;
 
-fn build_traced_gradient_program<'engine, E, Input, V, O>(
+fn build_traced_gradient_program<'engine, E, Input, V>(
     engine: &'engine E,
     input_structure: Input::ParameterStructure,
-    traced_program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-) -> Result<Program<ArrayType, V, O, Input, Input>, TracingError>
+    traced_program: &Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>,
+) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    O: Clone
-        + Operation<ArrayType>
-        + InterpretableOperation<ArrayType, V>
-        + TracedLinearizableOperation<'engine, E, O>
-        + 'static,
-    LinearPrimitiveOperation<Tracer<'engine, E, O>>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E, O>>
-        + LinearOperation<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
+    E::Operation: InterpretableOperation<ArrayType, V> + TracedLinearizableOperation<'engine, E> + 'static,
+    LinearPrimitiveOperation<Tracer<'engine, E>>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
+        + LinearOperation<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
 {
-    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, O>::new()));
+    let traced_primal_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, V, E::Operation>::new()));
     let traced_primals = traced_program
         .input_ids
         .iter()
@@ -28,7 +24,7 @@ where
             Tracer::from_staged_parts(atom, input_type, traced_primal_builder.clone(), engine)
         })
         .collect::<Vec<_>>();
-    let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E, O>(
+    let (_, traced_gradient) = reverse_mode_scalar_traced_program::<V, E>(
         engine,
         traced_primal_builder.clone(),
         traced_program,
@@ -62,12 +58,11 @@ pub fn compile_grad<'engine, E, F, Input, V>(
     _engine: &'engine E,
     function: F,
     example_primals: Input,
-) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E::DifferentiableOperation:
-        InterpretableOperation<ArrayType, V> + TracedLinearizableOperation<'engine, E, E::DifferentiableOperation>,
+    E::Operation: InterpretableOperation<ArrayType, V> + TracedLinearizableOperation<'engine, E>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
         + LinearOperation<
@@ -90,14 +85,11 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<
-        Input::To<ArrayType>,
-        V::To<ArrayType>,
-        V,
-        E,
-        E::DifferentiableOperation,
-        _,
-    >(_engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
+    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
+        _engine,
+        |staged_input| Ok(function(staged_input)),
+        staged_input_types,
+    )?;
     build_traced_gradient_program(_engine, input_structure, &traced_program)
 }
 
@@ -145,12 +137,12 @@ pub fn compile_grad_with_policy<'engine, E, F, Input, V>(
     function: F,
     example_primals: Input,
     policy: RematerializationPolicy,
-) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
-        + TracedLinearizableOperation<'engine, E, E::DifferentiableOperation>
+    E::Operation: InterpretableOperation<ArrayType, V>
+        + TracedLinearizableOperation<'engine, E>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
@@ -195,12 +187,12 @@ fn compile_grad_segmented<'engine, E, F, Input, V>(
     function: &F,
     example_primals: Input,
     segment_size: Option<usize>,
-) -> Result<Program<ArrayType, V, E::DifferentiableOperation, Input, Input>, TracingError>
+) -> Result<Program<ArrayType, V, E::Operation, Input, Input>, TracingError>
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V> + One<ArrayType>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>
-        + TracedLinearizableOperation<'engine, E, E::DifferentiableOperation>
+    E::Operation: InterpretableOperation<ArrayType, V>
+        + TracedLinearizableOperation<'engine, E>
         + SupportsRematerialize<ArrayType, V, E::LinearOperation>,
     LinearPrimitiveOperation<DifferentiableTracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, DifferentiableTracer<'engine, E>>
@@ -224,17 +216,14 @@ where
         input_structure.clone(),
         example_primals.parameters().map(|primal| primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (_, traced_program) = trace_flat_program_from_input_types::<
-        Input::To<ArrayType>,
-        V::To<ArrayType>,
-        V,
-        E,
-        E::DifferentiableOperation,
-        _,
-    >(engine, |staged_input| Ok(function(staged_input)), staged_input_types)?;
+    let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
+        engine,
+        |staged_input| Ok(function(staged_input)),
+        staged_input_types,
+    )?;
     let segmented_program = match segment_size {
-        None => wrap_program_in_rematerialize::<E, V, E::DifferentiableOperation>(&traced_program)?,
-        Some(size) => segment_program::<E, V, E::DifferentiableOperation>(&traced_program, size)?,
+        None => wrap_program_in_rematerialize::<E, V, E::Operation>(&traced_program)?,
+        Some(size) => segment_program::<E, V, E::Operation>(&traced_program, size)?,
     };
     build_traced_gradient_program(engine, input_structure, &segmented_program)
 }

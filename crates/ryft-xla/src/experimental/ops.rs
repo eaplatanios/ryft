@@ -425,10 +425,10 @@ where
     }
 }
 
-impl TracedLinearizableOperation<'static, XlaEngine<'static>, XlaPrimitiveOperation> for XlaPrimitiveOperation {
+impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOperation {
     fn jvp_traced_linearization(
         &self,
-        engine: &LinearizationEngine<'static, XlaEngine<'static>, XlaPrimitiveOperation>,
+        engine: &LinearizationEngine<'static, XlaEngine<'static>>,
         context: &mut JvpContext<'_, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>,
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {

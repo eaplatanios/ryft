@@ -418,7 +418,7 @@ pub fn vmap<'engine, E, F, Input, Output, V>(
     batch_axis: usize,
 ) -> Result<Output, TracingError>
 where
-    E: crate::tracing_v2::Engine<Type = ArrayType, Value = V> + ?Sized,
+    E: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
     V: Traceable<ArrayType>,
     Input: Parameterized<
             V,
@@ -439,7 +439,7 @@ where
     Output::To<ArrayType>:
         Parameterized<ArrayType, To<V> = Output, To<Tracer<'engine, E>> = Output::To<Tracer<'engine, E>>>,
     F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::TracingOperation: BatchableOperation<V>,
+    E::Operation: BatchableOperation<V>,
 {
     let structure = input.parameter_structure();
     let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -681,7 +681,7 @@ mod tests {
     use crate::{
         broadcasting::Broadcastable,
         tracing_v2::{
-            DifferentiableEngine, Engine,
+            DifferentiableEngine, Engine, TracingEngine,
             operations::{ControlFlowError, ControlFlowValue, CustomPrimitive},
         },
         types::{DataType, Shape},
@@ -874,7 +874,6 @@ mod tests {
     impl Engine for TestArrayEngine {
         type Type = ArrayType;
         type Value = TestArray;
-        type TracingOperation = PrimitiveOperation<TestArray>;
 
         fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
             Ok(TestArray { r#type: r#type.clone(), values: vec![0.0; TestArray::element_count(r#type)] })
@@ -885,8 +884,11 @@ mod tests {
         }
     }
 
+    impl TracingEngine for TestArrayEngine {
+        type Operation = PrimitiveOperation<TestArray>;
+    }
+
     impl DifferentiableEngine for TestArrayEngine {
-        type DifferentiableOperation = PrimitiveOperation<TestArray>;
         type LinearOperation = LinearPrimitiveOperation<TestArray>;
     }
 

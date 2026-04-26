@@ -277,24 +277,23 @@ where
 /// `engine.zero(t)`. After this materialization the returned pullback contains no `Zero` ops, so
 /// the standard interpret path applies.
 #[allow(private_bounds)]
-pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E, TracingOperation>(
+pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E>(
     engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, TracingOperation>>>,
-    program: &Program<ArrayType, Tracer<'engine, E, TracingOperation>, O, Input, Output>,
-) -> Result<Program<ArrayType, Tracer<'engine, E, TracingOperation>, O, Output, Input>, TracingError>
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::Operation>>>,
+    program: &Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
+) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Output, Input>, TracingError>
 where
     V: Traceable<ArrayType>,
-    Input: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
-    Output: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
+    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     O: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E, TracingOperation>>
-        + LinearOperation<ArrayType, Tracer<'engine, E, TracingOperation>, O>
-        + SupportsAdd<ArrayType, Tracer<'engine, E, TracingOperation>>
-        + SupportsZero<ArrayType, Tracer<'engine, E, TracingOperation>>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    TracingOperation: Clone + Operation<ArrayType>,
+        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
+        + LinearOperation<ArrayType, Tracer<'engine, E>, O>
+        + SupportsAdd<ArrayType, Tracer<'engine, E>>
+        + SupportsZero<ArrayType, Tracer<'engine, E>>,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
 {
-    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Tracer<'engine, E, TracingOperation>, O>::new()));
+    let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Tracer<'engine, E>, O>::new()));
     let mut context = TranspositionContext::new(builder);
     let pullback = transpose_linear_program_with_context(&mut context, program)?;
     materialize_tracer_zero_ops(pullback, engine, tracing_builder)
@@ -308,24 +307,23 @@ where
 /// so the returned pullback is interpretable by code that holds [`Tracer`] inputs. Tracer values
 /// cannot satisfy [`Zero<ArrayType>`](crate::tracing_v2::operations::constants::Zero) statically,
 /// so traced pullbacks must be materialized away from `Zero` ops before being interpreted.
-fn materialize_tracer_zero_ops<'engine, Input, Output, V, O, E, TracingOperation>(
-    program: Program<ArrayType, Tracer<'engine, E, TracingOperation>, O, Input, Output>,
+fn materialize_tracer_zero_ops<'engine, Input, Output, V, O, E>(
+    program: Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
     engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, TracingOperation>>>,
-) -> Result<Program<ArrayType, Tracer<'engine, E, TracingOperation>, O, Input, Output>, TracingError>
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::Operation>>>,
+) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Input, Output>, TracingError>
 where
     V: Traceable<ArrayType>,
-    Input: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
-    Output: Parameterized<Tracer<'engine, E, TracingOperation>, ParameterStructure: Clone>,
+    Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
+    Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
     O: Clone
-        + InterpretableOperation<ArrayType, Tracer<'engine, E, TracingOperation>>
-        + LinearOperation<ArrayType, Tracer<'engine, E, TracingOperation>, O>
-        + SupportsAdd<ArrayType, Tracer<'engine, E, TracingOperation>>
-        + SupportsZero<ArrayType, Tracer<'engine, E, TracingOperation>>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    TracingOperation: Clone + Operation<ArrayType>,
+        + InterpretableOperation<ArrayType, Tracer<'engine, E>>
+        + LinearOperation<ArrayType, Tracer<'engine, E>, O>
+        + SupportsAdd<ArrayType, Tracer<'engine, E>>
+        + SupportsZero<ArrayType, Tracer<'engine, E>>,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
 {
-    let mut builder = ProgramBuilder::<ArrayType, Tracer<'engine, E, TracingOperation>, O>::new();
+    let mut builder = ProgramBuilder::<ArrayType, Tracer<'engine, E>, O>::new();
     builder.atoms = program.atoms.clone();
     builder.input_ids = program.input_ids.clone();
     let mut atom_remapping: Vec<Option<AtomId>> = vec![None; builder.atoms.len()];

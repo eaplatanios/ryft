@@ -7,7 +7,7 @@ use crate::{
     types::{ArrayType, DataType, Shape, Size, TypeError, Typed},
 };
 
-use super::{Operation, SupportsMatMul, SupportsMatrixTranspose};
+use super::{SupportsMatMul, SupportsMatrixTranspose};
 
 /// Matrix operations required by the tracing prototype.
 ///
@@ -150,14 +150,14 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
     matches!(r#type.shape.dimensions.as_slice(), [Size::Static(1), Size::Static(1)])
 }
 
-impl<'engine, V: Traceable<ArrayType>, E, O> MatrixOps for Tracer<'engine, E, O>
+impl<'engine, V: Traceable<ArrayType>, E> MatrixOps for Tracer<'engine, E>
 where
-    E: crate::tracing_v2::Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone + Operation<ArrayType> + SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
+    E: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E::Operation: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
 {
     #[inline]
     fn matmul(self, rhs: Self) -> Self {
-        self.binary(rhs, O::matmul_operation())
+        self.binary(rhs, E::Operation::matmul_operation())
     }
 
     #[inline]
@@ -165,7 +165,7 @@ where
         if matrix_transpose_is_identity_type(&self.r#type()) {
             return self;
         }
-        self.unary(O::matrix_transpose_operation())
+        self.unary(E::Operation::matrix_transpose_operation())
     }
 }
 
@@ -182,7 +182,7 @@ pub mod ndarray_support {
         tracing::{Traceable, TracingError, Value},
         tracing_v2::{
             CoordinateValue, Cos, Differentiable, LinearPrimitiveOperation, PrimitiveOperation, Sin,
-            engines::{DifferentiableEngine, Engine},
+            engines::{DifferentiableEngine, Engine, TracingEngine},
             operations::constants::{One, OneLike, Zero, ZeroLike},
         },
         types::{ArrayType, DataType, TypeError, Typed},
@@ -229,7 +229,6 @@ pub mod ndarray_support {
     impl Engine for Array2Engine<f32> {
         type Type = ArrayType;
         type Value = Array2<f32>;
-        type TracingOperation = PrimitiveOperation<Array2<f32>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Result<Array2<f32>, TracingError> {
@@ -242,15 +241,17 @@ pub mod ndarray_support {
         }
     }
 
+    impl TracingEngine for Array2Engine<f32> {
+        type Operation = PrimitiveOperation<Array2<f32>>;
+    }
+
     impl DifferentiableEngine for Array2Engine<f32> {
-        type DifferentiableOperation = PrimitiveOperation<Array2<f32>>;
         type LinearOperation = LinearPrimitiveOperation<Array2<f32>>;
     }
 
     impl Engine for Array2Engine<f64> {
         type Type = ArrayType;
         type Value = Array2<f64>;
-        type TracingOperation = PrimitiveOperation<Array2<f64>>;
 
         #[inline]
         fn zero(&self, r#type: &ArrayType) -> Result<Array2<f64>, TracingError> {
@@ -263,8 +264,11 @@ pub mod ndarray_support {
         }
     }
 
+    impl TracingEngine for Array2Engine<f64> {
+        type Operation = PrimitiveOperation<Array2<f64>>;
+    }
+
     impl DifferentiableEngine for Array2Engine<f64> {
-        type DifferentiableOperation = PrimitiveOperation<Array2<f64>>;
         type LinearOperation = LinearPrimitiveOperation<Array2<f64>>;
     }
 

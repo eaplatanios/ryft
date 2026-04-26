@@ -22,17 +22,13 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
-    E::DifferentiableOperation: InterpretableOperation<E::Type, V>,
+    E::Operation: InterpretableOperation<E::Type, V> + DifferentiableOperation<E>,
     E::Type: Parameter,
 {
     let input_structure = primals.parameter_structure();
     let input_primals: Vec<V> = primals.into_parameters().collect();
     let reconstructed_primals = Input::from_parameters(input_structure, input_primals.iter().cloned())?;
-    let (primal_output, program) = interpret_and_trace_with_operation::<E, E::DifferentiableOperation, _, _, _>(
-        engine,
-        function,
-        reconstructed_primals,
-    )?;
+    let (primal_output, program) = interpret_and_trace(engine, function, reconstructed_primals)?;
     Ok((primal_output, linearize_program(engine, &program, input_primals)?))
 }
 
@@ -51,12 +47,12 @@ where
     V: Traceable<ArrayType> + Parameterized<V, ParameterStructure = Placeholder>,
     Input: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
-    E::TracingOperation: TracedLinearizableOperation<'engine, E, E::TracingOperation>,
+    E::Operation: TracedLinearizableOperation<'engine, E>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
     F: FnOnce(Input) -> Result<Output, TracingError>,
 {
@@ -80,18 +76,12 @@ where
         input_structure.clone(),
         traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
     )?;
-    let (primal_output_types, traced_program) = trace_flat_program_from_input_types::<
-        Input::To<ArrayType>,
-        Output::To<ArrayType>,
-        V,
-        E,
-        E::TracingOperation,
-        _,
-    >(
-        exemplar_traced_primal.outer_engine(),
-        move |staged_input| function(staged_input),
-        staged_input_types,
-    )?;
+    let (primal_output_types, traced_program) =
+        trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, E, _>(
+            exemplar_traced_primal.outer_engine(),
+            move |staged_input| function(staged_input),
+            staged_input_types,
+        )?;
     let output_structure = primal_output_types.parameter_structure();
     let tracing_builder = exemplar_traced_primal.builder().clone();
     let (traced_primal_output, pushforward) = linearize_traced_program(
@@ -128,7 +118,7 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> Result<Output::To<DifferentiableTracer<'engine, E>>, TracingError>,
-    E::DifferentiableOperation: InterpretableOperation<E::Type, V>,
+    E::Operation: InterpretableOperation<E::Type, V> + DifferentiableOperation<E>,
     E::LinearOperation: Clone
         + InterpretableOperation<E::Type, V>
         + LinearOperation<E::Type, V, E::LinearOperation>
@@ -194,7 +184,7 @@ where
     V: for<'engine> Parameterized<V, To<DifferentiableTracer<'engine, E>> = DifferentiableTracer<'engine, E>>,
     Input::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
     V::Family: for<'engine> ParameterizedFamily<DifferentiableTracer<'engine, E>>,
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
     E::LinearOperation: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, E::LinearOperation>
@@ -240,7 +230,7 @@ where
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     V::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Tracer<'engine, E>>,
-    E::TracingOperation: TracedLinearizableOperation<'engine, E, E::TracingOperation>,
+    E::Operation: TracedLinearizableOperation<'engine, E>,
     LinearPrimitiveOperation<Tracer<'engine, E>>: Clone
         + InterpretableOperation<ArrayType, Tracer<'engine, E>>
         + LinearOperation<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
@@ -269,19 +259,12 @@ where
             traced_primals.iter().map(|traced_primal| traced_primal.r#type().into_owned()).collect::<Vec<_>>(),
         )?;
         let tracing_engine = traced_primals[0].engine.clone();
-        let (_, traced_program) = trace_flat_program_from_input_types::<
-            Input::To<ArrayType>,
-            V::To<ArrayType>,
-            V,
-            E,
-            E::TracingOperation,
-            _,
-        >(
+        let (_, traced_program) = trace_flat_program_from_input_types::<Input::To<ArrayType>, V::To<ArrayType>, V, E, _>(
             tracing_engine.outer_engine(),
             |staged_input| Ok(function(staged_input)),
             staged_input_types,
         )?;
-        let (traced_output, traced_gradient) = reverse_mode_scalar_traced_program::<V, E, E::TracingOperation>(
+        let (traced_output, traced_gradient) = reverse_mode_scalar_traced_program::<V, E>(
             tracing_engine.outer_engine(),
             tracing_engine.builder().clone(),
             &traced_program,
@@ -343,7 +326,7 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> (DifferentiableTracer<'engine, E>, Aux::To<DifferentiableTracer<'engine, E>>),
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
     E::LinearOperation: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, E::LinearOperation>
@@ -407,7 +390,7 @@ where
     F: FnOnce(
         Input::To<DifferentiableTracer<'engine, E>>,
     ) -> (DifferentiableTracer<'engine, E>, Aux::To<DifferentiableTracer<'engine, E>>),
-    E::DifferentiableOperation: InterpretableOperation<ArrayType, V>,
+    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
     E::LinearOperation: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, E::LinearOperation>
@@ -652,7 +635,6 @@ mod tests {
     impl Engine for TestEngine {
         type Type = TestType;
         type Value = TestValue;
-        type TracingOperation = AddOperation;
 
         fn zero(&self, _type: &TestType) -> Result<TestValue, TracingError> {
             Ok(TestValue(0.0))
@@ -663,8 +645,11 @@ mod tests {
         }
     }
 
+    impl TracingEngine for TestEngine {
+        type Operation = AddOperation;
+    }
+
     impl DifferentiableEngine for TestEngine {
-        type DifferentiableOperation = AddOperation;
         type LinearOperation = TestLinearOperation;
     }
 
@@ -672,7 +657,7 @@ mod tests {
     fn test_jvp_program_supports_non_array_type_metadata() {
         let engine = TestEngine;
         let (output, pushforward) =
-            jvp_program(&engine, |x: Tracer<'_, TestEngine, AddOperation>| Ok(x.clone() + x), TestValue(3.0)).unwrap();
+            jvp_program(&engine, |x: Tracer<'_, TestEngine>| Ok(x.clone() + x), TestValue(3.0)).unwrap();
 
         assert_eq!(output, TestValue(6.0));
         assert_eq!(pushforward.interpret(TestValue(5.0)), Ok(TestValue(10.0)));

@@ -10,7 +10,7 @@ use crate::macros::check_input_count;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
     LinearPrimitiveOperation,
-    engines::{DifferentiableEngine, Engine},
+    engines::{DifferentiableEngine, TracingEngine},
     forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
     operations::constants::ZeroLike,
@@ -164,28 +164,23 @@ where
 ///
 /// The operation's captured factor is `V_inner` (the underlying engine's value type), but the
 /// wrapper engine's [`Value`](crate::tracing_v2::engines::Engine::Value) is
-/// [`Tracer<'engine, EInner, OInner>`](crate::tracing_v2::Tracer). The rule lifts the captured
+/// [`Tracer`](crate::tracing_v2::Tracer). The rule lifts the captured
 /// factor into a `Tracer` constant in the outer trace and then stages both the primal product
 /// and the tangent scale on traced primals.
-impl<'engine, V, EInner, OInner>
-    DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner>>
     for ScaleOperation<ArrayType, V>
 where
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: Engine<Type = ArrayType, Value = V> + ?Sized,
-    OInner: TracedLinearizationCarrier<V>,
-    Tracer<'engine, EInner, OInner>: Mul<Output = Tracer<'engine, EInner, OInner>>,
+    EInner: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    EInner::Operation: TracedLinearizationCarrier<V>,
+    Tracer<'engine, EInner>: Mul<Output = Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner, OInner>,
-            LinearPrimitiveOperation<Tracer<'engine, EInner, OInner>>,
-        >,
-        inputs: &[JvpTracer<Tracer<'engine, EInner, OInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner, OInner>, AtomId>>, TracingError> {
+        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner>,
+        context: &mut JvpContext<'_, Tracer<'engine, EInner>, LinearPrimitiveOperation<Tracer<'engine, EInner>>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let input = &inputs[0];
         let factor_tracer = engine.lift_constant(self.factor().clone());

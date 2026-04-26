@@ -8,18 +8,17 @@ use crate::tracing_v2::{JvpContext, LinearizationEngine};
 /// trait is the exact semantic contract needed for one staged operation carrier to participate in
 /// that pass.
 #[doc(hidden)]
-pub trait TracedLinearizableOperation<'engine, E, O>: Clone + Operation<ArrayType>
+pub trait TracedLinearizableOperation<'engine, E>: Clone + Operation<ArrayType>
 where
-    E: Engine<Type = ArrayType> + ?Sized,
-    O: Clone + Operation<ArrayType>,
+    E: TracingEngine<Type = ArrayType> + ?Sized,
 {
     /// Applies this operation's JVP rule to traced primals inside the active linearization pass.
     fn jvp_traced_linearization(
         &self,
-        engine: &LinearizationEngine<'engine, E, O>,
-        context: &mut JvpContext<'_, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>,
-        inputs: &[JvpTracer<Tracer<'engine, E, O>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, E, O>, AtomId>>, TracingError>;
+        engine: &LinearizationEngine<'engine, E>,
+        context: &mut JvpContext<'_, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
+        inputs: &[JvpTracer<Tracer<'engine, E>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, AtomId>>, TracingError>;
 }
 
 /// Builds a staged linear program by replaying a traced primal program on symbolic dual inputs.
@@ -29,29 +28,28 @@ where
 /// linear program immediately, it works inside an outer JIT trace and stages the resulting
 /// pushforward symbolically.
 #[doc(hidden)]
-pub fn linearize_traced_program<'engine, V, E, O>(
+pub fn linearize_traced_program<'engine, V, E>(
     engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
-    program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    primals: Vec<Tracer<'engine, E, O>>,
-) -> Result<(Vec<Tracer<'engine, E, O>>, TracedLinearProgram<'engine, E, O>), TracingError>
+    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::Operation>>>,
+    program: &Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>,
+    primals: Vec<Tracer<'engine, E>>,
+) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TracingError>
 where
     V: Traceable<ArrayType>,
-    E: Engine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    O: Clone + Operation<ArrayType> + TracedLinearizableOperation<'engine, E, O> + 'static,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
 {
-    fn tangent_for_atom<'engine, V, E, O>(
-        primal_values: &[Option<Tracer<'engine, E, O>>],
+    fn tangent_for_atom<'engine, V, E>(
+        primal_values: &[Option<Tracer<'engine, E>>],
         builder: &Rc<
-            RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E, O>, LinearPrimitiveOperation<Tracer<'engine, E, O>>>>,
+            RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
         >,
         tangents: &mut [Option<AtomId>],
         atom_id: AtomId,
     ) -> Result<AtomId, TracingError>
     where
         V: Traceable<ArrayType>,
-        E: Engine<Type = ArrayType, Value = V> + ?Sized,
-        O: Clone + Operation<ArrayType>,
+        E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
     {
         if let Some(atom) = tangents[atom_id.index] {
             return Ok(atom);
@@ -68,11 +66,11 @@ where
     }
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
         ArrayType,
-        Tracer<'engine, E, O>,
-        LinearPrimitiveOperation<Tracer<'engine, E, O>>,
+        Tracer<'engine, E>,
+        LinearPrimitiveOperation<Tracer<'engine, E>>,
     >::new()));
     let linearization_engine = LinearizationEngine::new(engine, tracing_builder);
-    let mut primal_values: Vec<Option<Tracer<'engine, E, O>>> = vec![None; program.atoms.len()];
+    let mut primal_values: Vec<Option<Tracer<'engine, E>>> = vec![None; program.atoms.len()];
     let mut tangents: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
 
     for (input_atom, primal) in program.input_ids.iter().copied().zip(primals.into_iter()) {
@@ -97,7 +95,7 @@ where
                     primal: primal_values[input_atom.index]
                         .clone()
                         .ok_or(TracingError::UnboundAtomId { id: input_atom })?,
-                    tangent: tangent_for_atom::<V, E, O>(
+                    tangent: tangent_for_atom::<V, E>(
                         primal_values.as_slice(),
                         &builder,
                         tangents.as_mut_slice(),
@@ -133,7 +131,7 @@ where
         .output_ids
         .iter()
         .copied()
-        .map(|output| tangent_for_atom::<V, E, O>(primal_values.as_slice(), &builder, tangents.as_mut_slice(), output))
+        .map(|output| tangent_for_atom::<V, E>(primal_values.as_slice(), &builder, tangents.as_mut_slice(), output))
         .collect::<Result<Vec<_>, _>>()?;
     drop(context);
     drop(tangents);

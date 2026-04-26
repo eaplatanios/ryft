@@ -3,7 +3,7 @@ use std::{cell::RefCell, rc::Rc};
 use crate::{
     tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
-        engines::{DifferentiableEngine, Engine},
+        engines::{DifferentiableEngine, TracingEngine},
         forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
     },
@@ -126,7 +126,7 @@ where
 }
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
-pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: Engine<Type = ArrayType, Value = V> + ?Sized>(
+pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: TracingEngine<Type = ArrayType, Value = V> + ?Sized>(
     constant: &V,
     exemplar: &Tracer<'engine, E>,
 ) -> Tracer<'engine, E> {

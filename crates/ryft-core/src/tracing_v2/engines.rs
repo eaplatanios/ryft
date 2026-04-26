@@ -3,8 +3,7 @@ use std::marker::PhantomData;
 use crate::{
     tracing::{Operation, Traceable, TracingError},
     tracing_v2::{
-        Differentiable, DifferentiableOperation as DifferentiableOperationTrait,
-        LinearOperation as LinearOperationTrait, LinearPrimitiveOperation, PrimitiveOperation,
+        Differentiable, LinearOperation as LinearOperationTrait, LinearPrimitiveOperation, PrimitiveOperation,
         operations::{SupportsAdd, SupportsNeg, SupportsScale},
     },
     types::{ArrayType, Type},
@@ -13,14 +12,9 @@ use crate::{
 /// Synthesizes concrete leaf values from abstract type metadata.
 ///
 /// [`Engine`] is the backend token threaded through the public `tracing_v2` transforms. It has
-/// two closely related jobs:
-///
-/// 1. choose the closed operation carrier that ordinary staged programs should store,
-///    and
-/// 2. synthesize representative zero and one values from abstract metadata when a transform needs
-///    an exemplar but only knows a leaf's type.
-///
-/// That second responsibility is what lets higher-order transforms stay generic. Linearization,
+/// one narrow job: synthesize representative zero and one values from abstract metadata when a
+/// transform needs an exemplar but only knows a leaf's type. That responsibility is what lets
+/// higher-order transforms stay generic. Linearization,
 /// reverse-mode transposition, and rematerialization all occasionally need to rebuild a value from
 /// shape/type information alone; [`Engine`] is the narrow seam where backend-specific knowledge
 /// enters the otherwise backend-agnostic transform code.
@@ -47,12 +41,6 @@ pub trait Engine {
     /// the runtime leaf that inhabits traced programs once they are executed.
     type Value: Traceable<Self::Type>;
 
-    /// Ordinary staged operation type selected by this engine for public tracing transforms.
-    ///
-    /// Programs produced by [`trace`](crate::tracing_v2::trace) and
-    /// [`interpret_and_trace`](crate::tracing_v2::interpret_and_trace) store this carrier.
-    type TracingOperation: Clone + Operation<Self::Type> + 'static;
-
     /// Returns the additive-identity value corresponding to the provided type metadata.
     ///
     /// Transforms use this when they need a representative value for a leaf without having a
@@ -67,32 +55,90 @@ pub trait Engine {
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
+/// Active engine used while staging one traced program.
+///
+/// [`TracingEngine`] extends [`Engine`] with the closed operation carrier that the paired
+/// [`ProgramBuilder`](crate::tracing::ProgramBuilder) stores. This keeps carrier selection on the
+/// engine value that is actually threaded through tracers instead of splitting it across a separate
+/// generic parameter.
+pub trait TracingEngine: Engine {
+    /// Staged operation type selected by this active tracing engine.
+    type Operation: Clone + Operation<Self::Type>;
+}
+
+/// Active tracing engine that pairs an arbitrary operation carrier with a runtime [`Engine`].
+///
+/// Most backends implement [`TracingEngine`] directly. This wrapper is for transforms that need to
+/// replay or construct a program with an operation carrier chosen by the caller rather than by the
+/// backend's ordinary tracing surface.
+#[derive(Debug)]
+pub struct OperationTracingEngine<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> {
+    /// Runtime engine used for metadata-driven value synthesis.
+    engine: &'engine E,
+
+    /// Operation carrier selected for the active trace.
+    marker: PhantomData<fn() -> O>,
+}
+
+impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> OperationTracingEngine<'engine, E, O> {
+    /// Creates a tracing engine that pairs `engine` with operation carrier `O`.
+    #[inline]
+    pub const fn new(engine: &'engine E) -> Self {
+        Self { engine, marker: PhantomData }
+    }
+
+    /// Returns the wrapped runtime engine.
+    #[inline]
+    pub const fn inner(&self) -> &'engine E {
+        self.engine
+    }
+}
+
+impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Clone for OperationTracingEngine<'engine, E, O> {
+    fn clone(&self) -> Self {
+        Self { engine: self.engine, marker: PhantomData }
+    }
+}
+
+impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Copy for OperationTracingEngine<'engine, E, O> {}
+
+impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> Engine for OperationTracingEngine<'engine, E, O> {
+    type Type = E::Type;
+    type Value = E::Value;
+
+    #[inline]
+    fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+        self.engine.zero(r#type)
+    }
+
+    #[inline]
+    fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+        self.engine.one(r#type)
+    }
+}
+
+impl<'engine, E: Engine + ?Sized, O: Clone + Operation<E::Type>> TracingEngine
+    for OperationTracingEngine<'engine, E, O>
+{
+    type Operation = O;
+}
+
 /// Extension of [`Engine`] for backends that support automatic differentiation.
 ///
-/// Engines that only need ordinary tracing implement [`Engine`] alone. AD transforms such as
-/// [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
-/// [`vjp`](crate::tracing_v2::vjp) require this extension trait so non-differentiable backends do
-/// not need to define fake tangent or differentiable-operation carriers.
+/// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
+/// transforms such as [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
+/// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
+/// define fake tangent carriers.
 ///
-/// The associated `DifferentiableOperation` and `LinearOperation` carriers are not bounded by
-/// `'static`. That allows wrapper engines such as
-/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine), used by
-/// [`linearize_traced_program`](crate::tracing_v2::linear::linearize_traced_program) to drive
-/// `linearize_program` on traced primals, to satisfy `DifferentiableEngine` even though their
-/// carriers reference the borrow lifetime of the inner engine. Call sites that genuinely need a
-/// `'static` engine restate the bound at the use site.
-pub trait DifferentiableEngine: Engine
+/// Differentiated closures are traced with [`TracingEngine::Operation`]. AD entry points that stage
+/// user code therefore bound that operation carrier by
+/// [`DifferentiableOperation`](crate::tracing_v2::operations::DifferentiableOperation) at the use
+/// site. This trait itself only adds the linear operation carrier used by tangent and cotangent
+/// programs.
+pub trait DifferentiableEngine: TracingEngine
 where
     Self::Value: Differentiable<Self::Type, Tangent = Self::Value>,
 {
-    /// Differentiable staged operation type selected by this engine for AD transforms.
-    ///
-    /// Reverse- and forward-mode transforms trace user closures with this carrier instead of the
-    /// full ordinary tracing carrier. Backends can therefore expose non-differentiable operations
-    /// through [`Engine::TracingOperation`] without making those operations stageable inside
-    /// differentiated closures.
-    type DifferentiableOperation: Clone + DifferentiableOperationTrait<Self>;
-
     /// Linear staged operation type selected by this engine for tangent and cotangent programs.
     ///
     /// Linear programs produced by [`jvp_program`](crate::tracing_v2::jvp_program),
@@ -137,7 +183,6 @@ macro_rules! impl_engine_for_array_scalar_engine {
         impl Engine for ArrayScalarEngine<$ty> {
             type Type = ArrayType;
             type Value = $ty;
-            type TracingOperation = PrimitiveOperation<$ty>;
 
             #[inline]
             fn zero(&self, _type: &ArrayType) -> Result<$ty, TracingError> {
@@ -150,8 +195,11 @@ macro_rules! impl_engine_for_array_scalar_engine {
             }
         }
 
+        impl TracingEngine for ArrayScalarEngine<$ty> {
+            type Operation = PrimitiveOperation<$ty>;
+        }
+
         impl DifferentiableEngine for ArrayScalarEngine<$ty> {
-            type DifferentiableOperation = PrimitiveOperation<$ty>;
             type LinearOperation = LinearPrimitiveOperation<$ty>;
         }
     };

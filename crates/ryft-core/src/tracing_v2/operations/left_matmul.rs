@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
-    engines::{DifferentiableEngine, Engine},
+    engines::{DifferentiableEngine, TracingEngine},
     forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
     operations::constants::ZeroLike,
@@ -151,24 +151,20 @@ where
 
 /// JVP rule for `LeftMatMulOperation` under
 /// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
-impl<'engine, V, EInner, OInner>
-    DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>> for LeftMatMulOperation<V>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner>>
+    for LeftMatMulOperation<V>
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: Engine<Type = ArrayType, Value = V> + ?Sized,
-    OInner: TracedLinearizationCarrier<V>,
-    Tracer<'engine, EInner, OInner>: MatrixOps,
+    EInner: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    EInner::Operation: TracedLinearizationCarrier<V>,
+    Tracer<'engine, EInner>: MatrixOps,
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner, OInner>,
-        context: &mut JvpContext<
-            '_,
-            Tracer<'engine, EInner, OInner>,
-            LinearPrimitiveOperation<Tracer<'engine, EInner, OInner>>,
-        >,
-        inputs: &[JvpTracer<Tracer<'engine, EInner, OInner>, AtomId>],
-    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner, OInner>, AtomId>>, TracingError> {
+        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner>,
+        context: &mut JvpContext<'_, Tracer<'engine, EInner>, LinearPrimitiveOperation<Tracer<'engine, EInner>>>,
+        inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
+    ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let factor_tracer = engine.lift_constant(self.factor().clone());
         let primal = factor_tracer.clone().matmul(inputs[0].primal.clone());

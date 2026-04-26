@@ -6,7 +6,7 @@ use std::{
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
-    engines::{DifferentiableEngine, Engine},
+    engines::{DifferentiableEngine, TracingEngine},
     forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
 };
@@ -115,13 +115,13 @@ where
     }
 }
 
-impl<'engine, V: Traceable<ArrayType> + Cos, E, O> Cos for Tracer<'engine, E, O>
+impl<'engine, V: Traceable<ArrayType> + Cos, E> Cos for Tracer<'engine, E>
 where
-    E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone + Operation<ArrayType> + SupportsCos<ArrayType, V>,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E::Operation: SupportsCos<ArrayType, V>,
 {
     #[inline]
     fn cos(self) -> Self {
-        self.unary(O::cos_operation())
+        self.unary(E::Operation::cos_operation())
     }
 }

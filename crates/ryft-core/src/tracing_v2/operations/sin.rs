@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
-    engines::{DifferentiableEngine, Engine},
+    engines::{DifferentiableEngine, TracingEngine},
     forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
 };
@@ -106,13 +106,13 @@ where
     }
 }
 
-impl<'engine, V: Traceable<ArrayType> + Sin, E, O> Sin for Tracer<'engine, E, O>
+impl<'engine, V: Traceable<ArrayType> + Sin, E> Sin for Tracer<'engine, E>
 where
-    E: Engine<Type = ArrayType, Value = V> + ?Sized,
-    O: Clone + Operation<ArrayType> + SupportsSin<ArrayType, V>,
+    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E::Operation: SupportsSin<ArrayType, V>,
 {
     #[inline]
     fn sin(self) -> Self {
-        self.unary(O::sin_operation())
+        self.unary(E::Operation::sin_operation())
     }
 }
