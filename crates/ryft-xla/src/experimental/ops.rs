@@ -8,7 +8,7 @@ use ryft_core::{
     tracing::{InterpretableOperation, Operation, TracingError},
     tracing_v2::{
         CustomOperationError, CustomPrimitive, DifferentiableOperation, DifferentiationError, JvpContext,
-        LinearPrimitiveOperation, LinearizationEngine,
+        LinearPrimitiveOperation, TracingEngine,
         engines::DifferentiableEngine,
         forward::{Differentiable, JvpTracer},
         linear::{TracedLinearizableOperation, linearize_program, transpose_linear_program_with_output_examples},
@@ -428,7 +428,7 @@ where
 impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOperation {
     fn jvp_traced_linearization(
         &self,
-        engine: &LinearizationEngine<'static, XlaEngine<'static>>,
+        engine: &TracingEngine<'static, XlaEngine<'static>>,
         context: &mut JvpContext<'_, ShardMapTracer, LinearPrimitiveOperation<ShardMapTracer>>,
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
@@ -451,9 +451,9 @@ impl TracedLinearizableOperation<'static, XlaEngine<'static>> for XlaPrimitiveOp
             Self::While(while_operation) => while_operation.jvp(engine, context, inputs),
             Self::ShardMap(op) => {
                 let traced_op = ShardMapOperation::<ShardMapTracer>::new(op.body().clone());
-                traced_op.jvp_with_builders(engine.tracing_builder().clone(), context, inputs)
+                traced_op.jvp_with_builders(engine.builder().clone(), context, inputs)
             }
-            Self::LinearShardMap(op) => op.jvp_traced_with_builders(engine.tracing_builder().clone(), context, inputs),
+            Self::LinearShardMap(op) => op.jvp_traced_with_builders(engine.builder().clone(), context, inputs),
             Self::WithShardingConstraint(op) => {
                 let input = inputs.first().ok_or(TracingError::InvalidInputCount { expected: 1, got: 0 })?;
                 let primal = input

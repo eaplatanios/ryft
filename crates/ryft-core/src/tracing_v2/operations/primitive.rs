@@ -9,7 +9,7 @@ use crate::{
     tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value},
     tracing_v2::{
         Cos, MatrixOps, Sin,
-        engines::DifferentiableEngine,
+        engines::{DifferentiableEngine, DifferentiableStagingEngine},
         forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
         operations::{
@@ -696,7 +696,7 @@ impl<
     E: DifferentiableEngine<
             Type = ArrayType,
             Value = V,
-            Operation = PrimitiveOperation<V>,
+            DifferentiableOperation = PrimitiveOperation<V>,
             LinearOperation = LinearPrimitiveOperation<V>,
         > + 'static,
 > DifferentiableOperation<E> for PrimitiveOperation<V>
@@ -743,14 +743,14 @@ where
 /// Linearization-engine dispatcher for [`PrimitiveOperation`] under the traced-linearization path.
 ///
 /// Forwards each variant to the per-op JVP rule, picking up the
-/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine)-keyed impls for V-capturing
+/// [`TracingEngine`](crate::tracing_v2::TracingEngine)-keyed impls for V-capturing
 /// variants ([`Scale`](Self::Scale), [`LeftMatMul`](Self::LeftMatMul),
 /// [`RightMatMul`](Self::RightMatMul)), the [`Rematerialize`](Self::Rematerialize) impl that
 /// recurses via [`linearize_traced_program`](crate::tracing_v2::linear::linearize_traced_program),
 /// the [`Condition`](Self::Condition) / [`While`](Self::While) stub impls (predicate extraction
 /// does not work at trace time), and the [`Custom`](Self::Custom) bridge to the registered traced
 /// linearization rule.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>
     for PrimitiveOperation<V>
 where
     V: Value<ArrayType>
@@ -768,9 +768,8 @@ where
         + ControlFlowValue
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    EInner: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>>
-        + ?Sized
-        + 'static,
+    EInner:
+        DifferentiableStagingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'static,
     V::ParameterStructure: Clone + std::fmt::Debug + PartialEq,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     LinearPrimitiveOperation<V>: super::SupportsAdd<ArrayType, V>
@@ -789,14 +788,24 @@ where
         + Sin
         + Cos
         + MatrixOps,
-    for<'a> LinearPrimitiveOperation<Tracer<'a, EInner>>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'a, EInner>>
-        + LinearOperation<ArrayType, Tracer<'a, EInner>, LinearPrimitiveOperation<Tracer<'a, EInner>>>,
+    EInner::LinearOperation<'engine>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
+        + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>
+        + SupportsLeftMatMul<ArrayType, Tracer<'engine, EInner>>
+        + SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>
+        + SupportsMatrixTranspose<ArrayType, Tracer<'engine, EInner>>
+        + SupportsReshape<ArrayType, Tracer<'engine, EInner>>
+        + SupportsZero<ArrayType, Tracer<'engine, EInner>>
+        + SupportsLinearRematerialize<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner>,
-        context: &mut JvpContext<'_, Tracer<'engine, EInner>, LinearPrimitiveOperation<Tracer<'engine, EInner>>>,
+        engine: &crate::tracing_v2::TracingEngine<'engine, EInner>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner>,
+            <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+        >,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         match self {
@@ -825,18 +834,21 @@ impl<'engine, V, EInner> crate::tracing_v2::linear::TracedLinearizableOperation<
     for PrimitiveOperation<V>
 where
     V: Traceable<ArrayType> + Differentiable<ArrayType, Tangent = V> + Parameter + 'static,
-    EInner: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>>
-        + ?Sized
-        + 'engine,
-    PrimitiveOperation<V>: DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner>>,
+    EInner:
+        DifferentiableStagingEngine<Type = ArrayType, Value = V, Operation = PrimitiveOperation<V>> + ?Sized + 'engine,
+    PrimitiveOperation<V>: DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>,
 {
     fn jvp_traced_linearization(
         &self,
-        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner>,
-        context: &mut JvpContext<'_, Tracer<'engine, EInner>, LinearPrimitiveOperation<Tracer<'engine, EInner>>>,
+        engine: &crate::tracing_v2::TracingEngine<'engine, EInner>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner>,
+            <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+        >,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
-        <Self as DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner>>>::jvp(
+        <Self as DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>>::jvp(
             self, engine, context, inputs,
         )
     }

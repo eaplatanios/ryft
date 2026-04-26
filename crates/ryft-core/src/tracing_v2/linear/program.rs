@@ -278,8 +278,7 @@ where
 /// the standard interpret path applies.
 #[allow(private_bounds)]
 pub fn transpose_traced_linear_program<'engine, Input, Output, V, O, E>(
-    engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::Operation>>>,
+    tracing_engine: TracingEngine<'engine, E>,
     program: &Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
 ) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Output, Input>, TracingError>
 where
@@ -291,12 +290,12 @@ where
         + LinearOperation<ArrayType, Tracer<'engine, E>, O>
         + SupportsAdd<ArrayType, Tracer<'engine, E>>
         + SupportsZero<ArrayType, Tracer<'engine, E>>,
-    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
 {
     let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, Tracer<'engine, E>, O>::new()));
     let mut context = TranspositionContext::new(builder);
     let pullback = transpose_linear_program_with_context(&mut context, program)?;
-    materialize_tracer_zero_ops(pullback, engine, tracing_builder)
+    materialize_tracer_zero_ops(pullback, tracing_engine)
 }
 
 /// Walks a linear program and replaces every
@@ -309,8 +308,7 @@ where
 /// so traced pullbacks must be materialized away from `Zero` ops before being interpreted.
 fn materialize_tracer_zero_ops<'engine, Input, Output, V, O, E>(
     program: Program<ArrayType, Tracer<'engine, E>, O, Input, Output>,
-    engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::Operation>>>,
+    tracing_engine: TracingEngine<'engine, E>,
 ) -> Result<Program<ArrayType, Tracer<'engine, E>, O, Input, Output>, TracingError>
 where
     V: Traceable<ArrayType>,
@@ -321,7 +319,7 @@ where
         + LinearOperation<ArrayType, Tracer<'engine, E>, O>
         + SupportsAdd<ArrayType, Tracer<'engine, E>>
         + SupportsZero<ArrayType, Tracer<'engine, E>>,
-    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
 {
     let mut builder = ProgramBuilder::<ArrayType, Tracer<'engine, E>, O>::new();
     builder.atoms = program.atoms.clone();
@@ -333,9 +331,9 @@ where
             && instruction.outputs.len() == 1
             && instruction.inputs.is_empty()
         {
-            let zero_value = engine.zero(zero_type)?;
-            let outer_atom = tracing_builder.borrow_mut().add_constant(zero_value);
-            let zero_tracer = Tracer::from_staged_parts(outer_atom, zero_type.clone(), tracing_builder.clone(), engine);
+            let zero_value = tracing_engine.outer_engine().zero(zero_type)?;
+            let outer_atom = tracing_engine.builder().borrow_mut().add_constant(zero_value);
+            let zero_tracer = tracing_engine.tracer_from_staged_parts(outer_atom, zero_type.clone());
             let constant_atom = builder.add_constant(zero_tracer);
             atom_remapping[instruction.outputs[0].index] = Some(constant_atom);
         } else {

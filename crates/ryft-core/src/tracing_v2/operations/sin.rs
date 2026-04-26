@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, Traceable, TracingError};
 use crate::tracing_v2::{
-    engines::{DifferentiableEngine, TracingEngine},
+    engines::{DifferentiableEngine, StagingEngine},
     forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
 };
@@ -108,7 +108,7 @@ where
 
 impl<'engine, V: Traceable<ArrayType> + Sin, E> Sin for Tracer<'engine, E>
 where
-    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized,
     E::Operation: SupportsSin<ArrayType, V>,
 {
     #[inline]

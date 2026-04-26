@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use crate::macros::check_input_count;
 use crate::tracing::{AtomId, OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
-    engines::{DifferentiableEngine, TracingEngine},
+    engines::{DifferentiableEngine, DifferentiableStagingEngine},
     forward::{Differentiable, JvpContext, JvpTracer},
     jit::Tracer,
     operations::constants::ZeroLike,
@@ -151,26 +151,38 @@ where
 }
 
 /// JVP rule for `RightMatMulOperation` under
-/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner>>
+/// [`TracingEngine`](crate::tracing_v2::TracingEngine).
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>
     for RightMatMulOperation<V>
 where
     V: MatrixValue + Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    EInner: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
-    EInner::Operation: TracedLinearizationCarrier<V>,
+    EInner: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized,
+    EInner::Operation: TracedLinearizationCarrier<ArrayType, V>,
+    EInner::LinearOperation<'engine>: SupportsRightMatMul<ArrayType, Tracer<'engine, EInner>>,
     Tracer<'engine, EInner>: MatrixOps,
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner>,
-        context: &mut JvpContext<'_, Tracer<'engine, EInner>, LinearPrimitiveOperation<Tracer<'engine, EInner>>>,
+        engine: &crate::tracing_v2::TracingEngine<'engine, EInner>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, EInner>,
+            <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+        >,
         inputs: &[JvpTracer<Tracer<'engine, EInner>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, EInner>, AtomId>>, TracingError> {
         check_input_count!(inputs, 1);
         let factor_tracer = engine.lift_constant(self.factor().clone());
         let primal = inputs[0].primal.clone().matmul(factor_tracer.clone());
         let tangent = context
-            .apply_operation(&[inputs[0].tangent], LinearPrimitiveOperation::RightMatMul { factor: factor_tracer }, 1)?
+            .apply_operation(
+                &[inputs[0].tangent],
+                <EInner::LinearOperation<'engine> as SupportsRightMatMul<
+                    ArrayType,
+                    Tracer<'engine, EInner>,
+                >>::right_matmul_operation(factor_tracer),
+                1,
+            )?
             .into_iter()
             .next()
             .expect("right matmul jvp should produce one tangent");

@@ -6,11 +6,9 @@ use crate::{
     tracing::{Instruction, OperationFormatter, Program, ProgramBuilder, Traceable, TracingError, Value},
     tracing_v2::{
         Differentiable, DifferentiationError, LinearPrimitiveOperation, PrimitiveOperation, Tracer,
-        engines::{DifferentiableEngine, TracingEngine},
-        linear::{
-            linearize_program, trace_flat_program_from_input_types, transpose_linear_program_with_output_examples,
-        },
-        operations::constants::{Zero, ZeroLike},
+        engines::{DifferentiableEngine, DifferentiableStagingEngine, StagingEngine},
+        linear::{linearize_program, transpose_linear_program_with_output_examples},
+        operations::constants::{SupportsZero, Zero, ZeroLike},
     },
     types::{ArrayType, Type, TypeError, Typed},
 };
@@ -166,15 +164,16 @@ where
 }
 
 /// JVP rule for `RematerializeOperation` under
-/// [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
+/// [`TracingEngine`](crate::tracing_v2::TracingEngine).
 ///
 /// Stages the primal effect by applying the rematerialize op in the outer trace via
-/// [`TracingScope::apply_staged_op`](crate::tracing_v2::TracingScope::apply_staged_op), then recursively linearizes the body through
+/// [`TracingEngine::apply_staged_op`](crate::tracing_v2::TracingEngine::apply_staged_op), then recursively linearizes
+/// the body through
 /// [`linearize_traced_program`] to obtain a pushforward over `Tracer` values, and finally wraps
 /// that pushforward (paired with its transpose) in a
 /// [`LinearPrimitiveOperation::Rematerialize`] variant that the active linear builder can stage
 /// directly.
-impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::LinearizationEngine<'engine, EInner>>
+impl<'engine, V, EInner> DifferentiableOperation<crate::tracing_v2::TracingEngine<'engine, EInner>>
     for RematerializeOperation<ArrayType, V, EInner::Operation, LinearPrimitiveOperation<V>>
 where
     V: Value<ArrayType>
@@ -182,25 +181,27 @@ where
         + crate::tracing_v2::operations::constants::Zero<ArrayType>
         + Differentiable<ArrayType, Tangent = V>
         + 'static,
-    EInner: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
-    EInner::Operation: TracedLinearizationCarrier<V>
+    EInner: DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    EInner::Operation: TracedLinearizationCarrier<ArrayType, V>
         + InterpretableOperation<ArrayType, V>
         + SupportsRematerialize<ArrayType, V, LinearPrimitiveOperation<V>>,
     Vec<V>: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     LinearPrimitiveOperation<V>:
         Clone + InterpretableOperation<ArrayType, V> + LinearOperation<ArrayType, V, LinearPrimitiveOperation<V>>,
     EInner::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, EInner>,
-    for<'a> LinearPrimitiveOperation<Tracer<'a, EInner>>: Clone
-        + InterpretableOperation<ArrayType, Tracer<'a, EInner>>
-        + LinearOperation<ArrayType, Tracer<'a, EInner>, LinearPrimitiveOperation<Tracer<'a, EInner>>>,
+    EInner::LinearOperation<'engine>: Clone
+        + InterpretableOperation<ArrayType, Tracer<'engine, EInner>>
+        + LinearOperation<ArrayType, Tracer<'engine, EInner>, EInner::LinearOperation<'engine>>
+        + SupportsZero<ArrayType, Tracer<'engine, EInner>>
+        + SupportsLinearRematerialize<ArrayType, Tracer<'engine, EInner>>,
 {
     fn jvp(
         &self,
-        engine: &crate::tracing_v2::LinearizationEngine<'engine, EInner>,
+        engine: &crate::tracing_v2::TracingEngine<'engine, EInner>,
         context: &mut crate::tracing_v2::JvpContext<
             '_,
             Tracer<'engine, EInner>,
-            LinearPrimitiveOperation<Tracer<'engine, EInner>>,
+            <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
         >,
         inputs: &[crate::tracing_v2::JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>],
     ) -> Result<Vec<crate::tracing_v2::JvpTracer<Tracer<'engine, EInner>, crate::tracing::AtomId>>, TracingError> {
@@ -224,39 +225,37 @@ where
         }
 
         let (_, pushforward) = crate::tracing_v2::linear::linearize_traced_program(
-            engine.inner(),
-            engine.tracing_builder().clone(),
+            (*engine).clone(),
             self.body().program(),
             primal_inputs,
         )?;
-        let pullback = crate::tracing_v2::linear::transpose_traced_linear_program(
-            engine.inner(),
-            engine.tracing_builder().clone(),
-            &pushforward,
-        )?;
+        let pullback = crate::tracing_v2::linear::transpose_traced_linear_program((*engine).clone(), &pushforward)?;
 
         let body_input_types = self.body().input_types().to_vec();
         let body_output_types = self.body().output_types().to_vec();
         let linear_remat = LinearRematerializeOperation::<
             ArrayType,
             Tracer<'engine, EInner>,
-            LinearPrimitiveOperation<Tracer<'engine, EInner>>,
+            <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
         >::new(
             FlatTracedRematerialize::<
                 ArrayType,
                 Tracer<'engine, EInner>,
-                LinearPrimitiveOperation<Tracer<'engine, EInner>>,
+                <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
             >::from_parts(body_input_types.clone(), body_output_types.clone(), pushforward),
             FlatTracedRematerialize::<
                 ArrayType,
                 Tracer<'engine, EInner>,
-                LinearPrimitiveOperation<Tracer<'engine, EInner>>,
+                <EInner as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
             >::from_parts(body_output_types, body_input_types, pullback),
         );
 
         let tangent_outputs = context.apply_operation(
             tangent_inputs.as_slice(),
-            LinearPrimitiveOperation::Rematerialize(Box::new(linear_remat)),
+            <EInner::LinearOperation<'engine> as SupportsLinearRematerialize<
+                ArrayType,
+                Tracer<'engine, EInner>,
+            >>::rematerialize_operation(linear_remat),
             self.body().output_types().len(),
         )?;
 
@@ -317,7 +316,7 @@ where
 impl<
     'engine,
     V: Value<ArrayType> + Differentiable<ArrayType, Tangent = V>,
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + StagingEngine + ?Sized,
 > InterpretableOperation<ArrayType, Tracer<'engine, E>>
     for RematerializeOperation<ArrayType, V, E::Operation, E::LinearOperation>
 where
@@ -554,7 +553,7 @@ impl<
 }
 
 /// Already-traced dispatch for [`rematerialize`]: traces the body function into a sub-program and
-/// stages a [`RematerializeOperation`] in the enclosing [`Tracer`] scope. The sub-program is traced
+/// stages a [`RematerializeOperation`] in the enclosing [`Tracer`] engine. The sub-program is traced
 /// once over exemplar values and captured as a [`Program`] that lowering can later handle.
 impl<
     'engine,
@@ -564,7 +563,7 @@ impl<
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
 > RematerializeInvocationLeaf<Input, Output> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V> + StagingEngine + ?Sized + 'static,
     Input::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input, To<V> = Input::To<V>>,
@@ -586,10 +585,14 @@ where
             return Err(DifferentiationError::MissingTracedRematerializeInputLeaves.into());
         };
         let (exemplar_output_types, body_program) =
-            trace_flat_program_from_input_types::<Input::To<ArrayType>, Output::To<ArrayType>, V, E, _>(
-                exemplar_traced_input.outer_engine(),
-                |staged_input| Ok(function(staged_input)),
-                exemplar_input_types,
+            crate::tracing_v2::linear::trace_flat_program_from_input_engine::<
+                Input::To<ArrayType>,
+                Output::To<ArrayType>,
+                V,
+                E,
+                _,
+            >(
+                &exemplar_traced_input.engine, |staged_input| Ok(function(staged_input)), exemplar_input_types
             )?;
 
         let output_structure = exemplar_output_types.parameter_structure();

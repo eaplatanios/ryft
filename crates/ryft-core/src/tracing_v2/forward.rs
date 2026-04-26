@@ -8,12 +8,13 @@ use crate::{
         AtomId, Instruction, InterpretableOperation, Operation, Program, ProgramBuilder, Traceable, TracingError, Value,
     },
     tracing_v2::{
-        LinearPrimitiveOperation,
-        engines::{DifferentiableEngine, Engine, TracingEngine},
+        engines::{
+            DifferentiableEngine, DifferentiableStagingEngine, DifferentiationStagingEngine, Engine, StagingEngine,
+        },
         jit::Tracer,
         linear::{jvp_program, jvp_traced},
         operations::{
-            DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale, TracedLinearizationCarrier,
+            DifferentiableOperation, SupportsAdd, SupportsNeg, SupportsScale,
             constants::{One, Zero},
         },
     },
@@ -97,112 +98,9 @@ pub trait Differentiable<T: Type>: Traceable<T> {
     type Tangent: Traceable<T> + Zero<T> + One<T>;
 }
 
-/// Linearization-side wrapper over an outer engine for traced forward-mode AD.
-///
-/// [`LinearizationEngine`] adapts a concrete underlying engine `E` so that JVP rules can run with
-/// [`Tracer`](crate::tracing_v2::Tracer) primals instead of bare `E::Value` leaves.
-/// It is used by the traced linearization pipeline to drive
-/// [`linearize_program`](crate::tracing_v2::linear::linearize_program) inside an outer JIT scope:
-/// the wrapper exposes [`Engine::Value`] = `Tracer<'engine, E>` so each per-op JVP rule sees
-/// traced primals and stages tangent ops into a separate linear-program builder over the same
-/// traced primal type.
-///
-/// Architecturally, this wrapper lets traced linearization go through the same per-op
-/// [`DifferentiableOperation`](crate::tracing_v2::operations::DifferentiableOperation) rules that
-/// power concrete forward-mode AD, just specialized to a wrapper engine whose `Value` is itself a
-/// staged tracer from an outer scope.
-pub struct LinearizationEngine<'engine, E>
-where
-    E: TracingEngine<Type = ArrayType> + ?Sized,
-{
-    /// Underlying engine that owns the outer tracing scope.
-    inner: &'engine E,
-
-    /// Outer tracing builder used to lift constants and stage primal effects of higher-order ops.
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::Operation>>>,
-}
-
-impl<'engine, E> LinearizationEngine<'engine, E>
-where
-    E: TracingEngine<Type = ArrayType> + ?Sized,
-{
-    /// Wraps `inner` and the outer-trace builder so JVP rules can operate on traced primals.
-    #[inline]
-    pub fn new(
-        inner: &'engine E,
-        tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::Operation>>>,
-    ) -> Self {
-        Self { inner, tracing_builder }
-    }
-
-    /// Returns the underlying engine.
-    #[inline]
-    pub fn inner(&self) -> &'engine E {
-        self.inner
-    }
-
-    /// Returns the shared outer-trace program builder.
-    #[inline]
-    pub fn tracing_builder(&self) -> &Rc<RefCell<ProgramBuilder<ArrayType, E::Value, E::Operation>>> {
-        &self.tracing_builder
-    }
-
-    /// Lifts a concrete `E::Value` into a [`Tracer`] constant in the outer trace.
-    ///
-    /// JVP rules for V-capturing ops (`ScaleOperation`, `LeftMatMulOperation`,
-    /// `RightMatMulOperation`) need to convert their captured factor — which is `E::Value` (i.e.
-    /// the underlying engine's value type) — into a [`Tracer`] before staging the primal effect
-    /// or constructing a new linear op. This helper centralizes that lift.
-    pub fn lift_constant(&self, value: E::Value) -> Tracer<'engine, E> {
-        let r#type = <E::Value as Typed<ArrayType>>::r#type(&value).into_owned();
-        let atom = self.tracing_builder.borrow_mut().add_constant(value);
-        Tracer::from_staged_parts(atom, r#type, self.tracing_builder.clone(), self.inner)
-    }
-}
-
-impl<'engine, E> Engine for LinearizationEngine<'engine, E>
-where
-    E: TracingEngine<Type = ArrayType> + ?Sized,
-{
-    type Type = ArrayType;
-    type Value = Tracer<'engine, E>;
-
-    #[inline]
-    fn zero(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-        let value = self.inner.zero(r#type)?;
-        let atom = self.tracing_builder.borrow_mut().add_constant(value);
-        Ok(Tracer::from_staged_parts(atom, r#type.clone(), self.tracing_builder.clone(), self.inner))
-    }
-
-    #[inline]
-    fn one(&self, r#type: &ArrayType) -> Result<Self::Value, TracingError> {
-        let value = self.inner.one(r#type)?;
-        let atom = self.tracing_builder.borrow_mut().add_constant(value);
-        Ok(Tracer::from_staged_parts(atom, r#type.clone(), self.tracing_builder.clone(), self.inner))
-    }
-}
-
-impl<'engine, E> TracingEngine for LinearizationEngine<'engine, E>
-where
-    E: TracingEngine<Type = ArrayType> + ?Sized,
-    E::Value: Differentiable<ArrayType, Tangent = E::Value>,
-    E::Operation: TracedLinearizationCarrier<E::Value>,
-{
-    type Operation = crate::tracing_v2::operations::AddOperation;
-}
-
-impl<'engine, E> DifferentiableEngine for LinearizationEngine<'engine, E>
-where
-    E: TracingEngine<Type = ArrayType> + ?Sized,
-    E::Value: Differentiable<ArrayType, Tangent = E::Value>,
-    E::Operation: TracedLinearizationCarrier<E::Value>,
-{
-    type LinearOperation = LinearPrimitiveOperation<Tracer<'engine, E>>;
-}
-
 impl<'engine, E> Differentiable<E::Type> for Tracer<'engine, E>
 where
-    E: TracingEngine + ?Sized,
+    E: StagingEngine + ?Sized,
     E::Value: Differentiable<E::Type>,
 {
     type Tangent = Self;
@@ -288,20 +186,20 @@ impl<
 > JvpInvocationLeaf<E, Input, Output> for V
 where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
-    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, E>>,
-    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+    Input::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    Output::Family: for<'engine> ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>
         + SupportsAdd<ArrayType, V>
         + SupportsNeg<ArrayType, V>
         + SupportsScale<ArrayType, V>,
 {
     type FunctionInput<'engine>
-        = Input::To<Tracer<'engine, E>>
+        = Input::To<Tracer<'engine, DifferentiationStagingEngine<E>>>
     where
         E: 'engine;
     type FunctionOutput<'engine>
-        = Output::To<Tracer<'engine, E>>
+        = Output::To<Tracer<'engine, DifferentiationStagingEngine<E>>>
     where
         E: 'engine;
 
@@ -342,13 +240,16 @@ impl<
     Output: Parameterized<Tracer<'engine, E>, ParameterStructure: Clone, To<Tracer<'engine, E>> = Output>,
 > JvpInvocationLeaf<E, Input, Output> for Tracer<'engine, E>
 where
-    E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
+    E: DifferentiableEngine<Type = ArrayType, Value = V>
+        + DifferentiableStagingEngine<Type = ArrayType, Value = V>
+        + StagingEngine
+        + 'static,
     Input::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<Tracer<'engine, E>> + ParameterizedFamily<V> + ParameterizedFamily<ArrayType>,
     Input::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Input>,
     Output::To<ArrayType>: Parameterized<ArrayType, To<Tracer<'engine, E>> = Output>,
     E::Operation: crate::tracing_v2::linear::TracedLinearizableOperation<'engine, E>,
-    LinearPrimitiveOperation<Tracer<'engine, E>>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
+    <E as DifferentiableStagingEngine>::LinearOperation<'engine>: InterpretableOperation<ArrayType, Tracer<'engine, E>>,
 {
     type FunctionInput<'call>
         = Input
@@ -403,30 +304,27 @@ mod tests {
     use crate::parameters::{ParameterError, Parameterized};
     use crate::tracing::ProgramBuilder;
     use crate::tracing_v2::{
-        PrimitiveOperation,
+        LinearPrimitiveOperation, PrimitiveOperation,
         engines::ArrayScalarEngine,
-        jit::TracingScope,
+        jit::TracingEngine,
         operations::{AddOperation, DifferentiableOperation},
         test_support,
     };
 
     use super::*;
 
-    /// Validates that [`LinearizationEngine`] can host a JVP rule like [`AddOperation`] when its
-    /// `Value` is `Tracer<E>`: the rule stages its primal effect through the underlying engine
-    /// and its tangent effect through the wrapper's `LinearOperation` carrier without any
-    /// `'static` constraints on the wrapper itself.
+    /// Validates that [`TracingEngine`] can host a JVP rule like [`AddOperation`] when its
+    /// `Value` is `Tracer<E>`: the rule stages its primal effect through the underlying engine and
+    /// its tangent effect through the context's `LinearOperation` carrier.
     #[test]
-    fn linearization_engine_dispatches_add_jvp_with_traced_primals() {
+    fn tracing_engine_dispatches_add_jvp_with_traced_primals() {
         let engine = ArrayScalarEngine::<f64>::new();
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, PrimitiveOperation<f64>>::new()));
         let outer_input_a = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
         let outer_input_b = outer_builder.borrow_mut().add_input(ArrayType::scalar(crate::types::DataType::F64));
-        let outer_scope = TracingScope::new(&engine, outer_builder.clone());
-        let primal_a = outer_scope.tracer_from_atom(outer_input_a);
-        let primal_b = outer_scope.tracer_from_atom(outer_input_b);
-
-        let linearization_engine = LinearizationEngine::<ArrayScalarEngine<f64>>::new(&engine, outer_builder.clone());
+        let outer_tracing_engine = TracingEngine::new(&engine, outer_builder.clone());
+        let primal_a = outer_tracing_engine.tracer_from_atom(outer_input_a);
+        let primal_b = outer_tracing_engine.tracer_from_atom(outer_input_b);
 
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
@@ -439,14 +337,14 @@ mod tests {
 
         let outputs = AddOperation
             .jvp(
-                &linearization_engine,
+                &outer_tracing_engine,
                 &mut context,
                 &[
                     JvpTracer { primal: primal_a, tangent: tangent_a },
                     JvpTracer { primal: primal_b, tangent: tangent_b },
                 ],
             )
-            .expect("AddOperation::jvp should run on a LinearizationEngine wrapper");
+            .expect("AddOperation::jvp should run on a TracingEngine");
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(linear_builder.borrow().instructions.len(), 1);

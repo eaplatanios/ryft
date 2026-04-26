@@ -2,10 +2,11 @@ use std::marker::PhantomData;
 
 use crate::{
     parameters::Parameter,
-    tracing::{Operation, Traceable, TracingError},
+    tracing::{InterpretableOperation, Operation, Traceable, TracingError},
     tracing_v2::{
-        Differentiable, LinearOperation as LinearOperationTrait, LinearPrimitiveOperation, PrimitiveOperation,
-        operations::{SupportsAdd, SupportsNeg, SupportsScale},
+        LinearOperation as LinearOperationTrait, LinearPrimitiveOperation, PrimitiveOperation,
+        jit::Tracer,
+        operations::{SupportsAdd, SupportsNeg, SupportsScale, SupportsZero},
     },
     types::{ArrayType, Type},
 };
@@ -56,33 +57,51 @@ pub trait Engine {
     fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError>;
 }
 
-/// Active engine used while staging one traced program.
+/// Engine capability for selecting a staged operation carrier.
 ///
-/// [`TracingEngine`] extends [`Engine`] with the closed operation carrier that the paired
+/// [`StagingEngine`] extends [`Engine`] with the closed operation carrier that the paired
 /// [`ProgramBuilder`](crate::tracing::ProgramBuilder) stores. This keeps carrier selection on the
 /// engine value that is actually threaded through tracers instead of splitting it across a separate
 /// generic parameter.
-pub trait TracingEngine: Engine {
-    /// Staged operation type selected by this active tracing engine.
+pub trait StagingEngine: Engine {
+    /// Staged operation type selected by this staging engine.
     type Operation: Clone + Operation<Self::Type>;
+}
+
+/// Optional extension for staging engines that support differentiation inside an active trace.
+///
+/// Plain staging engines do not need to choose any linear carrier. This trait is the additional
+/// contract required when a [`TracingEngine`](crate::tracing_v2::TracingEngine) itself needs to act
+/// as a differentiable engine: tangent and cotangent programs then operate on
+/// [`Tracer`] values, so the underlying staging engine must select a linear operation carrier for
+/// those traced leaves.
+pub trait DifferentiableStagingEngine: StagingEngine {
+    /// Linear operation carrier used for tangent and cotangent programs over traced values.
+    type LinearOperation<'engine>: Clone
+        + LinearOperationTrait<Self::Type, Tracer<'engine, Self>, Self::LinearOperation<'engine>>
+        + SupportsAdd<Self::Type, Tracer<'engine, Self>>
+        + SupportsNeg<Self::Type, Tracer<'engine, Self>>
+        + SupportsScale<Self::Type, Tracer<'engine, Self>>
+        + SupportsZero<Self::Type, Tracer<'engine, Self>>
+    where
+        Self: 'engine;
 }
 
 /// Extension of [`Engine`] for backends that support automatic differentiation.
 ///
-/// Engines that only need ordinary tracing implement [`TracingEngine`] without this extension. AD
+/// Engines that only need ordinary tracing implement [`StagingEngine`] without this extension. AD
 /// transforms such as [`grad`](crate::tracing_v2::grad), [`jvp`](crate::tracing_v2::jvp), and
 /// [`vjp`](crate::tracing_v2::vjp) require this trait so non-differentiable backends do not need to
 /// define fake tangent carriers.
 ///
-/// Differentiated closures are traced with [`TracingEngine::Operation`]. AD entry points that stage
-/// user code therefore bound that operation carrier by
-/// [`DifferentiableOperation`](crate::tracing_v2::operations::DifferentiableOperation) at the use
-/// site. This trait itself only adds the linear operation carrier used by tangent and cotangent
-/// programs.
-pub trait DifferentiableEngine: TracingEngine
-where
-    Self::Value: Differentiable<Self::Type, Tangent = Self::Value>,
-{
+/// Differentiated closures are traced through [`DifferentiationStagingEngine`], whose
+/// [`StagingEngine::Operation`] is [`DifferentiableEngine::DifferentiableOperation`]. That keeps
+/// ordinary tracing free to use a wider operation carrier while making differentiation reject
+/// unsupported operations at type-check time when the differentiation carrier omits them.
+pub trait DifferentiableEngine: Engine {
+    /// Staged operation type selected by this engine for tracing differentiable primal programs.
+    type DifferentiableOperation: Clone + InterpretableOperation<Self::Type, Self::Value>;
+
     /// Linear staged operation type selected by this engine for tangent and cotangent programs.
     ///
     /// Linear programs produced by [`jvp_program`](crate::tracing_v2::jvp_program),
@@ -92,6 +111,67 @@ where
         + SupportsAdd<Self::Type, Self::Value>
         + SupportsNeg<Self::Type, Self::Value>
         + SupportsScale<Self::Type, Self::Value>;
+}
+
+/// Active tracing view used while staging differentiable primal programs.
+///
+/// This transparent view selects [`DifferentiableEngine::DifferentiableOperation`] as the active
+/// staged operation carrier for an existing [`DifferentiableEngine`]. It does not store its own
+/// reference or state: [`DifferentiationStagingEngine::new`] reborrows an engine as this view, so a
+/// [`TracingEngine`](crate::tracing_v2::jit::TracingEngine) can keep using ordinary engine references
+/// without allocating or owning a wrapper.
+#[repr(transparent)]
+pub struct DifferentiationStagingEngine<E: DifferentiableEngine + ?Sized> {
+    /// Engine viewed through the differentiation tracing carrier.
+    engine: E,
+}
+
+impl<E: DifferentiableEngine + ?Sized> DifferentiationStagingEngine<E> {
+    /// Reborrows `engine` as a differentiation tracing view.
+    #[inline]
+    pub const fn new(engine: &E) -> &Self {
+        // SAFETY: `DifferentiationStagingEngine<E>` is `repr(transparent)` over `E` and adds no
+        // fields, so references to `E` and references to this view have identical layout.
+        unsafe { &*(std::ptr::from_ref(engine) as *const Self) }
+    }
+
+    /// Returns the wrapped differentiation engine.
+    #[inline]
+    pub const fn inner(&self) -> &E {
+        // SAFETY: `DifferentiationStagingEngine<E>` is `repr(transparent)` over `E` and adds no
+        // fields, so references to this view and references to `E` have identical layout.
+        unsafe { &*(std::ptr::from_ref(self) as *const E) }
+    }
+}
+
+impl<E: DifferentiableEngine + ?Sized> std::fmt::Debug for DifferentiationStagingEngine<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DifferentiationStagingEngine").finish_non_exhaustive()
+    }
+}
+
+impl<E: DifferentiableEngine + ?Sized> Engine for DifferentiationStagingEngine<E> {
+    type Type = E::Type;
+    type Value = E::Value;
+
+    #[inline]
+    fn zero(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+        self.inner().zero(r#type)
+    }
+
+    #[inline]
+    fn one(&self, r#type: &Self::Type) -> Result<Self::Value, TracingError> {
+        self.inner().one(r#type)
+    }
+}
+
+impl<E: DifferentiableEngine + ?Sized> StagingEngine for DifferentiationStagingEngine<E> {
+    type Operation = E::DifferentiableOperation;
+}
+
+impl<E: DifferentiableEngine + ?Sized> DifferentiableEngine for DifferentiationStagingEngine<E> {
+    type DifferentiableOperation = E::DifferentiableOperation;
+    type LinearOperation = E::LinearOperation;
 }
 
 /// Stateless engine that synthesizes scalar-compatible values from [`ArrayType`] metadata.
@@ -139,12 +219,20 @@ macro_rules! impl_engine_for_array_scalar_engine {
             }
         }
 
-        impl TracingEngine for ArrayScalarEngine<$ty> {
+        impl StagingEngine for ArrayScalarEngine<$ty> {
             type Operation = PrimitiveOperation<$ty>;
         }
 
         impl DifferentiableEngine for ArrayScalarEngine<$ty> {
+            type DifferentiableOperation = PrimitiveOperation<$ty>;
             type LinearOperation = LinearPrimitiveOperation<$ty>;
+        }
+
+        impl DifferentiableStagingEngine for ArrayScalarEngine<$ty> {
+            type LinearOperation<'engine>
+                = LinearPrimitiveOperation<Tracer<'engine, Self>>
+            where
+                Self: 'engine;
         }
     };
 }

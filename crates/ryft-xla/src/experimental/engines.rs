@@ -7,8 +7,8 @@ use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::TracingError;
 use ryft_core::tracing_v2::{
-    LinearPrimitiveOperation,
-    engines::{DifferentiableEngine, Engine, TracingEngine},
+    LinearPrimitiveOperation, Tracer,
+    engines::{DifferentiableEngine, DifferentiableStagingEngine, Engine, StagingEngine},
 };
 use ryft_core::types::{ArrayType, DataType, TypeError};
 
@@ -139,12 +139,20 @@ impl<'c> Engine for XlaEngine<'c> {
     }
 }
 
-impl<'c> TracingEngine for XlaEngine<'c> {
+impl<'c> StagingEngine for XlaEngine<'c> {
     type Operation = XlaPrimitiveOperation;
 }
 
 impl<'c> DifferentiableEngine for XlaEngine<'c> {
+    type DifferentiableOperation = XlaPrimitiveOperation;
     type LinearOperation = LinearPrimitiveOperation<ShardMapTensor>;
+}
+
+impl<'c> DifferentiableStagingEngine for XlaEngine<'c> {
+    type LinearOperation<'engine>
+        = LinearPrimitiveOperation<Tracer<'engine, Self>>
+    where
+        Self: 'engine;
 }
 
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), TracingError> {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::tracing_v2::{JvpContext, LinearizationEngine};
+use crate::tracing_v2::{JvpContext, TracingEngine};
 
 /// Operation-level capability required by traced program linearization.
 ///
@@ -10,13 +10,17 @@ use crate::tracing_v2::{JvpContext, LinearizationEngine};
 #[doc(hidden)]
 pub trait TracedLinearizableOperation<'engine, E>: Clone + Operation<ArrayType>
 where
-    E: TracingEngine<Type = ArrayType> + ?Sized,
+    E: crate::tracing_v2::DifferentiableStagingEngine<Type = ArrayType> + ?Sized,
 {
     /// Applies this operation's JVP rule to traced primals inside the active linearization pass.
     fn jvp_traced_linearization(
         &self,
-        engine: &LinearizationEngine<'engine, E>,
-        context: &mut JvpContext<'_, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>,
+        engine: &TracingEngine<'engine, E>,
+        context: &mut JvpContext<
+            '_,
+            Tracer<'engine, E>,
+            <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+        >,
         inputs: &[JvpTracer<Tracer<'engine, E>, AtomId>],
     ) -> Result<Vec<JvpTracer<Tracer<'engine, E>, AtomId>>, TracingError>;
 }
@@ -29,27 +33,44 @@ where
 /// pushforward symbolically.
 #[doc(hidden)]
 pub fn linearize_traced_program<'engine, V, E>(
-    engine: &'engine E,
-    tracing_builder: Rc<RefCell<ProgramBuilder<ArrayType, V, E::Operation>>>,
+    tracing_engine: TracingEngine<'engine, E>,
     program: &Program<ArrayType, V, E::Operation, Vec<V>, Vec<V>>,
     primals: Vec<Tracer<'engine, E>>,
-) -> Result<(Vec<Tracer<'engine, E>>, TracedLinearProgram<'engine, E>), TracingError>
+) -> Result<
+    (
+        Vec<Tracer<'engine, E>>,
+        Program<
+            ArrayType,
+            Tracer<'engine, E>,
+            <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+            Vec<Tracer<'engine, E>>,
+            Vec<Tracer<'engine, E>>,
+        >,
+    ),
+    TracingError,
+>
 where
     V: Traceable<ArrayType>,
-    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
+    E: crate::tracing_v2::DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized + 'static,
     E::Operation: TracedLinearizableOperation<'engine, E> + 'static,
 {
     fn tangent_for_atom<'engine, V, E>(
         primal_values: &[Option<Tracer<'engine, E>>],
         builder: &Rc<
-            RefCell<ProgramBuilder<ArrayType, Tracer<'engine, E>, LinearPrimitiveOperation<Tracer<'engine, E>>>>,
+            RefCell<
+                ProgramBuilder<
+                    ArrayType,
+                    Tracer<'engine, E>,
+                    <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
+                >,
+            >,
         >,
         tangents: &mut [Option<AtomId>],
         atom_id: AtomId,
     ) -> Result<AtomId, TracingError>
     where
         V: Traceable<ArrayType>,
-        E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+        E: crate::tracing_v2::DifferentiableStagingEngine<Type = ArrayType, Value = V> + ?Sized,
     {
         if let Some(atom) = tangents[atom_id.index] {
             return Ok(atom);
@@ -67,9 +88,8 @@ where
     let builder = Rc::new(RefCell::new(ProgramBuilder::<
         ArrayType,
         Tracer<'engine, E>,
-        LinearPrimitiveOperation<Tracer<'engine, E>>,
+        <E as crate::tracing_v2::DifferentiableStagingEngine>::LinearOperation<'engine>,
     >::new()));
-    let linearization_engine = LinearizationEngine::new(engine, tracing_builder);
     let mut primal_values: Vec<Option<Tracer<'engine, E>>> = vec![None; program.atoms.len()];
     let mut tangents: Vec<Option<AtomId>> = vec![None; program.atoms.len()];
 
@@ -80,7 +100,7 @@ where
     }
     for (atom_index, atom) in program.atoms.iter().enumerate() {
         if let Atom::Constant(value) = atom {
-            primal_values[atom_index] = Some(linearization_engine.lift_constant(value.clone()));
+            primal_values[atom_index] = Some(tracing_engine.lift_constant(value.clone()));
         }
     }
 
@@ -104,11 +124,10 @@ where
                 })
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
-        let output_duals = instruction.operation.jvp_traced_linearization(
-            &linearization_engine,
-            &mut context,
-            input_duals.as_slice(),
-        )?;
+        let output_duals =
+            instruction
+                .operation
+                .jvp_traced_linearization(&tracing_engine, &mut context, input_duals.as_slice())?;
         if output_duals.len() != instruction.outputs.len() {
             return Err(TracingError::InvalidOutputCount {
                 expected: instruction.outputs.len(),

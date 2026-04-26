@@ -10,9 +10,9 @@ use ryft_core::tracing::TracingError;
 use ryft_core::tracing::{Traceable, Value};
 use ryft_core::tracing_v2::operations::{
     ControlFlowError, ControlFlowValue,
-    constants::{OneLike, ZeroLike},
+    constants::{One, OneLike, Zero, ZeroLike},
 };
-use ryft_core::tracing_v2::{CoordinateValue, Cos, MatrixOps, ReshapeOps, Sin};
+use ryft_core::tracing_v2::{CoordinateValue, Cos, Differentiable, MatrixOps, ReshapeOps, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Element type supported by the `ryft-ndarray` backend.
@@ -256,6 +256,24 @@ impl<T: NdArrayElement> OneLike for Array<T> {
     fn one_like(&self) -> Self {
         Self::new(ArrayD::from_elem(self.values.raw_dim(), T::one()))
     }
+}
+
+impl<T: NdArrayElement> Zero<ArrayType> for Array<T> {
+    #[inline]
+    fn zero(array_type: &ArrayType) -> Result<Self, TracingError> {
+        Array::zeros(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
+    }
+}
+
+impl<T: NdArrayElement> One<ArrayType> for Array<T> {
+    #[inline]
+    fn one(array_type: &ArrayType) -> Result<Self, TracingError> {
+        Array::ones(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
+    }
+}
+
+impl<T: NdArrayElement> Differentiable<ArrayType> for Array<T> {
+    type Tangent = Self;
 }
 
 impl<T: NdArrayElement> CoordinateValue for Array<T> {

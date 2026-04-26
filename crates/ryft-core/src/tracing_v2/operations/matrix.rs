@@ -152,7 +152,7 @@ fn matrix_transpose_is_identity_type(r#type: &ArrayType) -> bool {
 
 impl<'engine, V: Traceable<ArrayType>, E> MatrixOps for Tracer<'engine, E>
 where
-    E: crate::tracing_v2::TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: crate::tracing_v2::StagingEngine<Type = ArrayType, Value = V> + ?Sized,
     E::Operation: SupportsMatMul<ArrayType, V> + SupportsMatrixTranspose<ArrayType, V>,
 {
     #[inline]
@@ -181,8 +181,8 @@ pub mod ndarray_support {
         parameters::Parameter,
         tracing::{Traceable, TracingError, Value},
         tracing_v2::{
-            CoordinateValue, Cos, Differentiable, LinearPrimitiveOperation, PrimitiveOperation, Sin,
-            engines::{DifferentiableEngine, Engine, TracingEngine},
+            CoordinateValue, Cos, Differentiable, LinearPrimitiveOperation, PrimitiveOperation, Sin, Tracer,
+            engines::{DifferentiableEngine, DifferentiableStagingEngine, Engine, StagingEngine},
             operations::constants::{One, OneLike, Zero, ZeroLike},
         },
         types::{ArrayType, DataType, TypeError, Typed},
@@ -241,12 +241,20 @@ pub mod ndarray_support {
         }
     }
 
-    impl TracingEngine for Array2Engine<f32> {
+    impl StagingEngine for Array2Engine<f32> {
         type Operation = PrimitiveOperation<Array2<f32>>;
     }
 
     impl DifferentiableEngine for Array2Engine<f32> {
+        type DifferentiableOperation = PrimitiveOperation<Array2<f32>>;
         type LinearOperation = LinearPrimitiveOperation<Array2<f32>>;
+    }
+
+    impl DifferentiableStagingEngine for Array2Engine<f32> {
+        type LinearOperation<'engine>
+            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+        where
+            Self: 'engine;
     }
 
     impl Engine for Array2Engine<f64> {
@@ -264,12 +272,20 @@ pub mod ndarray_support {
         }
     }
 
-    impl TracingEngine for Array2Engine<f64> {
+    impl StagingEngine for Array2Engine<f64> {
         type Operation = PrimitiveOperation<Array2<f64>>;
     }
 
     impl DifferentiableEngine for Array2Engine<f64> {
+        type DifferentiableOperation = PrimitiveOperation<Array2<f64>>;
         type LinearOperation = LinearPrimitiveOperation<Array2<f64>>;
+    }
+
+    impl DifferentiableStagingEngine for Array2Engine<f64> {
+        type LinearOperation<'engine>
+            = LinearPrimitiveOperation<Tracer<'engine, Self>>
+        where
+            Self: 'engine;
     }
 
     impl Parameter for Array2<f32> {}

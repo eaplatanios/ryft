@@ -14,25 +14,23 @@ pub enum DifferentiationError {
     NonScalarGradientOutput { output_type: ArrayType },
 
     /// Traced forward-mode differentiation was invoked without any staged input leaves.
-    #[error("traced jvp requires at least one input leaf to recover the staging context")]
+    #[error("traced jvp requires at least one input leaf to recover the tracing engine")]
     MissingTracedJvpInputLeaves,
 
     /// Traced reverse-mode differentiation was invoked without any staged input leaves.
-    #[error("traced reverse-mode requires at least one input leaf to recover the staging context")]
+    #[error("traced reverse-mode requires at least one input leaf to recover the tracing engine")]
     MissingTracedReverseModeInputLeaves,
 
     /// Traced rematerialization was invoked without any staged input leaves.
-    #[error("traced rematerialize requires at least one input leaf to recover the staging context")]
+    #[error("traced rematerialize requires at least one input leaf to recover the tracing engine")]
     MissingTracedRematerializeInputLeaves,
 
     /// Linear rematerialization replay was invoked without any tangent leaves.
-    #[error("linear rematerialize replay requires at least one tangent leaf to recover the staging context")]
+    #[error("linear rematerialize replay requires at least one tangent leaf to recover the tracing engine")]
     MissingLinearRematerializeReplayTangentLeaves,
 
     /// Linear rematerialization transpose was invoked without any output cotangent leaves.
-    #[error(
-        "linear rematerialize transpose requires at least one output cotangent leaf to recover the staging context"
-    )]
+    #[error("linear rematerialize transpose requires at least one output cotangent leaf to recover the tracing engine")]
     MissingLinearRematerializeTransposeCotangentLeaves,
 
     /// Dense Jacobian materialization produced an unexpected number of rows.

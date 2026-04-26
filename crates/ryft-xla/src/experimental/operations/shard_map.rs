@@ -14,7 +14,7 @@ use ryft_core::{
     },
     tracing_v2::{
         CustomPrimitive, DifferentiableOperation, JvpContext, LinearCustomPrimitive, LinearOperation,
-        LinearPrimitiveOperation, Tracer, TracingScope,
+        LinearPrimitiveOperation, TracingEngine,
         engines::DifferentiableEngine,
         forward::{Differentiable, JvpTracer},
         linear::{linearize_traced_program, transpose_traced_linear_program},
@@ -358,7 +358,7 @@ impl LinearShardMapOperation<ShardMapTracer> {
     ) -> Result<Vec<ShardMapTracer>, TracingError> {
         let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let _ = self.infer_output_types(abstract_inputs.as_slice())?;
-        TracingScope::new(XlaEngine::token(), tracing_builder)
+        TracingEngine::new(XlaEngine::token(), tracing_builder)
             .apply_staged_op(inputs, XlaPrimitiveOperation::LinearShardMap(Box::new(self.to_tensor_xla_op())))
     }
 }
@@ -372,7 +372,7 @@ impl LinearShardMapOperation<ShardMapTensor> {
         inputs: &[JvpTracer<ShardMapTracer, AtomId>],
     ) -> Result<Vec<JvpTracer<ShardMapTracer, AtomId>>, TracingError> {
         let primal_inputs = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
-        let primal_outputs = TracingScope::new(XlaEngine::token(), tracing_builder)
+        let primal_outputs = TracingEngine::new(XlaEngine::token(), tracing_builder)
             .apply_staged_op(primal_inputs.as_slice(), XlaPrimitiveOperation::LinearShardMap(Box::new(self.clone())))?;
         let traced_op = self.to_tracer_linear_op(primal_inputs.as_slice())?;
         let tangent_inputs = inputs.iter().map(|input| input.tangent).collect::<Vec<_>>();
@@ -444,7 +444,7 @@ fn shard_map_boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> b
 /// Re-embeds one traced shard-map output type into the caller's ambient sharding envelope.
 ///
 /// Traced nested `shard_map` invocations stage as ordinary higher-order ops inside an already-local
-/// caller scope. When the caller's ambient sharding envelope differs from the captured shard-map
+/// caller context. When the caller's ambient sharding envelope differs from the captured shard-map
 /// boundary, the staged result must use the ambient envelope again so downstream traced primitives
 /// see a value in the surrounding local context rather than in the nested shard-map boundary space.
 ///
@@ -1279,7 +1279,7 @@ fn apply_flat_traced_shard_map(
     body: FlatTracedShardMap,
     traced_inputs: Vec<ShardMapTracer>,
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
-    TracingScope::new(XlaEngine::token(), tracing_builder)
+    TracingEngine::new(XlaEngine::token(), tracing_builder)
         .apply_staged_op(
             traced_inputs.as_slice(),
             XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
@@ -1386,25 +1386,23 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let pushforward_compiled_builder =
         Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
+    let pushforward_compiled_context = TracingEngine::new(XlaEngine::token(), pushforward_compiled_builder.clone());
     let pushforward_compiled_outputs = {
         let combined_inputs = pushforward_local_input_types
             .iter()
             .cloned()
             .map(|input_type| {
                 let atom = pushforward_compiled_builder.borrow_mut().add_input(input_type.clone());
-                Tracer::from_staged_parts(atom, input_type, pushforward_compiled_builder.clone(), XlaEngine::token())
+                pushforward_compiled_context.tracer_from_staged_parts(atom, input_type)
             })
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_tangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = linearize_traced_program(
-            XlaEngine::token(),
-            pushforward_compiled_builder.clone(),
-            &body.program,
-            local_primals,
-        )?;
+        let (_, pushforward_program) =
+            linearize_traced_program(pushforward_compiled_context.clone(), &body.program, local_primals)?;
         pushforward_program.interpret(local_tangents)?
     };
+    drop(pushforward_compiled_context);
     let pushforward_compiled = build_traced_xla_program(
         pushforward_compiled_builder,
         pushforward_compiled_outputs,
@@ -1414,30 +1412,25 @@ fn trace_linear_shard_map_bodies(body: &FlatTracedShardMap) -> Result<LinearShar
 
     let pullback_compiled_builder =
         Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ShardMapTensor, XlaPrimitiveOperation>::new()));
+    let pullback_compiled_context = TracingEngine::new(XlaEngine::token(), pullback_compiled_builder.clone());
     let pullback_compiled_outputs = {
         let combined_inputs = pullback_local_input_types
             .iter()
             .cloned()
             .map(|input_type| {
                 let atom = pullback_compiled_builder.borrow_mut().add_input(input_type.clone());
-                Tracer::from_staged_parts(atom, input_type, pullback_compiled_builder.clone(), XlaEngine::token())
+                pullback_compiled_context.tracer_from_staged_parts(atom, input_type)
             })
             .collect::<Vec<_>>();
         let local_primals = combined_inputs[..local_input_count].to_vec();
         let local_output_cotangents = combined_inputs[local_input_count..].to_vec();
-        let (_, pushforward_program) = linearize_traced_program(
-            XlaEngine::token(),
-            pullback_compiled_builder.clone(),
-            &body.program,
-            local_primals,
-        )?;
-        let pullback_program = transpose_traced_linear_program(
-            XlaEngine::token(),
-            pullback_compiled_builder.clone(),
-            &pushforward_program,
-        )?;
+        let (_, pushforward_program) =
+            linearize_traced_program(pullback_compiled_context.clone(), &body.program, local_primals)?;
+        let pullback_program =
+            transpose_traced_linear_program(pullback_compiled_context.clone(), &pushforward_program)?;
         pullback_program.interpret(local_output_cotangents)?
     };
+    drop(pullback_compiled_context);
     let pullback_compiled = build_traced_xla_program(
         pullback_compiled_builder,
         pullback_compiled_outputs,
@@ -1500,7 +1493,7 @@ fn apply_traced_shard_map<Output: Parameterized<ShardMapTracer>>(
     traced_inputs: Vec<ShardMapTracer>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError> {
-    let staged_outputs = TracingScope::new(XlaEngine::token(), tracing_builder).apply_staged_op(
+    let staged_outputs = TracingEngine::new(XlaEngine::token(), tracing_builder).apply_staged_op(
         traced_inputs.as_slice(),
         XlaPrimitiveOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
     )?;
@@ -1627,7 +1620,7 @@ impl ShardMapInvocationLeaf for ShardMapTracer {
             None if output_structure.parameter_count() == 0 => {
                 return Ok(Output::To::<ShardMapTracer>::from_parameters(output_structure, Vec::new())?);
             }
-            None => return Err(ShardMapTraceError::MissingTracedInvocationContext),
+            None => return Err(ShardMapTraceError::MissingTracedInvocationEngine),
         };
         let traced = trace_flat_shard_map::<F, Input::To<ArrayType>, Output>(
             function,

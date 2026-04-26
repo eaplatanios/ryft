@@ -3,8 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use crate::{
     tracing::{AtomId, Instruction, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
-        engines::{DifferentiableEngine, TracingEngine},
-        forward::{Differentiable, JvpContext, JvpTracer},
+        engines::{DifferentiableEngine, StagingEngine},
+        forward::{JvpContext, JvpTracer},
         jit::Tracer,
     },
     types::{ArrayType, Type, TypeError, Typed},
@@ -87,7 +87,7 @@ pub use right_matmul::{RightMatMulOperation, SupportsRightMatMul};
 pub use scale::{ScaleOperation, SupportsScale};
 pub use sin::{Sin, SinOperation, SupportsSin};
 
-/// Carrier capability required by [`LinearizationEngine`](crate::tracing_v2::LinearizationEngine).
+/// Carrier capability required by [`TracingEngine`](crate::tracing_v2::TracingEngine).
 ///
 /// Traced linearization runs ordinary JVP rules with [`Tracer`] primals. Those rules may stage the
 /// primal side of built-in arithmetic through the outer operation carrier, so the carrier must know
@@ -95,38 +95,39 @@ pub use sin::{Sin, SinOperation, SupportsSin};
 /// Keeping that requirement as one semantic bound prevents every traced-linearization impl from
 /// repeating the individual primitive support traits.
 #[doc(hidden)]
-pub trait TracedLinearizationCarrier<V: Traceable<ArrayType>>:
+pub trait TracedLinearizationCarrier<T: Type, V: Traceable<T>>:
     Clone
-    + Operation<ArrayType>
-    + SupportsAdd<ArrayType, V>
-    + SupportsMul<ArrayType, V>
-    + SupportsNeg<ArrayType, V>
-    + SupportsScale<ArrayType, V>
-    + SupportsMatMul<ArrayType, V>
-    + SupportsMatrixTranspose<ArrayType, V>
-    + SupportsReshape<ArrayType, V>
+    + Operation<T>
+    + SupportsAdd<T, V>
+    + SupportsMul<T, V>
+    + SupportsNeg<T, V>
+    + SupportsScale<T, V>
+    + SupportsMatMul<T, V>
+    + SupportsMatrixTranspose<T, V>
+    + SupportsReshape<T, V>
     + 'static
 {
 }
 
-impl<V, O> TracedLinearizationCarrier<V> for O
+impl<T, V, O> TracedLinearizationCarrier<T, V> for O
 where
-    V: Traceable<ArrayType>,
+    T: Type,
+    V: Traceable<T>,
     O: Clone
-        + Operation<ArrayType>
-        + SupportsAdd<ArrayType, V>
-        + SupportsMul<ArrayType, V>
-        + SupportsNeg<ArrayType, V>
-        + SupportsScale<ArrayType, V>
-        + SupportsMatMul<ArrayType, V>
-        + SupportsMatrixTranspose<ArrayType, V>
-        + SupportsReshape<ArrayType, V>
+        + Operation<T>
+        + SupportsAdd<T, V>
+        + SupportsMul<T, V>
+        + SupportsNeg<T, V>
+        + SupportsScale<T, V>
+        + SupportsMatMul<T, V>
+        + SupportsMatrixTranspose<T, V>
+        + SupportsReshape<T, V>
         + 'static,
 {
 }
 
 /// Lifts one concrete value into the staged program owned by a JIT tracer.
-pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: TracingEngine<Type = ArrayType, Value = V> + ?Sized>(
+pub fn lift_jit_constant<'engine, V: Traceable<ArrayType>, E: StagingEngine<Type = ArrayType, Value = V> + ?Sized>(
     constant: &V,
     exemplar: &Tracer<'engine, E>,
 ) -> Tracer<'engine, E> {
@@ -275,11 +276,7 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primi
 /// atom id in the active linear-program builder — and stage tangent ops via
 /// [`JvpContext::apply_operation`]. Higher-order rules (e.g., the rematerialization and
 /// control-flow ops) use `engine` to recurse into nested sub-programs.
-pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type>
-where
-    E::Value: Differentiable<E::Type, Tangent = E::Value>,
-    E::LinearOperation: Operation<E::Type>,
-{
+pub trait DifferentiableOperation<E: DifferentiableEngine + ?Sized>: Operation<E::Type> {
     /// Applies the forward-mode JVP rule.
     fn jvp(
         &self,

@@ -287,10 +287,14 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+    Input::Family:
+        ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    Output::Family:
+        ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    F: FnOnce(
+        Input::To<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    ) -> Result<Output::To<Tracer<'engine, DifferentiationStagingEngine<E>>>, TracingError>,
+    E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     let input_structure = primals.parameter_structure();
@@ -336,10 +340,14 @@ where
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
     Output: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    Output::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Output::To<Tracer<'engine, E>>, TracingError>,
-    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+    Input::Family:
+        ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    Output::Family:
+        ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    F: FnOnce(
+        Input::To<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    ) -> Result<Output::To<Tracer<'engine, DifferentiationStagingEngine<E>>>, TracingError>,
+    E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: Clone
         + InterpretableOperation<ArrayType, V>
         + LinearOperation<ArrayType, V, E::LinearOperation>
@@ -381,9 +389,12 @@ where
     E: DifferentiableEngine<Type = ArrayType, Value = V> + 'static,
     V: CoordinateValue,
     Input: Parameterized<V, ParameterStructure: Clone + std::fmt::Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, E>>,
-    F: FnOnce(Input::To<Tracer<'engine, E>>) -> Result<Input::To<Tracer<'engine, E>>, TracingError>,
-    E::Operation: DifferentiableOperation<E> + InterpretableOperation<ArrayType, V>,
+    Input::Family:
+        ParameterizedFamily<ReferenceBatch<V>> + ParameterizedFamily<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    F: FnOnce(
+        Input::To<Tracer<'engine, DifferentiationStagingEngine<E>>>,
+    ) -> Result<Input::To<Tracer<'engine, DifferentiationStagingEngine<E>>>, TracingError>,
+    E::DifferentiableOperation: DifferentiableOperation<E>,
     E::LinearOperation: InterpretableOperation<ArrayType, V>,
 {
     jacfwd::<E, F, Input, Input, V>(engine, gradient_function, primals)

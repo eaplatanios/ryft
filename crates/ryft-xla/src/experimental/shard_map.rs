@@ -132,9 +132,9 @@ pub enum ShardMapTraceError {
     ParameterError(#[from] ParameterError),
 
     /// Error returned when traced `shard_map` staging has non-empty outputs but no traced input
-    /// leaf is available to supply the outer tracing context.
+    /// leaf is available to supply the outer tracing engine.
     #[error("traced shard_map with non-empty outputs requires at least one traced input leaf")]
-    MissingTracedInvocationContext,
+    MissingTracedInvocationEngine,
 
     /// Error returned while building StableHLO/Shardy MLIR for a traced shard-map body.
     #[error("{message}")]
@@ -2063,7 +2063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_rejects_zero_input_traced_invocation_without_context() {
+    fn test_shard_map_rejects_zero_input_traced_invocation_without_engine() {
         let mesh = test_logical_mesh_2x2();
         let result: Result<Vec<ShardMapTracer>, ShardMapTraceError> =
             shard_map::<_, Vec<ShardMapTracer>, Vec<ArrayType>, ShardMapTracer>(
@@ -2076,7 +2076,7 @@ mod tests {
                 vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
             );
 
-        assert!(matches!(result, Err(ShardMapTraceError::MissingTracedInvocationContext)));
+        assert!(matches!(result, Err(ShardMapTraceError::MissingTracedInvocationEngine)));
     }
 
     #[test]

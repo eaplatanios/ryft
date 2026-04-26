@@ -9,7 +9,7 @@ use crate::{
     tracing::{AtomId, OperationFormatter, Traceable, TracingError},
     tracing_v2::{
         LinearPrimitiveOperation,
-        engines::{DifferentiableEngine, TracingEngine},
+        engines::{DifferentiableEngine, StagingEngine},
         forward::{Differentiable, JvpContext, JvpTracer},
         jit::Tracer,
     },
@@ -197,7 +197,7 @@ impl<T: Traceable<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 impl<'engine, V: Traceable<ArrayType>, E> ReshapeOps for Tracer<'engine, E>
 where
-    E: TracingEngine<Type = ArrayType, Value = V> + ?Sized,
+    E: StagingEngine<Type = ArrayType, Value = V> + ?Sized,
     E::Operation: SupportsReshape<ArrayType, V>,
 {
     fn reshape(self, target_shape: Shape) -> Result<Self, TracingError> {
