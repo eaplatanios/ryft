@@ -76,6 +76,7 @@ impl<V: MatrixValue> InterpretableOperation<ArrayType, V> for MatrixTransposeOpe
 impl<V: MatrixValue> LinearOperation<ArrayType, V> for MatrixTransposeOperation {
     fn transpose(
         &self,
+        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         check_input_count!(output_cotangents, 1);

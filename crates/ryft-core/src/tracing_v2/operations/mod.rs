@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use crate::{
     parameters::Parameterized,
-    tracing::{InterpretableOperation, Operation, Traceable, TracingError},
+    tracing::{AtomId, InterpretableOperation, Operation, ProgramBuilder, Traceable, TracingError},
     tracing_v2::{
         engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, EngineTangent, JvpTracer},
@@ -65,8 +65,8 @@ pub mod sin;
 
 pub use add::{AddOperation, AddTracingOperation, LinearAddOperation};
 pub use control_flow::{
-    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, LinearConditionOperation,
-    WhileOperation, flat_program_input_types, flat_program_output_types,
+    ConditionOperation, ConditionPredicate, ControlFlowError, ControlFlowValue, FlatProgram, WhileOperation,
+    flat_program_input_types, flat_program_output_types,
 };
 pub use cos::{Cos, CosOperation, CosTracingOperation};
 pub use custom::{
@@ -119,7 +119,8 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 /// that pulls cotangents on `y` back to cotangents on `x`. The rule does not receive concrete
 /// primal witnesses because those are not part of the transpose trace. Instead, it operates
 /// directly on staged output cotangents and emits staged cotangent contributions for the op
-/// inputs.
+/// inputs. The transpose context is available for higher-order rules that need to recursively
+/// transpose nested programs and synthesize zeros for disconnected leaves.
 ///
 /// A few concrete examples:
 ///
@@ -135,7 +136,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
-///   let contributions = ScaleOperation::new(3.0f64).transpose(&[cotangent]).unwrap();
+///   let contributions = ScaleOperation::new(3.0f64).transpose(context, &[cotangent]).unwrap();
 ///   let dx = contributions[0].clone().expect("scale contributes one cotangent");
 ///   // `dx` is a staged `LinearTerm` representing `3.0 * cotangent`.
 ///   ```
@@ -151,7 +152,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   let cotangent_atom = builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
-///   let contributions = AddOperation.transpose(&[cotangent]).unwrap();
+///   let contributions = AddOperation.transpose(context, &[cotangent]).unwrap();
 ///   let dx0 = contributions[0].clone().expect("add contributes to lhs");
 ///   let dx1 = contributions[1].clone().expect("add contributes to rhs");
 ///   // `dx0` and `dx1` are staged `LinearTerm`s representing the same cotangent.
@@ -174,7 +175,7 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///   let cotangent_atom = builder.borrow_mut().add_input(arr2(&[[1.0, 2.0], [3.0, 4.0]]).r#type().into_owned());
 ///   let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder.clone());
 ///
-///   let contributions = MatrixTransposeOperation.transpose(&[cotangent]).unwrap();
+///   let contributions = MatrixTransposeOperation.transpose(context, &[cotangent]).unwrap();
 ///   let dx = contributions[0].clone().expect("transpose contributes one cotangent");
 ///   // `dx` is a staged `LinearTerm` representing `cotangent.transpose()`.
 ///   ```
@@ -183,6 +184,24 @@ pub fn unary_abstract(inputs: &[ArrayType]) -> Result<ArrayType, TypeError> {
 ///
 /// Structural validation happens when the forward linear program is built and when any staged ops
 /// emitted by the rule are added to the transpose program.
+#[doc(hidden)]
+pub trait LinearTransposeContext<T: Type, V: Traceable<T>, LinearCarrier: Clone + Operation<T>> {
+    /// Creates one pullback-program input for an output cotangent.
+    fn make_output_cotangent_input(
+        &mut self,
+        builder: &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
+        output_type: &T,
+        output_index: usize,
+    ) -> Result<AtomId, TracingError>;
+
+    /// Creates a structurally zero cotangent for a disconnected input.
+    fn make_missing_input_cotangent(
+        &mut self,
+        builder: &Rc<RefCell<ProgramBuilder<T, V, LinearCarrier>>>,
+        input_type: &T,
+    ) -> Result<AtomId, TracingError>;
+}
+
 pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primitive::LinearPrimitiveOperation<V>>:
     Operation<T>
 {
@@ -196,6 +215,7 @@ pub trait LinearOperation<T: Type, V: Traceable<T>, LinearCarrier: Clone = primi
     /// need to materialize an explicit zero term for that input.
     fn transpose(
         &self,
+        context: &mut dyn LinearTransposeContext<T, V, LinearCarrier>,
         output_cotangents: &[LinearTerm<T, V, LinearCarrier>],
     ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TracingError>
     where
@@ -324,12 +344,13 @@ impl<O: LinearOperation<T, V, LinearCarrier> + ?Sized, T: Type, V: Traceable<T>,
     #[inline]
     fn transpose(
         &self,
+        context: &mut dyn LinearTransposeContext<T, V, LinearCarrier>,
         output_cotangents: &[LinearTerm<T, V, LinearCarrier>],
     ) -> Result<Vec<Option<LinearTerm<T, V, LinearCarrier>>>, TracingError>
     where
         LinearCarrier: Operation<T>,
     {
-        (**self).transpose(output_cotangents)
+        (**self).transpose(context, output_cotangents)
     }
 }
 

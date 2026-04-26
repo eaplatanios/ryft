@@ -9,6 +9,7 @@ use indoc::indoc;
 use crate::macros::check_input_count;
 use crate::tracing::{OperationFormatter, Traceable, TracingError, Value};
 use crate::tracing_v2::{
+    LinearPrimitiveOperation,
     engines::{DifferentiableEngine, Engine},
     forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
     jit::Tracer,
@@ -112,6 +113,7 @@ impl<V: Traceable<ArrayType> + Mul<Output = V> + ZeroLike> LinearOperation<Array
 {
     fn transpose(
         &self,
+        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         check_input_count!(output_cotangents, 1);
@@ -175,9 +177,34 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::{parameters::Placeholder, tracing::ProgramBuilder, tracing_v2::LinearPrimitiveOperation};
+    use crate::{
+        parameters::Placeholder,
+        tracing::{AtomId, ProgramBuilder},
+        tracing_v2::{LinearPrimitiveOperation, operations::LinearTransposeContext},
+    };
 
     use super::*;
+
+    struct TestLinearTransposeContext;
+
+    impl LinearTransposeContext<ArrayType, f64, LinearPrimitiveOperation<f64>> for TestLinearTransposeContext {
+        fn make_output_cotangent_input(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
+            output_type: &ArrayType,
+            _output_index: usize,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
+        }
+
+        fn make_missing_input_cotangent(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
+            _input_type: &ArrayType,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_constant(0.0))
+        }
+    }
 
     fn approx_eq(left: f64, right: f64) {
         let delta = (left - right).abs();
@@ -190,8 +217,9 @@ mod tests {
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(1.0f64.r#type().into_owned());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
+        let mut context = TestLinearTransposeContext;
         let contribution = ScaleOperation::new(3.0f64)
-            .transpose(&[output_cotangent])
+            .transpose(&mut context, &[output_cotangent])
             .unwrap()
             .into_iter()
             .next()

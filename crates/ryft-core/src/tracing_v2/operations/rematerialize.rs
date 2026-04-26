@@ -389,6 +389,7 @@ where
 impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearRematerializeOperation<ArrayType, V> {
     fn transpose(
         &self,
+        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         let transpose = self.transpose_op();
@@ -590,15 +591,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::tracing::{Program, ProgramBuilder};
+    use crate::tracing::{AtomId, Program, ProgramBuilder};
     use crate::tracing_v2::{
-        DifferentiationError, JvpTracer, Linearized, Sin, Tracer,
+        DifferentiationError, JvpTracer, LinearPrimitiveOperation, Linearized, Sin, Tracer,
         engines::ArrayScalarEngine,
         interpret_and_trace,
         linear::{compile_grad, grad, value_and_grad},
+        operations::LinearTransposeContext,
     };
 
     use super::*;
@@ -610,6 +614,27 @@ mod tests {
 
     fn scalar_type() -> ArrayType {
         ArrayType::scalar(crate::types::DataType::F64)
+    }
+
+    struct TestLinearTransposeContext;
+
+    impl LinearTransposeContext<ArrayType, f64, LinearPrimitiveOperation<f64>> for TestLinearTransposeContext {
+        fn make_output_cotangent_input(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
+            output_type: &ArrayType,
+            _output_index: usize,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
+        }
+
+        fn make_missing_input_cotangent(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
+            _input_type: &ArrayType,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_constant(0.0))
+        }
     }
 
     fn empty_traced_body() -> FlatTracedRematerialize<ArrayType, f64> {
@@ -671,9 +696,10 @@ mod tests {
     fn test_linear_rematerialize_transpose_requires_output_cotangent_leaves() {
         let operation = LinearRematerializeOperation::<ArrayType, f64>::new(empty_linear_body(), empty_linear_body());
         let output_cotangents: Vec<LinearTerm<ArrayType, f64>> = Vec::new();
+        let mut context = TestLinearTransposeContext;
 
         assert!(matches!(
-            operation.transpose(output_cotangents.as_slice()),
+            operation.transpose(&mut context, output_cotangents.as_slice()),
             Err(TracingError::Differentiation(
                 DifferentiationError::MissingLinearRematerializeTransposeCotangentLeaves
             ))

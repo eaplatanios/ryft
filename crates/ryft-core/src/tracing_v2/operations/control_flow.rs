@@ -6,27 +6,18 @@ use crate::{
     parameters::Parameterized,
     tracing::{InterpretableOperation, Operation, OperationFormatter, Program, Traceable, TracingError},
     tracing_v2::{
-        EngineTangent, JvpTracer, LinearPrimitiveOperation, LinearTerm, PrimitiveOperation, Tracer,
+        EngineTangent, JvpTracer, LinearTerm, PrimitiveOperation, Tracer,
         engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, TangentSpace},
-        linear::linearize_program,
+        linear::{linearize_program, transpose_linear_program_with_context},
         operations::constants::ZeroLike,
     },
     types::{ArrayType, DataType, TypeError, Typed},
 };
 
-use super::{DifferentiableOperation, LinearOperation};
-
-/// Hidden staging trait for the `condition` higher-order primitive in linear programs.
-///
-/// Linear transpose rules sometimes need to rebuild a nested condition after swapping each branch
-/// for its transpose branch. Backend-owned linear carriers implement this trait so the rule can
-/// stage that rebuilt condition without depending on [`LinearPrimitiveOperation`].
-#[doc(hidden)]
-pub trait LinearConditionOperation<V: Traceable<ArrayType>>: Clone + Operation<ArrayType> {
-    /// Constructs the carrier-specific representation of a linear `condition` primitive.
-    fn linear_condition_op(op: ConditionOperation<V, Self>) -> Self;
-}
+use super::{
+    CoreLinearProgramOperation, DifferentiableOperation, LinearAddOperation, LinearOperation, LinearTransposeContext,
+};
 
 /// Flat nested program shape used by control-flow operations.
 pub type FlatProgram<V, O> = Program<ArrayType, V, O, Vec<V>, Vec<V>>;
@@ -46,13 +37,6 @@ pub enum ControlFlowError {
     MissingTransformRule {
         /// Name of the missing transform.
         transform: &'static str,
-    },
-
-    /// Transposing a linear condition requires a branch pullback program.
-    #[error("linear condition is missing a transpose branch for the {branch} branch")]
-    MissingBranchTranspose {
-        /// Branch that has no transpose program.
-        branch: &'static str,
     },
 
     /// Replaying a linear nested program needs an existing linear builder but no inputs were available.
@@ -145,12 +129,6 @@ pub struct ConditionOperation<V: Traceable<ArrayType>, O: Clone + Operation<Arra
 
     /// Program evaluated when the predicate is false.
     false_branch: FlatProgram<V, O>,
-
-    /// Optional transpose of the true branch used when this condition appears in a linear program.
-    true_transpose_branch: Option<FlatProgram<V, O>>,
-
-    /// Optional transpose of the false branch used when this condition appears in a linear program.
-    false_transpose_branch: Option<FlatProgram<V, O>>,
 }
 
 /// While-loop operation with nested condition and body programs over the same loop-carried state.
@@ -274,7 +252,7 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> ConditionOperatio
         false_branch: FlatProgram<V, O>,
     ) -> Result<Self, TypeError> {
         ensure_scalar_bool_type(&predicate_type)?;
-        Self::from_parts(ConditionPredicate::RuntimeInput(predicate_type), true_branch, false_branch, None, None)
+        Self::from_parts(ConditionPredicate::RuntimeInput(predicate_type), true_branch, false_branch)
     }
 
     /// Creates a condition whose predicate is captured in the operation.
@@ -283,66 +261,23 @@ impl<V: Traceable<ArrayType>, O: Clone + Operation<ArrayType>> ConditionOperatio
         true_branch: FlatProgram<V, O>,
         false_branch: FlatProgram<V, O>,
     ) -> Result<Self, TypeError> {
-        Self::from_parts(ConditionPredicate::Captured(predicate), true_branch, false_branch, None, None)
+        Self::from_parts(ConditionPredicate::Captured(predicate), true_branch, false_branch)
     }
 
-    /// Creates a condition with explicit branch transpose programs.
-    pub fn with_transpose_branches(
-        predicate: ConditionPredicate,
-        true_branch: FlatProgram<V, O>,
-        false_branch: FlatProgram<V, O>,
-        true_transpose_branch: FlatProgram<V, O>,
-        false_transpose_branch: FlatProgram<V, O>,
-    ) -> Result<Self, TypeError> {
-        if let ConditionPredicate::RuntimeInput(predicate_type) = &predicate {
-            ensure_scalar_bool_type(predicate_type)?;
-        }
-        Self::from_parts(
-            predicate,
-            true_branch,
-            false_branch,
-            Some(true_transpose_branch),
-            Some(false_transpose_branch),
-        )
-    }
-
-    /// Creates a condition after validating branch and optional transpose signatures.
+    /// Creates a condition after validating branch signatures.
     fn from_parts(
         predicate: ConditionPredicate,
         true_branch: FlatProgram<V, O>,
         false_branch: FlatProgram<V, O>,
-        true_transpose_branch: Option<FlatProgram<V, O>>,
-        false_transpose_branch: Option<FlatProgram<V, O>>,
     ) -> Result<Self, TypeError> {
+        if let ConditionPredicate::RuntimeInput(predicate_type) = &predicate {
+            ensure_scalar_bool_type(predicate_type)?;
+        }
         let input_types = flat_program_input_types(&true_branch);
         ensure_types_match("condition branch input", &input_types, &flat_program_input_types(&false_branch))?;
         let output_types = flat_program_output_types(&true_branch);
         ensure_types_match("condition branch output", &output_types, &flat_program_output_types(&false_branch))?;
-        if let Some(transpose_branch) = &true_transpose_branch {
-            ensure_types_match(
-                "true condition transpose input",
-                &output_types,
-                &flat_program_input_types(transpose_branch),
-            )?;
-            ensure_types_match(
-                "true condition transpose output",
-                &input_types,
-                &flat_program_output_types(transpose_branch),
-            )?;
-        }
-        if let Some(transpose_branch) = &false_transpose_branch {
-            ensure_types_match(
-                "false condition transpose input",
-                &output_types,
-                &flat_program_input_types(transpose_branch),
-            )?;
-            ensure_types_match(
-                "false condition transpose output",
-                &input_types,
-                &flat_program_output_types(transpose_branch),
-            )?;
-        }
-        Ok(Self { predicate, true_branch, false_branch, true_transpose_branch, false_transpose_branch })
+        Ok(Self { predicate, true_branch, false_branch })
     }
 
     /// Returns the predicate source used by this condition.
@@ -459,32 +394,18 @@ where
 impl<V, O> LinearOperation<ArrayType, V, O> for ConditionOperation<V, O>
 where
     V: Traceable<ArrayType>,
-    O: LinearConditionOperation<V>,
+    O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + From<ConditionOperation<V, O>>,
 {
     fn transpose(
         &self,
+        context: &mut dyn LinearTransposeContext<ArrayType, V, O>,
         output_cotangents: &[LinearTerm<ArrayType, V, O>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V, O>>>, TracingError> {
-        if matches!(self.predicate, ConditionPredicate::RuntimeInput(_)) {
+        let ConditionPredicate::Captured(predicate) = self.predicate else {
             return Err(
                 ControlFlowError::MissingTransformRule { transform: "runtime-predicate condition transpose" }.into()
             );
-        }
-        let true_transpose = self
-            .true_transpose_branch
-            .clone()
-            .ok_or(ControlFlowError::MissingBranchTranspose { branch: "true" })?;
-        let false_transpose = self
-            .false_transpose_branch
-            .clone()
-            .ok_or(ControlFlowError::MissingBranchTranspose { branch: "false" })?;
-        let transposed_condition = ConditionOperation::with_transpose_branches(
-            self.predicate.clone(),
-            true_transpose,
-            false_transpose,
-            self.true_branch.clone(),
-            self.false_branch.clone(),
-        )?;
+        };
         let Some(first_cotangent) = output_cotangents.first() else {
             return if self.input_types().is_empty() {
                 Ok(Vec::new())
@@ -492,11 +413,17 @@ where
                 Err(ControlFlowError::MissingLinearInvocationContext.into())
             };
         };
+        let mut transpose_branch = |branch: &FlatProgram<V, O>| transpose_linear_program_with_context(context, branch);
+        let transposed_condition = ConditionOperation::with_captured_predicate(
+            predicate,
+            transpose_branch(&self.true_branch)?,
+            transpose_branch(&self.false_branch)?,
+        )?;
         let input_count = self.input_types().len();
         let cotangents = LinearTerm::apply_staged_op(
             first_cotangent.builder.clone(),
             output_cotangents,
-            O::linear_condition_op(transposed_condition),
+            O::from(transposed_condition),
             input_count,
         )?;
         Ok(cotangents.into_iter().map(Some).collect())
@@ -651,6 +578,7 @@ where
 {
     fn transpose(
         &self,
+        _context: &mut dyn LinearTransposeContext<ArrayType, V, O>,
         _output_cotangents: &[LinearTerm<ArrayType, V, O>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V, O>>>, TracingError> {
         Err(ControlFlowError::MissingTransformRule { transform: "while transpose" }.into())
@@ -726,6 +654,7 @@ mod tests {
         parameters::{Parameter, Placeholder},
         tracing::{ProgramBuilder, Traceable, Value},
         tracing_v2::{
+            LinearPrimitiveOperation,
             engines::{ArrayScalarEngine, Engine},
             operations::{LinearAddOperation, LinearNegOperation, LinearScaleOperation},
         },
@@ -924,6 +853,7 @@ mod tests {
     impl LinearOperation<ArrayType, TestValue, TestLinearOperation> for TestLinearOperation {
         fn transpose(
             &self,
+            context: &mut dyn LinearTransposeContext<ArrayType, TestValue, TestLinearOperation>,
             output_cotangents: &[LinearTerm<ArrayType, TestValue, TestLinearOperation>],
         ) -> Result<Vec<Option<LinearTerm<ArrayType, TestValue, TestLinearOperation>>>, TracingError> {
             match self {
@@ -951,7 +881,7 @@ mod tests {
                     )?;
                     Ok(vec![Some(outputs[0].clone())])
                 }
-                Self::Condition(condition) => condition.transpose(output_cotangents),
+                Self::Condition(condition) => condition.transpose(context, output_cotangents),
             }
         }
     }
@@ -974,8 +904,8 @@ mod tests {
         }
     }
 
-    impl LinearConditionOperation<TestValue> for TestLinearOperation {
-        fn linear_condition_op(op: ConditionOperation<TestValue, Self>) -> Self {
+    impl From<ConditionOperation<TestValue, TestLinearOperation>> for TestLinearOperation {
+        fn from(op: ConditionOperation<TestValue, TestLinearOperation>) -> Self {
             Self::Condition(Box::new(op))
         }
     }
@@ -1064,6 +994,27 @@ mod tests {
         type LinearOperation = TestLinearOperation;
     }
 
+    struct TestLinearTransposeContext;
+
+    impl LinearTransposeContext<ArrayType, TestValue, TestLinearOperation> for TestLinearTransposeContext {
+        fn make_output_cotangent_input(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
+            output_type: &ArrayType,
+            _output_index: usize,
+        ) -> Result<crate::tracing::AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
+        }
+
+        fn make_missing_input_cotangent(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, TestValue, TestLinearOperation>>>,
+            input_type: &ArrayType,
+        ) -> Result<crate::tracing::AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_constant(TestEngine.zero(input_type)?))
+        }
+    }
+
     impl DifferentiableOperation<TestEngine> for TestDifferentiableOperation {
         fn jvp(
             &self,
@@ -1106,13 +1057,6 @@ mod tests {
         let one = builder.add_constant(TestValue::Number(1.0));
         let output = builder.add_instruction(TestOperation::Sub, vec![input, one]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder]).unwrap()
-    }
-
-    fn identity_linear_branch() -> FlatProgram<TestValue, LinearPrimitiveOperation<TestValue>> {
-        let mut builder =
-            ProgramBuilder::<ArrayType, TestValue, LinearPrimitiveOperation<TestValue>>::new(vec![Placeholder]);
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.build(vec![input], vec![Placeholder]).unwrap()
     }
 
     fn identity_primitive_branch() -> FlatProgram<TestValue, PrimitiveOperation<TestValue>> {
@@ -1387,23 +1331,31 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_condition_transpose_requires_explicit_transpose_branches() {
-        let condition =
-            ConditionOperation::with_captured_predicate(true, identity_linear_branch(), identity_linear_branch())
-                .unwrap();
+    fn test_linear_condition_transpose_rejects_runtime_predicates() {
+        let condition = ConditionOperation::new(
+            ArrayType::scalar(DataType::Boolean),
+            custom_linear_identity_branch(),
+            custom_linear_identity_branch(),
+        )
+        .unwrap();
+        let builder =
+            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder])));
+        let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+        let cotangent = LinearTerm::from_staged_parts(cotangent_input, builder);
+        let mut context = TestLinearTransposeContext;
 
         assert!(matches!(
-            condition.transpose(&[]),
-            Err(TracingError::ControlFlow(ControlFlowError::MissingBranchTranspose { branch: "true" })),
+            condition.transpose(&mut context, &[cotangent]),
+            Err(TracingError::ControlFlow(ControlFlowError::MissingTransformRule {
+                transform: "runtime-predicate condition transpose",
+            })),
         ));
     }
 
     #[test]
     fn test_generic_linear_condition_transpose_uses_custom_carrier() {
-        let condition = ConditionOperation::with_transpose_branches(
-            ConditionPredicate::Captured(true),
-            custom_linear_identity_branch(),
-            custom_linear_identity_branch(),
+        let condition = ConditionOperation::with_captured_predicate(
+            true,
             custom_linear_identity_branch(),
             custom_linear_identity_branch(),
         )
@@ -1412,7 +1364,8 @@ mod tests {
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new(vec![Placeholder])));
         let cotangent_input = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let cotangent = LinearTerm::from_staged_parts(cotangent_input, builder.clone());
-        let outputs = condition.transpose(&[cotangent]).unwrap();
+        let mut context = TestLinearTransposeContext;
+        let outputs = condition.transpose(&mut context, &[cotangent]).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_some());

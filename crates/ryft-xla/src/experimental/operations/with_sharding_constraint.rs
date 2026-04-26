@@ -123,6 +123,11 @@ impl InterpretableOperation<ArrayType, ShardMapTensor> for WithShardingConstrain
 impl LinearOperation<ArrayType, ShardMapTensor> for WithShardingConstraintOperation {
     fn transpose(
         &self,
+        _context: &mut dyn ryft_core::tracing_v2::operations::LinearTransposeContext<
+            ArrayType,
+            ShardMapTensor,
+            LinearPrimitiveOperation<ShardMapTensor>,
+        >,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTensor>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTensor>>>, TracingError> {
         check_input_count!(output_cotangents, 1);
@@ -257,6 +262,11 @@ impl InterpretableOperation<ArrayType, ShardMapTracer> for WithShardingConstrain
 impl LinearOperation<ArrayType, ShardMapTracer> for WithShardingConstraintOperation {
     fn transpose(
         &self,
+        _context: &mut dyn ryft_core::tracing_v2::operations::LinearTransposeContext<
+            ArrayType,
+            ShardMapTracer,
+            LinearPrimitiveOperation<ShardMapTracer>,
+        >,
         output_cotangents: &[LinearTerm<ArrayType, ShardMapTracer>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, ShardMapTracer>>>, TracingError> {
         check_input_count!(output_cotangents, 1);
@@ -298,8 +308,10 @@ mod tests {
 
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing::ProgramBuilder;
-    use ryft_core::tracing_v2::{LinearOperation, LinearPrimitiveOperation, LinearTerm};
+    use ryft_core::tracing::{AtomId, Operation, ProgramBuilder, Traceable};
+    use ryft_core::tracing_v2::{
+        LinearOperation, LinearPrimitiveOperation, LinearTerm, operations::LinearTransposeContext,
+    };
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -310,6 +322,29 @@ mod tests {
 
     fn test_sharding(mesh: &LogicalMesh) -> Sharding {
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
+    }
+
+    struct TestLinearTransposeContext;
+
+    impl<V: Traceable<ArrayType>> LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>
+        for TestLinearTransposeContext
+    {
+        fn make_output_cotangent_input(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
+            output_type: &ArrayType,
+            _output_index: usize,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
+        }
+
+        fn make_missing_input_cotangent(
+            &mut self,
+            _builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, LinearPrimitiveOperation<V>>>>,
+            _input_type: &ArrayType,
+        ) -> Result<AtomId, TracingError> {
+            panic!("with_sharding_constraint transpose tests should not synthesize missing cotangents");
+        }
     }
 
     #[test]
@@ -445,13 +480,17 @@ mod tests {
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let contribution =
-            LinearOperation::transpose(&WithShardingConstraintOperation::new(sharding.clone()), &[output_cotangent])
-                .unwrap()
-                .into_iter()
-                .next()
-                .expect("transpose should return one contribution")
-                .expect("transpose should produce one cotangent contribution");
+        let mut context = TestLinearTransposeContext;
+        let contribution = LinearOperation::transpose(
+            &WithShardingConstraintOperation::new(sharding.clone()),
+            &mut context,
+            &[output_cotangent],
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("transpose should return one contribution")
+        .expect("transpose should produce one cotangent contribution");
         let contribution_atom = contribution.atom;
         drop(contribution);
 
@@ -481,13 +520,17 @@ mod tests {
             ));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(input_type.clone());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
-        let contribution =
-            LinearOperation::transpose(&WithShardingConstraintOperation::new(sharding.clone()), &[output_cotangent])
-                .unwrap()
-                .into_iter()
-                .next()
-                .expect("transpose should return one contribution")
-                .expect("transpose should produce one cotangent contribution");
+        let mut context = TestLinearTransposeContext;
+        let contribution = LinearOperation::transpose(
+            &WithShardingConstraintOperation::new(sharding.clone()),
+            &mut context,
+            &[output_cotangent],
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("transpose should return one contribution")
+        .expect("transpose should produce one cotangent contribution");
         let contribution_atom = contribution.atom;
         drop(contribution);
 

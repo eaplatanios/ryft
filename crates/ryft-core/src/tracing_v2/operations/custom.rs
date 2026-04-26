@@ -382,12 +382,13 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for CustomPri
 impl<V: Traceable<ArrayType> + 'static> LinearOperation<ArrayType, V> for CustomPrimitive<ArrayType, V> {
     fn transpose(
         &self,
+        context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         self.transpose_rule
             .as_deref()
             .ok_or_else(|| TracingError::from(self.missing_rule("transpose")))?
-            .transpose(output_cotangents)
+            .transpose(context, output_cotangents)
     }
 }
 
@@ -496,13 +497,14 @@ impl<V: Traceable<ArrayType>> InterpretableOperation<ArrayType, V> for LinearCus
 impl<V: Traceable<ArrayType>> LinearOperation<ArrayType, V> for LinearCustomPrimitive<ArrayType, V> {
     fn transpose(
         &self,
+        context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         self.primitive
             .transpose_rule
             .as_deref()
             .expect("linear custom primitives must carry a transpose rule")
-            .transpose(output_cotangents)
+            .transpose(context, output_cotangents)
     }
 }
 
@@ -513,10 +515,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::tracing::{Program, ProgramBuilder};
+    use crate::tracing::{AtomId, Program, ProgramBuilder};
     use crate::tracing_v2::{
-        LinearPrimitiveOperation, PrimitiveOperation, Tracer, engines::ArrayScalarEngine, grad, interpret_and_trace,
-        jvp, operations::constants::OneLike,
+        LinearPrimitiveOperation, PrimitiveOperation, Tracer,
+        engines::ArrayScalarEngine,
+        grad, interpret_and_trace, jvp,
+        operations::{LinearTransposeContext, constants::OneLike},
     };
     use crate::types::{ArrayType, DataType, Shape};
 
@@ -566,6 +570,11 @@ mod tests {
     impl LinearOperation<ArrayType, f64> for ShiftOp {
         fn transpose(
             &self,
+            _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<
+                ArrayType,
+                f64,
+                LinearPrimitiveOperation<f64>,
+            >,
             output_cotangents: &[LinearTerm<ArrayType, f64>],
         ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TracingError> {
             if output_cotangents.len() != 1 {
@@ -642,6 +651,27 @@ mod tests {
         ArrayType::new(DataType::F64, Shape::scalar(), None, None).expect("scalar array types should be valid")
     }
 
+    struct TestLinearTransposeContext;
+
+    impl LinearTransposeContext<ArrayType, f64, LinearPrimitiveOperation<f64>> for TestLinearTransposeContext {
+        fn make_output_cotangent_input(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
+            output_type: &ArrayType,
+            _output_index: usize,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
+        }
+
+        fn make_missing_input_cotangent(
+            &mut self,
+            builder: &Rc<RefCell<ProgramBuilder<ArrayType, f64, LinearPrimitiveOperation<f64>>>>,
+            _input_type: &ArrayType,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_constant(0.0))
+        }
+    }
+
     #[test]
     fn test_linear_custom_primitive_requires_transpose_rule_up_front() {
         let primitive = CustomPrimitive::<ArrayType, f64>::new(ShiftOp::new(2.0));
@@ -681,9 +711,10 @@ mod tests {
             Rc::new(RefCell::new(ProgramBuilder::<ArrayType, f64, LinearPrimitiveOperation<f64>>::new(Vec::new())));
         let cotangent_atom = builder.borrow_mut().add_input(0.0f64.r#type().into_owned());
         let cotangent = LinearTerm::from_staged_parts(cotangent_atom, builder);
+        let mut context = TestLinearTransposeContext;
 
         assert!(matches!(
-            primitive.transpose(&[cotangent]),
+            primitive.transpose(&mut context, &[cotangent]),
             Err(TracingError::CustomOperation(CustomOperationError::MissingRule {
                 op: "test_shift",
                 transform: "transpose",

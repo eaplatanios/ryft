@@ -14,6 +14,7 @@ use super::*;
 ///   - `output_cotangents`: transpose-builder atom ids for the already-staged cotangents of
 ///     the primitive outputs.
 fn transpose<V, O>(
+    context: &mut dyn LinearTransposeContext<ArrayType, V, O>,
     op: &O,
     builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
     output_cotangents: &[AtomId],
@@ -27,10 +28,40 @@ where
         .map(|cotangent| LinearTerm::from_staged_parts(*cotangent, builder.clone()))
         .collect::<Vec<_>>();
     Ok(op
-        .transpose(cotangent_terms.as_slice())?
+        .transpose(context, cotangent_terms.as_slice())?
         .into_iter()
         .map(|term| term.map(|term| term.atom))
         .collect())
+}
+
+struct FactoryLinearTransposeContext<F, G> {
+    make_output_cotangent_input: F,
+    make_missing_input_cotangent: G,
+}
+
+impl<V, O, F, G> LinearTransposeContext<ArrayType, V, O> for FactoryLinearTransposeContext<F, G>
+where
+    V: Traceable<ArrayType>,
+    O: Clone + Operation<ArrayType>,
+    F: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType, usize) -> Result<AtomId, TracingError>,
+    G: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType) -> Result<AtomId, TracingError>,
+{
+    fn make_output_cotangent_input(
+        &mut self,
+        builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
+        output_type: &ArrayType,
+        output_index: usize,
+    ) -> Result<AtomId, TracingError> {
+        (self.make_output_cotangent_input)(builder, output_type, output_index)
+    }
+
+    fn make_missing_input_cotangent(
+        &mut self,
+        builder: &Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>,
+        input_type: &ArrayType,
+    ) -> Result<AtomId, TracingError> {
+        (self.make_missing_input_cotangent)(builder, input_type)
+    }
 }
 
 /// Converts a staged primal program into a staged pushforward linear map.
@@ -176,17 +207,14 @@ where
     )
 }
 
-fn transpose_linear_program_with_factories<V, Input, Output, O, F, G>(
+pub(crate) fn transpose_linear_program_with_context<V, Input, Output, O>(
+    context: &mut dyn LinearTransposeContext<ArrayType, V, O>,
     program: &Program<ArrayType, V, O, Input, Output>,
-    mut make_output_cotangent_input: F,
-    mut make_missing_input_cotangent: G,
 ) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
 where
     V: Traceable<ArrayType>,
     Input: Parameterized<V, ParameterStructure: Clone>,
     Output: Parameterized<V, ParameterStructure: Clone>,
-    F: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType, usize) -> Result<AtomId, TracingError>,
-    G: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType) -> Result<AtomId, TracingError>,
     O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
 {
     fn accumulate<V, O, BuilderInput, BuilderOutput>(
@@ -222,7 +250,7 @@ where
     let mut output_cotangent_inputs = Vec::with_capacity(program.output_ids.len());
     for (output_index, output) in program.output_ids.iter().enumerate() {
         let output_atom = program.atoms.get(output.index).ok_or(TracingError::UnboundAtomId { id: *output })?;
-        let cotangent_input = make_output_cotangent_input(&builder, &output_atom.r#type(), output_index)?;
+        let cotangent_input = context.make_output_cotangent_input(&builder, &output_atom.r#type(), output_index)?;
         output_cotangent_inputs.push(cotangent_input);
     }
 
@@ -242,11 +270,12 @@ where
             .map(|output| {
                 Ok(match adjoints[output.index] {
                     Some(adjoint) => adjoint,
-                    None => make_missing_input_cotangent(&builder, &program.atoms[output.index].r#type())?,
+                    None => context.make_missing_input_cotangent(&builder, &program.atoms[output.index].r#type())?,
                 })
             })
             .collect::<Result<Vec<_>, TracingError>>()?;
-        let input_cotangents = transpose(&instruction.operation, &builder, instruction_output_cotangents.as_slice())?;
+        let input_cotangents =
+            transpose(context, &instruction.operation, &builder, instruction_output_cotangents.as_slice())?;
         for (input, contribution) in instruction.inputs.iter().copied().zip(input_cotangents) {
             if let Some(contribution) = contribution {
                 accumulate(&builder, adjoints.as_mut_slice(), input, contribution)?;
@@ -261,7 +290,7 @@ where
         .map(|input| {
             Ok(match adjoints[input.index] {
                 Some(adjoints) => adjoints,
-                None => make_missing_input_cotangent(&builder, &program.atoms[input.index].r#type())?,
+                None => context.make_missing_input_cotangent(&builder, &program.atoms[input.index].r#type())?,
             })
         })
         .collect::<Result<Vec<_>, TracingError>>()?;
@@ -275,6 +304,23 @@ where
         .into_typed::<Output, Input>(program.output_structure.clone())
         .build(outputs, program.input_structure.clone())?
         .simplified()
+}
+
+fn transpose_linear_program_with_factories<V, Input, Output, O, F, G>(
+    program: &Program<ArrayType, V, O, Input, Output>,
+    make_output_cotangent_input: F,
+    make_missing_input_cotangent: G,
+) -> Result<Program<ArrayType, V, O, Output, Input>, TracingError>
+where
+    V: Traceable<ArrayType>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+    F: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType, usize) -> Result<AtomId, TracingError>,
+    G: FnMut(&Rc<RefCell<ProgramBuilder<ArrayType, V, O>>>, &ArrayType) -> Result<AtomId, TracingError>,
+    O: CoreLinearProgramOperation<V> + LinearAddOperation<ArrayType, V> + Clone,
+{
+    let mut context = FactoryLinearTransposeContext { make_output_cotangent_input, make_missing_input_cotangent };
+    transpose_linear_program_with_context(&mut context, program)
 }
 
 /// Transposes a linear program using concrete output examples to seed the cotangent inputs.

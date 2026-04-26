@@ -11,7 +11,7 @@ use crate::{
     sharding::{Sharding, ShardingDimension},
     tracing::{OperationFormatter, Traceable, TracingError},
     tracing_v2::{
-        MatrixOps,
+        LinearPrimitiveOperation, MatrixOps,
         engines::{DifferentiableEngine, Engine},
         forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
         jit::Tracer,
@@ -427,6 +427,7 @@ impl<V: ReshapeValue> InterpretableOperation<ArrayType, V> for ReshapeOperation 
 impl<V: ReshapeValue + ZeroLike + OneLike + MatrixOps> LinearOperation<ArrayType, V> for ReshapeOperation {
     fn transpose(
         &self,
+        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         check_input_count!(output_cotangents, 1);
@@ -470,15 +471,49 @@ mod tests {
     use crate::{
         parameters::Placeholder,
         sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding},
-        tracing::{Program, ProgramBuilder},
+        tracing::{AtomId, Program, ProgramBuilder},
         tracing_v2::{
-            LinearPrimitiveOperation, PrimitiveOperation, interpret_and_trace,
+            LinearPrimitiveOperation, PrimitiveOperation, interpret_and_trace, operations::LinearTransposeContext,
             operations::matrix::ndarray_support::Array2Engine,
         },
         types::{DataType, Shape},
     };
 
     use super::*;
+
+    struct TestArrayLinearTransposeContext;
+
+    impl LinearTransposeContext<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>
+        for TestArrayLinearTransposeContext
+    {
+        fn make_output_cotangent_input(
+            &mut self,
+            builder: &Rc<
+                RefCell<
+                    ProgramBuilder<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>,
+                >,
+            >,
+            output_type: &ArrayType,
+            _output_index: usize,
+        ) -> Result<AtomId, TracingError> {
+            Ok(builder.borrow_mut().add_input(output_type.clone()))
+        }
+
+        fn make_missing_input_cotangent(
+            &mut self,
+            builder: &Rc<
+                RefCell<
+                    ProgramBuilder<ArrayType, ndarray::Array2<f64>, LinearPrimitiveOperation<ndarray::Array2<f64>>>,
+                >,
+            >,
+            input_type: &ArrayType,
+        ) -> Result<AtomId, TracingError> {
+            let [Size::Static(rows), Size::Static(cols)] = input_type.shape.dimensions.as_slice() else {
+                panic!("test array cotangents require rank-2 static shapes");
+            };
+            Ok(builder.borrow_mut().add_constant(ndarray::Array2::zeros((*rows, *cols))))
+        }
+    }
 
     /// Creates one small manual mesh used by reshape sharding tests.
     fn test_mesh() -> LogicalMesh {
@@ -735,11 +770,12 @@ mod tests {
         >::new(Vec::new())));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(output_value.r#type().into_owned());
         let output_cotangent = LinearTerm::from_staged_parts(output_cotangent_atom, transpose_builder.clone());
+        let mut context = TestArrayLinearTransposeContext;
         let contribution = ReshapeOperation::new(
             input_type.clone(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(4)]), None, None).unwrap(),
         )
-        .transpose(&[output_cotangent])
+        .transpose(&mut context, &[output_cotangent])
         .unwrap()
         .into_iter()
         .next()

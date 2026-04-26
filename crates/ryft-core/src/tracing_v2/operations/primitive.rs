@@ -17,7 +17,7 @@ use crate::{
             AddOperation, CosOperation, LeftMatMulOperation, MatMulOperation, MatrixTransposeOperation, MulOperation,
             NegOperation, ReshapeOperation, RightMatMulOperation, ScaleOperation, SinOperation,
             constants::{OneLike, ZeroLike},
-            control_flow::{ConditionOperation, ControlFlowValue, LinearConditionOperation, WhileOperation},
+            control_flow::{ConditionOperation, ControlFlowValue, WhileOperation},
             left_matmul::left_matmul_abstract_eval,
             right_matmul::right_matmul_abstract_eval,
         },
@@ -314,9 +314,9 @@ impl<V: Traceable<ArrayType>> LinearRematerializeCarrierOperation<ArrayType, V> 
     }
 }
 
-impl<V: Traceable<ArrayType>> LinearConditionOperation<V> for LinearPrimitiveOperation<V> {
+impl<V: Traceable<ArrayType>> From<ConditionOperation<V, LinearPrimitiveOperation<V>>> for LinearPrimitiveOperation<V> {
     #[inline]
-    fn linear_condition_op(op: ConditionOperation<V, Self>) -> Self {
+    fn from(op: ConditionOperation<V, LinearPrimitiveOperation<V>>) -> Self {
         LinearPrimitiveOperation::Condition(Box::new(op))
     }
 }
@@ -616,22 +616,27 @@ where
 {
     fn transpose(
         &self,
+        context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         match self {
-            Self::Add => AddOperation.transpose(output_cotangents),
-            Self::Neg => NegOperation.transpose(output_cotangents),
-            Self::MatrixTranspose => MatrixTransposeOperation.transpose(output_cotangents),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(output_cotangents),
-            Self::LeftMatMul { factor } => LeftMatMulOperation::new(factor.clone()).transpose(output_cotangents),
-            Self::RightMatMul { factor } => RightMatMulOperation::new(factor.clone()).transpose(output_cotangents),
-            Self::Reshape { input_type, output_type } => {
-                ReshapeOperation::new(input_type.clone(), output_type.clone()).transpose(output_cotangents)
+            Self::Add => AddOperation.transpose(context, output_cotangents),
+            Self::Neg => NegOperation.transpose(context, output_cotangents),
+            Self::MatrixTranspose => MatrixTransposeOperation.transpose(context, output_cotangents),
+            Self::Scale { factor } => ScaleOperation::new(factor.clone()).transpose(context, output_cotangents),
+            Self::LeftMatMul { factor } => {
+                LeftMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
             }
-            Self::Rematerialize(remat) => remat.transpose(output_cotangents),
-            Self::Condition(condition) => condition.transpose(output_cotangents),
-            Self::While(while_operation) => while_operation.transpose(output_cotangents),
-            Self::Custom(op) => op.transpose(output_cotangents),
+            Self::RightMatMul { factor } => {
+                RightMatMulOperation::new(factor.clone()).transpose(context, output_cotangents)
+            }
+            Self::Reshape { input_type, output_type } => {
+                ReshapeOperation::new(input_type.clone(), output_type.clone()).transpose(context, output_cotangents)
+            }
+            Self::Rematerialize(remat) => remat.transpose(context, output_cotangents),
+            Self::Condition(condition) => condition.transpose(context, output_cotangents),
+            Self::While(while_operation) => while_operation.transpose(context, output_cotangents),
+            Self::Custom(op) => op.transpose(context, output_cotangents),
         }
     }
 }

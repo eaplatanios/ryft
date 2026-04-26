@@ -10,6 +10,7 @@ use crate::{
     macros::check_input_count,
     tracing::{Traceable, TracingError},
     tracing_v2::{
+        LinearPrimitiveOperation,
         engines::DifferentiableEngine,
         forward::{Differentiable, EngineTangent, JvpTracer, TangentSpace},
         linear::LinearTerm,
@@ -114,6 +115,7 @@ impl<V: Traceable<ArrayType> + Add<Output = V>> InterpretableOperation<ArrayType
 impl<V: Traceable<ArrayType> + Add<Output = V> + ZeroLike> LinearOperation<ArrayType, V> for AddOperation {
     fn transpose(
         &self,
+        _context: &mut dyn crate::tracing_v2::operations::LinearTransposeContext<ArrayType, V, LinearPrimitiveOperation<V>>,
         output_cotangents: &[LinearTerm<ArrayType, V>],
     ) -> Result<Vec<Option<LinearTerm<ArrayType, V>>>, TracingError> {
         check_input_count!(output_cotangents, 1);

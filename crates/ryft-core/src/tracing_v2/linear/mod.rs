@@ -15,7 +15,7 @@ use crate::{
         jit::{DifferentiableTracer, Tracer, interpret_and_trace_with_operation},
         operations::{
             CoreLinearProgramOperation, CoreLinearReplayOperation, DifferentiableOperation, LinearAddOperation,
-            LinearNegOperation, LinearScaleOperation, RematerializeTracingOperation,
+            LinearNegOperation, LinearScaleOperation, LinearTransposeContext, RematerializeTracingOperation,
             constants::{OneLike, ZeroLike},
             rematerialize::{FlatTracedRematerialize, RematerializeOperation},
         },
@@ -40,6 +40,7 @@ pub use dense::{CoordinateValue, DenseJacobian, hessian, jacfwd, jacrev};
 #[doc(hidden)]
 pub use program::linearize_program;
 pub use program::transpose_linear_program;
+pub(crate) use program::transpose_linear_program_with_context;
 pub use program::transpose_linear_program_with_output_examples;
 pub use program::transpose_traced_linear_program;
 pub use rematerialization::{RematerializationPolicy, compile_grad, compile_grad_with_policy};
@@ -226,6 +227,7 @@ mod tests {
     impl LinearOperation<ArrayType, f64> for PanicReplayOp {
         fn transpose(
             &self,
+            _context: &mut dyn LinearTransposeContext<ArrayType, f64, LinearPrimitiveOperation<f64>>,
             output_cotangents: &[LinearTerm<ArrayType, f64>],
         ) -> Result<Vec<Option<LinearTerm<ArrayType, f64>>>, TracingError> {
             if output_cotangents.len() != 1 {
